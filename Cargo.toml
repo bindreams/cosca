@@ -1,0 +1,17 @@
+[package]
+name = "subprocess"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity (and, later, elevation)."
+license = "Apache-2.0"
+publish = false           # working name; not yet published
+
+[dependencies]
+thiserror = "2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+all = "warn"

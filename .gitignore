@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+
+# library crate: do not commit the lockfile
+Cargo.lock
+
+# agent scratch (specs/plans are force-added in git)
+.tmp/
+.superpowers/
