@@ -12,10 +12,7 @@ fn quote_error_kinds_have_distinct_messages() {
         QuoteErrorKind::UnterminatedDoubleQuote.to_string(),
         "unterminated double quote"
     );
-    assert_eq!(
-        QuoteErrorKind::TrailingBackslash.to_string(),
-        "trailing backslash"
-    );
+    assert_eq!(QuoteErrorKind::TrailingBackslash.to_string(), "trailing backslash");
 }
 
 #[test]

@@ -12,153 +12,295 @@ fn strs(input: &str) -> Vec<String> {
 // Test vectors (input/expected pairs) are factual data, not copyrighted expression.
 
 #[test]
-fn py_single_word() { assert_eq!(strs("x"), ["x"]); }
+fn py_single_word() {
+    assert_eq!(strs("x"), ["x"]);
+}
 #[test]
-fn py_two_words() { assert_eq!(strs("foo bar"), ["foo", "bar"]); }
+fn py_two_words() {
+    assert_eq!(strs("foo bar"), ["foo", "bar"]);
+}
 #[test]
-fn py_leading_ws() { assert_eq!(strs(" foo bar"), ["foo", "bar"]); }
+fn py_leading_ws() {
+    assert_eq!(strs(" foo bar"), ["foo", "bar"]);
+}
 #[test]
-fn py_leading_trailing_ws() { assert_eq!(strs(" foo bar "), ["foo", "bar"]); }
+fn py_leading_trailing_ws() {
+    assert_eq!(strs(" foo bar "), ["foo", "bar"]);
+}
 #[test]
-fn py_multi_ws() { assert_eq!(strs("foo   bar  bla     fasel"), ["foo", "bar", "bla", "fasel"]); }
+fn py_multi_ws() {
+    assert_eq!(strs("foo   bar  bla     fasel"), ["foo", "bar", "bla", "fasel"]);
+}
 #[test]
-fn py_embedded_runs() { assert_eq!(strs("x y  z              xxxx"), ["x", "y", "z", "xxxx"]); }
+fn py_embedded_runs() {
+    assert_eq!(strs("x y  z              xxxx"), ["x", "y", "z", "xxxx"]);
+}
 #[test]
-fn py_bs_x() { assert_eq!(strs(r"\x bar"), ["x", "bar"]); }
+fn py_bs_x() {
+    assert_eq!(strs(r"\x bar"), ["x", "bar"]);
+}
 #[test]
-fn py_bs_space_x() { assert_eq!(strs(r"\ x bar"), [" x", "bar"]); }
+fn py_bs_space_x() {
+    assert_eq!(strs(r"\ x bar"), [" x", "bar"]);
+}
 #[test]
-fn py_bs_space() { assert_eq!(strs(r"\ bar"), [" bar"]); }
+fn py_bs_space() {
+    assert_eq!(strs(r"\ bar"), [" bar"]);
+}
 #[test]
-fn py_bs_x_mid() { assert_eq!(strs(r"foo \x bar"), ["foo", "x", "bar"]); }
+fn py_bs_x_mid() {
+    assert_eq!(strs(r"foo \x bar"), ["foo", "x", "bar"]);
+}
 #[test]
-fn py_bs_space_x_mid() { assert_eq!(strs(r"foo \ x bar"), ["foo", " x", "bar"]); }
+fn py_bs_space_x_mid() {
+    assert_eq!(strs(r"foo \ x bar"), ["foo", " x", "bar"]);
+}
 #[test]
-fn py_bs_space_mid() { assert_eq!(strs(r"foo \ bar"), ["foo", " bar"]); }
+fn py_bs_space_mid() {
+    assert_eq!(strs(r"foo \ bar"), ["foo", " bar"]);
+}
 #[test]
-fn py_dq_word() { assert_eq!(strs(r#"foo "bar" bla"#), ["foo", "bar", "bla"]); }
+fn py_dq_word() {
+    assert_eq!(strs(r#"foo "bar" bla"#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_all_dq() { assert_eq!(strs(r#""foo" "bar" "bla""#), ["foo", "bar", "bla"]); }
+fn py_all_dq() {
+    assert_eq!(strs(r#""foo" "bar" "bla""#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_mixed_dq() { assert_eq!(strs(r#""foo" bar "bla""#), ["foo", "bar", "bla"]); }
+fn py_mixed_dq() {
+    assert_eq!(strs(r#""foo" bar "bla""#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_dq_start() { assert_eq!(strs(r#""foo" bar bla"#), ["foo", "bar", "bla"]); }
+fn py_dq_start() {
+    assert_eq!(strs(r#""foo" bar bla"#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_sq_word() { assert_eq!(strs(r#"foo 'bar' bla"#), ["foo", "bar", "bla"]); }
+fn py_sq_word() {
+    assert_eq!(strs(r#"foo 'bar' bla"#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_all_sq() { assert_eq!(strs(r#"'foo' 'bar' 'bla'"#), ["foo", "bar", "bla"]); }
+fn py_all_sq() {
+    assert_eq!(strs(r#"'foo' 'bar' 'bla'"#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_mixed_sq() { assert_eq!(strs(r#"'foo' bar 'bla'"#), ["foo", "bar", "bla"]); }
+fn py_mixed_sq() {
+    assert_eq!(strs(r#"'foo' bar 'bla'"#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_sq_start() { assert_eq!(strs(r#"'foo' bar bla"#), ["foo", "bar", "bla"]); }
+fn py_sq_start() {
+    assert_eq!(strs(r#"'foo' bar bla"#), ["foo", "bar", "bla"]);
+}
 #[test]
-fn py_adjacent_dq() { assert_eq!(strs(r#"blurb foo"bar"bar"fasel" baz"#), ["blurb", "foobarbarfasel", "baz"]); }
+fn py_adjacent_dq() {
+    assert_eq!(
+        strs(r#"blurb foo"bar"bar"fasel" baz"#),
+        ["blurb", "foobarbarfasel", "baz"]
+    );
+}
 #[test]
-fn py_adjacent_sq() { assert_eq!(strs(r#"blurb foo'bar'bar'fasel' baz"#), ["blurb", "foobarbarfasel", "baz"]); }
+fn py_adjacent_sq() {
+    assert_eq!(
+        strs(r#"blurb foo'bar'bar'fasel' baz"#),
+        ["blurb", "foobarbarfasel", "baz"]
+    );
+}
 #[test]
-fn py_empty_dq_mid() { assert_eq!(strs(r#"foo "" bar"#), ["foo", "", "bar"]); }
+fn py_empty_dq_mid() {
+    assert_eq!(strs(r#"foo "" bar"#), ["foo", "", "bar"]);
+}
 #[test]
-fn py_empty_sq_mid() { assert_eq!(strs("foo '' bar"), ["foo", "", "bar"]); }
+fn py_empty_sq_mid() {
+    assert_eq!(strs("foo '' bar"), ["foo", "", "bar"]);
+}
 #[test]
-fn py_triple_empty_dq() { assert_eq!(strs(r#"foo "" "" "" bar"#), ["foo", "", "", "", "bar"]); }
+fn py_triple_empty_dq() {
+    assert_eq!(strs(r#"foo "" "" "" bar"#), ["foo", "", "", "", "bar"]);
+}
 #[test]
-fn py_triple_empty_sq() { assert_eq!(strs("foo '' '' '' bar"), ["foo", "", "", "", "bar"]); }
+fn py_triple_empty_sq() {
+    assert_eq!(strs("foo '' '' '' bar"), ["foo", "", "", "", "bar"]);
+}
 #[test]
-fn py_bs_dq_unquoted() { assert_eq!(strs(r#"\""#), [r#"""#]); }
+fn py_bs_dq_unquoted() {
+    assert_eq!(strs(r#"\""#), [r#"""#]);
+}
 #[test]
-fn py_dq_bs_dq() { assert_eq!(strs(r#""\"""#), [r#"""#]); }
+fn py_dq_bs_dq() {
+    assert_eq!(strs(r#""\"""#), [r#"""#]);
+}
 #[test]
-fn py_dq_bs_space() { assert_eq!(strs(r#""foo\ bar""#), [r"foo\ bar"]); } // \<space> in dQ: both literal
+fn py_dq_bs_space() {
+    assert_eq!(strs(r#""foo\ bar""#), [r"foo\ bar"]);
+} // \<space> in dQ: both literal
 #[test]
-fn py_dq_bs_bs_space() { assert_eq!(strs(r#""foo\\ bar""#), [r"foo\ bar"]); } // \\ in dQ: consume one
+fn py_dq_bs_bs_space() {
+    assert_eq!(strs(r#""foo\\ bar""#), [r"foo\ bar"]);
+} // \\ in dQ: consume one
 #[test]
-fn py_dq_bs_bs_space_bs_dq() { assert_eq!(strs(r#""foo\\ bar\"""#), [r#"foo\ bar""#]); }
+fn py_dq_bs_bs_space_bs_dq() {
+    assert_eq!(strs(r#""foo\\ bar\"""#), [r#"foo\ bar""#]);
+}
 #[test]
-fn py_dq_bs_bs_close_bs_dq() { assert_eq!(strs(r#""foo\\" bar\""#), [r"foo\", r#"bar""#]); }
+fn py_dq_bs_bs_close_bs_dq() {
+    assert_eq!(strs(r#""foo\\" bar\""#), [r"foo\", r#"bar""#]);
+}
 #[test]
-fn py_dq_multi() { assert_eq!(strs(r#""foo\\ bar\" dfadf""#), [r#"foo\ bar" dfadf"#]); }
+fn py_dq_multi() {
+    assert_eq!(strs(r#""foo\\ bar\" dfadf""#), [r#"foo\ bar" dfadf"#]);
+}
 #[test]
-fn py_dq_multi_triple_bs() { assert_eq!(strs(r#""foo\\\ bar\" dfadf""#), [r#"foo\\ bar" dfadf"#]); }
+fn py_dq_multi_triple_bs() {
+    assert_eq!(strs(r#""foo\\\ bar\" dfadf""#), [r#"foo\\ bar" dfadf"#]);
+}
 #[test]
-fn py_dq_multi_triple_bs_x() { assert_eq!(strs(r#""foo\\\x bar\" dfadf""#), [r#"foo\\x bar" dfadf"#]); }
+fn py_dq_multi_triple_bs_x() {
+    assert_eq!(strs(r#""foo\\\x bar\" dfadf""#), [r#"foo\\x bar" dfadf"#]);
+}
 #[test]
-fn py_dq_bs_x_mid() { assert_eq!(strs(r#""foo\x bar\" dfadf""#), [r#"foo\x bar" dfadf"#]); }
+fn py_dq_bs_x_mid() {
+    assert_eq!(strs(r#""foo\x bar\" dfadf""#), [r#"foo\x bar" dfadf"#]);
+}
 #[test]
-fn py_bs_sq_unquoted() { assert_eq!(strs(r"\'"), ["'"]); }
+fn py_bs_sq_unquoted() {
+    assert_eq!(strs(r"\'"), ["'"]);
+}
 #[test]
-fn py_sq_bs_space() { assert_eq!(strs(r"'foo\ bar'"), [r"foo\ bar"]); }
+fn py_sq_bs_space() {
+    assert_eq!(strs(r"'foo\ bar'"), [r"foo\ bar"]);
+}
 #[test]
-fn py_sq_bs_bs_space() { assert_eq!(strs(r"'foo\\ bar'"), [r"foo\\ bar"]); }
+fn py_sq_bs_bs_space() {
+    assert_eq!(strs(r"'foo\\ bar'"), [r"foo\\ bar"]);
+}
 #[test]
-fn py_mixed_hard() { assert_eq!(strs(r#""foo\\\x bar\" df'a\ 'df""#), [r#"foo\\x bar" df'a\ 'df"#]); }
+fn py_mixed_hard() {
+    assert_eq!(strs(r#""foo\\\x bar\" df'a\ 'df""#), [r#"foo\\x bar" df'a\ 'df"#]);
+}
 #[test]
-fn py_bs_dq_foo() { assert_eq!(strs(r#"\"foo"#), [r#""foo"#]); }
+fn py_bs_dq_foo() {
+    assert_eq!(strs(r#"\"foo"#), [r#""foo"#]);
+}
 #[test]
-fn py_bs_dq_foo_bs_x() { assert_eq!(strs(r#"\"foo\x"#), [r#""foox"#]); }
+fn py_bs_dq_foo_bs_x() {
+    assert_eq!(strs(r#"\"foo\x"#), [r#""foox"#]);
+}
 #[test]
-fn py_dq_bs_x() { assert_eq!(strs(r#""foo\x""#), [r"foo\x"]); }
+fn py_dq_bs_x() {
+    assert_eq!(strs(r#""foo\x""#), [r"foo\x"]);
+}
 #[test]
-fn py_dq_bs_trailing_space() { assert_eq!(strs(r#""foo\ ""#), [r"foo\ "]); }
+fn py_dq_bs_trailing_space() {
+    assert_eq!(strs(r#""foo\ ""#), [r"foo\ "]);
+}
 #[test]
-fn py_bs_space_mid_word() { assert_eq!(strs(r"foo\ xx"), ["foo xx"]); }
+fn py_bs_space_mid_word() {
+    assert_eq!(strs(r"foo\ xx"), ["foo xx"]);
+}
 #[test]
-fn py_bs_space_bs_x() { assert_eq!(strs(r"foo\ x\x"), ["foo xx"]); }
+fn py_bs_space_bs_x() {
+    assert_eq!(strs(r"foo\ x\x"), ["foo xx"]);
+}
 #[test]
-fn py_bs_space_bs_x_bs_dq() { assert_eq!(strs(r#"foo\ x\x\""#), [r#"foo xx""#]); }
+fn py_bs_space_bs_x_bs_dq() {
+    assert_eq!(strs(r#"foo\ x\x\""#), [r#"foo xx""#]);
+}
 #[test]
-fn py_dq_bs_space_bs_x() { assert_eq!(strs(r#""foo\ x\x""#), [r"foo\ x\x"]); }
+fn py_dq_bs_space_bs_x() {
+    assert_eq!(strs(r#""foo\ x\x""#), [r"foo\ x\x"]);
+}
 #[test]
-fn py_dq_bs_space_bs_x_bs_bs() { assert_eq!(strs(r#""foo\ x\x\\""#), [r"foo\ x\x\"]); }
+fn py_dq_bs_space_bs_x_bs_bs() {
+    assert_eq!(strs(r#""foo\ x\x\\""#), [r"foo\ x\x\"]);
+}
 #[test]
-fn py_dq_mix_adjacent() { assert_eq!(strs(r#""foo\ x\x\\""foobar""#), [r"foo\ x\x\foobar"]); }
+fn py_dq_mix_adjacent() {
+    assert_eq!(strs(r#""foo\ x\x\\""foobar""#), [r"foo\ x\x\foobar"]);
+}
 #[test]
-fn py_dq_mix_adjacent_bs_sq() { assert_eq!(strs(r#""foo\ x\x\\"\'"foobar""#), [r"foo\ x\x\'foobar"]); }
+fn py_dq_mix_adjacent_bs_sq() {
+    assert_eq!(strs(r#""foo\ x\x\\"\'"foobar""#), [r"foo\ x\x\'foobar"]);
+}
 #[test]
-fn py_dq_mix_adjacent_bs_sq_embedded_sq() { assert_eq!(strs(r#""foo\ x\x\\"\'"fo'obar""#), [r"foo\ x\x\'fo'obar"]); }
+fn py_dq_mix_adjacent_bs_sq_embedded_sq() {
+    assert_eq!(strs(r#""foo\ x\x\\"\'"fo'obar""#), [r"foo\ x\x\'fo'obar"]);
+}
 #[test]
 fn py_dq_adjacent_with_sq_dont() {
-    assert_eq!(strs(r#""foo\ x\x\\"\'"fo'obar" 'don'\''t'"#), [r"foo\ x\x\'fo'obar", "don't"]);
+    assert_eq!(
+        strs(r#""foo\ x\x\\"\'"fo'obar" 'don'\''t'"#),
+        [r"foo\ x\x\'fo'obar", "don't"]
+    );
 }
 #[test]
 fn py_dq_adjacent_trailing_bs_bs() {
-    assert_eq!(strs(r#""foo\ x\x\\"\'"fo'obar" 'don'\''t' \\"#), [r"foo\ x\x\'fo'obar", "don't", r"\"]);
+    assert_eq!(
+        strs(r#""foo\ x\x\\"\'"fo'obar" 'don'\''t' \\"#),
+        [r"foo\ x\x\'fo'obar", "don't", r"\"]
+    );
 }
 #[test]
-fn py_literal_faces() { assert_eq!(strs(":-) ;-)"), [":-)", ";-)"]); }
+fn py_literal_faces() {
+    assert_eq!(strs(":-) ;-)"), [":-)", ";-)"]);
+}
 #[test]
-fn py_unicode() { assert_eq!(strs("áéíóú"), ["áéíóú"]); }
+fn py_unicode() {
+    assert_eq!(strs("áéíóú"), ["áéíóú"]);
+}
 
 // (B) Python-is-wrong per POSIX: strict POSIX consumes the backslash before $, `, and <LF>
 // inside "...". Python preserves it. We follow POSIX.
 
 #[test]
-fn dq_escaped_dollar() { assert_eq!(strs(r#""\$""#), ["$"]); }
+fn dq_escaped_dollar() {
+    assert_eq!(strs(r#""\$""#), ["$"]);
+}
 #[test]
-fn dq_escaped_backtick() { assert_eq!(strs("\"\\\x60\""), ["`"]); }
+fn dq_escaped_backtick() {
+    assert_eq!(strs("\"\\\x60\""), ["`"]);
+}
 #[test]
-fn dq_line_cont() { assert_eq!(strs("\"foo\\\nbar\""), ["foobar"]); }
+fn dq_line_cont() {
+    assert_eq!(strs("\"foo\\\nbar\""), ["foobar"]);
+}
 
 // (C) Python agrees with POSIX on these.
 
 #[test]
-fn dq_escaped_quote() { assert_eq!(strs(r#""\"""#), [r#"""#]); }
+fn dq_escaped_quote() {
+    assert_eq!(strs(r#""\"""#), [r#"""#]);
+}
 #[test]
-fn dq_escaped_backslash() { assert_eq!(strs(r#""\\""#), [r"\"]); }
+fn dq_escaped_backslash() {
+    assert_eq!(strs(r#""\\""#), [r"\"]);
+}
 #[test]
-fn dq_non_special() { assert_eq!(strs(r#""\P""#), [r"\P"]); }
+fn dq_non_special() {
+    assert_eq!(strs(r#""\P""#), [r"\P"]);
+}
 
 // (D) Windows path matrix.
 
 #[test]
-fn win_quoted_single_bs() { assert_eq!(strs(r#""C:\Projects\qodana-cli""#), [r"C:\Projects\qodana-cli"]); }
+fn win_quoted_single_bs() {
+    assert_eq!(strs(r#""C:\Projects\qodana-cli""#), [r"C:\Projects\qodana-cli"]);
+}
 #[test]
-fn win_quoted_double_bs() { assert_eq!(strs(r#""C:\\Projects\\qodana-cli""#), [r"C:\Projects\qodana-cli"]); }
+fn win_quoted_double_bs() {
+    assert_eq!(strs(r#""C:\\Projects\\qodana-cli""#), [r"C:\Projects\qodana-cli"]);
+}
 #[test]
-fn win_forward_slash() { assert_eq!(strs("C:/Projects/qodana-cli"), ["C:/Projects/qodana-cli"]); }
+fn win_forward_slash() {
+    assert_eq!(strs("C:/Projects/qodana-cli"), ["C:/Projects/qodana-cli"]);
+}
 #[test]
-fn win_unquoted_bs_consumed() { assert_eq!(strs(r"C:\Projects\qodana-cli"), ["C:Projectsqodana-cli"]); }
+fn win_unquoted_bs_consumed() {
+    assert_eq!(strs(r"C:\Projects\qodana-cli"), ["C:Projectsqodana-cli"]);
+}
 #[test]
-fn win_include_dir() { assert_eq!(strs(r#"-I"C:\Projects\qodana-cli""#), [r"-IC:\Projects\qodana-cli"]); }
+fn win_include_dir() {
+    assert_eq!(strs(r#"-I"C:\Projects\qodana-cli""#), [r"-IC:\Projects\qodana-cli"]);
+}
 #[test]
 fn win_program_files_plus_arg() {
     assert_eq!(
@@ -184,109 +326,201 @@ fn win_post_json_quoted() {
 // (E) Adjacent quoting / empty-token concatenation.
 
 #[test]
-fn dq_adjacent() { assert_eq!(strs(r#""a""b""#), ["ab"]); }
+fn dq_adjacent() {
+    assert_eq!(strs(r#""a""b""#), ["ab"]);
+}
 #[test]
-fn sq_adjacent() { assert_eq!(strs("'a''b'"), ["ab"]); }
+fn sq_adjacent() {
+    assert_eq!(strs("'a''b'"), ["ab"]);
+}
 #[test]
-fn dq_then_sq() { assert_eq!(strs(r#""a"'b'"#), ["ab"]); }
+fn dq_then_sq() {
+    assert_eq!(strs(r#""a"'b'"#), ["ab"]);
+}
 #[test]
-fn sq_then_dq() { assert_eq!(strs(r#"'a'"b""#), ["ab"]); }
+fn sq_then_dq() {
+    assert_eq!(strs(r#"'a'"b""#), ["ab"]);
+}
 #[test]
-fn word_dq_word() { assert_eq!(strs(r#"a"b"c"#), ["abc"]); }
+fn word_dq_word() {
+    assert_eq!(strs(r#"a"b"c"#), ["abc"]);
+}
 #[test]
-fn dq_word_dq() { assert_eq!(strs(r#""a"b"c""#), ["abc"]); }
+fn dq_word_dq() {
+    assert_eq!(strs(r#""a"b"c""#), ["abc"]);
+}
 #[test]
-fn foo_empty_dq() { assert_eq!(strs(r#"foo"""#), ["foo"]); }
+fn foo_empty_dq() {
+    assert_eq!(strs(r#"foo"""#), ["foo"]);
+}
 #[test]
-fn empty_dq_foo() { assert_eq!(strs(r#"""foo"#), ["foo"]); }
+fn empty_dq_foo() {
+    assert_eq!(strs(r#"""foo"#), ["foo"]);
+}
 #[test]
-fn bare_empty_dq() { assert_eq!(strs(r#""""#), [""]); }
+fn bare_empty_dq() {
+    assert_eq!(strs(r#""""#), [""]);
+}
 #[test]
-fn two_adjacent_empty_dq() { assert_eq!(strs("\"\"\"\""), [""]); }
+fn two_adjacent_empty_dq() {
+    assert_eq!(strs("\"\"\"\""), [""]);
+}
 #[test]
-fn foo_dq_empty_dq_bar() { assert_eq!(strs(r#"foo "" bar"#), ["foo", "", "bar"]); }
+fn foo_dq_empty_dq_bar() {
+    assert_eq!(strs(r#"foo "" bar"#), ["foo", "", "bar"]);
+}
 #[test]
-fn foo_sq_empty_sq_bar() { assert_eq!(strs("foo '' '' bar"), ["foo", "", "", "bar"]); }
+fn foo_sq_empty_sq_bar() {
+    assert_eq!(strs("foo '' '' bar"), ["foo", "", "", "bar"]);
+}
 
 // (F) Whitespace — all blank inputs yield empty vec.
 
 #[test]
-fn ws_empty() { assert!(split(b"").unwrap().is_empty()); }
+fn ws_empty() {
+    assert!(split(b"").unwrap().is_empty());
+}
 #[test]
-fn ws_space() { assert!(split(b" ").unwrap().is_empty()); }
+fn ws_space() {
+    assert!(split(b" ").unwrap().is_empty());
+}
 #[test]
-fn ws_tab() { assert!(split(b"\t").unwrap().is_empty()); }
+fn ws_tab() {
+    assert!(split(b"\t").unwrap().is_empty());
+}
 #[test]
-fn ws_lf() { assert!(split(b"\n").unwrap().is_empty()); }
+fn ws_lf() {
+    assert!(split(b"\n").unwrap().is_empty());
+}
 #[test]
-fn ws_cr() { assert!(split(b"\r").unwrap().is_empty()); }
+fn ws_cr() {
+    assert!(split(b"\r").unwrap().is_empty());
+}
 #[test]
-fn ws_runs() { assert!(split(b"   ").unwrap().is_empty()); }
+fn ws_runs() {
+    assert!(split(b"   ").unwrap().is_empty());
+}
 #[test]
-fn ws_crlf() { assert!(split(b"\r\n").unwrap().is_empty()); }
+fn ws_crlf() {
+    assert!(split(b"\r\n").unwrap().is_empty());
+}
 #[test]
-fn ws_a_cr_b() { assert_eq!(strs("a\rb"), ["a", "b"]); }
+fn ws_a_cr_b() {
+    assert_eq!(strs("a\rb"), ["a", "b"]);
+}
 #[test]
-fn ws_a_crlf_b() { assert_eq!(strs("a\r\nb"), ["a", "b"]); }
+fn ws_a_crlf_b() {
+    assert_eq!(strs("a\r\nb"), ["a", "b"]);
+}
 #[test]
-fn ws_trailing_space() { assert_eq!(strs("a "), ["a"]); }
+fn ws_trailing_space() {
+    assert_eq!(strs("a "), ["a"]);
+}
 #[test]
-fn ws_double_space_mid() { assert_eq!(strs("a  b"), ["a", "b"]); }
+fn ws_double_space_mid() {
+    assert_eq!(strs("a  b"), ["a", "b"]);
+}
 #[test]
-fn ws_leading_and_trailing() { assert_eq!(strs(" a "), ["a"]); }
+fn ws_leading_and_trailing() {
+    assert_eq!(strs(" a "), ["a"]);
+}
 #[test]
-fn ws_all_types() { assert!(split(b" \t\n\r").unwrap().is_empty()); }
+fn ws_all_types() {
+    assert!(split(b" \t\n\r").unwrap().is_empty());
+}
 
 // (G) Literal special chars (documented deviations).
 
 #[test]
-fn hash_mid_word() { assert_eq!(strs("foo#bar"), ["foo#bar"]); }
+fn hash_mid_word() {
+    assert_eq!(strs("foo#bar"), ["foo#bar"]);
+}
 #[test]
-fn hash_at_start() { assert_eq!(strs("#foo"), ["#foo"]); }
+fn hash_at_start() {
+    assert_eq!(strs("#foo"), ["#foo"]);
+}
 #[test]
-fn hash_as_separate_word() { assert_eq!(strs("a #b c"), ["a", "#b", "c"]); }
+fn hash_as_separate_word() {
+    assert_eq!(strs("a #b c"), ["a", "#b", "c"]);
+}
 #[test]
-fn cmd_subst() { assert_eq!(strs("$(rm -rf /)"), ["$(rm", "-rf", "/)", ]); }
+fn cmd_subst() {
+    assert_eq!(strs("$(rm -rf /)"), ["$(rm", "-rf", "/)",]);
+}
 #[test]
-fn param_expansion() { assert_eq!(strs("${foo}"), ["${foo}"]); }
+fn param_expansion() {
+    assert_eq!(strs("${foo}"), ["${foo}"]);
+}
 #[test]
-fn backtick_subst() { assert_eq!(strs("`backtick`"), ["`backtick`"]); }
+fn backtick_subst() {
+    assert_eq!(strs("`backtick`"), ["`backtick`"]);
+}
 #[test]
-fn shell_operators_no_ws() { assert_eq!(strs("a&b;c|d"), ["a&b;c|d"]); }
+fn shell_operators_no_ws() {
+    assert_eq!(strs("a&b;c|d"), ["a&b;c|d"]);
+}
 #[test]
-fn double_pipe() { assert_eq!(strs("a || b"), ["a", "||", "b"]); }
+fn double_pipe() {
+    assert_eq!(strs("a || b"), ["a", "||", "b"]);
+}
 #[test]
-fn redirects_literal() { assert_eq!(strs("a >b <c"), ["a", ">b", "<c"]); }
+fn redirects_literal() {
+    assert_eq!(strs("a >b <c"), ["a", ">b", "<c"]);
+}
 
 // (I) Line continuation — LF, CRLF, and bare CR (NOT line continuation).
 
 #[test]
-fn lf_unquoted_mid_word() { assert_eq!(strs("foo\\\nbar"), ["foobar"]); }
+fn lf_unquoted_mid_word() {
+    assert_eq!(strs("foo\\\nbar"), ["foobar"]);
+}
 #[test]
-fn lf_inside_dq() { assert_eq!(strs("\"foo\\\nbar\""), ["foobar"]); }
+fn lf_inside_dq() {
+    assert_eq!(strs("\"foo\\\nbar\""), ["foobar"]);
+}
 #[test]
-fn lf_at_start_only() { assert!(split(b"\\\n").unwrap().is_empty()); }
+fn lf_at_start_only() {
+    assert!(split(b"\\\n").unwrap().is_empty());
+}
 #[test]
-fn lf_split_mid() { assert_eq!(strs("a\\\nb c"), ["ab", "c"]); }
+fn lf_split_mid() {
+    assert_eq!(strs("a\\\nb c"), ["ab", "c"]);
+}
 #[test]
-fn crlf_unquoted() { assert_eq!(strs("foo\\\r\nbar"), ["foobar"]); }
+fn crlf_unquoted() {
+    assert_eq!(strs("foo\\\r\nbar"), ["foobar"]);
+}
 #[test]
-fn bare_cr_unquoted_literal() { assert_eq!(s("foo\\\rbar"), [b"foo\rbar".to_vec()]); }
+fn bare_cr_unquoted_literal() {
+    assert_eq!(s("foo\\\rbar"), [b"foo\rbar".to_vec()]);
+}
 #[test]
-fn crlf_inside_dq() { assert_eq!(strs("\"a\\\r\nb\""), ["ab"]); }
+fn crlf_inside_dq() {
+    assert_eq!(strs("\"a\\\r\nb\""), ["ab"]);
+}
 #[test]
-fn bare_cr_inside_dq_preserved() { assert_eq!(s("\"a\\\rb\""), [b"a\\\rb".to_vec()]); }
+fn bare_cr_inside_dq_preserved() {
+    assert_eq!(s("\"a\\\rb\""), [b"a\\\rb".to_vec()]);
+}
 
 // (S) UTF-8 pass-through.
 
 #[test]
-fn unicode_two_words() { assert_eq!(strs("héllo 世界"), ["héllo", "世界"]); }
+fn unicode_two_words() {
+    assert_eq!(strs("héllo 世界"), ["héllo", "世界"]);
+}
 #[test]
-fn unicode_inside_dq() { assert_eq!(strs("\"café au lait\""), ["café au lait"]); }
+fn unicode_inside_dq() {
+    assert_eq!(strs("\"café au lait\""), ["café au lait"]);
+}
 #[test]
-fn unicode_after_bs_unquoted() { assert_eq!(strs("\\é"), ["é"]); }
+fn unicode_after_bs_unquoted() {
+    assert_eq!(strs("\\é"), ["é"]);
+}
 #[test]
-fn unicode_after_bs_in_dq() { assert_eq!(strs("\"\\é\""), ["\\é"]); }
+fn unicode_after_bs_in_dq() {
+    assert_eq!(strs("\"\\é\""), ["\\é"]);
+}
 
 // (H) Non-ASCII bytes / NUL pass-through (byte-level, not string-level).
 
@@ -391,7 +625,7 @@ fn join_separates_with_single_space() {
 fn split_join_round_trips() {
     let cases: Vec<Vec<&[u8]>> = vec![
         vec![b"echo", b"hello world"],
-        vec![b"a", b"", b"c"],          // empty element
+        vec![b"a", b"", b"c"], // empty element
         vec![br"weird $`\ chars", b"'q'"],
         vec![b"a\nb", b"\ttab"],
         vec![b"\x00\xff", b"non-utf8"], // arbitrary bytes
@@ -651,18 +885,16 @@ fn split_never_panics_and_pos_in_bounds_exhaustive() {
     }
 
     for max_len in 0usize..=4 {
-        enumerate(max_len, &mut |input: &[u8]| {
-            match split(input) {
-                Ok(_) => {}
-                Err(e) => {
-                    assert!(
-                        e.pos <= input.len(),
-                        "split error pos {} out of bounds for input of len {}; input={:?}",
-                        e.pos,
-                        input.len(),
-                        input
-                    );
-                }
+        enumerate(max_len, &mut |input: &[u8]| match split(input) {
+            Ok(_) => {}
+            Err(e) => {
+                assert!(
+                    e.pos <= input.len(),
+                    "split error pos {} out of bounds for input of len {}; input={:?}",
+                    e.pos,
+                    input.len(),
+                    input
+                );
             }
         });
     }

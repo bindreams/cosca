@@ -1,0 +1,57 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+
+exclude = "^target/"
+default_install_hook_types = ["pre-commit", "commit-msg"]
+
+# Local hooks ==========================================================================================================
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+entry = "cargo clippy --all-targets --locked -- -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+# External hooks =======================================================================================================
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v5.0.0"
+hooks = [
+  { id = "check-executables-have-shebangs" },
+  # Rust inner attributes start with `#![...]`, which the shebang detector
+  # mistakes for `#!/...`. Exclude .rs.
+  { id = "check-shebang-scripts-are-executable", exclude_types = ["rust"] },
+  { id = "mixed-line-ending", args = ["--fix=lf"] },
+]
+
+[[repos]]
+repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
+rev = "3.2.1"
+hooks = [
+  # Rust gets `cargo fmt`; markdown gets prettier; both have stronger opinions
+  # than .editorconfig and conflict on trailing whitespace, so exclude them.
+  { id = "editorconfig-checker", exclude_types = ["rust", "markdown"] },
+]
+
+[[repos]]
+# Prettier (rather than mdformat) so trailing-two-space line breaks are preserved.
+repo = "https://github.com/rbubley/mirrors-prettier"
+rev = "v3.8.2"
+hooks = [
+  { id = "prettier", types = ["markdown"] },
+]

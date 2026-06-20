@@ -1,0 +1,44 @@
+name: Set up Rust build environment
+description: Installs stable Rust, caches the cargo registry, and configures sccache.
+inputs:
+  components:
+    description: "Extra rustup components (e.g. 'clippy, rustfmt')"
+    required: false
+    default: ""
+  targets:
+    description: "Rust target triple(s)"
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      id: rust-toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+
+    - name: Configure sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Enable sccache for cargo
+      shell: bash
+      run: |
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+    - name: Log toolchain versions
+      shell: bash
+      run: |
+        rustc --version
+        cargo --version

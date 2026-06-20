@@ -11,7 +11,10 @@ fn public_surface_is_usable() {
     assert_eq!(posix::split(&line).unwrap(), vec![b"echo".to_vec(), b"a b".to_vec()]);
 
     // POSIX error surfaced publicly.
-    assert_eq!(posix::split(b"x\\").unwrap_err().kind, QuoteErrorKind::TrailingBackslash);
+    assert_eq!(
+        posix::split(b"x\\").unwrap_err().kind,
+        QuoteErrorKind::TrailingBackslash
+    );
 
     // Windows join + first-token via the public path.
     let wides: Vec<Vec<u16>> = ["a b", "c"].iter().map(|s| s.encode_utf16().collect()).collect();
