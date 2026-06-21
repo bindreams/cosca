@@ -5,6 +5,7 @@
 //! the foundation plan task-by-task.
 
 pub mod error;
+pub mod identity;
 pub mod quote;
 
 mod command;

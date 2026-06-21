@@ -10,6 +10,12 @@ publish = false           # working name; not yet published
 [dependencies]
 thiserror = "2"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 

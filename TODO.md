@@ -19,6 +19,10 @@ Design spec: `.tmp/claude/superpowers/specs/2026-06-20-subprocess-design.md`.
 
 - [ ] Full psutil-style system-wide enumeration: `process_iter()`, system-wide `parent()`/`children()`, cached `(pid,start_token)` registry, `oneshot` snapshot batching, `wait_procs(timeout)->(gone,alive)`.
 
+## Identity (follow-ups from Plan 2)
+
+- [ ] Add a `cfg(unix)` real-zombie integration test asserting `is_alive()==false` for an un-reaped exited child (exercises Linux `/proc` state `Z` and macOS `pbi_status==SZOMB` at RUNTIME). Needs Plan 6's foreign-wait primitive to deterministically observe a zombie without reaping. Decision logic is already host-tested on Linux via `running_from_stat`; macOS is a single `!= SZOMB`.
+
 ## Stdio / PTY
 
 - [ ] Full PTY wiring behind `pty` feature (`portable-pty`): ConPTY drain quirks (never-EOF until close, single-threaded close deadlock, output VT/CSI/OSC scrubbing, input-pipe write-end lifetime), mixed stdout/stderr-PTY via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. (`Stdio::pty()` variant exists in v1.)
