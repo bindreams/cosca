@@ -31,6 +31,13 @@ pub enum Error {
     Quote(#[from] QuoteError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// An operation isn't available on this platform / in this build.
+    #[error("{op} is not supported on {platform}: {detail}")]
+    Unsupported {
+        op: String,
+        platform: &'static str,
+        detail: String,
+    },
 }
 
 #[cfg(test)]

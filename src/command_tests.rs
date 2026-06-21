@@ -1,4 +1,6 @@
 use crate::command::{Command, CommandInput};
+use crate::stdio::{Direction, ResolvedStdio, Stdio};
+use crate::Fd;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -60,4 +62,113 @@ fn executable_overrides_load_path_independently_of_argv() {
     cmd.executable("/bin/busybox").args(["sh", "-c", "echo hi"]);
     assert_eq!(cmd.executable_path(), Some(Path::new("/bin/busybox")));
     assert_eq!(argv(&cmd), ["sh", "-c", "echo hi"]);
+}
+
+#[test]
+fn stdout_shorthand_records_resolved_pipe_out() {
+    let mut cmd = Command::new();
+    cmd.args(["x"]);
+    cmd.stdout(Stdio::pipe()).unwrap();
+    let fds = cmd.fds();
+    assert!(matches!(
+        fds.get(&Fd::STDOUT),
+        Some(ResolvedStdio::Pipe(Direction::Out))
+    ));
+}
+
+#[test]
+fn stdin_pipe_infers_in() {
+    let mut cmd = Command::new();
+    cmd.stdin(Stdio::pipe()).unwrap();
+    assert!(matches!(
+        cmd.fds().get(&Fd::STDIN),
+        Some(ResolvedStdio::Pipe(Direction::In))
+    ));
+}
+
+#[test]
+fn bare_pipe_on_fd3_errs_at_attach() {
+    let mut cmd = Command::new();
+    assert!(cmd.fd(3, Stdio::pipe()).is_err());
+}
+
+#[test]
+fn explicit_pipe_out_on_fd3_attaches() {
+    let mut cmd = Command::new();
+    cmd.fd(3, Stdio::pipe_out()).unwrap();
+    assert!(matches!(
+        cmd.fds().get(&Fd::from(3)),
+        Some(ResolvedStdio::Pipe(Direction::Out))
+    ));
+}
+
+#[test]
+fn kill_on_drop_defaults_true_and_toggles() {
+    let mut cmd = Command::new();
+    assert!(cmd.kill_on_drop_flag());
+    cmd.kill_on_drop(false);
+    assert!(!cmd.kill_on_drop_flag());
+}
+
+#[test]
+fn fd_last_set_wins_for_same_slot() {
+    let mut cmd = Command::new();
+    cmd.stdout(Stdio::pipe()).unwrap();
+    cmd.stdout(Stdio::null()).unwrap();
+    assert!(matches!(cmd.fds().get(&Fd::STDOUT), Some(ResolvedStdio::Null)));
+}
+
+#[test]
+fn inherit_resolves_through_builder() {
+    let mut cmd = Command::new();
+    cmd.stderr(Stdio::inherit()).unwrap();
+    assert!(matches!(cmd.fds().get(&Fd::STDERR), Some(ResolvedStdio::Inherit)));
+}
+
+#[test]
+fn null_resolves_through_builder() {
+    let mut cmd = Command::new();
+    cmd.stdin(Stdio::null()).unwrap();
+    assert!(matches!(cmd.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
+}
+
+#[test]
+fn merge_resolves_through_builder() {
+    let mut cmd = Command::new();
+    cmd.stderr(Stdio::merge(Fd::STDOUT)).unwrap();
+    assert!(matches!(
+        cmd.fds().get(&Fd::STDERR),
+        Some(ResolvedStdio::Merge(Fd::STDOUT))
+    ));
+}
+
+#[test]
+fn env_ops_recorded_in_order() {
+    use crate::command::EnvOp;
+    let mut cmd = Command::new();
+    cmd.env_clear();
+    cmd.env("A", "1");
+    cmd.env_remove("B");
+    cmd.envs([("C", "3"), ("D", "4")]);
+    let ops = cmd.env_ops();
+    assert!(matches!(ops[0], EnvOp::Clear));
+    assert!(matches!(&ops[1], EnvOp::Set(k, v) if k == "A" && v == "1"));
+    assert!(matches!(&ops[2], EnvOp::Remove(k) if k == "B"));
+    assert!(matches!(&ops[3], EnvOp::Set(k, v) if k == "C" && v == "3"));
+    assert!(matches!(&ops[4], EnvOp::Set(k, v) if k == "D" && v == "4"));
+    assert_eq!(ops.len(), 5);
+}
+
+#[test]
+fn envs_empty_iterator_records_nothing() {
+    let mut cmd = Command::new();
+    cmd.envs::<_, &str, &str>([]);
+    assert!(cmd.env_ops().is_empty());
+}
+
+#[test]
+fn cwd_recorded() {
+    let mut cmd = Command::new();
+    cmd.current_dir("/tmp");
+    assert_eq!(cmd.cwd(), Some(Path::new("/tmp")));
 }

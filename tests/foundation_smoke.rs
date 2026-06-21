@@ -29,3 +29,17 @@ fn public_surface_is_usable() {
     cmd.args(["ls", "-la"]);
     let _ = cmd; // input model exercised in unit tests
 }
+
+#[test]
+fn spawn_public_surface_is_usable() {
+    use subprocess::{run, Stdio};
+    // run([...]) -> output() captures; status code reachable.
+    let out = run([env!("CARGO_BIN_EXE_subprocess_testbin"), "echo-argv", "hi"])
+        .output()
+        .expect("output");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"hi\n");
+    // The Stdio constructors are reachable from the crate root.
+    let _ = Stdio::pipe();
+    let _ = Stdio::null();
+}

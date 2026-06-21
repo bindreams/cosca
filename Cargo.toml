@@ -7,14 +7,24 @@ description = "Unified cross-platform subprocess management: spawning, stdio, pr
 license = "Apache-2.0"
 publish = false           # working name; not yet published
 
+[features]
+pty = []
+
 [dependencies]
 thiserror = "2"
+shared_child = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[bin]]
+name = "subprocess_testbin"
+path = "testbin/main.rs"
+test = false
+doc = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

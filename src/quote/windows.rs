@@ -59,6 +59,41 @@ fn append_arg(cmd: &mut Vec<u16>, arg: &[u16]) {
     }
 }
 
+/// Like [`first_token_wide`], but also returns the remainder of the command
+/// line AFTER the first token (with the separating whitespace consumed). Used
+/// to feed `raw_arg` the args-only portion (std prepends the program itself).
+/// Returns `None` only for empty/whitespace-only input.
+pub fn first_token_and_rest_wide(cmd: &[u16]) -> Option<(Vec<u16>, Vec<u16>)> {
+    let mut i = 0usize;
+    while i < cmd.len() && (cmd[i] == SPACE || cmd[i] == TAB) {
+        i += 1;
+    }
+    if i >= cmd.len() {
+        return None;
+    }
+    let mut first = Vec::new();
+    if cmd[i] == QUOTE {
+        i += 1;
+        while i < cmd.len() && cmd[i] != QUOTE {
+            first.push(cmd[i]);
+            i += 1;
+        }
+        if i < cmd.len() {
+            i += 1; // consume the closing quote
+        }
+    } else {
+        while i < cmd.len() && cmd[i] != SPACE && cmd[i] != TAB {
+            first.push(cmd[i]);
+            i += 1;
+        }
+    }
+    // Skip the whitespace separating the first token from the rest.
+    while i < cmd.len() && (cmd[i] == SPACE || cmd[i] == TAB) {
+        i += 1;
+    }
+    Some((first, cmd[i..].to_vec()))
+}
+
 /// Extract the program token (argv[0]) from a command line, for deriving
 /// `lpApplicationName` from a user-supplied `commandline`.
 ///
@@ -71,27 +106,7 @@ fn append_arg(cmd: &mut Vec<u16>, arg: &[u16]) {
 /// unterminated); an unquoted token runs to the next space/tab; backslashes
 /// are literal here (no escaping).
 pub fn first_token_wide(cmd: &[u16]) -> Option<Vec<u16>> {
-    let mut i = 0usize;
-    while i < cmd.len() && (cmd[i] == SPACE || cmd[i] == TAB) {
-        i += 1;
-    }
-    if i >= cmd.len() {
-        return None;
-    }
-    let mut out = Vec::new();
-    if cmd[i] == QUOTE {
-        i += 1;
-        while i < cmd.len() && cmd[i] != QUOTE {
-            out.push(cmd[i]);
-            i += 1;
-        }
-    } else {
-        while i < cmd.len() && cmd[i] != SPACE && cmd[i] != TAB {
-            out.push(cmd[i]);
-            i += 1;
-        }
-    }
-    Some(out)
+    first_token_and_rest_wide(cmd).map(|(first, _)| first)
 }
 
 #[cfg(test)]

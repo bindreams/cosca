@@ -21,3 +21,16 @@ fn error_wraps_quote_error_via_from() {
     assert!(matches!(e, Error::Quote(_)));
     assert!(e.to_string().contains("trailing backslash"));
 }
+
+#[test]
+fn unsupported_displays_op_platform_and_detail() {
+    let e = Error::Unsupported {
+        op: "fd 3".into(),
+        platform: "windows",
+        detail: "arbitrary fds require the raw backend (Plan 4)".into(),
+    };
+    let s = e.to_string();
+    assert!(s.contains("fd 3"), "{s}");
+    assert!(s.contains("windows"), "{s}");
+    assert!(s.contains("raw backend"), "{s}");
+}

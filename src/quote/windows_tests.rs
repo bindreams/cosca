@@ -1,4 +1,4 @@
-use crate::quote::windows::join_wide;
+use crate::quote::windows::{first_token_and_rest_wide, first_token_wide, join_wide};
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
@@ -158,10 +158,38 @@ mod roundtrip {
     }
 }
 
-use crate::quote::windows::first_token_wide;
-
 fn first(s: &str) -> Option<String> {
     first_token_wide(&w(s)).map(|t| String::from_utf16(&t).unwrap())
+}
+
+fn split_first(s: &str) -> Option<(String, String)> {
+    first_token_and_rest_wide(&w(s)).map(|(a, b)| (String::from_utf16(&a).unwrap(), String::from_utf16(&b).unwrap()))
+}
+
+#[test]
+fn first_token_and_rest_splits_unquoted() {
+    assert_eq!(
+        split_first("git status --short"),
+        Some(("git".into(), "status --short".into()))
+    );
+}
+
+#[test]
+fn first_token_and_rest_splits_quoted_program_with_spaces() {
+    assert_eq!(
+        split_first("\"C:\\Program Files\\app.exe\" --flag x"),
+        Some(("C:\\Program Files\\app.exe".into(), "--flag x".into()))
+    );
+}
+
+#[test]
+fn first_token_and_rest_empty_rest() {
+    assert_eq!(split_first("solo"), Some(("solo".into(), "".into())));
+}
+
+#[test]
+fn first_token_and_rest_none_for_blank() {
+    assert_eq!(split_first("   "), None);
 }
 
 #[test]
