@@ -38,6 +38,9 @@ pub enum Error {
         platform: &'static str,
         detail: String,
     },
+    /// A containment mechanism could not be established or torn down.
+    #[error("process containment failed: {detail}")]
+    Containment { detail: String },
 }
 
 #[cfg(test)]

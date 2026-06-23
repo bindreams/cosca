@@ -24,6 +24,12 @@ pub(super) fn parse_state(stat: &[u8]) -> Option<u8> {
     tail(stat)?.split_whitespace().next()?.bytes().next()
 }
 
+/// Field 4 (`ppid`, index 1 of the tail) — the parent pid. Used by the
+/// containment tree-walk's `/proc` enumerator; comm-safe via the same anchor.
+pub(crate) fn parse_ppid(stat: &[u8]) -> Option<u32> {
+    tail(stat)?.split_whitespace().nth(1)?.parse::<u32>().ok()
+}
+
 /// Decide whether a process is *running* from its raw `/proc/<pid>/stat` bytes:
 /// the starttime token must match `start` (reject a reused PID) AND the state
 /// must not be zombie ('Z') or dead ('X'/'x'). Pure, so it is host-testable.

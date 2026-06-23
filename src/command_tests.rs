@@ -1,6 +1,7 @@
 use crate::command::{Command, CommandInput};
+use crate::containment::Nesting;
 use crate::stdio::{Direction, ResolvedStdio, Stdio};
-use crate::Fd;
+use crate::{ContainMode, Fd};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -171,4 +172,27 @@ fn cwd_recorded() {
     let mut cmd = Command::new();
     cmd.current_dir("/tmp");
     assert_eq!(cmd.cwd(), Some(Path::new("/tmp")));
+}
+
+#[test]
+fn contain_records_strongest_request() {
+    let mut cmd = Command::new();
+    cmd.contain();
+    let req = cmd.contain_request();
+    assert_eq!(req.mode, Some(ContainMode::Strongest));
+    assert_eq!(req.nesting, Nesting::Mark);
+}
+
+#[test]
+fn uncontained_by_default() {
+    assert_eq!(Command::new().contain_request().mode, None);
+}
+
+#[test]
+fn contain_with_and_nesting_recorded() {
+    let mut cmd = Command::new();
+    cmd.contain_with(ContainMode::TreeWalk).nesting(Nesting::Opaque);
+    let req = cmd.contain_request();
+    assert_eq!(req.mode, Some(ContainMode::TreeWalk));
+    assert_eq!(req.nesting, Nesting::Opaque);
 }

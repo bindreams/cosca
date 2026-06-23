@@ -12,7 +12,7 @@
 //! human-facing wall-clock lives in `created_at()` (Task 2), allowed to drift
 //! and never used for identity.
 
-mod stat_parse;
+pub(crate) mod stat_parse;
 
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]
@@ -56,11 +56,28 @@ impl ProcessId {
         self.pid
     }
 
+    /// The raw start token as a `u64`, for crate-internal ordering by creation
+    /// time (the containment tree-walk keeps only descendants created at-or-after
+    /// the root acquired its pid). Opaque outside identity ordering.
+    pub(crate) fn start_token_raw(&self) -> u64 {
+        self.start.raw()
+    }
+
     /// Resolve the live identity of `pid`, or `None` if no such process is
     /// currently resolvable.
     pub fn of(pid: RawPid) -> Option<ProcessId> {
         let start = backend::start_token(pid)?;
         Some(ProcessId { pid, start })
+    }
+
+    /// Test-only constructor from raw parts, so sibling modules can build
+    /// synthetic identities (with chosen pid/token) without a live process.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(pid: RawPid, token: u64) -> ProcessId {
+        ProcessId {
+            pid,
+            start: StartToken::from_raw(token),
+        }
     }
 
     /// This process's own identity.

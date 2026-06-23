@@ -25,7 +25,7 @@ fn bsd_info(pid: RawPid) -> Option<libc::proc_bsdinfo> {
 }
 
 fn token_of(info: &libc::proc_bsdinfo) -> StartToken {
-    StartToken::from_raw(info.pbi_start_tvsec as u64 * 1_000_000 + info.pbi_start_tvusec as u64)
+    StartToken::from_raw(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
 pub(super) fn start_token(pid: RawPid) -> Option<StartToken> {
@@ -40,7 +40,7 @@ pub(super) fn is_running(pid: RawPid, start: StartToken) -> bool {
         return false; // reused PID
     }
     // SZOMB == zombie (exited, unreaped). Anything else is a live process.
-    info.pbi_status != libc::SZOMB as u32
+    info.pbi_status != libc::SZOMB
 }
 
 pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {

@@ -3,6 +3,21 @@
 Deferred work, captured during design (2026-06-20). Converted to tickets at first push.
 Design spec: `.tmp/claude/superpowers/specs/2026-06-20-subprocess-design.md`.
 
+## CI provisioning required (cgroup v2 live test)
+
+The live cgroup v2 integration test (`linux_cgroup_v2_kill_tree_reaps_the_grandchild` in
+`tests/spawn_io.rs`) is gated behind `SUBPROCESS_TEST_CGROUP=1`. It is a no-op when the
+variable is absent, and FAILS loudly when the variable is set but a usable delegated
+cgroup v2 slice is unavailable.
+
+To run the live test in CI:
+
+- Provision a delegated cgroup v2 slice (e.g. run the job under a systemd user slice,
+  or with `--cgroupns private` + cgroup delegation). The process must be able to
+  `mkdir` under its own cgroup path.
+- Set `SUBPROCESS_TEST_CGROUP=1` in the CI environment for the Linux job.
+- Verify kernel ≥ 5.14 (for `cgroup.kill` support).
+
 ## Elevation (the headline differentiator — after core)
 
 - [ ] Elevate to Admin/root: declarative `Privilege` on the builder + pure `Host::plan(target) -> Transition` planner (cross-tested on all OS); per-OS effect layer rejects wrong-platform variants. Reuse hole `xtask/src/privilege` architecture; salvage stepstool's `prime_sudo` (TTY-gated), `preserve_env_arg`, `{SudoNotFound,AuthFailed,NoTty}` taxonomy.

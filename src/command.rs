@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::containment::{ContainMode, ContainRequest, Nesting};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio, Stdio};
 
@@ -20,6 +21,7 @@ pub struct Command {
     env_ops: Vec<EnvOp>,
     cwd: Option<PathBuf>,
     kill_on_drop: bool,
+    contain: ContainRequest,
 }
 
 /// An environment variable operation, recorded in order.
@@ -39,6 +41,7 @@ impl Default for Command {
             env_ops: Vec::new(),
             cwd: None,
             kill_on_drop: true,
+            contain: ContainRequest::default(),
         }
     }
 }
@@ -181,6 +184,30 @@ impl Command {
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self
+    }
+
+    /// Contain the child's whole process tree using the strongest mechanism
+    /// available, so dropping or `kill_tree`-ing the child tears down every
+    /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
+    pub fn contain(&mut self) -> &mut Command {
+        self.contain_with(ContainMode::Strongest)
+    }
+
+    /// Contain with a specific [`ContainMode`].
+    pub fn contain_with(&mut self, mode: ContainMode) -> &mut Command {
+        self.contain.mode = Some(mode);
+        self
+    }
+
+    /// Set how this contained spawn marks its descendants (default [`Nesting::Mark`]).
+    pub fn nesting(&mut self, nesting: Nesting) -> &mut Command {
+        self.contain.nesting = nesting;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn contain_request(&self) -> ContainRequest {
+        self.contain
     }
 
     // ---- crate-internal accessors for the spawn engine (Task 4) -------------

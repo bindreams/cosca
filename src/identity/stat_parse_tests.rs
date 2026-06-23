@@ -1,5 +1,5 @@
 use super::super::StartToken;
-use super::{parse_starttime_jiffies, parse_state, running_from_stat};
+use super::{parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat};
 
 fn tok(v: u64) -> StartToken {
     StartToken::from_raw(v)
@@ -20,6 +20,26 @@ fn handles_comm_containing_parens_and_spaces() {
     let stat = b"7 (a) b) R 0 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 55 0 0";
     assert_eq!(parse_starttime_jiffies(stat), Some(55));
     assert_eq!(parse_state(stat), Some(b'R'));
+}
+
+// ppid is field 4 (index 1 of the post-comm tail). Comm-safe via the LAST ')'.
+#[test]
+fn parses_ppid_simple() {
+    let stat = b"1234 (my proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 8675309 0 0";
+    assert_eq!(parse_ppid(stat), Some(1));
+}
+
+#[test]
+fn parses_ppid_with_comm_containing_parens_and_spaces() {
+    // comm = "a) b" — embedded ')' and space; ppid (field 4) must still be 7.
+    let stat = b"9 (a) b) R 7 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 55 0 0";
+    assert_eq!(parse_ppid(stat), Some(7));
+}
+
+#[test]
+fn ppid_rejects_truncated_stat() {
+    let stat = b"1 (init) S"; // no ppid token after the state
+    assert_eq!(parse_ppid(stat), None);
 }
 
 #[test]

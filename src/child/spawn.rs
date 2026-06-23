@@ -22,7 +22,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // Reject what the std-only backend cannot express in this plan.
+    // On Windows, fd >= 3 is unsupported in this plan (no MSVCRT fd-table wiring).
+    // On Unix, arbitrary fds are handled below via command-fds.
+    #[cfg(windows)]
     for slot in fds.keys() {
         if slot.raw() >= 3 {
             return Err(Error::Unsupported {
@@ -35,8 +37,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // Reject merge-targeting-a-merge: the two-pass algorithm only resolves one
     // level of indirection. Transitive chaining requires a fixpoint loop and is
     // deferred to the raw backend.
-    for slot in [Fd::STDIN, Fd::STDOUT, Fd::STDERR] {
-        if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
+    for slot in fds.keys() {
+        if let Some(ResolvedStdio::Merge(target)) = fds.get(slot) {
             if matches!(fds.get(target), Some(ResolvedStdio::Merge(_))) {
                 return Err(Error::Unsupported {
                     op: format!("merge {slot} -> {target} -> <another merge>"),
@@ -51,15 +53,40 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
 
     let mut std_cmd = build_std_command(cmd)?;
 
-    // Resolve each std slot to a (child-side ChildEnd, optional parent end).
-    // Default unset 0/1/2 to inherit. Resolve non-merge first so merge can dup.
+    // Resolve every configured slot to a (child-side ChildEnd, optional parent
+    // end). On Unix this covers both 0/1/2 and n>=3; on Windows only 0/1/2 reach
+    // here (n>=3 are rejected above). Two-pass: non-merge first so merge can dup.
     let mut child_ends: BTreeMap<Fd, ChildEnd> = BTreeMap::new();
     let mut parent_ends: BTreeMap<Fd, ParentEnd> = BTreeMap::new();
 
-    for slot in [Fd::STDIN, Fd::STDOUT, Fd::STDERR] {
+    // First pass: resolve all non-merge slots. On Unix iterate all configured fds;
+    // on Windows the rejection above ensures only 0/1/2 exist. The std slots 0/1/2
+    // default to inherit when not explicitly configured; n>=3 have no default.
+    let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
+    let all_slots: Vec<Fd> = {
+        // Yield 0/1/2 first (even unconfigured, for inherit defaulting), then any
+        // configured n>=3. The n>=3 collection is Unix-only: on Windows the
+        // early rejection above guarantees `fds` holds no fd>=3, so the push is
+        // dead code there — cfg-gate it to make that explicit (and avoid an
+        // unused-`mut` warning on Windows where nothing is pushed).
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut v: Vec<Fd> = std_slots.to_vec();
+        #[cfg(unix)]
+        for &fd in fds.keys() {
+            if fd.raw() >= 3 {
+                v.push(fd);
+            }
+        }
+        v
+    };
+    for slot in all_slots {
         let resolved = fds.get(&slot);
         if let Some(ResolvedStdio::Merge(_)) = resolved {
             continue; // second pass
+        }
+        // n>=3 slots have no inherit default; skip unconfigured ones.
+        if slot.raw() >= 3 && resolved.is_none() {
+            continue;
         }
         let (child_end, parent) = resolve_non_merge(slot, resolved)?;
         if let Some(p) = parent {
@@ -67,40 +94,101 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
         child_ends.insert(slot, child_end);
     }
-    // Second pass: merges dup an already-resolved target's child end.
-    for slot in [Fd::STDIN, Fd::STDOUT, Fd::STDERR] {
-        if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
+    // Second pass: merges dup an already-resolved target's child end (any slot).
+    for slot in fds.keys() {
+        if let Some(ResolvedStdio::Merge(target)) = fds.get(slot) {
             let src = child_ends.get(target).ok_or_else(|| Error::Unsupported {
                 op: format!("merge {slot} -> {target}"),
                 platform: std::env::consts::OS,
                 detail: "merge target descriptor is not configured".into(),
             })?;
-            child_ends.insert(slot, dup(src)?);
+            child_ends.insert(*slot, dup(src)?);
         }
     }
 
-    // Hand the child ends to std (consumes them; std closes its copies on spawn).
-    for (slot, end) in child_ends {
-        let stdio = StdStdio::from(end);
-        match slot {
-            Fd::STDIN => std_cmd.stdin(stdio),
-            Fd::STDOUT => std_cmd.stdout(stdio),
-            _ => std_cmd.stderr(stdio),
-        };
+    // Hand 0/1/2 child ends to std (consumes them; std closes its copies on spawn).
+    for slot in std_slots {
+        if let Some(end) = child_ends.remove(&slot) {
+            let stdio = StdStdio::from(end);
+            match slot {
+                Fd::STDIN => std_cmd.stdin(stdio),
+                Fd::STDOUT => std_cmd.stdout(stdio),
+                _ => std_cmd.stderr(stdio),
+            };
+        }
     }
 
-    let shared = SharedChild::spawn(&mut std_cmd).map_err(Error::Io)?;
-    // Read the identity immediately after spawn while the child is guaranteed
-    // resolvable: on Windows shared_child holds the process handle (no PID
-    // reuse possible); on Unix the child is an un-reaped zombie until wait()
-    // so /proc still lists it.
-    let id = ProcessId::of(shared.id()).ok_or_else(|| {
+    // Phase 1 (before spawn): root detection + pre-spawn containment setup. This
+    // MUST run before the command-fds block below so that command-fds installs
+    // the LAST pre_exec hook. Why ordering matters: pre_exec hooks run in
+    // registration order in the forked child. The Linux cgroup self-placement
+    // hook (registered inside `prepare`) writes "0" to a pre-opened cgroup.procs
+    // fd whose CLOEXEC is cleared (so it is inherited across fork). If
+    // command-fds' dup2 ran FIRST, it could dup2 the user's fd over the number
+    // that cgroup.procs fd occupies — closing/replacing it — so the later cgroup
+    // write would hit a closed/wrong fd (silent CgroupV2->ProcessGroup downgrade,
+    // or a stray "0" corrupting the user's fd). By running command-fds LAST, the
+    // cgroup write+close happens while its fd is still valid; command-fds may then
+    // freely reuse the now-closed slot. Net child order: std stdio (0/1/2) ->
+    // containment pre_execs (cgroup placement / setsid) -> command-fds dup2 (last).
+    let prepared = crate::containment::prepare(&mut std_cmd, &cmd.contain_request());
+
+    // On Unix, hand n>=3 child ends to command-fds. This installs a pre_exec hook
+    // that dup2's each OwnedFd to its target number post-fork. It is registered
+    // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
+    // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
+    // disables posix_spawn when hooks are registered), so our n>=3 mappings never
+    // clobber the std stdio fds either. FdMappingCollision is unreachable:
+    // child_ends keys come from a BTreeMap, so each child fd number is unique.
+    #[cfg(unix)]
+    {
+        use command_fds::{CommandFdExt, FdMapping};
+
+        let mappings: Vec<FdMapping> = child_ends
+            .into_iter()
+            .map(|(fd, owned)| FdMapping {
+                parent_fd: owned,
+                child_fd: fd.raw(),
+            })
+            .collect();
+        if !mappings.is_empty() {
+            std_cmd
+                .fd_mappings(mappings)
+                .expect("child fd numbers are unique (BTreeMap keys)");
+        }
+    }
+
+    // We own the std Child so containment can job-assign + resume it (Task 5).
+    let child = std_cmd.spawn().map_err(Error::Io)?;
+    // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
+    // `prepared` is consumed here: Linux cgroup leaf ownership moves to Attached::Cgroup.
+    let (containment, attached) = crate::containment::attach(&child, prepared)?;
+    // Read identity BEFORE adopting into SharedChild. `SharedChild::new` calls
+    // `try_wait()`, which REAPS an already-exited child — and a short-lived child
+    // (e.g. `exit 0`, `sid-report`) can exit before we reach this point. Once
+    // reaped, /proc/<pid> is gone and the identity is unresolvable (observed as a
+    // load-dependent "vanished" race under parallel spawns). While we still own
+    // the un-reaped `std::process::Child`, the child is at worst a zombie — on
+    // Unix its /proc entry persists; on Windows the std Child pins the process
+    // handle so the pid cannot be reused — so this read is race-free.
+    let id = ProcessId::of(child.id()).ok_or_else(|| {
         Error::Io(std::io::Error::other(
             "spawned child vanished before its identity could be read",
         ))
     })?;
+    // Adopt AFTER the identity read (and after Task-5 resume) so SharedChild's
+    // internal try_wait can reap-or-track without losing the identity; the whole
+    // Plan-3 wait/kill/identity/pump model is preserved.
+    let shared = SharedChild::new(child).map_err(Error::Io)?;
 
-    Ok(Child::from_parts(shared, id, parent_ends, kill_on_drop))
+    Ok(Child::from_parts(
+        shared,
+        id,
+        parent_ends,
+        kill_on_drop,
+        containment,
+        attached,
+    ))
 }
 
 fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
@@ -308,6 +396,8 @@ fn file_end(f: &std::fs::File) -> Result<ChildEnd, Error> {
 fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     // Duplicate the parent's matching std stream. Bind the stream to a variable
     // before borrowing its descriptor (a temporary would be dropped while borrowed).
+    // For n>=3, Stdio::inherit() has no defined parent stream to dup — reject it
+    // explicitly. (The raw backend, Plan 4, can open arbitrary parent fds by number.)
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
@@ -320,9 +410,18 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
                 let s = std::io::stdout();
                 s.as_fd().try_clone_to_owned()
             }
-            _ => {
+            Fd::STDERR => {
                 let s = std::io::stderr();
                 s.as_fd().try_clone_to_owned()
+            }
+            other => {
+                return Err(Error::Unsupported {
+                    op: format!("Stdio::inherit() on {other}"),
+                    platform: "unix",
+                    detail: "inherit on fd >= 3 has no defined parent stream; \
+                             use pipe/file/null, or the raw backend (Plan 4)"
+                        .into(),
+                })
             }
         };
         owned.map_err(Error::Io)

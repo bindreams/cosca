@@ -1,8 +1,9 @@
 use super::{ProcessId, RawPid, StartToken};
 use std::collections::HashSet;
 
-// Build a ProcessId directly from parts (descendant module can access the
-// private fields and the private StartToken). No public constructor exists yet.
+// Build a ProcessId directly from parts (this test module can access the
+// private fields and the private StartToken). Mirrors the crate-internal,
+// test-only `ProcessId::from_parts_for_test`.
 fn id(pid: RawPid, tok: u64) -> ProcessId {
     ProcessId {
         pid,
@@ -49,6 +50,16 @@ fn current_process_resolves_exists_and_is_alive() {
     assert!(me.is_alive());
     assert_eq!(Some(me), ProcessId::of(me.pid()));
     assert!(me.created_at().is_some());
+}
+
+#[test]
+fn start_token_raw_is_stable_and_matches_reresolved() {
+    let me = ProcessId::current();
+    // Stable across two calls on the same identity.
+    assert_eq!(me.start_token_raw(), me.start_token_raw());
+    // Equals the token of a freshly re-resolved identity for the same pid.
+    let again = ProcessId::of(me.pid()).expect("current pid resolves");
+    assert_eq!(me.start_token_raw(), again.start_token_raw());
 }
 
 #[test]

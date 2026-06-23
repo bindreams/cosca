@@ -6,6 +6,7 @@ use std::io::{PipeReader, PipeWriter};
 use shared_child::SharedChild;
 
 use crate::command::Command;
+use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::stdio::Fd;
@@ -31,6 +32,8 @@ pub struct Child {
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
     kill_on_drop: bool,
+    containment: Containment,
+    attached: crate::containment::Attached,
 }
 
 impl Child {
@@ -39,13 +42,22 @@ impl Child {
         id: ProcessId,
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
+        containment: Containment,
+        attached: crate::containment::Attached,
     ) -> Child {
         Child {
             shared,
             id,
             pipes,
             kill_on_drop,
+            containment,
+            attached,
         }
+    }
+
+    /// The tree-teardown mechanism actually established for this child.
+    pub fn containment(&self) -> Containment {
+        self.containment
     }
 
     /// This child's stable identity (see [`crate::identity::ProcessId`]).
@@ -75,17 +87,25 @@ impl Child {
         self.shared.kill().map_err(Error::Io)
     }
 
+    /// Hard-kill the contained tree (or the lone process if uncontained).
+    pub fn kill_tree(&self) -> Result<(), Error> {
+        let group_result = self.attached.hard_kill();
+        // Also kill the direct child (covers the uncontained / nested-no-group case).
+        // Discard the direct-kill result: already-dead is Ok on all platforms, and
+        // an error here is superseded by a group-level error from hard_kill above.
+        let _ = self.shared.kill();
+        group_result
+    }
+
+    /// Send the graceful termination signal to the contained group (signal-only;
+    /// does not wait or reap). Graceful escalation with a deadline is Plan 5.
+    pub fn terminate_tree(&self) -> Result<(), Error> {
+        self.attached.terminate(self.shared.id())
+    }
+
     /// Take the parent's write end of the child's stdin pipe, if configured.
     pub fn stdin(&mut self) -> Option<PipeWriter> {
-        match self.pipes.remove(&Fd::STDIN) {
-            Some(ParentEnd::Writer(w)) => Some(w),
-            other => {
-                if let Some(e) = other {
-                    self.pipes.insert(Fd::STDIN, e);
-                }
-                None
-            }
-        }
+        self.fd_write_end(Fd::STDIN)
     }
 
     /// Take the parent's read end of the child's stdout pipe, if configured.
@@ -98,9 +118,34 @@ impl Child {
         take_reader(&mut self.pipes, Fd::STDERR)
     }
 
+    /// Take the parent's write end of a pipe configured for `fd` (child reads).
+    /// Returns `None` if `fd` was not configured as a pipe, or the write end has
+    /// already been taken.
+    pub fn fd_write_end(&mut self, fd: Fd) -> Option<PipeWriter> {
+        match self.pipes.remove(&fd) {
+            Some(ParentEnd::Writer(w)) => Some(w),
+            other => {
+                if let Some(e) = other {
+                    self.pipes.insert(fd, e);
+                }
+                None
+            }
+        }
+    }
+
+    /// Take the parent's read end of a pipe configured for `fd` (child writes).
+    /// Returns `None` if `fd` was not configured as a pipe, or the read end has
+    /// already been taken.
+    pub fn fd_read_end(&mut self, fd: Fd) -> Option<PipeReader> {
+        take_reader(&mut self.pipes, fd)
+    }
+
     /// Consume the handle without killing or waiting for the child (opt out of
-    /// kill-on-drop; see the [`Drop`] impl below).
+    /// kill-on-drop). For Job Object containment, `disarm()` clears the
+    /// `KILL_ON_JOB_CLOSE` flag before the job handle is released, ensuring the
+    /// tree keeps running after `detach`.
     pub fn detach(mut self) {
+        self.attached.disarm();
         self.kill_on_drop = false;
     }
 
@@ -118,6 +163,41 @@ impl Child {
     pub(crate) fn take_reader(&mut self, fd: Fd) -> Option<PipeReader> {
         take_reader(&mut self.pipes, fd)
     }
+
+    /// Test-only: return whether this child is inside our Job Object.
+    /// Uses `IsProcessInJob` against the handle we hold (not "any job").
+    /// Exposed outside `cfg(test)` so integration tests (separate compilation unit) can call it.
+    #[cfg(windows)]
+    pub fn test_job_handle_contains_self(&self) -> bool {
+        use crate::containment::Attached;
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
+
+        let Attached::JobObject(ref job) = self.attached else {
+            return false;
+        };
+        let Some(job_handle) = job.as_handle() else {
+            return false;
+        };
+
+        // Open the child process by PID; shared_child doesn't expose its handle.
+        // SAFETY: standard Win32 call; handle closed below.
+        let process_handle = unsafe {
+            match OpenProcess(PROCESS_QUERY_INFORMATION, false, self.shared.id()) {
+                Ok(h) => h,
+                Err(_) => return false,
+            }
+        };
+
+        let mut in_job = windows::core::BOOL(0);
+        // SAFETY: both handles are valid for the duration of the call.
+        let ok = unsafe { IsProcessInJob(process_handle, Some(job_handle), &mut in_job) };
+        // SAFETY: process_handle was opened above and must be closed.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(process_handle);
+        }
+        ok.is_ok() && in_job.as_bool()
+    }
 }
 
 impl Drop for Child {
@@ -125,15 +205,9 @@ impl Drop for Child {
         if !self.kill_on_drop {
             return; // detached / opted out
         }
-        // Hard-kill the lone process (tree-wide kill is Plan 4) and reap so we
-        // never leak a zombie/handle. Best-effort: `shared_child`'s kill() and
-        // wait() are idempotent and safe after exit, so an already-exited child
-        // is fine and a double-call cannot happen (drop runs once).
-        //
-        // Order matters: kill BEFORE wait. On Unix, reaping (wait) frees the PID
-        // for reuse, so signaling (kill) after a reap could hit an unrelated
-        // process. (shared_child serializes kill/wait under a lock but does not
-        // itself impose this ordering — we do, here.)
+        // Hard-kill the contained tree (if any) then also the direct child, then reap.
+        // Order matters on Unix: kill BEFORE wait (reaping frees the PID).
+        let _ = self.attached.hard_kill();
         let _ = self.shared.kill();
         let _ = self.shared.wait();
     }

@@ -70,6 +70,93 @@ fn main() {
             let code: i32 = args[2].parse().unwrap();
             exit(code);
         }
+        "control-block" => {
+            // Connect to the test's control listener, send a 1-byte tag, then
+            // block holding the socket open. On our death the OS closes it,
+            // EOF-ing the test's read — a real exit event, never a timer.
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
+        }
+        "spawn-grandchild" => {
+            // Spawn a grandchild that holds its own control connection (tag "G"),
+            // then hold ours (tag "R"). Both die together iff containment works.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills it
+            let _gc = std::process::Command::new(exe)
+                .args(["control-block", &addr, "G"])
+                .spawn()
+                .unwrap();
+            // Become a control-block ourselves (no test-owned stdin → no EOF confound).
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(unix)]
+        "spawn-grandchild-escapee" => {
+            // Like spawn-grandchild, but FIRST escape any process group / session
+            // the parent put us in by calling setsid(2). A killpg-based teardown
+            // aimed at our original pgid would then miss us and the grandchild;
+            // only the identity-aware TreeWalk catches us. We become a new session
+            // leader, THEN spawn the grandchild (it inherits the new session), THEN
+            // hold our own control connection.
+            let addr = args[2].clone();
+            // Safety: setsid() has no preconditions here (we are not already a
+            // process-group leader in the common spawn path) and is always safe to
+            // call; on EPERM we proceed anyway (best-effort escape for the test).
+            unsafe {
+                let _ = libc::setsid();
+            }
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; TreeWalk kills it
+            let _gc = std::process::Command::new(exe)
+                .args(["control-block", &addr, "G"])
+                .spawn()
+                .unwrap();
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(unix)]
+        "sid-report" => {
+            // Print our session id (getsid(0)) to stdout so the test can verify
+            // setsid() actually ran and the child is its own session leader.
+            // Safety: getsid(0) has no preconditions and always succeeds for pid 0.
+            let sid = unsafe { libc::getsid(0) };
+            println!("{sid}");
+        }
+        #[cfg(unix)]
+        "fd3-echo" => {
+            // Read all bytes from fd 3 and echo them to stdout. Used by the
+            // arbitrary-fd tests to prove the child received its fd 3 mapping.
+            // Safety: fd 3 is passed in by the test (via command-fds); this is
+            // the only caller and it always provides a valid, open fd 3.
+            use std::os::fd::FromRawFd;
+            let mut f = unsafe { std::fs::File::from_raw_fd(3) };
+            std::io::copy(&mut f, &mut std::io::stdout().lock()).unwrap();
+        }
+        #[cfg(unix)]
+        "fd3-write" => {
+            // Write the token bytes to fd 3 and flush. Used by the cgroup-clobber
+            // test: if command-fds' dup2 ran before the cgroup self-placement, a
+            // stray "0" would corrupt this fd's stream; an exact match proves no
+            // clobber. Safety: fd 3 is passed in by the test (via command-fds);
+            // this is the only caller and it always provides a valid, open fd 3.
+            use std::os::fd::FromRawFd;
+            let token = &args[2];
+            let mut f = unsafe { std::fs::File::from_raw_fd(3) };
+            f.write_all(token.as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
         other => {
             eprintln!("subprocess_testbin: unknown mode {other:?}");
             exit(2);

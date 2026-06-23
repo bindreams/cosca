@@ -1,6 +1,14 @@
 use crate::error::{Error, QuoteError, QuoteErrorKind};
 
 #[test]
+fn containment_error_displays_detail() {
+    let e = Error::Containment {
+        detail: "cgroup leaf not writable".into(),
+    };
+    assert!(e.to_string().contains("cgroup leaf not writable"), "{e}");
+}
+
+#[test]
 fn quote_error_displays_kind_and_offset() {
     let e = QuoteError::new(7, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.to_string(), "unterminated single quote at offset 7");
