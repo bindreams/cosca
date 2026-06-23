@@ -79,3 +79,33 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --target ${{ matrix.target }}
+
+      # `pty` is an additive feature flag; exercise the feature-gated code paths.
+      - name: Run tests (pty feature)
+        run: cargo test --locked --features pty --target ${{ matrix.target }}
+
+      # Live cgroup v2 containment tests are gated behind SUBPROCESS_TEST_CGROUP
+      # (a no-op without it). They need a cgroup the supervisor may create child
+      # cgroups under. We make a fresh leaf directly under the unified root cgroup:
+      # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
+      # rule does not apply and a cgroup may hold BOTH the test process and a child
+      # leaf. We move our shell into it and run only the cgroup-named tests there
+      # (as root, single-threaded). With the marker set the tests assert CgroupV2
+      # and FAIL LOUDLY if the leaf is unusable — never a silent skip.
+      - name: Run cgroup v2 containment tests (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          set -euxo pipefail
+          cargo test --locked --features pty --target ${{ matrix.target }} --no-run
+          BIN=$(cargo test --locked --features pty --target ${{ matrix.target }} --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "spawn_io") | .executable' \
+            | grep -v '^null$' | grep . | head -n1)
+          test -n "$BIN"
+          echo "cgroup test binary: $BIN"
+          sudo bash -euxc '
+            CG=/sys/fs/cgroup/subprocess-ci
+            mkdir -p "$CG"
+            echo $$ > "$CG/cgroup.procs"
+            export SUBPROCESS_TEST_CGROUP=1
+            exec "$0" cgroup --nocapture --test-threads=1
+          ' "$BIN"
