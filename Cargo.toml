@@ -12,7 +12,7 @@ pty = []
 
 [dependencies]
 thiserror = "2"
-shared_child = "1"
+shared_child = { version = "1", features = ["timeout"] }
 
 [dev-dependencies]
 tempfile = "3"

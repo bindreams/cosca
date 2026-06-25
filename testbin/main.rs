@@ -1,5 +1,6 @@
-//! Test-only helper spawned by the crate's integration tests. std-only; does
-//! not depend on the `subprocess` crate. Behavior is selected by argv[1].
+//! Test-only helper spawned by the crate's integration tests. std-only, with
+//! one exception: the `report-nested-kill-tree` mode uses the `subprocess` crate
+//! to exercise the real nested-member `kill_tree` path. Behavior is selected by argv[1].
 
 use std::io::{Read, Write};
 use std::process::exit;
@@ -156,6 +157,27 @@ fn main() {
             let mut f = unsafe { std::fs::File::from_raw_fd(3) };
             f.write_all(token.as_bytes()).unwrap();
             f.flush().unwrap();
+        }
+        "report-nested-kill-tree" => {
+            // This process is itself spawned CONTAINED (so NESTED_ENV is set). A crate
+            // spawn here is a nested member (Attached::Delegated), whose kill_tree() must
+            // be Unsupported. Report 'D' (Delegated + Unsupported) or 'O' (other).
+            let addr = &args[2];
+            let exe = std::env::current_exe().unwrap();
+            let mut gc = subprocess::Command::new();
+            gc.executable(&exe).args(["subprocess_testbin", "exit", "0"]).contain();
+            let child = gc.spawn().unwrap();
+            // A nested member must report Containment::Delegated AND reject kill_tree as
+            // Unsupported. Transmitting both discriminates the Delegated path from an
+            // uncontained None (which also yields Unsupported) — so a marker-propagation
+            // regression (nested -> None) is caught, not silently passed.
+            let is_delegated = child.containment() == subprocess::Containment::Delegated;
+            let unsupported = matches!(child.kill_tree(), Err(subprocess::error::Error::Unsupported { .. }));
+            let _ = child.wait();
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(if is_delegated && unsupported { b"D" } else { b"O" })
+                .unwrap();
+            sock.flush().unwrap();
         }
         other => {
             eprintln!("subprocess_testbin: unknown mode {other:?}");

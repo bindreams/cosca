@@ -6,6 +6,7 @@
 //! - [`Containment::JobObject`] (Windows): Job + `KILL_ON_JOB_CLOSE`.
 //! - [`Containment::ProcessGroup`]/[`Containment::Session`] (Unix): `killpg`.
 //! - [`Containment::TreeWalk`] (all): identity-aware descendant kill at teardown.
+//! - [`Containment::Delegated`]: a nested member — the outermost root tears it down.
 //! - [`Containment::None`]: not contained — lone-process semantics.
 //!
 //! This is NOT a security sandbox: a determined child escapes every mechanism
@@ -30,8 +31,28 @@ pub enum Containment {
     Session,
     /// Identity-aware descendant enumeration at teardown. Misses reparented orphans.
     TreeWalk,
+    /// A nested member of an ancestor's containment group/job: this child joined the
+    /// tree the outermost root owns, so it drives no teardown itself (`can_teardown()`
+    /// is `false`) and its `_tree` ops return `Unsupported`. The root tears the tree down.
+    Delegated,
     /// No containment — `kill`/drop act on the lone process.
     None,
+}
+
+impl Containment {
+    /// Whether this handle can drive tree teardown (`kill_tree`/`terminate_tree` act
+    /// rather than returning `Unsupported`). Exhaustive (no `_`) so a new variant must
+    /// declare its disposition.
+    pub fn can_teardown(&self) -> bool {
+        match self {
+            Containment::CgroupV2
+            | Containment::JobObject
+            | Containment::ProcessGroup
+            | Containment::Session
+            | Containment::TreeWalk => true,
+            Containment::None | Containment::Delegated => false,
+        }
+    }
 }
 
 impl fmt::Display for Containment {
@@ -42,6 +63,7 @@ impl fmt::Display for Containment {
             Containment::ProcessGroup => "process group",
             Containment::Session => "session",
             Containment::TreeWalk => "process-tree walk",
+            Containment::Delegated => "delegated",
             Containment::None => "none",
         })
     }

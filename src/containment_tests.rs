@@ -7,7 +7,23 @@ fn containment_display_names_the_mechanism() {
     assert_eq!(Containment::ProcessGroup.to_string(), "process group");
     assert_eq!(Containment::Session.to_string(), "session");
     assert_eq!(Containment::TreeWalk.to_string(), "process-tree walk");
+    assert_eq!(Containment::Delegated.to_string(), "delegated");
     assert_eq!(Containment::None.to_string(), "none");
+}
+
+#[test]
+fn containment_can_teardown() {
+    assert!(!Containment::None.can_teardown());
+    assert!(!Containment::Delegated.can_teardown());
+    for c in [
+        Containment::CgroupV2,
+        Containment::JobObject,
+        Containment::ProcessGroup,
+        Containment::Session,
+        Containment::TreeWalk,
+    ] {
+        assert!(c.can_teardown(), "{c:?} must be teardown-capable");
+    }
 }
 
 #[test]

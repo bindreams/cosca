@@ -65,6 +65,10 @@ To run the live test in CI:
 
 - [ ] (Plan 4) Implement raw backend (CreateProcess/execve) to support independent `executable` + `commandline` on Windows — std has no stable API to set `lpApplicationName` independently of `lpCommandLine`, so the std-only backend forces `argv[0]` to equal the executable when both are set.
 
+## Lifecycle / graceful shutdown (from Plan 5)
+
+- [ ] (Plan 6) Graceful-escalation trio deferred from Plan 5: `terminate()` (Unix-only lone `SIGTERM`), `graceful_shutdown(Duration)` (lone soft→hard escalation), `graceful_shutdown_tree(Duration)` (tree soft→hard escalation). Race-free implementation needs Plan-6 primitives: `pidfd_send_signal` (Linux identity-bound signal — closes lone `terminate`'s check-then-act PID-reuse race against a concurrent reap; macOS has no equivalent) and a non-reaping wait-with-timeout (so a tree hard-sweep runs BEFORE the root is reaped, avoiding the `killpg`-after-reap race that `shared_child`'s reaping wait can't). Settled design (Plan-6 blueprint): lone graceful is Unix-only (Windows has no single-process graceful primitive — group-scoped `CTRL_BREAK` only); grace is a relative `Duration` (matches Python/.NET/Go); escalation proceeds past a failed soft signal.
+
 ## Hardening / tech-debt (from foundation review)
 
 - [ ] Before publish, exclude or feature-gate `subprocess_testbin` so the test helper isn't shipped in the published crate.
@@ -72,3 +76,4 @@ To run the live test in CI:
 - [ ] At the edition-2024 bump, convert the test-only `extern "system"` blocks (quote/windows_tests.rs) to `unsafe extern`.
 - [ ] (Optional) Supplement the deterministic exhaustive never-panics/round-trip sweeps with a `proptest`/`cargo-fuzz` unbounded property for the quoting parsers.
 - [ ] Unify the POSIX `split` Whitespace-state backslash handling with `backslash_unquoted` via an enum return (cosmetic DRY; behavior is correct and oracle-matched).
+- [ ] (Plan 5 T5-1, DRY) Extract a shared `tests/common/mod.rs` control-spawn harness and migrate the duplicated sites: `tests/lifecycle.rs`'s `spawn_control` and `tests/spawn_io.rs`'s `spawn_contained_tree`/`spawn_session_tree`/`spawn_treewalk_tree` + the escapee (4 sites). Deferred from Plan 5 (consolidating would pull Plan-4 test files into Plan-5 scope).

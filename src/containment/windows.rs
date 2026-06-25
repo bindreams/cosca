@@ -123,6 +123,19 @@ impl JobHandle {
     }
 }
 
+#[cfg(all(windows, test))]
+impl JobHandle {
+    /// Test-only: a real but empty job object (no process assigned). Cheap to create and
+    /// cleanly closed on `Drop`; for variant-level assertions like
+    /// `Attached::JobObject(_).is_actionable()`.
+    pub(crate) fn create_empty_for_test() -> JobHandle {
+        // Safety: CreateJobObjectW with null name/attrs returns an owned job handle.
+        let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
+            .expect("CreateJobObjectW for test placeholder");
+        JobHandle::new(handle)
+    }
+}
+
 impl Drop for JobHandle {
     fn drop(&mut self) {
         // If `hard_kill` was not called and `disarm` did not clear the flag,
