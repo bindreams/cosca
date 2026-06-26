@@ -21,7 +21,7 @@ const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
 
 /// Read the creation FILETIME of an open process handle as a raw token.
 // SAFETY: `handle` must be a live process handle with QUERY_LIMITED rights.
-fn creation_token(handle: HANDLE) -> Option<StartToken> {
+pub(super) fn creation_token(handle: HANDLE) -> Option<StartToken> {
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();

@@ -59,6 +59,14 @@ pub(crate) const ALLOW_EQUAL_TOKEN: bool = false;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) const ALLOW_EQUAL_TOKEN: bool = false;
 
+/// The PID-reuse keep-predicate (the crate's core safety invariant — see the module
+/// docs): a candidate genuinely descends from an anchor only if its start token orders
+/// at-or-after the anchor's. The single source of this rule, shared by `descendants_with`
+/// and `children_of_with`.
+pub(crate) fn keeps_token(token: u64, anchor: u64, allow_equal: bool) -> bool {
+    token > anchor || (allow_equal && token == anchor)
+}
+
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
 /// identity via `resolve` and keeps it ONLY if its start token orders correctly
@@ -73,7 +81,7 @@ pub(crate) fn descendants_with(
     resolve: impl Fn(RawPid) -> Option<ProcessId>,
 ) -> Vec<ProcessId> {
     let root_token = root.start_token_raw();
-    let keep = |token: u64| token > root_token || (allow_equal && token == root_token);
+    let keep = |token: u64| keeps_token(token, root_token, allow_equal);
 
     // BFS over the ppid forest. `frontier` holds pids whose children we still
     // need to visit; it starts as just the root pid. A pid joins the result (and
@@ -129,6 +137,36 @@ pub(crate) fn descendants_with(
 /// `ProcessId::of` resolver and per-OS `ALLOW_EQUAL_TOKEN` rule.
 pub(crate) fn descendants(root: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
     descendants_with(root, parents, ALLOW_EQUAL_TOKEN, ProcessId::of)
+}
+
+/// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
+/// pid and whose start token passes `keeps_token` against the parent's. `resolve` is
+/// injected for purity. The parent itself is never included.
+pub(crate) fn children_of_with(
+    parent: ProcessId,
+    parents: &[(RawPid, RawPid)],
+    allow_equal: bool,
+    resolve: impl Fn(RawPid) -> Option<ProcessId>,
+) -> Vec<ProcessId> {
+    let ptoken = parent.start_token_raw();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for &(pid, ppid) in parents {
+        if ppid != parent.pid() || pid == ppid {
+            continue;
+        }
+        let Some(id) = resolve(pid) else { continue };
+        if keeps_token(id.start_token_raw(), ptoken, allow_equal) && seen.insert(pid) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Live one-level children of `parent`: the pure filter wired to `ProcessId::of` and the
+/// per-OS `ALLOW_EQUAL_TOKEN` rule.
+pub(crate) fn children_of(parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
+    children_of_with(parent, parents, ALLOW_EQUAL_TOKEN, ProcessId::of)
 }
 
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a

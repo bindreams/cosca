@@ -36,7 +36,7 @@ To run the live test in CI:
 
 ## Identity (follow-ups from Plan 2)
 
-- [ ] Add a `cfg(unix)` real-zombie integration test asserting `is_alive()==false` for an un-reaped exited child (exercises Linux `/proc` state `Z` and macOS `pbi_status==SZOMB` at RUNTIME). Needs Plan 6's foreign-wait primitive to deterministically observe a zombie without reaping. Decision logic is already host-tested on Linux via `running_from_stat`; macOS is a single `!= SZOMB`.
+- [x] Add a `cfg(unix)` real-zombie integration test asserting `is_alive()==false` for an un-reaped exited child (exercises Linux `/proc` state `Z` and macOS `pbi_status==SZOMB` at RUNTIME). Needs Plan 6's foreign-wait primitive to deterministically observe a zombie without reaping. Decision logic is already host-tested on Linux via `running_from_stat`; macOS is a single `!= SZOMB`.
 
 ## Stdio / PTY
 
@@ -67,7 +67,7 @@ To run the live test in CI:
 
 ## Lifecycle / graceful shutdown (from Plan 5)
 
-- [ ] (Plan 6) Graceful-escalation trio deferred from Plan 5: `terminate()` (Unix-only lone `SIGTERM`), `graceful_shutdown(Duration)` (lone soft→hard escalation), `graceful_shutdown_tree(Duration)` (tree soft→hard escalation). Race-free implementation needs Plan-6 primitives: `pidfd_send_signal` (Linux identity-bound signal — closes lone `terminate`'s check-then-act PID-reuse race against a concurrent reap; macOS has no equivalent) and a non-reaping wait-with-timeout (so a tree hard-sweep runs BEFORE the root is reaped, avoiding the `killpg`-after-reap race that `shared_child`'s reaping wait can't). Settled design (Plan-6 blueprint): lone graceful is Unix-only (Windows has no single-process graceful primitive — group-scoped `CTRL_BREAK` only); grace is a relative `Duration` (matches Python/.NET/Go); escalation proceeds past a failed soft signal.
+- [ ] (Plan 7) Graceful-escalation trio — deferred from Plan 5: `terminate()` (Unix-only lone `SIGTERM`), `graceful_shutdown(Duration)` (lone soft→hard escalation), `graceful_shutdown_tree(Duration)` (tree soft→hard escalation). Race-free implementation needs Plan-6 primitives: `pidfd_send_signal` (Linux identity-bound signal — closes lone `terminate`'s check-then-act PID-reuse race against a concurrent reap; macOS has no equivalent) and a non-reaping wait-with-timeout (so a tree hard-sweep runs BEFORE the root is reaped, avoiding the `killpg`-after-reap race that `shared_child`'s reaping wait can't). Settled design (Plan-6 blueprint): lone graceful is Unix-only (Windows has no single-process graceful primitive — group-scoped `CTRL_BREAK` only); grace is a relative `Duration` (matches Python/.NET/Go); escalation proceeds past a failed soft signal.
 
 ## Hardening / tech-debt (from foundation review)
 

@@ -18,6 +18,11 @@ pub use child::Child;
 mod command;
 pub use command::Command;
 
+mod wait;
+
+pub mod process;
+pub use process::{Process, Recursive};
+
 pub use std::process::ExitStatus;
 
 /// Captured result of a finished process.

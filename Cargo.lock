@@ -183,6 +183,7 @@ dependencies = [
  "command-fds",
  "libc",
  "nix",
+ "rustix",
  "shared_child",
  "tempfile",
  "thiserror",

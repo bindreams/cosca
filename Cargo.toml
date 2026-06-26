@@ -29,8 +29,11 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process", "event"] }
 command-fds = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["process", "event"] }
 
 [[bin]]
 name = "subprocess_testbin"

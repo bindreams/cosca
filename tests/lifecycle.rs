@@ -1,32 +1,12 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use subprocess::Command;
 
-fn testbin() -> &'static str {
-    env!("CARGO_BIN_EXE_subprocess_testbin")
-}
-
-/// Spawn `mode <addr> [extra...]` as a single control child; return
-/// `(child, its_control_socket)`. The child connects, writes a 1-byte tag, then
-/// blocks; the accepted+read socket proves it is alive. `contain` selects `.contain()`.
-fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (subprocess::Child, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-    let addr = listener.local_addr().unwrap().to_string();
-    let mut argv: Vec<String> = vec!["subprocess_testbin".into(), mode.into(), addr];
-    argv.extend(extra.iter().map(|s| s.to_string()));
-    let mut cmd = Command::new();
-    cmd.executable(testbin()).args(&argv);
-    if contain {
-        cmd.contain();
-    }
-    let child = cmd.spawn().expect("spawn control child");
-    let (mut sock, _) = listener.accept().expect("accept control conn");
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("read control tag");
-    (child, sock)
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{spawn_control, testbin};
 
 #[test]
 fn wait_timeout_returns_none_while_running() {
