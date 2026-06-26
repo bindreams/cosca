@@ -39,3 +39,27 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (subprocess::
 pub fn spawn_blocker() -> (subprocess::Child, TcpStream) {
     spawn_control("control-block", &["R"], false)
 }
+
+/// Spawn the `spawn-grandchild` helper (root tag "R" + one grandchild tag "G"), optionally
+/// contained, and return the owned `Child` plus BOTH accepted sockets (the two tag reads prove
+/// the 2-level tree is alive). The tree dies — and both sockets EOF — only when the whole tree
+/// is torn down, so callers prove teardown by reading EOF on both, never by a timer.
+pub fn spawn_grandchild(contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = subprocess::Command::new();
+    cmd.executable(testbin())
+        .args(["subprocess_testbin", "spawn-grandchild", addr.as_str()]);
+    if contain {
+        cmd.contain();
+    }
+    let child = cmd.spawn().expect("spawn grandchild tree");
+    let mut socks = Vec::new();
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept");
+        let mut tag = [0u8; 1];
+        s.read_exact(&mut tag).expect("read tag");
+        socks.push(s);
+    }
+    (child, socks)
+}

@@ -36,6 +36,14 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     backend::kill(id)
 }
 
+/// Send the graceful termination signal (`SIGTERM`) to the process with identity `id`,
+/// identity-verified. Signal-only — does not wait or reap. Already-dead ⇒ `Ok`; a real
+/// failure (no rights / `EPERM`) ⇒ `Err`. Windows has no per-process graceful signal ⇒
+/// `Unsupported`.
+pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
+    backend::terminate(id)
+}
+
 /// Remaining time until `deadline` (`None` = unbounded; `Some(None)` = a duration
 /// that overflowed `Instant` ⇒ unbounded). Saturates to ZERO once past. Shared by the
 /// backends to recompute the per-syscall timeout after an `EINTR` retry.

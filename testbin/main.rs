@@ -179,6 +179,21 @@ fn main() {
                 .unwrap();
             sock.flush().unwrap();
         }
+        #[cfg(unix)]
+        "control-block-ignore-term" => {
+            // Ignore SIGTERM, then behave exactly like control-block.
+            // SAFETY: installing SIG_IGN for SIGTERM has no preconditions and is always safe.
+            unsafe {
+                let _ = libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
         other => {
             eprintln!("subprocess_testbin: unknown mode {other:?}");
             exit(2);

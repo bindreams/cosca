@@ -20,6 +20,9 @@ pub(crate) mod spawn;
 #[path = "child/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "child/graceful.rs"]
+mod graceful;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {

@@ -85,3 +85,22 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
         Err(e) => Err(Error::Io(e.into())),      // EPERM etc. surfaced, not swallowed
     }
 }
+
+pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
+    use nix::sys::signal::{kill as nix_kill, Signal};
+    use nix::unistd::Pid;
+    // Re-verify identity immediately before signaling.
+    if ProcessId::of(id.pid()) != Some(id) {
+        return Ok(()); // gone (or recycled) => already-dead is success
+    }
+    debug_assert!(
+        id.pid() <= i32::MAX as u32,
+        "pid {} exceeds i32::MAX; signal target cast would truncate",
+        id.pid()
+    );
+    match nix_kill(Pid::from_raw(id.pid() as i32), Signal::SIGTERM) {
+        Ok(()) => Ok(()),
+        Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(e) => Err(Error::Io(e.into())),
+    }
+}

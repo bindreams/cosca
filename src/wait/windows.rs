@@ -86,3 +86,14 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
         }
     }
 }
+
+pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
+    let _ = id;
+    Err(Error::Unsupported {
+        op: "graceful terminate (SIGTERM-equivalent)".into(),
+        platform: "windows",
+        detail: "Windows has no per-process graceful-termination signal; for a contained \
+                 child use graceful_shutdown_tree (CTRL_BREAK to the group)"
+            .into(),
+    })
+}

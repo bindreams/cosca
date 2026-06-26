@@ -77,3 +77,12 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
         Err(e) => Err(Error::Io(std::io::Error::from(e))),
     }
 }
+
+pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
+    let Some(pidfd) = open_verified(id)? else { return Ok(()) };
+    match pidfd_send_signal(&pidfd, Signal::TERM) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
+        Err(e) => Err(Error::Io(std::io::Error::from(e))),
+    }
+}

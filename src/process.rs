@@ -9,6 +9,9 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::identity::{ProcessId, RawPid};
 
+#[path = "process/graceful.rs"]
+mod graceful;
+
 /// Whether a tree query descends recursively or returns only direct children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recursive {
