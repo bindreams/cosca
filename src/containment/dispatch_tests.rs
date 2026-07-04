@@ -106,7 +106,18 @@ fn nested_attach_is_delegated() {
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
         };
-        let (containment, attached) = attach(&child, prepared).expect("attach nested");
+        #[cfg(windows)]
+        let proc_handle = {
+            use std::os::windows::io::AsRawHandle;
+            child.as_raw_handle()
+        };
+        let (containment, attached) = attach(
+            child.id(),
+            #[cfg(windows)]
+            proc_handle,
+            prepared,
+        )
+        .expect("attach nested");
         // Reap before asserting: `attached` is owned and independent of `child`, so a
         // failing assertion must not leak the helper (the nested arms don't touch it).
         let _ = child.kill();

@@ -138,14 +138,13 @@ pub(crate) fn is_nested(marker_present: bool) -> bool {
     marker_present
 }
 
-/// Resolve the spawned child's stable identity for the TreeWalk root, or `Err`
-/// if it vanished before we could read it. Consistent with the post-attach
-/// identity read in `spawn.rs`: the child is freshly spawned and (on Windows)
-/// its handle is held by std::process::Child / (on Unix) it is an un-reaped
-/// zombie at worst, so this should always succeed; the error path is defensive.
+/// Resolve the spawned root's identity by pid. **Precondition:** the caller holds the owning
+/// `Child` (sync `std::process::Child` / async `::tokio::process::Child`) across this call — it
+/// pins the pid against reuse, so the by-pid resolve is race-free (the freshly spawned root is
+/// un-reaped, and on Windows still suspended, hence resolvable).
 #[cfg(any(unix, windows))]
-fn resolve_root_id(child: &std::process::Child) -> Result<crate::identity::ProcessId, Error> {
-    crate::identity::ProcessId::of(child.id()).ok_or_else(|| Error::Containment {
+fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, Error> {
+    crate::identity::ProcessId::of(pid).ok_or_else(|| Error::Containment {
         detail: "tree-walk root vanished before its identity could be read".into(),
     })
 }
@@ -300,7 +299,11 @@ pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest)
 /// Phase 2 (after spawn, before SharedChild::new): attach the mechanism.
 /// Consumes `prepared` so Linux cgroup leaf ownership transfers cleanly to
 /// `Attached::Cgroup` without requiring interior mutability.
-pub(crate) fn attach(child: &std::process::Child, prepared: Prepared) -> Result<(Containment, Attached), Error> {
+pub(crate) fn attach(
+    pid: u32,
+    #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
+    prepared: Prepared,
+) -> Result<(Containment, Attached), Error> {
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
@@ -310,10 +313,10 @@ pub(crate) fn attach(child: &std::process::Child, prepared: Prepared) -> Result<
                 // by identity. Resolve the root identity (consistent with the
                 // post-attach identity read in spawn.rs).
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(child)?)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
                 }
 
-                let raw_pid = child.id();
+                let raw_pid = pid;
                 debug_assert!(
                     raw_pid <= i32::MAX as u32,
                     "pid {raw_pid} exceeds i32::MAX; pgid cast would truncate"
@@ -362,9 +365,9 @@ pub(crate) fn attach(child: &std::process::Child, prepared: Prepared) -> Result<
             if prepared.is_root {
                 // TreeWalk root: no process group; identity teardown.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(child)?)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
                 }
-                let raw_pid = child.id();
+                let raw_pid = pid;
                 debug_assert!(
                     raw_pid <= i32::MAX as u32,
                     "pid {raw_pid} exceeds i32::MAX; pgid cast would truncate"
@@ -391,16 +394,16 @@ pub(crate) fn attach(child: &std::process::Child, prepared: Prepared) -> Result<
             // TreeWalk root: no job (spawned with CREATE_NEW_PROCESS_GROUP only);
             // identity teardown, with CTRL_BREAK to the group as cooperative term.
             if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(child)?)));
+                return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
             }
-            match crate::containment::windows::attach_job(child) {
+            match crate::containment::windows::attach_job(proc_handle) {
                 Ok(Some(job)) => return Ok((Containment::JobObject, Attached::JobObject(job))),
                 Ok(None) => {
                     // Job assignment failed: fall back to the universal TreeWalk
                     // mechanism rather than silently yielding no containment. The
                     // root was spawned with CREATE_NEW_PROCESS_GROUP (set_root_flags),
                     // so `terminate`'s CTRL_BREAK still reaches the group.
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(child)?)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
                 }
                 Err(e) => return Err(Error::Containment { detail: e.to_string() }),
             }
@@ -413,7 +416,7 @@ pub(crate) fn attach(child: &std::process::Child, prepared: Prepared) -> Result<
     }
 
     // Uncontained (or unsupported platform).
-    let _ = (child, prepared);
+    let _ = prepared;
     Ok((Containment::None, Attached::None))
 }
 

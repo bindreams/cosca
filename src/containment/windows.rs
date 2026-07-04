@@ -13,7 +13,6 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
-use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
@@ -192,11 +191,10 @@ pub(crate) fn terminate(pid: u32) -> io::Result<()> {
     unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) }.map_err(io::Error::from)
 }
 
-/// Create a `KILL_ON_JOB_CLOSE` job and assign `child` to it.
-fn assign_to_kill_on_close_job(child: &std::process::Child) -> io::Result<JobHandle> {
-    // `as_raw_handle()` returns a `*mut c_void` on Windows.
-    let raw_ptr = child.as_raw_handle();
-    let raw_handle = HANDLE(raw_ptr.cast());
+/// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
+fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+    // A Windows `RawHandle` is a `*mut c_void`.
+    let raw_handle = HANDLE(proc_handle.cast());
     // SAFETY: all calls are standard Win32; owned handles are closed on error.
     unsafe {
         let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(io::Error::from)?;
@@ -222,7 +220,7 @@ fn assign_to_kill_on_close_job(child: &std::process::Child) -> io::Result<JobHan
     }
 }
 
-/// Resume every suspended thread of `child` after job assignment.
+/// Resume every suspended thread of the process at `proc_handle` after job assignment.
 ///
 /// Why resume REGARDLESS of job-assign result:
 /// the kill-group race invariant requires the child to be inside the job before
@@ -231,16 +229,15 @@ fn assign_to_kill_on_close_job(child: &std::process::Child) -> io::Result<JobHan
 /// process is unacceptable. If `ResumeThread` fails we kill the child immediately
 /// and return an error.
 ///
-/// PID-reuse safety: we hold the child's process handle (via `std::process::Child`),
-/// keeping its PID alive for the duration of the Toolhelp snapshot walk.
-fn resume_initial_threads(child: &std::process::Child) -> io::Result<()> {
+/// PID-reuse safety: the caller holds the child's process handle (via the owning
+/// `Child`), keeping its PID alive for the duration of the Toolhelp snapshot walk.
+fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::Result<()> {
     use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
 
-    let raw_ptr = child.as_raw_handle();
-    let raw_handle = HANDLE(raw_ptr.cast());
+    let raw_handle = HANDLE(proc_handle.cast());
 
     // Thread32First/Next signal end-of-enumeration with ERROR_NO_MORE_FILES.
     let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
@@ -293,18 +290,23 @@ fn resume_initial_threads(child: &std::process::Child) -> io::Result<()> {
     Ok(())
 }
 
-/// Assign `child` to a `KILL_ON_JOB_CLOSE` job and resume its initial threads.
+/// Assign the process at `proc_handle` to a `KILL_ON_JOB_CLOSE` job and resume its
+/// initial threads.
+///
+/// `proc_handle` must remain open for the whole call (it pins the pid against reuse during the
+/// Toolhelp thread walk in `resume_initial_threads`). Both callers hold the owning `Child` —
+/// sync `std::process::Child`, async `::tokio::process::Child` — across the call, so it does.
 ///
 /// Returns `Ok(Some(JobHandle))` on full success (job assigned AND resumed).
 /// Returns `Ok(None)` when job assignment fails — the caller falls back to the
 /// universal `Containment::TreeWalk` mechanism (identity teardown).
 /// Returns `Err` when resume fails — a frozen child is unacceptable; we kill
 /// the child+job and propagate the error to fail the spawn.
-pub(crate) fn attach_job(child: &std::process::Child) -> io::Result<Option<JobHandle>> {
-    let job_result = assign_to_kill_on_close_job(child);
+pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<Option<JobHandle>> {
+    let job_result = assign_to_kill_on_close_job(proc_handle);
 
     // Resume REGARDLESS of job assignment result. A frozen child cannot be left running.
-    if let Err(resume_err) = resume_initial_threads(child) {
+    if let Err(resume_err) = resume_initial_threads(proc_handle) {
         if let Ok(job) = job_result {
             // Kill via the job first (catches any threads the walk may have missed).
             job.hard_kill();
