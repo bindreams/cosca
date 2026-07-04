@@ -15,6 +15,12 @@ pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Out
     let stdin = child.take_stdin_writer();
     let stdout = child.take_reader(Fd::STDOUT);
     let stderr = child.take_reader(Fd::STDERR);
+    // Caller contract: input can only be delivered if stdin was piped — surface the misuse
+    // rather than silently dropping the bytes.
+    debug_assert!(
+        input.is_none() || stdin.is_some(),
+        "communicate given input but stdin was not piped"
+    );
 
     thread::scope(|scope| -> Result<Output, Error> {
         // Writer: feed input, then drop the write end so the child sees EOF.

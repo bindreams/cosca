@@ -69,6 +69,17 @@ To run the live test in CI:
 
 - [x] (Plan 7) Graceful-escalation trio — deferred from Plan 5: `terminate()` (Unix-only lone `SIGTERM`), `graceful_shutdown(Duration)` (lone soft→hard escalation), `graceful_shutdown_tree(Duration)` (tree soft→hard escalation). Race-free implementation needs Plan-6 primitives: `pidfd_send_signal` (Linux identity-bound signal — closes lone `terminate`'s check-then-act PID-reuse race against a concurrent reap; macOS has no equivalent) and a non-reaping wait-with-timeout (so a tree hard-sweep runs BEFORE the root is reaped, avoiding the `killpg`-after-reap race that `shared_child`'s reaping wait can't). Settled design (Plan-6 blueprint): lone graceful is Unix-only (Windows has no single-process graceful primitive — group-scoped `CTRL_BREAK` only); grace is a relative `Duration` (matches Python/.NET/Go); escalation proceeds past a failed soft signal.
 
+## Lifecycle / async (from Plan 8)
+
+The async mirror shipped as an I/O foundation only; deferred to Plan 9:
+
+- [ ] Async `contain_with`/`nesting` builder modes (the async builder exposes `contain()` only).
+- [ ] Async parent-end access for fd ≥ 3 via `AsyncFd` (the async API rejects fd ≥ 3 at spawn).
+- [ ] Async merge-into-a-piped-target (rejected as `Unsupported`, mirroring the foundation subset).
+- [ ] Async explicit control: `kill`/`kill_tree`/`terminate_tree` + the graceful trio
+      (`terminate`/`graceful_shutdown`/`graceful_shutdown_tree`).
+- [ ] Async foreign `Process` (introspect/wait/kill on a non-owned process).
+
 ## Hardening / tech-debt (from foundation review)
 
 - [ ] Before publish, exclude or feature-gate `subprocess_testbin` so the test helper isn't shipped in the published crate.

@@ -63,3 +63,61 @@ pub fn spawn_grandchild(contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
     }
     (child, socks)
 }
+
+/// Async `control-block` blocker (uncontained): a child that connects, tags "R", and blocks on
+/// its socket. The accept/tag-read is sync std (the test side); the CHILD is async.
+#[cfg(feature = "tokio")]
+pub fn spawn_blocker_async() -> (subprocess::tokio::Child, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(testbin())
+        .args(["subprocess_testbin", "control-block", addr.as_str(), "R"]);
+    let child = cmd.spawn().expect("spawn async blocker");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read tag");
+    (child, sock)
+}
+
+/// Async analogue of `spawn_grandchild`, returning the root ("R") and grandchild ("G") control
+/// sockets identified by tag (accept order is not guaranteed).
+#[cfg(feature = "tokio")]
+pub fn spawn_grandchild_async(contain: bool) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
+    spawn_grandchild_async_with(contain, true)
+}
+
+/// `spawn_grandchild_async` with explicit `contain` and `kill_on_drop` flags, so a test can
+/// exercise the `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`.
+#[cfg(feature = "tokio")]
+pub fn spawn_grandchild_async_with(
+    contain: bool,
+    kill_on_drop: bool,
+) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(testbin())
+        .args(["subprocess_testbin", "spawn-grandchild", addr.as_str()]);
+    if contain {
+        cmd.contain();
+    }
+    cmd.kill_on_drop(kill_on_drop);
+    let child = cmd.spawn().expect("spawn async grandchild tree");
+    let (mut root, mut grandchild) = (None, None);
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept");
+        let mut tag = [0u8; 1];
+        s.read_exact(&mut tag).expect("read tag");
+        match &tag {
+            b"R" => root = Some(s),
+            b"G" => grandchild = Some(s),
+            other => panic!("unexpected grandchild-tree tag {other:?}"),
+        }
+    }
+    (
+        child,
+        root.expect("root R connected"),
+        grandchild.expect("grandchild G connected"),
+    )
+}

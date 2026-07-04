@@ -23,6 +23,9 @@ mod wait;
 pub mod process;
 pub use process::{Process, Recursive};
 
+#[cfg(feature = "tokio")]
+pub mod tokio;
+
 pub use std::process::ExitStatus;
 
 /// Captured result of a finished process.
