@@ -40,44 +40,104 @@ pub fn spawn_blocker() -> (subprocess::Child, TcpStream) {
     spawn_control("control-block", &["R"], false)
 }
 
-/// Spawn the `spawn-grandchild` helper (root tag "R" + one grandchild tag "G"), optionally
-/// contained, and return the owned `Child` plus BOTH accepted sockets (the two tag reads prove
-/// the 2-level tree is alive). The tree dies — and both sockets EOF — only when the whole tree
-/// is torn down, so callers prove teardown by reading EOF on both, never by a timer.
-pub fn spawn_grandchild(contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
+/// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R" + one grandchild
+/// tag "G"), optionally contained, and return the owned `Child` plus BOTH accepted sockets (the
+/// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
+/// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
+/// a timer.
+pub fn spawn_tree(mode: &str, contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = subprocess::Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "spawn-grandchild", addr.as_str()]);
+        .args(["subprocess_testbin", mode, addr.as_str()]);
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn grandchild tree");
-    let mut socks = Vec::new();
+    let child = cmd.spawn().expect("spawn tree");
+    // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
+    // duplicate or foreign tag is a harness bug worth failing loudly on).
+    let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
         let (mut s, _) = listener.accept().expect("accept");
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
-        socks.push(s);
+        match &tag {
+            b"R" => root = Some(s),
+            b"G" => grand = Some(s),
+            other => panic!("unexpected tree tag {other:?}"),
+        }
     }
-    (child, socks)
+    (
+        child,
+        vec![root.expect("root R connected"), grand.expect("grandchild G connected")],
+    )
+}
+
+/// Spawn the `spawn-grandchild` helper tree.
+pub fn spawn_grandchild(contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
+    spawn_tree("spawn-grandchild", contain)
+}
+
+/// Async analogue of `spawn_control`: spawn a testbin control child (it connects back and
+/// sends its tag before the helper returns), optionally contained.
+#[cfg(feature = "tokio")]
+pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (subprocess::tokio::Child, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut argv: Vec<String> = vec!["subprocess_testbin".into(), mode.into(), addr];
+    argv.extend(extra.iter().map(|s| s.to_string()));
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(testbin()).args(&argv);
+    if contain {
+        cmd.contain();
+    }
+    let child = cmd.spawn().expect("spawn async control child");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read tag");
+    (child, sock)
+}
+
+/// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R", grandchild
+/// tag "G"), with builder configuration supplied by `configure` (containment mode, nesting).
+/// Returns the root and grandchild control sockets identified by tag (accept order is not
+/// guaranteed).
+#[cfg(feature = "tokio")]
+pub fn spawn_tree_async(
+    mode: &str,
+    configure: impl FnOnce(&mut subprocess::tokio::Command),
+) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(testbin())
+        .args(["subprocess_testbin", mode, addr.as_str()]);
+    configure(&mut cmd);
+    let child = cmd.spawn().expect("spawn async tree");
+    let (mut root, mut grandchild) = (None, None);
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept");
+        let mut tag = [0u8; 1];
+        s.read_exact(&mut tag).expect("read tag");
+        match &tag {
+            b"R" => root = Some(s),
+            b"G" => grandchild = Some(s),
+            other => panic!("unexpected tree tag {other:?}"),
+        }
+    }
+    (
+        child,
+        root.expect("root R connected"),
+        grandchild.expect("grandchild G connected"),
+    )
 }
 
 /// Async `control-block` blocker (uncontained): a child that connects, tags "R", and blocks on
 /// its socket. The accept/tag-read is sync std (the test side); the CHILD is async.
 #[cfg(feature = "tokio")]
 pub fn spawn_blocker_async() -> (subprocess::tokio::Child, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(testbin())
-        .args(["subprocess_testbin", "control-block", addr.as_str(), "R"]);
-    let child = cmd.spawn().expect("spawn async blocker");
-    let (mut sock, _) = listener.accept().expect("accept");
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("read tag");
-    (child, sock)
+    spawn_control_async("control-block", &["R"], false)
 }
 
 /// Async analogue of `spawn_grandchild`, returning the root ("R") and grandchild ("G") control
@@ -94,30 +154,10 @@ pub fn spawn_grandchild_async_with(
     contain: bool,
     kill_on_drop: bool,
 ) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(testbin())
-        .args(["subprocess_testbin", "spawn-grandchild", addr.as_str()]);
-    if contain {
-        cmd.contain();
-    }
-    cmd.kill_on_drop(kill_on_drop);
-    let child = cmd.spawn().expect("spawn async grandchild tree");
-    let (mut root, mut grandchild) = (None, None);
-    for _ in 0..2 {
-        let (mut s, _) = listener.accept().expect("accept");
-        let mut tag = [0u8; 1];
-        s.read_exact(&mut tag).expect("read tag");
-        match &tag {
-            b"R" => root = Some(s),
-            b"G" => grandchild = Some(s),
-            other => panic!("unexpected grandchild-tree tag {other:?}"),
+    spawn_tree_async("spawn-grandchild", |cmd| {
+        if contain {
+            cmd.contain();
         }
-    }
-    (
-        child,
-        root.expect("root R connected"),
-        grandchild.expect("grandchild G connected"),
-    )
+        cmd.kill_on_drop(kill_on_drop);
+    })
 }

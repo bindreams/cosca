@@ -21,12 +21,22 @@ impl Process {
     /// exit status only to the real parent. Escalation proceeds even if `SIGTERM` is ignored.
     /// Unix only; Windows returns `Unsupported`. `grace` is relative; `ZERO` signals, polls
     /// once, then escalates.
+    ///
+    /// A watch failure surfaces only after the kill runs; a kill error wins over it.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
         crate::wait::terminate(self.id)?;
-        if crate::wait::block_until_exit(self.id, Some(grace))? {
+        // A watch failure must not strand the process between the soft signal and the
+        // escalation — the kill still runs (grace unobservable => escalate now); the watch
+        // error surfaces only after it succeeds (a kill error wins — deliberate subsumption,
+        // mirroring the owned twins' disposition).
+        let watch = crate::wait::block_until_exit(self.id, Some(grace));
+        if matches!(watch, Ok(true)) {
             return Ok(()); // exited within grace
         }
-        crate::wait::kill(self.id) // timeout → hard SIGKILL (no reap — not the parent)
+        // Hard SIGKILL (no reap — not the parent); an Err returns HERE, subsuming any watch Err.
+        crate::wait::kill(self.id)?;
+        watch?;
+        Ok(())
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies
@@ -71,9 +81,24 @@ impl Process {
     /// to `grace` for the **root** to exit, then a hard identity-walk sweep. Best-effort (the
     /// `TreeWalk` contract); no `ExitStatus`. Unix only (Windows `terminate_tree` is
     /// `Unsupported`).
+    ///
+    /// A grace-watch failure does not strand the tree between the soft signal and the sweep:
+    /// the hard sweep still runs (an unobservable grace escalates immediately), and the watch
+    /// error is surfaced afterward; a sweep failure would win over it.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
-        let _ = crate::wait::block_until_exit(self.id, Some(grace))?;
-        self.kill_tree()
+
+        // Watch-Err ordering: sweep first, then surface (see graceful_shutdown above).
+        let watch = crate::wait::block_until_exit(self.id, Some(grace));
+        // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
+        // drained. A sweep Err subsumes any watch Err; there is no reap to order against (the
+        // real parent collects the zombie).
+        self.kill_tree()?;
+        watch?;
+        Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "graceful_tests.rs"]
+mod graceful_tests;

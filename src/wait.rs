@@ -16,6 +16,29 @@ pub(crate) mod backend;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!("subprocess::wait is implemented only for Linux, macOS, and Windows");
 
+/// Force the NEXT grace-watch on THIS thread to fail (consumed by `block_until_exit`,
+/// `Child::wait_timeout`, and `tokio::wait::grace_wait`), so the watch-error escalation
+/// ordering is testable. Same take-semantics contract as the treewalk fault seam.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    thread_local! {
+        static FORCE_WATCH_ERROR: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn set_force_watch_error(on: bool) {
+        FORCE_WATCH_ERROR.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_watch_error() -> bool {
+        FORCE_WATCH_ERROR.with(|f| f.replace(false))
+    }
+    pub(crate) fn armed() -> bool {
+        FORCE_WATCH_ERROR.with(|f| f.get())
+    }
+    pub(crate) fn forced_watch_error() -> crate::error::Error {
+        crate::error::Error::Io(std::io::Error::other("forced grace-watch failure (test seam)"))
+    }
+}
+
 /// Block until the process with identity `id` exits. `Ok(true)` = exited; `Ok(false)`
 /// = the timeout elapsed while it was still alive; `Err` = a wait failure (incl.
 /// `Unsupported` on Linux kernels < 5.3). `None` = block until exit; `Some(ZERO)` =
@@ -25,6 +48,10 @@ compile_error!("subprocess::wait is implemented only for Linux, macOS, and Windo
 /// process, macOS surfaces the permission failure as `Err` whereas Windows cannot open the
 /// handle and reports `Ok(true)` (matching [`ProcessId::is_alive`]'s open-failure convention).
 pub(crate) fn block_until_exit(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+    #[cfg(test)]
+    if fault::take_force_watch_error() {
+        return Err(fault::forced_watch_error());
+    }
     // Convert to an absolute deadline up front so EINTR retries don't extend the total wait.
     let deadline = timeout.map(|d| Instant::now().checked_add(d));
     backend::block_until_exit(id, deadline)

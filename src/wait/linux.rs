@@ -11,7 +11,7 @@ use crate::error::Error;
 use crate::identity::ProcessId;
 
 /// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
-fn open_verified(id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+pub(crate) fn open_verified(id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
         "pid {} exceeds i32::MAX; pidfd cast would truncate",

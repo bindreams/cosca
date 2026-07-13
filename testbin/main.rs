@@ -5,6 +5,17 @@
 use std::io::{Read, Write};
 use std::process::exit;
 
+#[cfg(windows)]
+fn install_ignore_break() {
+    use windows::core::BOOL;
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe extern "system" fn ignore(_event: u32) -> BOOL {
+        BOOL(1) // handled — do not die
+    }
+    // SAFETY: installing a console ctrl handler has no preconditions.
+    unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("");
@@ -119,6 +130,108 @@ fn main() {
             #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; TreeWalk kills it
             let _gc = std::process::Command::new(exe)
                 .args(["control-block", &addr, "G"])
+                .spawn()
+                .unwrap();
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(unix)]
+        "spawn-grandchild-ignore-term" => {
+            // spawn-grandchild where BOTH members ignore SIGTERM: the group's soft signal
+            // provably kills neither, so only a tree escalation's hard sweep tears them down.
+            // SAFETY: installing SIG_IGN for SIGTERM has no preconditions and is always safe.
+            unsafe {
+                let _ = libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            let _gc = std::process::Command::new(exe)
+                .args(["control-block-ignore-term", &addr, "G"])
+                .spawn()
+                .unwrap();
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(unix)]
+        "control-block-ack-term" => {
+            // Like control-block-ignore-term, but the SIGTERM handler ACKS by writing "T" to
+            // the control socket and returns — the process stays alive, so SIGKILL remains
+            // its only terminating signal AND signal delivery is observable as a real event.
+            use std::os::fd::AsRawFd;
+            static SOCK_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+            extern "C" fn ack(_sig: libc::c_int) {
+                let fd = SOCK_FD.load(std::sync::atomic::Ordering::Relaxed);
+                if fd >= 0 {
+                    // SAFETY: write(2) is async-signal-safe; the fd outlives the handler.
+                    unsafe { libc::write(fd, b"T".as_ptr().cast(), 1) };
+                }
+            }
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            SOCK_FD.store(sock.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: the handler only calls async-signal-safe write(2).
+            unsafe {
+                let _ = libc::signal(libc::SIGTERM, ack as *const () as libc::sighandler_t);
+            }
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            // Retry EINTR: the SIGTERM interrupts this read on platforms without SA_RESTART.
+            loop {
+                match sock.read(&mut buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    _ => break,
+                }
+            }
+        }
+        #[cfg(unix)]
+        "spawn-grandchild-stubborn-child" => {
+            // spawn-grandchild where only the GRANDCHILD ignores SIGTERM: the group's soft
+            // signal kills the root (default disposition) but leaves the grandchild — a
+            // survivor only the post-grace hard sweep can reach.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            let _gc = std::process::Command::new(exe)
+                .args(["control-block-ignore-term", &addr, "G"])
+                .spawn()
+                .unwrap();
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(windows)]
+        "control-block-ignore-break" => {
+            // Ignore CTRL_BREAK, then behave exactly like control-block — only a hard kill ends us.
+            install_ignore_break();
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(windows)]
+        "spawn-grandchild-ignore-break" => {
+            // spawn-grandchild where BOTH members ignore CTRL_BREAK: whether or not the soft
+            // group signal reaches this console group, only the hard sweep tears them down.
+            install_ignore_break();
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            let _gc = std::process::Command::new(exe)
+                .args(["control-block-ignore-break", &addr, "G"])
                 .spawn()
                 .unwrap();
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();

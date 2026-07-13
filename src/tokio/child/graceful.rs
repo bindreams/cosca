@@ -1,5 +1,6 @@
-//! `Child` graceful shutdown — the soft-then-hard escalation trio. A submodule of `child`
-//! so it can reach `Child`'s private `shared`/`id`.
+//! Async `Child` graceful shutdown — the soft-then-hard escalation trio. A submodule of
+//! `child` (mirroring the sync `src/child/graceful.rs`) so it can reach `Child`'s private
+//! `require_contained` and fields.
 
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -13,7 +14,7 @@ impl Child {
     /// pid. Unix only — Windows has no per-process graceful signal and returns `Unsupported`
     /// (use [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) for a contained child).
     pub fn terminate(&self) -> Result<(), Error> {
-        crate::wait::terminate(self.id)
+        crate::wait::terminate(self.id())
     }
 
     /// Cooperative-then-forced lone shutdown: `SIGTERM`, wait up to `grace` for the child to
@@ -24,18 +25,30 @@ impl Child {
     /// Escalation proceeds even if the child ignores `SIGTERM`. Unix only; Windows returns
     /// `Unsupported`. `grace` is relative; `Duration::ZERO` signals, polls once, then escalates.
     ///
+    /// Dropping this future mid-grace cancels the exit watch (the `AsyncFd` deregisters and
+    /// the fd closes) and performs no further signalling — the child stays owned, and
+    /// `Drop`'s teardown still applies.
+    ///
     /// A watch failure never skips the kill and reap; it surfaces only after they run, and a
     /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
     /// applies).
-    pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        crate::wait::terminate(self.id)?; // SIGTERM (Windows: Unsupported, early return)
-
-        let watch = self.wait_timeout(grace);
-        if let Ok(Some(status)) = &watch {
-            return Ok(*status); // exited within grace (already reaped by wait_timeout)
+    ///
+    /// # Runtime
+    ///
+    /// Needs a runtime with the IO **and** time drivers enabled (the `#[tokio::main]` /
+    /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
+    /// rather than returning a typed error.
+    pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
+        crate::wait::terminate(self.id())?;
+        // A watch failure must not strand the child between the soft signal and the
+        // escalation — kill and reap still run (grace unobservable => escalate now); the
+        // watch error surfaces only after they succeed (a kill/reap error wins — deliberate
+        // subsumption, mirroring kill_tree's both-fail disposition).
+        let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
+        if !matches!(watch, Ok(true)) {
+            self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
         }
-        self.shared.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
-        let status = self.wait()?;
+        let status = self.wait().await?;
         watch?;
         Ok(status)
     }
@@ -53,18 +66,27 @@ impl Child {
     /// unconditional but a no-op once the tree has drained, so a graceful exit's status is
     /// preserved (the lone backstop no-ops on the already-dead root).
     ///
+    /// Dropping this future mid-grace cancels the exit watch (on all platforms — the Windows
+    /// watcher is released via its cancel event) and performs no further signalling — the
+    /// child stays owned, and `Drop`'s teardown still applies.
+    ///
     /// A watch failure never skips the sweep and reap; a sweep error wins over it — and over
     /// a graceful root exit (survivors may remain; the root is still reaped first when its
     /// exit was observed, otherwise the child stays owned for `Drop`).
-    pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        // Fail fast before sending any signal. terminate_tree/kill_tree re-check this guard
-        // internally; the redundancy is intentional so an uncontained child errors up front.
-        self.require_contained()?;
-        self.terminate_tree()?; // group SIGTERM / CTRL_BREAK (signal-only)
-
+    ///
+    /// # Runtime
+    ///
+    /// On Unix, needs a runtime with the IO **and** time drivers enabled (the
+    /// `#[tokio::main]` / `#[tokio::test]` defaults) — missing either, tokio panics rather
+    /// than returning a typed error. On Windows the grace-wait runs on the blocking pool:
+    /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
+    /// pool accordingly for many long concurrent shutdowns.
+    pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
+        // terminate_tree's own require_contained guard fires before any signal, so an
+        // uncontained child errors up front.
+        self.terminate_tree()?;
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
-        let watch = crate::wait::block_until_exit(self.id, Some(grace)); // NON-reaping grace-wait on root
-
+        let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
         // drained (the survivor-sweep scenario). A sweep Err subsumes any watch Err; it must
         // propagate before the reap on a LIVE root (waiting unswept would hang), but once the
@@ -75,11 +97,11 @@ impl Child {
                 // observed exit). The sweep Err stays the verdict: the status, and even a distinct
                 // reap Err (a wait failure on the zombie), are subsumed — live survivors are the
                 // actionable failure, and the child stays owned for Drop's teardown.
-                let _ = self.wait();
+                let _ = self.wait().await;
             }
             return Err(sweep);
         }
-        let status = self.wait()?;
+        let status = self.wait().await?;
         watch?;
         Ok(status)
     }

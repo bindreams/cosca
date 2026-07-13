@@ -133,3 +133,57 @@ fn nested_attach_is_delegated() {
         );
     }
 }
+
+// kill_tree handle-backstop (treewalk fault seam) =====
+
+// A long-lived TreeWalk-contained child; no descendants, so with the root identity-kill
+// seam-disabled the ONLY killer is kill_tree's handle backstop. Armed AFTER the fallible
+// spawn so a spawn panic cannot leak the flag.
+#[test]
+fn sync_kill_tree_backstop_is_load_bearing() {
+    use super::super::treewalk::fault;
+    let mut cmd = crate::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let child = cmd.spawn().expect("spawn");
+    fault::set_force_root_kill_noop(true);
+    let result = child.kill_tree();
+    assert!(
+        !fault::armed(),
+        "seam not consumed — hard_kill did not run on the arming thread"
+    );
+    result.expect("kill_tree via backstop");
+    let status = child.wait().expect("reap");
+    assert!(
+        !status.success(),
+        "the handle backstop must be what killed the root, got {status:?}"
+    );
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_kill_tree_backstop_is_load_bearing() {
+    use super::super::treewalk::fault;
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    fault::set_force_root_kill_noop(true);
+    let result = child.kill_tree();
+    assert!(
+        !fault::armed(),
+        "seam not consumed — hard_kill did not run on the arming thread"
+    );
+    result.expect("kill_tree via backstop");
+    let status = child.wait().await.expect("reap");
+    assert!(
+        !status.success(),
+        "the handle backstop must be what killed the root, got {status:?}"
+    );
+}

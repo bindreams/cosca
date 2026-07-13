@@ -97,6 +97,19 @@ impl Command {
         self
     }
 
+    /// Contain with a specific [`ContainMode`](crate::ContainMode).
+    pub fn contain_with(&mut self, mode: crate::ContainMode) -> &mut Command {
+        self.inner.contain_with(mode);
+        self
+    }
+
+    /// Set how this contained spawn marks its descendants (default
+    /// [`Nesting::Mark`](crate::containment::Nesting::Mark)).
+    pub fn nesting(&mut self, nesting: crate::containment::Nesting) -> &mut Command {
+        self.inner.nesting(nesting);
+        self
+    }
+
     /// Spawn the child. Spawn is synchronous; the returned `Child`'s waits are async.
     ///
     /// # Runtime
@@ -141,3 +154,7 @@ impl Command {
         String::from_utf8(out.stdout).map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
 }
+
+#[cfg(test)]
+#[path = "command_tests.rs"]
+mod command_tests;
