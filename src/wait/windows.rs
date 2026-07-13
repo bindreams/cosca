@@ -2,12 +2,13 @@
 //! object, so a reused pid cannot fool it; we re-verify the start_token once at open.
 //! No reaping concept on Windows.
 
-use std::time::Instant;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    CreateEventW, OpenProcess, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::error::Error;
@@ -40,13 +41,79 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     };
     // SAFETY: `handle` is a live process handle held for the wait's duration.
     let waited = unsafe { WaitForSingleObject(handle, ms) };
+    // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
+    let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
+    close(handle);
+    match wait_err {
+        None => Ok(waited == WAIT_OBJECT_0), // exited, or WAIT_TIMEOUT => still alive
+        Some(e) => Err(Error::Io(e)),
+    }
+}
+
+/// An unnamed manual-reset event, initially unsignaled, for releasing
+/// `block_until_exit_or_cancel` early. Signal with [`signal_cancel`]; `OwnedHandle` closes it.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
+pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
+    // SAFETY: creating an unnamed event has no preconditions; the handle is immediately
+    // wrapped in an OwnedHandle, which closes it.
+    let h = unsafe { CreateEventW(None, true, false, None) }.map_err(|e| Error::Io(e.into()))?;
+    // SAFETY: `h` is a freshly created, owned event handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h.0 as _) })
+}
+
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
+pub(crate) fn signal_cancel(event: &OwnedHandle) {
+    // SAFETY: `event` is a live event handle (the OwnedHandle keeps it open).
+    let set = unsafe { SetEvent(HANDLE(event.as_raw_handle())) };
+    // SetEvent on a live owned event has no documented failure mode; a silent failure would
+    // degrade the cancellation contract to an unbounded park, so fail LOUD. Release builds
+    // skip the assert during an unwind (the in-flight panic wins — never double-panic);
+    // debug builds assert even then, an abort being an acceptable price for visibility there.
+    debug_assert!(set.is_ok(), "SetEvent on an owned event handle failed: {set:?}");
+    if !std::thread::panicking() {
+        assert!(set.is_ok(), "SetEvent on an owned event handle failed: {set:?}");
+    }
+}
+
+/// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
+/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
+pub(crate) fn block_until_exit_or_cancel(id: ProcessId, grace: Duration, cancel: &OwnedHandle) -> Result<bool, Error> {
+    // SAFETY: OpenProcess tolerates a dead/invalid pid (returns Err); the handle is
+    // closed on every return path below.
+    let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid()) }
+    {
+        Ok(h) => h,
+        // gone / unopenable => exited (mirroring block_until_exit).
+        Err(_) => return Ok(true),
+    };
+    if !id.exists() {
+        close(handle);
+        return Ok(true); // recycled before open
+    }
+    // Deliberately capped at INFINITE-1, never true INFINITE: the cancel event — signaled on
+    // every drop path — is the release mechanism for large graces, and the cap is the
+    // last-resort bound. (block_until_exit's None => INFINITE is for deliberately unbounded waits.)
+    let ms = grace.as_millis().min((INFINITE - 1) as u128) as u32;
+    let handles = [handle, HANDLE(cancel.as_raw_handle())];
+    // SAFETY: both handles are live for the wait's duration.
+    let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+    // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
+    let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
     if waited == WAIT_OBJECT_0 {
-        Ok(true)
-    } else if waited == WAIT_TIMEOUT {
-        Ok(false)
+        Ok(true) // process exited
+    } else if waited.0 == WAIT_OBJECT_0.0 + 1 || waited == WAIT_TIMEOUT {
+        Ok(false) // released by cancel, or grace elapsed — still alive either way
+    } else if let Some(e) = wait_failed {
+        Err(Error::Io(e))
     } else {
-        Err(Error::Io(std::io::Error::last_os_error()))
+        // Events cannot be abandoned (a mutex verdict); anything else is undocumented.
+        // Report the raw verdict — GetLastError is only meaningful for WAIT_FAILED.
+        debug_assert!(false, "unexpected WaitForMultipleObjects verdict: {waited:?}");
+        Err(Error::Io(std::io::Error::other(format!(
+            "unexpected WaitForMultipleObjects result: {waited:?}"
+        ))))
     }
 }
 

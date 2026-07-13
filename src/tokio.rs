@@ -8,6 +8,8 @@ mod command;
 mod pump;
 #[path = "tokio/spawn.rs"]
 mod spawn;
+#[path = "tokio/wait.rs"]
+pub(crate) mod wait;
 
 pub use child::Child;
 pub use command::Command;

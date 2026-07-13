@@ -55,6 +55,28 @@ impl Containment {
     }
 }
 
+/// Guard for the `_tree` operations, shared by the sync and async `Child`: they act on the
+/// containment group's teardown mechanism, so a child whose mechanism is a no-op has no tree
+/// to act on.
+pub(crate) fn require_contained(containment: Containment, attached: &Attached) -> Result<(), crate::error::Error> {
+    debug_assert_eq!(
+        containment.can_teardown(),
+        attached.is_actionable(),
+        "Containment/Attached actionability diverged"
+    );
+    if !attached.is_actionable() {
+        return Err(crate::error::Error::Unsupported {
+            op: "tree teardown (kill_tree / terminate_tree)".into(),
+            platform: std::env::consts::OS,
+            detail: "this child holds no actionable tree-teardown mechanism (uncontained, \
+                     or a nested member of an ancestor's containment group). Use kill() for a \
+                     lone process, or tear down the tree via the outermost .contain()ed handle."
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 impl fmt::Display for Containment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

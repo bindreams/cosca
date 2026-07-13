@@ -69,25 +69,9 @@ impl Child {
         self.containment
     }
 
-    /// Guard for the `_tree` operations: they act on the containment group's teardown
-    /// mechanism, so a child whose mechanism is a no-op has no tree to act on.
+    /// Guard for the `_tree` operations (single-sourced with the async `Child`).
     fn require_contained(&self) -> Result<(), Error> {
-        debug_assert_eq!(
-            self.containment.can_teardown(),
-            self.attached.is_actionable(),
-            "Containment/Attached actionability diverged"
-        );
-        if !self.attached.is_actionable() {
-            return Err(Error::Unsupported {
-                op: "tree teardown (kill_tree / terminate_tree)".into(),
-                platform: std::env::consts::OS,
-                detail: "this child holds no actionable tree-teardown mechanism (uncontained, \
-                         or a nested member of an ancestor's containment group). Use kill() for a \
-                         lone process, or tear down the tree via the outermost .contain()ed handle."
-                    .into(),
-            });
-        }
-        Ok(())
+        crate::containment::require_contained(self.containment, &self.attached)
     }
 
     /// This child's stable identity (see [`crate::identity::ProcessId`]).
@@ -119,6 +103,7 @@ impl Child {
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use `kill()` for a lone process).
+    /// If both the group teardown and the handle backstop fail, the group error is returned.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         let group_result = self.attached.hard_kill();

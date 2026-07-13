@@ -222,22 +222,51 @@ pub(crate) fn kill_by_identity(id: ProcessId) {
 pub(crate) fn hard_kill(root: ProcessId) {
     let parents = crate::containment::enumerate::process_parents();
     let descendants = descendants(root, &parents);
+    // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
+    #[cfg(test)]
+    let skip_root = fault::take_force_root_kill_noop();
+    #[cfg(not(test))]
+    let skip_root = false;
     #[cfg(unix)]
     {
-        kill_by_identity(root, Signal::SIGKILL);
+        if !skip_root {
+            kill_by_identity(root, Signal::SIGKILL);
+        }
         for id in descendants {
             kill_by_identity(id, Signal::SIGKILL);
         }
     }
     #[cfg(windows)]
     {
-        kill_by_identity(root);
+        if !skip_root {
+            kill_by_identity(root);
+        }
         for id in descendants {
             kill_by_identity(id);
         }
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (root, descendants);
+    let _ = (root, descendants, skip_root);
+}
+
+/// Test-only: force the NEXT `hard_kill` on THIS thread to skip the root's identity kill
+/// (makes the `kill_tree` handle backstop forcible). Take semantics: `hard_kill` consumes the
+/// flag — arm and call on one thread; assert consumption via [`armed`].
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    thread_local! {
+        static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn set_force_root_kill_noop(on: bool) {
+        FORCE_ROOT_KILL_NOOP.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_root_kill_noop() -> bool {
+        FORCE_ROOT_KILL_NOOP.with(|f| f.replace(false))
+    }
+    pub(crate) fn armed() -> bool {
+        FORCE_ROOT_KILL_NOOP.with(|f| f.get())
+    }
 }
 
 /// Graceful termination of the tree rooted at `root`.

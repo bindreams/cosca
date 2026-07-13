@@ -1,6 +1,9 @@
 //! Async `Child` handle, wrapping `::tokio::process::Child` plus the stable `ProcessId` and the
 //! contained-tree `Attached`.
 
+#[path = "child/graceful.rs"]
+mod graceful;
+
 use std::process::ExitStatus;
 
 use crate::containment::{Attached, Containment};
@@ -64,6 +67,44 @@ impl Child {
     /// Exit status if the child has already exited (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
         self.child.try_wait().map_err(Error::Io)
+    }
+
+    /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
+    /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
+    /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
+    /// `wait().await` (or `Drop`) collects the exit status.
+    pub fn kill(&mut self) -> Result<(), Error> {
+        self.child.start_kill().map_err(Error::Io)
+    }
+
+    /// Hard-kill the contained tree. Requires an actionable containment mechanism
+    /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
+    /// If both the group teardown and the handle backstop fail, the group error is returned.
+    pub fn kill_tree(&mut self) -> Result<(), Error> {
+        self.require_contained()?;
+        let group_result = self.attached.hard_kill();
+        // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
+        // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
+        // covers that, so its failure is contract-relevant.
+        let backstop = self.kill();
+        // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.
+        group_result.and(backstop)
+    }
+
+    /// Send the graceful termination signal to the contained group — `SIGTERM` via
+    /// `killpg`/cgroup, or `CTRL_BREAK` to the job/console group. **Signal-only:** does
+    /// not wait or reap. Requires an actionable containment mechanism (errors
+    /// `Unsupported` otherwise). Cooperative best-effort: on the `TreeWalk` mechanism a
+    /// descendant whose identity transiently fails to resolve is intentionally left
+    /// unsignaled; [`kill_tree`](Child::kill_tree) is the guaranteed hard teardown.
+    pub fn terminate_tree(&self) -> Result<(), Error> {
+        self.require_contained()?;
+        self.attached.terminate(self.id.pid())
+    }
+
+    /// Guard for the `_tree` operations (single-sourced with the sync `Child`).
+    fn require_contained(&self) -> Result<(), Error> {
+        crate::containment::require_contained(self.containment, &self.attached)
     }
 }
 

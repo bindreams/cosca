@@ -168,6 +168,35 @@ fn child_graceful_shutdown_tree_escalates() {
 
 #[cfg(unix)]
 #[test]
+fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
+    // The exact case the sweep-before-reap invariant protects: the root honors the group
+    // SIGTERM and exits within the grace, but the grandchild ignores it and survives — only
+    // the post-grace hard sweep (running while the unreaped root still pins the group id)
+    // can tear it down. The root's status stays SIGTERM: the sweep no-ops on the dead root.
+    let (child, mut socks) = common::spawn_tree("spawn-grandchild-stubborn-child", true);
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("tree graceful with survivor");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "root must exit via SIGTERM (graceful), got {status:?}"
+    );
+    for (i, s) in socks.iter_mut().enumerate() {
+        let mut buf = [0u8; 1];
+        match s.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("tree member {i} not torn down: {other:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn process_terminate_sends_sigterm() {
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
