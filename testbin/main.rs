@@ -5,6 +5,22 @@
 use std::io::{Read, Write};
 use std::process::exit;
 
+/// Borrow a std stream's raw descriptor as an UNBUFFERED `File`. `ManuallyDrop` keeps the
+/// real descriptor open (a plain `File` drop would close it — double-close on exit).
+/// Callers must pass one of this process's std descriptors, which live for the whole run.
+#[cfg(unix)]
+fn borrow_std_file(fd: std::os::fd::RawFd) -> std::mem::ManuallyDrop<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the fd is live per the contract above; ManuallyDrop prevents the close.
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+#[cfg(windows)]
+fn borrow_std_file(handle: std::os::windows::io::RawHandle) -> std::mem::ManuallyDrop<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: the handle is live per the contract above; ManuallyDrop prevents the close.
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
 #[cfg(windows)]
 fn install_ignore_break() {
     use windows::core::BOOL;
@@ -67,6 +83,33 @@ fn main() {
             }
             stdout.flush().unwrap();
             stderr.flush().unwrap();
+        }
+        "stdin-split-echo" => {
+            // Prove the In-direction merge dup: fd 0 and fd 2 are dups of ONE pipe, so
+            // reading EXACTLY n bytes from fd 0 and then fd 2 to EOF splits a single
+            // ordered stream. "<head>|<tail>" on stdout is only produced if fd 2 is a
+            // LIVE dup. fd 0 must be read UNBUFFERED — std::io::stdin()'s BufReader
+            // would over-read into its buffer, stealing the bytes destined for fd 2.
+            let n: usize = args[2].parse().unwrap();
+            #[cfg(unix)]
+            let (mut fd0, mut fd2) = (borrow_std_file(0), borrow_std_file(2));
+            #[cfg(windows)]
+            let (mut fd0, mut fd2) = {
+                use std::os::windows::io::AsRawHandle;
+                (
+                    borrow_std_file(std::io::stdin().as_raw_handle()),
+                    borrow_std_file(std::io::stderr().as_raw_handle()),
+                )
+            };
+            let mut head = vec![0u8; n];
+            fd0.read_exact(&mut head).unwrap();
+            let mut tail = Vec::new();
+            fd2.read_to_end(&mut tail).unwrap();
+            let mut out = std::io::stdout().lock();
+            out.write_all(&head).unwrap();
+            out.write_all(b"|").unwrap();
+            out.write_all(&tail).unwrap();
+            out.flush().unwrap();
         }
         "emit-raw" => {
             // Write raw bytes (as hex pairs) to stdout; used to test invalid-UTF-8 handling.

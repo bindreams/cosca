@@ -76,9 +76,14 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
 }
 
 /// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
-/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`.
+/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`;
+/// `None` = unbounded.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
-pub(crate) fn block_until_exit_or_cancel(id: ProcessId, grace: Duration, cancel: &OwnedHandle) -> Result<bool, Error> {
+pub(crate) fn block_until_exit_or_cancel(
+    id: ProcessId,
+    grace: Option<Duration>,
+    cancel: &OwnedHandle,
+) -> Result<bool, Error> {
     // SAFETY: OpenProcess tolerates a dead/invalid pid (returns Err); the handle is
     // closed on every return path below.
     let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid()) }
@@ -91,10 +96,20 @@ pub(crate) fn block_until_exit_or_cancel(id: ProcessId, grace: Duration, cancel:
         close(handle);
         return Ok(true); // recycled before open
     }
-    // Deliberately capped at INFINITE-1, never true INFINITE: the cancel event — signaled on
-    // every drop path — is the release mechanism for large graces, and the cap is the
-    // last-resort bound. (block_until_exit's None => INFINITE is for deliberately unbounded waits.)
-    let ms = grace.as_millis().min((INFINITE - 1) as u128) as u32;
+    let ms = match grace {
+        None => INFINITE,
+        // Capped at INFINITE-1 (~49.7 days) — the cancel event releases large graces early;
+        // a debug_assert flags the rare clamp.
+        Some(d) => {
+            let clamped = d.as_millis().min((INFINITE - 1) as u128) as u32;
+            debug_assert!(
+                d.as_millis() <= (INFINITE - 1) as u128,
+                "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
+                d.as_secs()
+            );
+            clamped
+        }
+    };
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // SAFETY: both handles are live for the wait's duration.
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };

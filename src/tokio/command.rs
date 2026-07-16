@@ -10,11 +10,13 @@ use super::child::Child;
 
 /// An async (tokio) process to configure and spawn — mirrors [`subprocess::Command`](crate::Command).
 ///
-/// # Limitations (vs the sync API)
+/// # Limitations
 ///
-/// Arbitrary descriptors (fd ≥ 3) and merging stderr/stdout into a *piped* target are not yet
-/// supported on the async API (they need an async parent pipe end) and return
-/// [`Error::Unsupported`](crate::error::Error::Unsupported) at spawn.
+/// Mirror the sync API: arbitrary descriptors (fd ≥ 3) are Unix-only — parent pipe ends via
+/// `Child::fd_read_end`/`Child::fd_write_end`; Windows returns the sync path's typed
+/// [`Error::Unsupported`](crate::error::Error::Unsupported) at spawn. Merging into a *piped*
+/// target works on all platforms, in both directions; a merge whose target is itself a merge
+/// is rejected.
 #[derive(Debug, Default)]
 pub struct Command {
     inner: SyncCommand,

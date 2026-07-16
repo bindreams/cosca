@@ -196,35 +196,6 @@ fn async_spawn_on_io_disabled_runtime_succeeds_on_windows() {
 }
 
 #[tokio::test]
-async fn async_merge_into_pipe_is_unsupported() {
-    let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(common::testbin())
-        .args(["subprocess_testbin", "exit", "0"]);
-    cmd.stdout(subprocess::Stdio::pipe()).unwrap();
-    cmd.stderr(subprocess::Stdio::merge(subprocess::Fd::STDOUT)).unwrap();
-    let err = cmd.spawn().expect_err("merge into a piped target is unsupported");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn async_fd3_is_unsupported() {
-    // The async strict-subset rejection of arbitrary fd >= 3 (a non-pipe slot, so `fd()` itself
-    // accepts it; the rejection is at spawn).
-    let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(common::testbin())
-        .args(["subprocess_testbin", "exit", "0"]);
-    cmd.fd(subprocess::Fd::from(3), subprocess::Stdio::null()).unwrap();
-    let err = cmd.spawn().expect_err("fd >= 3 is unsupported on the async API");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
-}
-
-#[tokio::test]
 async fn async_chained_merge_is_unsupported() {
     // A merge whose target is itself a merge → Unsupported (mirrors the sync chained-merge test):
     // stderr -> stdout, and stdout -> stdin, so stdout's resolved kind is Merge.
@@ -369,6 +340,355 @@ async fn async_drop_leaves_no_zombie() {
         Some(id),
         "Drop must fully reap the child (no lingering process/zombie at its identity)"
     );
+}
+
+// Arbitrary fd (n>=3) — Unix only, wired via command-fds (async mirror of spawn_io.rs) =====
+
+/// Async twin of sync `unix_fd3_pipe_round_trips`: the testbin's `fd3-echo` mode reads fd 3
+/// and copies it to stdout. Write a known payload into the parent write end, close it (EOF),
+/// read stdout to EOF — no timers, fully deterministic.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd3_pipe_round_trips() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-echo"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.fd(3, subprocess::Stdio::pipe_in()).expect("fd 3 pipe_in");
+    let mut child = cmd.spawn().expect("spawn with fd 3");
+    let mut stdout = child.stdout().expect("stdout reader");
+    let mut fd3_writer = child.fd_write_end(subprocess::Fd::from(3)).expect("fd 3 writer");
+
+    fd3_writer.write_all(b"hello fd3").await.expect("write to fd 3");
+    drop(fd3_writer); // EOF on the child's fd 3 read end
+
+    let mut buf = Vec::new();
+    stdout.read_to_end(&mut buf).await.expect("read stdout");
+    drop(stdout);
+    let _ = child.wait().await;
+
+    assert_eq!(buf, b"hello fd3");
+}
+
+/// Async twin of sync `unix_fd3_null_is_accepted`: fd 3 as `Stdio::null()` spawns, the child
+/// reads immediate EOF from /dev/null and produces no output, exiting cleanly.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd3_null_is_accepted() {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-echo"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.fd(3, subprocess::Stdio::null()).expect("fd 3 null");
+    let mut child = cmd.spawn().expect("spawn with null fd 3");
+    let mut stdout = child.stdout().expect("stdout reader");
+    let mut buf = Vec::new();
+    stdout.read_to_end(&mut buf).await.expect("read stdout");
+    let status = child.wait().await.expect("reap");
+    assert!(buf.is_empty(), "null fd 3 is immediate EOF — no echo, got {buf:?}");
+    assert_eq!(status.code(), Some(0));
+}
+
+/// Async twin of sync `arbitrary_fd_is_unsupported_on_windows`: config attaches fine, spawn
+/// rejects with the sync path's typed error.
+#[cfg(windows)]
+#[tokio::test]
+async fn async_fd3_is_unsupported_on_windows() {
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "exit", "0"]);
+    cmd.fd(3, subprocess::Stdio::pipe_out()).unwrap(); // attaches fine
+    let err = cmd.spawn().unwrap_err(); // but spawn rejects it on Windows
+    assert!(matches!(err, subprocess::error::Error::Unsupported { .. }));
+}
+
+/// fd 3 as pipe_out: the testbin's `fd3-write` mode writes a token to fd 3; the parent
+/// reads it back via the reactor-registered `fd_read_end`.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-write", "fd3-token"]);
+    cmd.fd(3, subprocess::Stdio::pipe_out()).expect("fd 3 pipe_out");
+    let mut child = cmd.spawn().expect("spawn with fd 3 out");
+    let mut fd3_reader = child.fd_read_end(subprocess::Fd::from(3)).expect("fd 3 reader");
+    let mut buf = Vec::new();
+    fd3_reader.read_to_end(&mut buf).await.expect("read fd 3");
+    let _ = child.wait().await;
+    assert_eq!(buf, b"fd3-token");
+}
+
+/// A wrong-direction accessor must NOT consume the stashed end (the put-back arm): after
+/// the mismatched take returns `None`, the correctly-directioned accessor still yields a
+/// WORKING end — proven by a full round-trip, both directions.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_fd3_wrong_direction_take_puts_the_end_back() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // pipe_in: the read-accessor first (wrong) must not lose the write end.
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-echo"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.fd(3, subprocess::Stdio::pipe_in()).expect("fd 3 pipe_in");
+    let mut child = cmd.spawn().expect("spawn");
+    assert!(
+        child.fd_read_end(subprocess::Fd::from(3)).is_none(),
+        "wrong direction is None"
+    );
+    let mut w = child
+        .fd_write_end(subprocess::Fd::from(3))
+        .expect("the write end survives the wrong-direction take");
+    w.write_all(b"put-back").await.expect("write");
+    drop(w);
+    let mut buf = Vec::new();
+    child
+        .stdout()
+        .expect("stdout")
+        .read_to_end(&mut buf)
+        .await
+        .expect("read");
+    let _ = child.wait().await;
+    assert_eq!(buf, b"put-back");
+
+    // pipe_out: the write-accessor first (wrong) must not lose the read end.
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-write", "still-here"]);
+    cmd.fd(3, subprocess::Stdio::pipe_out()).expect("fd 3 pipe_out");
+    let mut child = cmd.spawn().expect("spawn");
+    assert!(
+        child.fd_write_end(subprocess::Fd::from(3)).is_none(),
+        "wrong direction is None"
+    );
+    let mut r = child
+        .fd_read_end(subprocess::Fd::from(3))
+        .expect("the read end survives the wrong-direction take");
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).await.expect("read fd 3");
+    let _ = child.wait().await;
+    assert_eq!(buf, b"still-here");
+}
+
+// Merge into a piped target (all platforms; our-owned pipes) =====
+
+#[tokio::test]
+async fn async_merge_stderr_onto_stdout_combines_output() {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = subprocess::tokio::Command::new();
+    // Same scenario as sync merge_stderr_onto_stdout_combines_output (tests/spawn_io.rs):
+    // emit 3 bytes to stdout, 2 to stderr; merged, all 5 arrive on the one stdout pipe.
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "emit", "3", "2"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(subprocess::Stdio::merge(subprocess::Fd::STDOUT))
+        .expect("stderr merge");
+    let mut child = cmd.spawn().expect("spawn merged");
+    let mut reader = child.stdout().expect("merged stdout reader");
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).await.expect("read merged");
+    drop(reader);
+    let _ = child.wait().await;
+    // All 5 bytes arrive; order between stdout/stderr is unspecified, but the COUNTS are
+    // exact — a regression that drops stderr and doubles stdout cannot pass.
+    assert_eq!(
+        buf.len(),
+        5,
+        "expected 5 bytes (3 stdout + 2 stderr merged), got {buf:?}"
+    );
+    assert_eq!(
+        buf.iter().filter(|&&b| b == b'o').count(),
+        3,
+        "3 stdout bytes, got {buf:?}"
+    );
+    assert_eq!(
+        buf.iter().filter(|&&b| b == b'e').count(),
+        2,
+        "2 stderr bytes, got {buf:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_merge_into_unpiped_targets_still_works() {
+    // Regression: merge into null stays on the existing (non-owned) path.
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "emit", "3", "2"]);
+    cmd.stdout(subprocess::Stdio::null()).expect("stdout null");
+    cmd.stderr(subprocess::Stdio::merge(subprocess::Fd::STDOUT))
+        .expect("stderr merge");
+    let mut child = cmd.spawn().expect("spawn");
+    let status = child.wait().await.expect("reap");
+    assert_eq!(status.code(), Some(0));
+}
+
+#[tokio::test]
+async fn async_communicate_reads_a_merged_stream() {
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "emit", "3", "2"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(subprocess::Stdio::merge(subprocess::Fd::STDOUT))
+        .expect("stderr merge");
+    let mut child = cmd.spawn().expect("spawn");
+    let out = child.communicate(None).await.expect("communicate");
+    assert_eq!(
+        out.stdout.len(),
+        5,
+        "merged bytes arrive on stdout, got {:?}",
+        out.stdout
+    );
+    assert!(out.stderr.is_empty(), "stderr was merged away");
+}
+
+#[tokio::test]
+async fn async_merged_stream_accessor_has_take_semantics() {
+    // stdout() as a piped merge target: first take yields the reader, second is None
+    // (take semantics, matching the tokio-owned branch).
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "emit", "3", "2"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(subprocess::Stdio::merge(subprocess::Fd::STDOUT))
+        .expect("stderr merge");
+    let mut child = cmd.spawn().expect("spawn");
+    let first = child.stdout();
+    assert!(first.is_some(), "first stdout() take yields the merged reader");
+    assert!(
+        child.stdout().is_none(),
+        "second stdout() take must be None (take semantics)"
+    );
+    // The MERGING slot (stderr) has no stream of its own: tokio's stderr was never piped.
+    assert!(child.stderr().is_none(), "a merged-away slot yields no stream");
+    drop(first); // close the parent end so the child's writes cannot block forever
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn async_non_merged_stream_accessor_has_take_semantics() {
+    // Regression test: stdin, stdout, stderr's take-semantics when NOT merge targets.
+    // (The pre-pass skips slots it assigns; this ensures stdin/stdout/stderr still behave
+    // correctly for non-merge configurations.)
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "emit", "5", "0"]);
+    cmd.stdin(subprocess::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(subprocess::Stdio::null()).expect("stderr null");
+    let mut child = cmd.spawn().expect("spawn");
+
+    assert!(child.stdin().is_some(), "first stdin() take");
+    assert!(child.stdin().is_none(), "second stdin() take is None");
+    assert!(child.stdout().is_some(), "first stdout() take");
+    assert!(child.stdout().is_none(), "second stdout() take is None");
+    assert!(child.stderr().is_none(), "stderr is null, so takes are always None");
+
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+async fn async_plain_piped_stream_accessor_has_take_semantics() {
+    // The tokio-owned (non-merge) branch's take-semantics: stdout piped (no merge), so
+    // tokio owns the internal pipe. Verifies parity with the merge-owned case above.
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "emit", "3", "0"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let first = child.stdout();
+    assert!(first.is_some(), "first take yields the tokio-owned reader");
+    assert!(child.stdout().is_none(), "second take must be None (take semantics)");
+    drop(first);
+    let _ = child.wait().await;
+}
+
+/// In-direction merge target on ALL platforms: stdin is piped and stderr merges into it,
+/// so the pre-pass owns stdin's pipe (tokio cannot share its internal one). The child's
+/// `stdin-split-echo` mode reads EXACTLY 3 bytes from fd 0, then fd 2 to EOF: dup'd
+/// descriptors share ONE pipe, so `abc|def` proves the merging slot's handle is a LIVE dup
+/// of that pipe — a silently skipped dup could not produce the tail. Parent writes via the
+/// OWNED stdin path (Windows `WinOwnedWrite`; Unix `pipe::Sender`), EOF by drop.
+#[tokio::test]
+async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "stdin-split-echo", "3"]);
+    cmd.stdin(subprocess::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(subprocess::Stdio::merge(subprocess::Fd::STDIN))
+        .expect("stderr merges into stdin");
+    let mut child = cmd.spawn().expect("spawn merged-stdin child");
+    let mut stdin = child.stdin().expect("owned stdin writer");
+    stdin.write_all(b"abcdef").await.expect("write");
+    drop(stdin); // buffered data is delivered first, then EOF (verified teardown order)
+    let mut buf = Vec::new();
+    child
+        .stdout()
+        .expect("stdout reader")
+        .read_to_end(&mut buf)
+        .await
+        .expect("read echo");
+    let _ = child.wait().await;
+    assert_eq!(buf, b"abc|def");
+}
+
+/// fd >= 3 as a merge SOURCE into a piped Out target: the pre-pass routes the dup'd write
+/// end through command-fds (never silently dropped). testbin's `fd3-write` emits its token
+/// on fd 3 — a dup of stdout's owned pipe — so the token arrives on the stdout reader.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_fd3_source_merges_into_piped_stdout() {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-write", "fd3-merged"]);
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.fd(3, subprocess::Stdio::merge(subprocess::Fd::STDOUT))
+        .expect("fd 3 merges into stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let mut buf = Vec::new();
+    child
+        .stdout()
+        .expect("stdout reader")
+        .read_to_end(&mut buf)
+        .await
+        .expect("read");
+    let _ = child.wait().await;
+    assert_eq!(buf, b"fd3-merged");
+}
+
+/// fd >= 3 as a merge SOURCE into a piped In target (one parent writer, several child read
+/// fds — the user-decided shape): fd 3 is a dup of the owned stdin read end; testbin's
+/// `fd3-echo` copies fd 3 to stdout, so the parent's stdin writes round-trip through the DUP.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_fd3_source_merges_into_piped_stdin() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cmd = subprocess::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["subprocess_testbin", "fd3-echo"]);
+    cmd.stdin(subprocess::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(subprocess::Stdio::pipe()).expect("stdout pipe");
+    cmd.fd(3, subprocess::Stdio::merge(subprocess::Fd::STDIN))
+        .expect("fd 3 merges into stdin");
+    let mut child = cmd.spawn().expect("spawn");
+    let mut stdin = child.stdin().expect("stdin writer");
+    stdin.write_all(b"via-the-dup").await.expect("write");
+    drop(stdin); // the parent writer is the ONLY write end — drop is EOF for the child
+    let mut buf = Vec::new();
+    child
+        .stdout()
+        .expect("stdout reader")
+        .read_to_end(&mut buf)
+        .await
+        .expect("read");
+    let _ = child.wait().await;
+    assert_eq!(buf, b"via-the-dup");
 }
 
 #[cfg(windows)]

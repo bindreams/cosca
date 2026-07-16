@@ -14,6 +14,7 @@ tokio = ["dep:tokio"]
 [dependencies]
 thiserror = "2"
 shared_child = { version = "1", features = ["timeout"] }
+log = "0.4"
 # `macros` is required by the library, not only tests: `communicate` uses `tokio::try_join!`,
 # which is gated behind tokio's `macros` feature. `net` is solely for `AsyncFd` (the
 # reactor-native death-watch); `time` solely for the grace bound on it.
@@ -23,6 +24,9 @@ tokio = { version = "1", optional = true, features = ["process", "rt", "io-util"
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
+# Unpredictable merge-target pipe names (std parity: std randomizes its anon-pipe names).
+# `std` for the `io::Error` conversion.
+getrandom = { version = "0.3", features = ["std"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Threading",

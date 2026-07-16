@@ -17,8 +17,8 @@ pub(crate) mod backend;
 compile_error!("subprocess::wait is implemented only for Linux, macOS, and Windows");
 
 /// Force the NEXT grace-watch on THIS thread to fail (consumed by `block_until_exit`,
-/// `Child::wait_timeout`, and `tokio::wait::grace_wait`), so the watch-error escalation
-/// ordering is testable. Same take-semantics contract as the treewalk fault seam.
+/// `Child::wait_timeout`, and `tokio::wait::{grace_wait, wait_exit}`), so the watch-error
+/// escalation ordering is testable. Same take-semantics contract as the treewalk fault seam.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
