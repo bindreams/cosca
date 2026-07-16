@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 // This module is declared INSIDE src/tokio/wait.rs, so `super` is `tokio::wait` itself.
-use super::grace_wait;
+use super::{grace_wait, wait_exit};
 use crate::identity::ProcessId;
 
 // A long-lived std child (leak-proof: killed + reaped by each test).
@@ -67,7 +67,7 @@ async fn grace_wait_true_when_child_dies_mid_wait() {
 
 // The Windows release mechanism itself, deterministically: a PRE-signaled cancel event must
 // release the wait on a LIVE child — no race, nothing to time. If the cancel plumbing were
-// broken, the wait would sit at the (effectively infinite) Duration::MAX cap and the test
+// broken, the wait would sit at the unbounded `None` (=> INFINITE) watch and the test
 // harness's own bound would surface the hang loudly.
 #[cfg(windows)]
 #[test]
@@ -76,8 +76,7 @@ fn cancel_event_releases_the_blocking_wait() {
     let id = ProcessId::of(child.id()).expect("identity of live child");
     let cancel = crate::wait::backend::new_cancel_event().expect("event");
     crate::wait::backend::signal_cancel(&cancel);
-    let exited =
-        crate::wait::backend::block_until_exit_or_cancel(id, Duration::MAX, &cancel).expect("cancellable wait");
+    let exited = crate::wait::backend::block_until_exit_or_cancel(id, None, &cancel).expect("cancellable wait");
     assert!(!exited, "a live child with a signaled cancel must report still-alive");
     child.kill().expect("cleanup");
     child.wait().expect("reap");
@@ -95,7 +94,7 @@ fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
     let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event().expect("event"));
     let watcher = std::thread::spawn({
         let cancel = cancel.clone();
-        move || crate::wait::backend::block_until_exit_or_cancel(id, Duration::MAX, &cancel)
+        move || crate::wait::backend::block_until_exit_or_cancel(id, None, &cancel)
     });
     crate::wait::backend::signal_cancel(&cancel);
     let exited = watcher.join().expect("watcher thread").expect("cancellable wait");
@@ -185,4 +184,86 @@ mod classify {
         // live child), not an error (would force-kill a graceful exit) — re-await.
         assert!(classify_pidfd_ready(Ready::EMPTY).is_none());
     }
+}
+
+#[tokio::test]
+async fn wait_exit_resolves_for_exited_unreaped_child() {
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).expect("identity of live child");
+    child.kill().expect("kill");
+    // NOT reaped: the exit event precedes the call, so the unbounded watch must resolve.
+    wait_exit(id).await.expect("wait_exit");
+    child.wait().expect("reap");
+}
+
+#[tokio::test]
+async fn wait_exit_resolves_when_child_dies_mid_wait() {
+    // Arm on a LIVE child; our own kill is the real exit event. Race-tolerant either side.
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).expect("identity of live child");
+    let watch = ::tokio::spawn(wait_exit(id));
+    child.kill().expect("kill mid-wait");
+    watch.await.expect("join").expect("wait_exit");
+    child.wait().expect("reap");
+}
+
+#[tokio::test]
+async fn grace_wait_zero_reports_an_observed_exit() {
+    // The ZERO one-shot probe must see an already-exited (zombie) child — the sync/async
+    // parity case a plain timeout(ZERO, ..) gets wrong (the AsyncFd readiness of a zombie
+    // needs a reactor round-trip the zero timer would win against).
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).expect("identity of live child");
+    child.kill().expect("kill");
+    // Observe the exit as a real event WITHOUT reaping: wait for it via the unbounded watch
+    // (30 s-class bound is the harness), then probe at ZERO.
+    wait_exit(id).await.expect("exit observed");
+    assert!(
+        grace_wait(id, Duration::ZERO).await.expect("zero probe"),
+        "an observed-exited child must report exited at ZERO grace"
+    );
+    child.wait().expect("reap");
+}
+
+#[tokio::test]
+async fn wait_exit_cancel_leaves_child_untouched() {
+    use std::future::Future;
+    // Poll the unbounded watch exactly once (arms it), then drop — the watch is signal-free,
+    // so the child must still be alive; it dies only by the test's own kill.
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).expect("identity of live child");
+    {
+        let mut fut = std::pin::pin!(wait_exit(id));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+            panic!("unbounded watch resolved at first poll on a live child: {r:?}");
+        }
+    } // <- future dropped here; on Windows the drop-guard releases the blocking watcher
+    assert!(id.is_alive(), "a cancelled watch must not affect the child");
+    child.kill().expect("cleanup");
+    child.wait().expect("reap");
+}
+
+// Proves release without a timeout: the watcher signals a channel when it returns; recv()
+// blocks until that happens.
+#[cfg(windows)]
+#[tokio::test]
+async fn wait_exit_drop_releases_the_windows_watcher() {
+    use std::future::Future;
+    let (tx, rx) = std::sync::mpsc::channel();
+    super::fault_observer::install_release_observer(tx);
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).expect("identity of live child");
+    {
+        let mut fut = std::pin::pin!(wait_exit(id));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+            panic!("unbounded watch resolved at first poll on a live child: {r:?}");
+        }
+    } // <- drop signals the cancel event
+    rx.recv()
+        .expect("the blocking watcher must return after the drop released it");
+    assert!(id.is_alive(), "release must be signal-free");
+    child.kill().expect("cleanup");
+    child.wait().expect("reap");
 }

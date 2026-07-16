@@ -339,9 +339,10 @@ pub(crate) enum PipeOwnership {
     /// Sync: create the OS pipe now (`std::io::pipe`), keep the child end for the
     /// child, and return the parent end to the caller.
     Owned,
-    /// Async: tokio owns piped ends. Pipe slots are left out of the resolved child
-    /// ends (the caller assigns `Stdio::piped()`), and a merge into a pipe target is
-    /// rejected — its end is tokio's, not ours to dup.
+    /// Async: tokio owns the piped STD ends (0/1/2) — those slots are left out of the
+    /// resolved child ends (the caller assigns `Stdio::piped()`), and a merge into a piped
+    /// STD target is rejected (its end is tokio's, not ours to dup). fd >= 3 pipes are OURS
+    /// on every path: they resolve like `Owned` and produce parent ends.
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     Deferred,
 }
@@ -380,7 +381,7 @@ pub(crate) fn resolve_stdio(
         let resolved = fds.get(&slot);
         match resolved {
             Some(ResolvedStdio::Merge(_)) => continue, // second pass
-            Some(ResolvedStdio::Pipe(_)) if matches!(pipe, PipeOwnership::Deferred) => continue,
+            Some(ResolvedStdio::Pipe(_)) if matches!(pipe, PipeOwnership::Deferred) && slot.raw() < 3 => continue,
             None if slot.raw() >= 3 => continue,
             _ => {
                 let (child_end, parent) = resolve_non_merge(slot, resolved)?;
@@ -396,7 +397,10 @@ pub(crate) fn resolve_stdio(
     // a merge into a pipe target has no child end of ours to dup — reject it.
     for &slot in slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
-            if matches!(pipe, PipeOwnership::Deferred) && matches!(fds.get(target), Some(ResolvedStdio::Pipe(_))) {
+            if matches!(pipe, PipeOwnership::Deferred)
+                && target.raw() < 3
+                && matches!(fds.get(target), Some(ResolvedStdio::Pipe(_)))
+            {
                 return Err(Error::Unsupported {
                     op: format!("async merge {slot} -> {target} (piped)"),
                     platform: std::env::consts::OS,

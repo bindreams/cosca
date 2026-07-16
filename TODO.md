@@ -74,13 +74,14 @@ To run the live test in CI:
 The async mirror shipped as an I/O foundation only; remaining items deferred to Plan 10:
 
 - [x] (Plan 9) Async `contain_with`/`nesting` builder modes.
-- [ ] Async parent-end access for fd ≥ 3 via `AsyncFd` (the async API rejects fd ≥ 3 at spawn).
-- [ ] Async merge-into-a-piped-target (rejected as `Unsupported`, mirroring the foundation subset).
+- [x] (Plan 10) Async parent-end access for fd ≥ 3 via tokio pipe ends (Unix, mirroring sync).
+- [x] (Plan 10) Async merge-into-a-piped-target (all platforms; Windows via an owned
+      overlapped named-pipe pair).
 - [x] (Plan 9) Async explicit control: `kill`/`kill_tree`/`terminate_tree` + the graceful trio
       (`terminate`/`graceful_shutdown`/`graceful_shutdown_tree`), on a reactor-native grace-wait
       (`AsyncFd` pidfd / kqueue; Windows: event-cancellable blocking wait — no pollable
       process handle).
-- [ ] Async foreign `Process` (introspect/wait/kill on a non-owned process).
+- [x] (Plan 10) Async foreign `Process` (introspect/wait/kill/graceful on a non-owned process).
 
 ## Hardening / tech-debt (from foundation review)
 

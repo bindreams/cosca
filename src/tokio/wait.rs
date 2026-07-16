@@ -12,28 +12,38 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::identity::ProcessId;
 
-/// `Ok(true)` = the process exited within `grace`; `Ok(false)` = still alive at the deadline.
-/// Non-reaping and signal-free; identity-verified (a stale/recycled id reports exited).
+/// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified
+/// (a stale/recycled id reports exited immediately). Cancellable: dropping the future
+/// deregisters the watch on Unix; on Windows the drop-guard's cancel event releases the
+/// blocking watcher promptly.
 #[cfg(unix)]
-pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
+pub(crate) async fn wait_exit(id: ProcessId) -> Result<(), Error> {
     // Shared watch fault seam (take-semantics; the async fn body runs on the arming thread).
     #[cfg(test)]
     if crate::wait::fault::take_force_watch_error() {
         return Err(crate::wait::fault::forced_watch_error());
     }
-    match ::tokio::time::timeout(grace, exit_watch(id)).await {
+    exit_watch(id).await
+}
+
+/// `Ok(true)` = the process exited within `grace`; `Ok(false)` = still alive at the deadline.
+/// Non-reaping and signal-free; identity-verified (a stale/recycled id reports exited).
+/// `Duration::ZERO` performs the sync backend's one-shot non-blocking probe.
+#[cfg(unix)]
+pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
+    if grace.is_zero() {
+        // Delegates to the sync ZERO probe (bounded-instant, safe from async); consumes the
+        // fault seam there.
+        return crate::wait::block_until_exit(id, Some(Duration::ZERO));
+    }
+    match ::tokio::time::timeout(grace, wait_exit(id)).await {
         Ok(watch) => watch.map(|()| true),
         Err(_elapsed) => Ok(false),
     }
 }
 
 #[cfg(windows)]
-pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
-    // Shared watch fault seam (take-semantics; the async fn body runs on the arming thread).
-    #[cfg(test)]
-    if crate::wait::fault::take_force_watch_error() {
-        return Err(crate::wait::fault::forced_watch_error());
-    }
+async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, Error> {
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
     /// returns promptly instead of parking out the grace, and `Runtime::drop` — which joins
     /// blocking tasks — does not stall.
@@ -45,9 +55,13 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
     }
     let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
-    let joined =
-        ::tokio::task::spawn_blocking(move || crate::wait::backend::block_until_exit_or_cancel(id, grace, &cancel))
-            .await;
+    let joined = ::tokio::task::spawn_blocking(move || {
+        let result = crate::wait::backend::block_until_exit_or_cancel(id, grace, &cancel);
+        #[cfg(test)]
+        fault_observer::notify_released();
+        result
+    })
+    .await;
     match joined {
         Ok(result) => result,
         // block_until_exit_or_cancel does not panic — a panic here is a bug, not an I/O
@@ -64,6 +78,67 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
         Err(e) => {
             debug_assert!(false, "unknown JoinError variant: {e:?}");
             Err(Error::Io(std::io::Error::other(e)))
+        }
+    }
+}
+
+/// `Ok(true)` = the process exited within `grace`; `Ok(false)` = still alive at the deadline.
+/// Non-reaping and signal-free; identity-verified (a stale/recycled id reports exited).
+/// `Duration::ZERO` performs the sync backend's one-shot non-blocking probe.
+///
+/// **Windows:** Graces >= ~49.7 days (`INFINITE - 1` ms) are silently clamped to that cap —
+/// a platform limit. A debug_assert surfaces this clamping in tests. On production, the clamp
+/// is silent; a use case needing a genuinely unbounded watch composes `wait()` (unbounded,
+/// cancellable) with its own escalation instead of a grace.
+#[cfg(windows)]
+pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
+    // Shared watch fault seam (take-semantics; the async fn body runs on the arming thread).
+    #[cfg(test)]
+    if crate::wait::fault::take_force_watch_error() {
+        return Err(crate::wait::fault::forced_watch_error());
+    }
+    blocking_watch(id, Some(grace)).await
+}
+
+/// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified
+/// (a stale/recycled id reports exited immediately). Cancellable: dropping the future
+/// deregisters the watch on Unix; on Windows the drop-guard's cancel event releases the
+/// blocking watcher promptly.
+#[cfg(windows)]
+pub(crate) async fn wait_exit(id: ProcessId) -> Result<(), Error> {
+    // Shared watch fault seam (take-semantics; the async fn body runs on the arming thread).
+    #[cfg(test)]
+    if crate::wait::fault::take_force_watch_error() {
+        return Err(crate::wait::fault::forced_watch_error());
+    }
+    // An unbounded watch (`None` => INFINITE) has no timeout path, and cancel-at-drop never
+    // RESOLVES the future (it is gone) — so a resolved watch means exit. If that contract
+    // ever broke, re-watching — not returning — preserves the postcondition (the Unix
+    // exit_watch's false-positive re-await idiom); the debug_assert trips it in tests.
+    loop {
+        let exited = blocking_watch(id, None).await?;
+        debug_assert!(exited, "an unbounded watch resolved without an exit");
+        if exited {
+            return Ok(());
+        }
+        log::warn!("unbounded watch for {id:?} resolved without an exit; re-watching");
+    }
+}
+
+/// Deliberate test scaffolding (the `wait::fault` pattern): signals when the blocking
+/// watcher RETURNS, so a test can prove drop-release with a plain `recv()` — the
+/// no-time-sync alternative to observing teardown timing. Absent from non-test builds.
+#[cfg(all(test, windows))]
+pub(crate) mod fault_observer {
+    use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
+    static RELEASE_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
+    pub(crate) fn install_release_observer(tx: Sender<()>) {
+        *RELEASE_TX.lock().unwrap() = Some(tx);
+    }
+    pub(crate) fn notify_released() {
+        if let Some(tx) = RELEASE_TX.lock().unwrap().as_ref() {
+            let _ = tx.send(());
         }
     }
 }
