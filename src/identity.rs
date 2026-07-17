@@ -6,11 +6,11 @@
 //! distinguishes "the same process" from "a reused PID".
 //!
 //! The token is the RAW kernel value (Windows creation `FILETIME`, Linux
-//! `/proc` `starttime` jiffies, macOS `proc_bsdinfo` start µs), compared
-//! exactly. It is deliberately NOT a wall-clock time: deriving wall-clock from
-//! boot time drifts under NTP and would silently break `Eq`/`Hash`. The
-//! human-facing wall-clock lives in `created_at()` (Task 2), allowed to drift
-//! and never used for identity.
+//! `/proc` `starttime` jiffies, macOS `sysctl KERN_PROC` (`kinfo_proc`) start
+//! µs), compared exactly. It is deliberately NOT a wall-clock time: deriving
+//! wall-clock from boot time drifts under NTP and would silently break
+//! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()` (Task 2),
+//! allowed to drift and never used for identity.
 
 pub(crate) mod stat_parse;
 
@@ -88,10 +88,9 @@ impl ProcessId {
 
     /// Whether a process with this exact identity is still *resolvable* (the
     /// zombie-inclusive sense, matching psutil's `is_running`). True for a not-yet-reaped
-    /// zombie on **Linux** (`/proc` persists) and, on **Windows**, during the post-exit
-    /// window while a process handle remains open. **macOS caveat:** `proc_pidinfo` does
-    /// not return for a zombie, so on macOS `exists()` is already `false` once the process
-    /// exits (not zombie-inclusive). For "is it still running?", use [`ProcessId::is_alive`].
+    /// zombie on every platform: Linux (`/proc` persists), macOS (`sysctl KERN_PROC`
+    /// resolves zombies), and Windows (during the post-exit handle window). For
+    /// "is it still running?", use [`ProcessId::is_alive`].
     pub fn exists(&self) -> bool {
         backend::start_token(self.pid) == Some(self.start)
     }

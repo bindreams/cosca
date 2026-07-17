@@ -1,16 +1,22 @@
-//! macOS process-identity backend: `proc_pidinfo(PROC_PIDTBSDINFO)` start time
-//! (µs since epoch) as the start token; `is_running` via `pbi_status`.
+//! macOS process-identity backend: `proc_pidinfo` (Apple's stable public libproc API) is
+//! the PRIMARY source; `sysctl(KERN_PROC_PID)` (the `kinfo` module) is the FALLBACK for
+//! what libproc cannot see — ZOMBIES — keeping identity resolution zombie-inclusive like
+//! Linux procfs while the common live path stays on the stable ABI. Both sources report
+//! the process start time in µs (cross-source equality pinned by the kinfo_tests oracle),
+//! so a layout drift in the undocumented kinfo_proc ABI degrades only zombie resolution
+//! (a token mismatch — the pre-fix behavior), never live identity.
 
 use std::time::{Duration, SystemTime};
 
 use super::{RawPid, StartToken};
 
-/// Read `proc_bsdinfo` for `pid`, or `None` if the process is not resolvable.
+#[path = "macos/kinfo.rs"]
+mod kinfo;
+
 fn bsd_info(pid: RawPid) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; the pointer
-    // and size match.
+    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; pointer and size match.
     let n = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
@@ -20,27 +26,70 @@ fn bsd_info(pid: RawPid) -> Option<libc::proc_bsdinfo> {
             size,
         )
     };
-    // proc_pidinfo returns the number of bytes written; a full struct == success.
-    (n == size).then_some(info)
+    if n == size {
+        return Some(info);
+    }
+    if n <= 0 {
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            // Expected misses: gone/zombie (ESRCH) or an unprivileged cross-user query
+            // (EPERM) — the sysctl fallback covers both.
+            Some(libc::ESRCH) | Some(libc::EPERM) => {}
+            _ => contract_violation(format_args!("proc_pidinfo({pid}) failed: {e}")),
+        }
+        return None;
+    }
+    // 0 < n < size: a partial record — never trust it.
+    contract_violation(format_args!("proc_pidinfo({pid}) wrote {n} bytes, expected {size}"));
+    None
 }
 
-fn token_of(info: &libc::proc_bsdinfo) -> StartToken {
+/// The shared contract-violation disposition for BOTH identity sources: trace FIRST (so
+/// the warn executes in every build mode), then the debug tripwire.
+pub(super) fn contract_violation(what: std::fmt::Arguments<'_>) {
+    log::warn!("{what}");
+    debug_assert!(false, "{what}");
+}
+
+fn token_of_bsd(info: &libc::proc_bsdinfo) -> StartToken {
     StartToken::from_raw(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
+fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
+    // SAFETY: the kernel's KERN_PROC copy always fills `p_starttime` (XNU
+    // fill_externproc); the union's other arm is kernel-internal queue pointers never
+    // exported here. Both arms are plain old data, so the read is defined.
+    let start = unsafe { info.kp_proc.p_un.p_starttime };
+    StartToken::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
+}
+
 pub(super) fn start_token(pid: RawPid) -> Option<StartToken> {
-    bsd_info(pid).as_ref().map(token_of)
+    if let Some(info) = bsd_info(pid) {
+        return Some(token_of_bsd(&info));
+    }
+    // libproc-invisible: gone or a ZOMBIE — only sysctl resolves the latter.
+    kinfo::kinfo(pid).as_ref().map(token_of_kinfo)
 }
 
 pub(super) fn is_running(pid: RawPid, start: StartToken) -> bool {
-    let Some(info) = bsd_info(pid) else {
+    if let Some(info) = bsd_info(pid) {
+        if token_of_bsd(&info) != start {
+            return false; // reused PID
+        }
+        // SZOMB == zombie (exited, unreaped). Anything else is a live process.
+        return info.pbi_status != libc::SZOMB;
+    }
+    // libproc-invisible: gone, a ZOMBIE, or an EPERM-hidden LIVE process (an unprivileged
+    // cross-user query — pid 1 on darwin CI proved a miss is NOT always gone-or-zombie).
+    // The fallback keeps the same shape — token-guarded, zombie-EXCLUSIVE via `p_stat` —
+    // and a kinfo layout drift fails safe to the pre-fix answer (token mismatch => false).
+    let Some(info) = kinfo::kinfo(pid) else {
         return false; // gone => not running
     };
-    if token_of(&info) != start {
+    if token_of_kinfo(&info) != start {
         return false; // reused PID
     }
-    // SZOMB == zombie (exited, unreaped). Anything else is a live process.
-    info.pbi_status != libc::SZOMB
+    info.kp_proc.p_stat as u32 != libc::SZOMB
 }
 
 pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {

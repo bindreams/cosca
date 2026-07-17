@@ -111,6 +111,9 @@ impl Child {
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
         let backstop = self.shared.kill().map_err(Error::Io);
+        if let (Err(group), Err(bs)) = (&group_result, &backstop) {
+            log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
+        }
         group_result.and(backstop)
     }
 

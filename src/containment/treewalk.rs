@@ -115,13 +115,17 @@ pub(crate) fn descendants_with(
                 continue;
             }
             let id = *resolved.entry(pid).or_insert_with(|| resolve(pid));
-            // Unresolvable (already gone), or resolvable but the token says
-            // impostor (recycled pid / stale ppid): drop the whole subtree under it.
-            let Some(id) = id else { continue };
-            // `keep` (token rule) first; `accepted.insert` dedups so a duplicate
-            // edge never enumerates/kills the same process twice (short-circuit
-            // means insert runs only for a kept pid — same as the prior guard).
-            if keep(id.start_token_raw()) && accepted.insert(pid) {
+            let Some(id) = id else {
+                log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
+                continue;
+            };
+            if !keep(id.start_token_raw()) {
+                log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");
+                continue;
+            }
+            // `accepted.insert` dedups so a duplicate edge never enumerates/kills the
+            // same process twice.
+            if accepted.insert(pid) {
                 result.push(id);
                 next.push(pid);
             }
@@ -155,8 +159,15 @@ pub(crate) fn children_of_with(
         if ppid != parent.pid() || pid == ppid {
             continue;
         }
-        let Some(id) = resolve(pid) else { continue };
-        if keeps_token(id.start_token_raw(), ptoken, allow_equal) && seen.insert(pid) {
+        let Some(id) = resolve(pid) else {
+            log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
+            continue;
+        };
+        if !keeps_token(id.start_token_raw(), ptoken, allow_equal) {
+            log::debug!("treewalk: dropping impostor pid {pid} (recycled pid / stale ppid)");
+            continue;
+        }
+        if seen.insert(pid) {
             out.push(id);
         }
     }
@@ -178,6 +189,10 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) {
     // Re-verify identity at the instant of the kill: if the pid was recycled
     // since the snapshot, `of` returns a different (or no) identity and we skip.
     if ProcessId::of(id.pid()) != Some(id) {
+        log::debug!(
+            "treewalk: skipping pid {pid} — identity changed since the snapshot",
+            pid = id.pid()
+        );
         return;
     }
     debug_assert!(
@@ -202,6 +217,10 @@ pub(crate) fn kill_by_identity(id: ProcessId) {
 
     // Re-verify identity against the live pid before opening it for terminate.
     if ProcessId::of(id.pid()) != Some(id) {
+        log::debug!(
+            "treewalk: skipping pid {pid} — identity changed since the snapshot",
+            pid = id.pid()
+        );
         return;
     }
     // SAFETY: OpenProcess tolerates an invalid/dead pid (returns Err); the handle
@@ -211,6 +230,7 @@ pub(crate) fn kill_by_identity(id: ProcessId) {
         let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, id.pid()) else {
             return; // gone or unopenable => already-dead is success
         };
+        // best-effort (ERROR_ACCESS_DENIED etc.): nothing actionable to surface here
         let _ = TerminateProcess(handle, 1);
         let _ = CloseHandle(handle);
     }

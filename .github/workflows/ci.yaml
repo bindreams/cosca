@@ -87,6 +87,12 @@ jobs:
       - name: Run tests (tokio feature)
         run: cargo test --locked --features tokio --target ${{ matrix.target }}
 
+      # Release lane (debug_assertions off): exercises the calm-release arm of the
+      # should_panic oracles in the macOS-gated kinfo_tests.rs.
+      - name: Unit tests (release — debug_assertions off)
+        if: matrix.os == 'darwin'
+        run: cargo test --locked --release --lib --target ${{ matrix.target }}
+
       # Live cgroup v2 containment tests are gated behind SUBPROCESS_TEST_CGROUP
       # (a no-op without it). They need a cgroup the supervisor may create child
       # cgroups under. We make a fresh leaf directly under the unified root cgroup:

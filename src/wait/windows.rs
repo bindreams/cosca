@@ -72,6 +72,11 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
     debug_assert!(set.is_ok(), "SetEvent on an owned event handle failed: {set:?}");
     if !std::thread::panicking() {
         assert!(set.is_ok(), "SetEvent on an owned event handle failed: {set:?}");
+    } else if let Err(e) = &set {
+        // RELEASE unwind (a debug build already aborted above — visibility over grace,
+        // the shipped policy): cannot assert while a panic is in flight, so leave the
+        // loudest trace we can for the possible unbounded park.
+        log::error!("SetEvent failed during unwind ({e}); a parked watcher may not release");
     }
 }
 

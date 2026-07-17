@@ -184,34 +184,37 @@ fn foreign_kill_terminates_the_process() {
     p.kill().expect("second kill on a dead process must be Ok");
 }
 
-// Linux-only: pid 1 (init) is world-resolvable (`/proc/1`) AND non-root-unkillable there.
-// On macOS, launchd (pid 1) is NOT `proc_pidinfo`-resolvable by a non-root process, and there
-// is no portable resolvable-but-unkillable target — the macOS `wait::kill` EPERM->Err mapping
-// is the same reviewed code, and its success path is covered by `foreign_kill_terminates`.
-#[cfg(target_os = "linux")]
+// pid 1 (init/launchd) is world-resolvable AND non-root-unkillable on Linux and macOS:
+// procfs / sysctl KERN_PROC both resolve it, and a non-root kill(1) returns EPERM, which
+// Process::kill must SURFACE as Err (not swallow into Ok). The ROOT branch stays
+// Linux-only: Linux provably discards unhandled SIGKILL to pid 1 (SIGNAL_UNKILLABLE);
+// XNU's launchd protection is unverified, and being wrong panics the machine — so as
+// root on non-Linux we refuse to signal pid 1 at all.
+#[cfg(unix)]
 #[test]
 fn foreign_kill_surfaces_permission_denied() {
-    // pid 1 (init) is always alive but unkillable: SIGKILL to it is kernel-ignored. As a
-    // non-root user kill(1) returns EPERM, which Process::kill must SURFACE as Err (not
-    // swallow into Ok); as root the kernel returns Ok (init is immune). Assert the real
-    // per-privilege behavior either way — init is unharmed. This drives the Err arm of
-    // wait::kill that distinguishes "denied on a live process" from "already-dead".
     let init = subprocess::Process::from_pid(1).expect("pid 1 resolves");
     assert!(init.is_alive(), "init must be alive");
-    let r = init.kill();
     // SAFETY: geteuid() takes no arguments and is always safe.
-    if unsafe { libc::geteuid() } == 0 {
-        assert!(r.is_ok(), "as root, SIGKILL to init is kernel-ignored => Ok, got {r:?}");
-    } else {
+    let root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(target_os = "linux"))]
+    if root {
+        // Fail LOUD, never silently pass unverified (the repo's no-silent-skip rule):
+        panic!(
+            "inconclusive: refusing to SIGKILL pid 1 as root on this platform \
+             (unverified kernel semantics) — run this test unprivileged"
+        );
+    }
+    let r = init.kill();
+    if !root {
         assert!(
             matches!(r, Err(subprocess::error::Error::Io(_))),
             "non-root kill of init must surface EPERM as Err, got {r:?}"
         );
+    } else {
+        assert!(r.is_ok(), "as root, SIGKILL to init is kernel-ignored => Ok, got {r:?}");
     }
-    assert!(
-        init.is_alive(),
-        "init must survive (SIGKILL to pid 1 is kernel-ignored)"
-    );
+    assert!(init.is_alive(), "init must survive");
 }
 
 #[cfg(unix)]
@@ -240,13 +243,11 @@ fn is_alive_is_false_for_a_real_zombie() {
     p.wait().expect("death-watch"); // returns at the zombie instant (no reap yet)
 
     assert!(!p.is_alive(), "an exited-but-unreaped child is a zombie => not alive");
-    // Linux keeps a zombie resolvable (`/proc` persists → exists() is zombie-inclusive). macOS
-    // `proc_pidinfo` does NOT return for a zombie, so its identity stops resolving the instant
-    // it exits — assert the still-resolves property only where it holds.
-    #[cfg(target_os = "linux")]
+    // exists() is zombie-inclusive on ALL Unixes: Linux `/proc` persists, and macOS
+    // resolves zombies via `sysctl KERN_PROC` (identity.rs).
     assert!(
         subprocess::Process::from_id(p.id()).is_some(),
-        "a zombie identity still resolves on Linux"
+        "a zombie identity still resolves"
     );
     raw.wait().expect("reap the zombie");
 }

@@ -570,9 +570,8 @@ async fn async_merged_stream_accessor_has_take_semantics() {
 
 #[tokio::test]
 async fn async_non_merged_stream_accessor_has_take_semantics() {
-    // Regression test: stdin, stdout, stderr's take-semantics when NOT merge targets.
-    // (The pre-pass skips slots it assigns; this ensures stdin/stdout/stderr still behave
-    // correctly for non-merge configurations.)
+    // Regression: the pre-pass skips slots it does not assign, so stdin/stdout/stderr keep
+    // plain take-semantics in a non-merge config.
     let mut cmd = subprocess::tokio::Command::new();
     cmd.executable(common::testbin())
         .args(["subprocess_testbin", "emit", "5", "0"]);

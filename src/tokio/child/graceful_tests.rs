@@ -14,22 +14,31 @@ async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
     let id = child.id();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(30))
         .await
         .expect_err("the watch error must surface");
     assert!(
+        crate::log_capture::contains_since(mark, &format!("graceful_shutdown_tree({pid})", pid = id.pid())),
+        "the subsumption trace must fire on the forced watch error"
+    );
+    assert!(
         !fault::armed(),
         "seam not consumed — the watch did not run on this thread"
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-    #[cfg(target_os = "linux")]
+    // The reap is proven by identity on all Unix (procfs / `sysctl KERN_PROC` are both
+    // zombie-inclusive); Windows skips the assert — exists() stays true there while
+    // `child` still holds the process handle.
+    #[cfg(unix)]
     assert!(
         !id.exists(),
-        "root must be swept AND reaped despite the watch error (on Linux a zombie would still exist)"
+        "root must be swept AND reaped despite the watch error (a zombie would still exist)"
     );
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     let _ = id;
     let status = child
         .wait()
@@ -45,23 +54,26 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
     cmd.args(["sleep", "30"]);
     let mut child = cmd.spawn().expect("spawn");
     let id = child.id();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
     let err = child
         .graceful_shutdown(Duration::from_secs(30))
         .await
         .expect_err("the watch error must surface");
     assert!(
+        crate::log_capture::contains_since(mark, &format!("graceful_shutdown({pid})", pid = id.pid())),
+        "the subsumption trace must fire on the forced watch error"
+    );
+    assert!(
         !fault::armed(),
         "seam not consumed — the watch did not run on this thread"
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-    #[cfg(target_os = "linux")]
     assert!(
         !id.exists(),
-        "child must be killed AND reaped despite the watch error (on Linux a zombie would still exist)"
+        "child must be killed AND reaped despite the watch error (a zombie would still exist)"
     );
-    #[cfg(not(target_os = "linux"))]
-    let _ = id;
     let status = child
         .wait()
         .await
