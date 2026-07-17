@@ -34,6 +34,12 @@ impl Child {
         if let Ok(Some(status)) = &watch {
             return Ok(*status); // exited within grace (already reaped by wait_timeout)
         }
+        if let Err(e) = &watch {
+            log::debug!(
+                "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {e}",
+                id = self.id.pid()
+            );
+        }
         self.shared.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
         let status = self.wait()?;
         watch?;
@@ -69,6 +75,12 @@ impl Child {
         // drained (the survivor-sweep scenario). A sweep Err subsumes any watch Err; it must
         // propagate before the reap on a LIVE root (waiting unswept would hang), but once the
         // root's exit was observed, the reap runs first so no zombie is stranded.
+        if let Err(e) = &watch {
+            log::debug!(
+                "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
+                id = self.id.pid()
+            );
+        }
         if let Err(sweep) = self.kill_tree() {
             if matches!(watch, Ok(true)) {
                 // The root is a zombie — this reap cannot hang (which is why it is gated on the

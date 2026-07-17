@@ -20,6 +20,9 @@ pub use command::Command;
 
 mod wait;
 
+#[cfg(test)]
+mod log_capture;
+
 pub mod process;
 pub use process::{Process, Recursive};
 

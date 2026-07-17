@@ -598,7 +598,8 @@ pub(crate) mod fault {
 
     /// Assert the spawned child was fully torn down — reuse-immune, via the child's stable identity
     /// (pid + start token). On Unix a not-yet-reaped zombie keeps that identity (Linux /proc
-    /// persists) → caught; a reaped pid resolves to `None` or a *different* identity → passes, so a
+    /// persists; macOS `sysctl KERN_PROC` resolves zombies) → caught on ALL Unix; a reaped pid
+    /// resolves to `None` or a *different* identity → passes, so a
     /// recycled pid never false-fails. Windows has no zombies, and its process-object cleanup is not
     /// synchronous with `wait()`, so there we assert only that the child is dead (`!is_alive()`, also
     /// reuse-immune via the start token).

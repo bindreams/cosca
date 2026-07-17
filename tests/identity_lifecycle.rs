@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime};
 
 use subprocess::identity::ProcessId;
 
+#[path = "common/mod.rs"]
+mod common;
+
 const BLOCK_VAR: &str = "SUBPROCESS_IDENTITY_TEST_BLOCK";
 
 /// When this integration-test binary is re-spawned with `BLOCK_VAR` set, this
@@ -66,4 +69,56 @@ fn created_at_is_present_and_not_in_the_future() {
     // Sanity bound (not a synchronization wait): our start time is in the past.
     // A few seconds of slack absorbs clock-source granularity differences.
     assert!(created <= SystemTime::now() + Duration::from_secs(5));
+}
+
+/// An exited-but-unreaped (zombie) child must still resolve by identity on EVERY platform.
+/// Exit is proven by stdout EOF — the child's write end closes at process exit.
+#[test]
+fn identity_resolves_an_exited_unreaped_child() {
+    // RAW std::process::Command: argv[0] is the exe path, so the testbin mode is args[1].
+    let mut child = Command::new(common::testbin())
+        .args(["exit", "0"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut buf = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_end(&mut buf)
+        .expect("EOF");
+    let id = ProcessId::of(child.id()).expect("an unreaped exit must resolve by pid");
+    assert!(id.exists(), "an unreaped exit must remain visible to exists()");
+    child.wait().expect("reap");
+}
+
+/// The start token must be STABLE across the alive -> zombie transition — the property
+/// `is_running`'s reused-PID guard depends on. `waitid(WEXITED | WNOWAIT)` pins the
+/// zombie: it returns only once the child IS a zombie and leaves it unreaped.
+#[cfg(unix)]
+#[test]
+fn identity_survives_the_alive_to_zombie_transition() {
+    // _sock must stay alive: dropping our socket end would unblock the child early.
+    let (child, _sock) = common::spawn_blocker();
+    let id = ProcessId::of(child.id().pid()).expect("live child resolves");
+    assert!(id.exists(), "live child exists");
+    assert!(id.is_alive(), "live child is alive");
+    child.kill().expect("kill");
+    // WNOWAIT: leaves the zombie unreaped.
+    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `si` is a valid out-param; the child is ours and unreaped.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id().pid() as libc::id_t,
+            &mut si,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid(WNOWAIT): {}", std::io::Error::last_os_error());
+    assert!(id.exists(), "the pre-exit token must still match the unreaped zombie");
+    assert!(!id.is_alive(), "a zombie is not alive");
+    child.wait().expect("reap");
+    assert!(!id.exists(), "a reaped process is gone");
 }

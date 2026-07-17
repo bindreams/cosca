@@ -272,6 +272,9 @@ impl Child {
         // covers that, so its failure is contract-relevant.
         let backstop = self.kill();
         // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.
+        if let (Err(group), Err(bs)) = (&group_result, &backstop) {
+            log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
+        }
         group_result.and(backstop)
     }
 

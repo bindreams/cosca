@@ -46,6 +46,12 @@ impl Child {
         // subsumption, mirroring kill_tree's both-fail disposition).
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         if !matches!(watch, Ok(true)) {
+            if let Err(e) = &watch {
+                log::debug!(
+                    "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {e}",
+                    id = self.id().pid()
+                );
+            }
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
         }
         let status = self.wait().await?;
@@ -91,6 +97,12 @@ impl Child {
         // drained (the survivor-sweep scenario). A sweep Err subsumes any watch Err; it must
         // propagate before the reap on a LIVE root (waiting unswept would hang), but once the
         // root's exit was observed, the reap runs first so no zombie is stranded.
+        if let Err(e) = &watch {
+            log::debug!(
+                "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
+                id = self.id().pid()
+            );
+        }
         if let Err(sweep) = self.kill_tree() {
             if matches!(watch, Ok(true)) {
                 // The root is a zombie — this reap cannot hang (which is why it is gated on the

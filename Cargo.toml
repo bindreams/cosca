@@ -26,7 +26,7 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 # Unpredictable merge-target pipe names (std parity: std randomizes its anon-pipe names).
 # `std` for the `io::Error` conversion.
-getrandom = { version = "0.3", features = ["std"] }
+getrandom = { version = "0.4", features = ["std"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
