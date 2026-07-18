@@ -27,6 +27,8 @@ tempfile = "3"
 # Unpredictable merge-target pipe names (std parity: std randomizes its anon-pipe names).
 # `std` for the `io::Error` conversion.
 getrandom = { version = "0.4", features = ["std"] }
+# `get_osfhandle`/`isatty`: the testbin maps CRT fds to OS handles and classifies devices.
+libc = "0.2"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
