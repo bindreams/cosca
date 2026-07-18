@@ -8,3 +8,6 @@
 
 #[path = "windows_raw/crt_fds.rs"]
 mod crt_fds;
+
+#[path = "windows_raw/resolve.rs"]
+mod resolve;
