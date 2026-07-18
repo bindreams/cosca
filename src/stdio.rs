@@ -19,6 +19,14 @@ impl Fd {
     pub fn raw(self) -> i32 {
         self.0
     }
+
+    /// Rebuild an `Fd` from a raw descriptor number, without the non-negativity
+    /// debug-assert of `From<i32>`. Used by the Windows raw spawn backend to walk
+    /// a dense `0..=maxfd` fd-table; unused (hence `dead_code`-allowed) on Unix.
+    #[allow(dead_code)]
+    pub(crate) fn from_raw(n: i32) -> Fd {
+        Fd(n)
+    }
 }
 
 impl From<i32> for Fd {

@@ -615,6 +615,14 @@ pub(crate) mod fault {
     }
 }
 
+// Windows raw `CreateProcessW` spawn backend (Plan 12). The MSVCRT fd-table
+// encoder + device classifier (`crt_fds`) lands first; the spawn path that
+// consumes it follows in later tasks. Explicit `#[path]` per the repo's
+// `foo.rs` + `foo/` module convention (mirroring `child.rs`'s `child/spawn.rs`).
+#[cfg(windows)]
+#[path = "spawn/windows_raw.rs"]
+mod windows_raw;
+
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
