@@ -12,8 +12,8 @@ use super::child::Child;
 impl Child {
     pub async fn communicate(&mut self, input: Option<Vec<u8>>) -> Result<Output, Error> {
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
-        // `self.child` (so the four-future join compiles), and tokio's `Child::wait` internally
-        // drops `self.child.stdin`, already None here, so it cannot race the write future.
+        // `self.proc` (so the four-future join compiles), and the Tokio backend's `wait` internally
+        // drops its own stdin, already taken here, so it cannot race the write future.
         let mut stdin = self.stdin();
         let mut stdout = self.stdout();
         let mut stderr = self.stderr();
@@ -36,30 +36,35 @@ impl Child {
             }
             if let Some(mut w) = stdin.take() {
                 if let Some(bytes) = input.as_ref() {
-                    w.write_all(bytes).await.or_else(swallow_broken_pipe)?;
-                    w.flush().await.or_else(swallow_broken_pipe)?;
+                    w.write_all(bytes)
+                        .await
+                        .or_else(swallow_broken_pipe)
+                        .map_err(Error::Io)?;
+                    w.flush().await.or_else(swallow_broken_pipe).map_err(Error::Io)?;
                 }
                 drop(w); // EOF
             }
-            Ok::<(), std::io::Error>(())
+            Ok::<(), Error>(())
         };
         let read_out = async {
             let mut buf = Vec::new();
             if let Some(mut r) = stdout.take() {
-                r.read_to_end(&mut buf).await?;
+                r.read_to_end(&mut buf).await.map_err(Error::Io)?;
             }
-            Ok::<Vec<u8>, std::io::Error>(buf)
+            Ok::<Vec<u8>, Error>(buf)
         };
         let read_err = async {
             let mut buf = Vec::new();
             if let Some(mut r) = stderr.take() {
-                r.read_to_end(&mut buf).await?;
+                r.read_to_end(&mut buf).await.map_err(Error::Io)?;
             }
-            Ok::<Vec<u8>, std::io::Error>(buf)
+            Ok::<Vec<u8>, Error>(buf)
         };
-        let wait = async { self.child.wait().await };
+        // `wait` is the sole borrow of `self` here (already mapped to `Error`); the stream futures
+        // own their taken locals, so the four-future join has no aliasing conflict.
+        let wait = async { self.proc.wait().await };
 
-        let ((), out, err, status) = ::tokio::try_join!(write, read_out, read_err, wait).map_err(Error::Io)?;
+        let ((), out, err, status) = ::tokio::try_join!(write, read_out, read_err, wait)?;
         Ok(Output {
             status,
             stdout: out,

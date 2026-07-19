@@ -10,13 +10,21 @@
 #[path = "windows_raw/crt_fds.rs"]
 mod crt_fds;
 
+// `pub(crate)`: the async raw backend (`crate::tokio::spawn::windows_raw`) reuses program/env/NUL
+// resolution verbatim.
 #[path = "windows_raw/resolve.rs"]
-mod resolve;
+pub(crate) mod resolve;
 
 #[path = "windows_raw/proc.rs"]
 mod proc;
 
 pub(crate) use proc::RawChild;
+// Additional seams the async raw backend reuses (Task 7): the cancellable handle wait + its
+// outcome, and the exit-status reader. The sync path uses these only inside `proc`, so the
+// re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
+// needs no re-export.)
+#[cfg(feature = "tokio")]
+pub(crate) use proc::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -191,7 +199,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
 
 /// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
 /// can close the child ends + attribute list before releasing the spawn lock on either arm.
-fn spawn_step(
+/// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
+pub(crate) fn spawn_step(
     handles: &[HANDLE],
     app: Option<&[u16]>,
     cmdline: &mut [u16],
@@ -207,8 +216,9 @@ fn spawn_step(
 }
 
 /// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn
-/// never leaks a running/zombie process (mirrors the std path's teardown).
-fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
+/// never leaks a running/zombie process (mirrors the std path's teardown). `pub(crate)`: the async
+/// raw backend shares the identical error-teardown.
+pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
     let rc = RawChild::new(proc, pid);
     let _ = rc.kill();
     if let Err(_e) = rc.wait() {
@@ -227,13 +237,14 @@ fn set_inherit(h: HANDLE) -> Result<(), Error> {
     unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.map_err(|e| Error::Io(e.into()))
 }
 
-fn to_wide_nul(s: &OsStr) -> Vec<u16> {
+pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// Reject a `.bat`/`.cmd` program by the token that determines the loaded image: `executable()` if
-/// set, else the argv[0] / command-line first token. Runs before resolution.
-fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
+/// set, else the argv[0] / command-line first token. Runs before resolution. `pub(crate)`: shared
+/// with the async raw backend.
+pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
     let token = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     if let Some(prog) = token {
         reject_batch_path(&prog)?;
@@ -255,8 +266,9 @@ fn program_token(cmd: &Command) -> Option<PathBuf> {
 
 /// Build the child's command line. argv[0] is always the user's name (independent of the loaded
 /// `executable()`); each token is NUL-checked. `commandline()` is passed through verbatim (the OS
-/// parses argv[0] as its first token); `argv` is joined via the MSVCRT quoter.
-fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
+/// parses argv[0] as its first token); `argv` is joined via the MSVCRT quoter. `pub(crate)`: shared
+/// with the async raw backend.
+pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
     match cmd.input() {
         CommandInput::Empty => {
             // executable() alone, no argv/commandline: the OS uses lpApplicationName as argv[0].
@@ -287,14 +299,15 @@ fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
 
 /// RAII owner of a `PROC_THREAD_ATTRIBUTE_LIST` carrying a HANDLE_LIST. Deletes the list on drop.
 /// The handle array it references must outlive the list (per `UpdateProcThreadAttribute`): callers
-/// keep `all_handles` alive across both `CreateProcessW` and this drop.
-struct AttributeList {
+/// keep `all_handles` alive across both `CreateProcessW` and this drop. `pub(crate)`: the async raw
+/// backend builds the identical scoped inheritance list.
+pub(crate) struct AttributeList {
     _buf: Vec<u8>,
     list: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 
 impl AttributeList {
-    fn build(handles: &[HANDLE]) -> Result<AttributeList, Error> {
+    pub(crate) fn build(handles: &[HANDLE]) -> Result<AttributeList, Error> {
         let mut size: usize = 0;
         // Sizing call: returns ERROR_INSUFFICIENT_BUFFER and writes the required byte count.
         // SAFETY: the null-list form is the documented way to query the buffer size.
@@ -325,7 +338,7 @@ impl AttributeList {
         Ok(AttributeList { _buf: buf, list })
     }
 
-    fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+    pub(crate) fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.list
     }
 }

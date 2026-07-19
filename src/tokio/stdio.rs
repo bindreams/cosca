@@ -367,6 +367,29 @@ impl AsyncWrite for WinOwnedWrite {
     }
 }
 
+/// Build a direction-appropriate overlapped (reactor-registered) pipe: the child's raw handle end
+/// plus our owned parent wrapper, whose mandatory `ConnectNamedPipe` is spawned as a task here
+/// (inside the runtime). Shared by the async std spawn's merge pre-pass and the async raw backend's
+/// piped std slots. Any failure is a typed `Err` — no retry.
+#[cfg(windows)]
+pub(crate) fn owned_overlapped_pipe(
+    dir: crate::stdio::Direction,
+) -> Result<(std::os::windows::io::OwnedHandle, OwnedStd), crate::error::Error> {
+    use crate::stdio::Direction;
+    match dir {
+        Direction::In => {
+            let (server, client) = overlapped_in_pipe()?;
+            let connecting = ConnectingPipe::Connecting(connect_task(server));
+            Ok((client, OwnedStd::Write(WinOwnedWrite(connecting))))
+        }
+        Direction::Out => {
+            let (server, client) = overlapped_out_pipe()?;
+            let connecting = ConnectingPipe::Connecting(connect_task(server));
+            Ok((client, OwnedStd::Read(WinOwnedRead(connecting))))
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "stdio_tests.rs"]
 mod stdio_tests;

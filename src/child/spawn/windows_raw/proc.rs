@@ -114,7 +114,9 @@ impl RawChild {
     }
 }
 
-/// The outcome of [`wait_handle_or_cancel`].
+/// The outcome of [`wait_handle_or_cancel`]. `Copy`/`Eq`: the async backend clones it across the
+/// per-instance test observer channel and asserts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitOutcome {
     /// The process handle signaled — the child exited.
     Exited,
@@ -150,8 +152,9 @@ pub(crate) fn wait_handle_or_cancel(proc: HANDLE, cancel: Option<HANDLE>) -> io:
     }
 }
 
-/// Read an exited process's status. Only valid after the handle has signaled.
-fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
+/// Read an exited process's status. Only valid after the handle has signaled. `pub(crate)`: the
+/// async raw backend reads its exit status through the same seam.
+pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
     let mut code: u32 = 0;
     // SAFETY: `handle` is a live, owned process handle; the process has exited so its code is final.
     unsafe { GetExitCodeProcess(handle, &mut code) }?;

@@ -4,6 +4,10 @@
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[path = "child/proc_source.rs"]
+mod proc_source;
+pub(crate) use proc_source::ProcSource;
+
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
@@ -15,9 +19,8 @@ use crate::stdio::Fd;
 
 #[derive(Debug)]
 pub struct Child {
-    // `pub(super)`: the sibling `pump` module borrows the inner tokio child for `communicate`'s
-    // `wait` future.
-    pub(super) child: ::tokio::process::Child,
+    // `pub(super)`: the sibling `pump` module borrows the backend for `communicate`'s `wait` future.
+    pub(super) proc: ProcSource,
     id: ProcessId,
     attached: Attached,
     kill_on_drop: bool,
@@ -34,7 +37,7 @@ pub struct Child {
 impl Child {
     // The only caller is the sibling `spawn` (and `OwnedStd` is module-scoped).
     pub(super) fn from_parts(
-        child: ::tokio::process::Child,
+        proc: ProcSource,
         id: ProcessId,
         attached: Attached,
         kill_on_drop: bool,
@@ -43,7 +46,7 @@ impl Child {
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
-            child,
+            proc,
             id,
             attached,
             kill_on_drop,
@@ -68,7 +71,7 @@ impl Child {
         if let Some(owned) = self.take_owned_in(crate::stdio::Fd::STDIN) {
             return Some(super::stdio::ChildStdin { inner: owned });
         }
-        self.child.stdin.take().map(|s| super::stdio::ChildStdin {
+        self.proc.take_stdin().map(|s| super::stdio::ChildStdin {
             inner: super::stdio::InInner::Tokio(s),
         })
     }
@@ -76,7 +79,7 @@ impl Child {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDOUT) {
             return Some(super::stdio::ChildStdout { inner: owned });
         }
-        self.child.stdout.take().map(|s| super::stdio::ChildStdout {
+        self.proc.take_stdout().map(|s| super::stdio::ChildStdout {
             inner: super::stdio::OutInner::Stdout(s),
         })
     }
@@ -84,7 +87,7 @@ impl Child {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDERR) {
             return Some(super::stdio::ChildStderr { inner: owned });
         }
-        self.child.stderr.take().map(|s| super::stdio::ChildStderr {
+        self.proc.take_stderr().map(|s| super::stdio::ChildStderr {
             inner: super::stdio::OutInner::Stderr(s),
         })
     }
@@ -246,11 +249,11 @@ impl Child {
     /// Block until the child exits, returning its status. For a bounded wait use
     /// `tokio::time::timeout(d, child.wait())`.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
-        self.child.wait().await.map_err(Error::Io)
+        self.proc.wait().await
     }
     /// Exit status if the child has already exited (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
-        self.child.try_wait().map_err(Error::Io)
+        self.proc.try_wait()
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
@@ -258,7 +261,7 @@ impl Child {
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
-        self.child.start_kill().map_err(Error::Io)
+        self.proc.start_kill()
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -303,6 +306,19 @@ impl Child {
     }
 }
 
+#[cfg(all(test, windows))]
+impl Child {
+    /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's
+    /// `WaitObserver`), forwarded to the backend.
+    pub(crate) fn install_wait_observer(
+        &mut self,
+        started: ::tokio::sync::oneshot::Sender<()>,
+        outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
+    ) {
+        self.proc.install_wait_observer(started, outcome);
+    }
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -318,10 +334,10 @@ impl Drop for Child {
         );
         let _ = tree;
         // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
-        // the dropping thread; the child is SIGKILL'd so it exits at once. `true`: a prior wait()
-        // (a Done child) is legal on Drop.
+        // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend
+        // (tokio field-drop reap vs the raw handle's kill-then-wait).
         let pid = self.id.pid();
-        reap_now(&mut self.child, pid, true);
+        self.proc.reap_now_on_drop(pid);
     }
 }
 

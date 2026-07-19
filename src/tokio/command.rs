@@ -155,6 +155,21 @@ impl Command {
         let out = child.communicate(None).await?;
         String::from_utf8(out.stdout).map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
+
+    /// Test-only spawn variant that installs a per-instance wait observer on the resulting raw
+    /// child, so a cancellation test observes exactly THIS child's blocking wait (see the raw
+    /// backend's `WaitObserver`) rather than racing a parallel test. Routes through the normal
+    /// spawn, so the config must reach the raw backend (executable, uncontained, no fd >= 3).
+    #[cfg(all(test, windows))]
+    pub(crate) fn spawn_with_wait_observer(
+        &mut self,
+        started: ::tokio::sync::oneshot::Sender<()>,
+        outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
+    ) -> Result<Child, Error> {
+        let mut child = self.spawn()?;
+        child.install_wait_observer(started, outcome);
+        Ok(child)
+    }
 }
 
 #[cfg(test)]

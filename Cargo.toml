@@ -17,8 +17,9 @@ shared_child = { version = "1", features = ["timeout"] }
 log = "0.4"
 # `macros` is required by the library, not only tests: `communicate` uses `tokio::try_join!`,
 # which is gated behind tokio's `macros` feature. `net` is solely for `AsyncFd` (the
-# reactor-native death-watch); `time` solely for the grace bound on it.
-tokio = { version = "1", optional = true, features = ["process", "rt", "io-util", "macros", "net", "time"] }
+# reactor-native death-watch); `time` solely for the grace bound on it. `sync` backs the
+# per-instance wait observer (a `#[cfg(test)]` oneshot seam) the raw async backend is tested with.
+tokio = { version = "1", optional = true, features = ["process", "rt", "io-util", "macros", "net", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

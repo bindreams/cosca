@@ -9,9 +9,11 @@ use std::process::Stdio as StdStdio;
 use crate::child::spawn::{build_std_command, dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
-use crate::stdio::{Direction, Fd, ResolvedStdio};
+#[cfg(unix)]
+use crate::stdio::Direction;
+use crate::stdio::{Fd, ResolvedStdio};
 
-use super::child::{reap_now, Child};
+use super::child::{reap_now, Child, ProcSource};
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // tokio's `process::Command::spawn` needs a running reactor; outside ANY runtime it panics on
@@ -38,6 +40,15 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 4)".into(),
             });
         }
+    }
+
+    // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend
+    // (Plan 12 Task 7): an `executable()` loaded independently of argv[0], UNCONTAINED, with no
+    // fd >= 3 (the rejection above already guaranteed the latter). Contained executables stay on
+    // the std path until Task 8.
+    #[cfg(windows)]
+    if cmd.executable_path().is_some() && cmd.contain_request().mode.is_none() {
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
 
     let std_cmd = build_std_command(cmd)?;
@@ -92,21 +103,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 }
             };
             #[cfg(windows)]
-            let (child_end, parent_end) = {
-                use super::stdio::{ConnectingPipe, OwnedStd, WinOwnedRead, WinOwnedWrite};
-                match dir {
-                    Direction::In => {
-                        let (server, client) = super::stdio::overlapped_in_pipe()?;
-                        let connecting = ConnectingPipe::Connecting(super::stdio::connect_task(server));
-                        (client, OwnedStd::Write(WinOwnedWrite(connecting)))
-                    }
-                    Direction::Out => {
-                        let (server, client) = super::stdio::overlapped_out_pipe()?;
-                        let connecting = ConnectingPipe::Connecting(super::stdio::connect_task(server));
-                        (client, OwnedStd::Read(WinOwnedRead(connecting)))
-                    }
-                }
-            };
+            let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir)?;
             // Merging slots: each gets a dup of the child end. A merging slot with
             // raw() >= 3 (Unix only — Windows rejected fd >= 3 above) is not assignable as
             // std stdio: it joins the fd >= 3 child-ends collection the command-fds block
@@ -211,7 +208,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     }
 
-    let mut child = tcmd.spawn().map_err(Error::Io)?;
+    // Serialize the spawn against the raw backend's inheritable-handle window via the shared spawn
+    // lock: tokio's own handle-inheritance marking must not overlap a raw `CreateProcessW` spawn on
+    // another thread (mirrors the sync std path).
+    let mut child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        tcmd.spawn().map_err(Error::Io)?
+    };
 
     // Identity must be read before any await: spawn + attach are synchronous, so the runtime cannot
     // park and reap the child in between. Even if the child has already exited, tokio's held handle
@@ -250,7 +253,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     };
 
     Ok(Child::from_parts(
-        child,
+        ProcSource::Tokio(child),
         id,
         attached,
         kill_on_drop,
@@ -259,6 +262,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         owned_std,
     ))
 }
+
+#[cfg(windows)]
+#[path = "spawn/windows_raw.rs"]
+pub(crate) mod windows_raw;
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
