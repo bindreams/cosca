@@ -36,13 +36,12 @@ use crate::child::spawn::{
     attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, PipeOwnership,
 };
 use crate::child::Child;
-use crate::command::{Command, CommandInput};
+use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
-/// Spawn `cmd` via raw `CreateProcessW`. Handles an UNCONTAINED child with descriptors 0/1/2 plus
-/// arbitrary fd >= 3 (wired through the MSVCRT `lpReserved2` table). Containment (Task 6) leaves its
-/// marked seam below.
+/// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
+/// through the MSVCRT `lpReserved2` table), contained (Job Object / TreeWalk) or uncontained.
 pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
@@ -58,7 +57,33 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let app_name: Option<Vec<u16>> = image.as_ref().map(|p| to_wide_nul(p.as_os_str()));
     let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
-    let env_block = resolve::build_env_block(cmd.env_ops())?; // Task 6 may add the contain marker
+
+    // Containment: mirror `prepare`'s pre-spawn decision on the raw path. An uncontained spawn keeps
+    // the defaults (`contain_flags` 0, a `mode: None`/`is_root: false` `Prepared`); a Strongest root
+    // spawns CREATE_SUSPENDED and is job-assigned + resumed in `attach_or_fault`.
+    let req = cmd.contain_request();
+    let (contain_flags, is_root, marker_env) = if req.mode.is_some() {
+        let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
+        let is_root = !crate::containment::dispatch::is_nested(marker_present);
+        crate::containment::windows::clear_std_handle_inheritance();
+        let setup = crate::containment::dispatch::windows_contain_setup(&req, is_root);
+        (setup.creation_flags, is_root, setup.marker_env)
+    } else {
+        (0u32, false, false)
+    };
+
+    // Append the inherited root marker AFTER the user's env ops so it survives a user `env_clear()`
+    // (mirrors the std path setting the marker after the user's env).
+    let env_block = if marker_env {
+        let mut ops = cmd.env_ops().to_vec();
+        ops.push(EnvOp::Set(
+            OsString::from(crate::containment::NESTED_ENV),
+            OsString::from("1"),
+        ));
+        resolve::build_env_block(&ops)?
+    } else {
+        resolve::build_env_block(cmd.env_ops())?
+    };
     let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything
@@ -105,7 +130,6 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let all_handles: &[HANDLE] = &table.handles;
     let attr = AttributeList::build(all_handles)?;
     si.lpAttributeList = attr.as_ptr();
-    let contain_flags = 0u32; // Task 6 sets this (uncontained here)
     let flags = CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0 | contain_flags;
 
     // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
@@ -130,12 +154,12 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let (proc, pid) = spawned?;
 
     // Identity read + attach BEFORE building `Child`, with the SAME kill+reap teardown as the std
-    // path (dropping the OwnedHandle alone neither kills nor reaps on Windows). Uncontained in
-    // Task 4: build the `mode: None` Prepared directly — `prepare` returns exactly this and would
-    // otherwise need a std `Command` we do not have.
+    // path (dropping the OwnedHandle alone neither kills nor reaps on Windows). The `Prepared`
+    // carries the REAL mode + is_root computed above, so `attach_or_fault` assigns the Job Object
+    // (Strongest root) or the TreeWalk/Delegated mechanism exactly as the std path does.
     let prepared = crate::containment::Prepared {
-        mode: None,
-        is_root: false,
+        mode: req.mode,
+        is_root,
     };
     let raw_handle = proc.as_raw_handle();
     let (containment, attached) = match attach_or_fault(pid, raw_handle, prepared) {

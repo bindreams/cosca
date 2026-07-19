@@ -26,9 +26,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let mut fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // fd >= 3 is Unix-only (command-fds), exactly as on the sync path — Windows rejects it
-    // with the sync spawn's strings VERBATIM (op has no "async" prefix; the detail cites
-    // the raw backend) so the two paths report identically:
+    // fd >= 3 on Windows needs the raw `CreateProcessW` backend, which the async path does not have
+    // yet (the sync path routes there). Reject it rather than silently dropping the descriptor; the
+    // detail cites the raw backend:
     #[cfg(windows)]
     for slot in fds.keys() {
         if slot.raw() >= 3 {

@@ -176,22 +176,6 @@ fn null_stdout_discards_output() {
 
 // Rejections =====
 
-#[cfg(windows)]
-#[test]
-fn contained_fd_ge_3_is_rejected() {
-    // Uncontained fd >= 3 now works via the raw backend (see tests/raw_windows.rs). Under
-    // containment it stays Unsupported until the raw backend's containment wiring lands (Task 6).
-    let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
-    cmd.fd(3, Stdio::null()).expect("fd attach ok");
-    cmd.contain();
-    let err = cmd.spawn().expect_err("should reject contained fd >= 3 on Windows");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "expected Unsupported, got {err:?}"
-    );
-}
-
 #[test]
 fn merge_to_merge_is_rejected() {
     // stdout -> merge(stderr), stderr -> merge(stdout): chained merge.

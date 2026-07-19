@@ -13,7 +13,7 @@ use std::process::ExitStatus;
 use std::time::Instant;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
     PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOEXW,
@@ -99,14 +99,17 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => Ok(()),
-            // TerminateProcess fails on an already-exited process; treat that as success.
-            Err(e) => {
-                if self.try_wait()?.is_some() {
-                    Ok(())
-                } else {
-                    Err(e.into())
-                }
+            // TerminateProcess reports ERROR_ACCESS_DENIED once the target is already exiting or
+            // exited. We hold a full-access handle to our OWN child, so a real permission failure
+            // is impossible — the denial means its exit is already underway and guaranteed. BLOCK
+            // on that exit (a genuine external event, never a timer) to confirm it, rather than a
+            // non-blocking `try_wait` that races the OS teardown window where TerminateProcess
+            // reports the denial *before* the process object is signaled (a spurious kill error).
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+                self.wait()?;
+                Ok(())
             }
+            Err(e) => Err(e.into()),
         }
     }
 }

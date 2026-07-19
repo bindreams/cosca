@@ -149,20 +149,19 @@ impl Drop for JobHandle {
     }
 }
 
-/// Apply pre-spawn flags to `std_cmd` for a root spawn.
+/// Pre-spawn creation flags for a root spawn.
 /// `CREATE_SUSPENDED`: child must not execute before it is inside the job.
 /// `CREATE_NEW_PROCESS_GROUP`: child leads its own console group so
 /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can target it.
-pub(crate) fn set_root_flags(std_cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    std_cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0);
+/// Shared by the std path and the raw `CreateProcessW` backend via `windows_contain_setup`.
+pub(crate) fn root_flags() -> u32 {
+    CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0
 }
 
-/// Apply pre-spawn flags to `std_cmd` for a nested (non-root) spawn.
+/// Pre-spawn creation flags for a nested (non-root) spawn.
 /// Only `CREATE_NEW_PROCESS_GROUP` — no suspension needed for nested spawns.
-pub(crate) fn set_group_flags(std_cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    std_cmd.creation_flags(CREATE_NEW_PROCESS_GROUP.0);
+pub(crate) fn group_flags() -> u32 {
+    CREATE_NEW_PROCESS_GROUP.0
 }
 
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents

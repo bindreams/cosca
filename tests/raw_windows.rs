@@ -241,3 +241,43 @@ fn oversized_fd_is_unsupported() {
         .unwrap_err();
     assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
 }
+
+// Containment over the raw backend (Plan 12 Task 6) =====
+
+/// A CONTAINED child with fd >= 3 routes through the raw backend AND lands in OUR Job Object:
+/// `test_job_handle_contains_self()` confirms membership (immutable once assigned, so it is
+/// deterministic for a handle-pinned child regardless of run state), fd 3 delivers the child's
+/// bytes, and `kill_tree()` tears the tree down cleanly. EOF (child closing fd 3 on exit) bounds
+/// the read; no timer.
+#[test]
+fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .args(["subprocess_testbin", "write-fd", "3", "x"])
+        .fd(3, subprocess::Stdio::pipe_out())
+        .unwrap()
+        .contain();
+    let mut child = c.spawn().expect("contained raw spawn");
+    // Fixed at spawn (run-state-independent): the achieved mechanism is the Job Object.
+    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.fd_read_end(subprocess::Fd::from(3)).unwrap(), &mut s).unwrap();
+    assert_eq!(s, "x");
+    child.kill_tree().expect("kill_tree");
+}
+
+/// An UNCONTAINED executable spawn (no `.contain()`) reports `Containment::None` — the raw backend
+/// wires containment only when requested; without it the child is a lone process.
+#[test]
+fn uncontained_raw_child_has_no_containment() {
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .commandline("x argv0-report")
+        .stdout(subprocess::Stdio::pipe())
+        .unwrap();
+    assert!(matches!(
+        c.spawn().unwrap().containment(),
+        subprocess::Containment::None
+    ));
+}

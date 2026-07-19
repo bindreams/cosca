@@ -25,25 +25,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
 
     // Windows routing. The raw `CreateProcessW` backend (Plan 12) owns the cases std cannot
     // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors
-    // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It is used only for an UNCONTAINED child —
-    // containment on the raw path is Task 6, so a CONTAINED fd >= 3 stays rejected below until then.
+    // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It handles both uncontained and CONTAINED
+    // children (Task 6 wired containment — Job Object / TreeWalk — into the raw path).
     #[cfg(windows)]
     {
         let has_high_fd = fds.keys().any(|slot| slot.raw() >= 3);
-        if (cmd.executable_path().is_some() || has_high_fd) && cmd.contain_request().mode.is_none() {
+        if cmd.executable_path().is_some() || has_high_fd {
             return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
-        }
-        // Reaching here with a high fd means the child is CONTAINED (an uncontained one routed to
-        // the raw backend above). Containment over the raw backend is not yet wired (Task 6).
-        if has_high_fd {
-            let slot = fds.keys().find(|s| s.raw() >= 3).expect("has_high_fd");
-            return Err(Error::Unsupported {
-                op: format!("{slot}"),
-                platform: std::env::consts::OS,
-                detail: "arbitrary descriptors (>= 3) under containment require the raw backend's \
-                         containment wiring (Plan 12 Task 6)"
-                    .into(),
-            });
         }
     }
     let mut std_cmd = build_std_command(cmd)?;
@@ -54,9 +42,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
     let all_slots: Vec<Fd> = {
         // Yield 0/1/2 first (even unconfigured, for inherit defaulting), then any
-        // configured n>=3. The n>=3 collection is Unix-only: on Windows the fd>=3
-        // rejection above guarantees `fds` holds no fd>=3, so the push is dead code
-        // there — cfg-gate it to make that explicit.
+        // configured n>=3. The n>=3 collection is Unix-only: on Windows the routing
+        // above (any fd>=3 goes to the raw backend) guarantees `fds` holds no fd>=3,
+        // so the push is dead code there — cfg-gate it to make that explicit.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut v: Vec<Fd> = std_slots.to_vec();
         #[cfg(unix)]
