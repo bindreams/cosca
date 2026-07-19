@@ -44,12 +44,6 @@ impl RawChild {
         self.pid
     }
 
-    /// The process handle, for foreign/async control that borrows it (Task 7).
-    #[allow(dead_code)] // consumed by the async backend in Task 7
-    pub(crate) fn process_handle(&self) -> HANDLE {
-        self.handle()
-    }
-
     /// Block until the child exits, returning its status.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match wait_handle_or_cancel(self.handle(), None)? {

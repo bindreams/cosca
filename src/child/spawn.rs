@@ -414,8 +414,9 @@ pub(crate) fn resolve_stdio(
                 return Err(Error::Unsupported {
                     op: format!("async merge {slot} -> {target} (piped)"),
                     platform: std::env::consts::OS,
-                    detail: "merging into a piped target needs an async parent end (not yet built); \
-                             merge into file/null/inherit, or capture separately"
+                    detail: "merging into a piped target with a deferred (tokio-owned) pipe end needs \
+                             the merge target resolved first; merge into file/null/inherit, or capture \
+                             separately"
                         .into(),
                 });
             }

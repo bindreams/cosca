@@ -217,7 +217,6 @@ impl Command {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn contain_request(&self) -> ContainRequest {
         self.contain
     }
