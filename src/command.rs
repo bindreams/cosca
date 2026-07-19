@@ -91,10 +91,11 @@ impl Command {
     ///
     /// # Platform note
     ///
-    /// Combining `commandline` with [`executable`](Self::executable) is
-    /// unsupported on Windows in this plan (returns
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported)); POSIX
-    /// supports it.
+    /// Combining `commandline` with [`executable`](Self::executable) is supported
+    /// on both POSIX and Windows. On Windows the raw `CreateProcessW` backend sets
+    /// the loaded image (`lpApplicationName`) independently of the command line
+    /// (`lpCommandLine`), so `executable` selects the file that runs while the
+    /// child's argv[0] is the command line's first token.
     pub fn commandline<S: Into<OsString>>(&mut self, line: S) -> &mut Command {
         self.input = CommandInput::CommandLine(line.into());
         self
@@ -109,12 +110,13 @@ impl Command {
     /// `executable("/bin/busybox").args(["sh", "-c", "..."])` correctly loads
     /// busybox while the child sees `"sh"` as its argv[0].
     ///
-    /// On Windows, `std::process` has no stable API to set argv[0] independently
-    /// of the executable, so argv[0] will be the executable path instead of the
-    /// user-supplied value. This limitation is lifted in Plan 4's raw backend.
-    /// Combining `executable` with [`commandline`](Self::commandline) is
-    /// unsupported on Windows (returns
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported)).
+    /// On Windows, a set `executable` spawns through the raw `CreateProcessW`
+    /// backend, which sets `lpApplicationName` independently of `lpCommandLine` —
+    /// so argv[0] is preserved (it no longer degrades to the executable path), and
+    /// combining `executable` with [`commandline`](Self::commandline) is supported.
+    /// A bare or relative `executable` is resolved with a deliberate rule (not full
+    /// `CreateProcessW` search parity): the current directory first, then each
+    /// `PATH` directory, appending `.exe` when the name has no extension.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(path.into());
         self
@@ -130,6 +132,16 @@ impl Command {
 
     /// Wire descriptor `slot` to `target`. Errors now if the target's direction
     /// is ambiguous for `slot` (a bare `pipe()` on a descriptor >= 3).
+    ///
+    /// # Platform note
+    ///
+    /// A descriptor `slot >= 3` is delivered on Windows through the raw
+    /// `CreateProcessW` backend's MSVCRT `lpReserved2` fd-table, so only a child
+    /// linked against the MSVC/UCRT runtime sees it as a numbered fd; a non-MSVCRT
+    /// child (foreign or no CRT) cannot recover it — inherent to the CRT-private
+    /// table, not a bug. `Stdio::inherit()` on a `slot >= 3` (no defined parent
+    /// stream) and a chained merge (a merge whose target is itself a merge) remain
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) on every platform.
     pub fn fd(&mut self, slot: impl Into<Fd>, target: Stdio) -> Result<&mut Command, Error> {
         let slot = slot.into();
         let resolved = target.resolve(slot)?;

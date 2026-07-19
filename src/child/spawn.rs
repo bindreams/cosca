@@ -230,10 +230,11 @@ fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> std::ffi::OsS
 // Program + the trailing args (argv mode). `executable` overrides the loaded
 // file; argv[0] is the conventional program name otherwise.
 //
-// POSIX only: when `executable` is set and argv is non-empty, the user's
-// argv[0] is preserved via `CommandExt::arg0` (set on the caller's std_cmd).
-// On Windows std has no `arg0`; argv[0] silently becomes the executable path
-// (documented limitation lifted in Plan 4's raw backend).
+// POSIX: when `executable` is set and argv is non-empty, the user's argv[0] is
+// preserved via `CommandExt::arg0` (set on the caller's std_cmd). On Windows a
+// set `executable` never reaches this std path — it routes to the raw
+// `CreateProcessW` backend, which preserves argv[0] independently of the loaded
+// image (argv[0] no longer degrades to the executable path).
 fn resolve_program_argv<'a>(
     cmd: &'a Command,
     argv: &'a [std::ffi::OsString],
@@ -275,7 +276,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
 }
 
 #[cfg(windows)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<std::process::Command, Error> {
+fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<std::process::Command, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
@@ -284,23 +285,10 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
     // passing the whole line would duplicate the program token in the child's
     // argv. We split the first token off with first_token_and_rest_wide.
     //
-    // Limitation: std has no stable API to set lpApplicationName independently
-    // of lpCommandLine. So when executable() is set alongside a commandline(),
-    // we explicitly reject the combination rather than silently doing the wrong
-    // thing (the child's argv[0] would come from the commandline, but the file
-    // loaded would be executable — a confusing mismatch). The raw backend
-    // (Plan 4) removes this limitation via direct CreateProcess.
-    // TODO(plan4): implement raw backend to support independent executable + commandline on Windows
-    if cmd.executable_path().is_some() {
-        return Err(Error::Unsupported {
-            op: "spawn with executable() and commandline() both set".into(),
-            platform: "windows",
-            detail: "std::process has no API to set the loaded file independently of \
-                     the command line string; use the argv() builder or wait for the \
-                     raw backend (Plan 4)"
-                .into(),
-        });
-    }
+    // This std path is only reached for a commandline() WITHOUT executable(): a set
+    // executable() routes to the raw `CreateProcessW` backend (which sets
+    // lpApplicationName independently of lpCommandLine) before `build_std_command`
+    // is ever called, on both the sync and async spawn paths.
     let wide: Vec<u16> = line.encode_wide().collect();
     let (first, rest) = crate::quote::windows::first_token_and_rest_wide(&wide)
         .ok_or_else(|| Error::Io(std::io::Error::other("empty command line")))?;
@@ -377,7 +365,8 @@ pub(crate) fn resolve_stdio(
     pipe: PipeOwnership,
 ) -> Result<ResolvedStdioEnds, Error> {
     // Reject merge-targeting-a-merge: the two-pass algorithm resolves only one level of
-    // indirection. Transitive chaining needs a fixpoint loop and is deferred to the raw backend.
+    // indirection. Transitive chaining (a fixpoint loop) is an unsupported design limit — redirect
+    // to a concrete slot (pipe/file/null/inherit) instead.
     for &slot in slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
             if matches!(fds.get(target), Some(ResolvedStdio::Merge(_))) {
@@ -494,8 +483,9 @@ fn file_end(f: &std::fs::File) -> Result<ChildEnd, Error> {
 fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     // Duplicate the parent's matching std stream. Bind the stream to a variable
     // before borrowing its descriptor (a temporary would be dropped while borrowed).
-    // For n>=3, Stdio::inherit() has no defined parent stream to dup — reject it
-    // explicitly. (The raw backend, Plan 4, can open arbitrary parent fds by number.)
+    // For n>=3, Stdio::inherit() has no defined parent stream to dup — a design limit
+    // kept as a loud Unsupported on every path (the raw backend routes here too), never a
+    // silent drop.
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
@@ -517,7 +507,7 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
                     op: format!("Stdio::inherit() on {other}"),
                     platform: "unix",
                     detail: "inherit on fd >= 3 has no defined parent stream; \
-                             use pipe/file/null, or the raw backend (Plan 4)"
+                             use pipe/file/null instead"
                         .into(),
                 })
             }
@@ -540,14 +530,14 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
                 let s = std::io::stderr();
                 s.as_handle().try_clone_to_owned()
             }
-            // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). The raw
-            // backend opens arbitrary parent handles by number in Task 5.
+            // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). Retained design
+            // limit: the raw backend routes fd >= 3 inherit through here and rejects it too.
             other => {
                 return Err(Error::Unsupported {
                     op: format!("Stdio::inherit() on {other}"),
                     platform: "windows",
                     detail: "inherit on fd >= 3 has no defined parent stream; \
-                             use pipe/file/null, or the raw backend (Plan 12)"
+                             use pipe/file/null instead"
                         .into(),
                 })
             }

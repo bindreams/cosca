@@ -35,7 +35,7 @@ fn unsupported_displays_op_platform_and_detail() {
     let e = Error::Unsupported {
         op: "fd 3".into(),
         platform: "windows",
-        detail: "arbitrary fds require the raw backend (Plan 4)".into(),
+        detail: "arbitrary fds require the raw backend".into(),
     };
     let s = e.to_string();
     assert!(s.contains("fd 3"), "{s}");

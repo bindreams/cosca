@@ -6,7 +6,7 @@ use std::fs::File;
 use crate::error::Error;
 
 /// A target descriptor. `i32` matches POSIX fd numbering; on Windows 0/1/2 are
-/// the std handles and n>=3 is the MSVCRT fd-table slot (Plan 4). Use a bare
+/// the std handles and n>=3 is the MSVCRT fd-table slot. Use a bare
 /// `i32` at call sites via `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fd(i32);

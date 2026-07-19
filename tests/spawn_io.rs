@@ -393,7 +393,7 @@ fn unix_fd3_null_is_accepted() {
 }
 
 /// Prove that Stdio::inherit() on fd 3 is rejected with Unsupported (no defined
-/// parent stream to dup for n>=3). The raw backend (Plan 4) lifts this.
+/// parent stream to dup for n>=3) — a retained design limit on every path.
 #[cfg(unix)]
 #[test]
 fn unix_fd3_inherit_is_rejected() {

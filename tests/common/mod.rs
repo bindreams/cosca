@@ -89,9 +89,9 @@ pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (subpro
     argv.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = subprocess::tokio::Command::new();
     if contain {
-        // async Windows rejects contained `executable()` until Task 8 wires the raw backend's async
-        // containment; load the testbin as argv[0] via the std path instead (mode/addr stay at
-        // args[1..], so the testbin behaves identically).
+        // Load the testbin as argv[0] via the std path (mode/addr stay at args[1..], so it behaves
+        // identically) — keeps this shared helper on one code path across OSes. The async raw
+        // backend also serves contained `executable()` (see raw_windows_async.rs).
         let mut path_argv = vec![testbin().to_string()];
         path_argv.extend(argv.into_iter().skip(1));
         cmd.args(path_argv);
@@ -118,10 +118,10 @@ pub fn spawn_tree_async(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = subprocess::tokio::Command::new();
-    // Load the testbin as argv[0] via the std path (mode/addr at args[1..]): these trees are
-    // contained (and async Windows rejects contained `executable()` until Task 8's async
-    // containment), and the sole uncontained caller is backend-agnostic. `configure` applies the
-    // containment/nesting/kill_on_drop.
+    // Load the testbin as argv[0] via the std path (mode/addr at args[1..], so it behaves
+    // identically): these trees are usually contained and the sole uncontained caller is
+    // backend-agnostic, so argv[0] keeps this helper on one code path across OSes. `configure`
+    // applies the containment/nesting/kill_on_drop.
     cmd.args([testbin(), mode, addr.as_str()]);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn async tree");

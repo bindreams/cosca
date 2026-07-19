@@ -1,5 +1,10 @@
 # Plan 12 — Windows raw `CreateProcessW` backend (fd ≥ 3 + independent `executable`/`commandline`)
 
+> **Status: LANDED** (2026-07-19, branch `azhukova/4`). All 9 tasks implemented and reviewed;
+> the two Windows-only `Unsupported` rejections (`fd >= 3`, `executable()` + `commandline()`) are
+> lifted on both the sync and async surfaces. Retained design limits: chained merges,
+> `Stdio::inherit()` on `fd >= 3`, and `fd >= 3` for non-MSVCRT children.
+
 Fulfils the deferred "Plan 4" spawn-engine item (`TODO.md:66`): a raw `CreateProcessW`
 backend that lifts the two Windows-only `Unsupported` rejections `std::process` cannot
 express — `fd(n)` for n ≥ 3, and `executable()` set alongside `commandline()` (and the
