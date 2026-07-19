@@ -28,41 +28,14 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let mut fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // fd >= 3 on Windows needs the raw `CreateProcessW` backend, which the async path does not have
-    // yet (the sync path routes there). Reject it rather than silently dropping the descriptor; the
-    // detail cites the raw backend:
-    #[cfg(windows)]
-    for slot in fds.keys() {
-        if slot.raw() >= 3 {
-            return Err(Error::Unsupported {
-                op: format!("{slot}"),
-                platform: std::env::consts::OS,
-                detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 4)".into(),
-            });
-        }
-    }
-
     // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend
-    // (Plan 12 Task 7): an `executable()` loaded independently of argv[0]. fd >= 3 was rejected
-    // above, so no high fd reaches here.
+    // (Plan 12): an `executable()` loaded independently of argv[0], OR arbitrary descriptors
+    // (fd >= 3, wired through the MSVCRT `lpReserved2` table). The raw backend handles BOTH
+    // contained and uncontained via its own async containment (Task 8); everything else stays on
+    // the std/tokio path, whose `prepare` applies containment for argv/commandline spawns.
     #[cfg(windows)]
-    if cmd.executable_path().is_some() {
-        // Uncontained → the async raw backend (independent argv[0]).
-        if cmd.contain_request().mode.is_none() {
-            return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
-        }
-        // Contained executable() has no async raw path yet (Task 8 wires async containment). Reject
-        // LOUDLY for BOTH argv and commandline input — falling through to the std path would
-        // silently drop the user's argv[0] (std's arg0 preservation is Unix-only on Windows), a
-        // silent deferral this crate forbids.
-        return Err(Error::Unsupported {
-            op: "spawn with executable() and containment".into(),
-            platform: "windows",
-            detail: "a contained child loaded via executable() (independent of argv[0]) needs the \
-                     raw CreateProcessW backend's async containment, not yet wired (Task 8); spawn \
-                     uncontained, or use argv()/commandline() without executable()"
-                .into(),
-        });
+    if cmd.executable_path().is_some() || fds.keys().any(|f| f.raw() >= 3) {
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
 
     let std_cmd = build_std_command(cmd)?;
@@ -119,9 +92,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(windows)]
             let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir)?;
             // Merging slots: each gets a dup of the child end. A merging slot with
-            // raw() >= 3 (Unix only — Windows rejected fd >= 3 above) is not assignable as
-            // std stdio: it joins the fd >= 3 child-ends collection the command-fds block
-            // consumes, dup2'd into the child like any other fd >= 3 end — sync parity,
+            // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
+            // assignable as std stdio: it joins the fd >= 3 child-ends collection the command-fds
+            // block consumes, dup2'd into the child like any other fd >= 3 end — sync parity,
             // never silently dropped.
             let mergers: Vec<Fd> = fds
                 .iter()
@@ -138,7 +111,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                     #[cfg(unix)]
                     merge_fd_ends.push((slot, dup(&child_end)?));
                     #[cfg(windows)]
-                    unreachable!("fd >= 3 was rejected above");
+                    unreachable!("fd >= 3 routed to the raw backend above");
                 }
             }
             fds.remove(&target);
@@ -159,8 +132,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
         v
     };
-    // Windows: fd >= 3 was rejected above, and the slot list NEVER includes fd >= 3 — a
-    // stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
+    // Windows: fd >= 3 was routed to the raw backend above, and the slot list NEVER includes
+    // fd >= 3 — a stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
     #[cfg(windows)]
     let all_slots: Vec<Fd> = resolve_std_slots.collect();
     let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred)?;
@@ -266,13 +239,28 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     };
 
+    // fd >= 3 parent ends: Unix's `command-fds`-wired reactor pipes; on Windows the std path
+    // resolves none (fd >= 3 routes to the raw backend), so `parent_ends` is provably empty and the
+    // Windows `FdPipes` (overlapped async ends) is empty.
+    #[cfg(unix)]
+    let pipes = parent_ends;
+    #[cfg(windows)]
+    let pipes = {
+        debug_assert!(
+            parent_ends.is_empty(),
+            "the async std path resolves no fd >= 3 ends on Windows"
+        );
+        drop(parent_ends);
+        super::child::FdPipes::new()
+    };
+
     Ok(Child::from_parts(
         ProcSource::Tokio(child),
         id,
         attached,
         kill_on_drop,
         containment,
-        parent_ends,
+        pipes,
         owned_std,
     ))
 }

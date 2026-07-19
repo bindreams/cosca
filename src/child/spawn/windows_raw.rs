@@ -94,17 +94,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     };
     let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
 
-    // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything
-    // (`encoded_len` is overflow-safe). `maxfd` is the largest configured slot; 0/1/2 always
-    // resolve, so the `2` floor covers an empty/low map.
-    let maxfd = fds.keys().map(|f| f.raw()).max().unwrap_or(2);
-    if !crt_fds::table_fits(crt_fds::encoded_len(maxfd)) {
-        return Err(Error::Unsupported {
-            op: format!("fd {maxfd}"),
-            platform: "windows",
-            detail: "descriptor table exceeds the 64KiB cbReserved2 limit".into(),
-        });
-    }
+    // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
+    ensure_fd_table_fits(&fds)?;
 
     // Resolve 0/1/2 (always) plus any configured fd >= 3. `resolve_stdio` rejects inherit on fd >= 3.
     let slots: Vec<Fd> = {
@@ -114,14 +105,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     };
     let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned)?;
 
-    // Classify each resolved child end (0/1/2 + fd >= 3) for its CRT device flags, then encode the
-    // dense 0..=maxfd MSVCRT fd-table the child CRT reads back from `lpReserved2`.
-    let mut entries: BTreeMap<Fd, (HANDLE, crt_fds::FdKind)> = BTreeMap::new();
-    for (&slot, end) in &child_ends {
-        let h = HANDLE(end.as_raw_handle());
-        entries.insert(slot, (h, crt_fds::classify(h)?));
-    }
-    let table = crt_fds::encode(&entries);
+    // Classify each resolved child end (0/1/2 + fd >= 3) and encode the dense 0..=maxfd MSVCRT
+    // fd-table the child CRT reads back from `lpReserved2`.
+    let table = build_fd_table(&child_ends)?;
 
     // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
     // the child CRT recovers fd >= 3; the HANDLE_LIST scopes inheritance AND backs
@@ -195,6 +181,36 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         containment,
         attached,
     ))
+}
+
+/// Reject a descriptor set whose dense MSVCRT fd-table would exceed the WORD-sized `cbReserved2`
+/// field, BEFORE any allocation (`encoded_len` is overflow-safe). `maxfd` is the largest configured
+/// slot; 0/1/2 always resolve, so the `2` floor covers an empty/low map. `pub(crate)`: shared with
+/// the async raw backend, which caps the same table.
+pub(crate) fn ensure_fd_table_fits(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<(), Error> {
+    let maxfd = fds.keys().map(|f| f.raw()).max().unwrap_or(2);
+    if !crt_fds::table_fits(crt_fds::encoded_len(maxfd)) {
+        return Err(Error::Unsupported {
+            op: format!("fd {maxfd}"),
+            platform: "windows",
+            detail: "descriptor table exceeds the 64KiB cbReserved2 limit".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Classify each resolved child end (0/1/2 + fd >= 3) for its CRT device flags, then encode the
+/// dense `0..=maxfd` MSVCRT fd-table the child CRT reads back from `lpReserved2`. The returned
+/// `handles` is the SINGLE inheritance source (0/1/2 + fd >= 3, each a distinct fresh dup), so no
+/// duplicate reaches the HANDLE_LIST. `pub(crate)`: shared with the async raw backend, which builds
+/// the identical table. Gate the caller on [`ensure_fd_table_fits`] first.
+pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_fds::FdTable, Error> {
+    let mut entries: BTreeMap<Fd, (HANDLE, crt_fds::FdKind)> = BTreeMap::new();
+    for (&slot, end) in child_ends {
+        let h = HANDLE(end.as_raw_handle());
+        entries.insert(slot, (h, crt_fds::classify(h)?));
+    }
+    Ok(crt_fds::encode(&entries))
 }
 
 /// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller

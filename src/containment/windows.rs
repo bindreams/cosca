@@ -324,6 +324,41 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
     }
 }
 
+/// Test-only membership probe: whether `pid` is inside the Job Object held by `attached`, via
+/// `IsProcessInJob` against OUR job handle (not "any job"). Membership is immutable once assigned,
+/// so it is deterministic for a handle-pinned child regardless of run state. Shared by the sync and
+/// async `Child::test_job_handle_contains_self` accessors (both compiled outside `cfg(test)` so
+/// integration crates can call them).
+pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32) -> bool {
+    use windows::Win32::System::JobObjects::IsProcessInJob;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
+
+    let crate::containment::Attached::JobObject(job) = attached else {
+        return false;
+    };
+    let Some(job_handle) = job.as_handle() else {
+        return false;
+    };
+
+    // Open the child process by PID; the backend doesn't expose its handle.
+    // SAFETY: standard Win32 call; the handle is closed below.
+    let process_handle = unsafe {
+        match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(_) => return false,
+        }
+    };
+
+    let mut in_job = windows::core::BOOL(0);
+    // SAFETY: both handles are valid for the duration of the call.
+    let ok = unsafe { IsProcessInJob(process_handle, Some(job_handle), &mut in_job) };
+    // SAFETY: `process_handle` was opened above and must be closed.
+    unsafe {
+        let _ = CloseHandle(process_handle);
+    }
+    ok.is_ok() && in_job.as_bool()
+}
+
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;

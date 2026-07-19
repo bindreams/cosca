@@ -1,14 +1,17 @@
-//! Async (tokio) raw `CreateProcessW` spawn backend (Plan 12 Task 7).
+//! Async (tokio) raw `CreateProcessW` spawn backend (Plan 12 Tasks 7-8).
 //!
 //! The async mirror of [`crate::child::spawn::windows_raw`]: it loads an `executable()`
-//! independently of argv[0] (the case std/tokio cannot express on Windows) for an UNCONTAINED
-//! child with no fd >= 3. It reuses the sync backend's `CreateProcessW` FFI verbatim
-//! (`create_process`, the STARTUPINFOEXW/HANDLE_LIST build, the lock/close discipline, the
-//! error-teardown) and differs only where async demands it: piped std ends come from the tokio
-//! overlapped-named-pipe machinery, and the owned child is a [`RawAsyncChild`] whose waits run on
-//! the blocking pool over a cancellable handle wait. fd >= 3 + contained parity is Task 8.
+//! independently of argv[0] (the case std/tokio cannot express on Windows), wires arbitrary
+//! descriptors (fd >= 3, via the MSVCRT `lpReserved2` table), and applies containment (Job Object /
+//! TreeWalk) — the full sync feature set. It reuses the sync backend's `CreateProcessW` FFI verbatim
+//! (`spawn_step`/`create_process`, the fd-table encode + cap, the STARTUPINFOEXW/HANDLE_LIST build,
+//! the containment decision, the lock/close discipline, the error-teardown) and differs only where
+//! async demands it: piped ends come from the tokio overlapped-named-pipe machinery (std slots via
+//! the stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), and the owned child is
+//! a [`RawAsyncChild`] whose waits run on the blocking pool over a cancellable handle wait.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -21,7 +24,7 @@ use windows::Win32::System::Threading::{
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock};
-use crate::command::Command;
+use crate::command::{Command, EnvOp};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
@@ -38,7 +41,8 @@ use sync_raw::{exit_status, wait_handle_or_cancel, AttributeList, WaitOutcome};
 #[derive(Debug)]
 pub(crate) struct RawAsyncChild {
     proc: Arc<OwnedHandle>,
-    /// The child's OS pid — retained for diagnostics (and Task 8 containment queries).
+    /// The child's OS pid — retained for diagnostics (the `Child`'s stable `ProcessId` is the
+    /// source of truth for containment queries).
     pid: u32,
     /// Memoized once the child has exited, so a second `wait`/`try_wait` is immediate and cannot
     /// re-read a status off a (post-close) recycled handle.
@@ -208,11 +212,12 @@ struct WaitObserver {
     outcome: ::tokio::sync::oneshot::Sender<WaitOutcome>,
 }
 
-/// Spawn `cmd` via the async raw backend: an `executable()` loaded independently of argv[0],
-/// UNCONTAINED, with descriptors 0/1/2 only (fd >= 3 is Task 8). Reuses the sync backend's FFI.
+/// Spawn `cmd` via the async raw backend: an `executable()` loaded independently of argv[0], with
+/// arbitrary descriptors (fd >= 3) and containment — the full sync feature set. Reuses the sync
+/// backend's FFI (fd-table + HANDLE_LIST + containment decision + lock/close + error-teardown).
 pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
     // Batch reject on the program token, resolve the executable, NUL-check, build the command line
-    // and env block — all shared verbatim with the sync raw backend.
+    // — all shared verbatim with the sync raw backend.
     sync_raw::reject_batch_program(cmd)?;
     let image = cmd
         .executable_path()
@@ -227,30 +232,64 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let app_name: Option<Vec<u16>> = image.as_ref().map(|p| sync_raw::to_wide_nul(p.as_os_str()));
     let mut cmdline = sync_raw::raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
-    // Uncontained (Task 7): the parent environment, no nested-root marker.
-    let env_block = sync_raw::resolve::build_env_block(cmd.env_ops())?;
+
+    // Containment: mirror the sync raw backend's pre-spawn decision. Uncontained keeps the defaults
+    // (flags 0, `mode: None`/`is_root: false`); a Strongest root spawns CREATE_SUSPENDED and is
+    // job-assigned + resumed in `attach_or_fault`.
+    let req = cmd.contain_request();
+    let (contain_flags, is_root, marker_env) = if req.mode.is_some() {
+        let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
+        let is_root = !crate::containment::dispatch::is_nested(marker_present);
+        crate::containment::windows::clear_std_handle_inheritance();
+        let setup = crate::containment::dispatch::windows_contain_setup(&req, is_root);
+        (setup.creation_flags, is_root, setup.marker_env)
+    } else {
+        (0u32, false, false)
+    };
+
+    // Append the inherited root marker AFTER the user's env ops so it survives a user `env_clear()`
+    // (mirrors the sync path).
+    let env_block = if marker_env {
+        let mut ops = cmd.env_ops().to_vec();
+        ops.push(EnvOp::Set(
+            OsString::from(crate::containment::NESTED_ENV),
+            OsString::from("1"),
+        ));
+        sync_raw::resolve::build_env_block(&ops)?
+    } else {
+        sync_raw::resolve::build_env_block(cmd.env_ops())?
+    };
     let cwd_w = cmd.cwd().map(|c| sync_raw::to_wide_nul(c.as_os_str()));
 
-    // Resolve 0/1/2 to child handles: piped slots via the tokio overlapped-pipe machinery (we own
-    // the async parent ends, stashed for the accessors), merges as dups, the rest (inherit/file/
-    // null) via the shared core.
-    let (child_ends, owned_std) = resolve_raw_std_ends(&fds)?;
+    // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.
+    sync_raw::ensure_fd_table_fits(&fds)?;
 
-    // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2, inheritance scoped to exactly those
-    // three handles via the HANDLE_LIST (which also backs EXTENDED_STARTUPINFO_PRESENT). No
-    // lpReserved2 — fd >= 3 is Task 8; the child CRT recovers 0/1/2 from the std handles, as
-    // std::process does.
+    // Resolve 0/1/2 (always) plus any configured fd >= 3 to child handles: piped slots via the
+    // tokio overlapped-pipe machinery (we own the async parent ends — std slots via the
+    // stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), merges as dups, the rest
+    // (inherit/file/null) via the shared core (which rejects inherit on fd >= 3).
+    let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds)?;
+
+    // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` — the
+    // SAME layout + single HANDLE_LIST source as the sync backend.
+    let table = sync_raw::build_fd_table(&child_ends)?;
+
+    // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
+    // the child CRT recovers fd >= 3; the HANDLE_LIST (`table.handles`) scopes inheritance AND backs
+    // EXTENDED_STARTUPINFO_PRESENT. `table` (`bytes`) is kept alive until after CreateProcessW.
     let mut si = STARTUPINFOEXW::default();
     si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = HANDLE(child_ends[&Fd::STDIN].as_raw_handle());
     si.StartupInfo.hStdOutput = HANDLE(child_ends[&Fd::STDOUT].as_raw_handle());
     si.StartupInfo.hStdError = HANDLE(child_ends[&Fd::STDERR].as_raw_handle());
-    // Each std slot resolved to a DISTINCT owned handle (a merge dups its target), so the list has
-    // no duplicate — `UpdateProcThreadAttribute` rejects duplicates.
-    let handles: Vec<HANDLE> = child_ends.values().map(|e| HANDLE(e.as_raw_handle())).collect();
-    let attr = AttributeList::build(&handles)?;
+    si.StartupInfo.cbReserved2 = table.bytes.len() as u16; // fits: capped above
+    si.StartupInfo.lpReserved2 = table.bytes.as_ptr() as *mut u8;
+    // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup (its
+    // 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
+    let all_handles: &[HANDLE] = &table.handles;
+    let attr = AttributeList::build(all_handles)?;
     si.lpAttributeList = attr.as_ptr();
-    let flags = CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0;
+    let flags = CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0 | contain_flags;
 
     // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
     // the attribute list BEFORE the guard releases on EVERY path (mirrors the sync raw backend —
@@ -259,7 +298,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let spawned = {
         let _guard = spawn_lock();
         let r = sync_raw::spawn_step(
-            &handles,
+            all_handles,
             app_name.as_deref(),
             &mut cmdline,
             &mut si,
@@ -273,13 +312,14 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     };
     let (proc, pid) = spawned?;
 
-    // Identity read + attach BEFORE building `Child`, UNCONTAINED (`mode: None`), with the SAME
-    // kill+reap error-teardown as the sync-raw/std path (dropping the OwnedHandle alone neither
-    // kills nor reaps on Windows). Spawn + attach + identity are synchronous — no await before the
-    // identity read, so the runtime cannot park and reap in between.
+    // Identity read + attach BEFORE building `Child`, with the REAL mode + is_root (Job Object for a
+    // Strongest root, else TreeWalk/Delegated), and the SAME kill+reap error-teardown as the
+    // sync-raw/std path (dropping the OwnedHandle alone neither kills nor reaps on Windows). Spawn +
+    // attach + identity are synchronous — no await before the identity read, so the runtime cannot
+    // park and reap in between.
     let prepared = crate::containment::Prepared {
-        mode: None,
-        is_root: false,
+        mode: req.mode,
+        is_root,
     };
     let raw_handle = proc.as_raw_handle();
     let (containment, attached) = match attach_or_fault(pid, raw_handle, prepared) {
@@ -305,22 +345,33 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         attached,
         kill_on_drop,
         containment,
-        BTreeMap::new(), // no fd >= 3 parent ends in Task 7
+        fd_pipes,
         owned_std,
     ))
 }
 
-/// The raw backend's resolved std stdio: the child's 0/1/2 handle ends, keyed by slot, plus the
-/// async parent ends we own for the piped slots (keyed by slot).
-type RawStdEnds = (BTreeMap<Fd, OwnedHandle>, BTreeMap<Fd, OwnedStd>);
+/// The raw backend's resolved stdio ends: the child's handle ends (0/1/2 + fd >= 3) keyed by slot,
+/// plus the async parent ends we own — std-slot pipes (for the stdin/stdout/stderr accessors) and
+/// fd >= 3 pipes (for fd_read_end/fd_write_end), each keyed by slot.
+type RawEnds = (
+    BTreeMap<Fd, OwnedHandle>,
+    BTreeMap<Fd, OwnedStd>,
+    BTreeMap<Fd, OwnedStd>,
+);
 
-/// Resolve the child's std handles (0/1/2) for the raw backend, plus the async parent ends we own.
-/// Piped slots use OUR overlapped pipe (tokio owns none here — there is no `tokio::process::Child`);
-/// merges dup their target's child end; the rest resolve via the shared core.
-fn resolve_raw_std_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawStdEnds, Error> {
-    let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
+/// Resolve the child's handle ends (0/1/2 + fd >= 3) for the raw backend, plus the async parent ends
+/// we own. Piped slots use OUR overlapped pipe (tokio owns none here — there is no
+/// `tokio::process::Child`); merges dup their target's child end; the rest resolve via the shared
+/// core (which rejects inherit on fd >= 3).
+fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawEnds, Error> {
+    // Slots to resolve: 0/1/2 always, plus every configured fd >= 3.
+    let slots: Vec<Fd> = {
+        let mut v = vec![Fd::STDIN, Fd::STDOUT, Fd::STDERR];
+        v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
+        v
+    };
     // Reject chained merges (single-level indirection only), mirroring the shared resolver.
-    for &slot in &std_slots {
+    for &slot in &slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
             if matches!(fds.get(target), Some(ResolvedStdio::Merge(_))) {
                 return Err(Error::Unsupported {
@@ -335,25 +386,31 @@ fn resolve_raw_std_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawStdEnds,
     }
     let mut child_ends: BTreeMap<Fd, OwnedHandle> = BTreeMap::new();
     let mut owned_std: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
-    // First pass: non-merge slots. Piped slots use our overlapped pipe (async parent end stashed);
-    // the rest (inherit/file/null/unconfigured) resolve via the shared core.
-    for &slot in &std_slots {
+    let mut fd_pipes: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
+    // First pass: non-merge slots. Piped slots use our overlapped pipe (async parent end stashed —
+    // std slots for the stdin/stdout/stderr accessors, fd >= 3 for fd_read_end/fd_write_end); the
+    // rest (inherit/file/null/unconfigured std) resolve via the shared core.
+    for &slot in &slots {
         match fds.get(&slot) {
             Some(ResolvedStdio::Merge(_)) => continue, // second pass
             Some(ResolvedStdio::Pipe(dir)) => {
                 let (child_end, parent) = crate::tokio::stdio::owned_overlapped_pipe(*dir)?;
                 child_ends.insert(slot, child_end);
-                owned_std.insert(slot, parent);
+                if slot.raw() < 3 {
+                    owned_std.insert(slot, parent);
+                } else {
+                    fd_pipes.insert(slot, parent);
+                }
             }
             other => {
                 let (child_end, parent) = resolve_non_merge(slot, other)?;
-                debug_assert!(parent.is_none(), "a std non-pipe slot yields no parent end");
+                debug_assert!(parent.is_none(), "a raw non-pipe slot yields no parent end");
                 child_ends.insert(slot, child_end);
             }
         }
     }
     // Second pass: each merge dups its target's already-resolved child end.
-    for &slot in &std_slots {
+    for &slot in &slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
             let src = child_ends.get(target).ok_or_else(|| Error::Unsupported {
                 op: format!("merge {slot} -> {target}"),
@@ -363,7 +420,7 @@ fn resolve_raw_std_ends(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<RawStdEnds,
             child_ends.insert(slot, dup(src)?);
         }
     }
-    Ok((child_ends, owned_std))
+    Ok((child_ends, owned_std, fd_pipes))
 }
 
 #[cfg(test)]

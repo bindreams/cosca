@@ -191,39 +191,12 @@ impl Child {
         take_reader(&mut self.pipes, fd)
     }
 
-    /// Test-only: return whether this child is inside our Job Object.
-    /// Uses `IsProcessInJob` against the handle we hold (not "any job").
-    /// Exposed outside `cfg(test)` so integration tests (separate compilation unit) can call it.
+    /// Test-only: return whether this child is inside our Job Object (via `IsProcessInJob` against
+    /// the handle we hold, not "any job"). Exposed outside `cfg(test)` so integration tests (a
+    /// separate compilation unit) can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        use crate::containment::Attached;
-        use windows::Win32::System::JobObjects::IsProcessInJob;
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
-
-        let Attached::JobObject(ref job) = self.attached else {
-            return false;
-        };
-        let Some(job_handle) = job.as_handle() else {
-            return false;
-        };
-
-        // Open the child process by PID; the backend doesn't expose its handle.
-        // SAFETY: standard Win32 call; handle closed below.
-        let process_handle = unsafe {
-            match OpenProcess(PROCESS_QUERY_INFORMATION, false, self.proc.id()) {
-                Ok(h) => h,
-                Err(_) => return false,
-            }
-        };
-
-        let mut in_job = windows::core::BOOL(0);
-        // SAFETY: both handles are valid for the duration of the call.
-        let ok = unsafe { IsProcessInJob(process_handle, Some(job_handle), &mut in_job) };
-        // SAFETY: process_handle was opened above and must be closed.
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(process_handle);
-        }
-        ok.is_ok() && in_job.as_bool()
+        crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())
     }
 }
 

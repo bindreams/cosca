@@ -12,11 +12,10 @@ use super::child::Child;
 ///
 /// # Limitations
 ///
-/// Mirror the sync API: arbitrary descriptors (fd ≥ 3) are Unix-only — parent pipe ends via
-/// `Child::fd_read_end`/`Child::fd_write_end`; Windows returns the sync path's typed
-/// [`Error::Unsupported`](crate::error::Error::Unsupported) at spawn. Merging into a *piped*
-/// target works on all platforms, in both directions; a merge whose target is itself a merge
-/// is rejected.
+/// Mirror the sync API: arbitrary descriptors (fd ≥ 3) work on every platform — parent pipe ends
+/// via `Child::fd_read_end`/`Child::fd_write_end` (Unix wires them through `command-fds`; Windows
+/// through the raw `CreateProcessW` backend's MSVCRT fd-table). Merging into a *piped* target works
+/// on all platforms, in both directions; a merge whose target is itself a merge is rejected.
 #[derive(Debug, Default)]
 pub struct Command {
     inner: SyncCommand,
