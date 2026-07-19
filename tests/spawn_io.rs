@@ -176,19 +176,6 @@ fn null_stdout_discards_output() {
 
 // Rejections =====
 
-#[cfg(windows)]
-#[test]
-fn fd_ge_3_is_rejected() {
-    let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
-    cmd.fd(3, Stdio::null()).expect("fd attach ok");
-    let err = cmd.spawn().expect_err("should reject fd >= 3 on Windows");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "expected Unsupported, got {err:?}"
-    );
-}
-
 #[test]
 fn merge_to_merge_is_rejected() {
     // stdout -> merge(stderr), stderr -> merge(stdout): chained merge.
@@ -348,16 +335,6 @@ fn null_stdout_discards() {
     assert!(status.success());
 }
 
-#[cfg(windows)]
-#[test]
-fn arbitrary_fd_is_unsupported_on_windows() {
-    let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
-    cmd.fd(3, Stdio::pipe_out()).unwrap(); // attaches fine
-    let err = cmd.spawn().unwrap_err(); // but spawn rejects it on Windows
-    assert!(matches!(err, subprocess::error::Error::Unsupported { .. }));
-}
-
 // Arbitrary fd (n>=3) — Unix only, wired via command-fds =====
 
 /// Prove that a child fd 3 configured as a pipe is reachable from the child:
@@ -416,7 +393,7 @@ fn unix_fd3_null_is_accepted() {
 }
 
 /// Prove that Stdio::inherit() on fd 3 is rejected with Unsupported (no defined
-/// parent stream to dup for n>=3). The raw backend (Plan 4) lifts this.
+/// parent stream to dup for n>=3) — a retained design limit on every path.
 #[cfg(unix)]
 #[test]
 fn unix_fd3_inherit_is_rejected() {

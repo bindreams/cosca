@@ -6,6 +6,7 @@ use std::process::Stdio as StdStdio;
 
 use shared_child::SharedChild;
 
+use crate::child::proc_handle::ProcHandle;
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::Error;
@@ -22,16 +23,15 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // On Windows, fd >= 3 is unsupported in this plan (no MSVCRT fd-table wiring).
-    // On Unix, arbitrary fds are handled below via command-fds.
+    // Windows routing. The raw `CreateProcessW` backend (Plan 12) owns the cases std cannot
+    // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors
+    // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It handles both uncontained and CONTAINED
+    // children (Task 6 wired containment — Job Object / TreeWalk — into the raw path).
     #[cfg(windows)]
-    for slot in fds.keys() {
-        if slot.raw() >= 3 {
-            return Err(Error::Unsupported {
-                op: format!("{slot}"),
-                platform: std::env::consts::OS,
-                detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 4)".into(),
-            });
+    {
+        let has_high_fd = fds.keys().any(|slot| slot.raw() >= 3);
+        if cmd.executable_path().is_some() || has_high_fd {
+            return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
         }
     }
     let mut std_cmd = build_std_command(cmd)?;
@@ -42,9 +42,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
     let all_slots: Vec<Fd> = {
         // Yield 0/1/2 first (even unconfigured, for inherit defaulting), then any
-        // configured n>=3. The n>=3 collection is Unix-only: on Windows the fd>=3
-        // rejection above guarantees `fds` holds no fd>=3, so the push is dead code
-        // there — cfg-gate it to make that explicit.
+        // configured n>=3. The n>=3 collection is Unix-only: on Windows the routing
+        // above (any fd>=3 goes to the raw backend) guarantees `fds` holds no fd>=3,
+        // so the push is dead code there — cfg-gate it to make that explicit.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut v: Vec<Fd> = std_slots.to_vec();
         #[cfg(unix)]
@@ -109,8 +109,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     }
 
-    // We own the std Child so containment can job-assign + resume it (Task 5).
-    let mut child = std_cmd.spawn().map_err(Error::Io)?;
+    // We own the std Child so containment can job-assign + resume it (Task 5). Serialize the
+    // spawn against the raw backend's inheritable-handle window via the shared spawn lock: std's
+    // own handle-inheritance marking must not overlap a raw spawn on another thread.
+    let mut child = {
+        let _guard = spawn_lock();
+        std_cmd.spawn().map_err(Error::Io)?
+    };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
     // `prepared` is consumed here: Linux cgroup leaf ownership moves to Attached::Cgroup.
     #[cfg(windows)]
@@ -166,13 +171,23 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let shared = SharedChild::new(child).map_err(Error::Io)?;
 
     Ok(Child::from_parts(
-        shared,
+        ProcHandle::Std(shared),
         id,
         parent_ends,
         kill_on_drop,
         containment,
         attached,
     ))
+}
+
+/// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
+/// path and the raw `CreateProcessW` backend must mark child-side handles inheritable, spawn, then
+/// un-mark/close without a concurrent spawn inheriting them. Held across that window on both paths.
+/// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
+/// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
+pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
@@ -215,10 +230,11 @@ fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> std::ffi::OsS
 // Program + the trailing args (argv mode). `executable` overrides the loaded
 // file; argv[0] is the conventional program name otherwise.
 //
-// POSIX only: when `executable` is set and argv is non-empty, the user's
-// argv[0] is preserved via `CommandExt::arg0` (set on the caller's std_cmd).
-// On Windows std has no `arg0`; argv[0] silently becomes the executable path
-// (documented limitation lifted in Plan 4's raw backend).
+// POSIX: when `executable` is set and argv is non-empty, the user's argv[0] is
+// preserved via `CommandExt::arg0` (set on the caller's std_cmd). On Windows a
+// set `executable` never reaches this std path — it routes to the raw
+// `CreateProcessW` backend, which preserves argv[0] independently of the loaded
+// image (argv[0] no longer degrades to the executable path).
 fn resolve_program_argv<'a>(
     cmd: &'a Command,
     argv: &'a [std::ffi::OsString],
@@ -260,7 +276,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
 }
 
 #[cfg(windows)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<std::process::Command, Error> {
+fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<std::process::Command, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
@@ -269,23 +285,10 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
     // passing the whole line would duplicate the program token in the child's
     // argv. We split the first token off with first_token_and_rest_wide.
     //
-    // Limitation: std has no stable API to set lpApplicationName independently
-    // of lpCommandLine. So when executable() is set alongside a commandline(),
-    // we explicitly reject the combination rather than silently doing the wrong
-    // thing (the child's argv[0] would come from the commandline, but the file
-    // loaded would be executable — a confusing mismatch). The raw backend
-    // (Plan 4) removes this limitation via direct CreateProcess.
-    // TODO(plan4): implement raw backend to support independent executable + commandline on Windows
-    if cmd.executable_path().is_some() {
-        return Err(Error::Unsupported {
-            op: "spawn with executable() and commandline() both set".into(),
-            platform: "windows",
-            detail: "std::process has no API to set the loaded file independently of \
-                     the command line string; use the argv() builder or wait for the \
-                     raw backend (Plan 4)"
-                .into(),
-        });
-    }
+    // This std path is only reached for a commandline() WITHOUT executable(): a set
+    // executable() routes to the raw `CreateProcessW` backend (which sets
+    // lpApplicationName independently of lpCommandLine) before `build_std_command`
+    // is ever called, on both the sync and async spawn paths.
     let wide: Vec<u16> = line.encode_wide().collect();
     let (first, rest) = crate::quote::windows::first_token_and_rest_wide(&wide)
         .ok_or_else(|| Error::Io(std::io::Error::other("empty command line")))?;
@@ -296,7 +299,13 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
 }
 
 fn reject_batch_script(std_cmd: &std::process::Command) -> Result<(), Error> {
-    let prog = std::path::Path::new(std_cmd.get_program());
+    reject_batch_path(std::path::Path::new(std_cmd.get_program()))
+}
+
+/// Reject a `.bat`/`.cmd` program by its path extension. Shared by the std path
+/// (`reject_batch_script`) and the raw backend (`windows_raw::reject_batch_program`): cmd.exe
+/// batch escaping is a distinct, unimplemented vector (CVE-2024-24576 / BatBadBut).
+pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
     if let Some(ext) = prog.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {
@@ -356,7 +365,8 @@ pub(crate) fn resolve_stdio(
     pipe: PipeOwnership,
 ) -> Result<ResolvedStdioEnds, Error> {
     // Reject merge-targeting-a-merge: the two-pass algorithm resolves only one level of
-    // indirection. Transitive chaining needs a fixpoint loop and is deferred to the raw backend.
+    // indirection. Transitive chaining (a fixpoint loop) is an unsupported design limit — redirect
+    // to a concrete slot (pipe/file/null/inherit) instead.
     for &slot in slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
             if matches!(fds.get(target), Some(ResolvedStdio::Merge(_))) {
@@ -404,8 +414,9 @@ pub(crate) fn resolve_stdio(
                 return Err(Error::Unsupported {
                     op: format!("async merge {slot} -> {target} (piped)"),
                     platform: std::env::consts::OS,
-                    detail: "merging into a piped target needs an async parent end (not yet built); \
-                             merge into file/null/inherit, or capture separately"
+                    detail: "merging into a piped target with a deferred (tokio-owned) pipe end needs \
+                             the merge target resolved first; merge into file/null/inherit, or capture \
+                             separately"
                         .into(),
                 });
             }
@@ -473,8 +484,9 @@ fn file_end(f: &std::fs::File) -> Result<ChildEnd, Error> {
 fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     // Duplicate the parent's matching std stream. Bind the stream to a variable
     // before borrowing its descriptor (a temporary would be dropped while borrowed).
-    // For n>=3, Stdio::inherit() has no defined parent stream to dup — reject it
-    // explicitly. (The raw backend, Plan 4, can open arbitrary parent fds by number.)
+    // For n>=3, Stdio::inherit() has no defined parent stream to dup — a design limit
+    // kept as a loud Unsupported on every path (the raw backend routes here too), never a
+    // silent drop.
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
@@ -496,7 +508,7 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
                     op: format!("Stdio::inherit() on {other}"),
                     platform: "unix",
                     detail: "inherit on fd >= 3 has no defined parent stream; \
-                             use pipe/file/null, or the raw backend (Plan 4)"
+                             use pipe/file/null instead"
                         .into(),
                 })
             }
@@ -515,9 +527,20 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
                 let s = std::io::stdout();
                 s.as_handle().try_clone_to_owned()
             }
-            _ => {
+            Fd::STDERR => {
                 let s = std::io::stderr();
                 s.as_handle().try_clone_to_owned()
+            }
+            // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). Retained design
+            // limit: the raw backend routes fd >= 3 inherit through here and rejects it too.
+            other => {
+                return Err(Error::Unsupported {
+                    op: format!("Stdio::inherit() on {other}"),
+                    platform: "windows",
+                    detail: "inherit on fd >= 3 has no defined parent stream; \
+                             use pipe/file/null instead"
+                        .into(),
+                })
             }
         };
         owned.map_err(Error::Io)
@@ -614,6 +637,14 @@ pub(crate) mod fault {
         assert!(!captured.is_alive(), "a failed spawn must leave the child dead");
     }
 }
+
+// Windows raw `CreateProcessW` spawn backend (Plan 12). The MSVCRT fd-table
+// encoder + device classifier (`crt_fds`) lands first; the spawn path that
+// consumes it follows in later tasks. Explicit `#[path]` per the repo's
+// `foo.rs` + `foo/` module convention (mirroring `child.rs`'s `child/spawn.rs`).
+#[cfg(windows)]
+#[path = "spawn/windows_raw.rs"]
+pub(crate) mod windows_raw;
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]

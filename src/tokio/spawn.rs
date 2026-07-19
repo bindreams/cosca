@@ -9,9 +9,11 @@ use std::process::Stdio as StdStdio;
 use crate::child::spawn::{build_std_command, dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
-use crate::stdio::{Direction, Fd, ResolvedStdio};
+#[cfg(unix)]
+use crate::stdio::Direction;
+use crate::stdio::{Fd, ResolvedStdio};
 
-use super::child::{reap_now, Child};
+use super::child::{reap_now, Child, ProcSource};
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // tokio's `process::Command::spawn` needs a running reactor; outside ANY runtime it panics on
@@ -26,18 +28,14 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let mut fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // fd >= 3 is Unix-only (command-fds), exactly as on the sync path — Windows rejects it
-    // with the sync spawn's strings VERBATIM (op has no "async" prefix; the detail cites
-    // the raw backend) so the two paths report identically:
+    // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend
+    // (Plan 12): an `executable()` loaded independently of argv[0], OR arbitrary descriptors
+    // (fd >= 3, wired through the MSVCRT `lpReserved2` table). The raw backend handles BOTH
+    // contained and uncontained via its own async containment (Task 8); everything else stays on
+    // the std/tokio path, whose `prepare` applies containment for argv/commandline spawns.
     #[cfg(windows)]
-    for slot in fds.keys() {
-        if slot.raw() >= 3 {
-            return Err(Error::Unsupported {
-                op: format!("{slot}"),
-                platform: std::env::consts::OS,
-                detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 4)".into(),
-            });
-        }
+    if cmd.executable_path().is_some() || fds.keys().any(|f| f.raw() >= 3) {
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
 
     let std_cmd = build_std_command(cmd)?;
@@ -92,25 +90,11 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 }
             };
             #[cfg(windows)]
-            let (child_end, parent_end) = {
-                use super::stdio::{ConnectingPipe, OwnedStd, WinOwnedRead, WinOwnedWrite};
-                match dir {
-                    Direction::In => {
-                        let (server, client) = super::stdio::overlapped_in_pipe()?;
-                        let connecting = ConnectingPipe::Connecting(super::stdio::connect_task(server));
-                        (client, OwnedStd::Write(WinOwnedWrite(connecting)))
-                    }
-                    Direction::Out => {
-                        let (server, client) = super::stdio::overlapped_out_pipe()?;
-                        let connecting = ConnectingPipe::Connecting(super::stdio::connect_task(server));
-                        (client, OwnedStd::Read(WinOwnedRead(connecting)))
-                    }
-                }
-            };
+            let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir)?;
             // Merging slots: each gets a dup of the child end. A merging slot with
-            // raw() >= 3 (Unix only — Windows rejected fd >= 3 above) is not assignable as
-            // std stdio: it joins the fd >= 3 child-ends collection the command-fds block
-            // consumes, dup2'd into the child like any other fd >= 3 end — sync parity,
+            // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
+            // assignable as std stdio: it joins the fd >= 3 child-ends collection the command-fds
+            // block consumes, dup2'd into the child like any other fd >= 3 end — sync parity,
             // never silently dropped.
             let mergers: Vec<Fd> = fds
                 .iter()
@@ -127,7 +111,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                     #[cfg(unix)]
                     merge_fd_ends.push((slot, dup(&child_end)?));
                     #[cfg(windows)]
-                    unreachable!("fd >= 3 was rejected above");
+                    unreachable!("fd >= 3 routed to the raw backend above");
                 }
             }
             fds.remove(&target);
@@ -148,8 +132,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
         v
     };
-    // Windows: fd >= 3 was rejected above, and the slot list NEVER includes fd >= 3 — a
-    // stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
+    // Windows: fd >= 3 was routed to the raw backend above, and the slot list NEVER includes
+    // fd >= 3 — a stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
     #[cfg(windows)]
     let all_slots: Vec<Fd> = resolve_std_slots.collect();
     let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred)?;
@@ -211,7 +195,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     }
 
-    let mut child = tcmd.spawn().map_err(Error::Io)?;
+    // Serialize the spawn against the raw backend's inheritable-handle window via the shared spawn
+    // lock: tokio's own handle-inheritance marking must not overlap a raw `CreateProcessW` spawn on
+    // another thread (mirrors the sync std path).
+    let mut child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        tcmd.spawn().map_err(Error::Io)?
+    };
 
     // Identity must be read before any await: spawn + attach are synchronous, so the runtime cannot
     // park and reap the child in between. Even if the child has already exited, tokio's held handle
@@ -249,16 +239,35 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     };
 
+    // fd >= 3 parent ends: Unix's `command-fds`-wired reactor pipes; on Windows the std path
+    // resolves none (fd >= 3 routes to the raw backend), so `parent_ends` is provably empty and the
+    // Windows `FdPipes` (overlapped async ends) is empty.
+    #[cfg(unix)]
+    let pipes = parent_ends;
+    #[cfg(windows)]
+    let pipes = {
+        debug_assert!(
+            parent_ends.is_empty(),
+            "the async std path resolves no fd >= 3 ends on Windows"
+        );
+        drop(parent_ends);
+        super::child::FdPipes::new()
+    };
+
     Ok(Child::from_parts(
-        child,
+        ProcSource::Tokio(child),
         id,
         attached,
         kill_on_drop,
         containment,
-        parent_ends,
+        pipes,
         owned_std,
     ))
 }
+
+#[cfg(windows)]
+#[path = "spawn/windows_raw.rs"]
+pub(crate) mod windows_raw;
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]

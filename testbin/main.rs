@@ -21,6 +21,28 @@ fn borrow_std_file(handle: std::os::windows::io::RawHandle) -> std::mem::Manuall
     std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
+/// Wrap CRT fd `fd` as a `File` for the `read-fd`/`write-fd` relay modes. Callers must
+/// `std::mem::forget` the result after use so the drop does not close a descriptor this
+/// process still owns (double-close on exit). On Windows the CRT fd is translated to its OS
+/// handle via `get_osfhandle`; on unix the fd is used directly.
+#[cfg(windows)]
+fn file_from_fd(fd: i32) -> std::fs::File {
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    // SAFETY: get_osfhandle only reads the CRT fd table; it has no preconditions.
+    let h = unsafe { libc::get_osfhandle(fd) };
+    assert!(h != -1, "fd {fd} not wired into the CRT fd table");
+    // SAFETY: `h` is a live OS handle for this open fd; the caller forgets the File so the
+    // handle is not closed out from under the fd.
+    unsafe { std::fs::File::from_raw_handle(h as RawHandle) }
+}
+#[cfg(unix)]
+fn file_from_fd(fd: i32) -> std::fs::File {
+    use std::os::fd::{FromRawFd, RawFd};
+    // SAFETY: `fd` is an open descriptor passed in by the test; the caller forgets the File so
+    // the descriptor is not closed out from under the fd.
+    unsafe { std::fs::File::from_raw_fd(fd as RawFd) }
+}
+
 #[cfg(windows)]
 fn install_ignore_break() {
     use windows::core::BOOL;
@@ -40,6 +62,40 @@ fn main() {
             // Print this process's argv[0] so callers can verify it.
             let argv0 = std::env::args().next().unwrap_or_default();
             println!("{argv0}");
+        }
+        "argv0-report" => {
+            // Report argv[0] and the resolved image path on separate lines, so the raw backend
+            // tests can prove argv[0] is independent of the executable that actually ran.
+            let argv0 = std::env::args().next().unwrap_or_default();
+            let image = std::env::current_exe().expect("current_exe");
+            println!("argv0={argv0}");
+            println!("image={}", image.display());
+        }
+        "read-fd" => {
+            // Copy the given CRT fd to stdout (proves an inherited fd reached the child).
+            let fd: i32 = args[2].parse().unwrap();
+            let mut f = file_from_fd(fd);
+            let mut out = std::io::stdout().lock();
+            std::io::copy(&mut f, &mut out).unwrap();
+            out.flush().unwrap();
+            std::mem::forget(f); // keep the inherited fd open; do not close on exit
+        }
+        "write-fd" => {
+            // Write the given text straight to the given CRT fd (proves the child can drive an
+            // inherited fd back to the parent).
+            let fd: i32 = args[2].parse().unwrap();
+            let mut f = file_from_fd(fd);
+            f.write_all(args[3].as_bytes()).unwrap();
+            f.flush().unwrap();
+            std::mem::forget(f); // keep the inherited fd open; do not close on exit
+        }
+        "isatty-fd" => {
+            // Report whether the given CRT fd is a character device (console) vs a pipe/file, so
+            // the raw backend tests can classify inherited stdio.
+            let fd: i32 = args[2].parse().unwrap();
+            // SAFETY: isatty only queries the fd; it has no preconditions.
+            let tty = unsafe { libc::isatty(fd) };
+            println!("isatty={tty}");
         }
         "echo-argv" => {
             let mut out = std::io::stdout().lock();

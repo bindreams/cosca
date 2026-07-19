@@ -391,18 +391,10 @@ async fn async_unix_fd3_null_is_accepted() {
     assert_eq!(status.code(), Some(0));
 }
 
-/// Async twin of sync `arbitrary_fd_is_unsupported_on_windows`: config attaches fine, spawn
-/// rejects with the sync path's typed error.
-#[cfg(windows)]
-#[tokio::test]
-async fn async_fd3_is_unsupported_on_windows() {
-    let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(common::testbin())
-        .args(["subprocess_testbin", "exit", "0"]);
-    cmd.fd(3, subprocess::Stdio::pipe_out()).unwrap(); // attaches fine
-    let err = cmd.spawn().unwrap_err(); // but spawn rejects it on Windows
-    assert!(matches!(err, subprocess::error::Error::Unsupported { .. }));
-}
+// Windows fd >= 3 routes through the async raw `CreateProcessW` backend (Plan 12 Task 8): the
+// MSVCRT fd-table wires the descriptor and the parent end is the overlapped-named-pipe async end.
+// Its round-trips (both directions) + contained twin live in `tests/raw_windows_async.rs`,
+// alongside the rest of the raw-backend proofs.
 
 /// fd 3 as pipe_out: the testbin's `fd3-write` mode writes a token to fd 3; the parent
 /// reads it back via the reactor-registered `fd_read_end`.

@@ -61,9 +61,11 @@ To run the live test in CI:
 - [ ] Settle license line for the ported qodana shlex (Apache-2.0, user-authored) — attribution header / NOTICE.
 - [ ] Re-validate own-containment vs `process-wrap` dependency, and `cgroups-rs` vs thin direct cgroup-fs impl.
 
-## Spawn engine (from Plan 4)
+## Spawn engine (from Plan 4, delivered in Plan 12)
 
-- [ ] (Plan 4) Implement raw backend (CreateProcess/execve) to support independent `executable` + `commandline` on Windows — std has no stable API to set `lpApplicationName` independently of `lpCommandLine`, so the std-only backend forces `argv[0]` to equal the executable when both are set.
+- [x] (Plan 12) Raw `CreateProcessW` backend (sync + async) supporting independent `executable` + `commandline` and `fd >= 3` on Windows — `lpApplicationName` set independently of `lpCommandLine`, argv[0] preserved, and `fd >= 3` smuggled via the MSVCRT `lpReserved2` fd-table.
+
+Retained deferrals (agreed with user; permanent design limits, not bugs): chained merges (`merge -> merge`), `Stdio::inherit()` on `fd >= 3` (no defined parent stream), and `fd >= 3` for non-MSVCRT children (the `lpReserved2` table is a CRT-private contract — inherent).
 
 ## Lifecycle / graceful shutdown (from Plan 5)
 

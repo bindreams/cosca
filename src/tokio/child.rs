@@ -4,28 +4,42 @@
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[path = "child/proc_source.rs"]
+mod proc_source;
+pub(crate) use proc_source::ProcSource;
+
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
+#[cfg(unix)]
 use crate::child::ParentEnd;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::stdio::Fd;
 
+/// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
+/// (converted to a reactor pipe at take time); Windows stashes the already-registered overlapped
+/// async end (the raw backend's fd >= 3 pipes), taken directly (no `from_raw_handle`, which would
+/// double-register the IOCP handle).
+#[cfg(unix)]
+pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
+#[cfg(windows)]
+pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
+
 #[derive(Debug)]
 pub struct Child {
-    // `pub(super)`: the sibling `pump` module borrows the inner tokio child for `communicate`'s
-    // `wait` future.
-    pub(super) child: ::tokio::process::Child,
+    // `pub(super)`: the sibling `pump` module borrows the backend for `communicate`'s `wait` future.
+    pub(super) proc: ProcSource,
     id: ProcessId,
     attached: Attached,
     kill_on_drop: bool,
     containment: Containment,
-    /// Parent ends of fd >= 3 pipes (Unix; always empty on Windows, which rejects fd >= 3).
-    // Only the cfg(unix) accessors read it; the derived Debug read doesn't count.
-    #[cfg_attr(windows, allow(dead_code))]
-    pipes: BTreeMap<Fd, ParentEnd>,
+    /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
+    /// [`fd_write_end`](Child::fd_write_end). Unix: `command-fds`-wired reactor pipes; Windows: the
+    /// raw backend's overlapped async ends (empty on the std path, which routes fd >= 3 to the raw
+    /// backend).
+    pipes: FdPipes,
     /// Our-owned parent ends of piped std-slot MERGE TARGETS (the spawn pre-pass owns those
     /// pipes; tokio's internal ones cannot be shared), keyed by the target slot.
     owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
@@ -34,16 +48,16 @@ pub struct Child {
 impl Child {
     // The only caller is the sibling `spawn` (and `OwnedStd` is module-scoped).
     pub(super) fn from_parts(
-        child: ::tokio::process::Child,
+        proc: ProcSource,
         id: ProcessId,
         attached: Attached,
         kill_on_drop: bool,
         containment: Containment,
-        pipes: BTreeMap<Fd, ParentEnd>,
+        pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
-            child,
+            proc,
             id,
             attached,
             kill_on_drop,
@@ -68,7 +82,7 @@ impl Child {
         if let Some(owned) = self.take_owned_in(crate::stdio::Fd::STDIN) {
             return Some(super::stdio::ChildStdin { inner: owned });
         }
-        self.child.stdin.take().map(|s| super::stdio::ChildStdin {
+        self.proc.take_stdin().map(|s| super::stdio::ChildStdin {
             inner: super::stdio::InInner::Tokio(s),
         })
     }
@@ -76,7 +90,7 @@ impl Child {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDOUT) {
             return Some(super::stdio::ChildStdout { inner: owned });
         }
-        self.child.stdout.take().map(|s| super::stdio::ChildStdout {
+        self.proc.take_stdout().map(|s| super::stdio::ChildStdout {
             inner: super::stdio::OutInner::Stdout(s),
         })
     }
@@ -84,7 +98,7 @@ impl Child {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDERR) {
             return Some(super::stdio::ChildStderr { inner: owned });
         }
-        self.child.stderr.take().map(|s| super::stdio::ChildStderr {
+        self.proc.take_stderr().map(|s| super::stdio::ChildStderr {
             inner: super::stdio::OutInner::Stderr(s),
         })
     }
@@ -243,14 +257,69 @@ impl Child {
         }
     }
 
+    /// Take the parent's read end of the pipe on child descriptor `fd` (configured via
+    /// `Command::fd(n, Stdio::pipe_out())`), as an async [`ChildStdout`](super::stdio::ChildStdout).
+    /// The raw `CreateProcessW` backend serves fd >= 3 on Windows; the end is the overlapped
+    /// named-pipe async end created at spawn (inside the runtime), yielded directly.
+    ///
+    /// # Returns
+    ///
+    /// `Some(reader)` on success. `None` if the fd was not configured as a piped read end, or was
+    /// already taken. A wrong-direction take (a write end) leaves the end in place for
+    /// [`fd_write_end`](Child::fd_write_end).
+    #[cfg(windows)]
+    pub fn fd_read_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdout> {
+        let fd = fd.into();
+        match self.pipes.remove(&fd)? {
+            super::stdio::OwnedStd::Read(r) => Some(super::stdio::ChildStdout {
+                inner: super::stdio::OutInner::Owned(r),
+            }),
+            end => {
+                self.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
+                None
+            }
+        }
+    }
+
+    /// Take the parent's write end of the pipe on child descriptor `fd` (configured via
+    /// `Command::fd(n, Stdio::pipe_in())`), as an async [`ChildStdin`](super::stdio::ChildStdin).
+    /// See [`fd_read_end`](Child::fd_read_end) for the Windows raw-backend surface.
+    ///
+    /// # Returns
+    ///
+    /// `Some(writer)` on success. `None` if the fd was not configured as a piped write end, or was
+    /// already taken. A wrong-direction take leaves the end in place for
+    /// [`fd_read_end`](Child::fd_read_end).
+    #[cfg(windows)]
+    pub fn fd_write_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdin> {
+        let fd = fd.into();
+        match self.pipes.remove(&fd)? {
+            super::stdio::OwnedStd::Write(w) => Some(super::stdio::ChildStdin {
+                inner: super::stdio::InInner::Owned(w),
+            }),
+            end => {
+                self.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
+                None
+            }
+        }
+    }
+
+    /// Test-only: return whether this child is inside our Job Object (via `IsProcessInJob` against
+    /// the handle we hold, not "any job"). Exposed outside `cfg(test)` so integration tests (a
+    /// separate compilation unit) can call it.
+    #[cfg(windows)]
+    pub fn test_job_handle_contains_self(&self) -> bool {
+        crate::containment::windows::job_contains_pid(&self.attached, self.id.pid())
+    }
+
     /// Block until the child exits, returning its status. For a bounded wait use
     /// `tokio::time::timeout(d, child.wait())`.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
-        self.child.wait().await.map_err(Error::Io)
+        self.proc.wait().await
     }
     /// Exit status if the child has already exited (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
-        self.child.try_wait().map_err(Error::Io)
+        self.proc.try_wait()
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
@@ -258,7 +327,7 @@ impl Child {
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
-        self.child.start_kill().map_err(Error::Io)
+        self.proc.start_kill()
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -303,6 +372,19 @@ impl Child {
     }
 }
 
+#[cfg(all(test, windows))]
+impl Child {
+    /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's
+    /// `WaitObserver`), forwarded to the backend.
+    pub(crate) fn install_wait_observer(
+        &mut self,
+        started: ::tokio::sync::oneshot::Sender<()>,
+        outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
+    ) {
+        self.proc.install_wait_observer(started, outcome);
+    }
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -318,10 +400,10 @@ impl Drop for Child {
         );
         let _ = tree;
         // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
-        // the dropping thread; the child is SIGKILL'd so it exits at once. `true`: a prior wait()
-        // (a Done child) is legal on Drop.
+        // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend
+        // (tokio field-drop reap vs the raw handle's kill-then-wait).
         let pid = self.id.pid();
-        reap_now(&mut self.child, pid, true);
+        self.proc.reap_now_on_drop(pid);
     }
 }
 

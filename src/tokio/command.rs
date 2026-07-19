@@ -12,11 +12,10 @@ use super::child::Child;
 ///
 /// # Limitations
 ///
-/// Mirror the sync API: arbitrary descriptors (fd ≥ 3) are Unix-only — parent pipe ends via
-/// `Child::fd_read_end`/`Child::fd_write_end`; Windows returns the sync path's typed
-/// [`Error::Unsupported`](crate::error::Error::Unsupported) at spawn. Merging into a *piped*
-/// target works on all platforms, in both directions; a merge whose target is itself a merge
-/// is rejected.
+/// Mirror the sync API: arbitrary descriptors (fd ≥ 3) work on every platform — parent pipe ends
+/// via `Child::fd_read_end`/`Child::fd_write_end` (Unix wires them through `command-fds`; Windows
+/// through the raw `CreateProcessW` backend's MSVCRT fd-table). Merging into a *piped* target works
+/// on all platforms, in both directions; a merge whose target is itself a merge is rejected.
 #[derive(Debug, Default)]
 pub struct Command {
     inner: SyncCommand,
@@ -154,6 +153,21 @@ impl Command {
         let mut child = self.spawn()?;
         let out = child.communicate(None).await?;
         String::from_utf8(out.stdout).map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+    }
+
+    /// Test-only spawn variant that installs a per-instance wait observer on the resulting raw
+    /// child, so a cancellation test observes exactly THIS child's blocking wait (see the raw
+    /// backend's `WaitObserver`) rather than racing a parallel test. Routes through the normal
+    /// spawn, so the config must reach the raw backend (executable, uncontained, no fd >= 3).
+    #[cfg(all(test, windows))]
+    pub(crate) fn spawn_with_wait_observer(
+        &mut self,
+        started: ::tokio::sync::oneshot::Sender<()>,
+        outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
+    ) -> Result<Child, Error> {
+        let mut child = self.spawn()?;
+        child.install_wait_observer(started, outcome);
+        Ok(child)
     }
 }
 
