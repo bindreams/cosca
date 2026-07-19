@@ -6,7 +6,7 @@ use std::fs::File;
 use crate::error::Error;
 
 /// A target descriptor. `i32` matches POSIX fd numbering; on Windows 0/1/2 are
-/// the std handles and n>=3 is the MSVCRT fd-table slot (Plan 4). Use a bare
+/// the std handles and n>=3 is the MSVCRT fd-table slot. Use a bare
 /// `i32` at call sites via `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fd(i32);
@@ -18,6 +18,14 @@ impl Fd {
 
     pub fn raw(self) -> i32 {
         self.0
+    }
+
+    /// Rebuild an `Fd` from a raw descriptor number, without the non-negativity
+    /// debug-assert of `From<i32>`. Used by the Windows raw spawn backend to walk
+    /// a dense `0..=maxfd` fd-table; unused (hence `dead_code`-allowed) on Unix.
+    #[allow(dead_code)]
+    pub(crate) fn from_raw(n: i32) -> Fd {
+        Fd(n)
     }
 }
 

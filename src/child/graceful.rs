@@ -1,5 +1,5 @@
 //! `Child` graceful shutdown — the soft-then-hard escalation trio. A submodule of `child`
-//! so it can reach `Child`'s private `shared`/`id`.
+//! so it can reach `Child`'s private `proc`/`id`.
 
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -40,7 +40,7 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.shared.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        self.proc.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
         let status = self.wait()?;
         watch?;
         Ok(status)

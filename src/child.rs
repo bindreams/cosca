@@ -3,8 +3,6 @@
 use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter};
 
-use shared_child::SharedChild;
-
 use crate::command::Command;
 use crate::containment::Containment;
 use crate::error::Error;
@@ -16,6 +14,10 @@ pub(crate) mod pump;
 
 #[path = "child/spawn.rs"]
 pub(crate) mod spawn;
+
+#[path = "child/proc_handle.rs"]
+pub(crate) mod proc_handle;
+use proc_handle::ProcHandle;
 
 #[path = "child/lifecycle.rs"]
 mod lifecycle;
@@ -33,7 +35,7 @@ pub(crate) enum ParentEnd {
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
-    shared: SharedChild,
+    proc: ProcHandle,
     /// Stable identity resolved immediately after spawn.
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
@@ -44,7 +46,7 @@ pub struct Child {
 
 impl Child {
     pub(crate) fn from_parts(
-        shared: SharedChild,
+        proc: ProcHandle,
         id: ProcessId,
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
@@ -52,7 +54,7 @@ impl Child {
         attached: crate::containment::Attached,
     ) -> Child {
         Child {
-            shared,
+            proc,
             id,
             pipes,
             kill_on_drop,
@@ -86,19 +88,19 @@ impl Child {
 
     /// Block until the child exits, returning its status.
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
-        self.shared.wait().map_err(Error::Io)
+        self.proc.wait().map_err(Error::Io)
     }
 
     /// Return the exit status if the child has already exited.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, Error> {
-        self.shared.try_wait().map_err(Error::Io)
+        self.proc.try_wait().map_err(Error::Io)
     }
 
     /// Hard-kill the process. Returns `Ok(())` if already dead.
     pub fn kill(&self) -> Result<(), Error> {
-        // shared_child delegates to std::process::Child::kill, which returns
-        // Ok(()) for an already-exited child on all platforms.
-        self.shared.kill().map_err(Error::Io)
+        // Both backends return Ok(()) for an already-exited child (std delegates to
+        // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
+        self.proc.kill().map_err(Error::Io)
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -110,7 +112,7 @@ impl Child {
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
-        let backstop = self.shared.kill().map_err(Error::Io);
+        let backstop = self.proc.kill().map_err(Error::Io);
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
             log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
         }
@@ -125,7 +127,7 @@ impl Child {
     /// unsignaled; `kill_tree` is the guaranteed hard teardown.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        self.attached.terminate(self.shared.id())
+        self.attached.terminate(self.proc.id())
     }
 
     /// Take the parent's write end of the child's stdin pipe, if configured.
@@ -189,39 +191,12 @@ impl Child {
         take_reader(&mut self.pipes, fd)
     }
 
-    /// Test-only: return whether this child is inside our Job Object.
-    /// Uses `IsProcessInJob` against the handle we hold (not "any job").
-    /// Exposed outside `cfg(test)` so integration tests (separate compilation unit) can call it.
+    /// Test-only: return whether this child is inside our Job Object (via `IsProcessInJob` against
+    /// the handle we hold, not "any job"). Exposed outside `cfg(test)` so integration tests (a
+    /// separate compilation unit) can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        use crate::containment::Attached;
-        use windows::Win32::System::JobObjects::IsProcessInJob;
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
-
-        let Attached::JobObject(ref job) = self.attached else {
-            return false;
-        };
-        let Some(job_handle) = job.as_handle() else {
-            return false;
-        };
-
-        // Open the child process by PID; shared_child doesn't expose its handle.
-        // SAFETY: standard Win32 call; handle closed below.
-        let process_handle = unsafe {
-            match OpenProcess(PROCESS_QUERY_INFORMATION, false, self.shared.id()) {
-                Ok(h) => h,
-                Err(_) => return false,
-            }
-        };
-
-        let mut in_job = windows::core::BOOL(0);
-        // SAFETY: both handles are valid for the duration of the call.
-        let ok = unsafe { IsProcessInJob(process_handle, Some(job_handle), &mut in_job) };
-        // SAFETY: process_handle was opened above and must be closed.
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(process_handle);
-        }
-        ok.is_ok() && in_job.as_bool()
+        crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())
     }
 }
 
@@ -233,8 +208,8 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) then also the direct child, then reap.
         // Order matters on Unix: kill BEFORE wait (reaping frees the PID).
         let _ = self.attached.hard_kill();
-        let _ = self.shared.kill();
-        let _ = self.shared.wait();
+        let _ = self.proc.kill();
+        let _ = self.proc.wait();
     }
 }
 
