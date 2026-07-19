@@ -8,7 +8,6 @@
 //! in [`crt_fds`].
 
 #[path = "windows_raw/crt_fds.rs"]
-#[allow(dead_code)] // the fd-table encoder is consumed by the Task 5 fd>=3 spawn path; no caller yet
 mod crt_fds;
 
 #[path = "windows_raw/resolve.rs"]
@@ -41,8 +40,9 @@ use crate::command::{Command, CommandInput};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
-/// Spawn `cmd` via raw `CreateProcessW`. Task 4 scope: an UNCONTAINED child with std-only
-/// descriptors (0/1/2). fd >= 3 (Task 5) and containment (Task 6) leave their marked seams below.
+/// Spawn `cmd` via raw `CreateProcessW`. Handles an UNCONTAINED child with descriptors 0/1/2 plus
+/// arbitrary fd >= 3 (wired through the MSVCRT `lpReserved2` table). Containment (Task 6) leaves its
+/// marked seam below.
 pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
@@ -61,21 +61,49 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let env_block = resolve::build_env_block(cmd.env_ops())?; // Task 6 may add the contain marker
     let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
 
-    let slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR]; // Task 5 adds fd >= 3
+    // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything
+    // (`encoded_len` is overflow-safe). `maxfd` is the largest configured slot; 0/1/2 always
+    // resolve, so the `2` floor covers an empty/low map.
+    let maxfd = fds.keys().map(|f| f.raw()).max().unwrap_or(2);
+    if !crt_fds::table_fits(crt_fds::encoded_len(maxfd)) {
+        return Err(Error::Unsupported {
+            op: format!("fd {maxfd}"),
+            platform: "windows",
+            detail: "descriptor table exceeds the 64KiB cbReserved2 limit".into(),
+        });
+    }
+
+    // Resolve 0/1/2 (always) plus any configured fd >= 3. `resolve_stdio` rejects inherit on fd >= 3.
+    let slots: Vec<Fd> = {
+        let mut v = vec![Fd::STDIN, Fd::STDOUT, Fd::STDERR];
+        v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
+        v
+    };
     let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned)?;
 
-    // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2, plus an attribute list of exactly
-    // our child ends. hStd* wires the child's stdio; the HANDLE_LIST scopes inheritance to those
-    // handles AND backs EXTENDED_STARTUPINFO_PRESENT. (Task 5 adds fd >= 3 handles + lpReserved2.)
+    // Classify each resolved child end (0/1/2 + fd >= 3) for its CRT device flags, then encode the
+    // dense 0..=maxfd MSVCRT fd-table the child CRT reads back from `lpReserved2`.
+    let mut entries: BTreeMap<Fd, (HANDLE, crt_fds::FdKind)> = BTreeMap::new();
+    for (&slot, end) in &child_ends {
+        let h = HANDLE(end.as_raw_handle());
+        entries.insert(slot, (h, crt_fds::classify(h)?));
+    }
+    let table = crt_fds::encode(&entries);
+
+    // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
+    // the child CRT recovers fd >= 3; the HANDLE_LIST scopes inheritance AND backs
+    // EXTENDED_STARTUPINFO_PRESENT. The table (`bytes`) is kept alive until after CreateProcessW.
     let mut si = STARTUPINFOEXW::default();
     si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = child_handle(&child_ends, Fd::STDIN);
     si.StartupInfo.hStdOutput = child_handle(&child_ends, Fd::STDOUT);
     si.StartupInfo.hStdError = child_handle(&child_ends, Fd::STDERR);
-    // 0/1/2 child-end handles, all distinct (each slot is its own dup). Task 5 REPLACES this with
-    // `crt_fds` `table.handles` (0/1/2 plus fd >= 3).
-    let all_handles: Vec<HANDLE> = slots.iter().map(|s| child_handle(&child_ends, *s)).collect();
-    let attr = AttributeList::build(&all_handles)?;
+    si.StartupInfo.cbReserved2 = table.bytes.len() as u16; // fits: capped above
+    si.StartupInfo.lpReserved2 = table.bytes.as_ptr() as *mut u8;
+    // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup from
+    // `resolve_stdio` (its 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
+    let all_handles: &[HANDLE] = &table.handles;
+    let attr = AttributeList::build(all_handles)?;
     si.lpAttributeList = attr.as_ptr();
     let contain_flags = 0u32; // Task 6 sets this (uncontained here)
     let flags = CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0 | contain_flags;
@@ -87,7 +115,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let spawned = {
         let _guard = spawn_lock();
         let r = spawn_step(
-            &all_handles,
+            all_handles,
             app_name.as_deref(),
             &mut cmdline,
             &mut si,

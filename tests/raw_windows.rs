@@ -130,3 +130,114 @@ fn batch_script_via_executable_is_unsupported() {
         .unwrap_err();
     assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
 }
+
+// Raw backend, sync fd >= 3 via the MSVCRT lpReserved2 table (Plan 12 Task 5) =====
+
+/// A child-writes pipe on fd 3 delivers the child's bytes to the parent's read end — proving the
+/// fd-table wired fd 3 into the child's CRT and the parent kept the read end. EOF (from the child
+/// closing fd 3 on exit) bounds the read; no timer.
+#[test]
+fn fd3_pipe_out_delivers_child_bytes() {
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .args(["subprocess_testbin", "write-fd", "3", "hi-fd3"])
+        .fd(3, subprocess::Stdio::pipe_out())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.fd_read_end(subprocess::Fd::from(3)).unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    assert_eq!(s, "hi-fd3");
+}
+
+/// A parent-writes pipe on fd 3 feeds the child: the child copies fd 3 to stdout, so dropping the
+/// parent's write end (EOF) makes the child echo exactly what was written. EOF bounds both reads.
+#[test]
+fn fd3_pipe_in_feeds_child() {
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .args(["subprocess_testbin", "read-fd", "3"])
+        .fd(3, subprocess::Stdio::pipe_in())
+        .unwrap()
+        .stdout(subprocess::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn");
+    let mut w = child.fd_write_end(subprocess::Fd::from(3)).unwrap();
+    std::io::Write::write_all(&mut w, b"ping3").unwrap();
+    drop(w); // child reads to EOF, copies, exits
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    assert_eq!(s, "ping3");
+}
+
+/// `Stdio::inherit()` on fd >= 3 has no defined parent stream to dup — the raw path rejects it via
+/// the hardened `inherit_end` arm.
+#[test]
+fn inherit_on_fd3_is_unsupported() {
+    let e = subprocess::Command::new()
+        .executable(common::testbin())
+        .args(["subprocess_testbin", "exit", "0"])
+        .fd(3, subprocess::Stdio::inherit())
+        .unwrap()
+        .spawn()
+        .unwrap_err();
+    assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
+}
+
+/// A regular file on fd 3 classifies as a disk file (`FILE_TYPE_DISK` -> no `FDEV`), so the child's
+/// `_isatty(3)` reports 0. Deterministic device-class coverage with no console needed.
+#[test]
+fn fd3_file_is_not_a_tty() {
+    let f = tempfile::tempfile().expect("tempfile");
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .args(["subprocess_testbin", "isatty-fd", "3"])
+        .fd(3, subprocess::Stdio::from_file(f))
+        .unwrap()
+        .stdout(subprocess::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    assert!(s.contains("isatty=0"), "file on fd3 is not a tty: {s}");
+}
+
+/// NUL is `FILE_TYPE_CHAR` -> `classify` = `CharDev` -> `FDEV`, so the child's `_isatty(3)` is
+/// nonzero (MSVCRT returns the raw `FDEV` bit, `0x40`, not a normalized 1 — the file/pipe case
+/// still returns 0). Deterministic `CharDev` coverage without allocating a real console.
+#[test]
+fn fd3_nul_is_a_char_device() {
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .args(["subprocess_testbin", "isatty-fd", "3"])
+        .fd(3, subprocess::Stdio::null())
+        .unwrap()
+        .stdout(subprocess::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    let val: i32 = s
+        .trim()
+        .strip_prefix("isatty=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected isatty output: {s}"));
+    assert_ne!(val, 0, "NUL on fd3 is a char device (tty), got {s}");
+}
+
+/// A descriptor whose dense fd table would exceed the `WORD`-sized `cbReserved2` field is rejected
+/// up front (before any allocation), as `Unsupported`.
+#[test]
+fn oversized_fd_is_unsupported() {
+    let e = subprocess::Command::new()
+        .executable(common::testbin())
+        .args(["subprocess_testbin", "exit", "0"])
+        .fd(70_000, subprocess::Stdio::null())
+        .unwrap()
+        .spawn()
+        .unwrap_err();
+    assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
+}

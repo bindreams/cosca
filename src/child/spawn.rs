@@ -24,22 +24,25 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let kill_on_drop = cmd.kill_on_drop_flag();
 
     // Windows routing. The raw `CreateProcessW` backend (Plan 12) owns the cases std cannot
-    // express: an `executable()` loaded independently of argv[0]. It is used only for an
-    // UNCONTAINED child with std-only descriptors — containment on the raw path is Task 6 and
-    // fd >= 3 wiring is Task 5, so those stay on the paths that already handle (or reject) them.
+    // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors
+    // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It is used only for an UNCONTAINED child —
+    // containment on the raw path is Task 6, so a CONTAINED fd >= 3 stays rejected below until then.
     #[cfg(windows)]
     {
         let has_high_fd = fds.keys().any(|slot| slot.raw() >= 3);
-        if cmd.executable_path().is_some() && cmd.contain_request().mode.is_none() && !has_high_fd {
+        if (cmd.executable_path().is_some() || has_high_fd) && cmd.contain_request().mode.is_none() {
             return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
         }
-        // fd >= 3 has no std wiring on Windows (the raw fd-table path lands in Task 5).
+        // Reaching here with a high fd means the child is CONTAINED (an uncontained one routed to
+        // the raw backend above). Containment over the raw backend is not yet wired (Task 6).
         if has_high_fd {
             let slot = fds.keys().find(|s| s.raw() >= 3).expect("has_high_fd");
             return Err(Error::Unsupported {
                 op: format!("{slot}"),
                 platform: std::env::consts::OS,
-                detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 12)".into(),
+                detail: "arbitrary descriptors (>= 3) under containment require the raw backend's \
+                         containment wiring (Plan 12 Task 6)"
+                    .into(),
             });
         }
     }

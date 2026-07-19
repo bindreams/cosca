@@ -178,11 +178,14 @@ fn null_stdout_discards_output() {
 
 #[cfg(windows)]
 #[test]
-fn fd_ge_3_is_rejected() {
+fn contained_fd_ge_3_is_rejected() {
+    // Uncontained fd >= 3 now works via the raw backend (see tests/raw_windows.rs). Under
+    // containment it stays Unsupported until the raw backend's containment wiring lands (Task 6).
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
     cmd.fd(3, Stdio::null()).expect("fd attach ok");
-    let err = cmd.spawn().expect_err("should reject fd >= 3 on Windows");
+    cmd.contain();
+    let err = cmd.spawn().expect_err("should reject contained fd >= 3 on Windows");
     assert!(
         matches!(err, subprocess::error::Error::Unsupported { .. }),
         "expected Unsupported, got {err:?}"
@@ -346,16 +349,6 @@ fn null_stdout_discards() {
     cmd.stdout(Stdio::null()).unwrap();
     let status = cmd.status().expect("status");
     assert!(status.success());
-}
-
-#[cfg(windows)]
-#[test]
-fn arbitrary_fd_is_unsupported_on_windows() {
-    let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
-    cmd.fd(3, Stdio::pipe_out()).unwrap(); // attaches fine
-    let err = cmd.spawn().unwrap_err(); // but spawn rejects it on Windows
-    assert!(matches!(err, subprocess::error::Error::Unsupported { .. }));
 }
 
 // Arbitrary fd (n>=3) — Unix only, wired via command-fds =====

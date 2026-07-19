@@ -391,8 +391,9 @@ async fn async_unix_fd3_null_is_accepted() {
     assert_eq!(status.code(), Some(0));
 }
 
-/// Async twin of sync `arbitrary_fd_is_unsupported_on_windows`: config attaches fine, spawn
-/// rejects with the sync path's typed error.
+/// The async path has no raw backend yet (Task 7), so fd >= 3 on Windows still rejects: config
+/// attaches fine, spawn rejects with the sync path's typed error. (The sync path already routes
+/// uncontained fd >= 3 through the raw backend — see tests/raw_windows.rs.)
 #[cfg(windows)]
 #[tokio::test]
 async fn async_fd3_is_unsupported_on_windows() {
