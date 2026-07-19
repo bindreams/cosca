@@ -69,3 +69,64 @@ fn testbin_isatty_fd_reports_zero_for_a_pipe() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("isatty=0"), "got: {s}");
 }
+
+// Raw `CreateProcessW` backend, sync path (Plan 12 Task 4) =====
+
+/// The raw backend loads `executable()` while the child's argv[0] is the command line's first
+/// token — the independence std cannot express on Windows. `argv0-report` echoes both, proving
+/// the loaded image (`testbin`) differs from the reported argv[0] (`pretend-name`).
+#[test]
+fn executable_independent_of_argv0_on_windows() {
+    let exe = common::testbin();
+    let mut c = subprocess::Command::new();
+    c.executable(exe)
+        .commandline("pretend-name argv0-report")
+        .stdout(subprocess::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    assert!(
+        s.contains("argv0=pretend-name") && s.to_lowercase().contains("testbin"),
+        "{s}"
+    );
+}
+
+/// An embedded NUL in the command line cannot reach `CreateProcessW` (it would truncate the
+/// wide buffer); the raw backend rejects it up front as an `Io` error.
+#[test]
+fn embedded_nul_in_commandline_is_rejected() {
+    let e = subprocess::Command::new()
+        .executable(common::testbin())
+        .commandline("a\u{0}b")
+        .spawn()
+        .unwrap_err();
+    assert!(matches!(e, subprocess::error::Error::Io(_)), "{e:?}");
+}
+
+/// An embedded NUL in the working directory is rejected the same way (it would truncate the
+/// wide `lpCurrentDirectory`).
+#[test]
+fn embedded_nul_in_cwd_is_rejected() {
+    let mut c = subprocess::Command::new();
+    c.executable(common::testbin())
+        .commandline("x argv0-report")
+        .current_dir(std::path::PathBuf::from("a\u{0}b"));
+    assert!(matches!(c.spawn().unwrap_err(), subprocess::error::Error::Io(_)));
+}
+
+/// A `.bat`/`.cmd` reached via `executable()` is rejected BEFORE resolution (CVE-2024-24576): a
+/// batch program has cmd.exe escaping semantics the raw quoter does not implement.
+#[test]
+fn batch_script_via_executable_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let bat = dir.path().join("x.bat");
+    std::fs::write(&bat, b"@echo off\n").unwrap();
+    let e = subprocess::Command::new()
+        .executable(&bat)
+        .commandline("x.bat")
+        .spawn()
+        .unwrap_err();
+    assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
+}

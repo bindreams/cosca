@@ -6,6 +6,7 @@ use std::process::Stdio as StdStdio;
 
 use shared_child::SharedChild;
 
+use crate::child::proc_handle::ProcHandle;
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::Error;
@@ -22,15 +23,23 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
 
-    // On Windows, fd >= 3 is unsupported in this plan (no MSVCRT fd-table wiring).
-    // On Unix, arbitrary fds are handled below via command-fds.
+    // Windows routing. The raw `CreateProcessW` backend (Plan 12) owns the cases std cannot
+    // express: an `executable()` loaded independently of argv[0]. It is used only for an
+    // UNCONTAINED child with std-only descriptors — containment on the raw path is Task 6 and
+    // fd >= 3 wiring is Task 5, so those stay on the paths that already handle (or reject) them.
     #[cfg(windows)]
-    for slot in fds.keys() {
-        if slot.raw() >= 3 {
+    {
+        let has_high_fd = fds.keys().any(|slot| slot.raw() >= 3);
+        if cmd.executable_path().is_some() && cmd.contain_request().mode.is_none() && !has_high_fd {
+            return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
+        }
+        // fd >= 3 has no std wiring on Windows (the raw fd-table path lands in Task 5).
+        if has_high_fd {
+            let slot = fds.keys().find(|s| s.raw() >= 3).expect("has_high_fd");
             return Err(Error::Unsupported {
                 op: format!("{slot}"),
                 platform: std::env::consts::OS,
-                detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 4)".into(),
+                detail: "arbitrary descriptors (>= 3) require the raw backend (Plan 12)".into(),
             });
         }
     }
@@ -109,8 +118,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     }
 
-    // We own the std Child so containment can job-assign + resume it (Task 5).
-    let mut child = std_cmd.spawn().map_err(Error::Io)?;
+    // We own the std Child so containment can job-assign + resume it (Task 5). Serialize the
+    // spawn against the raw backend's inheritable-handle window via the shared spawn lock: std's
+    // own handle-inheritance marking must not overlap a raw spawn on another thread.
+    let mut child = {
+        let _guard = spawn_lock();
+        std_cmd.spawn().map_err(Error::Io)?
+    };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
     // `prepared` is consumed here: Linux cgroup leaf ownership moves to Attached::Cgroup.
     #[cfg(windows)]
@@ -166,13 +180,23 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let shared = SharedChild::new(child).map_err(Error::Io)?;
 
     Ok(Child::from_parts(
-        shared,
+        ProcHandle::Std(shared),
         id,
         parent_ends,
         kill_on_drop,
         containment,
         attached,
     ))
+}
+
+/// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
+/// path and the raw `CreateProcessW` backend must mark child-side handles inheritable, spawn, then
+/// un-mark/close without a concurrent spawn inheriting them. Held across that window on both paths.
+/// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
+/// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
+pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
@@ -296,7 +320,13 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
 }
 
 fn reject_batch_script(std_cmd: &std::process::Command) -> Result<(), Error> {
-    let prog = std::path::Path::new(std_cmd.get_program());
+    reject_batch_path(std::path::Path::new(std_cmd.get_program()))
+}
+
+/// Reject a `.bat`/`.cmd` program by its path extension. Shared by the std path
+/// (`reject_batch_script`) and the raw backend (`windows_raw::reject_batch_program`): cmd.exe
+/// batch escaping is a distinct, unimplemented vector (CVE-2024-24576 / BatBadBut).
+pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
     if let Some(ext) = prog.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {
@@ -515,9 +545,20 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
                 let s = std::io::stdout();
                 s.as_handle().try_clone_to_owned()
             }
-            _ => {
+            Fd::STDERR => {
                 let s = std::io::stderr();
                 s.as_handle().try_clone_to_owned()
+            }
+            // fd >= 3 has no defined parent std stream to dup (mirrors the Unix arm). The raw
+            // backend opens arbitrary parent handles by number in Task 5.
+            other => {
+                return Err(Error::Unsupported {
+                    op: format!("Stdio::inherit() on {other}"),
+                    platform: "windows",
+                    detail: "inherit on fd >= 3 has no defined parent stream; \
+                             use pipe/file/null, or the raw backend (Plan 12)"
+                        .into(),
+                })
             }
         };
         owned.map_err(Error::Io)
@@ -621,7 +662,7 @@ pub(crate) mod fault {
 // `foo.rs` + `foo/` module convention (mirroring `child.rs`'s `child/spawn.rs`).
 #[cfg(windows)]
 #[path = "spawn/windows_raw.rs"]
-mod windows_raw;
+pub(crate) mod windows_raw;
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]

@@ -1,5 +1,5 @@
 //! `Child` bounded waits. A submodule of `child` so it can reach `Child`'s private
-//! `shared`.
+//! `proc` handle.
 
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
@@ -34,6 +34,6 @@ impl Child {
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        self.shared.wait_deadline(deadline).map_err(Error::Io)
+        self.proc.wait_deadline(deadline).map_err(Error::Io)
     }
 }
