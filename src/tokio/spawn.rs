@@ -43,12 +43,26 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     }
 
     // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend
-    // (Plan 12 Task 7): an `executable()` loaded independently of argv[0], UNCONTAINED, with no
-    // fd >= 3 (the rejection above already guaranteed the latter). Contained executables stay on
-    // the std path until Task 8.
+    // (Plan 12 Task 7): an `executable()` loaded independently of argv[0]. fd >= 3 was rejected
+    // above, so no high fd reaches here.
     #[cfg(windows)]
-    if cmd.executable_path().is_some() && cmd.contain_request().mode.is_none() {
-        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
+    if cmd.executable_path().is_some() {
+        // Uncontained → the async raw backend (independent argv[0]).
+        if cmd.contain_request().mode.is_none() {
+            return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
+        }
+        // Contained executable() has no async raw path yet (Task 8 wires async containment). Reject
+        // LOUDLY for BOTH argv and commandline input — falling through to the std path would
+        // silently drop the user's argv[0] (std's arg0 preservation is Unix-only on Windows), a
+        // silent deferral this crate forbids.
+        return Err(Error::Unsupported {
+            op: "spawn with executable() and containment".into(),
+            platform: "windows",
+            detail: "a contained child loaded via executable() (independent of argv[0]) needs the \
+                     raw CreateProcessW backend's async containment, not yet wired (Task 8); spawn \
+                     uncontained, or use argv()/commandline() without executable()"
+                .into(),
+        });
     }
 
     let std_cmd = build_std_command(cmd)?;

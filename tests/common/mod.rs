@@ -88,9 +88,16 @@ pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (subpro
     let mut argv: Vec<String> = vec!["subprocess_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(testbin()).args(&argv);
     if contain {
+        // async Windows rejects contained `executable()` until Task 8 wires the raw backend's async
+        // containment; load the testbin as argv[0] via the std path instead (mode/addr stay at
+        // args[1..], so the testbin behaves identically).
+        let mut path_argv = vec![testbin().to_string()];
+        path_argv.extend(argv.into_iter().skip(1));
+        cmd.args(path_argv);
         cmd.contain();
+    } else {
+        cmd.executable(testbin()).args(&argv); // uncontained → the async raw backend
     }
     let child = cmd.spawn().expect("spawn async control child");
     let (mut sock, _) = listener.accept().expect("accept");
@@ -111,8 +118,11 @@ pub fn spawn_tree_async(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = subprocess::tokio::Command::new();
-    cmd.executable(testbin())
-        .args(["subprocess_testbin", mode, addr.as_str()]);
+    // Load the testbin as argv[0] via the std path (mode/addr at args[1..]): these trees are
+    // contained (and async Windows rejects contained `executable()` until Task 8's async
+    // containment), and the sole uncontained caller is backend-agnostic. `configure` applies the
+    // containment/nesting/kill_on_drop.
+    cmd.args([testbin(), mode, addr.as_str()]);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn async tree");
     let (mut root, mut grandchild) = (None, None);

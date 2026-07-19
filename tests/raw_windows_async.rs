@@ -28,3 +28,19 @@ async fn async_executable_independent_of_argv0() {
         "{s}"
     );
 }
+
+/// A CONTAINED `executable()` async spawn has no raw backend yet (Task 8 wires async containment):
+/// it must be rejected LOUDLY, not fall through to the std path — which would silently drop the
+/// user's argv[0] (std's arg0 preservation is Unix-only on Windows). Covers ARGV input; the
+/// commandline case is separately rejected by `build_from_commandline`.
+#[tokio::test]
+async fn async_contained_executable_is_unsupported() {
+    let mut c = subprocess::tokio::Command::new();
+    c.executable(common::testbin())
+        .args(["fakename", "exit", "0"]) // argv[0] "fakename" ≠ the loaded image
+        .contain();
+    let err = c
+        .spawn()
+        .expect_err("contained executable() must be rejected until Task 8");
+    assert!(matches!(err, subprocess::error::Error::Unsupported { .. }), "{err:?}");
+}
