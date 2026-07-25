@@ -1,0 +1,39 @@
+# Plan-review panel findings (round 4) — implementation-time correctness checklist
+
+Gate: REJECTED (25 findings). Round counts: 36 → 17 → 22 → 25 (non-converging).
+These are captured for application DURING TDD implementation (they are code-level).
+The genuinely-structural ones (marked ★) should land regardless of path.
+
+## ★ Structural (fix in the plan/design regardless)
+- **1a194902** — `RunAsIs` (already-elevated) branch bypasses `EnvSanitizer`: `.elevate().env("LD_PRELOAD",…)` strips it when unprivileged, forwards it to a root child when already root (no setuid scrub in that case → denylist is load-bearing there). FIX: run `sanitizer.apply()` BEFORE the short-circuit; on RunAsIs rewrite the original command's env ops to the kept set and report real `stripped_env`.
+- **d101e51e** — Auto-resolved env/Askpass/Stdin gates sit AFTER the short-circuit (privilege-dependent verdict) and use an inconsistent predicate (raw `Set` vs post-sanitize `kept`). FIX: evaluate env-forward + Askpass/Stdin gates against the backends `Auto` could resolve to, before the short-circuit; one predicate for explicit and Auto arms.
+- **c5f0112c / 3c63cf19** (same block) — `set_elevation(report)` runs only on success, AFTER the password-failure `child.kill()`. So the cleanup kill sees `is_elevated_wrapper()==false` → EPERM comes back as raw `Io` not `Unkillable`, and the subsequent Drop takes the blocking `wait()` arm → HANG. FIX: `set_elevation` immediately after spawn, before `write_after_spawn`. Sync AND async.
+- **3b12494e** — Decision D only extracted the two leaf helpers; the ~25-line dispatch block (rewrite → spawn-with-remap → deferred-password-write-with-kill-on-failure → set_elevation) is still hand-copied sync vs async. FIX: extract one shared function parameterized over the spawn closure (sync `spawn_unelevated` vs async recursive `spawn`); both call it. If a sync/async closure abstraction is judged not worth it, document the tradeoff explicitly.
+
+## Teardown/kill correctness (code-level)
+- **a36b0244** — `teardown_on_drop` dispatches on the `elevated` request flag, not the observed error. A child that gained privilege on its own (`args(["sudo","id"])` no `.elevate()`, setuid helper) → kill EPERM → blocking `wait()` HANG. FIX: dispatch on the ERROR: any PermissionDenied/ACCESS_DENIED from kill → try_wait+warn regardless of the flag; blocking wait only for a successful kill. Applies POSIX Std arm + Windows non-runas arms (proc.rs:3171, reap_blocking:3773).
+- **9aaf8c60** — password-failure path: `child.kill()` then `let _ = child.try_wait()` reaps NOTHING (child hasn't exited yet) → zombie. FIX: blocking `child.wait()` when kill returned Ok; try_wait+warn only when kill was denied (Unkillable). Sync + async.
+- **5225e5fa** — Windows runas `kill`: ACCESS_DENIED disambiguated by a single racing `try_wait` (ACCESS_DENIED also occurs in the already-exiting teardown window). FIX: query the granted-access mask (was PROCESS_TERMINATE granted at open? static for a SEE_MASK_NOCLOSEPROCESS handle) or open a 2nd handle requesting PROCESS_TERMINATE — permission is static, don't infer it from a poll.
+
+## Auth::Stdin write correctness (code-level)
+- **a7b19ac4** — non-blocking `write_all`: WouldBlock after a partial write is classified as "not needed" → TRUNCATED password reported as success. FIX: `write()` loop tracking bytes; zero-bytes BrokenPipe/WouldBlock → not-needed Ok; WouldBlock after partial → poll fd for writability (real readiness event, not a timer) and continue; BrokenPipe after partial → AuthFailed.
+- **a6fcd0df** — `set_writer_nonblocking`: `fcntl(F_SETFL)` failure silently discarded → writer stays blocking → `write_after_spawn` can block forever (the exact mode Decision B removes). FIX: `log::warn!` on fcntl failure (or hard `Error::Elevation` since the non-block invariant is load-bearing).
+- **c1d13a6d** — test asserts exact `capacity() == len+1`; `with_capacity` guarantees ≥. FIX: assert `capacity() >= len` AND capture `as_ptr()` before push, assert unchanged after (the real no-realloc invariant).
+- **d424da2f** — with `Auth::Stdin`, fd0 is the password pipe (EOF after the write) but report says `Passthrough` ("wired exactly as configured"). FIX: add a `#[non_exhaustive]` `ElevatedStdio` variant/flag for "fd0 consumed by auth channel", or reject Stdin unless the command opts out of stdin — don't report Passthrough.
+
+## Honest error remap (code-level)
+- **60a7eaf8 / f2dacab7** (same) — `remap_derived_spawn_error` gate `!backend_path.exists()` is check-then-act and MISSES the "exists but not executable" case (exec bit cleared, noexec, SELinux → PermissionDenied with exists()==true → NOT remapped → raw Io, contradicting the BackendUnavailable contract). FIX: don't re-stat; attribute from data in hand — check the caller-supplied cwd validity (the only other failure source) OR re-check executability; a PermissionDenied on an existing backend must reach BackendUnavailable. Always embed the underlying io::Error + path in detail.
+
+## Test-quality (code-level; fix as the tests are written)
+- **0bf540ea** — `runas_kill_of_a_killable_child_returns_and_reaps` asserts `try_wait().is_some()` right after `kill()` (TerminateProcess only initiates) → flaky. FIX: block on `wait()` then assert status.
+- **8f0899ff** — `posix_uncontained_elevated_child_is_unkillable…` races sudo's setuid transition (kill before sudo drops to root SUCCEEDS → panic "expected Unkillable"). FIX: run an elevated testbin payload that publishes a pid/marker once running as root, THEN kill (Windows twin already accepts Ok).
+- **b212c93b** — `pid_is_alive = kill(pid,0)==0` returns false for a ROOT payload queried by an unprivileged parent (EPERM). FIX: true for Ok AND EPERM; only ESRCH is gone; guard PID reuse via start-token or systemd unit state.
+- **aff98ce1** — `empty_path_element_is_not_resolved_from_cwd` uses a process-global `set_current_dir` under a private lock (races every other multi-threaded test). FIX: delete the chdir/lock/script; `resolve_in_path_var` is pure — assert `resolve_in_path_var("", "sudo")==None` and the `/a::/b` mid-empty form directly.
+- **793e17e3** — `spawn_long_lived_runas` calls `create_process(...,flags=0)` violating its documented `STARTUPINFOEXW`+EXTENDED_STARTUPINFO_PRESENT precondition. FIX: pass `EXTENDED_STARTUPINFO_PRESENT.0` (with a proper/absent attr list) or use the higher-level raw spawn path.
+- **4302a456** — `already_elevated_inherit_spawn_reports_already_elevated` has an undocumented second skip (`!is_elevated()`) → silent no-op on every ordinary gated Linux job. FIX: cover the AlreadyElevated report deterministically in the unit tier via `rewrite_with_host` + elevated fake Host (seam exists), or a separate CI var provisioned with an elevated runner (fail loud if set-but-not-elevated).
+- **6325e581** — `sync_and_async_remap_the_same_backend_failure_identically` calls the pure helper twice → tautology. FIX: drop it (structural sharing already covers), OR force a real spawn failure through BOTH sync and async spawn paths against a nonexistent backend via injected Host and assert both errors match.
+- **b67b0f54** — `windows_elevated_child_is_unkillable…` accepts `Ok(())` OR `Unkillable` → can pass without exercising Unkillable (asymmetric vs the POSIX twin). FIX: assert Unkillable unconditionally and make the harness fail loud if the runner process is itself elevated.
+- **8d841939** — async `tokio::Child::kill` Unkillable-mapping wiring + `is_elevated_wrapper()` untested. FIX: unit test constructing a tokio Child with fabricated `elevation: Some(Wrapped(Sudo))`, drive a permission-denied kill, assert `Error::Elevation{Unkillable}`.
+
+## Conciseness (apply)
+- Strip stray finding-ID hashes from shipped comments/plan prose (66d3ed85 line 4204, 1284658d line 3076); trim the Task-4 detect stub comment narrating a future edit (2f293702 line 773).
