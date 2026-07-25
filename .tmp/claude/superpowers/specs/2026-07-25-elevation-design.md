@@ -131,8 +131,11 @@ combinations are `Error::Unsupported`; each backend emits its real non-interacti
   non-sudo target's stdin is a credential leak.
 - **`Auth::Stdin` consumes the child's stdin:** the crate writes the password +
   newline then closes fd0 (EOF). It is therefore an `Error::Unsupported` to
-  combine `Auth::Stdin` with a caller-configured fd0. Password-write errors are
-  propagated as `Error::Elevation` and logged (never a silently-swallowed write).
+  combine `Auth::Stdin` with a caller-configured fd0. The password is written
+  **after the child is spawned** (the child is then draining via `sudo -S`), so
+  the write never blocks on an unread pipe regardless of secret length — no
+  reliance on kernel pipe-buffer capacity. Password-write errors are propagated as
+  `Error::Elevation` and logged (never a silently-swallowed write).
 - **Windows auth:** `ShellExecuteEx("runas")` has no non-interactive / askpass /
   stdin-credential mechanism, so the planner accepts only `Interactive`/`Gui`
   (both map to the UAC consent gate); `NonInteractive`/`Askpass`/`Stdin` →
@@ -161,13 +164,14 @@ arbitrary pipe handles (no stdio-handle mechanism) and cannot receive an
 arbitrary environment. That is exactly why the ecosystem builds a signed broker
 (the deferred item). So in this plan:
 
-| Capability | POSIX sudo/doas/pkexec | POSIX run0 (explicit) | Windows (`runas`) |
-|---|---|---|---|
-| Elevate a child; wait; exit code; kill | ✓ | ✓ (kill/id target the run0 client — documented) | ✓ |
-| Captured stdio (`pipe` / `.output()`) | ✓ (sudo is a normal parent) | ✓ (via forced `--pipe`) | ✗ `Unsupported` → broker (deferred) |
-| Inherited stdio | ✓ | ✓ | best-effort own-console, **reported** |
-| Forward env (`.env`, sanitized) | ✓ | ✓ | ✗ `Unsupported` (no mechanism without broker) |
-| `.contain()` + elevate | ✓ (whole subtree contained) | ✗ `Unsupported` (unit in its own scope cgroup) | ✗ `Unsupported` (job across integrity boundary) |
+| Capability | POSIX sudo | POSIX doas/pkexec | POSIX run0 (explicit) | Windows (`runas`) |
+|---|---|---|---|---|
+| Elevate a child; wait; exit code; kill | ✓ | ✓ | ✓ (kill/id target the run0 client) | ✓ (kill best-effort — higher-integrity child may be unkillable, honest error not a hang) |
+| Captured stdio (`pipe` / `.output()`), fd 0-2 | ✓ | ✓ | ✓ (forced `--pipe`) | ✗ `Unsupported` → broker (deferred) |
+| `fd ≥ 3` | ✗ `Unsupported` (backend `closefrom`) | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` |
+| Forward env (`.env`, sanitized) | ✓ (`--preserve-env`) | ✗ `Unsupported` (no mechanism) | ✓ (`--setenv`) | ✗ `Unsupported` (no mechanism without broker) |
+| `.env_remove()` / `.env_clear()` | ✗ `Unsupported` (cannot subtract from the backend base) | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` |
+| `.contain()` + elevate | ✓ (subtree contained) | ✓ | ✗ `Unsupported` (unit in its own scope cgroup) | ✗ `Unsupported` (job across integrity boundary) |
 
 - **Windows elevation in this plan = "fire an elevated action, get its exit
   code"** (installers, service restarts, protected writes). Useful and honest;
@@ -220,16 +224,37 @@ vars like `MY_APP_CONFIG`) and impossible to specify (benign app vars are
 unbounded). Footguns, by contrast, are finite and documented. Fail-closed
 remains one call away for the paranoid via `EnvSanitizer::allowlist([…])`.
 
-### Why the denylist is needed at all (the re-injection hole)
+### Forwarding mechanism — backend-native only, NO `env` wrapper
 
-`ld.so` strips loader vars from setuid binaries (`sudo`/`doas`/`pkexec`), and
-each tool's `env_reset` handles the rest — for **inherited** env. But the crate
-forwards explicit `.env()` by **re-injecting past the scrub**:
-`sudo --preserve-env=… env K=V prog`, `doas env K=V prog`, `pkexec env K=V prog`,
-or `run0 --setenv=K=V`. That `env K=V prog` runs a *non-setuid* `env` as root, so
-`ld.so` no longer scrubs `prog`; `run0 --setenv` injects directly. **The crate's
-own forwarding path is exactly the hole setuid + `env_reset` closed** — so the
-denylist guards that forwarding step, uniformly across all backends.
+The crate does **not** wrap the target in `env K=V` (an `env` wrapper is
+irredeemably fragile: GNU `env`'s `--` stops being an end-of-options marker once
+a `K=V` assignment precedes it, a program path containing `=` is always parsed as
+an assignment, and an unqualified `env` re-opens the PATH-hijack hole). Instead
+each backend uses its own native forwarding, and where a backend has none, `.env()`
+is a loud `Unsupported`:
+
+- **sudo:** the forwarded (sanitizer-approved) vars are set in the **sudo child's
+  own environment** (the crate controls it), and named in `--preserve-env=NAME,…`.
+  Names are validated to `[A-Za-z_][A-Za-z0-9_]*` (a name with a comma / `=` /
+  non-ASCII byte → `Unsupported`, never a lossy `to_string_lossy` join). The
+  program is sudo's own argument after `--`. Values never appear in argv.
+- **run0:** `--setenv=NAME=VALUE` per var.
+- **doas / pkexec:** **no** caller-env-forwarding mechanism exists, so `.env()` /
+  `.envs()` with `Backend::Doas` or `Backend::Pkexec` → `Error::Unsupported`.
+- **`.env_remove()` / `.env_clear()` + elevate → `Error::Unsupported`.** The
+  backend constructs the elevated base environment; the crate can *add* (preserve
+  / setenv) but cannot *subtract* from it, so honoring a removal is impossible —
+  a loud error, not a silent no-op.
+
+### Why the denylist is still needed (the re-injection hole)
+
+`ld.so` strips loader vars from setuid binaries (`sudo`/`doas`/`pkexec`), and each
+tool's `env_reset` handles the rest — for **inherited** env. But `run0 --setenv`
+injects directly into a PID-1-spawned unit that `ld.so` never scrubs, so the
+denylist is **load-bearing for run0** (the only wall against `LD_PRELOAD` reaching
+root via `--setenv`). For sudo it is defense-in-depth (sudo's `env_check` would
+refuse to preserve a loader var anyway) plus report accuracy (we strip first, so
+`stripped_env` is truthful and we never depend on the site's sudoers config).
 
 ### Consent model (no accidental unsafe; explicit on-purpose)
 
