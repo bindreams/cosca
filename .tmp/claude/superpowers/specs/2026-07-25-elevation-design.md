@@ -336,15 +336,68 @@ enum Transition {
 
 ```rust
 enum ElevationErrorKind {
-    BackendUnavailable, // forced backend not on PATH
+    BackendUnavailable, // forced backend not on PATH, or the resolved backend failed to exec
     AuthFailed,         // wrong password / `sudo -n` credential miss
     AuthDeclined,       // UAC prompt cancelled (ERROR_CANCELLED)
     NoTty,              // Interactive auth requested but no controlling terminal
+    Unkillable,         // an unprivileged parent could not signal its elevated child (EPERM / ACCESS_DENIED)
+    Untracked,          // launched but identity unresolvable; detail states terminated-vs-still-running
 }
 ```
 
 Rule: `Unsupported` = "can never work on this platform"; `Elevation` = "could
 work but failed now."
+
+### Killing an elevated child — a cross-platform reality, not a per-OS quirk
+
+An **unprivileged parent cannot reliably signal its elevated child on any
+platform**: POSIX `kill(pid, SIGKILL)` returns `EPERM` (the target's ruid/euid is
+root), and a medium-integrity Windows parent lacks `PROCESS_TERMINATE` on a
+higher-integrity runas child (`ERROR_ACCESS_DENIED`). This is one principle, applied
+uniformly:
+
+- `kill()` / `kill_tree()` on a child whose `elevation()` is `Some(Wrapped(..))`
+  maps `EPERM`/`ACCESS_DENIED` to `Error::Elevation { kind: Unkillable, .. }` — a
+  typed, loud error, never a raw `Io`.
+- `Drop` / `kill_on_drop` are **best-effort and NEVER block** on an unkillable
+  elevated child: attempt the signal, and on `EPERM`/`ACCESS_DENIED` `try_wait()` +
+  `log::warn!` ("elevated child N could not be terminated on drop; left running")
+  instead of an unconditional blocking `wait()`. This holds on the POSIX
+  `sudo`/`doas`/`pkexec` path and the Windows runas path alike.
+- `.contain()` (Linux `cgroup.kill`) is what actually restores reliable teardown of
+  an elevated subtree — noted on the capability matrix.
+
+### Config gates are privilege-independent (run BEFORE the already-elevated short-circuit)
+
+Structural request-validation — `fd ≥ 3`, `.env`/`.env_remove`/`.env_clear` on a
+backend that can't honor them, `.contain()`+run0/Windows, `commandline()`-built
+input, captured stdio on elevated-Windows — is a property of the **request**, not
+of ambient privilege. These gates run before the `RunAsIs` (already-elevated)
+short-circuit, so the same `Command` yields the same verdict whether or not the
+caller is already root/admin. (Only environmental preconditions — `NoTty`,
+`BackendUnavailable` — legitimately differ by privilege and stay after the
+short-circuit.)
+
+### `Auth::Stdin` post-spawn write — race-hardened
+
+The password is written after spawn (child draining via `sudo -S`), but a cached
+credential / `NOPASSWD` rule means sudo may never read fd0. So: the writer is
+**non-blocking**; `EPIPE`/`WouldBlock` means "the backend did not need the
+password" → `log::debug!` and `Ok` (NOT `AuthFailed`); only a genuine write error
+on a still-draining pipe is a failure. The secret buffer is **pre-sized**
+(`Vec::with_capacity(len+1)`) so appending the newline never reallocates and leaks
+an un-zeroized plaintext copy. On a genuine failure the child is **explicitly
+killed and reaped**, with the outcome folded into the `Error::Elevation` detail
+(mirroring the Windows `Untracked` treatment) — a bare `?` must never silently
+orphan a running elevated process.
+
+### `--preserve-env` is forwarding-subject-to-policy, not a guarantee
+
+`sudo --preserve-env=NAME` is still filtered by the site's sudoers
+`env_check`/`env_delete`, and `secure_path` overrides a forwarded `PATH`. The crate
+reports its *own* sanitizer drops in `stripped_env`; the residual sudoers filter is
+outside the crate's knowledge, so the matrix cell and `ElevationReport` doc state
+"forwarded, subject to sudoers policy" rather than promising delivery.
 
 ## Async (tokio) parity — in this plan
 
