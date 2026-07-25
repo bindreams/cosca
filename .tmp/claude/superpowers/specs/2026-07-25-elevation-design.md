@@ -71,12 +71,15 @@ EnvSanitizer::allowlist(["PATH", "LANG"]);     // opt-in fail-closed
 EnvSanitizer::none();                          // full foot-gun (greppable in source)
 
 // ── Achieved report on Child, mirroring Child::containment() ───────────────
+// Some(..) IFF elevation was REQUESTED (redefine None = "elevation not requested"),
+// so an already-elevated child is never mis-reported as un-elevated.
 child.elevation() -> Option<ElevationReport>;
 struct ElevationReport {
-    backend: Backend,             // which program ACTUALLY ran (e.g. Sudo)
+    via: ElevatedVia,             // Wrapped(Backend) | AlreadyElevated (no wrapper needed)
     stripped_env: Vec<OsString>,  // vars the sanitizer dropped (also logged)
     stdio: ElevatedStdio,         // how stdio was actually wired (Windows honesty)
 }
+pub enum ElevatedVia { Wrapped(Backend), AlreadyElevated }
 ```
 
 ### Enum spellings
@@ -100,13 +103,56 @@ pub enum Privilege { Unprivileged, Elevated }
 
 ### Default policies (confirmed)
 
-- **`Backend::Auto` never selects `pkexec`/GUI.** Auto detects among the CLI
-  backends by availability, order `run0` > `sudo` > `doas`. Graphical elevation
-  (`pkexec`, `Gui`) is explicit-only — a library must not pop a polkit dialog
-  unbidden.
-- **Default `auth = Interactive`** (prompt on the controlling TTY). With no TTY
-  and `Interactive`, spawn is a loud `Error::Elevation { kind: NoTty }` — never a
+- **`Backend::Auto` = `sudo` > `doas`** (by availability). run0 is **excluded
+  from `Auto`** and `pkexec`/GUI is explicit-only. A default backend must honor
+  the `Child` contract (identity/kill/kill_on_drop/contain); run0 spawns a
+  PID-1-parented transient systemd unit — not our descendant — so it cannot be
+  the default (see "run0's process model" below). A library must also not pop a
+  polkit dialog unbidden.
+- **Default `auth = Interactive`** (prompt on the controlling TTY, probed via
+  `/dev/tty` — NOT `isatty(stdin)`, which is wrong for a redirected-stdin
+  pipeline and for a post-`setsid` process). With no controlling terminal and
+  `Interactive`, spawn is a loud `Error::Elevation { kind: NoTty }` — never a
   hang, never a silent askpass surprise.
+
+### Auth × backend × platform validity (planner-enforced, loud on violation)
+
+The planner validates the whole matrix BEFORE the already-elevated short-circuit,
+so verdicts never depend on ambient privilege. Structurally-impossible
+combinations are `Error::Unsupported`; each backend emits its real non-interactive
+/ askpass flag rather than silently ignoring the request:
+
+- **POSIX auth flags:** `NonInteractive` → `sudo -n` / `doas -n` /
+  `run0 --no-ask-password`; `pkexec` has no non-interactive mode → `Unsupported`.
+  `Askpass(path)` → sudo only, delivered via `SUDO_ASKPASS=path` in the child env
+  (surviving the sanitizer/`env` threading); run0/pkexec/doas reject it. `Gui` →
+  `pkexec` only. `Stdin(Secret)` → **sudo only** (`sudo -S`); doas/run0/pkexec
+  reject it (`Unsupported`) — doas has no `-S`, and feeding a password to a
+  non-sudo target's stdin is a credential leak.
+- **`Auth::Stdin` consumes the child's stdin:** the crate writes the password +
+  newline then closes fd0 (EOF). It is therefore an `Error::Unsupported` to
+  combine `Auth::Stdin` with a caller-configured fd0. Password-write errors are
+  propagated as `Error::Elevation` and logged (never a silently-swallowed write).
+- **Windows auth:** `ShellExecuteEx("runas")` has no non-interactive / askpass /
+  stdin-credential mechanism, so the planner accepts only `Interactive`/`Gui`
+  (both map to the UAC consent gate); `NonInteractive`/`Askpass`/`Stdin` →
+  `Error::Unsupported`.
+
+### run0's process model (why explicit-only, and how it stays honest)
+
+`run0` runs the target as a **transient systemd unit forked off by the service
+manager (PID 1)** — the elevated process is not a descendant of the `run0`
+client the crate holds a `Child` for, and run0 allocates a **pseudo-TTY** when
+all of stdio is a TTY (merging stdout/stderr, translating line endings). So for
+`Backend::Run0` (explicit opt-in only):
+
+- Force `--pipe` so fds pass through directly (honest `Passthrough` stdio rather
+  than a silent pty merge).
+- `.contain()` + run0 → `Error::Unsupported` (the unit lives in its own scope
+  cgroup, outside ours).
+- Identity/`kill`/`kill_on_drop` apply to the run0 **client**; documented, and
+  the report reflects it. The client→unit kill propagation is pinned by a gated
+  live test; if it does not hold, that is surfaced as a blocker.
 
 ## The stdio + capability contract (the "don't lie" heart)
 
@@ -115,13 +161,13 @@ arbitrary pipe handles (no stdio-handle mechanism) and cannot receive an
 arbitrary environment. That is exactly why the ecosystem builds a signed broker
 (the deferred item). So in this plan:
 
-| Capability | POSIX (sudo/doas/run0/pkexec) | Windows (`runas`) |
-|---|---|---|
-| Elevate a child; wait; exit code; kill | ✓ | ✓ |
-| Captured stdio (`pipe` / `.output()`) | ✓ (sudo is a normal parent) | ✗ `Unsupported` → broker (deferred) |
-| Inherited stdio | ✓ | best-effort own-console, **reported** |
-| Forward env (`.env`, sanitized) | ✓ | ✗ `Unsupported` (no mechanism without broker) |
-| `.contain()` + elevate | ✓ (whole subtree contained) | ✗ `Unsupported` (job across integrity boundary) |
+| Capability | POSIX sudo/doas/pkexec | POSIX run0 (explicit) | Windows (`runas`) |
+|---|---|---|---|
+| Elevate a child; wait; exit code; kill | ✓ | ✓ (kill/id target the run0 client — documented) | ✓ |
+| Captured stdio (`pipe` / `.output()`) | ✓ (sudo is a normal parent) | ✓ (via forced `--pipe`) | ✗ `Unsupported` → broker (deferred) |
+| Inherited stdio | ✓ | ✓ | best-effort own-console, **reported** |
+| Forward env (`.env`, sanitized) | ✓ | ✓ | ✗ `Unsupported` (no mechanism without broker) |
+| `.contain()` + elevate | ✓ (whole subtree contained) | ✗ `Unsupported` (unit in its own scope cgroup) | ✗ `Unsupported` (job across integrity boundary) |
 
 - **Windows elevation in this plan = "fire an elevated action, get its exit
   code"** (installers, service restarts, protected writes). Useful and honest;
@@ -199,6 +245,12 @@ denylist guards that forwarding step, uniformly across all backends.
   `::none()`. Each is a visible, greppable token at the call site — the Rust
   `unsafe`-block equivalent. You cannot forward a loader var without one of them
   appearing in your source.
+- **`keep()` is additive WITHIN the current policy, never a silent downgrade.**
+  `keep([…])` on a denylist adds holes; on an allowlist it *widens* the allowlist.
+  It must never convert a fail-closed `allowlist(…)` into a fail-open denylist
+  (the type/impl enforces this — e.g. `keep` lives on a denylist-only builder or
+  matches the policy and widens in place), so a paranoid caller's fail-closed
+  choice cannot be accidentally reversed.
 
 ## Internal architecture
 
