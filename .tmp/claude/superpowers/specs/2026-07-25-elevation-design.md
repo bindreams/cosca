@@ -84,7 +84,12 @@ struct ElevationReport {
 ```rust
 pub enum Backend { Auto, Run0, Sudo, Doas, Pkexec }
 pub enum Auth { Interactive, NonInteractive, Askpass(PathBuf), Stdin(Secret), Gui }
-pub enum ElevatedStdio { Piped, Inherited, OwnConsole, Hidden } // achieved, reported
+// achieved stdio disposition, reported never faked; #[non_exhaustive]
+// (broker adds `Piped`, an SW_HIDE knob adds `Hidden` — both deferred, so
+// neither variant is defined yet — no dead variants):
+pub enum ElevatedStdio { Passthrough, OwnConsole }
+//   Passthrough — POSIX: stdio wired exactly as configured (no elevation change).
+//   OwnConsole  — Windows runas: child got its own console; parent streams not shared.
 // internal planner target, public for introspection/testing, #[non_exhaustive]
 pub enum Privilege { Unprivileged, Elevated }
 ```
@@ -122,9 +127,13 @@ arbitrary environment. That is exactly why the ecosystem builds a signed broker
   code"** (installers, service restarts, protected writes). Useful and honest;
   piping/env is what the broker later unlocks.
 - **`ElevatedStdio` is reported, never faked.** On Windows-elevated, `inherit()`
-  is accepted but the achieved disposition is honestly `OwnConsole` (or `Hidden`
-  under `SW_HIDE`) — the report tells the truth rather than pretending the parent
-  stream was shared. Captured stdio stays a hard `Unsupported`.
+  is accepted but the achieved disposition is honestly `OwnConsole` — the report
+  tells the truth rather than pretending the parent stream was shared. On POSIX
+  the disposition is `Passthrough` (stdio wired exactly as configured; it does
+  NOT falsely claim `Inherited` when you piped). Captured stdio on Windows stays a
+  hard `Unsupported`. (`Piped` across the boundary and `Hidden`/`SW_HIDE` arrive
+  with the deferred broker and a future hide knob; `ElevatedStdio` is
+  `#[non_exhaustive]` so adding them is non-breaking.)
 - **Empirical pin (implementation, not guessed here):** the precise
   `ShellExecuteEx` console behavior (own console vs. inheritable) is pinned by a
   test, per the crate's empirical-facts culture; the report reflects whatever is
