@@ -11,11 +11,11 @@
 ## Global Constraints
 
 - Rust edition 2021, `rust-version = "1.87"`. No new MSRV bump. `std::io::pipe` is stable as of 1.87 and is used for the `Auth::Stdin` channel.
-- Dependency versions (verbatim from `Cargo.toml`): `thiserror = "2"`, `shared_child = { version = "1", features = ["timeout"] }`, `log = "0.4"`, `tokio = { version = "1", optional = true, features = ["process","rt","io-util","macros","net","sync","time"] }`, `tempfile = "3"` (dev), `libc = "0.2"`, `nix = { version = "0.31", features = ["signal","process","event"] }` (UNCHANGED — the exec-bit check uses `libc::faccessat(AT_FDCWD, _, X_OK, AT_EACCESS)` and the tty probe uses `libc::open("/dev/tty", O_RDWR|O_CLOEXEC|O_NONBLOCK)`), `windows = "0.62"`. NEW: `zeroize = "1"`.
+- Dependency versions (verbatim from `Cargo.toml`): `thiserror = "2"`, `shared_child = { version = "1", features = ["timeout"] }`, `log = "0.4"`, `tokio = { version = "1", optional = true, features = ["process","rt","io-util","macros","net","sync","time"] }`, `tempfile = "3"` (dev), `libc = "0.2"`, `nix = { version = "0.31", features = ["signal","process","event","term"] }` (the exec-bit check uses `libc::faccessat(AT_FDCWD, _, X_OK, AT_EACCESS)` and the tty probe uses `libc::open("/dev/tty", O_RDWR|O_CLOEXEC|O_NONBLOCK)`; `term` is added in Task 17 solely for `nix::pty::openpty` in the real-PTY controlling-terminal test), `windows = "0.62"`. NEW: `zeroize = "1"`.
 - Module style: `foo.rs` + `foo/` subdir (NOT `mod.rs`). Unit tests in a SEPARATE sibling `foo_tests.rs`, included via `#[cfg(test)] #[path = "foo_tests.rs"] mod foo_tests;`. Debug asserts encouraged. `#[cfg(unix)]` / `#[cfg(windows)]` gating for platform effect code; pure code compiles everywhere.
 - Async is gated behind the `tokio` feature; every async task's tests run under `--features tokio`.
 - Builder methods are flat and return `&mut Command`, mirroring `.contain()` / `.contain_with()` / `.nesting()`.
-- `Error::Unsupported` = "can never work on this platform"; `Error::Elevation` = "could work but failed now." Never conflate.
+- `Error::Unsupported` = "can never work on this platform"; `Error::Elevation` = "could work but failed now." Never conflate. `ElevationErrorKind::Unkillable` is the one typed error an unprivileged parent gets when it cannot signal its elevated child (EPERM on POSIX, `ACCESS_DENIED` on Windows) — a loud error, never a raw `Io` and never a `Drop` hang.
 - `cargo clippy --all-targets --locked -- -D warnings` (prek.toml:26) is a hard gate on every commit: NO `dead_code`, NO `unused_mut`, NO unused imports may land. Each task must be clippy-clean on the platform(s) it compiles for.
 - Live privilege-gain tests are gated behind `SUBPROCESS_TEST_ELEVATION`: a true no-op when the var is absent, and FAIL LOUDLY when it is set but elevation is unavailable (mirror `SUBPROCESS_TEST_CGROUP` in `tests/spawn_io.rs`). Pure argv/rewrite/planner tests are UNGATED, inject a resolved backend path or a fake `Host`, and never shell out to a real backend or silently skip.
 - Detection/identity tests never assume ambient privilege: they compare `is_elevated()` against an independent ground truth (`geteuid()==0` on unix; the integrity-level invariant on windows) or branch on the detected state.
@@ -29,7 +29,7 @@
 |---|---|---|---|---|
 | 1 Error taxonomy | ✓ | ✓ | ✓ | pure |
 | 2 Secret | ✓ | ✓ | ✓ | pure |
-| 3 Public enums | ✓ | ✓ | ✓ | pure |
+| 3 Public enums + shared helpers | ✓ | ✓ | ✓ | pure (`already_elevated_report`/`remap_derived_spawn_error`) |
 | 4 Planner happy path | ✓ | ✓ | ✓ | pure (fake Host) |
 | 5 Planner rejection matrix | ✓ | ✓ | ✓ | pure |
 | 6 EnvSanitizer | ✓ | ✓ | ✓ | pure |
@@ -40,21 +40,21 @@
 | 11 POSIX effect rewrite + Child field | ✓ | ✓ | ✓ (Child field cross-platform; rewrite cfg(unix)) | non-destructive derived command |
 | 12 Windows detection + integrity + deps + identity helper | ✓ (compiles; windows arms inert) | ✓ | ✓ | |
 | 13 Windows reject gate | n/a arms | n/a arms | ✓ | |
-| 14 Windows `launch_runas` + `spawn_elevated` + non-blocking runas kill | ✓ (shared drop refactor compiles; windows arms inert) | ✓ | ✓ | RawChild `runas` flag + `ProcHandle::teardown_on_drop` + `Child::drop` are cross-platform |
+| 14 Universal teardown + Windows `launch_runas`/`spawn_elevated` | ✓ (map_elevated_kill_error + POSIX Std non-blocking teardown + Child kill mapping; windows arms inert) | ✓ | ✓ | `map_elevated_kill_error` + `ProcHandle::teardown_on_drop(elevated)` + `Child::kill`/`kill_tree`/`Drop` are cross-platform; RawChild `runas` is windows |
 | 15 `spawn()` elevation branch (fd-take reorder) | ✓ | ✓ | ✓ | references Tasks 11 + 14 — both already landed |
 | 16 Async parity | ✓ | ✓ | ✓ | `--features tokio` |
 | 17 Live gated tests + testbin | ✓ | ✓ | ✓ | ungated = no-op |
 | 18 TODO.md | ✓ | ✓ | ✓ | docs |
 | 19 PR + CI | — | — | — | workflow |
 
-The one ordering rule the sequence enforces: nothing forward-references a later task. Windows detection (12), the reject gate (13), and the Windows `spawn_elevated` (14) all land BEFORE the `spawn()` branch (15) that calls them; the `spawn_unelevated` extraction (10) and POSIX `rewrite` (11) land before that same branch. Task 14 also lands the RawChild `runas` flag, `ProcHandle::teardown_on_drop`, and the `Child::drop` change (the non-blocking runas kill) — all consumed by Task 15's Windows `spawn_elevated` continuation and by every `Child` drop.
+The one ordering rule the sequence enforces: nothing forward-references a later task. Windows detection (12), the reject gate (13), and the Windows `spawn_elevated` (14) all land BEFORE the `spawn()` branch (15) that calls them; the `spawn_unelevated` extraction (10) and POSIX `rewrite` (11) land before that same branch. Task 3 lands the cross-platform shared helpers (`already_elevated_report`, `remap_derived_spawn_error`) that Tasks 11/14/15/16 reuse. Task 14 lands the universal-teardown work (Decision A): the RawChild `runas` flag, `map_elevated_kill_error`, `ProcHandle::teardown_on_drop(elevated)` (non-blocking on BOTH the POSIX `Std` and Windows runas arms), and the `Child::kill`/`kill_tree`/`Drop` changes — all consumed by Task 15's Windows continuation and by every `Child` drop. The `elevation` field they read is added in Task 11.
 
 ---
 
 ## File Structure
 
 **Create:**
-- `src/elevation.rs` — public surface: `is_elevated()`, enums (`Backend`, `Auth`, `ElevatedStdio`, `ElevatedVia`, `Privilege`), `Secret`, `ElevationReport`, crate-internal `ElevationRequest`, module wiring + re-exports.
+- `src/elevation.rs` — public surface: `is_elevated()`, enums (`Backend`, `Auth`, `ElevatedStdio`, `ElevatedVia`, `Privilege`), `Secret`, `ElevationReport`, crate-internal `ElevationRequest`, the cross-platform shared helpers `already_elevated_report` / `remap_derived_spawn_error` / `map_elevated_kill_error`, module wiring + re-exports.
 - `src/elevation_tests.rs` — unit tests for the public surface (enum defaults, `Secret` redaction, `is_elevated` ground-truth detection).
 - `src/elevation/plan.rs` — PURE `Host` / `BackendSet` / `Os` / `Transition` + `Host::detect()` + `Host::plan()`.
 - `src/elevation/plan_tests.rs` — cross-OS planner + full rejection-matrix tests (fake `Host` on any runner).
@@ -67,14 +67,14 @@ The one ordering rule the sequence enforces: nothing forward-references a later 
 - `tests/elevation.rs` — gated live integration tests (sync + async) + ungated cross-process probes.
 
 **Modify:**
-- `Cargo.toml` — add `zeroize = "1"`; extend `[target.'cfg(windows)'.dependencies] windows` feature list.
-- `src/error.rs` (+ `src/error_tests.rs`) — add `ElevationErrorKind` and `Error::Elevation`.
+- `Cargo.toml` — add `zeroize = "1"`; add the `term` feature to `nix` (for `openpty` in the PTY test); extend `[target.'cfg(windows)'.dependencies] windows` feature list.
+- `src/error.rs` (+ `src/error_tests.rs`) — add `ElevationErrorKind` (incl. `Unkillable`) and `Error::Elevation`.
 - `src/lib.rs` — `pub mod elevation;`.
 - `src/identity/windows.rs` — `pub(crate) fn windows_identity_from_handle`.
 - `src/command.rs` (+ `src/command_tests.rs`) — the four builder methods + `ElevationRequest` field + `elevation_request()` / `set_input_argv()` / `set_env_ops()` / `set_contain()`.
-- `src/child.rs` — `elevation: Option<ElevationReport>` field, `set_elevation()`, `elevation()`; `Drop` uses `ProcHandle::teardown_on_drop`.
-- `src/child/proc_handle.rs` — `teardown_on_drop()` dispatcher.
-- `src/child/spawn/windows_raw/proc.rs` — `RawChild` gains a `runas` flag, `new_runas()`, and a non-blocking `teardown_on_drop()`.
+- `src/child.rs` — `elevation: Option<ElevationReport>` field, `set_elevation()`, `elevation()`, `is_elevated_wrapper()`; `kill`/`kill_tree` route EPERM/ACCESS_DENIED → `Unkillable`; `Drop` uses `ProcHandle::teardown_on_drop(elevated)`.
+- `src/child/proc_handle.rs` — `teardown_on_drop(elevated)` dispatcher (non-blocking on an elevated `Std` child).
+- `src/child/spawn/windows_raw/proc.rs` (+ new `src/child/spawn/windows_raw/proc_tests.rs`) — `RawChild` gains a `runas` flag, `new_runas()`, and a non-blocking `teardown_on_drop()`; unit tests prove the runas-flag routing.
 - `src/child/spawn.rs` — extract `spawn_unelevated`; add the elevation branch to `spawn()`.
 - `src/tokio/command.rs` — mirror the four builder methods.
 - `src/tokio/child.rs` — `elevation` field + `set_elevation()` + `elevation()`.
@@ -87,12 +87,16 @@ The one ordering rule the sequence enforces: nothing forward-references a later 
 
 | Capability | sudo | doas | pkexec | run0 (explicit) | Windows (`runas`) |
 |---|---|---|---|---|---|
-| Elevate a child; wait; exit code; kill | ✓ | ✓ | ✓ | ✓ (targets the run0 client) | ✓ (kill best-effort — higher-integrity child may be unkillable; honest error, never a hang) |
+| Elevate a child; wait; exit code | ✓ | ✓ | ✓ | ✓ (targets the run0 client) | ✓ |
+| `kill` an uncontained elevated child | ✗ `Unkillable` (parent is unprivileged; EPERM) | ✗ `Unkillable` | ✗ `Unkillable` | ✗ `Unkillable` (targets the run0 client) | ✗ `Unkillable` (higher integrity; `ACCESS_DENIED`) |
+| `kill`/`kill_tree` with `.contain()` | ✓ (cgroup `cgroup.kill` reaches the elevated subtree) | ✓ | ✓ | n/a (`.contain()` + run0 → `Unsupported`) | n/a (`.contain()` + runas → `Unsupported`) |
 | Captured stdio, fd 0-2 | ✓ | ✓ | ✓ | ✓ (forced `--pipe`) | ✗ `Unsupported` |
 | `fd ≥ 3` | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` |
-| Forward env (`.env`, sanitized) | ✓ (`--preserve-env`, set in sudo's own env) | ✗ `Unsupported` | ✗ `Unsupported` | ✓ (`--setenv=K=V`) | ✗ `Unsupported` |
+| Forward env (`.env`, sanitized) | ✓ (`--preserve-env`, subject to sudoers `env_check`/`secure_path`) | ✗ `Unsupported` | ✗ `Unsupported` | ✓ (`--setenv=K=V`) | ✗ `Unsupported` |
 | `.env_remove()` / `.env_clear()` | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` | ✗ `Unsupported` |
 | `.contain()` + elevate | ✓ | ✓ | ✓ | ✗ `Unsupported` | ✗ `Unsupported` |
+
+`kill()`/`kill_tree()` on an uncontained elevated child return the typed `Error::Elevation { kind: Unkillable, .. }` (never a raw `Io`), and `Drop` / `kill_on_drop` are best-effort and NEVER block on it (try_wait + `log::warn!`). `.contain()` is what restores reliable teardown on Linux — its `cgroup.kill` reaches the whole elevated subtree.
 
 ---
 
@@ -103,9 +107,11 @@ The one ordering rule the sequence enforces: nothing forward-references a later 
 - Test: `src/error_tests.rs`
 
 **Interfaces:**
-- Produces: `ElevationErrorKind::{BackendUnavailable, AuthFailed, AuthDeclined, NoTty, Untracked}` (Debug, Clone, Copy, PartialEq, Eq); `Error::Elevation { kind: ElevationErrorKind, detail: String }`.
+- Produces: `ElevationErrorKind::{BackendUnavailable, AuthFailed, AuthDeclined, NoTty, Unkillable, Untracked}` (Debug, Clone, Copy, PartialEq, Eq); `Error::Elevation { kind: ElevationErrorKind, detail: String }`.
 
-`Untracked` covers the "runas succeeded but we could not resolve/manage the child" case (Task 14): auth SUCCEEDED, so it must not report as `AuthFailed`. Its `Display` is NEUTRAL — it must not assert the child "was terminated", because the caller-visible `detail` reports terminated-vs-still-running honestly (Task 14 sets it from the actual `TerminateProcess` result).
+`Untracked` covers the "runas succeeded but we could not resolve/manage the child" case: auth SUCCEEDED, so it must not report as `AuthFailed`. Its `Display` is NEUTRAL — it must not assert the child "was terminated", because the caller-visible `detail` reports terminated-vs-still-running honestly (the Windows launch sets it from the actual `TerminateProcess` result).
+
+`Unkillable` is the universal-teardown error: an unprivileged parent could not signal its elevated child (EPERM on POSIX, `ACCESS_DENIED` on Windows). Its `Display` is about the failed signal, not the child's fate; the `detail` names the pid.
 
 - [ ] **Step 1: Write the failing test** — append to `src/error_tests.rs`:
 
@@ -125,7 +131,7 @@ fn elevation_error_displays_kind_and_detail() {
 #[test]
 fn elevation_error_kinds_have_distinct_messages() {
     use crate::error::ElevationErrorKind::*;
-    let all = [BackendUnavailable, AuthFailed, AuthDeclined, NoTty, Untracked];
+    let all = [BackendUnavailable, AuthFailed, AuthDeclined, NoTty, Unkillable, Untracked];
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.to_string(), b.to_string(), "{a:?} vs {b:?}");
@@ -135,16 +141,25 @@ fn elevation_error_kinds_have_distinct_messages() {
 
 #[test]
 fn untracked_message_does_not_assert_termination() {
-    // The kind's Display is neutral; termination status lives in `detail` (Task 14).
+    // The kind's Display is neutral; termination status lives in `detail`.
     use crate::error::ElevationErrorKind::Untracked;
     let s = Untracked.to_string();
     assert!(!s.contains("terminated"), "Untracked Display must not claim termination: {s}");
+}
+
+#[test]
+fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
+    // Display describes the signal denial; whether the child lives is in `detail`.
+    use crate::error::ElevationErrorKind::Unkillable;
+    let s = Unkillable.to_string();
+    assert!(!s.contains("terminated"), "Unkillable Display must not claim termination: {s}");
+    assert!(s.contains("terminate") || s.contains("signal") || s.contains("kill"), "{s}");
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --lib error_tests::elevation error_tests::untracked`
+Run: `cargo test --lib error_tests::elevation error_tests::untracked error_tests::unkillable`
 Expected: FAIL — `no variant named Elevation`, `no module ElevationErrorKind`.
 
 - [ ] **Step 3: Write minimal implementation** — in `src/error.rs`, add the enum before `Error` and the variant inside `Error`:
@@ -167,6 +182,10 @@ pub enum ElevationErrorKind {
     /// Interactive auth requested but there is no controlling terminal to prompt on.
     #[error("no controlling terminal for interactive elevation")]
     NoTty,
+    /// An unprivileged parent could not signal its elevated child (EPERM on POSIX,
+    /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
+    #[error("could not terminate an elevated child: permission denied")]
+    Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to
     /// manage it. Whether it was terminated is reported in the error `detail`.
     #[error("elevated child launched but could not be tracked")]
@@ -187,8 +206,8 @@ Inside `pub enum Error`, after the `Containment` variant:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test --lib error_tests::elevation error_tests::untracked`
-Expected: PASS (3 tests).
+Run: `cargo test --lib error_tests::elevation error_tests::untracked error_tests::unkillable`
+Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -318,6 +337,9 @@ git commit -m "feat: add zeroized Secret for Auth::Stdin"
   - `pub enum Privilege { Unprivileged, Elevated }` — Debug, Clone, Copy, PartialEq, Eq, `#[non_exhaustive]`.
   - `pub struct ElevationReport { via: ElevatedVia, stripped_env: Vec<OsString>, stdio: ElevatedStdio }` — Debug, Clone; public fields.
   - `pub(crate) struct ElevationRequest { enabled: bool, backend: Backend, auth: Auth, sanitizer: EnvSanitizer }` — Debug; `Default`.
+  - Two crate-internal shared helpers on `elevation.rs` (cross-platform, so both the sync and async spawn paths and both effect layers call ONE copy — DRY, parity-by-construction):
+    - `pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport` — the single source of the `AlreadyElevated` report literal (used by POSIX rewrite, Windows launch/spawn, and both async arms).
+    - `pub(crate) fn remap_derived_spawn_error(err: Error, backend_path: &Path) -> Error` — remaps a derived-backend spawn `Io(NotFound|PermissionDenied)` to `Elevation { BackendUnavailable }` ONLY when attributable to the backend path (else the original `Io` survives — a bad `current_dir()` yields the same kinds), always embedding the underlying `io::Error` + backend path in `detail`. Used by the sync and async POSIX spawn arms.
 
 `ElevatedStdio` is `{Passthrough, OwnConsole}` — the deferred broker (`Piped`) and a future `SW_HIDE` knob (`Hidden`) are non-breaking additions under `#[non_exhaustive]`. `ElevatedVia::WindowsUac` is a DEDICATED variant for Windows runas — it does NOT reuse `Backend::Auto`, which is a POSIX resolution concept.
 
@@ -357,6 +379,49 @@ fn elevation_report_holds_achieved_state() {
     assert_eq!(r.via, ElevatedVia::Wrapped(Backend::Sudo));
     assert_eq!(r.stripped_env, vec![std::ffi::OsString::from("LD_PRELOAD")]);
     assert_eq!(r.stdio, ElevatedStdio::Passthrough);
+}
+
+#[test]
+fn already_elevated_report_is_single_sourced() {
+    let r = super::already_elevated_report(ElevatedStdio::Passthrough);
+    assert_eq!(r.via, ElevatedVia::AlreadyElevated);
+    assert!(r.stripped_env.is_empty());
+    assert_eq!(r.stdio, ElevatedStdio::Passthrough);
+}
+
+#[test]
+fn remap_backend_missing_is_backend_unavailable_with_cause() {
+    use crate::error::{ElevationErrorKind, Error};
+    let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+    let e = super::remap_derived_spawn_error(Error::Io(io), std::path::Path::new("/nonexistent/sudo"));
+    match e {
+        Error::Elevation { kind: ElevationErrorKind::BackendUnavailable, detail } => {
+            assert!(detail.contains("/nonexistent/sudo"), "detail must name the backend path: {detail}");
+            assert!(detail.contains("no such file"), "detail must embed the underlying cause: {detail}");
+        }
+        other => panic!("expected BackendUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn remap_preserves_a_non_backend_io_error() {
+    use crate::error::Error;
+    // The backend path exists (this test binary), so a NotFound is NOT the backend —
+    // it is attributable elsewhere (e.g. a bad current_dir()). The original Io survives.
+    let exe = std::env::current_exe().unwrap();
+    let io = std::io::Error::new(std::io::ErrorKind::NotFound, "cwd gone");
+    let e = super::remap_derived_spawn_error(Error::Io(io), &exe);
+    assert!(matches!(e, Error::Io(_)), "a non-backend NotFound must not be remapped: {e:?}");
+}
+
+#[test]
+fn remap_passes_through_unrelated_errors() {
+    use crate::error::Error;
+    let e = super::remap_derived_spawn_error(
+        Error::Unsupported { op: "x".into(), platform: "unix", detail: "y".into() },
+        std::path::Path::new("/nonexistent/sudo"),
+    );
+    assert!(matches!(e, Error::Unsupported { .. }));
 }
 ```
 
@@ -442,7 +507,10 @@ pub enum Privilege {
 #[derive(Debug, Clone)]
 pub struct ElevationReport {
     pub via: ElevatedVia,
-    /// Vars the sanitizer dropped before forwarding (also `log`ged).
+    /// Vars the crate's own sanitizer dropped before forwarding (also `log`ged). The
+    /// vars that DO survive are forwarded to the backend but remain subject to the
+    /// site's own policy — sudo's `env_check`/`env_delete` and `secure_path` may still
+    /// filter or override a forwarded var, which the crate cannot observe.
     pub stripped_env: Vec<OsString>,
     pub stdio: ElevatedStdio,
 }
@@ -467,20 +535,51 @@ impl Default for ElevationRequest {
         }
     }
 }
+
+/// The single source of the "already elevated, no wrapper needed" report. Every
+/// sync/async spawn arm that short-circuits on ambient privilege calls this, so the
+/// literal is never hand-copied.
+pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport {
+    ElevationReport { via: ElevatedVia::AlreadyElevated, stripped_env: Vec::new(), stdio }
+}
+
+/// Remap a DERIVED-backend spawn error honestly. The derived command's program IS the
+/// elevation backend, but it also carries the caller's `current_dir()` — a bad cwd
+/// yields the same `NotFound`/`PermissionDenied` kinds. So only remap to
+/// `BackendUnavailable` when the backend path is the culprit (missing / not the file
+/// that failed); otherwise the original `Io` survives. Either way the underlying
+/// `io::Error` and the backend path are embedded so the cause is never lost.
+pub(crate) fn remap_derived_spawn_error(err: crate::error::Error, backend_path: &std::path::Path) -> crate::error::Error {
+    use crate::error::{ElevationErrorKind, Error};
+    match err {
+        Error::Io(e)
+            if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied)
+                && !backend_path.exists() =>
+        {
+            Error::Elevation {
+                kind: ElevationErrorKind::BackendUnavailable,
+                detail: format!("elevation backend {} could not be executed: {e}", backend_path.display()),
+            }
+        }
+        other => other,
+    }
+}
 ```
+
+> `Path` is used by `remap_derived_spawn_error`; it is reached via the fully-qualified `std::path::Path` above (no new `use`). `already_elevated_report`/`remap_derived_spawn_error` are cross-platform (no `cfg`), so every effect layer and both spawn paths share one copy.
 
 > Note: `pub mod sanitize;` and `pub mod plan;` are declared here but land in Tasks 4–6. Add stub files now so the crate compiles: create `src/elevation/sanitize.rs` containing only `#[derive(Debug, Default)] pub struct EnvSanitizer;` and `src/elevation/plan.rs` empty. Tasks 4–6 flesh them out.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --lib elevation_tests`
-Expected: PASS (all elevation_tests).
+Expected: PASS (all elevation_tests, including the shared-helper tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/elevation.rs src/elevation_tests.rs src/elevation/plan.rs src/elevation/sanitize.rs
-git commit -m "feat: elevation public enums, ElevatedVia, ElevationReport, ElevationRequest"
+git commit -m "feat: elevation public enums, ElevatedVia, ElevationReport, shared already_elevated_report/remap_derived_spawn_error helpers"
 ```
 
 ---
@@ -671,8 +770,8 @@ pub enum Transition {
 
 impl Host {
     pub fn detect() -> Host {
-        // Task 4 ships a self-contained body so this task compiles on every
-        // platform; Tasks 9/12 replace it with the real per-OS dispatch.
+        // A self-contained body so the crate compiles on every platform; the
+        // per-OS detect dispatch replaces it once the effect layers land.
         Host {
             elevated: false,
             has_tty: false,
@@ -755,6 +854,8 @@ git commit -m "feat: pure elevation planner with sudo>doas Auto resolution and r
 2. **Structural validation** (privilege-independent, BEFORE the elevated short-circuit): impossible `(backend, auth)` combos → `Reject { Unsupported }`.
 3. **Already-elevated short-circuit**: structurally valid + `self.elevated` → `RunAsIs`.
 4. **Resolution** (only when actually elevating): backend availability (`BackendUnavailable`), Auto→concrete, Askpass/Stdin-needs-sudo (`Unsupported`), and the `NoTty` precondition.
+
+**Privilege-independence extends to the effect layers.** The planner owns the `(backend, auth)` matrix, but the request also carries config the pure `Host` cannot see — `fd ≥ 3`, `.env`/`.env_remove`/`.env_clear` against an unsupporting backend, `.contain()` + run0/Windows, `commandline()`-built input, and captured stdio on elevated-Windows. Those STRUCTURAL config gates are a property of the request, not of ambient privilege, so the POSIX (`rewrite_with_host`) and Windows (`launch_runas_with_host`) effect layers run them BEFORE their own already-elevated short-circuit — evaluated against the REQUESTED backend so the verdict is identical with `elevated: true`. Only the environmental preconditions the planner already isolates (`NoTty`, `BackendUnavailable`) legitimately differ by privilege and stay after the short-circuit. Tasks 11 and 14 implement and test this.
 
 Structural rejections — POSIX: `Gui` with any non-`Pkexec` backend → `Unsupported`; `Pkexec` with any non-`Gui` auth → `Unsupported`; `Askpass` with a backend other than `Sudo`/`Auto` → `Unsupported`; `Stdin` with a backend other than `Sudo`/`Auto` → `Unsupported`.
 Structural rejections — Windows: `backend != Auto` → `Unsupported`; `auth ∈ {NonInteractive, Askpass, Stdin}` → `Unsupported`.
@@ -1260,15 +1361,16 @@ git commit -m "feat: EnvSanitizer consent gradient; keep is additive-within-poli
 - Consumes: `super::{Auth, Backend}`, `crate::error::Error`.
 - Produces: `pub(crate) fn build_argv(backend, backend_path: &OsStr, auth, program: &OsStr, args: &[OsString], env: &[(OsString, OsString)]) -> Result<Vec<OsString>, Error>` — the full elevated argv. **argv[0] is the injected RESOLVED ABSOLUTE `backend_path`.** Pure — no installed backend required.
 
-**Argv rules (spec + Decision 1 — the `env K=V` wrapper is GONE):**
+**Argv rules (backend-native env forwarding; the `env K=V` wrapper is GONE):**
 - argv[0] = `backend_path` (absolute); no `env` binary anywhere, so no unqualified-`env` PATH-hijack hole.
 - Per-backend auth flags: `Sudo` → `-n`/`-S`/`-A` (NonInteractive/Stdin/Askpass); `Doas` → `-n` (NonInteractive); `Run0` → `--no-ask-password` (NonInteractive). Structurally-invalid combos never reach here.
+- **`pkexec` gets `--disable-internal-agent`.** With no flag, pkexec falls back to an internal TEXT agent that blocks on a TTY prompt (defeating the graphical-only contract); `--disable-internal-agent` makes a missing graphical agent fail LOUD → `AuthFailed`, never a silent text prompt.
 - **Backend-native env forwarding:**
-  - `Sudo`: names the forwarded (sanitized) vars in **`--preserve-env=NAME,…`** (the VALUES are set in the sudo child's own env by the rewrite, Task 11 — never in argv). Each NAME is validated to `[A-Za-z_][A-Za-z0-9_]*`; a comma/`=`/non-ASCII name → `Error::Unsupported` (no lossy comma-join). No `--preserve-env` flag when the forwarded set is empty.
+  - `Sudo`: names the forwarded (sanitized) vars in **`--preserve-env=NAME,…`** (the VALUES are set in the sudo child's own env by the rewrite — never in argv). Each NAME is validated to `[A-Za-z_][A-Za-z0-9_]*`; a comma/`=`/non-ASCII name → `Error::Unsupported` (no lossy comma-join). No `--preserve-env` flag when the forwarded set is empty.
   - `Run0`: one **`--setenv=NAME=VALUE`** per var (name-validated the same way; run0 carries values in argv — no setuid scrub applies, and the sanitizer denylist is the load-bearing wall against loader vars reaching PID 1).
   - `Doas`/`Pkexec`: NO env-forwarding mechanism — the rewrite rejects `.env()` for these before `build_argv` is reached, so `build_argv` `debug_assert!`s the env is empty.
 - `run0` forces `--pipe` (honest `Passthrough`, not a silent pty merge).
-- A **`--` terminator** precedes the program on every backend, so a program path containing `=` or a leading `-` is not mis-parsed.
+- **The `--` terminator precedes the program on `Sudo`/`Doas`/`Run0` — but NOT `Pkexec`.** pkexec's hand-rolled option loop does not understand `--` (it breaks on the first unknown token and would treat `--` as the program). So pkexec emits no terminator; a leading-dash program under pkexec (which the terminator would otherwise shield) is a loud `Error::Unsupported`. A program path containing `=` is safe under pkexec (pkexec never parses assignments) and under the other backends (shielded by `--`).
 - `Backend::Auto` is `unreachable!()` — the planner resolves it before `build_argv` is called.
 
 - [ ] **Step 1: Write the failing test** — create `src/elevation/posix_tests.rs`:
@@ -1355,9 +1457,22 @@ fn run0_rejects_an_unforwardable_env_name() {
 }
 
 #[test]
-fn pkexec_gui_no_env() {
+fn pkexec_gui_disables_internal_agent_and_uses_no_terminator() {
+    // No `--` for pkexec (its option loop mis-parses it); --disable-internal-agent pins
+    // the graphical-only contract.
     let argv = build_argv(Backend::Pkexec, OsStr::new("/usr/bin/pkexec"), &Auth::Gui, OsStr::new("id"), &[], &[]).unwrap();
-    assert_eq!(argv, s(&["/usr/bin/pkexec", "--", "id"]));
+    assert_eq!(argv, s(&["/usr/bin/pkexec", "--disable-internal-agent", "id"]));
+    assert!(!argv.iter().any(|a| a == &OsString::from("--")), "pkexec must not emit a -- terminator");
+}
+
+#[test]
+fn pkexec_rejects_a_leading_dash_program() {
+    // With no `--` shield, a leading-dash program would be mis-parsed as a pkexec option.
+    let r = build_argv(Backend::Pkexec, OsStr::new("/usr/bin/pkexec"), &Auth::Gui, OsStr::new("-prog"), &[], &[]);
+    assert!(matches!(r, Err(crate::error::Error::Unsupported { .. })));
+    // An `=` in the program path is safe under pkexec (no assignment parsing).
+    let ok = build_argv(Backend::Pkexec, OsStr::new("/usr/bin/pkexec"), &Auth::Gui, OsStr::new("/opt/we=ird"), &[], &[]).unwrap();
+    assert_eq!(ok, s(&["/usr/bin/pkexec", "--disable-internal-agent", "/opt/we=ird"]));
 }
 
 #[test]
@@ -1453,6 +1568,16 @@ pub(crate) fn build_argv(
         }
         Backend::Pkexec => {
             debug_assert!(env.is_empty(), "pkexec forwards no env; the rewrite rejects .env() for pkexec");
+            // Fail loud if the graphical agent is missing, instead of a blocking text prompt.
+            argv.push("--disable-internal-agent".into());
+            // pkexec has no `--` terminator, so a leading-dash program cannot be shielded.
+            if program_starts_with_dash(program) {
+                return Err(Error::Unsupported {
+                    op: "elevating a leading-dash program under pkexec".into(),
+                    platform: "unix",
+                    detail: "pkexec cannot parse a `--` terminator, so a program starting with `-` would be taken as a pkexec option; use sudo/doas/run0, or a non-dash program path".into(),
+                });
+            }
         }
         Backend::Run0 => {
             argv.push("--pipe".into());
@@ -1472,11 +1597,21 @@ pub(crate) fn build_argv(
         }
         Backend::Auto => unreachable!("build_argv received unresolved Backend::Auto; the planner resolves Auto"),
     }
-    // Terminate option/assignment parsing before the program.
-    argv.push("--".into());
+    // Terminate option/assignment parsing before the program — every backend EXCEPT
+    // pkexec, whose option loop mis-parses `--` (a leading-dash pkexec program is
+    // rejected above instead).
+    if backend != Backend::Pkexec {
+        argv.push("--".into());
+    }
     argv.push(program.to_os_string());
     argv.extend(args.iter().cloned());
     Ok(argv)
+}
+
+/// Does `program` begin with `-`? (Only pkexec, which has no `--` shield, cares.)
+fn program_starts_with_dash(program: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    program.as_bytes().first() == Some(&b'-')
 }
 
 #[cfg(test)]
@@ -1495,13 +1630,13 @@ pub mod posix;
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --lib elevation::posix`
-Expected: PASS (11 tests).
+Expected: PASS (all posix argv tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/elevation.rs src/elevation/posix.rs src/elevation/posix_tests.rs
-git commit -m "feat: pure POSIX elevated-argv (abs path, --preserve-env/--setenv, -- terminator, run0 --pipe)"
+git commit -m "feat: pure POSIX elevated-argv (abs path, --preserve-env/--setenv, sudo/doas/run0 -- terminator, pkexec --disable-internal-agent, run0 --pipe)"
 ```
 
 ---
@@ -1924,19 +2059,20 @@ git commit -m "refactor: extract spawn_unelevated as the shared non-elevated spa
 
 **Interfaces:**
 - Produces:
-  - `pub(crate) struct PendingPassword` — carries the pipe write-end + `Secret`; `write_after_spawn(self) -> Result<(), Error>` delivers the password AFTER spawn.
-  - `pub(crate) struct PosixRewrite { derived: Option<Command>, report: Option<ElevationReport>, password_write: Option<PendingPassword> }`.
-  - `#[cfg(unix)] pub(crate) fn rewrite(cmd: &Command) -> Result<PosixRewrite, Error>` = `rewrite_with_host(cmd, &Host::detect())`.
+  - `pub(crate) struct PendingPassword` — carries the pipe write-end + `Secret`; `write_after_spawn(self) -> Result<(), Error>` delivers the password AFTER spawn, non-blocking and race-hardened.
+  - `pub(crate) struct PosixRewrite { derived: Option<Command>, report: Option<ElevationReport>, password_write: Option<PendingPassword>, backend_path: Option<PathBuf> }` — `backend_path` is the resolved argv[0] the spawn arm hands to `remap_derived_spawn_error` (`None` when already elevated).
+  - `#[cfg(unix)] pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error>` = `rewrite_with_host(cmd, &Host::detect())`.
   - `#[cfg(unix)] pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error>` — builds a DERIVED backend command; PURE given `host`.
   - On `Child`: `pub(crate) fn set_elevation(&mut self, r: Option<ElevationReport>)`, `pub fn elevation(&self) -> Option<ElevationReport>`.
 
 **Structural decisions woven in:**
-- **Decision 4 — non-destructive.** `rewrite_with_host` builds a fresh DERIVED `Command` (backend argv + rebuilt env + transferred cwd/contain/kill_on_drop/stdio) and returns it in `PosixRewrite.derived`; the caller's `Command` `input()`/`env_ops()` are left UNTOUCHED, so a second spawn never double-wraps. The caller's fd 0-2 stdio is MOVED into the derived command (`ResolvedStdio::File` is not `Clone`; the ordinary spawn path likewise consumes fds).
-- **Decision 1 — backend-native env.** sudo's forwarded vars are set in the DERIVED command's own env (`EnvOp::Set`) and named in `--preserve-env` by `build_argv`. run0 forwards via `--setenv`. `.env()` with doas/pkexec → `Unsupported`. `.env_remove()`/`.env_clear()` (any backend) → `Unsupported` (the backend builds the base env; the crate can add but not subtract). `SUDO_ASKPASS` is set on the derived env for `Auth::Askpass`.
-- **Decision 2 — deferred password.** `Auth::Stdin` wires the derived fd0 to a fresh pipe's READ end (`Stdio::from_file`, so it resolves to `ResolvedStdio::File`); the password is NOT written here. The write-end + `Secret` ride out in `password_write`, and Task 15/16 call `write_after_spawn` once the child (draining via `sudo -S`) exists — the write completes for any secret length. A caller-configured fd0 → `Unsupported`.
-- **Decision 5 — fd≥3.** Any `fd >= 3` on an elevated POSIX command → `Unsupported` (mirrors the Windows gate; the backend's `closefrom` / run0's PID-1 reparent drops it).
-- **f7897d84.** The impossible `Transition::ElevateWindows` arm is `unreachable!()`, not a misleading `BackendUnavailable` `Err`.
-- `Backend::Run0` + `.contain()` → `Unsupported`. `commandline()` / a distinct-argv0 `executable()` elevated → `Unsupported`. Report `via: Wrapped(backend)`, `stdio: Passthrough`; `RunAsIs` (requested but already elevated) → `Some(via: AlreadyElevated)` with `derived: None`.
+- **Non-destructive.** `rewrite_with_host` builds a fresh DERIVED `Command` (backend argv + rebuilt env + transferred cwd/contain/kill_on_drop/stdio) and returns it in `PosixRewrite.derived`; the caller's `Command` `input()`/`env_ops()` are left UNTOUCHED, so a second spawn never double-wraps. The caller's fd 0-2 stdio is MOVED into the derived command (`ResolvedStdio::File` is not `Clone`; the ordinary spawn path likewise consumes fds).
+- **Backend-native env.** sudo's forwarded vars are set in the DERIVED command's own env (`EnvOp::Set`) and named in `--preserve-env` by `build_argv`. run0 forwards via `--setenv`. `.env()` with doas/pkexec → `Unsupported`. `.env_remove()`/`.env_clear()` (any backend) → `Unsupported` (the backend builds the base env; the crate can add but not subtract). `SUDO_ASKPASS` is set on the derived env for `Auth::Askpass`.
+- **Deferred password.** `Auth::Stdin` wires the derived fd0 to a fresh pipe's READ end (`Stdio::from_file`, so it resolves to `ResolvedStdio::File`); the password is NOT written here. The write-end + `Secret` ride out in `password_write`, and the spawn arms call `write_after_spawn` once the child (draining via `sudo -S`) exists. A caller-configured fd0 → `Unsupported`.
+- **fd ≥ 3.** Any `fd >= 3` on an elevated POSIX command → `Unsupported` (mirrors the Windows gate; the backend's `closefrom` / run0's PID-1 reparent drops it).
+- **Config gates run BEFORE the already-elevated short-circuit (privilege-independent).** `fd >= 3`, `.env` on doas/pkexec, `.env_remove`/`.env_clear`, `.contain()` + run0, and `commandline()` / distinct-argv0 are validated against the REQUESTED backend FIRST — so an already-elevated caller gets the same `Unsupported` verdict — and only then does the planner's `RunAsIs`/resolution short-circuit run. The backend-availability (`BackendUnavailable`) and `NoTty` checks are environmental and stay in the planner, after the short-circuit.
+- The impossible `Transition::ElevateWindows` arm is `unreachable!()`, not a misleading `BackendUnavailable` `Err`.
+- Report `via: Wrapped(backend)`, `stdio: Passthrough`; `RunAsIs` (requested but already elevated) → `Some(already_elevated_report(Passthrough))` with `derived: None`, `backend_path: None`.
 
 - [ ] **Step 1: Write the failing test** — append to `src/elevation/posix_tests.rs`:
 
@@ -2108,6 +2244,59 @@ mod rewrite_tests {
             .elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
         assert!(matches!(super::rewrite_with_host(&mut c, &sudo_host()), Err(Error::Unsupported { .. })));
     }
+
+    fn elevated_sudo_host() -> Host {
+        Host { elevated: true, ..sudo_host() }
+    }
+
+    #[test]
+    fn already_elevated_requested_reports_already_elevated_with_no_derived() {
+        // The RunAsIs (requested but already elevated) branch: no wrapper, but a report.
+        let mut c = Command::new();
+        c.args(["id", "-u"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
+        let rw = super::rewrite_with_host(&mut c, &elevated_sudo_host()).expect("rewrite");
+        assert!(rw.derived.is_none(), "already-elevated must not build a derived command");
+        assert!(rw.backend_path.is_none());
+        assert!(rw.password_write.is_none());
+        assert_eq!(rw.report.as_ref().unwrap().via, ElevatedVia::AlreadyElevated);
+    }
+
+    #[test]
+    fn structural_config_gates_are_privilege_independent() {
+        // Same structurally-invalid requests must be rejected whether or not the caller
+        // is already elevated (Config gates run before the RunAsIs short-circuit).
+        for host in [sudo_host(), elevated_sudo_host()] {
+            let mut a = Command::new();
+            a.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
+            a.fd(3, Stdio::pipe_out()).unwrap();
+            assert!(matches!(super::rewrite_with_host(&mut a, &host), Err(Error::Unsupported { .. })),
+                "fd>=3 must reject with elevated={}", host.elevated);
+
+            let mut b = Command::new();
+            b.args(["id"]).env("A", "1").elevation_backend(Backend::Doas).elevation_auth(Auth::NonInteractive);
+            let doas_host = Host {
+                available: BackendSet { run0: None, sudo: None, doas: Some(PathBuf::from("/usr/bin/doas")), pkexec: None },
+                ..host.clone()
+            };
+            assert!(matches!(super::rewrite_with_host(&mut b, &doas_host), Err(Error::Unsupported { .. })),
+                ".env()+doas must reject with elevated={}", host.elevated);
+
+            let mut d = Command::new();
+            d.commandline("id -u").elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
+            assert!(matches!(super::rewrite_with_host(&mut d, &host), Err(Error::Unsupported { .. })),
+                "commandline() must reject with elevated={}", host.elevated);
+        }
+    }
+
+    #[test]
+    fn password_line_is_presized_and_never_reallocates() {
+        // A realloc while appending '\n' would leave an un-zeroized plaintext copy in the
+        // freed buffer. The pre-sized buffer's capacity must be exactly len+1 and stay put.
+        let secret = b"hunter2";
+        let line = crate::elevation::posix::password_line(secret);
+        assert_eq!(line, b"hunter2\n");
+        assert_eq!(line.capacity(), secret.len() + 1, "buffer must be pre-sized to len+1, no slack");
+    }
 }
 ```
 
@@ -2131,41 +2320,76 @@ use crate::error::ElevationErrorKind;
 use crate::stdio::{Fd, Stdio};
 
 /// The `Auth::Stdin` password channel: the pipe write-end plus the secret, written
-/// AFTER spawn (the child is then draining via `sudo -S`, so the write completes for
-/// any secret length — no kernel pipe-buffer assumption).
+/// AFTER spawn (the child is then draining via `sudo -S`).
 pub(crate) struct PendingPassword {
     writer: std::io::PipeWriter,
     secret: Secret,
 }
 
+/// The password line to feed `sudo -S`: the secret plus a trailing newline, in a buffer
+/// pre-sized to exactly `secret.len() + 1` so the `push` never reallocates. A realloc
+/// would leave an un-zeroized plaintext copy in the freed allocation. Zeroize the
+/// returned buffer after use.
+fn password_line(secret: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(secret.len() + 1);
+    bytes.extend_from_slice(secret);
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Put `writer`'s underlying fd into non-blocking mode so a `write_all` cannot block
+/// when the backend never reads fd0 (a cached-credential / NOPASSWD sudo).
+fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
+    use std::os::fd::AsRawFd;
+    let fd = writer.as_raw_fd();
+    // SAFETY: fcntl on a live owned fd; a best-effort mode change (failure is non-fatal —
+    // a genuine still-open-pipe error is still surfaced by write_after_spawn).
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
 impl PendingPassword {
-    /// Deliver the password + newline, then EOF. Errors are logged at debug and
-    /// propagated as `Error::Elevation` (never a silently-swallowed write).
+    /// Deliver the password + newline, then EOF. RACE-HARDENED: a cached-credential /
+    /// NOPASSWD sudo never reads fd0, so the writer is non-blocking and a `BrokenPipe`
+    /// (`EPIPE`, reader already gone) or `WouldBlock` means "the backend did not need
+    /// the password" → `log::debug!` + `Ok`, NOT `AuthFailed`. Only a genuine write
+    /// error on a still-open pipe is a failure. On that genuine failure the CALLER
+    /// (the spawn arm) kills and reaps the running child — a bare `?` must never orphan it.
     pub(crate) fn write_after_spawn(mut self) -> Result<(), Error> {
         use std::io::Write;
-        let mut bytes = self.secret.expose().to_vec();
-        bytes.push(b'\n');
+        let mut bytes = password_line(self.secret.expose());
+        set_writer_nonblocking(&self.writer);
         let res = self.writer.write_all(&bytes);
         bytes.zeroize();
         drop(self.writer); // EOF after the password line
-        if let Err(e) = res {
-            log::debug!("failed to deliver the elevation password after spawn: {e}");
-            return Err(Error::Elevation {
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WouldBlock) => {
+                log::debug!("elevation backend did not consume the password (fd0 closed / would block): {e}");
+                Ok(())
+            }
+            Err(e) => Err(Error::Elevation {
                 kind: ElevationErrorKind::AuthFailed,
                 detail: format!("could not deliver the sudo -S password: {e}"),
-            });
+            }),
         }
-        Ok(())
     }
 }
 
 /// Outcome of a POSIX rewrite. `derived` is the backend command to spawn (`None` iff
 /// already elevated — spawn the original unchanged). `report` is attached to the
-/// resulting `Child`. `password_write` is delivered after spawn.
+/// resulting `Child`. `password_write` is delivered after spawn. `backend_path` is the
+/// resolved argv[0] the spawn arm passes to `remap_derived_spawn_error` (`None` when
+/// already elevated).
 pub(crate) struct PosixRewrite {
     pub derived: Option<Command>,
     pub report: Option<ElevationReport>,
     pub password_write: Option<PendingPassword>,
+    pub backend_path: Option<PathBuf>,
 }
 
 /// Collect the explicitly-`Set` env into an ordered (k,v) list (later `Set`s win).
@@ -2212,41 +2436,13 @@ fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
     }
 }
 
-/// Detect-then-plan-then-rewrite. Thin wrapper over the pure form.
-pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
-    rewrite_with_host(cmd, &Host::detect())
-}
-
-/// PURE given `host`: plan + sanitize + build a DERIVED backend command. The
-/// caller's `Command` `input`/`env_ops` are left untouched (Decision 4).
-pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
-    let req = cmd.elevation_request();
-    let (backend, path, auth) = match host.plan(Privilege::Elevated, req.backend, req.auth.clone()) {
-        Transition::RunAsIs => {
-            // Requested but already elevated — no wrapper, but still reported.
-            return Ok(PosixRewrite {
-                derived: None,
-                report: Some(ElevationReport {
-                    via: ElevatedVia::AlreadyElevated,
-                    stripped_env: Vec::new(),
-                    stdio: ElevatedStdio::Passthrough,
-                }),
-                password_write: None,
-            });
-        }
-        Transition::Reject { error } => return Err(error),
-        Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
-        Transition::ElevatePosix { backend, path, auth } => (backend, path, auth),
-    };
-
-    // --- validation (before moving anything out of the caller's Command) ---
-    if backend == Backend::Run0 && cmd.contain_request().mode.is_some() {
-        return Err(Error::Unsupported {
-            op: ".contain() + Backend::Run0".into(),
-            platform: "unix",
-            detail: "run0 runs the target as a PID 1-parented transient unit outside our cgroup; containment cannot span it".into(),
-        });
-    }
+/// Structural request-validation, evaluated against the REQUESTED backend so the verdict
+/// is privilege-independent. Run BEFORE the already-elevated short-circuit, so an
+/// already-elevated caller gets the same rejection. (Backend availability + NoTty are
+/// environmental and stay in the planner, after the short-circuit.)
+fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) -> Result<(), Error> {
+    // commandline() / empty / distinct-argv0.
+    program_and_args(cmd)?;
     if cmd.fds().keys().any(|f| f.raw() >= 3) {
         return Err(Error::Unsupported {
             op: "fd >= 3 on an elevated POSIX child".into(),
@@ -2262,16 +2458,73 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             detail: "the backend builds the elevated base environment; the crate can add but not subtract from it".into(),
         });
     }
-    let has_set = ops.iter().any(|o| matches!(o, EnvOp::Set(..)));
-    if has_set && matches!(backend, Backend::Doas | Backend::Pkexec) {
+    if ops.iter().any(|o| matches!(o, EnvOp::Set(..))) && matches!(backend, Backend::Doas | Backend::Pkexec) {
         return Err(Error::Unsupported {
             op: format!(".env() + Backend::{backend:?}"),
             platform: "unix",
             detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them".into(),
         });
     }
+    if backend == Backend::Run0 && cmd.contain_request().mode.is_some() {
+        return Err(Error::Unsupported {
+            op: ".contain() + Backend::Run0".into(),
+            platform: "unix",
+            detail: "run0 runs the target as a PID 1-parented transient unit outside our cgroup; containment cannot span it".into(),
+        });
+    }
+    if matches!(auth, Auth::Stdin(_)) && cmd.fds().contains_key(&Fd::STDIN) {
+        return Err(Error::Unsupported {
+            op: "Auth::Stdin with a caller-configured stdin".into(),
+            platform: "unix",
+            detail: "Auth::Stdin consumes fd0 to feed sudo -S the password; do not also configure stdin".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Detect-then-plan-then-rewrite. Thin wrapper over the pure form.
+pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
+    rewrite_with_host(cmd, &Host::detect())
+}
+
+/// PURE given `host`: gate + plan + sanitize + build a DERIVED backend command. The
+/// caller's `Command` `input`/`env_ops` are left untouched (non-destructive).
+pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
+    let req = cmd.elevation_request();
+    let requested_backend = req.backend;
+    let requested_auth = req.auth.clone();
+
+    // Structural config gates FIRST — privilege-independent (before the short-circuit).
+    reject_structural_posix_config(cmd, requested_backend, &requested_auth)?;
+
+    let (backend, path, auth) = match host.plan(Privilege::Elevated, requested_backend, requested_auth) {
+        Transition::RunAsIs => {
+            // Requested but already elevated — no wrapper, but still reported.
+            return Ok(PosixRewrite {
+                derived: None,
+                report: Some(super::already_elevated_report(ElevatedStdio::Passthrough)),
+                password_write: None,
+                backend_path: None,
+            });
+        }
+        Transition::Reject { error } => return Err(error),
+        Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
+        Transition::ElevatePosix { backend, path, auth } => (backend, path, auth),
+    };
+
+    // Sanitize the explicitly-forwarded env only once we know we are actually elevating
+    // (so a rejected/already-elevated request logs no spurious strips).
+    let (kept, stripped) = cmd.elevation_request().sanitizer.apply(explicit_set_env(cmd.env_ops()));
+    // Backend resolved via Auto may land on a non-sudo target that cannot forward env
+    // (the requested-backend gate above only catches the EXPLICIT doas/pkexec case).
+    if !kept.is_empty() && matches!(backend, Backend::Doas | Backend::Pkexec) {
+        return Err(Error::Unsupported {
+            op: format!(".env() + Backend::{backend:?} (resolved via Auto)"),
+            platform: "unix",
+            detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them".into(),
+        });
+    }
     let (program, args) = program_and_args(cmd)?;
-    let (kept, stripped) = req.sanitizer.apply(explicit_set_env(ops));
     let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
     // --- build the DERIVED command (the caller's Command stays intact) ---
@@ -2295,17 +2548,10 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
     derived.set_contain(cmd.contain_request());
     derived.kill_on_drop(cmd.kill_on_drop_flag());
 
-    // Auth::Stdin: wire the derived fd0 to a fresh pipe's read end; write the password
-    // AFTER spawn (Decision 2).
+    // Auth::Stdin: wire the derived fd0 to a fresh pipe's read end; the password is
+    // written after spawn (the fd0-conflict was already rejected in the structural gate).
     let mut password_write = None;
     if let Auth::Stdin(secret) = &auth {
-        if cmd.fds().contains_key(&Fd::STDIN) {
-            return Err(Error::Unsupported {
-                op: "Auth::Stdin with a caller-configured stdin".into(),
-                platform: "unix",
-                detail: "Auth::Stdin consumes fd0 to feed sudo -S the password; do not also configure stdin".into(),
-            });
-        }
         let (reader, writer) = std::io::pipe().map_err(Error::Io)?;
         let reader_file = File::from(OwnedFd::from(reader));
         derived.stdin(Stdio::from_file(reader_file))?;
@@ -2329,6 +2575,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             stdio: ElevatedStdio::Passthrough,
         }),
         password_write,
+        backend_path: Some(path),
     })
 }
 ```
@@ -2372,8 +2619,8 @@ git commit -m "feat: non-destructive POSIX elevation rewrite (derived command) +
 
 **Correctness fixes woven in:**
 - `TOKEN_MANDATORY_LABEL` is read from an 8-byte-ALIGNED buffer (`Vec<u64>`), and the `Sid` pointer field is read via `addr_of!` + `read_unaligned` — never forming a misaligned reference.
-- `integrity_level` is wired into `detect` (debug log) so it is not dead code under `-D warnings`.
-- **dc2568da:** every token-query FAILURE path in `is_elevated`/`integrity_level` LOGS (distinguishing "determined not-elevated" from "could-not-determine, assuming not-elevated").
+- `integrity_level` is wired into `detect` (debug log) so it is not dead code under `-D warnings`, and asserted `is_some()` unconditionally in tests.
+- Every token-query FAILURE path in `is_elevated`/`integrity_level` LOGS (distinguishing "determined not-elevated" from "could-not-determine, assuming not-elevated").
 
 Windows dep features: ADD `Win32_System_SystemServices` (integrity RID constants), `Win32_System_Com` (CoInitializeEx — Task 14), `Win32_System_Registry` (the `HKEY` field of `SHELLEXECUTEINFOW` — Task 14), `Win32_UI_Shell` + `Win32_UI_WindowsAndMessaging` (ShellExecuteEx — Task 14). Keep the existing 7.
 
@@ -2387,16 +2634,23 @@ fn detect_reports_windows_os() {
 }
 
 #[test]
+fn integrity_level_is_always_answerable() {
+    // Every Windows process has a mandatory integrity label; a `None` here means the
+    // aligned two-call token read is broken, not that the runner lacks an answer. Fail
+    // loud rather than let the cross-check below go vacuous.
+    assert!(super::integrity_level().is_some(), "integrity_level() must resolve on any Windows runner");
+}
+
+#[test]
 fn is_elevated_agrees_with_integrity_level() {
     // Privilege-independent invariant (never assume ambient privilege): a full
     // (elevated) token runs at High+ integrity; a filtered token is Medium. This
     // cross-checks TokenElevation against the independent TokenIntegrityLevel class.
     use windows::Win32::System::SystemServices::SECURITY_MANDATORY_HIGH_RID;
     let elevated = super::is_elevated();
-    if let Some(rid) = super::integrity_level() {
-        let high = rid >= SECURITY_MANDATORY_HIGH_RID as u32;
-        assert_eq!(elevated, high, "TokenElevation ({elevated}) disagrees with integrity RID {rid:#x} vs High");
-    }
+    let rid = super::integrity_level().expect("integrity level must be readable");
+    let high = rid >= SECURITY_MANDATORY_HIGH_RID as u32;
+    assert_eq!(elevated, high, "TokenElevation ({elevated}) disagrees with integrity RID {rid:#x} vs High");
 }
 ```
 
@@ -2716,33 +2970,68 @@ git commit -m "feat: Windows elevation reject gate (all non-inherit slots + fd>=
 
 ---
 
-### Task 14: Windows `launch_runas` + `spawn_elevated` + non-blocking runas kill
+### Task 14: Universal elevated-child teardown + Windows `launch_runas` / `spawn_elevated`
 
 **Files:**
-- Modify: `src/elevation/windows.rs`, `src/elevation/windows_tests.rs`, `src/child/spawn/windows_raw/proc.rs`, `src/child/proc_handle.rs`, `src/child.rs`
+- Modify: `src/elevation.rs`, `src/elevation_tests.rs`, `src/elevation/windows.rs`, `src/elevation/windows_tests.rs`, `src/child/spawn/windows_raw/proc.rs`, `src/child/proc_handle.rs`, `src/child.rs`
+- Create: `src/child/spawn/windows_raw/proc_tests.rs`
 
 **Interfaces:**
 - Produces:
   - `#[cfg(windows)] pub(crate) enum RunasOutcome { AlreadyElevated, Launched { proc: OwnedHandle, pid: u32, id: ProcessId, report: ElevationReport } }`.
   - `#[cfg(windows)] pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error>` = `launch_runas_with_host(cmd, &Host::detect())`.
-  - `#[cfg(windows)] pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error>` — the Windows gate seam (mirrors `posix::rewrite_with_host`); tests inject a NON-elevated Host so the gate runs even on an already-elevated CI runner.
+  - `#[cfg(windows)] pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error>` — the Windows gate seam (mirrors `posix::rewrite_with_host`); runs the config gate BEFORE the already-elevated short-circuit; tests inject a NON-elevated AND an elevated Host so the gate's privilege-independence is proven.
   - `#[cfg(windows)] pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error>`.
-  - `RawChild::new_runas(proc, pid)` + `RawChild::teardown_on_drop()`; `ProcHandle::teardown_on_drop()`; `Child::drop` uses it.
+  - `RawChild::new_runas(proc, pid)` + `RawChild::teardown_on_drop()`; `ProcHandle::teardown_on_drop(elevated: bool)`; `Child::drop` uses it.
+  - Cross-platform `elevation::map_elevated_kill_error(err: io::Error, elevated_wrapper: bool) -> Error` + the `Child::kill`/`kill_tree` mapping that routes EPERM/ACCESS_DENIED on a `Wrapped(..)`/`WindowsUac` child to `Error::Elevation { Unkillable }`.
 
-**Structural decisions woven in:**
-- **Decision 3 — non-blocking runas kill.** `RawChild` gains a `runas: bool` flag. For a runas child (a higher-integrity process a medium parent cannot `PROCESS_TERMINATE`), `kill()` CHECKS the `TerminateProcess` result and on `ACCESS_DENIED` returns a real `Error` (or `Ok` if the child already exited) — it NEVER blocks in `wait()`. A new `teardown_on_drop()` (called by `Child::drop` via `ProcHandle::teardown_on_drop`) attempts terminate and, if the higher-integrity child cannot be killed, LOGS and moves on — never blocks. The old drop's unconditional `proc.wait()` is REPLACED by this dispatcher, so an unkillable elevated child cannot hang `Drop`.
-- **Decision 6 — host seam.** `launch_runas_with_host` plans against the injected `host`; the gate tests drive it with a non-elevated Windows `Host`.
-- **f7897d84.** The impossible `Transition::ElevatePosix` arm is `unreachable!()`.
-- **5cf8665a — COM.** `CoInitializeEx` returning `S_OK` OR `S_FALSE` both require a matching `CoUninitialize` (`S_FALSE` = already-init WITH the refcount incremented); only `RPC_E_CHANGED_MODE` skips it.
-- **0dd20e72/94ab6dc1 — Untracked honesty.** When identity is unresolvable, the code CHECKS the `TerminateProcess` result and reports terminated-vs-still-running in the error `detail` (the `Untracked` kind's Display stays neutral).
-- `nShow`: `SW_SHOWNORMAL.0 as i32`. `lpDirectory` from `cmd.cwd()`. `ERROR_CANCELLED` → `AuthDeclined`. Identity from the OWNED handle via `GetProcessId` + `windows_identity_from_handle`.
+**Universal elevated-child teardown (Decision A):** an unprivileged parent cannot signal its elevated child on ANY platform — POSIX `kill` → EPERM, Windows runas → ACCESS_DENIED — so one principle applies everywhere:
+- `Child::kill()` / `Child::kill_tree()` map EPERM/ACCESS_DENIED to `Error::Elevation { kind: Unkillable, .. }` (typed, never a raw `Io`) when `self.elevation()` is `Some` with `Wrapped(..)`/`WindowsUac`. Factored into `map_elevated_kill_error`.
+- `Drop` / `kill_on_drop` are best-effort and NEVER block: `ProcHandle::teardown_on_drop(elevated)` attempts the signal and, on EPERM/ACCESS_DENIED, does `try_wait()` + `log::warn!` instead of a blocking `wait()`. This replaces the OLD unconditional `let _ = kill(); let _ = wait();` on BOTH the POSIX `Std` arm (which previously blocked forever on an elevated child) AND the Windows runas arm.
+- `.contain()` restores reliable teardown on Linux (`cgroup.kill` reaches the elevated subtree), noted on the capability matrix.
 
-- [ ] **Step 1: Write the failing test** — append to `src/elevation/windows_tests.rs` (the gate runs before UAC; drive it through the host seam):
+**Windows launch decisions:**
+- Non-blocking runas kill: `RawChild` gains a `runas: bool` flag. For a runas child, `kill()` CHECKS the `TerminateProcess` result and on `ACCESS_DENIED` returns a real `Error` (or `Ok` if the child already exited) — never blocks in `wait()`.
+- Gate before short-circuit (privilege-independent): `launch_runas_with_host` runs `reject_unsupported_config` + the commandline/argv validation BEFORE the `RunAsIs` short-circuit, so a piped/`.env()`/`commandline()` elevated request is rejected identically whether or not the caller is already elevated.
+- The impossible `Transition::ElevatePosix` arm is `unreachable!()`.
+- COM balance: `CoInitializeEx` returning `S_OK` OR `S_FALSE` both require a matching `CoUninitialize` (`S_FALSE` = already-init WITH the refcount incremented); only `RPC_E_CHANGED_MODE` skips it.
+- Untracked honesty: when identity is unresolvable, the code CHECKS the `TerminateProcess` result and reports terminated-vs-still-running in the error `detail` (the `Untracked` kind's Display stays neutral).
+- `nShow`: `SW_SHOWNORMAL.0 as i32`. `lpDirectory` from `cmd.cwd()`. `ERROR_CANCELLED` → `AuthDeclined`. Identity from the OWNED handle via `GetProcessId` + `windows_identity_from_handle`. `RunAsIs` (already elevated) → `already_elevated_report(Passthrough)`.
+
+- [ ] **Step 1: Write the failing test**
+
+First, cross-platform `map_elevated_kill_error` tests — append to `src/elevation_tests.rs`:
 
 ```rust
-fn non_elevated_win_host() -> crate::elevation::plan::Host {
+#[test]
+fn kill_error_on_an_elevated_wrapper_is_unkillable() {
+    use crate::error::{ElevationErrorKind, Error};
+    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let e = super::map_elevated_kill_error(eperm, /* elevated_wrapper */ true);
+    assert!(matches!(e, Error::Elevation { kind: ElevationErrorKind::Unkillable, .. }), "{e:?}");
+}
+
+#[test]
+fn kill_error_on_a_plain_child_stays_io() {
+    use crate::error::Error;
+    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(matches!(super::map_elevated_kill_error(eperm, false), Error::Io(_)));
+}
+
+#[test]
+fn non_permission_kill_error_stays_io_even_when_elevated() {
+    use crate::error::Error;
+    let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert!(matches!(super::map_elevated_kill_error(other, true), Error::Io(_)));
+}
+```
+
+Next, the Windows host-seam gate tests — append to `src/elevation/windows_tests.rs` (the gate runs before UAC; drive it through the host seam, both privilege states):
+
+```rust
+fn win_host(elevated: bool) -> crate::elevation::plan::Host {
     crate::elevation::plan::Host {
-        elevated: false,
+        elevated,
         has_tty: false,
         available: crate::elevation::plan::BackendSet::default(),
         os: crate::elevation::plan::Os::Windows,
@@ -2750,31 +3039,78 @@ fn non_elevated_win_host() -> crate::elevation::plan::Host {
 }
 
 #[test]
-fn launch_runas_rejects_bad_config_before_any_prompt() {
-    // Must fail with Unsupported and never prompt — the gate runs before ShellExecuteEx.
-    // Driven through the host seam so an elevated CI runner does not short-circuit to RunAsIs.
-    let mut c = Command::new();
-    c.args(["whoami"]).elevate();
-    c.stdout(Stdio::pipe()).unwrap();
-    assert!(is_unsupported(super::launch_runas_with_host(&mut c, &non_elevated_win_host())));
+fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privilege() {
+    // Piped stdio must fail with Unsupported and never prompt — the gate runs BEFORE the
+    // already-elevated short-circuit, so the verdict is identical for elevated=false/true.
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args(["whoami"]).elevate();
+        c.stdout(Stdio::pipe()).unwrap();
+        assert!(is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))),
+            "piped elevated config must reject with elevated={elevated}");
+    }
 }
 
 #[test]
-fn commandline_elevated_is_unsupported_on_windows() {
+fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.commandline("whoami").elevate();
+        assert!(is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))));
+    }
+}
+
+#[test]
+fn already_elevated_inherit_only_is_run_as_is() {
+    // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
+    // passes the gate and short-circuits (no ShellExecuteEx).
     let mut c = Command::new();
-    c.commandline("whoami").elevate();
-    assert!(is_unsupported(super::launch_runas_with_host(&mut c, &non_elevated_win_host())));
+    c.args(["whoami"]).elevate();
+    assert!(matches!(
+        super::launch_runas_with_host(&mut c, &win_host(true)),
+        Ok(super::RunasOutcome::AlreadyElevated)
+    ));
+}
+```
+
+Finally, the runas-flag routing unit test (8cf4be21) — create `src/child/spawn/windows_raw/proc_tests.rs` (wired from `proc.rs` via `#[cfg(test)] #[path = "proc_tests.rs"] mod proc_tests;`). It wraps a REAL non-elevated child in `RawChild::new_runas` and proves kill/teardown/reap return promptly (the ACCESS_DENIED corner needs a manual elevated run, but this proves the flag routes correctly):
+
+```rust
+use super::{create_process, RawChild};
+
+fn spawn_long_lived_runas() -> RawChild {
+    // A real, NON-elevated child wrapped with the runas flag. `ping -n 5 127.0.0.1` runs
+    // ~4s — long-lived enough that kill/teardown must actually terminate it.
+    let mut cmdline: Vec<u16> = "ping -n 5 127.0.0.1\0".encode_utf16().collect();
+    let mut si = windows::Win32::System::Threading::STARTUPINFOEXW::default();
+    let (proc, pid) = create_process(None, &mut cmdline, &mut si, &None, &None, 0).expect("spawn");
+    RawChild::new_runas(proc, pid)
+}
+
+#[test]
+fn runas_kill_of_a_killable_child_returns_and_reaps() {
+    let child = spawn_long_lived_runas();
+    child.kill().expect("kill of our own (non-elevated) runas-flagged child must succeed");
+    // Reaped: try_wait now reports an exit (no hang).
+    assert!(child.try_wait().expect("try_wait").is_some(), "child must be reaped after kill");
+}
+
+#[test]
+fn runas_teardown_on_drop_returns_promptly() {
+    let child = spawn_long_lived_runas();
+    child.teardown_on_drop(); // must not hang even though the runas arm is taken
+    assert!(child.try_wait().expect("try_wait").is_some(), "teardown must reap a killable runas child");
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run (Windows): `cargo test --lib elevation::windows::windows_tests::launch_runas`
-Expected: FAIL — `launch_runas_with_host` not found.
+Run: `cargo test --lib elevation_tests::kill_error` (all platforms), and (Windows) `cargo test --lib elevation::windows::windows_tests::launch_runas windows_raw::proc_tests`
+Expected: FAIL — `map_elevated_kill_error` / `launch_runas_with_host` / `new_runas` / `teardown_on_drop` not found.
 
 - [ ] **Step 3: Write minimal implementation**
 
-First, the non-blocking runas kill in `src/child/spawn/windows_raw/proc.rs`. Add a `runas: bool` field to `RawChild`, a `new_runas` ctor, and `teardown_on_drop`; make `kill` flag-aware:
+First, the non-blocking runas kill in `src/child/spawn/windows_raw/proc.rs`. Add a `runas: bool` field to `RawChild`, a `new_runas` ctor, and `teardown_on_drop`; make `kill` flag-aware. Also wire the new unit tests at the bottom of `proc.rs`: `#[cfg(test)] #[path = "proc_tests.rs"] mod proc_tests;` (and re-export `create_process`/`RawChild` are already `pub(crate)` in this module, so `super::` reaches them).
 
 ```rust
 // struct RawChild gains:  runas: bool,
@@ -2841,24 +3177,72 @@ impl RawChild {
 }
 ```
 
-In `src/child/proc_handle.rs`, add the teardown dispatcher:
+In `src/child/proc_handle.rs`, add the teardown dispatcher. `elevated` is the caller's
+"this is an elevated child a plain parent may not be able to signal" hint (POSIX `Std`
+elevated children); the Windows `Raw` arm carries its own `runas` flag:
 
 ```rust
-    /// Best-effort teardown for `kill_on_drop`: kill then reap. A `runas` child a
-    /// lower-integrity parent cannot terminate is handled without blocking.
-    pub(crate) fn teardown_on_drop(&self) {
+    /// Best-effort teardown for `kill_on_drop`: kill then reap. NEVER blocks on an
+    /// unkillable elevated child. For the POSIX `Std` arm, `elevated` means the child
+    /// runs at a higher privilege and `kill` may return EPERM — on that failure we
+    /// `try_wait` + `log::warn!` instead of a blocking `wait` (which would hang forever
+    /// on a still-running elevated child). The Windows `Raw` arm handles its own
+    /// higher-integrity runas case via its `runas` flag.
+    pub(crate) fn teardown_on_drop(&self, elevated: bool) {
         match self {
-            ProcHandle::Std(s) => {
-                let _ = s.kill();
-                let _ = s.wait();
-            }
+            ProcHandle::Std(s) => match s.kill() {
+                Ok(()) => {
+                    let _ = s.wait(); // reap the zombie we just killed
+                }
+                Err(e) => {
+                    if elevated {
+                        // EPERM: an unprivileged parent cannot signal its elevated child.
+                        // Do NOT block; report if it is still running.
+                        if !matches!(s.try_wait(), Ok(Some(_))) {
+                            log::warn!(
+                                "elevated child {} could not be terminated on drop ({e}); leaving it running",
+                                s.id()
+                            );
+                        }
+                    } else {
+                        let _ = s.wait(); // already-dead child; reap
+                    }
+                }
+            },
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.teardown_on_drop(),
         }
     }
 ```
 
-In `src/child.rs`, `Drop` becomes:
+In `src/child.rs`, add the shared elevation predicate + kill mapping, wire `kill`/`kill_tree` to it, and rewrite `Drop`. First the helper (elevation field lands in Task 11):
+
+```rust
+    /// Is this a wrapper-elevated child a plain parent may be unable to signal?
+    /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
+    fn is_elevated_wrapper(&self) -> bool {
+        matches!(
+            self.elevation.as_ref().map(|r| &r.via),
+            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
+        )
+    }
+```
+
+Change `kill` and the `kill_tree` backstop to route through the shared mapper (replacing `.map_err(Error::Io)`):
+
+```rust
+    pub fn kill(&self) -> Result<(), Error> {
+        self.proc
+            .kill()
+            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+    }
+```
+
+In `kill_tree`, the handle backstop becomes
+`let backstop = self.proc.kill().map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));`
+(unchanged otherwise — a contained elevated subtree is killed via `cgroup.kill`, which succeeds; the backstop's EPERM on the bare elevated root is now the typed `Unkillable`).
+
+`Drop` becomes:
 
 ```rust
 impl Drop for Child {
@@ -2866,11 +3250,31 @@ impl Drop for Child {
         if !self.kill_on_drop {
             return; // detached / opted out
         }
-        // Hard-kill the contained tree (if any), then tear the direct child down. The
-        // teardown dispatcher preserves the Unix kill-before-wait order for the Std/Raw
-        // paths and stays non-blocking for a possibly-unkillable runas child.
+        // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
+        // subtree — then tear the direct child down. The dispatcher preserves the Unix
+        // kill-before-wait order and NEVER blocks on an unkillable elevated child.
+        let elevated = self.is_elevated_wrapper();
         let _ = self.attached.hard_kill();
-        self.proc.teardown_on_drop();
+        self.proc.teardown_on_drop(elevated);
+    }
+}
+```
+
+And in `src/elevation.rs`, the shared kill-error mapper (used by `Child::kill`/`kill_tree`, sync + async):
+
+```rust
+/// Map a raw kill/terminate `io::Error` on an ELEVATED wrapper child to the typed
+/// `Unkillable` error. EPERM (POSIX) and ACCESS_DENIED (Windows) both surface as
+/// `io::ErrorKind::PermissionDenied`; anything else, or a non-elevated child, stays `Io`.
+pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: bool) -> crate::error::Error {
+    use crate::error::{ElevationErrorKind, Error};
+    if elevated_wrapper && err.kind() == std::io::ErrorKind::PermissionDenied {
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            detail: format!("could not signal the elevated child: {err}"),
+        }
+    } else {
+        Error::Io(err)
     }
 }
 ```
@@ -2911,7 +3315,7 @@ fn wide_nul(s: &OsStr) -> Vec<u16> {
 }
 
 /// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
-/// identity, and the report — the async path (Task 16) builds its own `Child` from these.
+/// identity, and the report — the async path builds its own `Child` from these.
 pub(crate) enum RunasOutcome {
     AlreadyElevated,
     Launched { proc: OwnedHandle, pid: u32, id: ProcessId, report: ElevationReport },
@@ -2989,18 +3393,22 @@ pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
 }
 
-/// PURE given `host` (the Windows gate seam): plan, gate, then ShellExecuteEx(runas).
+/// PURE given `host` (the Windows gate seam): gate, plan, then ShellExecuteEx(runas).
 pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error> {
     let req = cmd.elevation_request();
-    match host.plan(Privilege::Elevated, req.backend, req.auth.clone()) {
+    let (backend, auth) = (req.backend, req.auth.clone());
+    // Structural config gate FIRST — privilege-independent (before the short-circuit), so
+    // an already-elevated caller gets the same verdict for piped/env/contain/commandline.
+    reject_unsupported_config(cmd)?;
+    let (program, params) = program_and_params(cmd)?; // validates commandline()/argv0 too
+
+    match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasOutcome::AlreadyElevated),
         Transition::Reject { error } => return Err(error),
         Transition::ElevatePosix { .. } => unreachable!("planner never yields ElevatePosix on a windows host"),
         Transition::ElevateWindows { .. } => {}
     }
-    reject_unsupported_config(cmd)?;
 
-    let (program, params) = program_and_params(cmd)?;
     let dir = cmd.cwd().map(|d| wide_nul(d.as_os_str()));
     let file_w = wide_nul(program.as_os_str());
     let params_w = wide_nul(params.as_os_str());
@@ -3071,11 +3479,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
     match launch_runas(cmd)? {
         RunasOutcome::AlreadyElevated => {
             let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
-            child.set_elevation(Some(ElevationReport {
-                via: ElevatedVia::AlreadyElevated,
-                stripped_env: Vec::new(),
-                stdio: ElevatedStdio::Passthrough,
-            }));
+            child.set_elevation(Some(crate::elevation::already_elevated_report(ElevatedStdio::Passthrough)));
             Ok(child)
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
@@ -3100,15 +3504,16 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run (Windows): `cargo test --lib elevation::windows`
-Then run the FULL suite (the shared-drop change): `cargo test --lib` on Windows AND on Linux/macOS (the `ProcHandle::teardown_on_drop` + `Child::drop` edits compile and must regress-clean everywhere).
+Run: `cargo test --lib elevation_tests::kill_error` (all platforms — the cross-platform kill mapper).
+Run (Windows): `cargo test --lib elevation::windows windows_raw::proc_tests`
+Then run the FULL suite (the shared-drop + kill-mapping change): `cargo test --lib` on Windows AND on Linux/macOS (the `ProcHandle::teardown_on_drop(elevated)` + `Child::kill`/`kill_tree`/`Drop` + `map_elevated_kill_error` edits compile and must regress-clean everywhere).
 Expected: PASS. Also `cargo build --target x86_64-pc-windows-msvc` and `cargo clippy --all-targets --locked -- -D warnings` clean.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/elevation/windows.rs src/elevation/windows_tests.rs src/child/spawn/windows_raw/proc.rs src/child/proc_handle.rs src/child.rs
-git commit -m "feat: Windows runas launch (plan-first host seam, COM S_FALSE fix, non-blocking runas kill, Untracked honesty)"
+git add src/elevation.rs src/elevation/windows.rs src/elevation/windows_tests.rs src/elevation_tests.rs src/child/spawn/windows_raw/proc.rs src/child/spawn/windows_raw/proc_tests.rs src/child/proc_handle.rs src/child.rs
+git commit -m "feat: universal elevated-child teardown (typed Unkillable, non-blocking Drop both platforms) + Windows runas launch (gate-first host seam, COM S_FALSE, Untracked honesty)"
 ```
 
 ---
@@ -3120,7 +3525,7 @@ git commit -m "feat: Windows runas launch (plan-first host seam, COM S_FALSE fix
 - Test: `src/child/spawn_tests.rs`
 
 **Interfaces:**
-- Produces: `spawn()` runs the elevation branch BEFORE `spawn_unelevated`'s `std::mem::take(cmd.fds_mut())`, so the effect layers see `cmd.fds()` while it is still populated. POSIX spawns the DERIVED command (`rw.derived`) — or the original when `AlreadyElevated` — then delivers the deferred password. A NotFound/PermissionDenied spawn error of the derived command (whose program IS the backend) is remapped to `BackendUnavailable` (948c8e5c: the `faccessat` check is a hint; the exec failure is the truth). Windows delegates to `windows::spawn_elevated` (Task 14).
+- Produces: `spawn()` runs the elevation branch BEFORE `spawn_unelevated`'s `std::mem::take(cmd.fds_mut())`, so the effect layers see `cmd.fds()` while it is still populated. POSIX spawns the DERIVED command (`rw.derived`) — or the original when `AlreadyElevated` — then delivers the deferred password. A NotFound/PermissionDenied spawn error of the derived command is remapped ONLY when attributable to the backend path via the shared `remap_derived_spawn_error` (the `faccessat` check is a hint; the exec failure is the truth, but a bad `current_dir()` yields the same kind and must NOT be mislabeled). A GENUINE password-write failure explicitly kills + reaps the running elevated child (folding the outcome into the error) rather than orphaning it. Windows delegates to `windows::spawn_elevated`.
 
 **Why the reorder matters:** if the branch ran after `mem::take`, the Windows reject gate would iterate an EMPTY `cmd.fds()` and pass vacuously (a silent lie), and the POSIX rewrite would move an empty fd set into the derived command. Running before `mem::take` fixes both.
 
@@ -3129,28 +3534,22 @@ git commit -m "feat: Windows runas launch (plan-first host seam, COM S_FALSE fix
 ```rust
 #[cfg(windows)]
 #[test]
-fn elevated_pipe_routes_through_the_gate() {
-    // Integration through the real spawn entrypoint. Branch on detected privilege
-    // (never assume): unprivileged → the honest gate rejects a piped elevated child
-    // before UAC; already-elevated → RunAsIs makes it an ordinary (allowed) spawn.
+fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
+    // DETERMINISTIC (no ambient-privilege branch): the honest config gate now runs BEFORE
+    // the already-elevated short-circuit, so a piped elevated child is
+    // Unsupported whether or not the runner is elevated — never a UAC prompt, never a hang.
     let mut c = crate::command::Command::new();
     c.args(["whoami"]).elevate();
     c.stdout(crate::stdio::Stdio::pipe()).unwrap();
-    let r = super::spawn(&mut c);
-    if crate::elevation::is_elevated() {
-        let mut ch = r.expect("already-elevated piped whoami should spawn");
-        let _ = ch.wait();
-    } else {
-        assert!(matches!(r, Err(crate::error::Error::Unsupported { .. })));
-    }
+    assert!(matches!(super::spawn(&mut c), Err(crate::error::Error::Unsupported { .. })));
 }
 ```
 
-(The POSIX "derived fd0 is the pipe read end" path is covered by `stdin_auth_wires_fd0_to_a_file_and_defers_the_write` in Task 11, which exercises the same `rewrite`.)
+(The allowed-spawn path's `child.elevation()` is asserted in the gated Task 17 tier — an inherit-only elevated child reports `WindowsUac`/`AlreadyElevated`; the POSIX "derived fd0 is the pipe read end" path is covered by `stdin_auth_wires_fd0_to_a_file_and_defers_the_write` in Task 11, which exercises the same `rewrite`.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run (Windows, unprivileged): `cargo test --lib spawn_tests::elevated_pipe_routes_through_the_gate`
+Run (Windows): `cargo test --lib spawn_tests::elevated_pipe_is_rejected_deterministically`
 Expected: FAIL — `spawn` does not yet route elevated commands.
 
 - [ ] **Step 3: Write minimal implementation** — change `spawn()` in `src/child/spawn.rs` (post-Task-10 two-line wrapper) to:
@@ -3169,25 +3568,29 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         #[cfg(unix)]
         {
             let rw = crate::elevation::posix::rewrite(cmd)?;
+            let backend_path = rw.backend_path;
             let mut child = match rw.derived {
-                Some(mut derived) => match spawn_unelevated(&mut derived, kill_on_drop) {
-                    Ok(c) => c,
-                    // The derived program IS the backend, so a NotFound/PermissionDenied at
-                    // spawn is the backend failing to exec — surface it as BackendUnavailable.
-                    Err(Error::Io(e))
-                        if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) =>
-                    {
-                        return Err(Error::Elevation {
-                            kind: crate::error::ElevationErrorKind::BackendUnavailable,
-                            detail: format!("the elevation backend could not be executed: {e}"),
-                        });
-                    }
-                    Err(e) => return Err(e),
-                },
+                // The derived program IS the backend; remap an exec failure to
+                // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
+                // yields the same kind and stays a plain Io) — shared with the async path.
+                Some(mut derived) => spawn_unelevated(&mut derived, kill_on_drop)
+                    .map_err(|e| crate::elevation::remap_derived_spawn_error(e, backend_path.as_deref().unwrap()))?,
                 None => spawn_unelevated(cmd, kill_on_drop)?, // AlreadyElevated: spawn the original
             };
             if let Some(pw) = rw.password_write {
-                pw.write_after_spawn()?;
+                if let Err(write_err) = pw.write_after_spawn() {
+                    // Do NOT orphan the running elevated child on a genuine write failure:
+                    // kill + reap it, folding the teardown outcome into the error detail.
+                    let kill_note = match child.kill() {
+                        Ok(()) => "child terminated".to_string(),
+                        Err(e) => format!("child could not be terminated: {e}"),
+                    };
+                    let _ = child.try_wait();
+                    return Err(Error::Elevation {
+                        kind: crate::error::ElevationErrorKind::AuthFailed,
+                        detail: format!("{write_err}; {kill_note}"),
+                    });
+                }
             }
             child.set_elevation(rw.report);
             return Ok(child);
@@ -3216,7 +3619,7 @@ Expected: PASS. `cargo clippy --all-targets --locked -- -D warnings` clean.
 
 ```bash
 git add src/child/spawn.rs src/child/spawn_tests.rs
-git commit -m "feat: spawn() elevation branch before fd-take (derived command, post-spawn password, backend-exec remap)"
+git commit -m "feat: spawn() elevation branch before fd-take (derived command, post-spawn password with orphan-safe kill, honest backend-exec remap)"
 ```
 
 ---
@@ -3229,9 +3632,9 @@ git commit -m "feat: spawn() elevation branch before fd-take (derived command, p
 
 **Interfaces:**
 - Produces on `tokio::Command`: `.elevate()`, `.elevation_backend(Backend)`, `.elevation_auth(Auth)`, `.sanitize_env(EnvSanitizer)` — forwarding to the inner sync `Command`.
-- Produces on `tokio::Child`: `elevation: Option<ElevationReport>` field, `set_elevation`, `pub fn elevation(&self) -> Option<ElevationReport>`.
-- Produces: an async spawn branch mirroring sync — POSIX rewrites into a DERIVED command and RECURSES into `spawn` (the derived command has elevation disabled, so no re-entry); the deferred password is written by a blocking `write_after_spawn` post-spawn (no `.await`). Windows uses `launch_runas`, and the async `Child` is built INSIDE `crate::tokio::spawn` via `RawAsyncChild::new_runas` (the non-blocking-kill async handle).
-- Produces: `RawAsyncChild` gains a `runas` flag + `new_runas` + a non-blocking `reap_blocking` (Decision 3, async side).
+- Produces on `tokio::Child`: `elevation: Option<ElevationReport>` field, `set_elevation`, `pub fn elevation(&self) -> Option<ElevationReport>`, and the same universal-teardown kill mapping as the sync `Child` (`kill`/`kill_tree` route EPERM/ACCESS_DENIED on a `Wrapped(..)`/`WindowsUac` child through `map_elevated_kill_error` → `Unkillable`).
+- Produces: an async spawn branch mirroring sync — POSIX rewrites into a DERIVED command and RECURSES into `spawn` (the derived command has elevation disabled, so no re-entry), remapping a derived-spawn error through the SHARED `remap_derived_spawn_error` and killing+reaping the child on a genuine password-write failure; the deferred password is written by a blocking `write_after_spawn` post-spawn (no `.await`). Windows uses `launch_runas`, and the async `Child` is built INSIDE `crate::tokio::spawn` via `RawAsyncChild::new_runas` (the non-blocking-kill async handle).
+- Produces: `RawAsyncChild` gains a `runas` flag + `new_runas` + a non-blocking `reap_blocking` (universal teardown, async side).
 
 - [ ] **Step 1: Write the failing test** — append to `src/tokio/command_tests.rs`:
 
@@ -3253,6 +3656,20 @@ async fn tokio_child_elevation_is_none_without_elevate() {
     c.args(["true"]);
     let child = c.spawn().expect("spawn");
     assert!(child.elevation().is_none());
+}
+
+#[test]
+fn sync_and_async_remap_the_same_backend_failure_identically() {
+    // Parity-by-construction: BOTH spawn paths funnel a derived-backend spawn
+    // error through the ONE shared `remap_derived_spawn_error`, so the same io failure +
+    // backend path yields the same Error on either path. Assert the shared helper directly.
+    use crate::error::{ElevationErrorKind, Error};
+    let path = std::path::Path::new("/nonexistent/sudo");
+    let mk = || Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"));
+    let sync_err = crate::elevation::remap_derived_spawn_error(mk(), path);
+    let async_err = crate::elevation::remap_derived_spawn_error(mk(), path);
+    assert!(matches!(sync_err, Error::Elevation { kind: ElevationErrorKind::BackendUnavailable, .. }));
+    assert_eq!(sync_err.to_string(), async_err.to_string(), "sync and async must remap identically");
 }
 ```
 
@@ -3284,7 +3701,7 @@ In `src/tokio/command.rs`, after `nesting`:
     }
 ```
 
-In `src/tokio/child.rs`, add `elevation: Option<crate::elevation::ElevationReport>` to `struct Child`, init `elevation: None` in `from_parts`, and add:
+In `src/tokio/child.rs`, add `elevation: Option<crate::elevation::ElevationReport>` to `struct Child`, init `elevation: None` in `from_parts`, and add the accessors plus the shared kill mapping (universal teardown, async side). Route `kill` through `map_elevated_kill_error` (a plain child is unaffected — it returns `Io`/`Ok` exactly as before):
 
 ```rust
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
@@ -3293,7 +3710,26 @@ In `src/tokio/child.rs`, add `elevation: Option<crate::elevation::ElevationRepor
     pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {
         self.elevation.clone()
     }
+    fn is_elevated_wrapper(&self) -> bool {
+        matches!(
+            self.elevation.as_ref().map(|r| &r.via),
+            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
+        )
+    }
 ```
+
+Change `kill` to map an EPERM/ACCESS_DENIED on an elevated child to `Unkillable` (the backstop in `kill_tree`, which calls `self.kill()`, inherits the mapping):
+
+```rust
+    pub fn kill(&mut self) -> Result<(), Error> {
+        match self.proc.start_kill() {
+            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
+            other => other,
+        }
+    }
+```
+
+> The async `Drop`'s `reap_now`/`reap_blocking` are already non-blocking on a kill failure (they SKIP the exit-wait when `start_kill` errors, and the runas `reap_blocking` arm logs instead of blocking), so an unkillable elevated child never hangs async `Drop`.
 
 In `src/tokio/spawn/windows_raw.rs`, give `RawAsyncChild` the `runas` flag + `new_runas` + a non-blocking `reap_blocking`:
 
@@ -3373,11 +3809,8 @@ In `src/tokio/spawn.rs`, move `let kill_on_drop = cmd.kill_on_drop_flag();` ABOV
                     return Ok(child);
                 }
                 RunasOutcome::AlreadyElevated => {
-                    elevation_report = Some(crate::elevation::ElevationReport {
-                        via: crate::elevation::ElevatedVia::AlreadyElevated,
-                        stripped_env: Vec::new(),
-                        stdio: crate::elevation::ElevatedStdio::Passthrough,
-                    });
+                    elevation_report =
+                        Some(crate::elevation::already_elevated_report(crate::elevation::ElevatedStdio::Passthrough));
                     // fall through to the normal async spawn of the (already-elevated) cmd
                 }
             }
@@ -3385,21 +3818,25 @@ In `src/tokio/spawn.rs`, move `let kill_on_drop = cmd.kill_on_drop_flag();` ABOV
         #[cfg(unix)]
         {
             let rw = crate::elevation::posix::rewrite(cmd)?;
+            let backend_path = rw.backend_path;
             if let Some(mut derived) = rw.derived {
-                let mut child = match spawn(&mut derived) {
-                    Ok(c) => c,
-                    Err(Error::Io(e))
-                        if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) =>
-                    {
+                // Same shared honest remap as the sync path (parity-by-construction).
+                let mut child = spawn(&mut derived)
+                    .map_err(|e| crate::elevation::remap_derived_spawn_error(e, backend_path.as_deref().unwrap()))?;
+                if let Some(pw) = rw.password_write {
+                    if let Err(write_err) = pw.write_after_spawn() {
+                        // Do NOT orphan the running elevated child: kill + reap, folding the
+                        // teardown outcome into the error (mirrors the sync arm).
+                        let kill_note = match child.kill() {
+                            Ok(()) => "child terminated".to_string(),
+                            Err(e) => format!("child could not be terminated: {e}"),
+                        };
+                        let _ = child.try_wait();
                         return Err(Error::Elevation {
-                            kind: crate::error::ElevationErrorKind::BackendUnavailable,
-                            detail: format!("the elevation backend could not be executed: {e}"),
+                            kind: crate::error::ElevationErrorKind::AuthFailed,
+                            detail: format!("{write_err}; {kill_note}"),
                         });
                     }
-                    Err(e) => return Err(e),
-                };
-                if let Some(pw) = rw.password_write {
-                    pw.write_after_spawn()?;
                 }
                 child.set_elevation(rw.report);
                 return Ok(child);
@@ -3448,13 +3885,17 @@ git commit -m "feat: async elevation parity (derived-command recursion, post-spa
 
 **Files:**
 - Create: `tests/elevation.rs`
-- Modify: `testbin/main.rs`
+- Modify: `testbin/main.rs`, `Cargo.toml` (add the `nix` `term` feature for `openpty` used by the PTY harness)
 
 **Interfaces:**
-- Consumes: the full public surface (`Command::elevate`, `Child::elevation`, `elevation::is_elevated`, `posix::controlling_terminal_present`), sync + async.
-- Produces: `testbin` subcommands `is-elevated-report` (prints `1`/`0`), `controlling-terminal` (prints `controlling_terminal_present()` as `1`/`0`), `write-marker <path>` (writes a byte, exit 0). Live privilege-gain tests are gated behind `SUBPROCESS_TEST_ELEVATION`; the `setsid` and stdin-redirection controlling-terminal tests are UNGATED (deterministic).
+- Consumes: the full public surface (`Command::elevate`, `Child::elevation`, `Child::kill`, `elevation::is_elevated`, `posix::controlling_terminal_present`), sync + async.
+- Produces: `testbin` subcommands `is-elevated-report` (prints `1`/`0`), `controlling-terminal` (prints `controlling_terminal_present()` as `1`/`0`), `acquire-ctty-and-probe` (Linux: `setsid` + acquire the inherited fd 3 as controlling terminal via `TIOCSCTTY`, then print the probe result — for the PTY test), `write-marker <path>` (writes a byte, exit 0), `write-pid-then-sleep <path>` (writes its own pid to `<path>`, then sleeps — for the run0 propagation test). Live privilege-gain + teardown tests are gated behind `SUBPROCESS_TEST_ELEVATION`; the `setsid` test is UNGATED (deterministic); the stdin-independence test is UNGATED but `#[cfg(feature = "pty")]` (needs a real controlling terminal).
 
-The controlling-terminal probe's stdin-independence is tested cross-process (a testbin child whose fd0 is actually redirected), fixing the previously vacuous in-process assertion. The `setsid` negative case is cross-process via the same subcommand. A gated run0 kill-propagation live test pins the client→unit teardown; the same gated run confirms the `--`-terminator corner case empirically.
+**Test-honesty fixes woven in:**
+- The controlling-terminal stdin-independence test is NOT vacuous: under `cargo test` there is no controlling terminal, so a null-vs-inherit comparison would be `0 == 0` regardless. It is rebuilt as a REAL-PTY harness gated behind the `pty` feature (the repo's `pty` CI leg): allocate a pty via `nix::pty::openpty`, spawn the child with the slave as fd 3 and stdin redirected to `/dev/null`, and have the child `setsid` + `ioctl(TIOCSCTTY)` to acquire the pty as its controlling terminal — then the probe must report `1` DESPITE stdin being `/dev/null`, which a buggy `isatty(STDIN)` could not. The `setsid` negative case (probe → `0`) stays a plain ungated cross-process test.
+- The run0 kill-propagation test asserts the transient UNIT/descendant is gone, not the always-reaped client: the elevated payload writes its OWN pid to a file, and after killing the client the test asserts THAT pid is no longer alive.
+- Decision A live teardown: a non-contained elevated long-lived child's `Drop` RETURNS (no hang) and `kill()` returns the typed `Unkillable` — asserted on both POSIX and Windows under the gate.
+- `Child::elevation()` is asserted on the allowed (already-elevated) spawn path.
 
 - [ ] **Step 1: Write the failing test** — create `tests/elevation.rs`:
 
@@ -3510,26 +3951,37 @@ fn posix_child_self_detects_elevation() {
     assert_eq!(s.trim(), "1", "elevated testbin did not self-detect elevation");
 }
 
-// UNGATED: redirecting the child's fd0 must not change the /dev/tty probe (it consults
-// the session's controlling terminal, not stdin). Non-vacuous — a buggy isatty(STDIN)
-// impl would differ between the null and inherit runs on a real terminal.
-#[cfg(unix)]
+// UNGATED but `#[cfg(feature = "pty")]`: NON-VACUOUS proof that the probe consults the
+// session's controlling terminal (/dev/tty), not isatty(STDIN). Under a plain `cargo test`
+// there is no controlling terminal, so we ALLOCATE a real pty and have the child acquire it
+// as its controlling terminal (setsid + TIOCSCTTY on the inherited slave fd 3) WHILE its
+// stdin is /dev/null. The probe must then report `1` — impossible for an isatty(STDIN) impl,
+// since stdin is not a tty. Gated to the `pty` CI leg so it never ships a CI-vacuous assert.
+#[cfg(all(target_os = "linux", feature = "pty"))]
 #[test]
-fn controlling_terminal_probe_ignores_stdin_redirection() {
+fn controlling_terminal_probe_consults_ctty_not_stdin() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    // A real pty pair. Keep the master alive for the child's session lifetime.
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let master: OwnedFd = pty.master;
+    let slave: OwnedFd = pty.slave;
+    let slave_file = std::fs::File::from(slave);
+
     let exe = testbin();
-    let run = |stdin: subprocess::Stdio| -> String {
-        let mut c = subprocess::Command::new();
-        c.args([exe.clone().into_os_string(), "controlling-terminal".into()]);
-        c.stdin(stdin).unwrap();
-        c.stdout(subprocess::Stdio::pipe()).unwrap();
-        let mut ch = c.spawn().expect("spawn");
-        let out = ch.communicate(None).expect("communicate");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let mut c = subprocess::Command::new();
+    c.args([exe.into_os_string(), "acquire-ctty-and-probe".into()]);
+    // stdin = /dev/null: a buggy isatty(STDIN) probe would answer 0 here.
+    c.stdin(subprocess::Stdio::null()).unwrap();
+    c.stdout(subprocess::Stdio::pipe()).unwrap();
+    // Pass the pty slave as fd 3; the child acquires it as its controlling terminal.
+    c.fd(3, subprocess::Stdio::from_file(slave_file)).unwrap();
+    let mut ch = c.spawn().expect("spawn");
+    let out = ch.communicate(None).expect("communicate");
+    let _ = master.as_raw_fd(); // keep master owned until here
     assert_eq!(
-        run(subprocess::Stdio::null()),
-        run(subprocess::Stdio::inherit()),
-        "stdin redirection changed the controlling-terminal probe",
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "1",
+        "probe must see the controlling terminal even with stdin=/dev/null",
     );
 }
 
@@ -3546,22 +3998,140 @@ fn controlling_terminal_probe_is_false_after_setsid() {
     assert_eq!(s.trim(), "0", "controlling_terminal_present() must be false after setsid");
 }
 
-// GATED: run0 client -> unit kill propagation. Explicit Backend::Run0, long-lived child.
+// GATED: run0 client -> transient-unit kill propagation. The client is ALWAYS reaped by
+// wait(), so that proves nothing; instead the elevated PAYLOAD writes its own pid to a
+// file, and after killing the client we assert THAT (the transient-unit process) is gone.
+// run0 auths via polkit; --no-ask-password (Auth::NonInteractive) suppresses the prompt
+// and fails loud without a polkit rule (verified: it does not silently hang), so an
+// unattended run needs a passwordless polkit rule for the run0 action.
 #[cfg(target_os = "linux")]
 #[test]
-fn run0_client_kill_propagates_to_the_unit() {
+fn run0_client_kill_propagates_to_the_transient_unit() {
     if !gated() || std::env::var_os("SUBPROCESS_TEST_ELEVATION_RUN0").is_none() {
-        return; // requires run0 + a root context that can spawn a transient unit.
+        return; // requires run0 + a polkit-passwordless context that can spawn a transient unit.
     }
+    let pidfile = std::env::temp_dir().join(format!("run0-payload-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+    let exe = testbin();
     let mut c = subprocess::Command::new();
-    c.args(["sleep", "600"])
+    c.executable(&exe)
+        .args([exe.clone().into_os_string(), "write-pid-then-sleep".into(), pidfile.clone().into_os_string()])
         .elevation_backend(subprocess::elevation::Backend::Run0)
         .elevation_auth(subprocess::elevation::Auth::NonInteractive);
-    let mut child = c.spawn().expect("run0 spawn");
-    let id = child.id();
+    let child = c.spawn().expect("run0 spawn");
+
+    // Wait for the payload to publish its pid on a real event (its file appears), not a timer.
+    let payload_pid: u32 = loop {
+        if let Ok(s) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = s.trim().parse() {
+                break pid;
+            }
+        }
+        std::thread::yield_now();
+    };
+    assert!(pid_is_alive(payload_pid), "payload should be running before the kill");
     child.kill().expect("kill run0 client");
     child.wait().expect("wait run0 client");
-    assert!(!id.is_alive(), "run0 client kill did not tear the elevated unit down");
+    // The transient-unit payload must be gone — waitpid/kill(0) on its pid fails (ESRCH).
+    // Poll on the real teardown event; if propagation is broken this loop exposes it.
+    while pid_is_alive(payload_pid) {
+        std::thread::yield_now();
+    }
+    let _ = std::fs::remove_file(&pidfile);
+}
+
+/// `kill(pid, 0)` == 0 means the pid is live (or a zombie we could signal); ESRCH means gone.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence/permission check, sends nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+// GATED: Auth::Stdin feeds the real password to `sudo -S`; the elevated child is root.
+#[cfg(unix)]
+#[test]
+fn posix_stdin_auth_reaches_root() {
+    if !gated() {
+        return;
+    }
+    let pw = std::env::var("SUBPROCESS_TEST_ELEVATION_PASSWORD").expect(
+        "SUBPROCESS_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test",
+    );
+    let mut c = subprocess::Command::new();
+    c.args(["id", "-u"])
+        .elevation_backend(subprocess::elevation::Backend::Sudo)
+        .elevation_auth(subprocess::elevation::Auth::Stdin(subprocess::elevation::Secret::new(pw)));
+    let out = c.output().expect("stdin-auth elevated output");
+    assert!(out.status.success(), "sudo -S id failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "Auth::Stdin child was not root");
+}
+
+// GATED: Auth::Askpass delivers the password via a trivial SUDO_ASKPASS helper script.
+#[cfg(unix)]
+#[test]
+fn posix_askpass_auth_reaches_root() {
+    if !gated() {
+        return;
+    }
+    let pw = std::env::var("SUBPROCESS_TEST_ELEVATION_PASSWORD")
+        .expect("SUBPROCESS_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
+    // A minimal askpass script that echoes the password.
+    let dir = std::env::temp_dir().join(format!("askpass-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("askpass.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' '{pw}'\n")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut c = subprocess::Command::new();
+    c.args(["id", "-u"])
+        .elevation_backend(subprocess::elevation::Backend::Sudo)
+        .elevation_auth(subprocess::elevation::Auth::Askpass(script.clone()));
+    let out = c.output().expect("askpass elevated output");
+    assert!(out.status.success(), "sudo -A id failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "Auth::Askpass child was not root");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// GATED (POSIX): dropping a non-contained elevated long-lived child must
+// RETURN (no hang), and kill() on it must return the typed Unkillable error.
+#[cfg(unix)]
+#[test]
+fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
+    if !gated() {
+        return;
+    }
+    let mut c = subprocess::Command::new();
+    c.args(["sleep", "600"]).elevation_auth(subprocess::elevation::Auth::NonInteractive);
+    let child = c.spawn().expect("elevated sleep");
+    // An unprivileged parent cannot signal its root child: a typed Unkillable, not a raw Io.
+    match child.kill() {
+        Err(subprocess::error::Error::Elevation { kind, .. }) => {
+            assert_eq!(kind, subprocess::error::ElevationErrorKind::Unkillable);
+        }
+        other => panic!("expected Unkillable, got {other:?}"),
+    }
+    // Dropping it must return (kill_on_drop is best-effort, non-blocking) — the test itself
+    // completing is the assertion. Leave the child; the harness/OS reaps it.
+    drop(child);
+}
+
+// GATED: the allowed (already-elevated) spawn path reports elevation() honestly.
+#[cfg(unix)]
+#[test]
+fn already_elevated_inherit_spawn_reports_already_elevated() {
+    if !gated() || !subprocess::elevation::is_elevated() {
+        return; // deterministic only when the gated runner is itself elevated.
+    }
+    let mut c = subprocess::Command::new();
+    c.args(["true"]).elevation_auth(subprocess::elevation::Auth::NonInteractive);
+    let child = c.spawn().expect("spawn");
+    assert_eq!(
+        child.elevation().expect("elevation requested → Some").via,
+        subprocess::elevation::ElevatedVia::AlreadyElevated,
+    );
+    let _ = child.wait();
 }
 
 #[cfg(windows)]
@@ -3604,14 +4174,78 @@ async fn async_posix_elevated_child_runs_as_root() {
     let out = c.output().await.expect("async elevated output");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
 }
+
+// GATED (Windows): a non-contained runas child a medium parent cannot
+// PROCESS_TERMINATE returns the typed Unkillable, and Drop does not hang.
+#[cfg(windows)]
+#[test]
+fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
+    if !gated() {
+        return;
+    }
+    let exe = testbin();
+    let mut c = subprocess::Command::new();
+    // A long-lived elevated child (ping loops ~50s).
+    c.executable(&exe)
+        .args([exe.clone().into_os_string(), "sleep-marker".into()])
+        .elevate();
+    let child = c.spawn().expect("runas spawn");
+    match child.kill() {
+        Err(subprocess::error::Error::Elevation { kind, .. }) => {
+            assert_eq!(kind, subprocess::error::ElevationErrorKind::Unkillable);
+        }
+        // If the CI context runs the parent elevated too, the child is killable — accept Ok.
+        Ok(()) => {}
+        other => panic!("expected Unkillable or Ok, got {other:?}"),
+    }
+    drop(child); // must return promptly (non-blocking teardown)
+}
+
+// MANUAL-TIER async Windows elevation (4c785f26): mirrors the sync marker test. Runs only
+// under the same gated, UAC-auto-approve manual tier documented in TODO.md.
+#[cfg(all(windows, feature = "tokio"))]
+#[tokio::test]
+async fn async_windows_elevated_child_writes_admin_marker() {
+    if !gated() {
+        return;
+    }
+    let dir = std::env::var_os("SUBPROCESS_TEST_ELEVATION_MARKER_DIR")
+        .map(PathBuf::from)
+        .expect("SUBPROCESS_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+    let marker = dir.join(format!("elev-async-{}.marker", std::process::id()));
+    let exe = testbin();
+    let mut c = subprocess::tokio::Command::new();
+    c.executable(&exe).args([
+        exe.clone().into_os_string(),
+        "write-marker".into(),
+        marker.clone().into_os_string(),
+    ]);
+    c.elevate();
+    let mut child = c.spawn().expect("async runas spawn");
+    let report = child.elevation().unwrap();
+    assert_eq!(report.via, subprocess::elevation::ElevatedVia::WindowsUac);
+    assert_eq!(report.stdio, subprocess::elevation::ElevatedStdio::OwnConsole);
+    let status = child.wait().await.expect("wait");
+    assert!(status.success(), "async elevated marker write failed: {status:?}");
+    assert!(marker.exists(), "async elevated child did not create the admin-only marker");
+    let _ = std::fs::remove_file(&marker);
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --test elevation`
-Expected on Linux: FAIL — `controlling_terminal_probe_is_false_after_setsid` / `controlling_terminal_probe_ignores_stdin_redirection` (testbin has no `controlling-terminal` subcommand → non-`0` output / spawn error).
+Run: `cargo test --test elevation` and `cargo test --features pty --test elevation`
+Expected on Linux: FAIL — `controlling_terminal_probe_is_false_after_setsid` (and, under `--features pty`, `controlling_terminal_probe_consults_ctty_not_stdin`): the testbin has no `controlling-terminal` / `acquire-ctty-and-probe` subcommand yet → non-`0` output / spawn error.
 
-- [ ] **Step 3: Write minimal implementation** — in `testbin/main.rs`, add the arms before the final `other =>`:
+- [ ] **Step 3: Write minimal implementation**
+
+In `Cargo.toml`, add the `term` feature to the existing `nix` dependency (for `nix::pty::openpty`), keeping the existing features:
+
+```toml
+nix = { version = "0.31", features = ["signal", "process", "event", "term"] }
+```
+
+In `testbin/main.rs`, add the arms before the final `other =>`:
 
 ```rust
         "is-elevated-report" => {
@@ -3622,24 +4256,47 @@ Expected on Linux: FAIL — `controlling_terminal_probe_is_false_after_setsid` /
             let present = subprocess::elevation::posix::controlling_terminal_present();
             println!("{}", if present { "1" } else { "0" });
         }
+        // Linux PTY harness: become a session leader with no ctty (setsid), acquire the
+        // inherited pty slave (fd 3) as controlling terminal (TIOCSCTTY), then probe. stdin
+        // is /dev/null, so a `1` here proves the probe reads /dev/tty, not isatty(STDIN).
+        #[cfg(target_os = "linux")]
+        "acquire-ctty-and-probe" => {
+            // SAFETY: setsid has no preconditions here; TIOCSCTTY on the inherited slave fd 3
+            // makes it this new session's controlling terminal. Both are one-shot syscalls.
+            unsafe {
+                assert!(libc::setsid() != -1, "setsid failed");
+                assert!(libc::ioctl(3, libc::TIOCSCTTY as _, 0) != -1, "TIOCSCTTY failed");
+            }
+            let present = subprocess::elevation::posix::controlling_terminal_present();
+            println!("{}", if present { "1" } else { "0" });
+        }
         "write-marker" => {
             let path = &args[2];
             std::fs::write(path, b"1").expect("write marker");
+        }
+        // Publish our own pid, then block long enough for the run0 propagation test to kill us.
+        "write-pid-then-sleep" => {
+            std::fs::write(&args[2], std::process::id().to_string()).expect("write pid");
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        }
+        // A long-lived elevated child for the Windows Unkillable/drop test.
+        "sleep-marker" => {
+            std::thread::sleep(std::time::Duration::from_secs(600));
         }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run (ungated): `cargo test --test elevation` and `cargo test --features tokio --test elevation`
-Expected: PASS (privilege tests no-op; Linux `setsid` + stdin-redirection tests green).
-Run (gated, Linux w/ passwordless sudo): `SUBPROCESS_TEST_ELEVATION=1 cargo test --test elevation`
-Expected: PASS (root uid `0`, self-detect `1`). Confirm empirically that the `--`-terminator handling in Task 7 holds (the `id -u` under sudo still runs).
+Run (ungated): `cargo test --test elevation`, `cargo test --features pty --test elevation`, and `cargo test --features tokio --test elevation`
+Expected: PASS (privilege + teardown tests no-op; Linux `setsid` green; under `--features pty` the real-PTY `acquire-ctty-and-probe` test prints `1`).
+Run (gated, Linux w/ passwordless sudo): `SUBPROCESS_TEST_ELEVATION=1 cargo test --test elevation` (add `SUBPROCESS_TEST_ELEVATION_PASSWORD=…` for the Stdin/Askpass tests, `--features pty` for the PTY test).
+Expected: PASS (root uid `0`, self-detect `1`, Stdin/Askpass reach root, the uncontained elevated child is `Unkillable` and its `Drop` returns). Confirm empirically that the sudo `--`-terminator and the pkexec no-`--` handling hold.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/elevation.rs testbin/main.rs
-git commit -m "test: gated live elevation tier + ungated cross-process controlling-terminal probes"
+git add tests/elevation.rs testbin/main.rs Cargo.toml Cargo.lock
+git commit -m "test: gated live elevation tier (Stdin/Askpass to root, universal-teardown Unkillable, run0 unit propagation) + real-PTY controlling-terminal probe"
 ```
 
 ---
@@ -3661,15 +4318,29 @@ elevation is unavailable (identical to `SUBPROCESS_TEST_CGROUP`).
 - **Linux:** provision passwordless `sudo` for the job user (a `NOPASSWD:ALL`
   sudoers drop-in), then set `SUBPROCESS_TEST_ELEVATION=1`. The tests spawn
   `id -u` elevated and assert `0`; `Auth::NonInteractive` is used so no prompt
-  blocks. `doas` is optional; `Backend::Auto` resolves `sudo` > `doas`. The run0
-  kill-propagation test additionally requires `SUBPROCESS_TEST_ELEVATION_RUN0=1`
-  and a `run0`-capable context.
+  blocks. `doas` is optional; `Backend::Auto` resolves `sudo` > `doas`.
+  - The `Auth::Stdin` and `Auth::Askpass` live tests need
+    `SUBPROCESS_TEST_ELEVATION_PASSWORD` set to the job user's sudo password
+    (use a NON-`NOPASSWD` sudoers entry for that user so `sudo -S`/`-A` actually
+    read the credential).
+  - The real-PTY controlling-terminal test runs only under `--features pty`
+    (the existing `pty` CI leg); it needs no elevation.
+  - The universal-teardown `Unkillable` test asserts an unprivileged parent
+    cannot signal its root child; it runs under the standard gated Linux job.
+  - The run0 unit-propagation test additionally requires
+    `SUBPROCESS_TEST_ELEVATION_RUN0=1`, a `run0`-capable context, and a polkit
+    rule granting the job user the run0 action passwordless (run0 authenticates
+    via polkit; `--no-ask-password` suppresses the prompt and fails loud without
+    such a rule — it does not provide cached-credential non-interactive auth the
+    way `sudo -n` does).
 - **Windows:** `ShellExecuteEx(runas)` always shows a UAC prompt on an
-  interactive desktop, so the live Windows tier is a **documented manual-run
-  tier** — run on a machine with UAC auto-approve (admin-approval-mode off) or a
-  self-hosted elevated runner, with `SUBPROCESS_TEST_ELEVATION=1` and
+  interactive desktop, so the live Windows tier (sync AND the
+  `#[cfg(all(windows, feature = "tokio"))]` async twin) is a **documented
+  manual-run tier** — run on a machine with UAC auto-approve (admin-approval-mode
+  off) or a self-hosted elevated runner, with `SUBPROCESS_TEST_ELEVATION=1` and
   `SUBPROCESS_TEST_ELEVATION_MARKER_DIR` pointing at an admin-only-writable dir
-  (e.g. `C:\Windows\System32\subprocess-ci`). Not run on hosted GitHub runners.
+  (e.g. `C:\Windows\System32\subprocess-ci`). The `Unkillable`/no-hang-Drop test
+  runs under the same tier. Not run on hosted GitHub runners.
 ```
 
 - [ ] **Step 2: Verify** — `git diff TODO.md` shows the new section only.
@@ -3724,49 +4395,54 @@ Expected: all checks green. Do not merge — squash-merge happens on user approv
 | `is_elevated()` free fn (ground-truth tested) | 9 (unix), 12 (windows) |
 | Flat builder: `.elevate/.elevation_backend/.elevation_auth/.sanitize_env` | 8 (sync), 16 (async) |
 | `Backend`/`Auth`/`ElevatedStdio`/`ElevatedVia`/`Privilege`/`Secret` spellings | 2, 3 |
+| Shared `already_elevated_report` / `remap_derived_spawn_error` (single-sourced sync+async dispatch) | 3 (defined), 11/14/16 (`already_elevated_report`), 15/16 (`remap_derived_spawn_error`, parity test in 16) |
 | `EnvSanitizer` consent gradient; keep additive-within-policy | 6 |
 | Two-layer env (clean default + denylist over explicit `Set`; no `env` wrapper) | 6 + 7 (`--preserve-env`/`--setenv`) + 11 (`explicit_set_env`; doas/pkexec/`env_remove`/`env_clear` → Unsupported) |
+| `--preserve-env` forwarded subject to sudoers policy (matrix cell + report doc) | front matrix, 3 (`ElevationReport` doc) |
 | `ElevationReport { via, stripped_env, stdio }` + `Child::elevation()` = Some iff requested | 11 (sync), 14 (windows RunAsIs/UAC), 16 (async) |
 | Pure `Host::plan` → `Transition`; single validation choke point | 4, 5 |
+| Config gates privilege-independent (run BEFORE the already-elevated short-circuit) | 5 (contract), 11 (POSIX `reject_structural_posix_config`), 14 (Windows gate-first) |
 | Auto = sudo>doas; pkexec/Gui explicit | 4, 5 |
 | Auth default Interactive; no controlling terminal → NoTty (`/dev/tty` `O_NONBLOCK` probe) | 5 (planner), 9 (probe) |
 | Auth × backend × platform matrix (incl. Run0+Gui cell) | 5 |
-| Error split: `Unsupported` (structural) vs `Elevation` (runtime, incl. `Untracked`, neutral Display) | 1, 5, 11, 13, 14 |
-| POSIX backend-native argv (`--preserve-env`/`--setenv`, name validation, `--` terminator, run0 `--pipe`, abs argv[0]) | 7 |
+| Error split: `Unsupported` (structural) vs `Elevation` (runtime, incl. `Unkillable`/`Untracked`, neutral Display) | 1, 5, 11, 13, 14 |
+| POSIX backend-native argv (`--preserve-env`/`--setenv`, name validation, sudo/doas/run0 `--` terminator, pkexec no-`--`/`--disable-internal-agent`/leading-dash reject, run0 `--pipe`, abs argv[0]) | 7 |
 | Non-destructive derived command (caller `Command` untouched; reuse never double-wraps) | 8 (`set_contain`), 11 |
-| `Auth::Stdin` password written AFTER spawn (no pipe-buffer assumption); write errors propagated | 11 (pipe+PendingPassword), 15 (sync write), 16 (async write) |
+| `Auth::Stdin` written AFTER spawn, race-hardened (non-blocking, EPIPE/WouldBlock→Ok, pre-sized buffer, orphan-safe kill on genuine failure) | 11 (`PendingPassword`/`password_line`), 15 (sync write+kill), 16 (async write+kill) |
 | fd ≥ 3 elevated → Unsupported (POSIX + Windows) | 11 (posix), 13 (windows) |
 | POSIX rewrite reuses existing spawn; `spawn_unelevated` core | 10, 11, 15 |
-| Windows `ShellExecuteEx(runas)` reduced child; plan-first host seam; COM S_FALSE; lpDirectory; identity-from-handle; ERROR_CANCELLED→AuthDeclined | 14 |
-| Non-blocking runas kill (kill/`teardown_on_drop`, honest error not a hang) sync+async | 14 (RawChild/ProcHandle/Child::drop), 16 (RawAsyncChild) |
+| Honest derived-spawn error remap (backend-attributable only; embeds cause + path) | 3 (`remap_derived_spawn_error`), 15 (sync), 16 (async) |
+| Windows `ShellExecuteEx(runas)` reduced child; gate-first host seam; COM S_FALSE; lpDirectory; identity-from-handle; ERROR_CANCELLED→AuthDeclined | 14 |
+| Universal elevated-child teardown (typed `Unkillable` kill/kill_tree; non-blocking Drop on POSIX `Std` + Windows runas; `.contain()` restores kill) sync+async | 14 (`map_elevated_kill_error`, RawChild/ProcHandle/Child), 16 (tokio Child + RawAsyncChild) |
 | Windows capability matrix (all non-inherit slots + fd>=3 + env + contain → Unsupported; `OwnConsole`) | 13, 14 |
-| run0 process model (explicit-only, `--pipe`, contain-reject, gated propagation test) | 4, 5, 7, 11, 17 |
-| Detection tests (privilege-independent invariants) | 9, 12 |
-| Live gated tier + ungated cross-process tty probes (stdin-redirection + setsid) | 17 |
-| Async parity (builder, report, derived-command recursion, in-tokio Windows build, no `.await` for Stdin) | 16 |
-| CI provisioning TODO | 18 |
+| run0 process model (explicit-only, `--pipe`, contain-reject, `--no-ask-password` suppresses polkit, gated unit-propagation test) | 4, 5, 7, 11, 17 |
+| Detection tests (privilege-independent invariants; `integrity_level().is_some()` unconditional) | 9, 12 |
+| Live gated tier (Stdin/Askpass to root, Unkillable/no-hang teardown) + real-PTY tty probe + setsid | 17 |
+| Async parity (builder, report, derived-command recursion, in-tokio Windows build, no `.await` for Stdin, manual Windows twin) | 16, 17 |
+| CI provisioning TODO (Stdin/Askpass password, PTY leg, run0 polkit, async Windows tier) | 18 |
 | Branch/PR/CI workflow | 19 |
-| zeroize dep; windows feature adds (SystemServices/Com/Registry/Shell/WindowsAndMessaging) | 2, 12 |
+| zeroize dep; nix `term` feature; windows feature adds (SystemServices/Com/Registry/Shell/WindowsAndMessaging) | 2, 17, 12 |
 
 No spec section is unmapped.
 
-**2. Placeholder scan:** No "TBD / similar to Task N / add error handling later" remain; every code step shows complete code. Three implementation seams are explicitly flagged (not hidden), all proven patterns in-repo: the `RawChild` import path + `HANDLE` cast shape (Task 14), the `identity::windows` `creation_token`/`ProcessId` field visibility (Task 12), and the async `RawAsyncChild` existing-field construction (Task 16). The `Auth::Stdin` password is fully delivered (post-spawn blocking write), not deferred.
+**2. Placeholder scan:** No "TBD / similar to a later task / add error handling later" remain; every code step shows complete code. Three implementation seams are explicitly flagged (not hidden), all proven patterns in-repo: the `RawChild` import path + `HANDLE` cast shape (Windows launch), the `identity::windows` `creation_token`/`ProcessId` field visibility (Windows detection), and the async `RawAsyncChild` existing-field construction (async parity). The `Auth::Stdin` password is fully delivered (race-hardened post-spawn write with orphan-safe teardown), not deferred.
 
 **3. Type consistency (matches code + tests everywhere):**
 - `Backend` (Auto/Run0/Sudo/Doas/Pkexec); `Auth` (Interactive/NonInteractive/Askpass/Stdin/Gui)
 - `ElevatedStdio` (**Passthrough/OwnConsole** — `#[non_exhaustive]`); `ElevatedVia` (Wrapped(Backend)/WindowsUac/AlreadyElevated)
-- `ElevationReport { via, stripped_env, stdio }`; `ElevationErrorKind` (BackendUnavailable/AuthFailed/AuthDeclined/NoTty/Untracked); `Privilege` (Unprivileged/Elevated)
+- `ElevationReport { via, stripped_env, stdio }`; `ElevationErrorKind` (BackendUnavailable/AuthFailed/AuthDeclined/NoTty/**Unkillable**/Untracked); `Privilege` (Unprivileged/Elevated)
 - `Host { elevated, has_tty, available, os }`; `BackendSet { run0, sudo, doas, pkexec }` each `Option<PathBuf>`
 - `Transition` (RunAsIs / ElevatePosix { backend, path, auth } / ElevateWindows { auth } / Reject { error })
 - `ElevationRequest { enabled, backend, auth, sanitizer }`
-- `build_argv(backend, backend_path, auth, program, args, env) -> Result<Vec<OsString>, Error>`
-- `PosixRewrite { derived, report, password_write }`; `PendingPassword::write_after_spawn`; `rewrite` / `rewrite_with_host`
+- `already_elevated_report(stdio) -> ElevationReport`; `remap_derived_spawn_error(err, backend_path) -> Error`; `map_elevated_kill_error(err, elevated_wrapper) -> Error` (all cross-platform in `elevation.rs`)
+- `build_argv(backend, backend_path, auth, program, args, env) -> Result<Vec<OsString>, Error>`; `program_starts_with_dash`
+- `PosixRewrite { derived, report, password_write, backend_path }`; `PendingPassword::write_after_spawn`; `password_line`; `reject_structural_posix_config`; `rewrite` / `rewrite_with_host`
 - `RunasOutcome { AlreadyElevated, Launched { proc, pid, id, report } }`; `launch_runas` / `launch_runas_with_host`; `spawn_elevated`
-- `RawChild::new_runas` / `teardown_on_drop`; `ProcHandle::teardown_on_drop`; `RawAsyncChild::new_runas`
+- `RawChild::new_runas` / `teardown_on_drop`; `ProcHandle::teardown_on_drop(elevated)`; `RawAsyncChild::new_runas`
 - `spawn_unelevated(cmd, kill_on_drop)`; `resolve_on_path` / `resolve_in_path_var`
-- `Child::elevation` / `set_elevation` (sync + async); `controlling_terminal_present`; `integrity_level`; `windows_identity_from_handle`
+- `Child::elevation` / `set_elevation` / `is_elevated_wrapper` (sync + async); `controlling_terminal_present`; `integrity_level`; `windows_identity_from_handle`
 
 All names are identical everywhere they appear.
 
-**4. No forward references:** Windows detection (12), reject gate (13), and `spawn_elevated`/`launch_runas` + the RawChild/ProcHandle/Child::drop teardown (14) all land before the `spawn()` branch (15). `spawn_unelevated` (10) and POSIX `rewrite` (11) land before the same branch. The async branch (16) references only symbols from 11/14 plus its own `RawAsyncChild::new_runas`. `set_contain`/`set_input_argv`/`set_env_ops` (8) precede their sole consumer (11). `resolve_in_path_var` is defined and tested in the same task (9). Every task compiles on its target platform(s) at commit time.
+**4. No forward references:** Task 3 defines the cross-platform shared helpers (`already_elevated_report`, `remap_derived_spawn_error`) before their consumers (11/14/15/16). Windows detection (12), reject gate (13), and `spawn_elevated`/`launch_runas` + the universal-teardown work `map_elevated_kill_error`/RawChild/ProcHandle/Child (14) all land before the `spawn()` branch (15); the `elevation` field the teardown reads is added in Task 11 (< 14). `spawn_unelevated` (10) and POSIX `rewrite` (11) land before the same branch. The async branch (16) references only symbols from 3/11/14 plus its own `RawAsyncChild::new_runas`. `set_contain`/`set_input_argv`/`set_env_ops` (8) precede their sole consumer (11). `resolve_in_path_var` is defined and tested in the same task (9). Every task compiles on its target platform(s) at commit time.
 
