@@ -12,6 +12,9 @@ pub mod plan;
 #[path = "elevation/posix.rs"]
 pub mod posix;
 pub mod sanitize;
+#[cfg(windows)]
+#[path = "elevation/windows.rs"]
+pub mod windows;
 
 pub use sanitize::EnvSanitizer;
 
