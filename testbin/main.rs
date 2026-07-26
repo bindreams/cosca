@@ -406,6 +406,41 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
         }
+        "is-elevated-report" => {
+            println!("{}", if subprocess::elevation::is_elevated() { "1" } else { "0" });
+        }
+        #[cfg(unix)]
+        "controlling-terminal" => {
+            let present = subprocess::elevation::posix::controlling_terminal_present();
+            println!("{}", if present { "1" } else { "0" });
+        }
+        // Linux PTY harness: become a session leader with no ctty (setsid), acquire the
+        // inherited pty slave (fd 3) as controlling terminal (TIOCSCTTY), then probe. stdin
+        // is /dev/null, so a `1` here proves the probe reads /dev/tty, not isatty(STDIN).
+        #[cfg(target_os = "linux")]
+        "acquire-ctty-and-probe" => {
+            // SAFETY: setsid has no preconditions here; TIOCSCTTY on the inherited slave fd 3
+            // makes it this new session's controlling terminal. Both are one-shot syscalls.
+            unsafe {
+                assert!(libc::setsid() != -1, "setsid failed");
+                assert!(libc::ioctl(3, libc::TIOCSCTTY as _, 0) != -1, "TIOCSCTTY failed");
+            }
+            let present = subprocess::elevation::posix::controlling_terminal_present();
+            println!("{}", if present { "1" } else { "0" });
+        }
+        "write-marker" => {
+            let path = &args[2];
+            std::fs::write(path, b"1").expect("write marker");
+        }
+        // Publish our own pid, then block long enough for the run0 propagation test to kill us.
+        "write-pid-then-sleep" => {
+            std::fs::write(&args[2], std::process::id().to_string()).expect("write pid");
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        }
+        // A long-lived elevated child for the Windows Unkillable/drop test.
+        "sleep-marker" => {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        }
         other => {
             eprintln!("subprocess_testbin: unknown mode {other:?}");
             exit(2);

@@ -301,9 +301,22 @@ impl Command {
 }
 
 impl Command {
+    /// Set `default` on fd0 UNLESS `Auth::Stdin` already claims it. The three convenience
+    /// methods below each force their own stdin default; `Auth::Stdin` needs sole,
+    /// unconflicting ownership of fd0 to feed the backend the password, and the elevation
+    /// rewrite rejects ANY caller-configured fd0 as ambiguous (real content could be lost).
+    /// A convenience method's own default is not a real caller intent to preserve, so it is
+    /// skipped here rather than tripping that same rejection.
+    fn apply_default_stdin(&mut self, default: crate::Stdio) -> Result<&mut Command, Error> {
+        if !matches!(self.elevation.auth, crate::elevation::Auth::Stdin(_)) {
+            self.stdin(default)?;
+        }
+        Ok(self)
+    }
+
     /// Run to completion capturing stdout+stderr (stdin is connected to null).
     pub fn output(&mut self) -> Result<crate::Output, Error> {
-        self.stdin(crate::Stdio::null())?;
+        self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
         self.stderr(crate::Stdio::pipe())?;
         let mut child = self.spawn()?;
@@ -314,7 +327,7 @@ impl Command {
     pub fn status(&mut self) -> Result<crate::ExitStatus, Error> {
         // Force inherit so a caller who previously called .stdout(pipe()) does
         // not get a pump-free wait() that deadlocks once the pipe buffer fills.
-        self.stdin(crate::Stdio::inherit())?;
+        self.apply_default_stdin(crate::Stdio::inherit())?;
         self.stdout(crate::Stdio::inherit())?;
         self.stderr(crate::Stdio::inherit())?;
         let child = self.spawn()?;
@@ -324,7 +337,7 @@ impl Command {
     /// Run to completion capturing stdout as a UTF-8 String (stdin=null,
     /// stderr inherited). Errors on invalid UTF-8; output is verbatim (no trim).
     pub fn read(&mut self) -> Result<String, Error> {
-        self.stdin(crate::Stdio::null())?;
+        self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
         // stderr left at its default (inherit).
         let mut child = self.spawn()?;
