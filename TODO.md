@@ -18,11 +18,49 @@ To run the live test in CI:
 - Set `SUBPROCESS_TEST_CGROUP=1` in the CI environment for the Linux job.
 - Verify kernel ≥ 5.14 (for `cgroup.kill` support).
 
+## CI provisioning required (elevation live tier)
+
+The live elevation tests (`tests/elevation.rs`) are gated behind
+`SUBPROCESS_TEST_ELEVATION`: a true no-op when absent, FAIL LOUDLY when set but
+elevation is unavailable (identical to `SUBPROCESS_TEST_CGROUP`).
+
+- **Linux:** provision passwordless `sudo` for the job user (a `NOPASSWD:ALL`
+  sudoers drop-in), then set `SUBPROCESS_TEST_ELEVATION=1`. The tests spawn
+  `id -u` elevated and assert `0`; `Auth::NonInteractive` is used so no prompt
+  blocks. `doas` is optional; `Backend::Auto` resolves `sudo` > `doas`.
+  - The `Auth::Stdin` and `Auth::Askpass` live tests need
+    `SUBPROCESS_TEST_ELEVATION_PASSWORD` set to the job user's sudo password
+    (use a NON-`NOPASSWD` sudoers entry for that user so `sudo -S`/`-A` actually
+    read the credential).
+  - The real-PTY controlling-terminal test runs only under `--features pty`
+    (the existing `pty` CI leg); it needs no elevation.
+  - The universal-teardown test asserts an unprivileged parent's `kill()` of its
+    elevated child either returns the typed `Unkillable` (direct-exec backends:
+    `doas`/`run0`/`sudo` without `Defaults use_pty`, where the tracked child IS
+    root) or succeeds (`sudo` WITH `use_pty`, where the tracked child is sudo's
+    same-uid monitor and root runs under a pty grandchild); in both cases `Drop`
+    must not hang. Tearing down that pty grandchild is the deferred teardown
+    contract below.
+  - The run0 unit-propagation test additionally requires
+    `SUBPROCESS_TEST_ELEVATION_RUN0=1`, a `run0`-capable context, and a polkit
+    rule granting the job user the run0 action passwordless (run0 authenticates
+    via polkit; `--no-ask-password` suppresses the prompt and fails loud without
+    such a rule — it does not provide cached-credential non-interactive auth the
+    way `sudo -n` does).
+- **Windows:** `ShellExecuteEx(runas)` always shows a UAC prompt on an
+  interactive desktop, so the live Windows tier (sync AND the
+  `#[cfg(all(windows, feature = "tokio"))]` async twin) is a **documented
+  manual-run tier** — run on a machine with UAC auto-approve (admin-approval-mode
+  off) or a self-hosted elevated runner, with `SUBPROCESS_TEST_ELEVATION=1` and
+  `SUBPROCESS_TEST_ELEVATION_MARKER_DIR` pointing at an admin-only-writable dir
+  (e.g. `C:\Windows\System32\subprocess-ci`). The `Unkillable`/no-hang-Drop test
+  runs under the same tier. Not run on hosted GitHub runners.
+
 ## Elevation (the headline differentiator — after core)
 
-- [ ] Elevate to Admin/root: declarative `Privilege` on the builder + pure `Host::plan(target) -> Transition` planner (cross-tested on all OS); per-OS effect layer rejects wrong-platform variants. Reuse hole `xtask/src/privilege` architecture; salvage stepstool's `prime_sudo` (TTY-gated), `preserve_env_arg`, `{SudoNotFound,AuthFailed,NoTty}` taxonomy.
-- [ ] POSIX backends: runtime-detected, ordered, overridable (`run0` > `sudo` > `doas`; GUI `pkexec`); auth-strategy enum (Interactive/Stdin/Askpass/NonInteractive/Gui); env as a security boundary (clean default, allowlist, deny `LD_PRELOAD`/`DYLD_*`/...).
-- [ ] Windows: `ShellExecuteEx("runas")` UAC path; detection via `TokenElevationType` + `TokenIntegrityLevel` (RID range-compare).
+- [x] Elevate to Admin/root: declarative elevation on the builder + pure `Host::plan(target) -> Transition` planner (cross-tested on all OS); per-OS effect layer rejects wrong-platform variants. (Delivered on branch `azhukova/6`, issue #6.)
+- [x] POSIX backends: runtime-detected, ordered, overridable (`Auto` = `sudo` > `doas`; explicit `run0`/`pkexec`); auth-strategy enum (Interactive/Stdin/Askpass/NonInteractive/Gui); env as a security boundary (clean default, denylist `EnvSanitizer`, backend-native forwarding — no `env` wrapper). NOTE: `run0` is EXCLUDED from `Auto` (it spawns a PID-1-parented transient unit that breaks the `Child` identity/kill/contain contract); it is explicit-only with forced `--pipe` and `.contain()`+run0 → `Unsupported`.
+- [x] Windows: `ShellExecuteEx("runas")` UAC path; detection via `TokenElevation` + `TokenIntegrityLevel` (aligned RID read). Honest capability contract: captured stdio / `.env` / `.contain` / `fd>=3` on an elevated Windows child are loud `Unsupported` (the broker below lifts these).
 - [ ] Run as a specific user (`CreateProcessWithLogonW`/`AsUser` chain on Windows; `sudo -u`/`su` on POSIX); credential handling.
 - [ ] Elevate to SYSTEM (`NT AUTHORITY\SYSTEM`): SeDebug/SeImpersonate token duplication, service, or SYSTEM scheduled task — separate consent/installer story.
 - [ ] De-elevation / privilege drop: POSIX `setgroups`→`setresgid`→`setresuid` (verify-by-regain); Windows linked-token de-elevation (the recovered hole 9-step minefield).
