@@ -20,8 +20,16 @@ pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
-    let fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
+    spawn_unelevated(cmd, kill_on_drop)
+}
+
+/// The non-elevated spawn core: resolve stdio, wire program/args, spawn, attach,
+/// read identity, adopt. Shared by the ordinary path and the elevation paths'
+/// already-elevated / derived-command continuations (which must spawn without
+/// re-entering the elevation branch).
+pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, Error> {
+    let fds = std::mem::take(cmd.fds_mut());
 
     // Windows routing. The raw `CreateProcessW` backend (Plan 12) owns the cases std cannot
     // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors

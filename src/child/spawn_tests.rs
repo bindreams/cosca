@@ -49,3 +49,15 @@ fn attach_failure_reaps_the_spawned_child() {
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
+
+#[test]
+fn spawn_unelevated_runs_a_plain_child() {
+    let mut c = crate::command::Command::new();
+    #[cfg(unix)]
+    c.args(["true"]);
+    #[cfg(windows)]
+    c.args(["cmd", "/C", "exit 0"]);
+    let kill_on_drop = c.kill_on_drop_flag();
+    let child = super::spawn_unelevated(&mut c, kill_on_drop).expect("spawn");
+    assert!(child.wait().expect("wait").success());
+}
