@@ -61,3 +61,28 @@ fn spawn_unelevated_runs_a_plain_child() {
     let child = super::spawn_unelevated(&mut c, kill_on_drop).expect("spawn");
     assert!(child.wait().expect("wait").success());
 }
+
+// A NON-elevated command must reach spawn_unelevated unchanged: the elevation branch
+// is gated on `elevation_request().enabled`, so a plain command never routes through it.
+#[test]
+fn non_elevated_spawn_skips_the_elevation_branch() {
+    let mut c = crate::command::Command::new();
+    #[cfg(unix)]
+    c.args(["true"]);
+    #[cfg(windows)]
+    c.args(["cmd", "/C", "exit 0"]);
+    let child = super::spawn(&mut c).expect("non-elevated spawn");
+    assert!(child.wait().expect("wait").success());
+}
+
+#[cfg(windows)]
+#[test]
+fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
+    // DETERMINISTIC (no ambient-privilege branch): the honest config gate now runs BEFORE
+    // the already-elevated short-circuit, so a piped elevated child is
+    // Unsupported whether or not the runner is elevated — never a UAC prompt, never a hang.
+    let mut c = crate::command::Command::new();
+    c.args(["whoami"]).elevate();
+    c.stdout(crate::stdio::Stdio::pipe()).unwrap();
+    assert!(matches!(super::spawn(&mut c), Err(crate::error::Error::Unsupported { .. })));
+}

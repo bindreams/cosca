@@ -258,10 +258,8 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
     Ok((program, OsString::from_wide(&joined)))
 }
 
-// The runas launch chain is driven by tests today; the sync/async spawn arms that route an
-// elevated `Command` here land in a later elevation-plan task (the POSIX rewrite is unwired for
-// the same reason). `allow(dead_code)` on the two entry points propagates to the whole chain.
-#[allow(dead_code)]
+// The sync spawn arm (`crate::child::spawn::spawn`) routes an elevated `Command` here via
+// `spawn_elevated`; the async arm follows in a later task.
 pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
 }
@@ -348,9 +346,6 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
     Ok(RunasOutcome::Launched { proc, pid, id, report })
 }
 
-// See the note on `launch_runas`: unwired until the spawn-routing task; `allow` propagates to
-// `already_elevated_report` and `RawChild::new_runas` (this function's otherwise-dead callees).
-#[allow(dead_code)]
 pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error> {
     match launch_runas(cmd)? {
         RunasOutcome::AlreadyElevated => {

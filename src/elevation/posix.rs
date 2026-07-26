@@ -199,13 +199,11 @@ pub(super) fn detect() -> Host {
 // ===== Non-destructive rewrite + deferred password channel =====
 //
 // The deferred-password chain (`PendingPassword`/`password_line`/`write_*`) and the
-// `PosixRewrite` fields are read by the sync/async POSIX spawn arms in a later
-// elevation-plan task; only tests drive them today, so each carries `allow(dead_code)`
-// until that arm lands (mirrors `build_argv`'s prior treatment).
+// `PosixRewrite` fields are consumed by the sync POSIX spawn arm
+// (`crate::child::spawn::spawn`); the async arm follows in a later task.
 
 /// The `Auth::Stdin` password channel: the pipe write-end plus the secret, written
 /// AFTER spawn (the child is then draining via `sudo -S`).
-#[allow(dead_code)]
 pub(crate) struct PendingPassword {
     writer: std::io::PipeWriter,
     secret: Secret,
@@ -215,7 +213,6 @@ pub(crate) struct PendingPassword {
 /// pre-sized to `secret.len() + 1` so the `push` never reallocates. A realloc would leave
 /// an un-zeroized plaintext copy in the freed allocation. Zeroize the returned buffer
 /// after use.
-#[allow(dead_code)]
 fn password_line(secret: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(secret.len() + 1);
     bytes.extend_from_slice(secret);
@@ -227,7 +224,6 @@ fn password_line(secret: &[u8]) -> Vec<u8> {
 /// backend never reads fd0 (a cached-credential / NOPASSWD sudo). The non-blocking
 /// invariant is load-bearing (`write_after_spawn` relies on `WouldBlock`), so an fcntl
 /// failure is surfaced via `log::warn!`, never silently swallowed.
-#[allow(dead_code)]
 fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
     use std::os::fd::AsRawFd;
     let fd = writer.as_raw_fd();
@@ -253,7 +249,6 @@ fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
 /// Block until `fd` is writable, or report that the reader hung up. The `-1` timeout is a
 /// real readiness wait on a genuine fd event (no time-based polling). `Ok(true)` =
 /// writable, `Ok(false)` = the reader closed / errored (`POLLHUP`/`POLLERR`).
-#[allow(dead_code)]
 fn wait_writable(fd: std::os::fd::RawFd) -> Result<bool, std::io::Error> {
     loop {
         let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
@@ -275,7 +270,6 @@ fn wait_writable(fd: std::os::fd::RawFd) -> Result<bool, std::io::Error> {
     }
 }
 
-#[allow(dead_code)]
 fn auth_failed(detail: String) -> Error {
     Error::Elevation {
         kind: ElevationErrorKind::AuthFailed,
@@ -288,7 +282,6 @@ fn auth_failed(detail: String) -> Error {
 /// WouldBlock/BrokenPipe with ZERO bytes written means the backend never read fd0
 /// (cached credentials) → success; the SAME error after a partial write is a real
 /// truncation → `AuthFailed`.
-#[allow(dead_code)]
 fn write_password_bytes(writer: &mut std::io::PipeWriter, fd: std::os::fd::RawFd, bytes: &[u8]) -> Result<(), Error> {
     use std::io::Write;
     let mut written = 0usize;
@@ -335,7 +328,6 @@ impl PendingPassword {
     /// the password" → `log::debug!` + `Ok`, NOT `AuthFailed`. The buffer is zeroized and
     /// the writer dropped (EOF) on EVERY path. On a genuine failure the CALLER (the spawn
     /// arm) kills and reaps the running child.
-    #[allow(dead_code)]
     pub(crate) fn write_after_spawn(mut self) -> Result<(), Error> {
         use std::os::fd::AsRawFd;
         let mut bytes = password_line(self.secret.expose());
@@ -353,7 +345,6 @@ impl PendingPassword {
 /// resulting `Child`. `password_write` is delivered after spawn. `backend_path` is the
 /// resolved argv[0] the spawn arm passes to `remap_derived_spawn_error` (`None` when no
 /// backend wraps the child, i.e. already elevated).
-#[allow(dead_code)]
 pub(crate) struct PosixRewrite {
     pub derived: Option<Command>,
     pub report: Option<ElevationReport>,
@@ -461,9 +452,8 @@ fn transfer_process_attrs(derived: &mut Command, cmd: &Command) {
 }
 
 /// Detect-then-plan-then-rewrite. Thin wrapper over the pure form.
-// Consumed by the sync/async POSIX spawn arms (a later elevation-plan task); the pure
-// `rewrite_with_host` is what the tests drive today.
-#[allow(dead_code)]
+// Consumed by the sync POSIX spawn arm (`crate::child::spawn::spawn`); the pure
+// `rewrite_with_host` is what the tests drive directly.
 pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
     rewrite_with_host(cmd, &Host::detect())
 }

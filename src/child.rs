@@ -65,9 +65,8 @@ impl Child {
         }
     }
 
-    // Consumed by the sync/async POSIX spawn arms (a later elevation-plan task); the
-    // rewrite that produces the report lands here first.
-    #[allow(dead_code)]
+    // Consumed by the sync spawn arms (POSIX `spawn`, Windows `spawn_elevated`); the async
+    // arm follows in a later task.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.elevation = report;
     }

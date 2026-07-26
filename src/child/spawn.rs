@@ -21,6 +21,74 @@ pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let kill_on_drop = cmd.kill_on_drop_flag();
+    // Elevation runs BEFORE spawn_unelevated's std::mem::take(cmd.fds_mut()), so the
+    // effect layers see/modify cmd.fds() while it is still populated (the honest Windows
+    // reject gate and the POSIX derived-command build both depend on it).
+    if cmd.elevation_request().enabled {
+        #[cfg(windows)]
+        {
+            return crate::elevation::windows::spawn_elevated(cmd, kill_on_drop);
+        }
+        #[cfg(unix)]
+        {
+            let crate::elevation::posix::PosixRewrite {
+                derived,
+                report,
+                password_write,
+                backend_path,
+            } = crate::elevation::posix::rewrite(cmd)?;
+            let mut child = match derived {
+                // The derived program IS the backend; remap an exec failure to
+                // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
+                // yields the same kind and stays a plain Io). An already-elevated derived
+                // (sanitized original) has no backend path, so it is never remapped.
+                Some(mut derived) => {
+                    let r = spawn_unelevated(&mut derived, kill_on_drop);
+                    match backend_path.as_deref() {
+                        Some(bp) => r.map_err(|e| crate::elevation::remap_derived_spawn_error(e, bp))?,
+                        None => r?,
+                    }
+                }
+                None => spawn_unelevated(cmd, kill_on_drop)?, // AlreadyElevated: spawn the original
+            };
+            // Set the elevation report BEFORE handling the deferred password: a cleanup
+            // kill() in the write-failure path must see the elevated state so an EPERM maps
+            // to the typed Unkillable rather than leaking a raw Io.
+            child.set_elevation(report);
+            if let Some(pw) = password_write {
+                if let Err(write_err) = pw.write_after_spawn() {
+                    // Do NOT orphan the running elevated child on a genuine write failure:
+                    // kill + reap it, folding the teardown outcome into the error detail. A
+                    // successful kill() (SIGKILL, uncatchable) is followed by a BLOCKING wait()
+                    // to actually reap; an Err kill() (e.g. Unkillable) can't be reaped, so fall
+                    // back to a non-blocking try_wait() and note it may still be running.
+                    let kill_note = match child.kill() {
+                        Ok(()) => {
+                            let _ = child.wait();
+                            "the elevated child was terminated".to_string()
+                        }
+                        Err(e) => {
+                            let _ = child.try_wait();
+                            format!("the elevated child could not be terminated ({e})")
+                        }
+                    };
+                    return Err(Error::Elevation {
+                        kind: crate::error::ElevationErrorKind::AuthFailed,
+                        detail: format!("{write_err}; {kill_note}"),
+                    });
+                }
+            }
+            return Ok(child);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return Err(Error::Unsupported {
+                op: "elevation".into(),
+                platform: std::env::consts::OS,
+                detail: "no elevation backend on this platform".into(),
+            });
+        }
+    }
     spawn_unelevated(cmd, kill_on_drop)
 }
 

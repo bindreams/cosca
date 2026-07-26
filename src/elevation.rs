@@ -166,9 +166,7 @@ pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: boo
 /// only) present but lacking the executable bit (cleared exec bit, `noexec` mount,
 /// SELinux denial). Non-unix has no portable executable-bit concept, so existence
 /// is the only check.
-// Not yet called by production code: only `remap_derived_spawn_error` calls this, and
-// that in turn awaits the sync/async POSIX spawn arms landing in later elevation-plan tasks.
-#[allow(dead_code)]
+// Reached from `remap_derived_spawn_error` on the unix sync spawn arm.
 #[cfg(unix)]
 fn backend_unusable(backend_path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -180,7 +178,7 @@ fn backend_unusable(backend_path: &std::path::Path) -> bool {
     unsafe { libc::faccessat(libc::AT_FDCWD, cpath.as_ptr(), libc::X_OK, libc::AT_EACCESS) != 0 }
 }
 
-// Not yet called by production code: see the `#[cfg(unix)]` twin above.
+// Dead on non-unix: `remap_derived_spawn_error` has no non-unix production caller.
 #[allow(dead_code)]
 #[cfg(not(unix))]
 fn backend_unusable(backend_path: &std::path::Path) -> bool {
@@ -193,9 +191,9 @@ fn backend_unusable(backend_path: &std::path::Path) -> bool {
 /// `BackendUnavailable` when the backend path itself is unusable (missing, or on unix
 /// present-but-not-executable); otherwise the original `Io` survives. Either way the
 /// underlying `io::Error` and the backend path are embedded so the cause is never lost.
-// Not yet called by production code: the sync/async POSIX spawn arms that derive a
-// backend command land in later tasks of the elevation plan.
-#[allow(dead_code)]
+// Consumed by the unix sync spawn arm (`crate::child::spawn::spawn`); dead on non-unix,
+// where the Windows arm delegates straight to `windows::spawn_elevated`.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn remap_derived_spawn_error(
     err: crate::error::Error,
     backend_path: &std::path::Path,
