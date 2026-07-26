@@ -115,9 +115,6 @@ use crate::stdio::ResolvedStdio;
 /// passes NO handles and no environment, and a Job Object cannot span the integrity
 /// boundary — so every non-inherit slot, every fd >= 3, any explicit env, and
 /// `.contain()` is a loud `Unsupported`, never a silent lie.
-// Not yet called by production code: Task 14's `launch_runas` calls this gate before
-// the UAC prompt.
-#[allow(dead_code)]
 pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
     let unsupported = |op: &str, detail: &str| {
         Err(Error::Unsupported { op: op.into(), platform: "windows", detail: detail.into() })
@@ -150,6 +147,232 @@ pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+// ===== ShellExecuteEx("runas") launch =====
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+};
+use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
+use windows::Win32::UI::Shell::{
+    ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+use crate::child::proc_handle::ProcHandle;
+use crate::child::spawn::windows_raw::RawChild;
+use crate::command::CommandInput;
+use crate::containment::{Attached, Containment};
+use crate::elevation::plan::Transition;
+use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
+use crate::error::ElevationErrorKind;
+use crate::identity::ProcessId;
+
+/// `ERROR_CANCELLED` (1223) as an HRESULT (0x800704C7) — the UAC-declined code.
+const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x800704C7_u32 as i32);
+
+fn wide_nul(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
+/// identity, and the report — the async path builds its own `Child` from these.
+pub(crate) enum RunasOutcome {
+    AlreadyElevated,
+    Launched { proc: OwnedHandle, pid: u32, id: ProcessId, report: ElevationReport },
+}
+
+/// Balances a `CoInitializeEx` with `CoUninitialize` only when WE incremented the refcount.
+struct ComInit {
+    uninit: bool,
+}
+impl ComInit {
+    fn init() -> Result<ComInit, Error> {
+        // SAFETY: COM apartment init on the calling thread; balanced in Drop.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        if hr == S_OK || hr == S_FALSE {
+            // S_FALSE = already initialized on this thread WITH the refcount incremented,
+            // so it still requires a matching CoUninitialize.
+            Ok(ComInit { uninit: true })
+        } else if hr == RPC_E_CHANGED_MODE {
+            // Already initialized in a different apartment model; we did NOT increment.
+            Ok(ComInit { uninit: false })
+        } else {
+            Err(Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail: format!("CoInitializeEx failed before ShellExecuteEx: {hr:?}"),
+            })
+        }
+    }
+}
+impl Drop for ComInit {
+    fn drop(&mut self) {
+        if self.uninit {
+            // SAFETY: balances our CoInitializeEx that incremented the refcount.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// Program (loaded image) + the joined parameter line. Honors `executable()`; an
+/// argv[0] distinct from a set `executable()` cannot be preserved by runas.
+fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
+    let CommandInput::Argv(argv) = cmd.input() else {
+        return Err(Error::Unsupported {
+            op: "elevation of a commandline() command".into(),
+            platform: "windows",
+            detail: "runas elevation requires an argv command (set .args([...]))".into(),
+        });
+    };
+    if argv.is_empty() {
+        return Err(Error::Unsupported {
+            op: "elevation of an empty command".into(),
+            platform: "windows",
+            detail: "set a program via .args([...]) before .elevate()".into(),
+        });
+    }
+    let program = match cmd.executable_path() {
+        Some(exe) => {
+            if argv[0].as_os_str() != exe.as_os_str() {
+                return Err(Error::Unsupported {
+                    op: "elevation with an argv[0] distinct from executable()".into(),
+                    platform: "windows",
+                    detail: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image".into(),
+                });
+            }
+            exe.as_os_str().to_os_string()
+        }
+        None => argv[0].clone(),
+    };
+    let tail_wide: Vec<Vec<u16>> = argv[1..].iter().map(|a| a.encode_wide().collect()).collect();
+    let tail_refs: Vec<&[u16]> = tail_wide.iter().map(|v| v.as_slice()).collect();
+    let joined = crate::quote::windows::join_wide(&tail_refs);
+    Ok((program, OsString::from_wide(&joined)))
+}
+
+// The runas launch chain is driven by tests today; the sync/async spawn arms that route an
+// elevated `Command` here land in a later elevation-plan task (the POSIX rewrite is unwired for
+// the same reason). `allow(dead_code)` on the two entry points propagates to the whole chain.
+#[allow(dead_code)]
+pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
+    launch_runas_with_host(cmd, &Host::detect())
+}
+
+/// PURE given `host` (the Windows gate seam): gate, plan, then ShellExecuteEx(runas).
+pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error> {
+    let req = cmd.elevation_request();
+    let (backend, auth) = (req.backend, req.auth.clone());
+    // Structural config gate FIRST — privilege-independent (before the short-circuit), so
+    // an already-elevated caller gets the same verdict for piped/env/contain/commandline.
+    reject_unsupported_config(cmd)?;
+    let (program, params) = program_and_params(cmd)?; // validates commandline()/argv0 too
+
+    match host.plan(Privilege::Elevated, backend, auth) {
+        Transition::RunAsIs => return Ok(RunasOutcome::AlreadyElevated),
+        Transition::Reject { error } => return Err(error),
+        Transition::ElevatePosix { .. } => unreachable!("planner never yields ElevatePosix on a windows host"),
+        Transition::ElevateWindows { .. } => {}
+    }
+
+    let dir = cmd.cwd().map(|d| wide_nul(d.as_os_str()));
+    let file_w = wide_nul(program.as_os_str());
+    let params_w = wide_nul(params.as_os_str());
+    let verb_w = wide_nul(OsStr::new("runas"));
+
+    let com = ComInit::init()?;
+    // SAFETY: `info` is fully initialized with the correct cbSize; the wide buffers
+    // outlive the call; SEE_MASK_NOCLOSEPROCESS yields an owned hProcess.
+    let proc: OwnedHandle = unsafe {
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            lpVerb: PCWSTR(verb_w.as_ptr()),
+            lpFile: PCWSTR(file_w.as_ptr()),
+            lpParameters: PCWSTR(params_w.as_ptr()),
+            lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        ShellExecuteExW(&mut info).map_err(|e| {
+            if e.code() == ERROR_CANCELLED_HRESULT {
+                Error::Elevation { kind: ElevationErrorKind::AuthDeclined, detail: "the UAC elevation prompt was declined".into() }
+            } else {
+                Error::Elevation { kind: ElevationErrorKind::AuthFailed, detail: format!("ShellExecuteEx(runas) failed: {e}") }
+            }
+        })?;
+        if info.hProcess.is_invalid() {
+            return Err(Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail: "ShellExecuteEx(runas) returned no process handle".into(),
+            });
+        }
+        OwnedHandle::from_raw_handle(info.hProcess.0 as std::os::windows::io::RawHandle)
+    };
+    drop(com);
+
+    // Identity from the OWNED handle — no second OpenProcess.
+    let handle = HANDLE(proc.as_raw_handle());
+    // SAFETY: `handle` is our live, owned process handle.
+    let pid = unsafe { GetProcessId(handle) };
+    let id = if pid != 0 {
+        crate::identity::windows_identity_from_handle(handle, pid)
+    } else {
+        None
+    };
+    let Some(id) = id else {
+        // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
+        // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
+        // SAFETY: `handle` is live; terminating our own launched child.
+        let terminated = unsafe { TerminateProcess(handle, 1) }.is_ok();
+        let detail = if terminated {
+            "the elevated child launched but its identity could not be resolved; it was terminated".into()
+        } else {
+            format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running")
+        };
+        return Err(Error::Elevation { kind: ElevationErrorKind::Untracked, detail });
+    };
+
+    let report = ElevationReport {
+        via: ElevatedVia::WindowsUac,
+        stripped_env: Vec::new(),
+        stdio: ElevatedStdio::OwnConsole,
+    };
+    Ok(RunasOutcome::Launched { proc, pid, id, report })
+}
+
+// See the note on `launch_runas`: unwired until the spawn-routing task; `allow` propagates to
+// `already_elevated_report` and `RawChild::new_runas` (this function's otherwise-dead callees).
+#[allow(dead_code)]
+pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error> {
+    match launch_runas(cmd)? {
+        RunasOutcome::AlreadyElevated => {
+            let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
+            child.set_elevation(Some(crate::elevation::already_elevated_report(ElevatedStdio::Passthrough)));
+            Ok(child)
+        }
+        RunasOutcome::Launched { proc, pid, id, report } => {
+            // A dedicated non-blocking-kill handle (RawChild::new_runas): a higher-integrity
+            // child a medium parent cannot terminate never hangs Drop.
+            let mut child = crate::child::Child::from_parts(
+                ProcHandle::Raw(RawChild::new_runas(proc, pid)),
+                id,
+                BTreeMap::new(),
+                kill_on_drop,
+                Containment::None,
+                Attached::None,
+            );
+            child.set_elevation(Some(report));
+            Ok(child)
+        }
+    }
 }
 
 #[cfg(test)]

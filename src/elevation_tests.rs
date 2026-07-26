@@ -159,3 +159,25 @@ fn detect_reports_unix_os() {
     let h = super::plan::Host::detect();
     assert_eq!(h.os, super::plan::Os::Unix);
 }
+
+#[test]
+fn kill_error_on_an_elevated_wrapper_is_unkillable() {
+    use crate::error::{ElevationErrorKind, Error};
+    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let e = super::map_elevated_kill_error(eperm, /* elevated_wrapper */ true);
+    assert!(matches!(e, Error::Elevation { kind: ElevationErrorKind::Unkillable, .. }), "{e:?}");
+}
+
+#[test]
+fn kill_error_on_a_plain_child_stays_io() {
+    use crate::error::Error;
+    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(matches!(super::map_elevated_kill_error(eperm, false), Error::Io(_)));
+}
+
+#[test]
+fn non_permission_kill_error_stays_io_even_when_elevated() {
+    use crate::error::Error;
+    let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert!(matches!(super::map_elevated_kill_error(other, true), Error::Io(_)));
+}

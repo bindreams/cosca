@@ -136,14 +136,29 @@ impl Default for ElevationRequest {
 /// The single source of the "already elevated, no wrapper needed" report. Every
 /// sync/async spawn arm that short-circuits on ambient privilege calls this, so the
 /// literal is never hand-copied.
-// Not yet called by production code: the sync/async spawn arms that short-circuit on
-// ambient privilege land in later tasks of the elevation plan.
-#[allow(dead_code)]
+// The Windows `RunAsIs` arm (Task 14) consumes this; the POSIX spawn arms that
+// short-circuit on ambient privilege land in a later task, so it stays dead there.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport {
     ElevationReport {
         via: ElevatedVia::AlreadyElevated,
         stripped_env: Vec::new(),
         stdio,
+    }
+}
+
+/// Map a raw kill/terminate `io::Error` on an ELEVATED wrapper child to the typed
+/// `Unkillable` error. EPERM (POSIX) and ACCESS_DENIED (Windows) both surface as
+/// `io::ErrorKind::PermissionDenied`; anything else, or a non-elevated child, stays `Io`.
+pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: bool) -> crate::error::Error {
+    use crate::error::{ElevationErrorKind, Error};
+    if elevated_wrapper && err.kind() == std::io::ErrorKind::PermissionDenied {
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            detail: format!("could not signal the elevated child: {err}"),
+        }
+    } else {
+        Error::Io(err)
     }
 }
 

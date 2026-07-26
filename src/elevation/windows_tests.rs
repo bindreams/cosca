@@ -79,3 +79,46 @@ fn inherit_only_is_accepted() {
     c.stdout(Stdio::inherit()).unwrap();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
+
+fn win_host(elevated: bool) -> crate::elevation::plan::Host {
+    crate::elevation::plan::Host {
+        elevated,
+        has_tty: false,
+        available: crate::elevation::plan::BackendSet::default(),
+        os: crate::elevation::plan::Os::Windows,
+    }
+}
+
+#[test]
+fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privilege() {
+    // Piped stdio must fail with Unsupported and never prompt — the gate runs BEFORE the
+    // already-elevated short-circuit, so the verdict is identical for elevated=false/true.
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args(["whoami"]).elevate();
+        c.stdout(Stdio::pipe()).unwrap();
+        assert!(is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))),
+            "piped elevated config must reject with elevated={elevated}");
+    }
+}
+
+#[test]
+fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.commandline("whoami").elevate();
+        assert!(is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))));
+    }
+}
+
+#[test]
+fn already_elevated_inherit_only_is_run_as_is() {
+    // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
+    // passes the gate and short-circuits (no ShellExecuteEx).
+    let mut c = Command::new();
+    c.args(["whoami"]).elevate();
+    assert!(matches!(
+        super::launch_runas_with_host(&mut c, &win_host(true)),
+        Ok(super::RunasOutcome::AlreadyElevated)
+    ));
+}
