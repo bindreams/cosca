@@ -108,7 +108,7 @@ impl Default for ElevationRequest {
             enabled: false,
             backend: Backend::Auto,
             auth: Auth::Interactive,
-            sanitizer: EnvSanitizer,
+            sanitizer: EnvSanitizer::default(),
         }
     }
 }
