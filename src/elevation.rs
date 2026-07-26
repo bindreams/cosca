@@ -94,9 +94,6 @@ pub struct ElevationReport {
 
 /// The resolved elevation request carried on a [`crate::Command`] (crate-internal),
 /// mirroring `ContainRequest`.
-// Not yet constructed by production code: `Command::elevate()` and the spawn dispatch
-// that reads this land in later tasks of the elevation plan.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ElevationRequest {
     pub enabled: bool,

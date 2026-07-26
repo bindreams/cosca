@@ -22,6 +22,7 @@ pub struct Command {
     cwd: Option<PathBuf>,
     kill_on_drop: bool,
     contain: ContainRequest,
+    elevation: crate::elevation::ElevationRequest,
 }
 
 /// An environment variable operation, recorded in order.
@@ -42,6 +43,7 @@ impl Default for Command {
             cwd: None,
             kill_on_drop: true,
             contain: ContainRequest::default(),
+            elevation: crate::elevation::ElevationRequest::default(),
         }
     }
 }
@@ -219,6 +221,60 @@ impl Command {
 
     pub(crate) fn contain_request(&self) -> ContainRequest {
         self.contain
+    }
+
+    /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +
+    /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
+    /// CHILD, never this process.
+    pub fn elevate(&mut self) -> &mut Command {
+        self.elevation.enabled = true;
+        self
+    }
+
+    /// Force a specific elevation backend (implies `.elevate()`).
+    pub fn elevation_backend(&mut self, backend: crate::elevation::Backend) -> &mut Command {
+        self.elevation.enabled = true;
+        self.elevation.backend = backend;
+        self
+    }
+
+    /// Choose the elevation auth strategy (implies `.elevate()`).
+    pub fn elevation_auth(&mut self, auth: crate::elevation::Auth) -> &mut Command {
+        self.elevation.enabled = true;
+        self.elevation.auth = auth;
+        self
+    }
+
+    /// Replace the env sanitizer applied to explicitly-forwarded vars (implies `.elevate()`).
+    pub fn sanitize_env(&mut self, sanitizer: crate::elevation::EnvSanitizer) -> &mut Command {
+        self.elevation.enabled = true;
+        self.elevation.sanitizer = sanitizer;
+        self
+    }
+
+    // `elevation_request` is read only by command_tests outside this module; the
+    // spawn dispatch that reads it in production lands in a later elevation-plan
+    // task. `set_input_argv`/`set_env_ops`/`set_contain` are mutators for the
+    // DERIVED command the POSIX rewrite builds (Task 11) — unused until then.
+    #[allow(dead_code)]
+    pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
+        &self.elevation
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
+        self.input = CommandInput::Argv(argv);
+        self.executable = None;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
+        self.env_ops = ops;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_contain(&mut self, req: ContainRequest) {
+        self.contain = req;
     }
 
     // ---- crate-internal accessors for the spawn engine (Task 4) -------------

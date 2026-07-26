@@ -196,3 +196,31 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.mode, Some(ContainMode::TreeWalk));
     assert_eq!(req.nesting, Nesting::Opaque);
 }
+
+#[test]
+fn elevate_enables_with_defaults() {
+    let mut c = Command::new();
+    c.args(["id", "-u"]).elevate();
+    let req = c.elevation_request();
+    assert!(req.enabled);
+    assert_eq!(req.backend, crate::elevation::Backend::Auto);
+    assert!(matches!(req.auth, crate::elevation::Auth::Interactive));
+}
+
+#[test]
+fn elevation_overrides_apply_and_enable() {
+    let mut c = Command::new();
+    c.arg("id")
+        .elevation_backend(crate::elevation::Backend::Doas)
+        .elevation_auth(crate::elevation::Auth::NonInteractive);
+    let req = c.elevation_request();
+    assert!(req.enabled);
+    assert_eq!(req.backend, crate::elevation::Backend::Doas);
+    assert!(matches!(req.auth, crate::elevation::Auth::NonInteractive));
+}
+
+#[test]
+fn command_without_elevate_is_disabled() {
+    let c = Command::new();
+    assert!(!c.elevation_request().enabled);
+}
