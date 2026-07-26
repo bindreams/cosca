@@ -52,13 +52,26 @@ fn elevation_error_displays_kind_and_detail() {
     };
     let s = e.to_string();
     assert!(s.contains("no controlling terminal"), "{s}");
-    assert!(matches!(e, Error::Elevation { kind: ElevationErrorKind::NoTty, .. }));
+    assert!(matches!(
+        e,
+        Error::Elevation {
+            kind: ElevationErrorKind::NoTty,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn elevation_error_kinds_have_distinct_messages() {
     use crate::error::ElevationErrorKind::*;
-    let all = [BackendUnavailable, AuthFailed, AuthDeclined, NoTty, Unkillable, Untracked];
+    let all = [
+        BackendUnavailable,
+        AuthFailed,
+        AuthDeclined,
+        NoTty,
+        Unkillable,
+        Untracked,
+    ];
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.to_string(), b.to_string(), "{a:?} vs {b:?}");
@@ -71,7 +84,10 @@ fn untracked_message_does_not_assert_termination() {
     // The kind's Display is neutral; termination status lives in `detail`.
     use crate::error::ElevationErrorKind::Untracked;
     let s = Untracked.to_string();
-    assert!(!s.contains("terminated"), "Untracked Display must not claim termination: {s}");
+    assert!(
+        !s.contains("terminated"),
+        "Untracked Display must not claim termination: {s}"
+    );
 }
 
 #[test]
@@ -79,6 +95,12 @@ fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
     // Display describes the signal denial; whether the child lives is in `detail`.
     use crate::error::ElevationErrorKind::Unkillable;
     let s = Unkillable.to_string();
-    assert!(!s.contains("terminated"), "Unkillable Display must not claim termination: {s}");
-    assert!(s.contains("terminate") || s.contains("signal") || s.contains("kill"), "{s}");
+    assert!(
+        !s.contains("terminated"),
+        "Unkillable Display must not claim termination: {s}"
+    );
+    assert!(
+        s.contains("terminate") || s.contains("signal") || s.contains("kill"),
+        "{s}"
+    );
 }

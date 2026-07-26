@@ -70,10 +70,7 @@ pub enum Error {
     Containment { detail: String },
     /// Privilege elevation could not be completed at runtime.
     #[error("elevation failed ({kind}): {detail}")]
-    Elevation {
-        kind: ElevationErrorKind,
-        detail: String,
-    },
+    Elevation { kind: ElevationErrorKind, detail: String },
 }
 
 #[cfg(test)]
