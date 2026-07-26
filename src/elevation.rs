@@ -7,15 +7,22 @@ use std::path::PathBuf;
 
 use zeroize::Zeroize;
 
-pub mod plan;
+// Effect-layer submodules are crate-internal (matching the `containment` convention); only the
+// public types below are exported. The one exception is `controlling_terminal_present`, a
+// `#[doc(hidden)]` probe the separate `testbin` binary (an external consumer) needs — re-exported
+// at this module's root so `posix` itself stays `pub(crate)`.
+pub(crate) mod plan;
 #[cfg(unix)]
 #[path = "elevation/posix.rs"]
-pub mod posix;
-pub mod sanitize;
+pub(crate) mod posix;
+pub(crate) mod sanitize;
 #[cfg(windows)]
 #[path = "elevation/windows.rs"]
-pub mod windows;
+pub(crate) mod windows;
 
+#[cfg(unix)]
+#[doc(hidden)]
+pub use posix::controlling_terminal_present;
 pub use sanitize::EnvSanitizer;
 
 /// Is the CURRENT process already elevated (root on Unix, an elevated token on

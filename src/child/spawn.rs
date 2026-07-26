@@ -49,7 +49,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                         None => r?,
                     }
                 }
-                None => spawn_unelevated(cmd, kill_on_drop)?, // AlreadyElevated: spawn the original
+                // No derived command: the current POSIX `rewrite` always returns `Some` (it
+                // sanitizes even the already-elevated case into a derived), so this is defensive.
+                None => spawn_unelevated(cmd, kill_on_drop)?,
             };
             // Set the elevation report BEFORE handling the deferred password: a cleanup
             // kill() in the write-failure path must see the elevated state so an EPERM maps

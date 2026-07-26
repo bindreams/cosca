@@ -170,10 +170,21 @@ impl RawAsyncChild {
         // SAFETY: our live, owned process handle; exit code 1 is the forced-kill code.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => Ok(()),
-            // We hold a full-access handle to our OWN child, so ERROR_ACCESS_DENIED is never a real
-            // permission failure — the child's exit is already underway (matches tokio's
-            // `start_kill` mapping an already-reaped child to Ok). Never blocks on it (signal-only).
-            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => Ok(()),
+            // `ACCESS_DENIED` has two causes: (a) our own child is already exiting (the OS teardown
+            // window signals the denial before the object is signaled — a spurious kill error), or
+            // (b) a runas child is genuinely higher-integrity than us. A static `can_terminate`
+            // probe (shared with the sync `RawChild`) separates them WITHOUT racing a `try_wait`.
+            // Only (b) is a real denial → surface the `Io` error so `Child::kill` maps it to the
+            // typed `Unkillable`; (a) is Ok (signal-only, so never block here).
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+                if self.runas && !sync_raw::can_terminate(self.pid) {
+                    Err(Error::Io(std::io::Error::from_raw_os_error(
+                        ERROR_ACCESS_DENIED.0 as i32,
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
             Err(e) => Err(Error::Io(e.into())),
         }
     }

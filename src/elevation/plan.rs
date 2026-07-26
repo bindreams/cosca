@@ -8,6 +8,10 @@ use super::{Auth, Backend, Privilege};
 use crate::error::{ElevationErrorKind, Error};
 
 /// Which OS the effect layer will use. Data, not `cfg!`, so `plan` is cross-tested.
+// The planner models EVERY platform's decision on ANY host (that is the whole point — a
+// Windows-shaped `Host` is planned on Linux and vice versa), so in a non-test single-platform
+// build the other platform's variant is never constructed. That is by design, not dead logic.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     Unix,
@@ -50,6 +54,9 @@ pub struct Host {
 
 /// The planner's decision. Not `PartialEq` — `Reject` wraps a non-comparable
 /// [`Error`]; tests use `matches!` and inspect fields.
+// Cross-platform like [`Os`]: the effect arm for the other platform (and its fields) is never
+// constructed in a single-platform non-test build, but is exercised by the cross-OS planner tests.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Transition {
     RunAsIs,

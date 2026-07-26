@@ -32,10 +32,10 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::System::Threading::{
-    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, OpenProcess, UpdateProcThreadAttribute,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_TERMINATE,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
@@ -239,6 +239,25 @@ pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
     let _ = rc.kill();
     if let Err(_e) = rc.wait() {
         debug_assert!(false, "raw spawn teardown failed to reap child: {_e}");
+    }
+}
+
+/// Does the caller hold `PROCESS_TERMINATE` on `pid`? A STATIC permission answer (a second
+/// `OpenProcess`), used to separate a genuine higher-integrity runas denial from the OS
+/// teardown-window `ACCESS_DENIED` WITHOUT racing a `try_wait`. Pid-reuse-safe when the caller
+/// still holds a handle pinning the process object. Shared by the sync `RawChild` and the async
+/// `RawAsyncChild` runas kill paths so both surface the same typed `Unkillable`.
+pub(crate) fn can_terminate(pid: u32) -> bool {
+    // SAFETY: the caller holds a live owned handle pinning the process object, so `pid` still
+    // names THIS process; OpenProcess tolerates failure (returns Err).
+    match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+        Ok(h) => {
+            // SAFETY: `h` is an owned handle from a successful OpenProcess; close it once.
+            let closed = unsafe { CloseHandle(h) };
+            debug_assert!(closed.is_ok(), "CloseHandle of an owned probe handle should not fail");
+            true
+        }
+        Err(_) => false,
     }
 }
 

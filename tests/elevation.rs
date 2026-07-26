@@ -411,3 +411,30 @@ async fn async_windows_elevated_child_writes_admin_marker() {
     );
     let _ = std::fs::remove_file(&marker);
 }
+
+// GATED (Windows, tokio): the async twin of the sync unkillable/no-hang test. A runas child a
+// medium-integrity parent cannot PROCESS_TERMINATE must surface the typed Unkillable from kill()
+// (never a false Ok), and async Drop must not block — locking the sync/async parity of the
+// runas-aware kill path.
+#[cfg(all(windows, feature = "tokio"))]
+#[tokio::test]
+async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
+    if !gated() {
+        return;
+    }
+    let exe = testbin();
+    let mut c = subprocess::tokio::Command::new();
+    c.executable(&exe)
+        .args([exe.clone().into_os_string(), "sleep-marker".into()])
+        .elevate();
+    let mut child = c.spawn().expect("async runas spawn");
+    match child.kill() {
+        Err(subprocess::error::Error::Elevation { kind, .. }) => {
+            assert_eq!(kind, subprocess::error::ElevationErrorKind::Unkillable);
+        }
+        // If the manual runner is itself elevated, the child is killable — accept Ok.
+        Ok(()) => {}
+        other => panic!("expected Unkillable or Ok, got {other:?}"),
+    }
+    drop(child); // must return promptly (non-blocking async teardown)
+}

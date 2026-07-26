@@ -11,6 +11,7 @@ pub mod identity;
 pub mod quote;
 pub mod stdio;
 pub use containment::{ContainMode, Containment};
+pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, EnvSanitizer, Privilege, Secret};
 pub use stdio::{Fd, Stdio};
 
 mod child;

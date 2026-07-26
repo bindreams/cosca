@@ -15,8 +15,8 @@ use std::time::Instant;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOEXW,
+    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOEXW,
 };
 
 use crate::error::Error;
@@ -62,15 +62,7 @@ impl RawChild {
     fn can_terminate(&self) -> bool {
         // SAFETY: our live owned handle pins the process object, so `self.pid` still names
         // THIS process; OpenProcess tolerates failure (returns Err).
-        match unsafe { OpenProcess(PROCESS_TERMINATE, false, self.pid) } {
-            Ok(h) => {
-                // SAFETY: `h` is an owned handle from a successful OpenProcess; close it once.
-                let closed = unsafe { CloseHandle(h) };
-                debug_assert!(closed.is_ok(), "CloseHandle of an owned probe handle should not fail");
-                true
-            }
-            Err(_) => false,
-        }
+        super::can_terminate(self.pid)
     }
 
     pub(crate) fn id(&self) -> u32 {

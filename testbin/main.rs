@@ -411,7 +411,7 @@ fn main() {
         }
         #[cfg(unix)]
         "controlling-terminal" => {
-            let present = subprocess::elevation::posix::controlling_terminal_present();
+            let present = subprocess::elevation::controlling_terminal_present();
             println!("{}", if present { "1" } else { "0" });
         }
         // Linux PTY harness: become a session leader with no ctty (setsid), acquire the
@@ -425,7 +425,7 @@ fn main() {
                 assert!(libc::setsid() != -1, "setsid failed");
                 assert!(libc::ioctl(3, libc::TIOCSCTTY as _, 0) != -1, "TIOCSCTTY failed");
             }
-            let present = subprocess::elevation::posix::controlling_terminal_present();
+            let present = subprocess::elevation::controlling_terminal_present();
             println!("{}", if present { "1" } else { "0" });
         }
         "write-marker" => {

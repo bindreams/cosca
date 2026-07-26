@@ -101,7 +101,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 }
                 return Ok(child);
             }
-            elevation_report = rw.report; // AlreadyElevated: fall through
+            // Defensive: the current POSIX `rewrite` always returns `Some(derived)` (it sanitizes
+            // even the already-elevated case), so this no-derived fall-through is not reached today.
+            elevation_report = rw.report;
         }
     }
 
@@ -115,8 +117,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(windows)]
     if cmd.executable_path().is_some() || fds.keys().any(|f| f.raw() >= 3) {
         // Attach the report on the AlreadyElevated fall-through too — an already-elevated
-        // `executable()`/fd>=3 command routes here, and dropping the raw child without the report
-        // would lose its elevation state (mirrors the sync `spawn_elevated` post-spawn set).
+        // `executable()` command routes here (fd >= 3 on an elevated child is already rejected by
+        // the Windows gate), and dropping the raw child without the report would lose its elevation
+        // state (mirrors the sync `spawn_elevated` post-spawn set).
         let mut child = windows_raw::spawn_raw(cmd, fds, kill_on_drop)?;
         child.set_elevation(elevation_report);
         return Ok(child);
