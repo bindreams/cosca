@@ -47,6 +47,9 @@ pub(crate) struct RawAsyncChild {
     /// Memoized once the child has exited, so a second `wait`/`try_wait` is immediate and cannot
     /// re-read a status off a (post-close) recycled handle.
     exited: Option<ExitStatus>,
+    /// A runas (UAC-elevated) child a lower-integrity parent may be unable to terminate: `Drop`
+    /// tears it down best-effort WITHOUT blocking, so an unkillable elevated child never hangs.
+    runas: bool,
     #[cfg(test)]
     observer: Option<WaitObserver>,
 }
@@ -57,6 +60,19 @@ impl RawAsyncChild {
             proc: Arc::new(proc),
             pid,
             exited: None,
+            runas: false,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+
+    /// A runas (UAC-elevated) child, torn down best-effort (never blocking) on `Drop`.
+    pub(crate) fn new_runas(proc: OwnedHandle, pid: u32) -> RawAsyncChild {
+        RawAsyncChild {
+            proc: Arc::new(proc),
+            pid,
+            exited: None,
+            runas: true,
             #[cfg(test)]
             observer: None,
         }
@@ -162,10 +178,31 @@ impl RawAsyncChild {
         }
     }
 
-    /// Synchronous kill-then-block-until-exit for `Drop` (no reactor, no `wait()` future in
-    /// flight). The child is `TerminateProcess`d so the wait returns at once.
+    /// Synchronous kill-then-reap for `Drop` (no reactor, no `wait()` future in flight). A plain
+    /// child is `TerminateProcess`d so the wait returns at once. A runas child a lower-integrity
+    /// parent cannot terminate is torn down best-effort WITHOUT blocking (universal teardown).
     pub(crate) fn reap_blocking(&mut self) {
         if self.exited.is_some() {
+            return;
+        }
+        if self.runas {
+            // SAFETY: our live, owned process handle.
+            match unsafe { TerminateProcess(self.handle(), 1) } {
+                Ok(()) => {
+                    // It will exit; the wait is bounded by a real termination event.
+                    // SAFETY: our live, owned process handle.
+                    let _ = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
+                }
+                Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+                    if !matches!(self.try_wait(), Ok(Some(_))) {
+                        log::warn!(
+                            "elevated async child {} could not be terminated on drop; leaving it running",
+                            self.pid
+                        );
+                    }
+                }
+                Err(e) => log::warn!("terminating elevated async child {} on drop failed: {e:?}", self.pid),
+            }
             return;
         }
         let _ = self.start_kill();

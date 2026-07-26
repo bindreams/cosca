@@ -111,6 +111,30 @@ impl Command {
         self
     }
 
+    /// Run the child elevated — mirrors [`subprocess::Command::elevate`](crate::Command::elevate).
+    pub fn elevate(&mut self) -> &mut Command {
+        self.inner.elevate();
+        self
+    }
+    /// Select the elevation backend — mirrors
+    /// [`elevation_backend`](crate::Command::elevation_backend).
+    pub fn elevation_backend(&mut self, backend: crate::elevation::Backend) -> &mut Command {
+        self.inner.elevation_backend(backend);
+        self
+    }
+    /// Select how the backend authenticates — mirrors
+    /// [`elevation_auth`](crate::Command::elevation_auth).
+    pub fn elevation_auth(&mut self, auth: crate::elevation::Auth) -> &mut Command {
+        self.inner.elevation_auth(auth);
+        self
+    }
+    /// Set the env sanitizer applied before forwarding to the backend — mirrors
+    /// [`sanitize_env`](crate::Command::sanitize_env).
+    pub fn sanitize_env(&mut self, sanitizer: crate::elevation::EnvSanitizer) -> &mut Command {
+        self.inner.sanitize_env(sanitizer);
+        self
+    }
+
     /// Spawn the child. Spawn is synchronous; the returned `Child`'s waits are async.
     ///
     /// # Runtime

@@ -116,10 +116,9 @@ impl EnvSanitizer {
     }
 
     /// Partition `env` into `(kept, stripped)`, both sorted by key.
-    // Not yet called by production code: only tests drive `apply` today; the sync/async
-    // POSIX spawn arms that read `ElevationRequest::sanitizer` land in later elevation-plan
-    // tasks (see the sibling `#[allow(dead_code)]`s in `src/elevation.rs`).
-    #[allow(dead_code)]
+    // Consumed by the POSIX spawn arms via `posix::rewrite` (sync + async); the Windows elevation
+    // path sanitizes nothing here, so it is dead on non-unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn apply(&self, env: Vec<(OsString, OsString)>) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
         let mut kept: Vec<(OsString, OsString)> = Vec::new();
         let mut stripped: Vec<OsString> = Vec::new();

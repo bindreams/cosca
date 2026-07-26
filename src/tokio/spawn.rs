@@ -25,8 +25,87 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         )));
     }
 
-    let mut fds = std::mem::take(cmd.fds_mut());
     let kill_on_drop = cmd.kill_on_drop_flag();
+
+    // Elevation runs before fds are taken (mirrors sync). POSIX rewrites into a DERIVED command and
+    // recurses (the derived command has elevation disabled → no re-entry); Windows builds the async
+    // Child here (tokio::child::Child::from_parts is pub(super)).
+    let mut elevation_report: Option<crate::elevation::ElevationReport> = None;
+    if cmd.elevation_request().enabled {
+        #[cfg(windows)]
+        {
+            use crate::elevation::windows::{launch_runas, RunasOutcome};
+            match launch_runas(cmd)? {
+                RunasOutcome::Launched { proc, pid, id, report } => {
+                    let raw = windows_raw::RawAsyncChild::new_runas(proc, pid);
+                    let mut child = Child::from_parts(
+                        ProcSource::Raw(raw),
+                        id,
+                        crate::containment::Attached::None,
+                        kill_on_drop,
+                        crate::containment::Containment::None,
+                        super::child::FdPipes::new(),
+                        std::collections::BTreeMap::new(),
+                    );
+                    child.set_elevation(Some(report));
+                    return Ok(child);
+                }
+                RunasOutcome::AlreadyElevated => {
+                    elevation_report = Some(crate::elevation::already_elevated_report(
+                        crate::elevation::ElevatedStdio::Passthrough,
+                    ));
+                    // fall through to the normal async spawn of the (already-elevated) cmd
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            let rw = crate::elevation::posix::rewrite(cmd)?;
+            let backend_path = rw.backend_path;
+            if let Some(mut derived) = rw.derived {
+                // Same shared honest remap as the sync path (parity-by-construction): remap a
+                // derived-backend exec failure to BackendUnavailable ONLY when the backend path is
+                // the culprit. An already-elevated derived (sanitized original) has no backend path.
+                let child = spawn(&mut derived);
+                let mut child = match backend_path.as_deref() {
+                    Some(bp) => child.map_err(|e| crate::elevation::remap_derived_spawn_error(e, bp))?,
+                    None => child?,
+                };
+                // Set the report BEFORE handling the deferred password: a cleanup kill() in the
+                // write-failure path must see the elevated state so an EPERM maps to the typed
+                // Unkillable rather than leaking a raw Io.
+                child.set_elevation(rw.report);
+                if let Some(pw) = rw.password_write {
+                    if let Err(write_err) = pw.write_after_spawn() {
+                        // Do NOT orphan the running elevated child on a genuine write failure:
+                        // kill + reap, folding the teardown outcome into the error detail. A
+                        // successful kill() (SIGKILL, uncatchable) is followed by a BLOCKING reap
+                        // (try_wait cannot reap a just-killed child, so it would leak a zombie); an
+                        // Err kill() (e.g. Unkillable) can't be reaped, so fall back to a
+                        // non-blocking try_wait() and note the child may still be running.
+                        let kill_note = match child.kill() {
+                            Ok(()) => {
+                                child.reap_blocking();
+                                "the elevated child was terminated".to_string()
+                            }
+                            Err(e) => {
+                                let _ = child.try_wait();
+                                format!("the elevated child could not be terminated ({e})")
+                            }
+                        };
+                        return Err(Error::Elevation {
+                            kind: crate::error::ElevationErrorKind::AuthFailed,
+                            detail: format!("{write_err}; {kill_note}"),
+                        });
+                    }
+                }
+                return Ok(child);
+            }
+            elevation_report = rw.report; // AlreadyElevated: fall through
+        }
+    }
+
+    let mut fds = std::mem::take(cmd.fds_mut());
 
     // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend
     // (Plan 12): an `executable()` loaded independently of argv[0], OR arbitrary descriptors
@@ -35,7 +114,12 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // the std/tokio path, whose `prepare` applies containment for argv/commandline spawns.
     #[cfg(windows)]
     if cmd.executable_path().is_some() || fds.keys().any(|f| f.raw() >= 3) {
-        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
+        // Attach the report on the AlreadyElevated fall-through too — an already-elevated
+        // `executable()`/fd>=3 command routes here, and dropping the raw child without the report
+        // would lose its elevation state (mirrors the sync `spawn_elevated` post-spawn set).
+        let mut child = windows_raw::spawn_raw(cmd, fds, kill_on_drop)?;
+        child.set_elevation(elevation_report);
+        return Ok(child);
     }
 
     let std_cmd = build_std_command(cmd)?;
@@ -254,7 +338,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         super::child::FdPipes::new()
     };
 
-    Ok(Child::from_parts(
+    let mut child = Child::from_parts(
         ProcSource::Tokio(child),
         id,
         attached,
@@ -262,7 +346,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         containment,
         pipes,
         owned_std,
-    ))
+    );
+    child.set_elevation(elevation_report);
+    Ok(child)
 }
 
 #[cfg(windows)]

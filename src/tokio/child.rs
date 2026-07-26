@@ -43,6 +43,9 @@ pub struct Child {
     /// Our-owned parent ends of piped std-slot MERGE TARGETS (the spawn pre-pass owns those
     /// pipes; tokio's internal ones cannot be shared), keyed by the target slot.
     owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
+    /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
+    /// `Child`). Drives the universal-teardown kill mapping.
+    elevation: Option<crate::elevation::ElevationReport>,
 }
 
 impl Child {
@@ -64,7 +67,34 @@ impl Child {
             containment,
             pipes,
             owned_std,
+            elevation: None,
         }
+    }
+
+    /// Attach the elevation report — set by the spawn arms before the deferred password write, so
+    /// a cleanup `kill` in the write-failure path already sees the elevated state.
+    pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
+        self.elevation = report;
+    }
+    /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
+    /// [`Child::elevation`](crate::Child::elevation)).
+    pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {
+        self.elevation.clone()
+    }
+    /// Is this a wrapper-elevated child a plain parent may be unable to signal?
+    /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
+    fn is_elevated_wrapper(&self) -> bool {
+        matches!(
+            self.elevation.as_ref().map(|r| &r.via),
+            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
+        )
+    }
+    /// Blocking kill-then-reap used by the POSIX spawn-error cleanup path (a sync context — no
+    /// reactor `await` available), delegating to the same per-backend primitive `Drop` uses.
+    /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
+    #[cfg(unix)]
+    pub(super) fn reap_blocking(&mut self) {
+        self.proc.reap_now_on_drop(self.id.pid());
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -327,7 +357,12 @@ impl Child {
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
-        self.proc.start_kill()
+        // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
+        // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
+        match self.proc.start_kill() {
+            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
+            other => other,
+        }
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
