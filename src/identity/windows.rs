@@ -32,6 +32,17 @@ pub(super) fn creation_token(handle: HANDLE) -> Option<StartToken> {
     Some(StartToken::from_raw(ft))
 }
 
+/// Build a `ProcessId` from an already-open Windows process handle and its pid,
+/// reusing the creation-token read. Avoids a second `OpenProcess` (which can fail
+/// and would otherwise force dropping a live elevated child).
+// Not yet called by production code: Task 14 wires this to the runas child's owned
+// handle (deriving identity without a second OpenProcess on a possibly-elevated child).
+#[allow(dead_code)]
+pub(crate) fn windows_identity_from_handle(handle: HANDLE, pid: RawPid) -> Option<crate::identity::ProcessId> {
+    let start = creation_token(handle)?;
+    Some(crate::identity::ProcessId { pid, start })
+}
+
 pub(super) fn start_token(pid: RawPid) -> Option<StartToken> {
     // PROCESS_QUERY_LIMITED_INFORMATION works without elevation for most
     // processes (incl. services). SAFETY: OpenProcess tolerates an invalid pid
