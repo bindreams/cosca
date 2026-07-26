@@ -268,12 +268,24 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     };
     assert!(pid_is_alive(payload_pid), "payload should be running before the kill");
 
-    // An unprivileged parent cannot signal its root child: a typed Unkillable, not a raw Io.
+    // kill() outcome depends on the backend's process topology:
+    //  - direct-exec backends (doas, run0, sudo WITHOUT `Defaults use_pty`) make the tracked
+    //    child the root process itself, so an unprivileged parent's signal is EPERM → the typed
+    //    `Unkillable`.
+    //  - sudo WITH `use_pty` (increasingly the distro default) keeps the tracked child as sudo's
+    //    same-uid monitor and runs root under a pty grandchild, so kill() SUCCEEDS on the monitor.
+    //    Tearing down that grandchild is the deferred "un-killable elevated child / sudo pty
+    //    monitor" teardown contract (TODO.md), out of this plan's scope.
+    // Either way is contract-correct here; the load-bearing Decision-A guarantee this test exists
+    // for is that neither kill() nor the Drop below BLOCKS. A raw untyped Io on the EPERM path
+    // would be the real defect.
     match child.kill() {
-        Err(subprocess::error::Error::Elevation { kind, .. }) => {
-            assert_eq!(kind, subprocess::error::ElevationErrorKind::Unkillable);
-        }
-        other => panic!("expected Unkillable, got {other:?}"),
+        Ok(()) => {}
+        Err(subprocess::error::Error::Elevation {
+            kind: subprocess::error::ElevationErrorKind::Unkillable,
+            ..
+        }) => {}
+        other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
     }
     // Dropping it must return (kill_on_drop is best-effort, non-blocking) — the test itself
     // completing is the assertion. Leave the child; the harness/OS reaps it.
