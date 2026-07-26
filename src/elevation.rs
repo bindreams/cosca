@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use zeroize::Zeroize;
 
 pub mod plan;
+#[cfg(unix)]
+#[path = "elevation/posix.rs"]
+pub mod posix;
 pub mod sanitize;
 
 pub use sanitize::EnvSanitizer;
