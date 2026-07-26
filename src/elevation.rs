@@ -15,6 +15,23 @@ pub mod sanitize;
 
 pub use sanitize::EnvSanitizer;
 
+/// Is the CURRENT process already elevated (root on Unix, an elevated token on
+/// Windows)? A free function — no spawn needed.
+pub fn is_elevated() -> bool {
+    #[cfg(unix)]
+    {
+        posix::is_elevated()
+    }
+    #[cfg(windows)]
+    {
+        windows::is_elevated()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 /// Which elevation program runs. `Auto` (default) detects among the CLI backends
 /// only — order `sudo` > `doas`. `run0` and `pkexec`/graphical elevation are
 /// explicit-only (`run0` spawns a PID-1-parented unit, not our descendant; a

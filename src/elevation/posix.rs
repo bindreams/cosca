@@ -2,7 +2,9 @@
 //! construction, non-destructive command rewrite, and the controlling-terminal probe.
 
 use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 
+use super::plan::{BackendSet, Host, Os};
 use super::{Auth, Backend};
 use crate::error::Error;
 
@@ -121,6 +123,74 @@ pub(crate) fn build_argv(
 fn program_starts_with_dash(program: &OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt;
     program.as_bytes().first() == Some(&b'-')
+}
+
+pub(super) fn is_elevated() -> bool {
+    // SAFETY: geteuid has no preconditions and never fails.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Does this session have a controlling terminal? Probes `/dev/tty` directly —
+/// which resolves to the controlling terminal regardless of stdin redirection and
+/// fails once a process has none (e.g. after `setsid`). `O_NONBLOCK` avoids
+/// blocking on a carrier-less serial console; the probe only needs the open to
+/// succeed. `isatty(stdin)` answers a different question and is wrong for both cases.
+#[doc(hidden)]
+pub fn controlling_terminal_present() -> bool {
+    // SAFETY: open/close of a fixed path; the fd is closed on the success path.
+    unsafe {
+        let fd = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        if fd < 0 {
+            return false;
+        }
+        libc::close(fd);
+        true
+    }
+}
+
+/// A best-effort HINT that `path` is an executable file for the EFFECTIVE ids.
+/// `faccessat(AT_EACCESS)` answers for the ids that will actually exec (unlike
+/// `access`, which uses the real ids); a real exec failure is still surfaced as
+/// `BackendUnavailable` at spawn time.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: faccessat with a valid NUL-terminated path; a read-only permission query.
+    path.is_file()
+        && unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
+}
+
+/// Resolve `program` to its ABSOLUTE path on `$PATH`.
+pub(super) fn resolve_on_path(program: &str) -> Option<PathBuf> {
+    resolve_in_path_var(&std::env::var_os("PATH")?, program)
+}
+
+/// PURE path resolution over an explicit PATH value: check the exec bit and SKIP
+/// empty elements (an empty element is CWD — never resolve a backend there).
+pub(super) fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
+    std::env::split_paths(path_var).find_map(|dir| {
+        if dir.as_os_str().is_empty() {
+            return None; // empty element = CWD; never resolve here
+        }
+        let cand = dir.join(program);
+        is_executable(&cand).then_some(cand)
+    })
+}
+
+pub(super) fn detect() -> Host {
+    Host {
+        elevated: is_elevated(),
+        has_tty: controlling_terminal_present(),
+        available: BackendSet {
+            run0: resolve_on_path("run0"),
+            sudo: resolve_on_path("sudo"),
+            doas: resolve_on_path("doas"),
+            pkexec: resolve_on_path("pkexec"),
+        },
+        os: Os::Unix,
+    }
 }
 
 #[cfg(test)]

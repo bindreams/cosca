@@ -68,13 +68,17 @@ pub enum Transition {
 
 impl Host {
     pub fn detect() -> Host {
-        // A self-contained body so the crate compiles on every platform; the
-        // per-OS detect dispatch replaces it once the effect layers land.
-        Host {
-            elevated: false,
-            has_tty: false,
-            available: BackendSet::default(),
-            os: if cfg!(windows) { Os::Windows } else { Os::Unix },
+        #[cfg(unix)]
+        {
+            super::posix::detect()
+        }
+        #[cfg(windows)]
+        {
+            super::windows::detect()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Host { elevated: false, has_tty: false, available: BackendSet::default(), os: Os::Unix }
         }
     }
 

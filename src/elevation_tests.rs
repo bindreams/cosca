@@ -143,3 +143,19 @@ fn elevated_stdio_stdin_consumed_variant_exists() {
     assert_ne!(ElevatedStdio::StdinConsumed, ElevatedStdio::Passthrough);
     assert_ne!(ElevatedStdio::StdinConsumed, ElevatedStdio::OwnConsole);
 }
+
+#[cfg(unix)]
+#[test]
+fn is_elevated_matches_effective_uid_ground_truth() {
+    // Never assume ambient privilege; compare against an independent syscall.
+    // SAFETY: geteuid has no preconditions and never fails.
+    let euid0 = unsafe { libc::geteuid() } == 0;
+    assert_eq!(super::is_elevated(), euid0, "is_elevated disagreed with geteuid()==0");
+}
+
+#[cfg(unix)]
+#[test]
+fn detect_reports_unix_os() {
+    let h = super::plan::Host::detect();
+    assert_eq!(h.os, super::plan::Os::Unix);
+}

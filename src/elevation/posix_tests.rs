@@ -104,3 +104,51 @@ fn terminator_protects_a_program_with_equals_or_leading_dash() {
     let dash = build_argv(Backend::Doas, OsStr::new("/usr/bin/doas"), &Auth::Interactive, OsStr::new("-prog"), &[], &[]).unwrap();
     assert_eq!(dash, s(&["/usr/bin/doas", "--", "-prog"]));
 }
+
+#[cfg(unix)]
+#[test]
+fn resolve_in_path_var_finds_an_executable_in_a_temp_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("sudo");
+    std::fs::write(&f, b"#!/bin/sh\ntrue\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let got = super::resolve_in_path_var(dir.path().as_os_str(), "sudo");
+    assert_eq!(got, Some(f));
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_skips_a_non_executable_same_named_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("sudo");
+    std::fs::write(&f, b"not exec").unwrap(); // mode 0644 — no exec bit
+    let got = super::resolve_in_path_var(dir.path().as_os_str(), "sudo");
+    assert_eq!(got, None, "a non-executable file named sudo must be skipped");
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_path_element_is_not_resolved_from_cwd() {
+    // `resolve_in_path_var` is PURE (it takes the PATH string as a parameter), so
+    // this is tested directly against explicit PATH values — no process-global
+    // chdir, and thus no cross-test race and no leaked CWD on a mid-test panic.
+
+    // A single empty PATH element must be skipped, never treated as "." (CWD).
+    assert_eq!(super::resolve_in_path_var(OsStr::new(""), "sudo"), None);
+
+    // A mid-string empty element is skipped too: put a non-matching dir, then the
+    // empty element, then the real match — so the empty branch is actually exercised
+    // (matching in an earlier element would let a skip bug pass silently).
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sudo = dir.path().join("sudo");
+    std::fs::write(&sudo, b"#!/bin/sh\ntrue\n").unwrap();
+    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!("/nonexistent::{}", dir.path().display());
+    let got = super::resolve_in_path_var(OsStr::new(&path_var), "sudo");
+    assert_eq!(got, Some(sudo), "a mid-string empty PATH element must be skipped, not resolved");
+
+    // A PATH consisting only of empty elements resolves nothing.
+    assert_eq!(super::resolve_in_path_var(OsStr::new(":"), "sudo"), None);
+}
