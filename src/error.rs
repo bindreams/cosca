@@ -24,6 +24,33 @@ pub enum QuoteErrorKind {
     TrailingBackslash,
 }
 
+/// Runtime elevation failures — "could work here but failed now" (contrast
+/// [`Error::Unsupported`], which is "can never work on this platform").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ElevationErrorKind {
+    /// The requested (or auto-detected) backend is not on PATH, or the resolved
+    /// backend could not be executed.
+    #[error("no usable elevation backend is available")]
+    BackendUnavailable,
+    /// Wrong password, or `sudo -n` found no cached credential, or the launch failed.
+    #[error("elevation authentication failed")]
+    AuthFailed,
+    /// The UAC / GUI prompt was cancelled by the user (Windows `ERROR_CANCELLED`).
+    #[error("elevation prompt was declined")]
+    AuthDeclined,
+    /// Interactive auth requested but there is no controlling terminal to prompt on.
+    #[error("no controlling terminal for interactive elevation")]
+    NoTty,
+    /// An unprivileged parent could not signal its elevated child (EPERM on POSIX,
+    /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
+    #[error("could not terminate an elevated child: permission denied")]
+    Unkillable,
+    /// The elevated child launched, but the parent could not resolve its identity to
+    /// manage it. Whether it was terminated is reported in the error `detail`.
+    #[error("elevated child launched but could not be tracked")]
+    Untracked,
+}
+
 /// The crate's top-level error type. Grows as later plans add fallible operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -41,6 +68,9 @@ pub enum Error {
     /// A containment mechanism could not be established or torn down.
     #[error("process containment failed: {detail}")]
     Containment { detail: String },
+    /// Privilege elevation could not be completed at runtime.
+    #[error("elevation failed ({kind}): {detail}")]
+    Elevation { kind: ElevationErrorKind, detail: String },
 }
 
 #[cfg(test)]

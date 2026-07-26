@@ -29,15 +29,40 @@ const INFINITE: u32 = 0xFFFF_FFFF;
 pub(crate) struct RawChild {
     proc: OwnedHandle,
     pid: u32,
+    /// A `runas`-elevated (higher-integrity) child a lower-integrity parent may be
+    /// unable to `PROCESS_TERMINATE`. Its kill/teardown must never block on it.
+    runas: bool,
 }
 
 impl RawChild {
     pub(crate) fn new(proc: OwnedHandle, pid: u32) -> RawChild {
-        RawChild { proc, pid }
+        RawChild {
+            proc,
+            pid,
+            runas: false,
+        }
+    }
+
+    /// A `runas`-elevated child: a higher-integrity process a lower-integrity parent
+    /// may be unable to `PROCESS_TERMINATE`. Its kill/teardown never block on it.
+    pub(crate) fn new_runas(proc: OwnedHandle, pid: u32) -> RawChild {
+        RawChild { proc, pid, runas: true }
     }
 
     fn handle(&self) -> HANDLE {
         HANDLE(self.proc.as_raw_handle())
+    }
+
+    /// Does the CALLER hold `PROCESS_TERMINATE` on this child? A STATIC permission answer,
+    /// not a racing `try_wait`: because we still hold `self.proc`, the process object — and
+    /// thus `self.pid` — cannot be reused while we probe. `OpenProcess(PROCESS_TERMINATE)`
+    /// SUCCEEDS iff we truly have terminate rights; `ACCESS_DENIED` means a genuinely
+    /// higher-integrity child. This disambiguates a real denial from the teardown-window
+    /// race where `TerminateProcess` reports `ACCESS_DENIED` on a child exiting on its own.
+    fn can_terminate(&self) -> bool {
+        // SAFETY: our live owned handle pins the process object, so `self.pid` still names
+        // THIS process; OpenProcess tolerates failure (returns Err).
+        super::can_terminate(self.pid)
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -93,17 +118,50 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => Ok(()),
-            // TerminateProcess reports ERROR_ACCESS_DENIED once the target is already exiting or
-            // exited. We hold a full-access handle to our OWN child, so a real permission failure
-            // is impossible — the denial means its exit is already underway and guaranteed. BLOCK
-            // on that exit (a genuine external event, never a timer) to confirm it, rather than a
-            // non-blocking `try_wait` that races the OS teardown window where TerminateProcess
-            // reports the denial *before* the process object is signaled (a spurious kill error).
+            // TerminateProcess reports ERROR_ACCESS_DENIED in two distinct situations: (a) the
+            // target is already exiting/exited (the OS teardown window signals the denial before
+            // the process object is signaled — a spurious kill error), or (b) a runas child is
+            // genuinely higher-integrity than us. A static `can_terminate` probe (a second
+            // OpenProcess for PROCESS_TERMINATE, pid-reuse-safe because we still hold the handle)
+            // separates the two WITHOUT racing a `try_wait`.
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                self.wait()?;
-                Ok(())
+                if self.runas && !self.can_terminate() {
+                    // (b) A genuinely higher-integrity runas child we cannot terminate. Do NOT
+                    // block in wait(): surface the denial.
+                    Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32))
+                } else {
+                    // (a) Our own CreateProcessW child, or a runas child we DO have terminate
+                    // rights on: the denial means exit is already underway. BLOCK on that real
+                    // event (never a timer) to confirm it.
+                    self.wait()?;
+                    Ok(())
+                }
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Best-effort `kill_on_drop` teardown that NEVER blocks on an unkillable runas child.
+    /// Non-runas (or a runas child we can terminate): kill, then reap via a blocking wait on
+    /// the real exit event. A genuinely higher-integrity runas child (static `can_terminate`
+    /// probe is false on the `ACCESS_DENIED` path): LOG and move on — never block.
+    pub(crate) fn teardown_on_drop(&self) {
+        // SAFETY: `handle` is our live, owned process handle.
+        match unsafe { TerminateProcess(self.handle(), 1) } {
+            Ok(()) => {
+                let _ = self.wait();
+            }
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+                if self.runas && !self.can_terminate() {
+                    log::warn!(
+                        "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
+                        self.pid
+                    );
+                } else {
+                    let _ = self.wait();
+                }
+            }
+            Err(e) => log::warn!("terminating child {} on drop failed: {e:?}", self.pid),
         }
     }
 }
@@ -199,3 +257,7 @@ pub(crate) fn create_process(
     }
     Ok((proc, pi.dwProcessId))
 }
+
+#[cfg(test)]
+#[path = "proc_tests.rs"]
+mod proc_tests;

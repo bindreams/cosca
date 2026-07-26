@@ -15,6 +15,8 @@ tokio = ["dep:tokio"]
 thiserror = "2"
 shared_child = { version = "1", features = ["timeout"] }
 log = "0.4"
+# Zeroize the password held for Auth::Stdin so it never lingers in freed memory.
+zeroize = "1"
 # `macros` is required by the library, not only tests: `communicate` uses `tokio::try_join!`,
 # which is gated behind tokio's `macros` feature. `net` is solely for `AsyncFd` (the
 # reactor-native death-watch); `time` solely for the grace bound on it. `sync` backs the
@@ -38,11 +40,16 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
+    "Win32_System_SystemServices",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["signal", "process", "event"] }
+nix = { version = "0.31", features = ["signal", "process", "event", "term"] }
 command-fds = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]

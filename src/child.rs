@@ -42,6 +42,7 @@ pub struct Child {
     kill_on_drop: bool,
     containment: Containment,
     attached: crate::containment::Attached,
+    elevation: Option<crate::elevation::ElevationReport>,
 }
 
 impl Child {
@@ -60,7 +61,20 @@ impl Child {
             kill_on_drop,
             containment,
             attached,
+            elevation: None,
         }
+    }
+
+    // Consumed by the sync spawn arms (POSIX `spawn`, Windows `spawn_elevated`); the async
+    // arm follows in a later task.
+    pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
+        self.elevation = report;
+    }
+
+    /// The achieved elevation state, or `None` if elevation was not requested
+    /// (mirrors [`Child::containment`]).
+    pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {
+        self.elevation.clone()
     }
 
     /// The tree-teardown mechanism for this child: a nested member reports
@@ -96,11 +110,23 @@ impl Child {
         self.proc.try_wait().map_err(Error::Io)
     }
 
+    /// Is this a wrapper-elevated child a plain parent may be unable to signal?
+    /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
+    fn is_elevated_wrapper(&self) -> bool {
+        matches!(
+            self.elevation.as_ref().map(|r| &r.via),
+            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
+        )
+    }
+
     /// Hard-kill the process. Returns `Ok(())` if already dead.
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
-        self.proc.kill().map_err(Error::Io)
+        // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed `Unkillable`.
+        self.proc
+            .kill()
+            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -112,7 +138,10 @@ impl Child {
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
-        let backstop = self.proc.kill().map_err(Error::Io);
+        let backstop = self
+            .proc
+            .kill()
+            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
             log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
         }
@@ -205,11 +234,11 @@ impl Drop for Child {
         if !self.kill_on_drop {
             return; // detached / opted out
         }
-        // Hard-kill the contained tree (if any) then also the direct child, then reap.
-        // Order matters on Unix: kill BEFORE wait (reaping frees the PID).
+        // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
+        // subtree — then tear the direct child down. The dispatcher preserves the Unix
+        // kill-before-wait order and NEVER blocks on an unkillable elevated child.
         let _ = self.attached.hard_kill();
-        let _ = self.proc.kill();
-        let _ = self.proc.wait();
+        self.proc.teardown_on_drop();
     }
 }
 

@@ -196,3 +196,56 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.mode, Some(ContainMode::TreeWalk));
     assert_eq!(req.nesting, Nesting::Opaque);
 }
+
+#[test]
+fn elevate_enables_with_defaults() {
+    let mut c = Command::new();
+    c.args(["id", "-u"]).elevate();
+    let req = c.elevation_request();
+    assert!(req.enabled);
+    assert_eq!(req.backend, crate::elevation::Backend::Auto);
+    assert!(matches!(req.auth, crate::elevation::Auth::Interactive));
+}
+
+#[test]
+fn elevation_overrides_apply_and_enable() {
+    let mut c = Command::new();
+    c.arg("id")
+        .elevation_backend(crate::elevation::Backend::Doas)
+        .elevation_auth(crate::elevation::Auth::NonInteractive);
+    let req = c.elevation_request();
+    assert!(req.enabled);
+    assert_eq!(req.backend, crate::elevation::Backend::Doas);
+    assert!(matches!(req.auth, crate::elevation::Auth::NonInteractive));
+}
+
+#[test]
+fn command_without_elevate_is_disabled() {
+    let c = Command::new();
+    assert!(!c.elevation_request().enabled);
+}
+
+// output()/status()/read() each force their own stdin default (null or inherit) before
+// spawning. Auth::Stdin needs SOLE ownership of fd0 to feed the backend the password, so
+// that internal default must not trip the same "caller-configured stdin" rejection a real
+// user-supplied stdin would — that would make Auth::Stdin unusable via any of the three
+// convenience methods, a regression this pins at the builder level (no live spawn needed).
+#[test]
+fn default_stdin_is_not_forced_when_auth_stdin_reserves_fd0() {
+    let mut c = Command::new();
+    c.args(["id"])
+        .elevation_auth(crate::elevation::Auth::Stdin(crate::elevation::Secret::new("pw")));
+    c.apply_default_stdin(Stdio::null()).unwrap();
+    assert!(
+        c.fds().get(&Fd::STDIN).is_none(),
+        "Auth::Stdin must keep fd0 unconfigured until the elevation rewrite wires its password channel"
+    );
+}
+
+#[test]
+fn default_stdin_is_forced_without_auth_stdin() {
+    let mut c = Command::new();
+    c.args(["id"]);
+    c.apply_default_stdin(Stdio::null()).unwrap();
+    assert!(matches!(c.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
+}

@@ -22,6 +22,7 @@ pub struct Command {
     cwd: Option<PathBuf>,
     kill_on_drop: bool,
     contain: ContainRequest,
+    elevation: crate::elevation::ElevationRequest,
 }
 
 /// An environment variable operation, recorded in order.
@@ -42,6 +43,7 @@ impl Default for Command {
             cwd: None,
             kill_on_drop: true,
             contain: ContainRequest::default(),
+            elevation: crate::elevation::ElevationRequest::default(),
         }
     }
 }
@@ -221,9 +223,62 @@ impl Command {
         self.contain
     }
 
+    /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +
+    /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
+    /// CHILD, never this process.
+    pub fn elevate(&mut self) -> &mut Command {
+        self.elevation.enabled = true;
+        self
+    }
+
+    /// Force a specific elevation backend (implies `.elevate()`).
+    pub fn elevation_backend(&mut self, backend: crate::elevation::Backend) -> &mut Command {
+        self.elevation.enabled = true;
+        self.elevation.backend = backend;
+        self
+    }
+
+    /// Choose the elevation auth strategy (implies `.elevate()`).
+    pub fn elevation_auth(&mut self, auth: crate::elevation::Auth) -> &mut Command {
+        self.elevation.enabled = true;
+        self.elevation.auth = auth;
+        self
+    }
+
+    /// Replace the env sanitizer applied to explicitly-forwarded vars (implies `.elevate()`).
+    pub fn sanitize_env(&mut self, sanitizer: crate::elevation::EnvSanitizer) -> &mut Command {
+        self.elevation.enabled = true;
+        self.elevation.sanitizer = sanitizer;
+        self
+    }
+
+    // Consumed in production by the POSIX elevation rewrite (`cfg(unix)`);
+    // `elevation_request`/`fds` read the request, `set_input_argv`/`set_env_ops`/
+    // `set_contain` build the DERIVED command. Still dead on non-unix (the Windows
+    // elevation arm lands in a later elevation-plan task), so the allow is gated there.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
+        &self.elevation
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
+        self.input = CommandInput::Argv(argv);
+        self.executable = None;
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
+        self.env_ops = ops;
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn set_contain(&mut self, req: ContainRequest) {
+        self.contain = req;
+    }
+
     // ---- crate-internal accessors for the spawn engine (Task 4) -------------
-    // `fds` is read only by command_tests; spawn uses `fds_mut` (std::mem::take).
-    #[allow(dead_code)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn fds(&self) -> &BTreeMap<Fd, ResolvedStdio> {
         &self.fds
     }
@@ -246,9 +301,22 @@ impl Command {
 }
 
 impl Command {
+    /// Set `default` on fd0 UNLESS `Auth::Stdin` already claims it. The three convenience
+    /// methods below each force their own stdin default; `Auth::Stdin` needs sole,
+    /// unconflicting ownership of fd0 to feed the backend the password, and the elevation
+    /// rewrite rejects ANY caller-configured fd0 as ambiguous (real content could be lost).
+    /// A convenience method's own default is not a real caller intent to preserve, so it is
+    /// skipped here rather than tripping that same rejection.
+    fn apply_default_stdin(&mut self, default: crate::Stdio) -> Result<&mut Command, Error> {
+        if !matches!(self.elevation.auth, crate::elevation::Auth::Stdin(_)) {
+            self.stdin(default)?;
+        }
+        Ok(self)
+    }
+
     /// Run to completion capturing stdout+stderr (stdin is connected to null).
     pub fn output(&mut self) -> Result<crate::Output, Error> {
-        self.stdin(crate::Stdio::null())?;
+        self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
         self.stderr(crate::Stdio::pipe())?;
         let mut child = self.spawn()?;
@@ -259,7 +327,7 @@ impl Command {
     pub fn status(&mut self) -> Result<crate::ExitStatus, Error> {
         // Force inherit so a caller who previously called .stdout(pipe()) does
         // not get a pump-free wait() that deadlocks once the pipe buffer fills.
-        self.stdin(crate::Stdio::inherit())?;
+        self.apply_default_stdin(crate::Stdio::inherit())?;
         self.stdout(crate::Stdio::inherit())?;
         self.stderr(crate::Stdio::inherit())?;
         let child = self.spawn()?;
@@ -269,7 +337,7 @@ impl Command {
     /// Run to completion capturing stdout as a UTF-8 String (stdin=null,
     /// stderr inherited). Errors on invalid UTF-8; output is verbatim (no trim).
     pub fn read(&mut self) -> Result<String, Error> {
-        self.stdin(crate::Stdio::null())?;
+        self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
         // stderr left at its default (inherit).
         let mut child = self.spawn()?;

@@ -119,6 +119,18 @@ pub(crate) fn windows_handle_is(handle: windows::Win32::Foundation::HANDLE, id: 
     backend::creation_token(handle) == Some(id.start)
 }
 
+/// Build a `ProcessId` from an already-open Windows handle + its pid, reusing the
+/// creation-token read (no second `OpenProcess`). Forwards to the private backend so
+/// the runas launch can derive identity from the owned handle of a possibly-elevated
+/// child without re-opening it by pid.
+#[cfg(windows)]
+pub(crate) fn windows_identity_from_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: RawPid,
+) -> Option<ProcessId> {
+    backend::windows_identity_from_handle(handle, pid)
+}
+
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;
