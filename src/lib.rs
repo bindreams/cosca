@@ -5,6 +5,7 @@
 //! the foundation plan task-by-task.
 
 pub mod containment;
+pub mod elevation;
 pub mod error;
 pub mod identity;
 pub mod quote;
