@@ -252,34 +252,33 @@ impl Command {
         self
     }
 
-    // `elevation_request` is read only by command_tests outside this module; the
-    // spawn dispatch that reads it in production lands in a later elevation-plan
-    // task. `set_input_argv`/`set_env_ops`/`set_contain` are mutators for the
-    // DERIVED command the POSIX rewrite builds (Task 11) — unused until then.
-    #[allow(dead_code)]
+    // Consumed in production by the POSIX elevation rewrite (`cfg(unix)`);
+    // `elevation_request`/`fds` read the request, `set_input_argv`/`set_env_ops`/
+    // `set_contain` build the DERIVED command. Still dead on non-unix (the Windows
+    // elevation arm lands in a later elevation-plan task), so the allow is gated there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
         self.input = CommandInput::Argv(argv);
         self.executable = None;
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
         self.env_ops = ops;
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_contain(&mut self, req: ContainRequest) {
         self.contain = req;
     }
 
     // ---- crate-internal accessors for the spawn engine (Task 4) -------------
-    // `fds` is read only by command_tests; spawn uses `fds_mut` (std::mem::take).
-    #[allow(dead_code)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn fds(&self) -> &BTreeMap<Fd, ResolvedStdio> {
         &self.fds
     }

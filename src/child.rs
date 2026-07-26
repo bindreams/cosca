@@ -42,6 +42,7 @@ pub struct Child {
     kill_on_drop: bool,
     containment: Containment,
     attached: crate::containment::Attached,
+    elevation: Option<crate::elevation::ElevationReport>,
 }
 
 impl Child {
@@ -60,7 +61,21 @@ impl Child {
             kill_on_drop,
             containment,
             attached,
+            elevation: None,
         }
+    }
+
+    // Consumed by the sync/async POSIX spawn arms (a later elevation-plan task); the
+    // rewrite that produces the report lands here first.
+    #[allow(dead_code)]
+    pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
+        self.elevation = report;
+    }
+
+    /// The achieved elevation state, or `None` if elevation was not requested
+    /// (mirrors [`Child::containment`]).
+    pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {
+        self.elevation.clone()
     }
 
     /// The tree-teardown mechanism for this child: a nested member reports
