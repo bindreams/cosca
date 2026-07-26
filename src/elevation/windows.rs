@@ -107,6 +107,51 @@ pub(super) fn detect() -> Host {
     }
 }
 
+use crate::command::Command;
+use crate::error::Error;
+use crate::stdio::ResolvedStdio;
+
+/// Enforce the honest capability matrix for Windows elevation. ShellExecuteEx(runas)
+/// passes NO handles and no environment, and a Job Object cannot span the integrity
+/// boundary — so every non-inherit slot, every fd >= 3, any explicit env, and
+/// `.contain()` is a loud `Unsupported`, never a silent lie.
+// Not yet called by production code: Task 14's `launch_runas` calls this gate before
+// the UAC prompt.
+#[allow(dead_code)]
+pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
+    let unsupported = |op: &str, detail: &str| {
+        Err(Error::Unsupported { op: op.into(), platform: "windows", detail: detail.into() })
+    };
+    for (&slot, resolved) in cmd.fds() {
+        if slot.raw() >= 3 {
+            return unsupported(
+                "fd >= 3 on an elevated Windows child",
+                "runas exposes no descriptor-passing mechanism; fd >= 3 needs the (deferred) broker",
+            );
+        }
+        if !matches!(resolved, ResolvedStdio::Inherit) {
+            return unsupported(
+                "captured/redirected stdio on an elevated Windows child",
+                "runas exposes no stdio-handle mechanism; capture/redirect needs the (deferred) broker. \
+                 Use inherit(), or elevate on POSIX.",
+            );
+        }
+    }
+    if !cmd.env_ops().is_empty() {
+        return unsupported(
+            "env forwarding to an elevated Windows child",
+            "runas provides no environment mechanism; forwarding needs the (deferred) broker",
+        );
+    }
+    if cmd.contain_request().mode.is_some() {
+        return unsupported(
+            ".contain() + elevate on Windows",
+            "a Job Object cannot span the integrity boundary of a runas child (deferred)",
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
