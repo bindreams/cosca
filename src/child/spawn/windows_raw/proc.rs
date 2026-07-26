@@ -36,7 +36,11 @@ pub(crate) struct RawChild {
 
 impl RawChild {
     pub(crate) fn new(proc: OwnedHandle, pid: u32) -> RawChild {
-        RawChild { proc, pid, runas: false }
+        RawChild {
+            proc,
+            pid,
+            runas: false,
+        }
     }
 
     /// A `runas`-elevated child: a higher-integrity process a lower-integrity parent

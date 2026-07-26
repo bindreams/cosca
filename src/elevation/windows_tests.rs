@@ -9,7 +9,10 @@ fn integrity_level_is_always_answerable() {
     // Every Windows process has a mandatory integrity label; a `None` here means the
     // aligned two-call token read is broken, not that the runner lacks an answer. Fail
     // loud rather than let the cross-check below go vacuous.
-    assert!(super::integrity_level().is_some(), "integrity_level() must resolve on any Windows runner");
+    assert!(
+        super::integrity_level().is_some(),
+        "integrity_level() must resolve on any Windows runner"
+    );
 }
 
 #[test]
@@ -21,7 +24,10 @@ fn is_elevated_agrees_with_integrity_level() {
     let elevated = super::is_elevated();
     let rid = super::integrity_level().expect("integrity level must be readable");
     let high = rid >= SECURITY_MANDATORY_HIGH_RID as u32;
-    assert_eq!(elevated, high, "TokenElevation ({elevated}) disagrees with integrity RID {rid:#x} vs High");
+    assert_eq!(
+        elevated, high,
+        "TokenElevation ({elevated}) disagrees with integrity RID {rid:#x} vs High"
+    );
 }
 
 use crate::command::Command;
@@ -97,8 +103,10 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
         let mut c = Command::new();
         c.args(["whoami"]).elevate();
         c.stdout(Stdio::pipe()).unwrap();
-        assert!(is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))),
-            "piped elevated config must reject with elevated={elevated}");
+        assert!(
+            is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))),
+            "piped elevated config must reject with elevated={elevated}"
+        );
     }
 }
 
@@ -107,7 +115,10 @@ fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
     for elevated in [false, true] {
         let mut c = Command::new();
         c.commandline("whoami").elevate();
-        assert!(is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))));
+        assert!(is_unsupported(super::launch_runas_with_host(
+            &mut c,
+            &win_host(elevated)
+        )));
     }
 }
 

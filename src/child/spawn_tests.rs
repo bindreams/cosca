@@ -84,5 +84,8 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
     let mut c = crate::command::Command::new();
     c.args(["whoami"]).elevate();
     c.stdout(crate::stdio::Stdio::pipe()).unwrap();
-    assert!(matches!(super::spawn(&mut c), Err(crate::error::Error::Unsupported { .. })));
+    assert!(matches!(
+        super::spawn(&mut c),
+        Err(crate::error::Error::Unsupported { .. })
+    ));
 }

@@ -165,7 +165,16 @@ fn kill_error_on_an_elevated_wrapper_is_unkillable() {
     use crate::error::{ElevationErrorKind, Error};
     let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     let e = super::map_elevated_kill_error(eperm, /* elevated_wrapper */ true);
-    assert!(matches!(e, Error::Elevation { kind: ElevationErrorKind::Unkillable, .. }), "{e:?}");
+    assert!(
+        matches!(
+            e,
+            Error::Elevation {
+                kind: ElevationErrorKind::Unkillable,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
 }
 
 #[test]

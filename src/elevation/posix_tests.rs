@@ -6,7 +6,10 @@ fn s(v: &[&str]) -> Vec<OsString> {
     v.iter().map(|x| OsString::from(*x)).collect()
 }
 fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
-    pairs.iter().map(|(k, v)| (OsString::from(*k), OsString::from(*v))).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (OsString::from(*k), OsString::from(*v)))
+        .collect()
 }
 
 #[test]
@@ -22,7 +25,15 @@ fn sudo_noninteractive_names_env_in_preserve_env_with_terminator() {
     .unwrap();
     assert_eq!(
         argv,
-        s(&["/usr/bin/sudo", "-n", "--preserve-env=FOO", "--", "/usr/bin/systemctl", "restart", "nginx"])
+        s(&[
+            "/usr/bin/sudo",
+            "-n",
+            "--preserve-env=FOO",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx"
+        ])
     );
     // The VALUE never appears in argv (it is set in sudo's own env by the rewrite).
     assert!(!argv.iter().any(|a| a.to_string_lossy().contains("bar")));
@@ -30,51 +41,127 @@ fn sudo_noninteractive_names_env_in_preserve_env_with_terminator() {
 
 #[test]
 fn sudo_preserve_env_joins_multiple_names() {
-    let argv = build_argv(Backend::Sudo, OsStr::new("/usr/bin/sudo"), &Auth::NonInteractive, OsStr::new("id"), &[], &env(&[("A", "1"), ("B", "2")])).unwrap();
+    let argv = build_argv(
+        Backend::Sudo,
+        OsStr::new("/usr/bin/sudo"),
+        &Auth::NonInteractive,
+        OsStr::new("id"),
+        &[],
+        &env(&[("A", "1"), ("B", "2")]),
+    )
+    .unwrap();
     assert_eq!(argv, s(&["/usr/bin/sudo", "-n", "--preserve-env=A,B", "--", "id"]));
 }
 
 #[test]
 fn sudo_interactive_no_env_has_no_flags() {
-    let argv = build_argv(Backend::Sudo, OsStr::new("/usr/bin/sudo"), &Auth::Interactive, OsStr::new("id"), &s(&["-u"]), &[]).unwrap();
+    let argv = build_argv(
+        Backend::Sudo,
+        OsStr::new("/usr/bin/sudo"),
+        &Auth::Interactive,
+        OsStr::new("id"),
+        &s(&["-u"]),
+        &[],
+    )
+    .unwrap();
     assert_eq!(argv, s(&["/usr/bin/sudo", "--", "id", "-u"]));
 }
 
 #[test]
 fn sudo_stdin_uses_dash_s() {
-    let argv = build_argv(Backend::Sudo, OsStr::new("/usr/bin/sudo"), &Auth::Stdin(crate::elevation::Secret::new("pw")), OsStr::new("id"), &[], &[]).unwrap();
+    let argv = build_argv(
+        Backend::Sudo,
+        OsStr::new("/usr/bin/sudo"),
+        &Auth::Stdin(crate::elevation::Secret::new("pw")),
+        OsStr::new("id"),
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(argv, s(&["/usr/bin/sudo", "-S", "--", "id"]));
 }
 
 #[test]
 fn sudo_askpass_uses_dash_a() {
-    let argv = build_argv(Backend::Sudo, OsStr::new("/usr/bin/sudo"), &Auth::Askpass("/usr/bin/ssh-askpass".into()), OsStr::new("id"), &[], &[]).unwrap();
+    let argv = build_argv(
+        Backend::Sudo,
+        OsStr::new("/usr/bin/sudo"),
+        &Auth::Askpass("/usr/bin/ssh-askpass".into()),
+        OsStr::new("id"),
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(argv, s(&["/usr/bin/sudo", "-A", "--", "id"]));
 }
 
 #[test]
 fn sudo_rejects_an_unforwardable_env_name() {
     for bad in [("A,B", "1"), ("A=C", "1"), ("PÄTH", "1"), ("", "1"), ("1BAD", "1")] {
-        let r = build_argv(Backend::Sudo, OsStr::new("/usr/bin/sudo"), &Auth::NonInteractive, OsStr::new("id"), &[], &env(&[bad]));
-        assert!(matches!(r, Err(crate::error::Error::Unsupported { .. })), "expected reject for {bad:?}");
+        let r = build_argv(
+            Backend::Sudo,
+            OsStr::new("/usr/bin/sudo"),
+            &Auth::NonInteractive,
+            OsStr::new("id"),
+            &[],
+            &env(&[bad]),
+        );
+        assert!(
+            matches!(r, Err(crate::error::Error::Unsupported { .. })),
+            "expected reject for {bad:?}"
+        );
     }
 }
 
 #[test]
 fn doas_noninteractive_no_env_emits_dash_n() {
-    let argv = build_argv(Backend::Doas, OsStr::new("/usr/bin/doas"), &Auth::NonInteractive, OsStr::new("id"), &s(&["-u"]), &[]).unwrap();
+    let argv = build_argv(
+        Backend::Doas,
+        OsStr::new("/usr/bin/doas"),
+        &Auth::NonInteractive,
+        OsStr::new("id"),
+        &s(&["-u"]),
+        &[],
+    )
+    .unwrap();
     assert_eq!(argv, s(&["/usr/bin/doas", "-n", "--", "id", "-u"]));
 }
 
 #[test]
 fn run0_forces_pipe_and_forwards_env_via_setenv() {
-    let argv = build_argv(Backend::Run0, OsStr::new("/usr/bin/run0"), &Auth::NonInteractive, OsStr::new("id"), &[], &env(&[("A", "1"), ("B", "2")])).unwrap();
-    assert_eq!(argv, s(&["/usr/bin/run0", "--pipe", "--no-ask-password", "--setenv=A=1", "--setenv=B=2", "--", "id"]));
+    let argv = build_argv(
+        Backend::Run0,
+        OsStr::new("/usr/bin/run0"),
+        &Auth::NonInteractive,
+        OsStr::new("id"),
+        &[],
+        &env(&[("A", "1"), ("B", "2")]),
+    )
+    .unwrap();
+    assert_eq!(
+        argv,
+        s(&[
+            "/usr/bin/run0",
+            "--pipe",
+            "--no-ask-password",
+            "--setenv=A=1",
+            "--setenv=B=2",
+            "--",
+            "id"
+        ])
+    );
 }
 
 #[test]
 fn run0_rejects_an_unforwardable_env_name() {
-    let r = build_argv(Backend::Run0, OsStr::new("/usr/bin/run0"), &Auth::NonInteractive, OsStr::new("id"), &[], &env(&[("A=B", "1")]));
+    let r = build_argv(
+        Backend::Run0,
+        OsStr::new("/usr/bin/run0"),
+        &Auth::NonInteractive,
+        OsStr::new("id"),
+        &[],
+        &env(&[("A=B", "1")]),
+    );
     assert!(matches!(r, Err(crate::error::Error::Unsupported { .. })));
 }
 
@@ -82,26 +169,68 @@ fn run0_rejects_an_unforwardable_env_name() {
 fn pkexec_gui_disables_internal_agent_and_uses_no_terminator() {
     // No `--` for pkexec (its option loop mis-parses it); --disable-internal-agent pins
     // the graphical-only contract.
-    let argv = build_argv(Backend::Pkexec, OsStr::new("/usr/bin/pkexec"), &Auth::Gui, OsStr::new("id"), &[], &[]).unwrap();
+    let argv = build_argv(
+        Backend::Pkexec,
+        OsStr::new("/usr/bin/pkexec"),
+        &Auth::Gui,
+        OsStr::new("id"),
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(argv, s(&["/usr/bin/pkexec", "--disable-internal-agent", "id"]));
-    assert!(!argv.iter().any(|a| a == &OsString::from("--")), "pkexec must not emit a -- terminator");
+    assert!(
+        !argv.iter().any(|a| a == &OsString::from("--")),
+        "pkexec must not emit a -- terminator"
+    );
 }
 
 #[test]
 fn pkexec_rejects_a_leading_dash_program() {
     // With no `--` shield, a leading-dash program would be mis-parsed as a pkexec option.
-    let r = build_argv(Backend::Pkexec, OsStr::new("/usr/bin/pkexec"), &Auth::Gui, OsStr::new("-prog"), &[], &[]);
+    let r = build_argv(
+        Backend::Pkexec,
+        OsStr::new("/usr/bin/pkexec"),
+        &Auth::Gui,
+        OsStr::new("-prog"),
+        &[],
+        &[],
+    );
     assert!(matches!(r, Err(crate::error::Error::Unsupported { .. })));
     // An `=` in the program path is safe under pkexec (no assignment parsing).
-    let ok = build_argv(Backend::Pkexec, OsStr::new("/usr/bin/pkexec"), &Auth::Gui, OsStr::new("/opt/we=ird"), &[], &[]).unwrap();
+    let ok = build_argv(
+        Backend::Pkexec,
+        OsStr::new("/usr/bin/pkexec"),
+        &Auth::Gui,
+        OsStr::new("/opt/we=ird"),
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(ok, s(&["/usr/bin/pkexec", "--disable-internal-agent", "/opt/we=ird"]));
 }
 
 #[test]
 fn terminator_protects_a_program_with_equals_or_leading_dash() {
-    let eq = build_argv(Backend::Sudo, OsStr::new("/usr/bin/sudo"), &Auth::NonInteractive, OsStr::new("/opt/we=ird"), &[], &[]).unwrap();
+    let eq = build_argv(
+        Backend::Sudo,
+        OsStr::new("/usr/bin/sudo"),
+        &Auth::NonInteractive,
+        OsStr::new("/opt/we=ird"),
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(eq, s(&["/usr/bin/sudo", "-n", "--", "/opt/we=ird"]));
-    let dash = build_argv(Backend::Doas, OsStr::new("/usr/bin/doas"), &Auth::Interactive, OsStr::new("-prog"), &[], &[]).unwrap();
+    let dash = build_argv(
+        Backend::Doas,
+        OsStr::new("/usr/bin/doas"),
+        &Auth::Interactive,
+        OsStr::new("-prog"),
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(dash, s(&["/usr/bin/doas", "--", "-prog"]));
 }
 
@@ -147,7 +276,11 @@ fn empty_path_element_is_not_resolved_from_cwd() {
     std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path_var = format!("/nonexistent::{}", dir.path().display());
     let got = super::resolve_in_path_var(OsStr::new(&path_var), "sudo");
-    assert_eq!(got, Some(sudo), "a mid-string empty PATH element must be skipped, not resolved");
+    assert_eq!(
+        got,
+        Some(sudo),
+        "a mid-string empty PATH element must be skipped, not resolved"
+    );
 
     // A PATH consisting only of empty elements resolves nothing.
     assert_eq!(super::resolve_in_path_var(OsStr::new(":"), "sudo"), None);
@@ -205,8 +338,14 @@ mod rewrite_tests {
         assert!(!a.iter().any(|x| x.to_string_lossy().contains("bar")));
         assert!(!a.iter().any(|x| x.to_string_lossy().contains("LD_PRELOAD")));
         let derived = rw.derived.as_ref().unwrap();
-        assert!(derived.env_ops().iter().any(|o| matches!(o, EnvOp::Set(k, v) if k == "FOO" && v == "bar")));
-        assert!(!derived.env_ops().iter().any(|o| matches!(o, EnvOp::Set(k, _) if k == "LD_PRELOAD")));
+        assert!(derived
+            .env_ops()
+            .iter()
+            .any(|o| matches!(o, EnvOp::Set(k, v) if k == "FOO" && v == "bar")));
+        assert!(!derived
+            .env_ops()
+            .iter()
+            .any(|o| matches!(o, EnvOp::Set(k, _) if k == "LD_PRELOAD")));
         // The caller's Command is untouched (no double-wrap on reuse).
         assert!(matches!(c.input(), CommandInput::Argv(v) if v == &[OsString::from("id"), OsString::from("-u")]));
         assert_eq!(c.env_ops().len(), 2, "caller env ops must be intact");
@@ -215,7 +354,9 @@ mod rewrite_tests {
     #[test]
     fn rewrite_twice_yields_identical_derived_argv() {
         let mut c = Command::new();
-        c.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
+        c.args(["id"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
         let a1 = derived_argv(&rewrite_with_host(&mut c, &sudo_host()).unwrap());
         let a2 = derived_argv(&rewrite_with_host(&mut c, &sudo_host()).unwrap());
         assert_eq!(a1, a2, "reusing an elevated Command must not double-wrap");
@@ -224,61 +365,127 @@ mod rewrite_tests {
     #[test]
     fn env_remove_or_clear_plus_elevate_is_unsupported() {
         let mut c = Command::new();
-        c.args(["id"]).env_clear().env("KEEP", "1").elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
-        assert!(matches!(rewrite_with_host(&mut c, &sudo_host()), Err(Error::Unsupported { .. })));
+        c.args(["id"])
+            .env_clear()
+            .env("KEEP", "1")
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        assert!(matches!(
+            rewrite_with_host(&mut c, &sudo_host()),
+            Err(Error::Unsupported { .. })
+        ));
         let mut c2 = Command::new();
-        c2.args(["id"]).env("A", "1").env_remove("A").elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
-        assert!(matches!(rewrite_with_host(&mut c2, &sudo_host()), Err(Error::Unsupported { .. })));
+        c2.args(["id"])
+            .env("A", "1")
+            .env_remove("A")
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        assert!(matches!(
+            rewrite_with_host(&mut c2, &sudo_host()),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
     fn doas_or_pkexec_with_env_is_unsupported() {
         let doas_host = Host {
-            available: BackendSet { run0: None, sudo: None, doas: Some(PathBuf::from("/usr/bin/doas")), pkexec: None },
+            available: BackendSet {
+                run0: None,
+                sudo: None,
+                doas: Some(PathBuf::from("/usr/bin/doas")),
+                pkexec: None,
+            },
             ..sudo_host()
         };
         let mut c = Command::new();
-        c.args(["id"]).env("A", "1").elevation_backend(Backend::Doas).elevation_auth(Auth::NonInteractive);
-        assert!(matches!(rewrite_with_host(&mut c, &doas_host), Err(Error::Unsupported { .. })));
+        c.args(["id"])
+            .env("A", "1")
+            .elevation_backend(Backend::Doas)
+            .elevation_auth(Auth::NonInteractive);
+        assert!(matches!(
+            rewrite_with_host(&mut c, &doas_host),
+            Err(Error::Unsupported { .. })
+        ));
 
         let pk_host = Host {
-            available: BackendSet { run0: None, sudo: None, doas: None, pkexec: Some(PathBuf::from("/usr/bin/pkexec")) },
+            available: BackendSet {
+                run0: None,
+                sudo: None,
+                doas: None,
+                pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
+            },
             ..sudo_host()
         };
         let mut c2 = Command::new();
-        c2.args(["id"]).env("A", "1").elevation_backend(Backend::Pkexec).elevation_auth(Auth::Gui);
-        assert!(matches!(rewrite_with_host(&mut c2, &pk_host), Err(Error::Unsupported { .. })));
+        c2.args(["id"])
+            .env("A", "1")
+            .elevation_backend(Backend::Pkexec)
+            .elevation_auth(Auth::Gui);
+        assert!(matches!(
+            rewrite_with_host(&mut c2, &pk_host),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
     fn run0_forwards_env_via_setenv() {
         let host = Host {
-            available: BackendSet { run0: Some(PathBuf::from("/usr/bin/run0")), sudo: None, doas: None, pkexec: None },
+            available: BackendSet {
+                run0: Some(PathBuf::from("/usr/bin/run0")),
+                sudo: None,
+                doas: None,
+                pkexec: None,
+            },
             ..sudo_host()
         };
         let mut c = Command::new();
-        c.args(["id"]).env("A", "1").elevation_backend(Backend::Run0).elevation_auth(Auth::NonInteractive);
+        c.args(["id"])
+            .env("A", "1")
+            .elevation_backend(Backend::Run0)
+            .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &host).expect("rewrite");
         assert!(derived_argv(&rw).contains(&OsString::from("--setenv=A=1")));
-        assert!(!rw.derived.as_ref().unwrap().env_ops().iter().any(|o| matches!(o, EnvOp::Set(k, _) if k == "A")));
+        assert!(!rw
+            .derived
+            .as_ref()
+            .unwrap()
+            .env_ops()
+            .iter()
+            .any(|o| matches!(o, EnvOp::Set(k, _) if k == "A")));
     }
 
     #[test]
     fn askpass_path_is_carried_in_the_backend_env() {
         let mut c = Command::new();
-        c.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::Askpass(PathBuf::from("/usr/bin/ssh-askpass")));
+        c.args(["id"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::Askpass(PathBuf::from("/usr/bin/ssh-askpass")));
         let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
-        assert!(rw.derived.as_ref().unwrap().env_ops().iter().any(|o| matches!(o, EnvOp::Set(k, v) if k == "SUDO_ASKPASS" && v == "/usr/bin/ssh-askpass")));
+        assert!(rw
+            .derived
+            .as_ref()
+            .unwrap()
+            .env_ops()
+            .iter()
+            .any(|o| matches!(o, EnvOp::Set(k, v) if k == "SUDO_ASKPASS" && v == "/usr/bin/ssh-askpass")));
     }
 
     #[test]
     fn stdin_auth_wires_fd0_to_a_file_and_defers_the_write() {
         let mut c = Command::new();
-        c.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
+        c.args(["id"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
         let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
         // Stdio::from_file(reader) resolves to ResolvedStdio::File(_).
-        assert!(matches!(rw.derived.as_ref().unwrap().fds().get(&Fd::STDIN), Some(ResolvedStdio::File(_))));
-        assert!(rw.password_write.is_some(), "the password write is deferred to after spawn");
+        assert!(matches!(
+            rw.derived.as_ref().unwrap().fds().get(&Fd::STDIN),
+            Some(ResolvedStdio::File(_))
+        ));
+        assert!(
+            rw.password_write.is_some(),
+            "the password write is deferred to after spawn"
+        );
         // fd0 is the password channel, not the caller's stdin — reported honestly.
         assert_eq!(rw.report.as_ref().unwrap().stdio, ElevatedStdio::StdinConsumed);
     }
@@ -286,47 +493,81 @@ mod rewrite_tests {
     #[test]
     fn stdin_auth_with_caller_configured_fd0_is_unsupported() {
         let mut c = Command::new();
-        c.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
+        c.args(["id"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::Stdin(crate::elevation::Secret::new("pw")));
         c.stdin(Stdio::pipe()).unwrap();
-        assert!(matches!(rewrite_with_host(&mut c, &sudo_host()), Err(Error::Unsupported { .. })));
+        assert!(matches!(
+            rewrite_with_host(&mut c, &sudo_host()),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
     fn fd_ge_3_elevated_is_unsupported() {
         let mut c = Command::new();
-        c.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
+        c.args(["id"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
         c.fd(3, Stdio::pipe_out()).unwrap();
-        assert!(matches!(rewrite_with_host(&mut c, &sudo_host()), Err(Error::Unsupported { .. })));
+        assert!(matches!(
+            rewrite_with_host(&mut c, &sudo_host()),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
     fn run0_plus_contain_is_unsupported() {
         let host = Host {
-            available: BackendSet { run0: Some(PathBuf::from("/usr/bin/run0")), sudo: None, doas: None, pkexec: None },
+            available: BackendSet {
+                run0: Some(PathBuf::from("/usr/bin/run0")),
+                sudo: None,
+                doas: None,
+                pkexec: None,
+            },
             ..sudo_host()
         };
         let mut c = Command::new();
-        c.args(["id"]).elevation_backend(Backend::Run0).elevation_auth(Auth::NonInteractive).contain();
-        assert!(matches!(rewrite_with_host(&mut c, &host), Err(Error::Unsupported { .. })));
+        c.args(["id"])
+            .elevation_backend(Backend::Run0)
+            .elevation_auth(Auth::NonInteractive)
+            .contain();
+        assert!(matches!(
+            rewrite_with_host(&mut c, &host),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
     fn commandline_elevated_is_unsupported() {
         let mut c = Command::new();
-        c.commandline("id -u").elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
-        assert!(matches!(rewrite_with_host(&mut c, &sudo_host()), Err(Error::Unsupported { .. })));
+        c.commandline("id -u")
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        assert!(matches!(
+            rewrite_with_host(&mut c, &sudo_host()),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
     fn distinct_argv0_with_executable_is_unsupported() {
         let mut c = Command::new();
-        c.executable("/bin/busybox").args(["sh", "-c", "true"])
-            .elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
-        assert!(matches!(rewrite_with_host(&mut c, &sudo_host()), Err(Error::Unsupported { .. })));
+        c.executable("/bin/busybox")
+            .args(["sh", "-c", "true"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        assert!(matches!(
+            rewrite_with_host(&mut c, &sudo_host()),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     fn elevated_sudo_host() -> Host {
-        Host { elevated: true, ..sudo_host() }
+        Host {
+            elevated: true,
+            ..sudo_host()
+        }
     }
 
     #[test]
@@ -341,7 +582,10 @@ mod rewrite_tests {
             .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &elevated_sudo_host()).expect("rewrite");
         // A derived command IS built (non-destructive), but there is no backend wrapper.
-        let derived = rw.derived.as_ref().expect("already-elevated still derives a sanitized command");
+        let derived = rw
+            .derived
+            .as_ref()
+            .expect("already-elevated still derives a sanitized command");
         assert!(rw.backend_path.is_none());
         assert!(rw.password_write.is_none());
         let report = rw.report.as_ref().unwrap();
@@ -350,7 +594,10 @@ mod rewrite_tests {
         // The derived program is the ORIGINAL command, not a backend.
         assert!(matches!(derived.input(), CommandInput::Argv(v) if v == &[OsString::from("id"), OsString::from("-u")]));
         // The dangerous var is gone from the derived env even under root.
-        assert!(!derived.env_ops().iter().any(|o| matches!(o, EnvOp::Set(k, _) if k == "LD_PRELOAD")));
+        assert!(!derived
+            .env_ops()
+            .iter()
+            .any(|o| matches!(o, EnvOp::Set(k, _) if k == "LD_PRELOAD")));
         // The caller's Command is left untouched.
         assert_eq!(c.env_ops().len(), 1, "caller env ops must be intact");
     }
@@ -361,24 +608,45 @@ mod rewrite_tests {
         // is already elevated (Config gates run before the RunAsIs short-circuit).
         for host in [sudo_host(), elevated_sudo_host()] {
             let mut a = Command::new();
-            a.args(["id"]).elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
+            a.args(["id"])
+                .elevation_backend(Backend::Sudo)
+                .elevation_auth(Auth::NonInteractive);
             a.fd(3, Stdio::pipe_out()).unwrap();
-            assert!(matches!(rewrite_with_host(&mut a, &host), Err(Error::Unsupported { .. })),
-                "fd>=3 must reject with elevated={}", host.elevated);
+            assert!(
+                matches!(rewrite_with_host(&mut a, &host), Err(Error::Unsupported { .. })),
+                "fd>=3 must reject with elevated={}",
+                host.elevated
+            );
 
             let mut b = Command::new();
-            b.args(["id"]).env("A", "1").elevation_backend(Backend::Doas).elevation_auth(Auth::NonInteractive);
+            b.args(["id"])
+                .env("A", "1")
+                .elevation_backend(Backend::Doas)
+                .elevation_auth(Auth::NonInteractive);
             let doas_host = Host {
-                available: BackendSet { run0: None, sudo: None, doas: Some(PathBuf::from("/usr/bin/doas")), pkexec: None },
+                available: BackendSet {
+                    run0: None,
+                    sudo: None,
+                    doas: Some(PathBuf::from("/usr/bin/doas")),
+                    pkexec: None,
+                },
                 ..host.clone()
             };
-            assert!(matches!(rewrite_with_host(&mut b, &doas_host), Err(Error::Unsupported { .. })),
-                ".env()+doas must reject with elevated={}", host.elevated);
+            assert!(
+                matches!(rewrite_with_host(&mut b, &doas_host), Err(Error::Unsupported { .. })),
+                ".env()+doas must reject with elevated={}",
+                host.elevated
+            );
 
             let mut d = Command::new();
-            d.commandline("id -u").elevation_backend(Backend::Sudo).elevation_auth(Auth::NonInteractive);
-            assert!(matches!(rewrite_with_host(&mut d, &host), Err(Error::Unsupported { .. })),
-                "commandline() must reject with elevated={}", host.elevated);
+            d.commandline("id -u")
+                .elevation_backend(Backend::Sudo)
+                .elevation_auth(Auth::NonInteractive);
+            assert!(
+                matches!(rewrite_with_host(&mut d, &host), Err(Error::Unsupported { .. })),
+                "commandline() must reject with elevated={}",
+                host.elevated
+            );
         }
     }
 
@@ -390,14 +658,20 @@ mod rewrite_tests {
         let secret = b"hunter2";
         let line = password_line(secret);
         assert_eq!(line, b"hunter2\n");
-        assert!(line.capacity() >= line.len(), "buffer must be pre-sized so the push never reallocates");
+        assert!(
+            line.capacity() >= line.len(),
+            "buffer must be pre-sized so the push never reallocates"
+        );
     }
 
     #[test]
     fn write_after_spawn_writes_password_and_newline_then_eof() {
         use std::io::Read;
         let (mut reader, writer) = std::io::pipe().unwrap();
-        let pp = PendingPassword { writer, secret: crate::elevation::Secret::new("pw") };
+        let pp = PendingPassword {
+            writer,
+            secret: crate::elevation::Secret::new("pw"),
+        };
         pp.write_after_spawn().expect("password delivered");
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).unwrap();
@@ -409,8 +683,14 @@ mod rewrite_tests {
         // A cached-credential / NOPASSWD sudo closes fd0 without reading: not an AuthFailed.
         let (reader, writer) = std::io::pipe().unwrap();
         drop(reader);
-        let pp = PendingPassword { writer, secret: crate::elevation::Secret::new("pw") };
-        assert!(pp.write_after_spawn().is_ok(), "reader-gone with zero bytes written is not a failure");
+        let pp = PendingPassword {
+            writer,
+            secret: crate::elevation::Secret::new("pw"),
+        };
+        assert!(
+            pp.write_after_spawn().is_ok(),
+            "reader-gone with zero bytes written is not a failure"
+        );
     }
 
     #[test]

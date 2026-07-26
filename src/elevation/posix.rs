@@ -75,13 +75,19 @@ pub(crate) fn build_argv(
             }
         }
         Backend::Doas => {
-            debug_assert!(env.is_empty(), "doas forwards no env; the rewrite rejects .env() for doas");
+            debug_assert!(
+                env.is_empty(),
+                "doas forwards no env; the rewrite rejects .env() for doas"
+            );
             if matches!(auth, Auth::NonInteractive) {
                 argv.push("-n".into());
             }
         }
         Backend::Pkexec => {
-            debug_assert!(env.is_empty(), "pkexec forwards no env; the rewrite rejects .env() for pkexec");
+            debug_assert!(
+                env.is_empty(),
+                "pkexec forwards no env; the rewrite rejects .env() for pkexec"
+            );
             // Fail loud if the graphical agent is missing, instead of a blocking text prompt.
             argv.push("--disable-internal-agent".into());
             // pkexec has no `--` terminator, so a leading-dash program cannot be shielded.
@@ -161,8 +167,7 @@ fn is_executable(path: &Path) -> bool {
         return false;
     };
     // SAFETY: faccessat with a valid NUL-terminated path; a read-only permission query.
-    path.is_file()
-        && unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
+    path.is_file() && unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
 }
 
 /// Resolve `program` to its ABSOLUTE path on `$PATH`.
@@ -251,7 +256,11 @@ fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
 /// writable, `Ok(false)` = the reader closed / errored (`POLLHUP`/`POLLERR`).
 fn wait_writable(fd: std::os::fd::RawFd) -> Result<bool, std::io::Error> {
     loop {
-        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
         // SAFETY: one initialized pollfd; `-1` blocks until a readiness event.
         let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, -1) };
         if rc < 0 {
@@ -292,7 +301,9 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, fd: std::os::fd::RawFd
                     log::debug!("elevation backend did not consume the password (fd0 accepted nothing)");
                     Ok(())
                 } else {
-                    Err(auth_failed("elevation backend closed the password channel after a partial write".into()))
+                    Err(auth_failed(
+                        "elevation backend closed the password channel after a partial write".into(),
+                    ))
                 };
             }
             Ok(n) => written += n,
@@ -304,8 +315,16 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, fd: std::os::fd::RawFd
                 }
                 match wait_writable(fd) {
                     Ok(true) => continue,
-                    Ok(false) => return Err(auth_failed("elevation backend closed fd0 after a partial password write".into())),
-                    Err(pe) => return Err(auth_failed(format!("waiting to deliver the sudo -S password failed: {pe}"))),
+                    Ok(false) => {
+                        return Err(auth_failed(
+                            "elevation backend closed fd0 after a partial password write".into(),
+                        ))
+                    }
+                    Err(pe) => {
+                        return Err(auth_failed(format!(
+                            "waiting to deliver the sudo -S password failed: {pe}"
+                        )))
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -313,7 +332,9 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, fd: std::os::fd::RawFd
                     log::debug!("elevation backend did not consume the password (fd0 closed / EPIPE): {e}");
                     return Ok(());
                 }
-                return Err(auth_failed(format!("elevation backend closed fd0 after a partial password write: {e}")));
+                return Err(auth_failed(format!(
+                    "elevation backend closed fd0 after a partial password write: {e}"
+                )));
             }
             Err(e) => return Err(auth_failed(format!("could not deliver the sudo -S password: {e}"))),
         }
@@ -371,7 +392,9 @@ fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
         return Err(Error::Unsupported {
             op: "elevation of a commandline() command".into(),
             platform: "unix",
-            detail: "elevation requires an argv command (set .args([...])); a raw command line cannot be safely wrapped".into(),
+            detail:
+                "elevation requires an argv command (set .args([...])); a raw command line cannot be safely wrapped"
+                    .into(),
         });
     };
     if argv.is_empty() {
@@ -407,7 +430,8 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
         return Err(Error::Unsupported {
             op: "fd >= 3 on an elevated POSIX child".into(),
             platform: "unix",
-            detail: "sudo/pkexec closefrom and run0's PID-1 reparent drop fds > 2; fd >= 3 needs the (deferred) broker".into(),
+            detail: "sudo/pkexec closefrom and run0's PID-1 reparent drop fds > 2; fd >= 3 needs the (deferred) broker"
+                .into(),
         });
     }
     let ops = cmd.env_ops();
@@ -415,21 +439,25 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
         return Err(Error::Unsupported {
             op: ".env_remove()/.env_clear() + elevate".into(),
             platform: "unix",
-            detail: "the backend builds the elevated base environment; the crate can add but not subtract from it".into(),
+            detail: "the backend builds the elevated base environment; the crate can add but not subtract from it"
+                .into(),
         });
     }
     if ops.iter().any(|o| matches!(o, EnvOp::Set(..))) && matches!(backend, Backend::Doas | Backend::Pkexec) {
         return Err(Error::Unsupported {
             op: format!(".env() + Backend::{backend:?}"),
             platform: "unix",
-            detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them".into(),
+            detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them"
+                .into(),
         });
     }
     if backend == Backend::Run0 && cmd.contain_request().mode.is_some() {
         return Err(Error::Unsupported {
             op: ".contain() + Backend::Run0".into(),
             platform: "unix",
-            detail: "run0 runs the target as a PID 1-parented transient unit outside our cgroup; containment cannot span it".into(),
+            detail:
+                "run0 runs the target as a PID 1-parented transient unit outside our cgroup; containment cannot span it"
+                    .into(),
         });
     }
     if matches!(auth, Auth::Stdin(_)) && cmd.fds().contains_key(&Fd::STDIN) {
@@ -507,7 +535,9 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                 return Err(Error::Unsupported {
                     op: format!(".env() + Backend::{backend:?} (resolved via Auto)"),
                     platform: "unix",
-                    detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them".into(),
+                    detail:
+                        "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them"
+                            .into(),
                 });
             }
             let (program, args) = program_and_args(cmd)?;
@@ -537,7 +567,10 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                 let (reader, writer) = std::io::pipe().map_err(Error::Io)?;
                 let reader_file = File::from(OwnedFd::from(reader));
                 derived.stdin(Stdio::from_file(reader_file))?;
-                password_write = Some(PendingPassword { writer, secret: secret.clone() });
+                password_write = Some(PendingPassword {
+                    writer,
+                    secret: secret.clone(),
+                });
             }
 
             // Move the caller's fd 0-2 stdio into the derived command (File is not Clone).

@@ -78,7 +78,12 @@ impl Host {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            Host { elevated: false, has_tty: false, available: BackendSet::default(), os: Os::Unix }
+            Host {
+                elevated: false,
+                has_tty: false,
+                available: BackendSet::default(),
+                os: Os::Unix,
+            }
         }
     }
 

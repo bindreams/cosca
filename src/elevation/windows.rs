@@ -117,7 +117,11 @@ use crate::stdio::ResolvedStdio;
 /// `.contain()` is a loud `Unsupported`, never a silent lie.
 pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
     let unsupported = |op: &str, detail: &str| {
-        Err(Error::Unsupported { op: op.into(), platform: "windows", detail: detail.into() })
+        Err(Error::Unsupported {
+            op: op.into(),
+            platform: "windows",
+            detail: detail.into(),
+        })
     };
     for (&slot, resolved) in cmd.fds() {
         if slot.raw() >= 3 {
@@ -158,13 +162,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
-use windows::Win32::UI::Shell::{
-    ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::child::proc_handle::ProcHandle;
@@ -187,7 +187,12 @@ fn wide_nul(s: &OsStr) -> Vec<u16> {
 /// identity, and the report — the async path builds its own `Child` from these.
 pub(crate) enum RunasOutcome {
     AlreadyElevated,
-    Launched { proc: OwnedHandle, pid: u32, id: ProcessId, report: ElevationReport },
+    Launched {
+        proc: OwnedHandle,
+        pid: u32,
+        id: ProcessId,
+        report: ElevationReport,
+    },
 }
 
 /// Balances a `CoInitializeEx` with `CoUninitialize` only when WE incremented the refcount.
@@ -301,9 +306,15 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         };
         ShellExecuteExW(&mut info).map_err(|e| {
             if e.code() == ERROR_CANCELLED_HRESULT {
-                Error::Elevation { kind: ElevationErrorKind::AuthDeclined, detail: "the UAC elevation prompt was declined".into() }
+                Error::Elevation {
+                    kind: ElevationErrorKind::AuthDeclined,
+                    detail: "the UAC elevation prompt was declined".into(),
+                }
             } else {
-                Error::Elevation { kind: ElevationErrorKind::AuthFailed, detail: format!("ShellExecuteEx(runas) failed: {e}") }
+                Error::Elevation {
+                    kind: ElevationErrorKind::AuthFailed,
+                    detail: format!("ShellExecuteEx(runas) failed: {e}"),
+                }
             }
         })?;
         if info.hProcess.is_invalid() {
@@ -335,7 +346,10 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         } else {
             format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running")
         };
-        return Err(Error::Elevation { kind: ElevationErrorKind::Untracked, detail });
+        return Err(Error::Elevation {
+            kind: ElevationErrorKind::Untracked,
+            detail,
+        });
     };
 
     let report = ElevationReport {
@@ -350,7 +364,9 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
     match launch_runas(cmd)? {
         RunasOutcome::AlreadyElevated => {
             let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
-            child.set_elevation(Some(crate::elevation::already_elevated_report(ElevatedStdio::Passthrough)));
+            child.set_elevation(Some(crate::elevation::already_elevated_report(
+                ElevatedStdio::Passthrough,
+            )));
             Ok(child)
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
