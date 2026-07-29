@@ -4,3 +4,7 @@
 # Claude Code
 .claude/*.local.*
 CLAUDE.local.md
+
+# Agent scratch: plans, specs, task briefs and reports.
+.tmp/
+.superpowers/

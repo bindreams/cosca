@@ -2,8 +2,8 @@
 # See https://prek.j178.dev for more information.
 #:schema https://www.schemastore.org/prek.json
 
-# `.tmp/` is agent scratch (plans/specs/reports force-added only for record) — not
-# source to be linted/reformatted, same rationale as `target/`.
+# `.tmp/` is agent scratch — not source to be linted/reformatted, same rationale as
+# `target/`. Both are gitignored; excluding them too guards against a stray force-add.
 exclude = "^(target|\\.tmp)/"
 default_install_hook_types = ["pre-commit", "commit-msg"]
 
