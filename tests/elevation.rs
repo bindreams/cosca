@@ -275,7 +275,7 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     //  - sudo WITH `use_pty` (increasingly the distro default) keeps the tracked child as sudo's
     //    same-uid monitor and runs root under a pty grandchild, so kill() SUCCEEDS on the monitor.
     //    Tearing down that grandchild is the deferred "un-killable elevated child / sudo pty
-    //    monitor" teardown contract (TODO.md), out of this plan's scope.
+    //    monitor" teardown contract (issue #14), out of this plan's scope.
     // Either way is contract-correct here; the load-bearing Decision-A guarantee this test exists
     // for is that neither kill() nor the Drop below BLOCKS. A raw untyped Io on the EPERM path
     // would be the real defect.
@@ -380,7 +380,7 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
 }
 
 // MANUAL-TIER async Windows elevation (4c785f26): mirrors the sync marker test. Runs only
-// under the same gated, UAC-auto-approve manual tier documented in TODO.md.
+// under the same gated, UAC-auto-approve manual tier documented in issue #9.
 #[cfg(all(windows, feature = "tokio"))]
 #[tokio::test]
 async fn async_windows_elevated_child_writes_admin_marker() {
