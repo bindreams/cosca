@@ -7,12 +7,12 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
 
-use subprocess::identity::ProcessId;
+use cosca::identity::ProcessId;
 
 #[path = "common/mod.rs"]
 mod common;
 
-const BLOCK_VAR: &str = "SUBPROCESS_IDENTITY_TEST_BLOCK";
+const BLOCK_VAR: &str = "COSCA_IDENTITY_TEST_BLOCK";
 
 /// When this integration-test binary is re-spawned with `BLOCK_VAR` set, this
 /// "test" blocks reading stdin until the parent closes the pipe. In a normal

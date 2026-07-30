@@ -12,7 +12,7 @@ use common::spawn_blocker;
 #[test]
 fn foreign_wait_returns_when_the_process_exits() {
     let (child, mut sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("foreign process resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("foreign process resolves");
     sock.write_all(b"x").expect("trigger child exit");
     p.wait().expect("foreign wait");
     // Prove the exit via a real event (the dead child's socket EOFs), not is_alive().
@@ -30,7 +30,7 @@ fn foreign_wait_timeout_times_out_on_a_live_process() {
     // The blocker is structurally wedged on its never-written socket, so it cannot
     // exit; wait_timeout returns Ok(false) regardless of the (short) duration.
     let (child, _sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
     let exited = p.wait_timeout(Duration::from_millis(200)).expect("wait_timeout");
     assert!(
         !exited,
@@ -43,7 +43,7 @@ fn foreign_wait_timeout_times_out_on_a_live_process() {
 #[test]
 fn foreign_wait_timeout_observes_an_exit() {
     let (child, mut sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
     sock.write_all(b"x").expect("trigger child exit");
     assert!(p.wait_timeout(Duration::from_secs(30)).expect("wait_timeout"));
     let _ = child.wait();
@@ -53,7 +53,7 @@ fn foreign_wait_timeout_observes_an_exit() {
 fn foreign_wait_timeout_zero_returns_immediately_on_a_live_process() {
     // ZERO is the poll-once edge in each backend; a wedged child must yield Ok(false).
     let (child, _sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
     assert!(!p.wait_timeout(Duration::ZERO).expect("wait_timeout"));
     child.kill().expect("kill cleanup");
     let _ = child.wait();
@@ -64,7 +64,7 @@ fn foreign_wait_timeout_huge_duration_does_not_panic() {
     // Duration::MAX overflows Instant + Duration; the saturating deadline must make
     // it unbounded, not panic. Trigger the exit first so the wait completes.
     let (child, mut sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
     sock.write_all(b"x").expect("trigger child exit");
     assert!(p.wait_timeout(Duration::MAX).expect("wait_timeout"));
     let _ = child.wait();
@@ -72,9 +72,9 @@ fn foreign_wait_timeout_huge_duration_does_not_panic() {
 
 #[test]
 fn current_and_from_id_round_trip() {
-    let me = subprocess::Process::current();
+    let me = cosca::Process::current();
     assert!(me.is_alive());
-    assert_eq!(subprocess::Process::from_id(me.id()).map(|p| p.id()), Some(me.id()));
+    assert_eq!(cosca::Process::from_id(me.id()).map(|p| p.id()), Some(me.id()));
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // liveness check, distinct from the zombie-inclusive exists()). Death is proven by the
     // reap, never by sleep.
     let (child, _sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("live foreign child resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("live foreign child resolves");
     assert_eq!(p.id(), child.id());
     assert!(p.is_alive(), "a freshly spawned foreign child is alive");
     child.kill().expect("kill");
@@ -95,18 +95,12 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
 #[test]
 fn parent_and_children_resolve_the_spawned_tree() {
     let (child, mut sock) = spawn_blocker();
-    let me = subprocess::Process::current();
-    let kid = subprocess::Process::from_pid(child.id().pid()).expect("child resolves");
+    let me = cosca::Process::current();
+    let kid = cosca::Process::from_pid(child.id().pid()).expect("child resolves");
 
     assert_eq!(kid.parent().expect("child has a parent").id(), me.id());
-    assert!(me
-        .children(subprocess::Recursive::No)
-        .iter()
-        .any(|p| p.id() == kid.id()));
-    assert!(me
-        .children(subprocess::Recursive::Yes)
-        .iter()
-        .any(|p| p.id() == kid.id()));
+    assert!(me.children(cosca::Recursive::No).iter().any(|p| p.id() == kid.id()));
+    assert!(me.children(cosca::Recursive::Yes).iter().any(|p| p.id() == kid.id()));
 
     sock.write_all(b"x").expect("release child");
     let _ = child.wait();
@@ -121,9 +115,9 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     // one-level-vs-recursive distinction a No<->Yes arm swap would otherwise pass silently.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = subprocess::Command::new();
+    let mut cmd = cosca::Command::new();
     cmd.executable(common::testbin())
-        .args(["subprocess_testbin", "spawn-grandchild", &addr]);
+        .args(["cosca_testbin", "spawn-grandchild", &addr]);
     let child = cmd.spawn().expect("spawn tree");
     let mut socks = Vec::new();
     for _ in 0..2 {
@@ -132,10 +126,10 @@ fn children_recursive_distinguishes_direct_from_descendant() {
         s.read_exact(&mut tag).expect("read tag");
         socks.push(s);
     }
-    let me = subprocess::Process::current();
-    let kid = subprocess::Process::from_pid(child.id().pid()).expect("child resolves");
+    let me = cosca::Process::current();
+    let kid = cosca::Process::from_pid(child.id().pid()).expect("child resolves");
     // The grandchild is kid's only direct child — use it to learn the grandchild's identity.
-    let grandkids = kid.children(subprocess::Recursive::No);
+    let grandkids = kid.children(cosca::Recursive::No);
     assert_eq!(
         grandkids.len(),
         1,
@@ -143,7 +137,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     );
     let grandkid = grandkids[0];
 
-    let direct = me.children(subprocess::Recursive::No);
+    let direct = me.children(cosca::Recursive::No);
     assert!(
         direct.iter().any(|p| p.id() == kid.id()),
         "Recursive::No must include the direct child"
@@ -152,7 +146,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
         !direct.iter().any(|p| p.id() == grandkid.id()),
         "Recursive::No must EXCLUDE the grandchild"
     );
-    let all = me.children(subprocess::Recursive::Yes);
+    let all = me.children(cosca::Recursive::Yes);
     assert!(
         all.iter().any(|p| p.id() == kid.id()),
         "Recursive::Yes must include the child"
@@ -171,7 +165,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
 #[test]
 fn foreign_kill_terminates_the_process() {
     let (child, mut sock) = spawn_blocker();
-    let p = subprocess::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
     p.kill().expect("kill");
     let mut buf = [0u8; 1];
     match sock.read(&mut buf) {
@@ -193,7 +187,7 @@ fn foreign_kill_terminates_the_process() {
 #[cfg(unix)]
 #[test]
 fn foreign_kill_surfaces_permission_denied() {
-    let init = subprocess::Process::from_pid(1).expect("pid 1 resolves");
+    let init = cosca::Process::from_pid(1).expect("pid 1 resolves");
     assert!(init.is_alive(), "init must be alive");
     // SAFETY: geteuid() takes no arguments and is always safe.
     let root = unsafe { libc::geteuid() } == 0;
@@ -208,7 +202,7 @@ fn foreign_kill_surfaces_permission_denied() {
     let r = init.kill();
     if !root {
         assert!(
-            matches!(r, Err(subprocess::error::Error::Io(_))),
+            matches!(r, Err(cosca::error::Error::Io(_))),
             "non-root kill of init must surface EPERM as Err, got {r:?}"
         );
     } else {
@@ -229,7 +223,7 @@ fn is_alive_is_false_for_a_real_zombie() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     // RAW std::process::Command: argv[0] is the exe path, so the testbin mode is args[1] —
-    // do NOT prepend "subprocess_testbin" the way the crate's Command requires.
+    // do NOT prepend "cosca_testbin" the way the crate's Command requires.
     let mut raw = std::process::Command::new(common::testbin())
         .args(["control-block", &addr, "Z"])
         .spawn()
@@ -238,7 +232,7 @@ fn is_alive_is_false_for_a_real_zombie() {
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
 
-    let p = subprocess::Process::from_pid(raw.id()).expect("raw child resolves");
+    let p = cosca::Process::from_pid(raw.id()).expect("raw child resolves");
     sock.write_all(b"x").expect("trigger exit");
     p.wait().expect("death-watch"); // returns at the zombie instant (no reap yet)
 
@@ -246,7 +240,7 @@ fn is_alive_is_false_for_a_real_zombie() {
     // exists() is zombie-inclusive on ALL Unixes: Linux `/proc` persists, and macOS
     // resolves zombies via `sysctl KERN_PROC` (identity.rs).
     assert!(
-        subprocess::Process::from_id(p.id()).is_some(),
+        cosca::Process::from_id(p.id()).is_some(),
         "a zombie identity still resolves"
     );
     raw.wait().expect("reap the zombie");

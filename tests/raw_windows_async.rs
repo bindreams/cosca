@@ -14,10 +14,10 @@ mod common;
 #[tokio::test]
 async fn async_executable_independent_of_argv0() {
     let exe = common::testbin();
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.executable(exe)
         .commandline("pretend-name argv0-report")
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
     let mut s = String::new();
@@ -36,13 +36,13 @@ async fn async_executable_independent_of_argv0() {
 /// child's CRT; EOF (child closing fd 3 on exit) bounds the read — no timer.
 #[tokio::test]
 async fn async_fd3_pipe_out_delivers_child_bytes() {
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "write-fd", "3", "hi-fd3"])
-        .fd(3, subprocess::Stdio::pipe_out())
+        .args(["cosca_testbin", "write-fd", "3", "hi-fd3"])
+        .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
-    let mut r = child.fd_read_end(subprocess::Fd::from(3)).expect("fd 3 reader");
+    let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
     child.wait().await.unwrap();
@@ -54,15 +54,15 @@ async fn async_fd3_pipe_out_delivers_child_bytes() {
 /// makes it echo exactly what was written. EOF bounds both reads — no timer.
 #[tokio::test]
 async fn async_fd3_pipe_in_feeds_child() {
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "read-fd", "3"])
-        .fd(3, subprocess::Stdio::pipe_in())
+        .args(["cosca_testbin", "read-fd", "3"])
+        .fd(3, cosca::Stdio::pipe_in())
         .unwrap()
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
-    let mut w = child.fd_write_end(subprocess::Fd::from(3)).expect("fd 3 writer");
+    let mut w = child.fd_write_end(cosca::Fd::from(3)).expect("fd 3 writer");
     w.write_all(b"ping3").await.unwrap();
     drop(w); // child reads to EOF, copies, exits
     let mut s = String::new();
@@ -80,17 +80,17 @@ async fn async_fd3_pipe_in_feeds_child() {
 /// EOF (child closing fd 3 on exit) bounds the read — no timer.
 #[tokio::test]
 async fn async_contained_raw_child_is_in_our_job() {
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "write-fd", "3", "x"])
-        .fd(3, subprocess::Stdio::pipe_out())
+        .args(["cosca_testbin", "write-fd", "3", "x"])
+        .fd(3, cosca::Stdio::pipe_out())
         .unwrap()
         .contain();
     let mut child = c.spawn().expect("contained raw spawn");
     // Fixed at spawn (run-state-independent): the achieved mechanism is the Job Object.
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
     assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
-    let mut r = child.fd_read_end(subprocess::Fd::from(3)).expect("fd 3 reader");
+    let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
     assert_eq!(s, "x");

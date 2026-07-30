@@ -1,8 +1,8 @@
-use subprocess::error::QuoteErrorKind;
-use subprocess::quote::posix;
-use subprocess::quote::windows;
-use subprocess::Command;
-use subprocess::Containment;
+use cosca::error::QuoteErrorKind;
+use cosca::quote::posix;
+use cosca::quote::windows;
+use cosca::Command;
+use cosca::Containment;
 
 #[test]
 fn public_surface_is_usable() {
@@ -39,9 +39,9 @@ fn public_surface_is_usable() {
 #[cfg(any(unix, windows))]
 #[test]
 fn containment_smoke() {
-    let tb = env!("CARGO_BIN_EXE_subprocess_testbin");
-    let mut cmd = subprocess::Command::new();
-    cmd.executable(tb).args(["subprocess_testbin", "exit", "0"]).contain();
+    let tb = env!("CARGO_BIN_EXE_cosca_testbin");
+    let mut cmd = cosca::Command::new();
+    cmd.executable(tb).args(["cosca_testbin", "exit", "0"]).contain();
     let child = cmd.spawn().expect("spawn contained child");
 
     // On every supported host (Unix + Windows) the strongest mechanism must
@@ -74,9 +74,9 @@ fn containment_smoke() {
 
 #[test]
 fn spawn_public_surface_is_usable() {
-    use subprocess::{run, Stdio};
+    use cosca::{run, Stdio};
     // run([...]) -> output() captures; status code reachable.
-    let out = run([env!("CARGO_BIN_EXE_subprocess_testbin"), "echo-argv", "hi"])
+    let out = run([env!("CARGO_BIN_EXE_cosca_testbin"), "echo-argv", "hi"])
         .output()
         .expect("output");
     assert!(out.status.success());

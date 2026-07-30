@@ -13,7 +13,7 @@ use crate::identity::RawPid;
 mod backend;
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-compile_error!("subprocess::containment::enumerate is implemented only for Windows, Linux, and macOS");
+compile_error!("cosca::containment::enumerate is implemented only for Windows, Linux, and macOS");
 
 /// A `(pid, ppid)` pair for every currently-listable process. Best-effort: a
 /// process that vanishes mid-snapshot is simply absent. Only pid/ppid are read;

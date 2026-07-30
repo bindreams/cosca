@@ -1,4 +1,4 @@
-# subprocess
+# cosca
 
 Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity, and elevation.
 
