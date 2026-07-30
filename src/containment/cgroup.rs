@@ -100,7 +100,7 @@ use nix::unistd::Pid;
 /// firing `cgroup.kill` first if the leaf is still occupied.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
-    /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/subprocess-<pid>`.
+    /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
     leaf_path: PathBuf,
     /// Pre-opened `cgroup.procs` fd (O_CLOEXEC cleared) for the `pre_exec` write.
     procs_fd: RawFd,
@@ -161,7 +161,7 @@ impl CgroupLeaf {
     /// fd or path.
     pub(crate) fn placeholder_for_test() -> CgroupLeaf {
         CgroupLeaf {
-            leaf_path: PathBuf::from("/nonexistent/subprocess-cgroup-placeholder"),
+            leaf_path: PathBuf::from("/nonexistent/cosca-cgroup-placeholder"),
             procs_fd: -1,
         }
     }
@@ -204,7 +204,7 @@ pub(crate) fn try_create_leaf() -> Option<CgroupLeaf> {
     // different seq values mean different leaf names).
     // Safety: getpid() is always valid.
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let leaf_name = format!("subprocess-{}-{}", unsafe { libc::getpid() }, seq);
+    let leaf_name = format!("cosca-{}-{}", unsafe { libc::getpid() }, seq);
     let leaf_path = current.join(&leaf_name);
 
     fs::create_dir(&leaf_path).ok()?;

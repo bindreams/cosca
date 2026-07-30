@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use subprocess::Command;
+use cosca::Command;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -106,18 +106,18 @@ fn child_is_send_and_sync() {
     // Load-bearing for `concurrent_wait_timeout_and_kill_is_safe` (shares &Child across
     // threads).
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<subprocess::Child>();
+    assert_send_sync::<cosca::Child>();
 }
 
 #[test]
 fn tree_ops_on_uncontained_child_are_unsupported() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
-    assert_eq!(child.containment(), subprocess::Containment::None);
+    assert_eq!(child.containment(), cosca::Containment::None);
     for r in [child.kill_tree(), child.terminate_tree()] {
         assert!(
-            matches!(r, Err(subprocess::error::Error::Unsupported { .. })),
+            matches!(r, Err(cosca::error::Error::Unsupported { .. })),
             "uncontained _tree op must be Unsupported, got {r:?}"
         );
     }
@@ -135,7 +135,7 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "report-nested-kill-tree", &addr])
+        .args(["cosca_testbin", "report-nested-kill-tree", &addr])
         .contain();
     let child = cmd.spawn().expect("spawn reporter");
     let (mut sock, _) = listener.accept().expect("accept");

@@ -93,7 +93,7 @@ jobs:
         if: matrix.os == 'darwin'
         run: cargo test --locked --release --lib --target ${{ matrix.target }}
 
-      # Live cgroup v2 containment tests are gated behind SUBPROCESS_TEST_CGROUP
+      # Live cgroup v2 containment tests are gated behind COSCA_TEST_CGROUP
       # (a no-op without it). They need a cgroup the supervisor may create child
       # cgroups under. We make a fresh leaf directly under the unified root cgroup:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
@@ -112,9 +112,9 @@ jobs:
           test -n "$BIN"
           echo "cgroup test binary: $BIN"
           sudo bash -euxc '
-            CG=/sys/fs/cgroup/subprocess-ci
+            CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
-            export SUBPROCESS_TEST_CGROUP=1
+            export COSCA_TEST_CGROUP=1
             exec "$0" cgroup --nocapture --test-threads=1
           ' "$BIN"

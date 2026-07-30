@@ -58,7 +58,7 @@ async fn overlapped_in_pipe_feeds_a_real_childs_input() {
 // first_pipe_instance makes the second create fail PermissionDenied.
 #[tokio::test]
 async fn overlapped_pipe_never_attaches_to_a_squatted_name() {
-    let name = format!(r"\\.\pipe\subprocess-test-squat.{}", std::process::id());
+    let name = format!(r"\\.\pipe\cosca-test-squat.{}", std::process::id());
     let _squatter = tokio::net::windows::named_pipe::ServerOptions::new()
         .first_pipe_instance(true)
         .create(&name)
@@ -78,7 +78,7 @@ async fn overlapped_pipe_never_attaches_to_a_squatted_name() {
 // what `overlapped_pipe_named` does when it loses the race.
 #[tokio::test]
 async fn overlapped_pipe_client_slot_is_exclusive() {
-    let name = format!(r"\\.\pipe\subprocess-test-slot.{}", std::process::id());
+    let name = format!(r"\\.\pipe\cosca-test-slot.{}", std::process::id());
     // The same instance overlapped_pipe_named creates (Out orientation).
     let _server = tokio::net::windows::named_pipe::ServerOptions::new()
         .access_inbound(true)
@@ -148,7 +148,7 @@ async fn owned_write_poll_after_join_error_is_err_not_panic() {
 async fn overlapped_pipe_connect_pending_completes_on_late_client_open() {
     use std::future::Future;
     use std::io::Write;
-    let name = format!(r"\\.\pipe\subprocess-test-pending.{}", std::process::id());
+    let name = format!(r"\\.\pipe\cosca-test-pending.{}", std::process::id());
     let mut server = tokio::net::windows::named_pipe::ServerOptions::new()
         .access_inbound(true)
         .first_pipe_instance(true)

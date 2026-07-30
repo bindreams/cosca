@@ -8,7 +8,7 @@ mod common;
 
 use std::io::Read;
 
-use subprocess::tokio::Process;
+use cosca::tokio::Process;
 
 fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     let mut buf = [0u8; 1];
@@ -163,21 +163,18 @@ async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
     use std::time::Duration;
     let (child, _sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).expect("resolves");
-    assert!(matches!(
-        p.terminate(),
-        Err(subprocess::error::Error::Unsupported { .. })
-    ));
+    assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)).await,
-        Err(subprocess::error::Error::Unsupported { .. })
+        Err(cosca::error::Error::Unsupported { .. })
     ));
     assert!(matches!(
         p.terminate_tree(),
-        Err(subprocess::error::Error::Unsupported { .. })
+        Err(cosca::error::Error::Unsupported { .. })
     ));
     assert!(matches!(
         p.graceful_shutdown_tree(Duration::from_secs(1)).await,
-        Err(subprocess::error::Error::Unsupported { .. })
+        Err(cosca::error::Error::Unsupported { .. })
     ));
     child.kill().expect("cleanup");
     let _ = child.wait();

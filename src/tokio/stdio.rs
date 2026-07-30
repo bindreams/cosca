@@ -173,7 +173,7 @@ fn overlapped_pipe(
     let mut r = [0u8; 8];
     getrandom::fill(&mut r).map_err(|e| crate::error::Error::Io(std::io::Error::other(e)))?;
     let name = format!(
-        r"\\.\pipe\subprocess.{}.{}.{:016x}",
+        r"\\.\pipe\cosca.{}.{}.{:016x}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed),
         u64::from_ne_bytes(r)

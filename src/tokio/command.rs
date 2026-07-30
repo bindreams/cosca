@@ -8,7 +8,7 @@ use crate::stdio::Stdio;
 
 use super::child::Child;
 
-/// An async (tokio) process to configure and spawn — mirrors [`subprocess::Command`](crate::Command).
+/// An async (tokio) process to configure and spawn — mirrors [`cosca::Command`](crate::Command).
 ///
 /// # Limitations
 ///
@@ -111,7 +111,7 @@ impl Command {
         self
     }
 
-    /// Run the child elevated — mirrors [`subprocess::Command::elevate`](crate::Command::elevate).
+    /// Run the child elevated — mirrors [`cosca::Command::elevate`](crate::Command::elevate).
     pub fn elevate(&mut self) -> &mut Command {
         self.inner.elevate();
         self

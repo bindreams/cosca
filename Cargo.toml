@@ -1,11 +1,11 @@
 [package]
-name = "subprocess"
+name = "cosca"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.87"
-description = "Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity (and, later, elevation)."
+description = "Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity, and elevation."
 license = "Apache-2.0"
-publish = false           # working name; not yet published
+publish = false           # name settled (`cosca`); not yet published
 
 [features]
 pty = []
@@ -56,7 +56,7 @@ command-fds = "0.3"
 rustix = { version = "1", features = ["process", "event"] }
 
 [[bin]]
-name = "subprocess_testbin"
+name = "cosca_testbin"
 path = "testbin/main.rs"
 test = false
 doc = false

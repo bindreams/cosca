@@ -1,4 +1,4 @@
-//! Live elevation tier — gated behind SUBPROCESS_TEST_ELEVATION (cgroup precedent):
+//! Live elevation tier — gated behind COSCA_TEST_ELEVATION (cgroup precedent):
 //! a TRUE no-op when the var is absent, and FAILS LOUDLY when set but elevation is
 //! unavailable. The pure tiers cover all logic unconditionally; only the privilege-gain
 //! (and the cross-process controlling-terminal probes) run here.
@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 fn gated() -> bool {
-    std::env::var_os("SUBPROCESS_TEST_ELEVATION").is_some()
+    std::env::var_os("COSCA_TEST_ELEVATION").is_some()
 }
 
 fn testbin() -> PathBuf {
@@ -16,9 +16,9 @@ fn testbin() -> PathBuf {
         p.pop();
     }
     p.push(if cfg!(windows) {
-        "subprocess_testbin.exe"
+        "cosca_testbin.exe"
     } else {
-        "subprocess_testbin"
+        "cosca_testbin"
     });
     p
 }
@@ -29,9 +29,9 @@ fn posix_elevated_child_runs_as_root_and_captures_uid() {
     if !gated() {
         return;
     }
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.args(["id", "-u"])
-        .elevation_auth(subprocess::elevation::Auth::NonInteractive);
+        .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let out = c.output().expect("elevated output");
     assert!(out.status.success(), "elevated `id -u` failed: {out:?}");
     assert_eq!(
@@ -49,11 +49,11 @@ fn posix_child_self_detects_elevation() {
     }
     let exe = testbin();
     let exe_str = exe.clone().into_os_string();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     // executable() set AND argv[0] == the exe path, so no distinct-argv0 rejection.
     c.executable(&exe)
         .args([exe_str, "is-elevated-report".into()])
-        .elevation_auth(subprocess::elevation::Auth::NonInteractive);
+        .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let s = c.read().expect("read");
     assert_eq!(s.trim(), "1", "elevated testbin did not self-detect elevation");
 }
@@ -75,13 +75,13 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
     let slave_file = std::fs::File::from(slave);
 
     let exe = testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.args([exe.into_os_string(), "acquire-ctty-and-probe".into()]);
     // stdin = /dev/null: a buggy isatty(STDIN) probe would answer 0 here.
-    c.stdin(subprocess::Stdio::null()).unwrap();
-    c.stdout(subprocess::Stdio::pipe()).unwrap();
+    c.stdin(cosca::Stdio::null()).unwrap();
+    c.stdout(cosca::Stdio::pipe()).unwrap();
     // Pass the pty slave as fd 3; the child acquires it as its controlling terminal.
-    c.fd(3, subprocess::Stdio::from_file(slave_file)).unwrap();
+    c.fd(3, cosca::Stdio::from_file(slave_file)).unwrap();
     let mut ch = c.spawn().expect("spawn");
     let out = ch.communicate(None).expect("communicate");
     let _ = master.as_raw_fd(); // keep master owned until here
@@ -99,7 +99,7 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
 #[test]
 fn controlling_terminal_probe_is_false_after_setsid() {
     let exe = testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.args(["setsid".into(), exe.into_os_string(), "controlling-terminal".into()]);
     let s = c.read().expect("read setsid child output");
     assert_eq!(
@@ -118,21 +118,21 @@ fn controlling_terminal_probe_is_false_after_setsid() {
 #[cfg(target_os = "linux")]
 #[test]
 fn run0_client_kill_propagates_to_the_transient_unit() {
-    if !gated() || std::env::var_os("SUBPROCESS_TEST_ELEVATION_RUN0").is_none() {
+    if !gated() || std::env::var_os("COSCA_TEST_ELEVATION_RUN0").is_none() {
         return; // requires run0 + a polkit-passwordless context that can spawn a transient unit.
     }
     let pidfile = std::env::temp_dir().join(format!("run0-payload-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
     let exe = testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(&exe)
         .args([
             exe.clone().into_os_string(),
             "write-pid-then-sleep".into(),
             pidfile.clone().into_os_string(),
         ])
-        .elevation_backend(subprocess::elevation::Backend::Run0)
-        .elevation_auth(subprocess::elevation::Auth::NonInteractive);
+        .elevation_backend(cosca::elevation::Backend::Run0)
+        .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = c.spawn().expect("run0 spawn");
 
     // Wait for the payload to publish its pid on a real event (its file appears), not a timer.
@@ -178,14 +178,12 @@ fn posix_stdin_auth_reaches_root() {
     if !gated() {
         return;
     }
-    let pw = std::env::var("SUBPROCESS_TEST_ELEVATION_PASSWORD")
-        .expect("SUBPROCESS_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test");
-    let mut c = subprocess::Command::new();
+    let pw = std::env::var("COSCA_TEST_ELEVATION_PASSWORD")
+        .expect("COSCA_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test");
+    let mut c = cosca::Command::new();
     c.args(["id", "-u"])
-        .elevation_backend(subprocess::elevation::Backend::Sudo)
-        .elevation_auth(subprocess::elevation::Auth::Stdin(subprocess::elevation::Secret::new(
-            pw,
-        )));
+        .elevation_backend(cosca::elevation::Backend::Sudo)
+        .elevation_auth(cosca::elevation::Auth::Stdin(cosca::elevation::Secret::new(pw)));
     let out = c.output().expect("stdin-auth elevated output");
     assert!(out.status.success(), "sudo -S id failed: {out:?}");
     assert_eq!(
@@ -202,8 +200,8 @@ fn posix_askpass_auth_reaches_root() {
     if !gated() {
         return;
     }
-    let pw = std::env::var("SUBPROCESS_TEST_ELEVATION_PASSWORD")
-        .expect("SUBPROCESS_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
+    let pw = std::env::var("COSCA_TEST_ELEVATION_PASSWORD")
+        .expect("COSCA_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
     // A minimal askpass script that echoes the password.
     let dir = std::env::temp_dir().join(format!("askpass-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -213,10 +211,10 @@ fn posix_askpass_auth_reaches_root() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.args(["id", "-u"])
-        .elevation_backend(subprocess::elevation::Backend::Sudo)
-        .elevation_auth(subprocess::elevation::Auth::Askpass(script.clone()));
+        .elevation_backend(cosca::elevation::Backend::Sudo)
+        .elevation_auth(cosca::elevation::Auth::Askpass(script.clone()));
     let out = c.output().expect("askpass elevated output");
     assert!(out.status.success(), "sudo -A id failed: {out:?}");
     assert_eq!(
@@ -246,14 +244,14 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     let pidfile = std::env::temp_dir().join(format!("uncontained-payload-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
     let exe = testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(&exe)
         .args([
             exe.clone().into_os_string(),
             "write-pid-then-sleep".into(),
             pidfile.clone().into_os_string(),
         ])
-        .elevation_auth(subprocess::elevation::Auth::NonInteractive);
+        .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = c.spawn().expect("elevated write-pid-then-sleep");
 
     // Wait for the payload to publish its pid on a real event (its file appears with parseable
@@ -281,8 +279,8 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     // would be the real defect.
     match child.kill() {
         Ok(()) => {}
-        Err(subprocess::error::Error::Elevation {
-            kind: subprocess::error::ElevationErrorKind::Unkillable,
+        Err(cosca::error::Error::Elevation {
+            kind: cosca::error::ElevationErrorKind::Unkillable,
             ..
         }) => {}
         other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
@@ -297,16 +295,15 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
 #[cfg(unix)]
 #[test]
 fn already_elevated_inherit_spawn_reports_already_elevated() {
-    if !gated() || !subprocess::elevation::is_elevated() {
+    if !gated() || !cosca::elevation::is_elevated() {
         return; // deterministic only when the gated runner is itself elevated.
     }
-    let mut c = subprocess::Command::new();
-    c.args(["true"])
-        .elevation_auth(subprocess::elevation::Auth::NonInteractive);
+    let mut c = cosca::Command::new();
+    c.args(["true"]).elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = c.spawn().expect("spawn");
     assert_eq!(
         child.elevation().expect("elevation requested → Some").via,
-        subprocess::elevation::ElevatedVia::AlreadyElevated,
+        cosca::elevation::ElevatedVia::AlreadyElevated,
     );
     let _ = child.wait();
 }
@@ -317,12 +314,12 @@ fn windows_elevated_child_writes_admin_marker() {
     if !gated() {
         return;
     }
-    let dir = std::env::var_os("SUBPROCESS_TEST_ELEVATION_MARKER_DIR")
+    let dir = std::env::var_os("COSCA_TEST_ELEVATION_MARKER_DIR")
         .map(PathBuf::from)
-        .expect("SUBPROCESS_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+        .expect("COSCA_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
     let marker = dir.join(format!("elev-{}.marker", std::process::id()));
     let exe = testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(&exe).args([
         exe.clone().into_os_string(),
         "write-marker".into(),
@@ -332,8 +329,8 @@ fn windows_elevated_child_writes_admin_marker() {
     let child = c.spawn().expect("runas spawn");
     // Honest report: WindowsUac + OwnConsole (never a faked shared stream).
     let report = child.elevation().unwrap();
-    assert_eq!(report.via, subprocess::elevation::ElevatedVia::WindowsUac);
-    assert_eq!(report.stdio, subprocess::elevation::ElevatedStdio::OwnConsole);
+    assert_eq!(report.via, cosca::elevation::ElevatedVia::WindowsUac);
+    assert_eq!(report.stdio, cosca::elevation::ElevatedStdio::OwnConsole);
     let status = child.wait().expect("wait");
     assert!(status.success(), "elevated marker write failed: {status:?}");
     assert!(marker.exists(), "elevated child did not create the admin-only marker");
@@ -346,9 +343,9 @@ async fn async_posix_elevated_child_runs_as_root() {
     if !gated() {
         return;
     }
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.args(["id", "-u"])
-        .elevation_auth(subprocess::elevation::Auth::NonInteractive);
+        .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let out = c.output().await.expect("async elevated output");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
 }
@@ -362,15 +359,15 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         return;
     }
     let exe = testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     // A long-lived elevated child (ping loops ~50s).
     c.executable(&exe)
         .args([exe.clone().into_os_string(), "sleep-marker".into()])
         .elevate();
     let child = c.spawn().expect("runas spawn");
     match child.kill() {
-        Err(subprocess::error::Error::Elevation { kind, .. }) => {
-            assert_eq!(kind, subprocess::error::ElevationErrorKind::Unkillable);
+        Err(cosca::error::Error::Elevation { kind, .. }) => {
+            assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
         }
         // If the CI context runs the parent elevated too, the child is killable — accept Ok.
         Ok(()) => {}
@@ -387,12 +384,12 @@ async fn async_windows_elevated_child_writes_admin_marker() {
     if !gated() {
         return;
     }
-    let dir = std::env::var_os("SUBPROCESS_TEST_ELEVATION_MARKER_DIR")
+    let dir = std::env::var_os("COSCA_TEST_ELEVATION_MARKER_DIR")
         .map(PathBuf::from)
-        .expect("SUBPROCESS_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+        .expect("COSCA_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
     let marker = dir.join(format!("elev-async-{}.marker", std::process::id()));
     let exe = testbin();
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.executable(&exe).args([
         exe.clone().into_os_string(),
         "write-marker".into(),
@@ -401,8 +398,8 @@ async fn async_windows_elevated_child_writes_admin_marker() {
     c.elevate();
     let mut child = c.spawn().expect("async runas spawn");
     let report = child.elevation().unwrap();
-    assert_eq!(report.via, subprocess::elevation::ElevatedVia::WindowsUac);
-    assert_eq!(report.stdio, subprocess::elevation::ElevatedStdio::OwnConsole);
+    assert_eq!(report.via, cosca::elevation::ElevatedVia::WindowsUac);
+    assert_eq!(report.stdio, cosca::elevation::ElevatedStdio::OwnConsole);
     let status = child.wait().await.expect("wait");
     assert!(status.success(), "async elevated marker write failed: {status:?}");
     assert!(
@@ -423,14 +420,14 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         return;
     }
     let exe = testbin();
-    let mut c = subprocess::tokio::Command::new();
+    let mut c = cosca::tokio::Command::new();
     c.executable(&exe)
         .args([exe.clone().into_os_string(), "sleep-marker".into()])
         .elevate();
     let mut child = c.spawn().expect("async runas spawn");
     match child.kill() {
-        Err(subprocess::error::Error::Elevation { kind, .. }) => {
-            assert_eq!(kind, subprocess::error::ElevationErrorKind::Unkillable);
+        Err(cosca::error::Error::Elevation { kind, .. }) => {
+            assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
         }
         // If the manual runner is itself elevated, the child is killable — accept Ok.
         Ok(()) => {}

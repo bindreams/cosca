@@ -21,7 +21,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // Err on every platform.
     if ::tokio::runtime::Handle::try_current().is_err() {
         return Err(Error::Io(std::io::Error::other(
-            "subprocess::tokio::Command must be spawned from within a Tokio runtime",
+            "cosca::tokio::Command must be spawned from within a Tokio runtime",
         )));
     }
 
@@ -128,7 +128,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let std_cmd = build_std_command(cmd)?;
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
-    // tokio's own `kill_on_drop` is intentionally left at its `false` default: subprocess's
+    // tokio's own `kill_on_drop` is intentionally left at its `false` default: cosca's
     // `Child::drop` (attached.hard_kill + reap_now) is the SOLE teardown owner. Forwarding the
     // builder's `kill_on_drop` to `tcmd` would make tokio fire its own kill and race reap_now.
 

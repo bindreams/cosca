@@ -20,7 +20,7 @@ pub(crate) mod stat_parse;
 mod backend;
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-compile_error!("subprocess::identity is implemented only for Windows, Linux, and macOS");
+compile_error!("cosca::identity is implemented only for Windows, Linux, and macOS");
 
 /// A process identifier as the OS knows it (matches `std::process::id`).
 pub type RawPid = u32;

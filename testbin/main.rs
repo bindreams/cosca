@@ -1,5 +1,5 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
-//! one exception: the `report-nested-kill-tree` mode uses the `subprocess` crate
+//! one exception: the `report-nested-kill-tree` mode uses the `cosca` crate
 //! to exercise the real nested-member `kill_tree` path. Behavior is selected by argv[1].
 
 use std::io::{Read, Write};
@@ -376,15 +376,15 @@ fn main() {
             // be Unsupported. Report 'D' (Delegated + Unsupported) or 'O' (other).
             let addr = &args[2];
             let exe = std::env::current_exe().unwrap();
-            let mut gc = subprocess::Command::new();
-            gc.executable(&exe).args(["subprocess_testbin", "exit", "0"]).contain();
+            let mut gc = cosca::Command::new();
+            gc.executable(&exe).args(["cosca_testbin", "exit", "0"]).contain();
             let child = gc.spawn().unwrap();
             // A nested member must report Containment::Delegated AND reject kill_tree as
             // Unsupported. Transmitting both discriminates the Delegated path from an
             // uncontained None (which also yields Unsupported) — so a marker-propagation
             // regression (nested -> None) is caught, not silently passed.
-            let is_delegated = child.containment() == subprocess::Containment::Delegated;
-            let unsupported = matches!(child.kill_tree(), Err(subprocess::error::Error::Unsupported { .. }));
+            let is_delegated = child.containment() == cosca::Containment::Delegated;
+            let unsupported = matches!(child.kill_tree(), Err(cosca::error::Error::Unsupported { .. }));
             let _ = child.wait();
             let mut sock = std::net::TcpStream::connect(addr).unwrap();
             sock.write_all(if is_delegated && unsupported { b"D" } else { b"O" })
@@ -407,11 +407,11 @@ fn main() {
             let _ = sock.read(&mut buf);
         }
         "is-elevated-report" => {
-            println!("{}", if subprocess::elevation::is_elevated() { "1" } else { "0" });
+            println!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });
         }
         #[cfg(unix)]
         "controlling-terminal" => {
-            let present = subprocess::elevation::controlling_terminal_present();
+            let present = cosca::elevation::controlling_terminal_present();
             println!("{}", if present { "1" } else { "0" });
         }
         // Linux PTY harness: become a session leader with no ctty (setsid), acquire the
@@ -425,7 +425,7 @@ fn main() {
                 assert!(libc::setsid() != -1, "setsid failed");
                 assert!(libc::ioctl(3, libc::TIOCSCTTY as _, 0) != -1, "TIOCSCTTY failed");
             }
-            let present = subprocess::elevation::controlling_terminal_present();
+            let present = cosca::elevation::controlling_terminal_present();
             println!("{}", if present { "1" } else { "0" });
         }
         "write-marker" => {
@@ -442,7 +442,7 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(600));
         }
         other => {
-            eprintln!("subprocess_testbin: unknown mode {other:?}");
+            eprintln!("cosca_testbin: unknown mode {other:?}");
             exit(2);
         }
     }

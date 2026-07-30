@@ -14,7 +14,7 @@ use crate::identity::ProcessId;
 pub(crate) mod backend;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-compile_error!("subprocess::wait is implemented only for Linux, macOS, and Windows");
+compile_error!("cosca::wait is implemented only for Linux, macOS, and Windows");
 
 /// Force the NEXT grace-watch on THIS thread to fail (consumed by `block_until_exit`,
 /// `Child::wait_timeout`, and `tokio::wait::{grace_wait, wait_exit}`), so the watch-error

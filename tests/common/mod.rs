@@ -10,19 +10,19 @@ use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 
 pub fn testbin() -> &'static str {
-    env!("CARGO_BIN_EXE_subprocess_testbin")
+    env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
 /// now calls this instead of keeping its own copy.
-pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (subprocess::Child, TcpStream) {
+pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut argv: Vec<String> = vec!["subprocess_testbin".into(), mode.into(), addr];
+    let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
-    let mut cmd = subprocess::Command::new();
+    let mut cmd = cosca::Command::new();
     cmd.executable(testbin()).args(&argv);
     if contain {
         cmd.contain();
@@ -36,7 +36,7 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (subprocess::
 
 /// Convenience alias for the common `control-block` blocker (no `.contain()`). A one-line
 /// shortcut over `spawn_control`, NOT a second copy of the body.
-pub fn spawn_blocker() -> (subprocess::Child, TcpStream) {
+pub fn spawn_blocker() -> (cosca::Child, TcpStream) {
     spawn_control("control-block", &["R"], false)
 }
 
@@ -45,12 +45,11 @@ pub fn spawn_blocker() -> (subprocess::Child, TcpStream) {
 /// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
 /// when the whole tree is torn down, so callers prove teardown by reading EOF on both, never by
 /// a timer.
-pub fn spawn_tree(mode: &str, contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
+pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = subprocess::Command::new();
-    cmd.executable(testbin())
-        .args(["subprocess_testbin", mode, addr.as_str()]);
+    let mut cmd = cosca::Command::new();
+    cmd.executable(testbin()).args(["cosca_testbin", mode, addr.as_str()]);
     if contain {
         cmd.contain();
     }
@@ -75,19 +74,19 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (subprocess::Child, Vec<TcpStrea
 }
 
 /// Spawn the `spawn-grandchild` helper tree.
-pub fn spawn_grandchild(contain: bool) -> (subprocess::Child, Vec<TcpStream>) {
+pub fn spawn_grandchild(contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     spawn_tree("spawn-grandchild", contain)
 }
 
 /// Async analogue of `spawn_control`: spawn a testbin control child (it connects back and
 /// sends its tag before the helper returns), optionally contained.
 #[cfg(feature = "tokio")]
-pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (subprocess::tokio::Child, TcpStream) {
+pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (cosca::tokio::Child, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut argv: Vec<String> = vec!["subprocess_testbin".into(), mode.into(), addr];
+    let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
-    let mut cmd = subprocess::tokio::Command::new();
+    let mut cmd = cosca::tokio::Command::new();
     if contain {
         // Load the testbin as argv[0] via the std path (mode/addr stay at args[1..], so it behaves
         // identically) — keeps this shared helper on one code path across OSes. The async raw
@@ -113,11 +112,11 @@ pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (subpro
 #[cfg(feature = "tokio")]
 pub fn spawn_tree_async(
     mode: &str,
-    configure: impl FnOnce(&mut subprocess::tokio::Command),
-) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = subprocess::tokio::Command::new();
+    let mut cmd = cosca::tokio::Command::new();
     // Load the testbin as argv[0] via the std path (mode/addr at args[1..], so it behaves
     // identically): these trees are usually contained and the sole uncontained caller is
     // backend-agnostic, so argv[0] keeps this helper on one code path across OSes. `configure`
@@ -146,24 +145,21 @@ pub fn spawn_tree_async(
 /// Async `control-block` blocker (uncontained): a child that connects, tags "R", and blocks on
 /// its socket. The accept/tag-read is sync std (the test side); the CHILD is async.
 #[cfg(feature = "tokio")]
-pub fn spawn_blocker_async() -> (subprocess::tokio::Child, TcpStream) {
+pub fn spawn_blocker_async() -> (cosca::tokio::Child, TcpStream) {
     spawn_control_async("control-block", &["R"], false)
 }
 
 /// Async analogue of `spawn_grandchild`, returning the root ("R") and grandchild ("G") control
 /// sockets identified by tag (accept order is not guaranteed).
 #[cfg(feature = "tokio")]
-pub fn spawn_grandchild_async(contain: bool) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
+pub fn spawn_grandchild_async(contain: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_grandchild_async_with(contain, true)
 }
 
 /// `spawn_grandchild_async` with explicit `contain` and `kill_on_drop` flags, so a test can
 /// exercise the `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`.
 #[cfg(feature = "tokio")]
-pub fn spawn_grandchild_async_with(
-    contain: bool,
-    kill_on_drop: bool,
-) -> (subprocess::tokio::Child, TcpStream, TcpStream) {
+pub fn spawn_grandchild_async_with(contain: bool, kill_on_drop: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_tree_async("spawn-grandchild", |cmd| {
         if contain {
             cmd.contain();

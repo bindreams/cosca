@@ -49,15 +49,9 @@ async fn async_kill_on_exited_unreaped_child_is_ok() {
 async fn async_tree_ops_unsupported_when_uncontained() {
     let (mut child, mut sock) = common::spawn_blocker_async();
     let err = child.kill_tree().expect_err("uncontained kill_tree");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     let err = child.terminate_tree().expect_err("uncontained terminate_tree");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
     let _ = child.wait().await;
@@ -98,10 +92,10 @@ async fn async_contain_with_treewalk_tears_down_tree() {
     // (no kernel group needed). The builder mirror's value-sensitivity is the unit test's job
     // (src/tokio/command_tests.rs).
     let (mut child, mut root, mut grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
-        cmd.contain_with(subprocess::ContainMode::TreeWalk)
-            .nesting(subprocess::containment::Nesting::Opaque);
+        cmd.contain_with(cosca::ContainMode::TreeWalk)
+            .nesting(cosca::containment::Nesting::Opaque);
     });
-    assert_eq!(child.containment(), subprocess::Containment::TreeWalk);
+    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
     child.kill_tree().expect("treewalk kill_tree");
     expect_eof("root", &mut root);
     expect_eof("grandchild", &mut grand);
@@ -132,10 +126,7 @@ async fn async_terminate_unsupported_on_windows() {
     let err = child
         .terminate()
         .expect_err("lone graceful terminate has no Windows primitive");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
     let _ = child.wait().await;
@@ -308,10 +299,7 @@ async fn async_graceful_shutdown_unsupported_on_windows() {
         .graceful_shutdown(Duration::from_secs(1))
         .await
         .expect_err("no Windows lone graceful");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
     let _ = child.wait().await;
@@ -408,10 +396,7 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
         .graceful_shutdown_tree(Duration::from_secs(1))
         .await
         .expect_err("uncontained tree graceful");
-    assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
     let _ = child.wait().await;

@@ -1,9 +1,9 @@
 use std::io::{Read, Write};
 
-use subprocess::{Command, Fd, Stdio};
+use cosca::{Command, Fd, Stdio};
 
 fn testbin() -> &'static str {
-    env!("CARGO_BIN_EXE_subprocess_testbin")
+    env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
 // Basics =====
@@ -11,7 +11,7 @@ fn testbin() -> &'static str {
 #[test]
 fn spawn_and_status_exit_code() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "7"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "exit", "7"]);
     let child = cmd.spawn().expect("spawn");
     let status = child.wait().expect("wait");
     assert_eq!(status.code(), Some(7));
@@ -20,7 +20,7 @@ fn spawn_and_status_exit_code() {
 #[test]
 fn spawned_child_has_live_identity() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
     // id() is stable across two calls.
     assert_eq!(child.id().pid(), child.id().pid());
@@ -33,7 +33,7 @@ fn try_wait_returns_none_before_exit_and_some_after() {
     // tee-both blocks on stdin — the child won't exit until stdin is closed.
     // Null stdout/stderr so tee-both doesn't panic on broken pipe.
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "tee-both"])
+        .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
         .expect("stdin pipe")
         .stdout(Stdio::null())
@@ -62,7 +62,7 @@ fn kill_terminates_running_child() {
     let mut cmd = Command::new();
     // tee-both blocks indefinitely on stdin.
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "tee-both"])
+        .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
         .expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -80,7 +80,7 @@ fn kill_terminates_running_child() {
 fn stdout_pipe_captures_output() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "emit", "5", "0"])
+        .args(["cosca_testbin", "emit", "5", "0"])
         .stdout(Stdio::pipe())
         .expect("stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -98,7 +98,7 @@ fn stdout_pipe_captures_output() {
 fn stderr_pipe_captures_output() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "emit", "0", "3"])
+        .args(["cosca_testbin", "emit", "0", "3"])
         .stderr(Stdio::pipe())
         .expect("stderr pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -118,7 +118,7 @@ fn stdin_pipe_is_writable() {
     // tee-both reads stdin and copies to stdout+stderr; we just need to confirm
     // the write end is usable. Wire stdout to null to avoid a broken-pipe panic.
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "tee-both"])
+        .args(["cosca_testbin", "tee-both"])
         .stdin(Stdio::pipe())
         .expect("stdin pipe")
         .stdout(Stdio::null())
@@ -141,10 +141,10 @@ fn merge_stderr_onto_stdout_combines_output() {
     // emit 3 bytes to stdout, 2 to stderr; merge stderr→stdout so both come
     // through the single stdout pipe.
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "emit", "3", "2"])
+        .args(["cosca_testbin", "emit", "3", "2"])
         .stdout(Stdio::pipe())
         .expect("stdout pipe")
-        .stderr(Stdio::merge(subprocess::Fd::STDOUT))
+        .stderr(Stdio::merge(cosca::Fd::STDOUT))
         .expect("stderr merge");
     let mut child = cmd.spawn().expect("spawn");
     let mut reader = child.stdout().expect("stdout reader");
@@ -165,7 +165,7 @@ fn merge_stderr_onto_stdout_combines_output() {
 fn null_stdout_discards_output() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "emit", "100", "0"])
+        .args(["cosca_testbin", "emit", "100", "0"])
         .stdout(Stdio::null())
         .expect("null stdout");
     let child = cmd.spawn().expect("spawn");
@@ -180,12 +180,12 @@ fn null_stdout_discards_output() {
 fn merge_to_merge_is_rejected() {
     // stdout -> merge(stderr), stderr -> merge(stdout): chained merge.
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
-    cmd.stderr(Stdio::merge(subprocess::Fd::STDOUT)).expect("stderr merge");
-    cmd.stdout(Stdio::merge(subprocess::Fd::STDERR)).expect("stdout merge");
+    cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
+    cmd.stderr(Stdio::merge(cosca::Fd::STDOUT)).expect("stderr merge");
+    cmd.stdout(Stdio::merge(cosca::Fd::STDERR)).expect("stdout merge");
     let err = cmd.spawn().expect_err("should reject merge-to-merge");
     assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
+        matches!(err, cosca::error::Error::Unsupported { .. }),
         "expected Unsupported for chained merge, got {err:?}"
     );
 }
@@ -196,8 +196,8 @@ fn merge_to_merge_is_rejected() {
 fn env_variable_reaches_child() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "env", "SUBPROCESS_TEST_VAR"])
-        .env("SUBPROCESS_TEST_VAR", "hello123")
+        .args(["cosca_testbin", "env", "COSCA_TEST_VAR"])
+        .env("COSCA_TEST_VAR", "hello123")
         .stdout(Stdio::pipe())
         .expect("stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -206,7 +206,7 @@ fn env_variable_reaches_child() {
     reader.read_to_string(&mut out).expect("read");
     drop(reader);
     let _ = child.wait();
-    assert_eq!(out.trim(), "SUBPROCESS_TEST_VAR=hello123");
+    assert_eq!(out.trim(), "COSCA_TEST_VAR=hello123");
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn current_dir_sets_working_directory() {
     let mut cmd = Command::new();
     // Use exit 0 — simplest child that honors cwd without writing to stdout.
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "exit", "0"])
+        .args(["cosca_testbin", "exit", "0"])
         .current_dir(&tmpdir);
     let child = cmd.spawn().expect("spawn with cwd");
     let status = child.wait().expect("wait");
@@ -269,7 +269,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     // A non-concurrent pump would deadlock here.
     let input = vec![b'x'; 512 * 1024];
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "tee-both"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
     cmd.stdout(Stdio::pipe()).unwrap();
     cmd.stderr(Stdio::pipe()).unwrap();
@@ -283,7 +283,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
 #[test]
 fn output_captures_stdout_and_stderr_with_sizes() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "emit", "5", "3"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "emit", "5", "3"]);
     let out = cmd.output().expect("output");
     assert!(out.status.success());
     assert_eq!(out.stdout, b"ooooo");
@@ -293,8 +293,7 @@ fn output_captures_stdout_and_stderr_with_sizes() {
 #[test]
 fn read_returns_verbatim_utf8() {
     let mut cmd = Command::new();
-    cmd.executable(testbin())
-        .args(["subprocess_testbin", "echo-argv", "hello"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "echo-argv", "hello"]);
     let s = cmd.read().expect("read");
     assert_eq!(s, "hello\n"); // verbatim: trailing newline preserved
 }
@@ -306,14 +305,14 @@ fn commandline_round_trips_through_split_or_passthrough() {
     // the first token (the args-only raw_arg fix — a duplicated program token
     // would make the child print the wrong argv or error).
     let line = format!(r#""{}" echo-argv hello"#, testbin());
-    let s = subprocess::run_line(line).read().expect("read");
+    let s = cosca::run_line(line).read().expect("read");
     assert_eq!(s, "hello\n");
 }
 
 #[test]
 fn merge_stderr_into_stdout() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "emit", "4", "4"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "emit", "4", "4"]);
     cmd.stdout(Stdio::pipe()).unwrap();
     cmd.stderr(Stdio::merge(Fd::STDOUT)).unwrap();
     let mut child = cmd.spawn().expect("spawn");
@@ -328,8 +327,7 @@ fn merge_stderr_into_stdout() {
 #[test]
 fn null_stdout_discards() {
     let mut cmd = Command::new();
-    cmd.executable(testbin())
-        .args(["subprocess_testbin", "emit", "100", "0"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "emit", "100", "0"]);
     cmd.stdout(Stdio::null()).unwrap();
     let status = cmd.status().expect("status");
     assert!(status.success());
@@ -346,7 +344,7 @@ fn null_stdout_discards() {
 fn unix_fd3_pipe_round_trips() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "fd3-echo"])
+        .args(["cosca_testbin", "fd3-echo"])
         .stdout(Stdio::pipe())
         .expect("stdout pipe")
         // pipe_in: child reads, parent holds the write end.
@@ -375,7 +373,7 @@ fn unix_fd3_pipe_round_trips() {
 fn unix_fd3_null_is_accepted() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "fd3-echo"])
+        .args(["cosca_testbin", "fd3-echo"])
         .stdout(Stdio::pipe())
         .expect("stdout pipe")
         .fd(3, Stdio::null())
@@ -399,12 +397,12 @@ fn unix_fd3_null_is_accepted() {
 fn unix_fd3_inherit_is_rejected() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "exit", "0"])
+        .args(["cosca_testbin", "exit", "0"])
         .fd(3, Stdio::inherit())
         .expect("fd attach ok");
     let err = cmd.spawn().expect_err("inherit on fd 3 should be rejected");
     assert!(
-        matches!(err, subprocess::error::Error::Unsupported { .. }),
+        matches!(err, cosca::error::Error::Unsupported { .. }),
         "expected Unsupported, got {err:?}"
     );
 }
@@ -425,7 +423,7 @@ fn unix_fd3_file_round_trips() {
 
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "fd3-echo"])
+        .args(["cosca_testbin", "fd3-echo"])
         .stdout(Stdio::pipe())
         .expect("stdout pipe")
         .fd(3, Stdio::from_file(tmp.try_clone().expect("clone file")))
@@ -451,7 +449,7 @@ fn unix_fd3_file_round_trips() {
 /// containment OR writing the cgroup's "0" into the user's fd 3 (corruption).
 /// We assert the parent reads EXACTLY the child-written token (no inserted "0",
 /// no broken pipe) AND that containment was actually established. Under a real
-/// delegated cgroup (SUBPROCESS_TEST_CGROUP set) we additionally assert the
+/// delegated cgroup (COSCA_TEST_CGROUP set) we additionally assert the
 /// achieved mechanism is CgroupV2 — proof the cgroup write was not clobbered.
 /// Read to EOF; no timers.
 #[cfg(target_os = "linux")]
@@ -459,7 +457,7 @@ fn unix_fd3_file_round_trips() {
 fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "fd3-write", "FD3PAYLOAD"])
+        .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
         // pipe_out: child writes, parent holds the read end.
         .fd(3, Stdio::pipe_out())
         .expect("fd 3 pipe_out");
@@ -470,15 +468,15 @@ fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
     // downgrade CgroupV2 -> ProcessGroup; None would mean containment vanished).
     assert_ne!(
         child.containment(),
-        subprocess::Containment::None,
+        cosca::Containment::None,
         "contain() + fd(3) must still establish containment"
     );
     // When a delegated cgroup is provisioned, the write must have landed in
     // cgroup.procs (not been clobbered by command-fds' dup2): CgroupV2 achieved.
-    if std::env::var_os("SUBPROCESS_TEST_CGROUP").is_some() {
+    if std::env::var_os("COSCA_TEST_CGROUP").is_some() {
         assert_eq!(
             child.containment(),
-            subprocess::Containment::CgroupV2,
+            cosca::Containment::CgroupV2,
             "cgroup write must not be clobbered by command-fds dup2; got {:?}",
             child.containment()
         );
@@ -499,7 +497,7 @@ fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
 
 #[test]
 fn run_free_fn_builds_command_from_args() {
-    let s = subprocess::run([testbin(), "echo-argv", "world"]).read().expect("read");
+    let s = cosca::run([testbin(), "echo-argv", "world"]).read().expect("read");
     assert_eq!(s, "world\n");
 }
 
@@ -507,10 +505,10 @@ fn run_free_fn_builds_command_from_args() {
 fn read_errors_on_invalid_utf8() {
     let mut cmd = Command::new();
     // 0xff is not valid UTF-8.
-    cmd.executable(testbin()).args(["subprocess_testbin", "emit-raw", "ff"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "emit-raw", "ff"]);
     let err = cmd.read().expect_err("should fail on invalid UTF-8");
     assert!(
-        matches!(err, subprocess::error::Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
+        matches!(err, cosca::error::Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
         "expected Io(InvalidData), got {err:?}"
     );
 }
@@ -522,7 +520,7 @@ fn drop_kills_and_reaps_the_child() {
     let mut cmd = Command::new();
     // tee-both with a piped (but never-written, never-closed) stdin blocks the
     // child reading stdin -> it stays alive until we drop the Child.
-    cmd.executable(testbin()).args(["subprocess_testbin", "tee-both"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
     let child = cmd.spawn().expect("spawn");
     let id = child.id();
@@ -534,7 +532,7 @@ fn drop_kills_and_reaps_the_child() {
 #[test]
 fn detach_leaves_the_child_running() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "tee-both"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
     let mut child = cmd.spawn().expect("spawn");
     let id = child.id();
@@ -561,9 +559,9 @@ fn detach_leaves_the_child_running() {
 #[test]
 fn uncontained_child_reports_containment_none() {
     let mut cmd = Command::new();
-    cmd.executable(testbin()).args(["subprocess_testbin", "exit", "0"]);
+    cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
-    assert_eq!(child.containment(), subprocess::Containment::None);
+    assert_eq!(child.containment(), cosca::Containment::None);
     let _ = child.wait();
 }
 
@@ -571,13 +569,13 @@ fn uncontained_child_reports_containment_none() {
 /// The grandchild's connected socket is proof it is alive; reading it to EOF
 /// later is the deterministic proof it died.
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
-fn spawn_contained_tree() -> (subprocess::Child, std::net::TcpStream) {
+fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "spawn-grandchild", &addr]);
+        .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
     // Accept both connections; keep the grandchild's (tag 'G'). Accepting it is
@@ -598,7 +596,7 @@ fn spawn_contained_tree() -> (subprocess::Child, std::net::TcpStream) {
 #[test]
 fn unix_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), subprocess::Containment::ProcessGroup);
+    assert_eq!(child.containment(), cosca::Containment::ProcessGroup);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -615,7 +613,7 @@ fn unix_kill_tree_reaps_the_grandchild() {
 #[test]
 fn unix_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), subprocess::Containment::ProcessGroup);
+    assert_eq!(child.containment(), cosca::Containment::ProcessGroup);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
@@ -642,7 +640,7 @@ fn unix_terminate_tree_reaps_the_grandchild() {
 #[test]
 fn windows_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -669,7 +667,7 @@ fn windows_kill_tree_reaps_the_grandchild() {
 #[test]
 fn windows_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
@@ -690,7 +688,7 @@ fn windows_terminate_tree_reaps_the_grandchild() {
 #[test]
 fn windows_child_is_inside_our_job_after_spawn() {
     let (child, _gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
 
     // test_job_handle_contains_self() is cfg(all(windows,test)) — confirms the job we hold.
     let in_job = child.test_job_handle_contains_self();
@@ -711,7 +709,7 @@ fn windows_child_is_inside_our_job_after_spawn() {
 #[test]
 fn windows_detach_leaves_the_tree_running() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
 
     // detach() must clear KILL_ON_JOB_CLOSE before closing the job handle.
     child.detach();
@@ -741,14 +739,14 @@ fn windows_detach_leaves_the_tree_running() {
 /// This is separate from `spawn_contained_tree` (which uses `contain()` =
 /// `Strongest`) so the two modes are tested independently.
 #[cfg(unix)]
-fn spawn_session_tree() -> (subprocess::Child, std::net::TcpStream) {
+fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "spawn-grandchild", &addr]);
-    cmd.contain_with(subprocess::ContainMode::Session);
+        .args(["cosca_testbin", "spawn-grandchild", &addr]);
+    cmd.contain_with(cosca::ContainMode::Session);
     let child = cmd.spawn().expect("spawn session-contained tree");
     let mut gc = None;
     for _ in 0..2 {
@@ -766,7 +764,7 @@ fn spawn_session_tree() -> (subprocess::Child, std::net::TcpStream) {
 #[test]
 fn unix_session_containment_reports_session() {
     let (child, mut gc_stream) = spawn_session_tree();
-    assert_eq!(child.containment(), subprocess::Containment::Session);
+    assert_eq!(child.containment(), cosca::Containment::Session);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait();
@@ -788,12 +786,12 @@ fn unix_session_child_is_own_session_leader() {
 
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "sid-report"])
+        .args(["cosca_testbin", "sid-report"])
         .stdout(Stdio::pipe())
         .expect("stdout pipe")
-        .contain_with(subprocess::ContainMode::Session);
+        .contain_with(cosca::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn sid-report");
-    assert_eq!(child.containment(), subprocess::Containment::Session);
+    assert_eq!(child.containment(), cosca::Containment::Session);
 
     let mut reader = child.stdout().expect("stdout reader");
     let mut out = String::new();
@@ -827,14 +825,14 @@ fn unix_session_child_is_own_session_leader() {
 /// cgroup / job) are reparenting-immune, so `spawn_contained_tree` need not do
 /// this; TreeWalk specifically does.
 #[cfg(any(unix, windows))]
-fn spawn_treewalk_tree() -> (subprocess::Child, std::net::TcpStream, std::net::TcpStream) {
+fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "spawn-grandchild", &addr]);
-    cmd.contain_with(subprocess::ContainMode::TreeWalk);
+        .args(["cosca_testbin", "spawn-grandchild", &addr]);
+    cmd.contain_with(cosca::ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn tree-walk-contained tree");
     let mut gc = None;
     let mut root = None;
@@ -861,7 +859,7 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
     // Hold `_root_stream` for the whole test: it keeps the root alive so TreeWalk
     // enumerates the grandchild as a live descendant (not a reparented orphan).
     let (child, mut gc_stream, _root_stream) = spawn_treewalk_tree();
-    assert_eq!(child.containment(), subprocess::Containment::TreeWalk);
+    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -891,7 +889,7 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
     // Hold `_root_stream` so the root stays alive through teardown (see
     // spawn_treewalk_tree): TreeWalk must enumerate a live root's descendants.
     let (child, mut gc_stream, _root_stream) = spawn_treewalk_tree();
-    assert_eq!(child.containment(), subprocess::Containment::TreeWalk);
+    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
@@ -919,10 +917,10 @@ fn treewalk_kills_process_group_escapee() {
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new();
     cmd.executable(testbin())
-        .args(["subprocess_testbin", "spawn-grandchild-escapee", &addr]);
-    cmd.contain_with(subprocess::ContainMode::TreeWalk);
+        .args(["cosca_testbin", "spawn-grandchild-escapee", &addr]);
+    cmd.contain_with(cosca::ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn tree-walk escapee tree");
-    assert_eq!(child.containment(), subprocess::Containment::TreeWalk);
+    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
 
     let mut gc = None;
     let mut root = None;
@@ -965,16 +963,16 @@ fn drop_kills_contained_tree() {
     // (Strongest), so the achieved mechanism is the host's strongest.
     assert_ne!(
         child.containment(),
-        subprocess::Containment::None,
+        cosca::Containment::None,
         "drop test requires real containment; got None"
     );
     #[cfg(windows)]
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
     #[cfg(target_os = "linux")]
     assert!(
         matches!(
             child.containment(),
-            subprocess::Containment::CgroupV2 | subprocess::Containment::ProcessGroup
+            cosca::Containment::CgroupV2 | cosca::Containment::ProcessGroup
         ),
         "Linux must use CgroupV2 or ProcessGroup, got {:?}",
         child.containment()
@@ -983,7 +981,7 @@ fn drop_kills_contained_tree() {
     assert!(
         matches!(
             child.containment(),
-            subprocess::Containment::ProcessGroup | subprocess::Containment::Session
+            cosca::Containment::ProcessGroup | cosca::Containment::Session
         ),
         "macOS/BSD must use ProcessGroup or Session, got {:?}",
         child.containment()
@@ -1003,24 +1001,24 @@ fn drop_kills_contained_tree() {
 
 // cgroup v2 integration test =====
 // Runs only on Linux, and only when the CI provisions a delegated cgroup
-// (SUBPROCESS_TEST_CGROUP=1). The env guard means this is a true no-op when
+// (COSCA_TEST_CGROUP=1). The env guard means this is a true no-op when
 // unprovisioned, but FAILS loudly when the marker is set but the cgroup is
 // unavailable (the test asserts CgroupV2, so it won't silently pass).
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
-    if std::env::var_os("SUBPROCESS_TEST_CGROUP").is_none() {
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         // Unprovisioned: skip (not CI-cgroup environment). The live cgroup test
-        // requires SUBPROCESS_TEST_CGROUP=1 and a delegated cgroup slice.
+        // requires COSCA_TEST_CGROUP=1 and a delegated cgroup slice.
         return;
     }
-    // SUBPROCESS_TEST_CGROUP is set: a usable delegated cgroup must exist.
+    // COSCA_TEST_CGROUP is set: a usable delegated cgroup must exist.
     // If try_create_leaf() returns None, containment falls back to ProcessGroup
     // and the assert below will fail loudly — that's intentional.
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(
         child.containment(),
-        subprocess::Containment::CgroupV2,
+        cosca::Containment::CgroupV2,
         "expected CgroupV2 containment but got {:?}; \
          is a delegated cgroup v2 slice available?",
         child.containment()
@@ -1038,19 +1036,19 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
 /// `terminate_tree` under cgroup v2 containment. Mirrors the kill_tree cgroup
 /// test but exercises the SIGTERM path (`CgroupLeaf::terminate` SIGTERMs every
 /// pid in cgroup.procs). The control-block grandchild has no SIGTERM handler so
-/// the default action kills it. Gated on SUBPROCESS_TEST_CGROUP — a true no-op
+/// the default action kills it. Gated on COSCA_TEST_CGROUP — a true no-op
 /// when unprovisioned, but FAILS loudly (CgroupV2 assertion) when the marker is
 /// set without a usable delegated cgroup. Proof of death: grandchild socket EOF.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
-    if std::env::var_os("SUBPROCESS_TEST_CGROUP").is_none() {
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         return; // unprovisioned: not a CI-cgroup environment.
     }
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(
         child.containment(),
-        subprocess::Containment::CgroupV2,
+        cosca::Containment::CgroupV2,
         "expected CgroupV2 containment but got {:?}; \
          is a delegated cgroup v2 slice available?",
         child.containment()

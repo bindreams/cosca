@@ -13,8 +13,8 @@ mod common;
 
 /// `argv0-report` emits both an `argv0=` and an `image=` line. Spawned via a RAW
 /// `std::process::Command`, so argv[0] is the exe path and the mode is `args[0]` — do NOT
-/// prepend "subprocess_testbin" (that convention is the crate's own `Command`). This asserts
-/// only that the mode works; the argv[0]≠exe behavior is proven later via `subprocess::Command`.
+/// prepend "cosca_testbin" (that convention is the crate's own `Command`). This asserts
+/// only that the mode works; the argv[0]≠exe behavior is proven later via `cosca::Command`.
 #[test]
 fn testbin_argv0_report_emits_argv0_and_image() {
     let out = Command::new(common::testbin())
@@ -78,10 +78,10 @@ fn testbin_isatty_fd_reports_zero_for_a_pipe() {
 #[test]
 fn executable_independent_of_argv0_on_windows() {
     let exe = common::testbin();
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(exe)
         .commandline("pretend-name argv0-report")
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
     let mut s = String::new();
@@ -97,23 +97,23 @@ fn executable_independent_of_argv0_on_windows() {
 /// wide buffer); the raw backend rejects it up front as an `Io` error.
 #[test]
 fn embedded_nul_in_commandline_is_rejected() {
-    let e = subprocess::Command::new()
+    let e = cosca::Command::new()
         .executable(common::testbin())
         .commandline("a\u{0}b")
         .spawn()
         .unwrap_err();
-    assert!(matches!(e, subprocess::error::Error::Io(_)), "{e:?}");
+    assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
 }
 
 /// An embedded NUL in the working directory is rejected the same way (it would truncate the
 /// wide `lpCurrentDirectory`).
 #[test]
 fn embedded_nul_in_cwd_is_rejected() {
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
         .commandline("x argv0-report")
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
-    assert!(matches!(c.spawn().unwrap_err(), subprocess::error::Error::Io(_)));
+    assert!(matches!(c.spawn().unwrap_err(), cosca::error::Error::Io(_)));
 }
 
 /// A `.bat`/`.cmd` reached via `executable()` is rejected BEFORE resolution (CVE-2024-24576): a
@@ -123,12 +123,12 @@ fn batch_script_via_executable_is_unsupported() {
     let dir = tempfile::tempdir().unwrap();
     let bat = dir.path().join("x.bat");
     std::fs::write(&bat, b"@echo off\n").unwrap();
-    let e = subprocess::Command::new()
+    let e = cosca::Command::new()
         .executable(&bat)
         .commandline("x.bat")
         .spawn()
         .unwrap_err();
-    assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
+    assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
 // Raw backend, sync fd >= 3 via the MSVCRT lpReserved2 table (Plan 12 Task 5) =====
@@ -138,14 +138,14 @@ fn batch_script_via_executable_is_unsupported() {
 /// closing fd 3 on exit) bounds the read; no timer.
 #[test]
 fn fd3_pipe_out_delivers_child_bytes() {
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "write-fd", "3", "hi-fd3"])
-        .fd(3, subprocess::Stdio::pipe_out())
+        .args(["cosca_testbin", "write-fd", "3", "hi-fd3"])
+        .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
     let mut s = String::new();
-    std::io::Read::read_to_string(&mut child.fd_read_end(subprocess::Fd::from(3)).unwrap(), &mut s).unwrap();
+    std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
     child.wait().unwrap();
     assert_eq!(s, "hi-fd3");
 }
@@ -154,15 +154,15 @@ fn fd3_pipe_out_delivers_child_bytes() {
 /// parent's write end (EOF) makes the child echo exactly what was written. EOF bounds both reads.
 #[test]
 fn fd3_pipe_in_feeds_child() {
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "read-fd", "3"])
-        .fd(3, subprocess::Stdio::pipe_in())
+        .args(["cosca_testbin", "read-fd", "3"])
+        .fd(3, cosca::Stdio::pipe_in())
         .unwrap()
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
-    let mut w = child.fd_write_end(subprocess::Fd::from(3)).unwrap();
+    let mut w = child.fd_write_end(cosca::Fd::from(3)).unwrap();
     std::io::Write::write_all(&mut w, b"ping3").unwrap();
     drop(w); // child reads to EOF, copies, exits
     let mut s = String::new();
@@ -175,14 +175,14 @@ fn fd3_pipe_in_feeds_child() {
 /// the hardened `inherit_end` arm.
 #[test]
 fn inherit_on_fd3_is_unsupported() {
-    let e = subprocess::Command::new()
+    let e = cosca::Command::new()
         .executable(common::testbin())
-        .args(["subprocess_testbin", "exit", "0"])
-        .fd(3, subprocess::Stdio::inherit())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(3, cosca::Stdio::inherit())
         .unwrap()
         .spawn()
         .unwrap_err();
-    assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
+    assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
 /// A regular file on fd 3 classifies as a disk file (`FILE_TYPE_DISK` -> no `FDEV`), so the child's
@@ -190,12 +190,12 @@ fn inherit_on_fd3_is_unsupported() {
 #[test]
 fn fd3_file_is_not_a_tty() {
     let f = tempfile::tempfile().expect("tempfile");
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "isatty-fd", "3"])
-        .fd(3, subprocess::Stdio::from_file(f))
+        .args(["cosca_testbin", "isatty-fd", "3"])
+        .fd(3, cosca::Stdio::from_file(f))
         .unwrap()
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
     let mut s = String::new();
@@ -209,12 +209,12 @@ fn fd3_file_is_not_a_tty() {
 /// still returns 0). Deterministic `CharDev` coverage without allocating a real console.
 #[test]
 fn fd3_nul_is_a_char_device() {
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "isatty-fd", "3"])
-        .fd(3, subprocess::Stdio::null())
+        .args(["cosca_testbin", "isatty-fd", "3"])
+        .fd(3, cosca::Stdio::null())
         .unwrap()
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn");
     let mut s = String::new();
@@ -232,14 +232,14 @@ fn fd3_nul_is_a_char_device() {
 /// up front (before any allocation), as `Unsupported`.
 #[test]
 fn oversized_fd_is_unsupported() {
-    let e = subprocess::Command::new()
+    let e = cosca::Command::new()
         .executable(common::testbin())
-        .args(["subprocess_testbin", "exit", "0"])
-        .fd(70_000, subprocess::Stdio::null())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(70_000, cosca::Stdio::null())
         .unwrap()
         .spawn()
         .unwrap_err();
-    assert!(matches!(e, subprocess::error::Error::Unsupported { .. }), "{e:?}");
+    assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
 // Containment over the raw backend (Plan 12 Task 6) =====
@@ -251,18 +251,18 @@ fn oversized_fd_is_unsupported() {
 /// the read; no timer.
 #[test]
 fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
-        .args(["subprocess_testbin", "write-fd", "3", "x"])
-        .fd(3, subprocess::Stdio::pipe_out())
+        .args(["cosca_testbin", "write-fd", "3", "x"])
+        .fd(3, cosca::Stdio::pipe_out())
         .unwrap()
         .contain();
     let mut child = c.spawn().expect("contained raw spawn");
     // Fixed at spawn (run-state-independent): the achieved mechanism is the Job Object.
-    assert_eq!(child.containment(), subprocess::Containment::JobObject);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
     assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
     let mut s = String::new();
-    std::io::Read::read_to_string(&mut child.fd_read_end(subprocess::Fd::from(3)).unwrap(), &mut s).unwrap();
+    std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
     assert_eq!(s, "x");
     child.kill_tree().expect("kill_tree");
 }
@@ -271,13 +271,10 @@ fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
 /// wires containment only when requested; without it the child is a lone process.
 #[test]
 fn uncontained_raw_child_has_no_containment() {
-    let mut c = subprocess::Command::new();
+    let mut c = cosca::Command::new();
     c.executable(common::testbin())
         .commandline("x argv0-report")
-        .stdout(subprocess::Stdio::pipe())
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
-    assert!(matches!(
-        c.spawn().unwrap().containment(),
-        subprocess::Containment::None
-    ));
+    assert!(matches!(c.spawn().unwrap().containment(), cosca::Containment::None));
 }
