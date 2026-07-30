@@ -3,14 +3,14 @@
 //! Two mechanisms are available:
 //! - **ProcessGroup** (`process_group(0)` / `setpgid`): the child becomes a
 //!   process-group leader (pgid == pid). Teardown sends `killpg`. cgroup v2
-//!   (Task 4) preempts this on Linux when available. macOS uses this for
+//!   preempts this on Linux when available. macOS uses this for
 //!   `ContainMode::Strongest`.
 //! - **Session** (`setsid`): the child becomes a session leader *and*
 //!   process-group leader in a new session, detached from any controlling
 //!   terminal. Teardown is identical (`killpg` on the session's initial pgroup,
 //!   which equals the leader's pid). Useful for daemon-like children.
 //!
-//! **Mutual exclusivity (S3):** `setsid` makes the child a session *and*
+//! **Mutual exclusivity:** `setsid` makes the child a session *and*
 //! process-group leader simultaneously. Calling `setpgid`/`process_group(0)`
 //! on a session leader fails with `EPERM`. Therefore Session mode applies
 //! `setsid` *instead of* `process_group(0)` — never both.
@@ -19,7 +19,7 @@
 //! parent's session/group; containment is then best-effort. This applies to
 //! both mechanisms and is documented as a known limitation (not a sandbox).
 //!
-//! Parent-side signals use `nix` (not hand-rolled `libc`); see Global Constraints.
+//! Parent-side signals use `nix` (not hand-rolled `libc`).
 //!
 //! # PGID-reuse caveat
 //! `kill_tree` must run *before* the leader is reaped (`wait`): once reaped, the
@@ -35,7 +35,7 @@ use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 
 /// Apply pre-spawn group setup to `std_cmd` (root spawns only).
-/// Must not be combined with `set_session` on the same command (S3).
+/// Must not be combined with `set_session` on the same command.
 pub(crate) fn set_process_group(std_cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0); // leader: pgid == pid
@@ -48,7 +48,7 @@ pub(crate) fn set_process_group(std_cmd: &mut std::process::Command) {
 /// == sid == pid), detached from any controlling terminal. Because the child is
 /// already a process-group leader after `setsid`, calling `setpgid` or
 /// `process_group(0)` on it would return `EPERM` — do not call
-/// `set_process_group` on the same command (S3 mutual exclusivity).
+/// `set_process_group` on the same command.
 ///
 /// The `pre_exec` closure is async-signal-safe: it calls only raw `libc::setsid`
 /// (no allocation, no unwinding). Failure of `setsid` aborts the spawn.
@@ -56,7 +56,7 @@ pub(crate) fn set_session(std_cmd: &mut std::process::Command) {
     // Safety: `pre_exec` runs post-fork, pre-exec. The closure is
     // async-signal-safe: `libc::setsid` is a raw syscall with no allocation.
     // A non-zero return means `setsid` failed (EPERM: already a session leader),
-    // which we surface as an `io::Error` to abort the spawn.
+    // surfaced as an `io::Error` to abort the spawn.
     unsafe {
         use std::os::unix::process::CommandExt;
         std_cmd.pre_exec(|| {

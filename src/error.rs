@@ -1,4 +1,4 @@
-//! Crate error taxonomy. Extended by later plans (spawn, containment, identity).
+//! Crate error taxonomy.
 
 /// Why splitting a command line failed. `pos` is a 0-based byte offset.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -51,7 +51,7 @@ pub enum ElevationErrorKind {
     Untracked,
 }
 
-/// The crate's top-level error type. Grows as later plans add fallible operations.
+/// The crate's top-level error type.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("argument parsing failed: {0}")]

@@ -1,6 +1,5 @@
-//! Async `Child` graceful shutdown — the soft-then-hard escalation trio. A submodule of
-//! `child` (mirroring the sync `src/child/graceful.rs`) so it can reach `Child`'s private
-//! `require_contained` and fields.
+//! Async `Child` graceful shutdown — the soft-then-hard escalation trio, mirroring the
+//! sync `Child` counterparts.
 
 use std::process::ExitStatus;
 use std::time::Duration;

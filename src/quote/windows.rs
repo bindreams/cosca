@@ -8,7 +8,7 @@
 //! `CommandLineToArgvW` reverses (MSVCRT / Win32 argv parsing). It does NOT
 //! handle `cmd.exe` metacharacter escaping: `.bat`/`.cmd` invocation (the
 //! actual BatBadBut / CVE-2024-24576 vector) requires a separate escaping
-//! layer and is deferred to spec §8.
+//! layer, which this module does not provide.
 
 const SPACE: u16 = b' ' as u16;
 const TAB: u16 = b'\t' as u16;
@@ -101,7 +101,7 @@ pub fn first_token_and_rest_wide(cmd: &[u16]) -> Option<(Vec<u16>, Vec<u16>)> {
 /// whitespace is skipped and empty/whitespace-only input returns `None`. The OS
 /// does not skip leading whitespace: on an empty string it substitutes the
 /// module path as argv[0]; on a whitespace-only string it returns `""` as
-/// argv[0]. In both cases our function returns `None`. The token shape
+/// argv[0]. In both cases this function returns `None`. The token shape
 /// otherwise matches: a leading `"` runs to the next `"` (or to the end if
 /// unterminated); an unquoted token runs to the next space/tab; backslashes
 /// are literal here (no escaping).

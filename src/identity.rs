@@ -9,7 +9,7 @@
 //! `/proc` `starttime` jiffies, macOS `sysctl KERN_PROC` (`kinfo_proc`) start
 //! µs), compared exactly. It is deliberately NOT a wall-clock time: deriving
 //! wall-clock from boot time drifts under NTP and would silently break
-//! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()` (Task 2),
+//! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity.
 
 pub(crate) mod stat_parse;

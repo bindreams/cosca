@@ -1,7 +1,7 @@
 //! Windows `(pid, ppid)` snapshot via the ToolHelp process snapshot — the same
-//! API the Job-Object backend uses for its thread walk. We read only
-//! `th32ProcessID` / `th32ParentProcessID`; the high-res start token comes from
-//! `ProcessId::of` later.
+//! API the Job-Object backend uses for its thread walk. Only
+//! `th32ProcessID` / `th32ParentProcessID` are read; the high-res start token
+//! comes from `ProcessId::of` later.
 
 use std::mem::size_of;
 

@@ -2,7 +2,7 @@
 //! group, is immediately assigned to a `KILL_ON_JOB_CLOSE` job, then resumed.
 //! The kernel enforces the invariant: every descendant of the child inherits the
 //! job (Windows jobs nest, so inner jobs are not a problem), and closing the job
-//! handle terminates the whole tree. Adapted from hole `kill-group`.
+//! handle terminates the whole tree.
 //!
 //! Kill-group race invariant (why `CREATE_SUSPENDED`):
 //! the child must be inside the job before executing any instruction — otherwise
@@ -63,10 +63,8 @@ impl JobHandle {
         }
     }
 
-    /// Test-only: return the raw job handle so integration tests can call
-    /// `IsProcessInJob` against OUR job (not any inherited job). Always compiled
-    /// on Windows (not just cfg(test)) because integration tests are a separate
-    /// compilation unit that links the library.
+    /// The raw job handle, or `None` once consumed. Backs the test-only
+    /// membership probe (`job_contains_pid`).
     pub(crate) fn as_handle(&self) -> Option<HANDLE> {
         let p = self.raw.load(Ordering::Relaxed);
         if p.is_null() {
@@ -221,12 +219,11 @@ fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> 
 
 /// Resume every suspended thread of the process at `proc_handle` after job assignment.
 ///
-/// Why resume REGARDLESS of job-assign result:
-/// the kill-group race invariant requires the child to be inside the job before
-/// executing. We froze it at spawn (CREATE_SUSPENDED) to close the race window.
-/// Whether or not job assignment succeeded, we MUST resume the child — a frozen
-/// process is unacceptable. If `ResumeThread` fails we kill the child immediately
-/// and return an error.
+/// Why resume REGARDLESS of job-assign result: the kill-group race invariant
+/// requires the child to be inside the job before executing, so it was spawned
+/// frozen (CREATE_SUSPENDED). Whether or not job assignment succeeded, the child
+/// MUST be resumed — a frozen process is unacceptable. If `ResumeThread` fails
+/// the child is killed immediately and an error returned.
 ///
 /// PID-reuse safety: the caller holds the child's process handle (via the owning
 /// `Child`), keeping its PID alive for the duration of the Toolhelp snapshot walk.
@@ -299,8 +296,8 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
 /// Returns `Ok(Some(JobHandle))` on full success (job assigned AND resumed).
 /// Returns `Ok(None)` when job assignment fails — the caller falls back to the
 /// universal `Containment::TreeWalk` mechanism (identity teardown).
-/// Returns `Err` when resume fails — a frozen child is unacceptable; we kill
-/// the child+job and propagate the error to fail the spawn.
+/// Returns `Err` when resume fails — a frozen child is unacceptable; the
+/// child+job are killed and the error propagates to fail the spawn.
 pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<Option<JobHandle>> {
     let job_result = assign_to_kill_on_close_job(proc_handle);
 
@@ -325,7 +322,7 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
 }
 
 /// Test-only membership probe: whether `pid` is inside the Job Object held by `attached`, via
-/// `IsProcessInJob` against OUR job handle (not "any job"). Membership is immutable once assigned,
+/// `IsProcessInJob` against that job handle (not "any job"). Membership is immutable once assigned,
 /// so it is deterministic for a handle-pinned child regardless of run state. Shared by the sync and
 /// async `Child::test_job_handle_contains_self` accessors (both compiled outside `cfg(test)` so
 /// integration crates can call them).

@@ -44,7 +44,7 @@ pub fn is_elevated() -> bool {
 
 /// Which elevation program runs. `Auto` (default) detects among the CLI backends
 /// only — order `sudo` > `doas`. `run0` and `pkexec`/graphical elevation are
-/// explicit-only (`run0` spawns a PID-1-parented unit, not our descendant; a
+/// explicit-only (`run0` spawns a PID-1-parented unit, not a descendant of the caller; a
 /// library must not pop a polkit dialog unbidden).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
@@ -143,8 +143,8 @@ impl Default for ElevationRequest {
 /// The single source of the "already elevated, no wrapper needed" report. Every
 /// sync/async spawn arm that short-circuits on ambient privilege calls this, so the
 /// literal is never hand-copied.
-// The Windows `RunAsIs` arm (Task 14) consumes this; the POSIX spawn arms that
-// short-circuit on ambient privilege land in a later task, so it stays dead there.
+// Consumed by the Windows `RunAsIs` arms only (the POSIX rewrite reports
+// `AlreadyElevated` through `PosixRewrite`), hence the gated allow.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport {
     ElevationReport {

@@ -1,6 +1,5 @@
 //! Minimal capturing logger: installed once per process (`log::set_logger` is
 //! once-per-process); records every message so tests assert by unique marker.
-//! Consumed by the stranding twins on every platform and the macOS kinfo oracles.
 //!
 //! Records are append-only and never erased: each test takes a [`mark`] and scans
 //! only records emitted after it via [`contains_since`], so a stale record from an

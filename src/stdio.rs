@@ -102,8 +102,7 @@ impl Stdio {
     pub fn merge(other: Fd) -> Stdio {
         Stdio(StdioKind::Merge(other))
     }
-    /// A pseudo-terminal. The variant exists now; wiring lands behind the `pty`
-    /// feature later, so this currently resolves to `Unsupported`.
+    /// A pseudo-terminal. Not yet wired: resolves to `Unsupported`.
     #[cfg(feature = "pty")]
     pub fn pty() -> Stdio {
         Stdio(StdioKind::Pty)

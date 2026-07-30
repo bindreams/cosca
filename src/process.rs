@@ -1,5 +1,6 @@
 //! A foreign process referenced by stable identity. Wraps a `ProcessId` (never a bare
-//! pid) and exposes lifecycle / identity / tree — NO stdio (we don't own its pipes).
+//! pid) and exposes lifecycle / identity / tree — NO stdio (its pipes belong to its
+//! real parent).
 //! Every operation re-verifies identity. `wait()` is a death-watch yielding no
 //! `ExitStatus` (the kernel hands exit status only to the real parent — contrast
 //! `Child::wait`).
@@ -56,8 +57,9 @@ impl Process {
         self.id.is_alive()
     }
 
-    /// Block until the process exits. Death-watch — yields no `ExitStatus` (we are not its
-    /// parent). `Err` only on a wait failure (incl. `Unsupported` on Linux < 5.3). Non-reaping.
+    /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
+    /// parent gets one). `Err` only on a wait failure (incl. `Unsupported` on Linux < 5.3).
+    /// Non-reaping.
     pub fn wait(&self) -> Result<(), Error> {
         let exited = crate::wait::block_until_exit(self.id, None)?;
         debug_assert!(exited);
@@ -71,10 +73,10 @@ impl Process {
     }
 
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
-    /// predates this child, so a recycled `ppid` naming a process created AFTER us (token after
-    /// ours) is rejected by the same token rule as [`children`](Self::children) — sound, modulo
-    /// the per-OS same-tick residual the whole crate shares. `None` if we have no resolvable
-    /// parent or `self` itself was recycled.
+    /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
+    /// token) is rejected by the same token rule as [`children`](Self::children) — sound,
+    /// modulo the per-OS same-tick residual the whole crate shares. `None` if there is no
+    /// resolvable parent or `self` itself was recycled.
     pub fn parent(&self) -> Option<Process> {
         // Anchor: a query against a recycled self pid is meaningless.
         if !self.id.exists() {
@@ -91,8 +93,8 @@ impl Process {
         }
         let parent = ProcessId::of(ppid)?;
         // Identity guard: a genuine parent predates this child, so the child's start token
-        // orders at-or-after the parent's. A recycled ppid names a process created AFTER us
-        // (token after ours) — reject it.
+        // orders at-or-after the parent's. A recycled ppid names a process created AFTER
+        // this one (later token) — reject it.
         crate::containment::treewalk::keeps_token(
             self.id.start_token_raw(),
             parent.start_token_raw(),

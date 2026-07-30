@@ -263,8 +263,7 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
     Ok((program, OsString::from_wide(&joined)))
 }
 
-// The sync spawn arm (`crate::child::spawn::spawn`) routes an elevated `Command` here via
-// `spawn_elevated`; the async arm follows in a later task.
+// Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
 pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
 }

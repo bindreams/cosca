@@ -1,5 +1,5 @@
-//! The `Command` builder: executable/args/commandline input model (Task 1)
-//! extended with stdio, env, cwd, and kill_on_drop (Task 3).
+//! The `Command` builder: executable/args/commandline input model plus stdio,
+//! env, cwd, and kill_on_drop.
 //!
 //! Note: `Command` does not implement `Clone` because [`ResolvedStdio`] can
 //! hold a [`std::fs::File`], which is not `Clone` by design.
@@ -252,10 +252,9 @@ impl Command {
         self
     }
 
-    // Consumed in production by the POSIX elevation rewrite (`cfg(unix)`);
-    // `elevation_request`/`fds` read the request, `set_input_argv`/`set_env_ops`/
-    // `set_contain` build the DERIVED command. Still dead on non-unix (the Windows
-    // elevation arm lands in a later elevation-plan task), so the allow is gated there.
+    // Consumed by the elevation paths: `elevation_request`/`fds` read the request;
+    // `set_input_argv`/`set_env_ops`/`set_contain` build the POSIX DERIVED command
+    // (hence the non-unix dead_code allows on the setters).
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
@@ -277,7 +276,7 @@ impl Command {
         self.contain = req;
     }
 
-    // ---- crate-internal accessors for the spawn engine (Task 4) -------------
+    // ---- crate-internal accessors for the spawn engine -------------
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn fds(&self) -> &BTreeMap<Fd, ResolvedStdio> {
         &self.fds

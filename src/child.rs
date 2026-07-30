@@ -65,8 +65,7 @@ impl Child {
         }
     }
 
-    // Consumed by the sync spawn arms (POSIX `spawn`, Windows `spawn_elevated`); the async
-    // arm follows in a later task.
+    // Set by the elevation spawn arms.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.elevation = report;
     }
@@ -95,7 +94,8 @@ impl Child {
         self.id
     }
 
-    /// Whether the child is still running.
+    /// Whether the child is still running — re-checked via its stable identity,
+    /// so a recycled pid never reads as alive.
     pub fn is_alive(&self) -> bool {
         self.id.is_alive()
     }
@@ -220,9 +220,8 @@ impl Child {
         take_reader(&mut self.pipes, fd)
     }
 
-    /// Test-only: return whether this child is inside our Job Object (via `IsProcessInJob` against
-    /// the handle we hold, not "any job"). Exposed outside `cfg(test)` so integration tests (a
-    /// separate compilation unit) can call it.
+    /// Test-only: whether this child is inside the crate's Job Object (`IsProcessInJob`
+    /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
         crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())

@@ -334,9 +334,8 @@ impl Child {
         }
     }
 
-    /// Test-only: return whether this child is inside our Job Object (via `IsProcessInJob` against
-    /// the handle we hold, not "any job"). Exposed outside `cfg(test)` so integration tests (a
-    /// separate compilation unit) can call it.
+    /// Test-only: whether this child is inside the crate's Job Object (`IsProcessInJob`
+    /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
         crate::containment::windows::job_contains_pid(&self.attached, self.id.pid())

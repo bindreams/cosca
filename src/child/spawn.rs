@@ -1,5 +1,5 @@
-//! std-only spawn: resolve our Stdio model onto `std::process::Command`, wire
-//! the program/args via the Plan-1 quoters, and spawn through `shared_child`.
+//! std-only spawn: resolve the crate's `Stdio` model onto `std::process::Command`,
+//! wire the program/args via the `quote` module, and spawn through `shared_child`.
 
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
@@ -101,10 +101,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
 pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, Error> {
     let fds = std::mem::take(cmd.fds_mut());
 
-    // Windows routing. The raw `CreateProcessW` backend (Plan 12) owns the cases std cannot
+    // Windows routing. The raw `CreateProcessW` backend owns the cases std cannot
     // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors
-    // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It handles both uncontained and CONTAINED
-    // children (Task 6 wired containment — Job Object / TreeWalk — into the raw path).
+    // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It handles both uncontained and
+    // CONTAINED children (Job Object / TreeWalk).
     #[cfg(windows)]
     {
         let has_high_fd = fds.keys().any(|slot| slot.raw() >= 3);
@@ -187,7 +187,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
     }
 
-    // We own the std Child so containment can job-assign + resume it (Task 5). Serialize the
+    // The std Child is owned here so containment can job-assign + resume it. Serialize the
     // spawn against the raw backend's inheritable-handle window via the shared spawn lock: std's
     // own handle-inheritance marking must not overlap a raw spawn on another thread.
     let mut child = {
@@ -243,9 +243,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             )));
         }
     };
-    // Adopt AFTER the identity read (and after Task-5 resume) so SharedChild's
-    // internal try_wait can reap-or-track without losing the identity; the whole
-    // Plan-3 wait/kill/identity/pump model is preserved.
+    // Adopt AFTER the identity read (and after the containment resume) so
+    // SharedChild's internal try_wait can reap-or-track without losing the identity.
     let shared = SharedChild::new(child).map_err(Error::Io)?;
 
     Ok(Child::from_parts(
@@ -269,7 +268,7 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
-    // Program + args via the Plan-1 quoting model.
+    // Program + args via the `quote` model.
     let mut std_cmd = match cmd.input() {
         CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
         CommandInput::Argv(argv) => {
@@ -716,10 +715,7 @@ pub(crate) mod fault {
     }
 }
 
-// Windows raw `CreateProcessW` spawn backend (Plan 12). The MSVCRT fd-table
-// encoder + device classifier (`crt_fds`) lands first; the spawn path that
-// consumes it follows in later tasks. Explicit `#[path]` per the repo's
-// `foo.rs` + `foo/` module convention (mirroring `child.rs`'s `child/spawn.rs`).
+// Windows raw `CreateProcessW` spawn backend.
 #[cfg(windows)]
 #[path = "spawn/windows_raw.rs"]
 pub(crate) mod windows_raw;

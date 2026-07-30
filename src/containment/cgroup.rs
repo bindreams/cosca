@@ -25,14 +25,11 @@
 //! `String`.
 
 // parse_v2_relative_path and cgroup_procs_contains are pure (no OS deps) —
-// compiled on all platforms so their unit tests run on the Windows dev host.
+// compiled on all platforms so their unit tests run on any host.
 
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
 /// success, or `None` when no such line is present (v1-only or empty).
-///
-/// Pure function (no I/O); intentionally compiled on all platforms so the unit
-/// tests in `cgroup_tests.rs` run on the Windows dev host.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
     for line in proc_self_cgroup.lines() {
@@ -49,9 +46,6 @@ pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
 /// Check whether `pid` appears in the contents of a `cgroup.procs` file.
 /// The file format is one pid per line (decimal, possibly with trailing
 /// whitespace/newline); blank lines are skipped.
-///
-/// Pure function (no I/O); intentionally compiled on all platforms so the unit
-/// tests in `cgroup_tests.rs` run on the Windows dev host.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn cgroup_procs_contains(contents: &str, pid: u32) -> bool {
     for line in contents.lines() {
@@ -140,8 +134,7 @@ impl CgroupLeaf {
     /// the signal a pid may exit and be recycled, potentially signalling an
     /// unrelated process. This is the same race as the process-group `SIGTERM`
     /// path; the cgroup mechanism's advantage (atomic, pid-free kill) applies
-    /// only to `hard_kill` via `cgroup.kill`. The window is narrow and
-    /// equivalent to the pgroup fallback — documented here for honesty.
+    /// only to `hard_kill` via `cgroup.kill`.
     pub(crate) fn terminate(&self) -> io::Result<()> {
         let content = fs::read_to_string(self.leaf_path.join("cgroup.procs"))?;
         for line in content.lines() {
