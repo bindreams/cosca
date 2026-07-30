@@ -1,7 +1,6 @@
-//! Foreign `Process` graceful shutdown — the soft-then-hard escalation trio over a process we
-//! do not own (no stdio, no reap). A submodule of `process` so it can reach the private `id`.
-//! Lone ops are identity-bound and surface real failures; tree ops are best-effort identity-
-//! walk sweeps (the `TreeWalk` contract).
+//! Foreign `Process` graceful shutdown — the soft-then-hard escalation trio over a process
+//! the crate does not own (no stdio, no reap). Lone ops are identity-bound and surface real
+//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract).
 
 use std::time::Duration;
 
@@ -51,7 +50,7 @@ impl Process {
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
     /// then descendants). Signal-only. Unix only: Windows has no per-process graceful signal and
-    /// a foreign process shares no addressable group with us, so this returns `Unsupported`
+    /// a foreign process shares no addressable group with the caller, so this returns `Unsupported`
     /// there (use [`kill_tree`](Process::kill_tree) for a hard sweep).
     pub fn terminate_tree(&self) -> Result<(), Error> {
         #[cfg(unix)]

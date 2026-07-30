@@ -1,4 +1,4 @@
-//! Async (tokio) raw `CreateProcessW` spawn backend (Plan 12 Tasks 7-8).
+//! Async (tokio) raw `CreateProcessW` spawn backend.
 //!
 //! The async mirror of [`crate::child::spawn::windows_raw`]: it loads an `executable()`
 //! independently of argv[0] (the case std/tokio cannot express on Windows), wires arbitrary

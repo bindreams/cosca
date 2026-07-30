@@ -1,4 +1,4 @@
-//! Async foreign graceful shutdown — mirrors `src/process/graceful.rs` on the
+//! Async foreign graceful shutdown — mirrors the sync `Process` graceful methods on the
 //! reactor-native grace-wait. No reap anywhere (the real parent collects the zombie).
 
 use std::time::Duration;

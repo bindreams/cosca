@@ -1,7 +1,6 @@
 //! Non-reaping, race-free death-watch and hard-kill for a `ProcessId`. `block_until_exit`
-//! blocks the calling thread in ONE kernel syscall until exit or timeout (no sleep-poll) —
-//! the sanctioned exception to the no-time-sync rule, since the timeout bounds a genuine
-//! external process-exit event. NEVER reaps: the target's real parent collects the zombie.
+//! blocks the calling thread in ONE kernel syscall until exit or timeout (no sleep-poll).
+//! NEVER reaps: the target's real parent collects the zombie.
 
 use std::time::{Duration, Instant};
 

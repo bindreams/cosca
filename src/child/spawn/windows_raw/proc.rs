@@ -2,9 +2,9 @@
 //!
 //! [`RawChild`] owns the process `HANDLE` a raw spawn returns and answers the
 //! same wait/kill/identity questions as the std backend. [`create_process`] and
-//! [`wait_handle_or_cancel`] are the shared FFI seams the async backend reuses
-//! (Task 7): the former is the sole `CreateProcessW` call site, the latter a
-//! cancellable process wait.
+//! [`wait_handle_or_cancel`] are the shared FFI seams the async backend reuses:
+//! the former is the sole `CreateProcessW` call site, the latter a cancellable
+//! process wait.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -172,12 +172,12 @@ impl RawChild {
 pub(crate) enum WaitOutcome {
     /// The process handle signaled — the child exited.
     Exited,
-    /// The cancel handle signaled first (async grace cancellation, Task 7).
+    /// The cancel handle signaled first (async grace cancellation).
     Cancelled,
 }
 
 /// Wait for `proc` to exit, or for `cancel` (if given) to signal first. With no cancel handle this
-/// is a plain blocking wait; the cancel arm backs the async backend's grace cancellation (Task 7).
+/// is a plain blocking wait; the cancel arm backs the async backend's grace cancellation.
 pub(crate) fn wait_handle_or_cancel(proc: HANDLE, cancel: Option<HANDLE>) -> io::Result<WaitOutcome> {
     match cancel {
         Some(cancel) => {

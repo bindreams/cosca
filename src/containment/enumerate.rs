@@ -1,9 +1,9 @@
 //! A `(pid, ppid)` snapshot of every process on the host — the raw material the
 //! tree-walk mechanism filters by identity. Per-OS backends reuse the same
 //! infrastructure as `identity`: ToolHelp on Windows, `/proc` on Linux,
-//! `proc_listallpids` on macOS. We deliberately do NOT use `sysinfo` (its
+//! `proc_listallpids` on macOS. `sysinfo` is deliberately NOT used: its
 //! 1-second start-time granularity is useless as an ordering key, and it pulls a
-//! second major `windows` version).
+//! second major `windows` version.
 
 use crate::identity::RawPid;
 

@@ -1,12 +1,10 @@
 //! Per-OS containment dispatch (two-phase: prepare before spawn, attach after).
-//! Unix process-group branch filled by Task 3; Linux cgroup v2 by Task 4;
-//! Windows Job Object by Task 5.
 
 use crate::containment::{ContainMode, ContainRequest, Containment, Nesting};
 use crate::error::Error;
 
-/// Decided before spawn (env-marker root detection); later tasks also apply
-/// pre-spawn flags / process_group / pre_exec inside `prepare`.
+/// The pre-spawn containment decision produced by `prepare` (env-marker root
+/// detection plus per-OS pre-spawn setup).
 pub(crate) struct Prepared {
     #[allow(dead_code)] // read in #[cfg(unix)] branch of attach()
     pub mode: Option<ContainMode>,
@@ -151,7 +149,7 @@ fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, Error> {
 
 /// Which Unix setup action to apply to a root `Command` for a given mode.
 /// Pure function: used by `prepare` and unit-tested separately to verify
-/// mutual exclusivity (S3): Session → setsid only; Strongest/default → pgroup
+/// mutual exclusivity: Session → setsid only; Strongest/default → pgroup
 /// only; TreeWalk → neither (it must catch process-group escapees).
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
@@ -167,7 +165,7 @@ pub(crate) enum UnixSetup {
     None,
 }
 
-/// Decide which Unix mechanism to apply for `mode` (root spawns only, S3).
+/// Decide which Unix mechanism to apply for `mode` (root spawns only).
 /// Keeping this as a pure function makes the mutual-exclusivity invariant
 /// directly unit-testable without inspecting `std::process::Command` internals.
 #[cfg(unix)]
@@ -230,12 +228,12 @@ pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest)
     let is_root = !is_nested(marker_present);
     if is_root && req.nesting == Nesting::Mark {
         // Set AFTER any user env ops (env_clear) have been applied to std_cmd by
-        // the spawn engine, so the marker survives env_clear (N1). `env` appends.
+        // the spawn engine, so the marker survives env_clear. `env` appends.
         std_cmd.env(crate::containment::NESTED_ENV, "1");
     }
 
     // Linux: session mode or (cgroup v2 + process group).
-    // Mechanism selection via `unix_setup_for` (S3 mutual exclusivity):
+    // Mechanism selection via `unix_setup_for` (setsid/pgroup mutual exclusivity):
     // Session → setsid only; Strongest/TreeWalk → process_group(0) + try cgroup.
     #[cfg(target_os = "linux")]
     {
@@ -296,7 +294,7 @@ pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest)
         };
     }
 
-    // Non-Linux Unix: process group or session (mutually exclusive; S3).
+    // Non-Linux Unix: process group or session (mutually exclusive).
     // Mechanism selection via `unix_setup_for`: Session → setsid only;
     // Strongest (= ProcessGroup on macOS) → process_group(0).
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -356,7 +354,7 @@ pub(crate) fn attach(
                 );
                 let pgid = raw_pid as i32;
 
-                // Session mode: setsid was applied pre-spawn; no cgroup (S3).
+                // Session mode: setsid was applied pre-spawn; no cgroup.
                 // pgid == sid == pid for the session leader; killpg works.
                 if matches!(prepared.mode, Some(ContainMode::Session)) {
                     return Ok((Containment::Session, Attached::ProcessGroup(pgid)));

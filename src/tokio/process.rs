@@ -1,6 +1,6 @@
 //! Async mirror of the foreign [`Process`](crate::Process). Introspection delegates
 //! synchronously; only the death-watch and the graceful pair are async (`tokio::wait`).
-//! NO stdio (we do not own its pipes); every operation re-verifies identity; nothing here
+//! NO stdio (its pipes belong to its real parent); every operation re-verifies identity; nothing here
 //! reaps (the real parent collects the zombie).
 
 use std::time::Duration;
@@ -62,8 +62,8 @@ impl Process {
         self.inner.children(recursive).into_iter().map(Process::from).collect()
     }
 
-    /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (we are not its
-    /// parent). Non-reaping and signal-free; `Err` only on a watch failure (incl.
+    /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
+    /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure (incl.
     /// `Unsupported` on Linux < 5.3). Dropping the future cancels the watch on every
     /// platform (the Windows watcher is released via its cancel event).
     ///

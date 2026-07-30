@@ -1,6 +1,5 @@
 //! Async `Command` builder — wraps the sync `crate::command::Command`, adding async run methods.
-//! The config methods hand-mirror the sync builder (no compiler-enforced parity): mirror any new
-//! sync builder method here too.
+//! The config methods hand-mirror the sync builder; parity is not compiler-enforced.
 
 use crate::command::Command as SyncCommand;
 use crate::error::Error;

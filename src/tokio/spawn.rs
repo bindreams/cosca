@@ -109,10 +109,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
 
     let mut fds = std::mem::take(cmd.fds_mut());
 
-    // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend
-    // (Plan 12): an `executable()` loaded independently of argv[0], OR arbitrary descriptors
+    // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend:
+    // an `executable()` loaded independently of argv[0], OR arbitrary descriptors
     // (fd >= 3, wired through the MSVCRT `lpReserved2` table). The raw backend handles BOTH
-    // contained and uncontained via its own async containment (Task 8); everything else stays on
+    // contained and uncontained via its own async containment; everything else stays on
     // the std/tokio path, whose `prepare` applies containment for argv/commandline spawns.
     #[cfg(windows)]
     if cmd.executable_path().is_some() || fds.keys().any(|f| f.raw() >= 3) {

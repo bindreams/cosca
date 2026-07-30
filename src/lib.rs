@@ -1,8 +1,9 @@
 //! `cosca`: unified cross-platform subprocess management.
 //!
-//! Under construction. The first landed layer is the pure core: the error
-//! taxonomy, argv quoting, and the command input model. Modules are added by
-//! the foundation plan task-by-task.
+//! Build a process with [`Command`] (stdio, env, tree containment, elevation),
+//! spawn it into an owned [`Child`], or attach to an already-running process by
+//! pid via [`Process`]. Sync by default; async counterparts live in the `tokio`
+//! module behind the `tokio` feature.
 
 pub mod containment;
 pub mod elevation;

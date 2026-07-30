@@ -14,10 +14,10 @@
 //!
 //! A `(pid, ppid)` snapshot is racy: a candidate's `pid` may have been recycled,
 //! or its `ppid` may name a *recycled* root pid. So a chained ppid alone does not
-//! prove descent. We additionally require the candidate's high-res start token
-//! (Linux jiffies / Windows 100 ns FILETIME / macOS µs) to order correctly
-//! against the root's: a genuine descendant was created at-or-after the root
-//! acquired its pid. The keep predicate is
+//! prove descent. The candidate's high-res start token (Linux jiffies / Windows
+//! 100 ns FILETIME / macOS µs) must additionally order correctly against the
+//! root's: a genuine descendant was created at-or-after the root acquired its
+//! pid. The keep predicate is
 //!
 //! ```text
 //! token > root.token || (allow_equal && token == root.token)
@@ -37,8 +37,8 @@
 //!   `>=` is therefore safe AND catches same-jiffy immediate children that strict
 //!   `>` would silently miss under Linux's coarse 10 ms jiffy clock (this also
 //!   makes the live integration test deterministic).
-//! - **Windows** does not reparent and recycles pids freely, so we keep strict
-//!   `>`. Its 100 ns FILETIME clock makes a same-tick *genuine* child
+//! - **Windows** does not reparent and recycles pids freely, so the rule stays
+//!   strict `>`. Its 100 ns FILETIME clock makes a same-tick *genuine* child
 //!   indistinguishable from impossible, so strict `>` loses nothing there.
 
 use crate::identity::{ProcessId, RawPid};
@@ -46,7 +46,7 @@ use crate::identity::{ProcessId, RawPid};
 #[cfg(unix)]
 use nix::sys::signal::Signal;
 
-/// Per-OS token-order rule (USER DECISION). See the module docs for the full
+/// Per-OS token-order rule. See the module docs for the full
 /// rationale. Linux/macOS reparent orphans → ppid is authoritative → keep
 /// same-tick children (`>=`). Windows recycles pids and never reparents → keep
 /// strict `>`.

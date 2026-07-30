@@ -204,8 +204,7 @@ pub(super) fn detect() -> Host {
 // ===== Non-destructive rewrite + deferred password channel =====
 //
 // The deferred-password chain (`PendingPassword`/`password_line`/`write_*`) and the
-// `PosixRewrite` fields are consumed by the sync POSIX spawn arm
-// (`crate::child::spawn::spawn`); the async arm follows in a later task.
+// `PosixRewrite` fields are consumed by the sync and async POSIX spawn arms.
 
 /// The `Auth::Stdin` password channel: the pipe write-end plus the secret, written
 /// AFTER spawn (the child is then draining via `sudo -S`).

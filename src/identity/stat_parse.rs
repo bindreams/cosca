@@ -1,9 +1,8 @@
-//! Pure parsers for `/proc/<pid>/stat` fields. In an always-compiled module so
-//! the tricky comm-field handling is unit-tested on every host, not only Linux.
+//! Pure parsers for `/proc/<pid>/stat` fields.
 //!
 //! The comm field (field 2) is paren-wrapped and may contain spaces and ')', so
-//! we anchor on the LAST ')': index 0 of the whitespace-split tail is field 3
-//! (state); `starttime` is field 22 (index 19).
+//! the parsers anchor on the LAST ')': index 0 of the whitespace-split tail is
+//! field 3 (state); `starttime` is field 22 (index 19).
 //
 // Compiled on every target (for host unit tests); only `linux.rs` calls these,
 // so they are dead on non-Linux builds.

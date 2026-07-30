@@ -1,10 +1,10 @@
-//! Windows raw `CreateProcessW` spawn backend (Plan 12).
+//! Windows raw `CreateProcessW` spawn backend.
 //!
 //! [`spawn_raw`] is the sync entry point: it loads an `executable()` file
 //! independently of argv[0] (the case std cannot express on Windows), wiring the
 //! child's std handles via `STARTUPINFOEXW` + a scoped `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
 //! The process-handle + FFI primitives live in [`proc`]; program/env/NUL
-//! resolution in [`resolve`]; the MSVCRT fd-table encoder (for fd >= 3, Task 5)
+//! resolution in [`resolve`]; the MSVCRT fd-table encoder (for fd >= 3)
 //! in [`crt_fds`].
 
 #[path = "windows_raw/crt_fds.rs"]
@@ -19,7 +19,7 @@ pub(crate) mod resolve;
 mod proc;
 
 pub(crate) use proc::RawChild;
-// Additional seams the async raw backend reuses (Task 7): the cancellable handle wait + its
+// Additional seams the async raw backend reuses: the cancellable handle wait + its
 // outcome, and the exit-status reader. The sync path uses these only inside `proc`, so the
 // re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
 // needs no re-export.)
