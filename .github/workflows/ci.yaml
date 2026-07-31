@@ -33,6 +33,10 @@ jobs:
       # locally as git hooks. prek-action runs `prek run --all-files`.
       - uses: j178/prek-action@v2
 
+      - name: Test release helper scripts
+        shell: bash
+        run: bash .github/scripts/release-script-tests.sh
+
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
