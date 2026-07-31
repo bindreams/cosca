@@ -82,7 +82,7 @@ impl Stdio {
         Stdio(StdioKind::Null)
     }
     /// A pipe whose direction is inferred from the slot (stdin=child-reads,
-    /// stdout/stderr=child-writes). Use [`pipe_in`]/[`pipe_out`] for fds >= 3.
+    /// stdout/stderr=child-writes). Use [`Stdio::pipe_in`]/[`Stdio::pipe_out`] for fds >= 3.
     pub fn pipe() -> Stdio {
         Stdio(StdioKind::Pipe(None))
     }

@@ -87,6 +87,13 @@ jobs:
       - name: Run tests (tokio feature)
         run: cargo test --locked --features tokio --target ${{ matrix.target }}
 
+      - name: Check rustdoc
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked --target "$TARGET"
+
       - name: Assert the package excludes test-only paths
         shell: bash
         env:

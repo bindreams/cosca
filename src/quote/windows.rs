@@ -21,7 +21,7 @@ fn needs_quotes(arg: &[u16]) -> bool {
 
 /// Join argv into a single command-line string per the MSVCRT rules that
 /// `CommandLineToArgvW` reverses. Intended for argv[1..]; the program name
-/// (argv[0]) is passed separately as `lpApplicationName`.
+/// (`argv[0]`) is passed separately as `lpApplicationName`.
 pub fn join_wide(args: &[&[u16]]) -> Vec<u16> {
     let mut cmd: Vec<u16> = Vec::new();
     for (idx, arg) in args.iter().enumerate() {
@@ -94,14 +94,14 @@ pub fn first_token_and_rest_wide(cmd: &[u16]) -> Option<(Vec<u16>, Vec<u16>)> {
     Some((first, cmd[i..].to_vec()))
 }
 
-/// Extract the program token (argv[0]) from a command line, for deriving
+/// Extract the program token (`argv[0]`) from a command line, for deriving
 /// `lpApplicationName` from a user-supplied `commandline`.
 ///
-/// Deliberate deviation from `CommandLineToArgvW`'s argv[0] handling: leading
+/// Deliberate deviation from `CommandLineToArgvW`'s `argv[0]` handling: leading
 /// whitespace is skipped and empty/whitespace-only input returns `None`. The OS
 /// does not skip leading whitespace: on an empty string it substitutes the
-/// module path as argv[0]; on a whitespace-only string it returns `""` as
-/// argv[0]. In both cases this function returns `None`. The token shape
+/// module path as `argv[0]`; on a whitespace-only string it returns `""` as
+/// `argv[0]`. In both cases this function returns `None`. The token shape
 /// otherwise matches: a leading `"` runs to the next `"` (or to the end if
 /// unterminated); an unquoted token runs to the next space/tab; backslashes
 /// are literal here (no escaping).
