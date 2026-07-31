@@ -87,6 +87,36 @@ jobs:
       - name: Run tests (tokio feature)
         run: cargo test --locked --features tokio --target ${{ matrix.target }}
 
+      - name: Assert the package excludes test-only paths
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # Write outside the workspace. A listing file created in the package
+          # root becomes an uncommitted, non-excluded file that cargo sees as a
+          # dirty worktree — the guard would abort before ever running.
+          LIST="${RUNNER_TEMP}/pkg-list.txt"
+          cargo package --list --locked --target "$TARGET" > "$LIST"
+
+          set +e
+          grep -qE '^(testbin/|tests/|\.github/|\.claude/|prek\.toml$)' "$LIST"
+          grep_status=$?
+          set -e
+
+          case "$grep_status" in
+            0)
+              echo "::error::Excluded paths leaked into the package:"
+              grep -E '^(testbin/|tests/|\.github/|\.claude/|prek\.toml$)' "$LIST"
+              exit 1
+              ;;
+            1) echo "no excluded paths in the package" ;;
+            *)
+              echo "::error::grep errored (exit $grep_status); exclusion unverified"
+              exit 1
+              ;;
+          esac
+
       # Release lane (debug_assertions off): exercises the calm-release arm of the
       # should_panic oracles in the macOS-gated kinfo_tests.rs.
       - name: Unit tests (release — debug_assertions off)
