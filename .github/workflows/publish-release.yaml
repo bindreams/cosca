@@ -154,7 +154,13 @@ jobs:
           # it is "unused if the Git tag already exists" — so it would just
           # echo back the original $SHA and the guard would never fire.
           # Resolve the tag itself instead.
-          PUBLISHED="$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')"
+          if ! PUBLISHED="$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')"; then
+            echo "::error::Could not resolve tag $TAG after publishing."
+            echo "::error::The crate was uploaded to crates.io and the release was published; both are irreversible."
+            echo "::error::Verify by hand that $TAG points at $SHA. Do NOT delete the release or tag on the strength of this error alone."
+            exit 1
+          fi
+
           if [ "$PUBLISHED" != "$SHA" ]; then
             echo "::error::Release $TAG points at $PUBLISHED, not the published commit $SHA."
             echo "::error::Fix by hand: delete the release and its tag, then re-run Draft Release."

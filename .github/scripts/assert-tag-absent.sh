@@ -14,7 +14,7 @@ git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1 || st
 
 case "$status" in
     0)
-        echo "::error::Tag ${tag} already exists on origin. gh release create would bind the release to it and ignore --target. Delete the tag first."
+        echo "::error::Tag ${tag} already exists on origin. GitHub would bind the release to that tag's existing commit instead of the intended one. Delete the tag first."
         exit 1
         ;;
     2)
