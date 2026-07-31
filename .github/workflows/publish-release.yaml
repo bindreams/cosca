@@ -1,0 +1,164 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the raw input. `normalize-version.sh` strips a leading `v`, so
+  # `0.1.0` and `v0.1.0` form separate groups resolving to one tag. Both sibling
+  # repos do this; accepted rather than deviating on one detail of a ported idiom.
+  group: publish-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Real preflight — version validation, the CI matrix, the dry-run publish —
+    # happens in draft-release.yaml before a draft can exist. The draft's
+    # existence is the evidence it passed, and the operator dispatching this has
+    # already reviewed it, so preflight is not duplicated here.
+    environment: Deploy
+    permissions:
+      # `write`, not `read`: the List releases API only returns drafts to a
+      # caller with push access.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft release exists and resolve commit SHA
+        id: release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! RELEASE_JSON=$(gh release view "$TAG" --json isDraft,targetCommitish); then
+            echo "::error::gh release view failed for $TAG. Does the draft release exist?"
+            exit 1
+          fi
+
+          IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG is already published"
+            exit 1
+          fi
+
+          TARGET=$(echo "$RELEASE_JSON" | jq -r '.targetCommitish')
+          if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Draft release target '$TARGET' is not a 40-char commit SHA. Recreate the draft via the Draft Release workflow."
+            exit 1
+          fi
+          echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.commit_sha }}
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Re-verify manifest version matches the release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "::error::Checked-out commit declares $MANIFEST but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
+      - name: Check crates.io for an existing version
+        id: crates_check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          # crates.io rejects requests without a User-Agent with HTTP 403.
+          CRATES_UA: "cosca-release-pipeline (https://github.com/bindreams/cosca)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" \
+            "https://crates.io/api/v1/crates/cosca/${VERSION}")
+          case "$CODE" in
+            200)
+              echo "already_published=true" >> "$GITHUB_OUTPUT"
+              echo "Version ${VERSION} already on crates.io; skipping publish."
+              ;;
+            404) echo "already_published=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::Unexpected HTTP $CODE from crates.io API"
+              exit 1
+              ;;
+          esac
+
+      - name: Publish to crates.io
+        if: steps.crates_check.outputs.already_published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Publish GitHub release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.release.outputs.commit_sha }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # One last check immediately before the action that creates the tag:
+          # the draft itself creates no tag, and a re-dispatch that resumes
+          # after a failed un-draft still has no tag (isDraft was still true
+          # above), so this is safe on every reachable path. It turns the race
+          # below into an early, explicit refusal instead of a silent
+          # mis-binding caught only by the read-back.
+          bash .github/scripts/assert-tag-absent.sh "$TAG"
+
+          gh release edit "$TAG" --draft=false
+
+          # Un-drafting is what creates the tag, so this is the first moment the
+          # binding is observable. If a tag named $TAG appeared between the draft's
+          # creation and now, GitHub attaches the release to THAT commit — leaving
+          # crates.io holding $SHA while the release points elsewhere. Read back and
+          # fail loudly; a visible inconsistency is recoverable by hand, an
+          # undetected one is not.
+          #
+          # `targetCommitish` is NOT usable for this: it is the stored input
+          # field from release creation, not the tag's resolved commit. GitHub
+          # never recomputes it when a draft is published — per the REST docs
+          # it is "unused if the Git tag already exists" — so it would just
+          # echo back the original $SHA and the guard would never fire.
+          # Resolve the tag itself instead.
+          PUBLISHED="$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')"
+          if [ "$PUBLISHED" != "$SHA" ]; then
+            echo "::error::Release $TAG points at $PUBLISHED, not the published commit $SHA."
+            echo "::error::Fix by hand: delete the release and its tag, then re-run Draft Release."
+            exit 1
+          fi
+
+          echo "Release published: https://github.com/${REPO}/releases/tag/$TAG"
