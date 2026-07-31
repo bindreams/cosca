@@ -97,24 +97,24 @@ impl Command {
     /// on both POSIX and Windows. On Windows the raw `CreateProcessW` backend sets
     /// the loaded image (`lpApplicationName`) independently of the command line
     /// (`lpCommandLine`), so `executable` selects the file that runs while the
-    /// child's argv[0] is the command line's first token.
+    /// child's `argv[0]` is the command line's first token.
     pub fn commandline<S: Into<OsString>>(&mut self, line: S) -> &mut Command {
         self.input = CommandInput::CommandLine(line.into());
         self
     }
 
-    /// Override the executable file that the OS loads, independently of argv[0]
-    /// (e.g. load `/bin/busybox` while argv[0] is `sh`).
+    /// Override the executable file that the OS loads, independently of `argv[0]`
+    /// (e.g. load `/bin/busybox` while `argv[0]` is `sh`).
     ///
     /// # Platform note
     ///
-    /// On POSIX, the user's argv[0] is preserved via `CommandExt::arg0`, so
+    /// On POSIX, the user's `argv[0]` is preserved via `CommandExt::arg0`, so
     /// `executable("/bin/busybox").args(["sh", "-c", "..."])` correctly loads
-    /// busybox while the child sees `"sh"` as its argv[0].
+    /// busybox while the child sees `"sh"` as its `argv[0]`.
     ///
     /// On Windows, a set `executable` spawns through the raw `CreateProcessW`
     /// backend, which sets `lpApplicationName` independently of `lpCommandLine` —
-    /// so argv[0] is preserved (it no longer degrades to the executable path), and
+    /// so `argv[0]` is preserved (it no longer degrades to the executable path), and
     /// combining `executable` with [`commandline`](Self::commandline) is supported.
     /// A bare or relative `executable` is resolved with a deliberate rule (not full
     /// `CreateProcessW` search parity): the current directory first, then each

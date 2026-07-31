@@ -1,11 +1,19 @@
 [package]
 name = "cosca"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+authors = ["Anna Zhukova"]
 description = "Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity, and elevation."
 license = "Apache-2.0"
-publish = false           # name settled (`cosca`); not yet published
+repository = "https://github.com/bindreams/cosca"
+readme = "README.md"
+keywords = ["subprocess", "process", "spawn", "elevation", "cross-platform"]
+categories = ["os", "development-tools", "asynchronous"]
+exclude = ["/testbin", "/tests", "/.github", "/.claude", "/prek.toml"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [features]
 pty = []

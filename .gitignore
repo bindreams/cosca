@@ -4,6 +4,7 @@
 # Claude Code
 .claude/*.local.*
 CLAUDE.local.md
+.claude/worktrees/
 
 # Agent scratch: plans, specs, task briefs and reports.
 .tmp/

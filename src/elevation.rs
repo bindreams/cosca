@@ -1,6 +1,6 @@
 //! Cross-platform privilege elevation. Elevation wraps the CHILD (a
 //! `sudo`/`run0`/`doas`/`pkexec` prefix on POSIX; `ShellExecuteEx("runas")` on
-//! Windows), never the calling process. See the pure planner in [`plan`].
+//! Windows), never the calling process.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
