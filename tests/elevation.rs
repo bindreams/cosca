@@ -1,3 +1,11 @@
+//! `COSCA_TEST_ELEVATION_GUI` gates the macOS graphical tier separately: unlike the
+//! POSIX tier, it raises an interactive authentication dialog that no CI runner can
+//! answer, so it is human-driven only. What CI DOES verify unattended lives in the
+//! unit suite (`elevation::macos`), where the crate's own composer is in scope: the
+//! two quoting layers driven through the real AppleScript parser and the real
+//! /bin/sh with the privilege clause removed, plus an `osacompile` parse of the
+//! unmodified elevated script.
+//!
 //! Live elevation tier — gated behind COSCA_TEST_ELEVATION (cgroup precedent):
 //! a TRUE no-op when the var is absent, and FAILS LOUDLY when set but elevation is
 //! unavailable. The pure tiers cover all logic unconditionally; only the privilege-gain
@@ -434,4 +442,37 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
     drop(child); // must return promptly (non-blocking async teardown)
+}
+
+// GATED behind COSCA_TEST_ELEVATION_GUI: a TRUE no-op without it, and loud when set.
+// This is the ONLY test that raises the authentication dialog, so it can never run
+// unattended — a human must be at the keyboard to approve it. It is here so the path
+// is verifiable at all, not so CI can verify it.
+#[cfg(target_os = "macos")]
+#[test]
+fn gui_elevated_child_runs_as_root() {
+    // Already root means the planner short-circuits to RunAsIs and reports
+    // AlreadyElevated: osascript never runs, so the assertions below would fail on
+    // a defect that does not exist. Same guard the POSIX gated tests use.
+    if std::env::var_os("COSCA_TEST_ELEVATION_GUI").is_none() || cosca::elevation::is_elevated() {
+        return;
+    }
+    let mut c = cosca::Command::new();
+    c.args(["/usr/bin/id", "-u"])
+        .elevation_auth(cosca::elevation::Auth::Gui);
+    c.stdin(cosca::Stdio::null()).unwrap();
+    c.stdout(cosca::Stdio::pipe()).unwrap();
+    let mut child = c.spawn().expect("gui-elevated spawn");
+    let report = child.elevation().expect("an elevation report");
+    assert_eq!(report.via, cosca::ElevatedVia::MacosOsascript);
+    assert_eq!(report.stdio, cosca::ElevatedStdio::OsascriptRelay);
+    // NOT dropped or killed before this returns: killing the front-end early would
+    // leave the root payload running and its outcome unobservable.
+    let out = child.communicate(None).expect("communicate");
+    assert!(out.status.success(), "the elevated `id -u` failed: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "the relayed stdout must show the elevated child ran as root"
+    );
 }

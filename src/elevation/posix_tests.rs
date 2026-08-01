@@ -306,8 +306,10 @@ mod rewrite_tests {
                 sudo: Some(PathBuf::from("/usr/bin/sudo")),
                 doas: Some(PathBuf::from("/usr/bin/doas")),
                 pkexec: None,
+                osascript: None,
             },
             os: Os::Unix,
+            arg_max: None,
         }
     }
 
@@ -394,6 +396,7 @@ mod rewrite_tests {
                 sudo: None,
                 doas: Some(PathBuf::from("/usr/bin/doas")),
                 pkexec: None,
+                osascript: None,
             },
             ..sudo_host()
         };
@@ -413,6 +416,7 @@ mod rewrite_tests {
                 sudo: None,
                 doas: None,
                 pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
+                osascript: None,
             },
             ..sudo_host()
         };
@@ -435,6 +439,7 @@ mod rewrite_tests {
                 sudo: None,
                 doas: None,
                 pkexec: None,
+                osascript: None,
             },
             ..sudo_host()
         };
@@ -524,6 +529,7 @@ mod rewrite_tests {
                 sudo: None,
                 doas: None,
                 pkexec: None,
+                osascript: None,
             },
             ..sudo_host()
         };
@@ -629,6 +635,7 @@ mod rewrite_tests {
                     sudo: None,
                     doas: Some(PathBuf::from("/usr/bin/doas")),
                     pkexec: None,
+                    osascript: None,
                 },
                 ..host.clone()
             };
@@ -715,5 +722,124 @@ mod rewrite_tests {
         assert_eq!(got.len(), secret_bytes.len() + 1);
         assert_eq!(&got[..secret_bytes.len()], &secret_bytes[..]);
         assert_eq!(got[secret_bytes.len()], b'\n');
+    }
+
+    // ===== macOS graphical elevation, planned on ANY unix host =====
+
+    fn macos_gui_host(elevated: bool) -> Host {
+        Host {
+            elevated,
+            has_tty: false,
+            available: BackendSet {
+                run0: None,
+                sudo: Some(PathBuf::from("/usr/bin/sudo")),
+                doas: None,
+                pkexec: None,
+                osascript: Some(PathBuf::from("/usr/bin/osascript")),
+            },
+            os: Os::MacOs,
+            arg_max: Some(1_048_576),
+        }
+    }
+
+    #[test]
+    fn macos_gui_rewrites_to_osascript() {
+        let mut c = Command::new();
+        c.args(["/usr/bin/id", "-u"]).elevation_auth(Auth::Gui);
+        let rw = rewrite_with_host(&mut c, &macos_gui_host(false)).expect("macos gui rewrite");
+        let derived = rw.derived.expect("a derived command");
+        let CommandInput::Argv(argv) = derived.input() else {
+            panic!("argv expected")
+        };
+        assert_eq!(argv[0], OsString::from("/usr/bin/osascript"));
+        assert_eq!(argv[1], OsString::from("-e"));
+        assert!(argv[2].to_str().unwrap().contains("with administrator privileges"));
+        assert_eq!(rw.backend_path, Some(PathBuf::from("/usr/bin/osascript")));
+        assert!(rw.password_write.is_none());
+        let report = rw.report.expect("a report");
+        assert_eq!(report.via, ElevatedVia::MacosOsascript);
+        assert_eq!(report.stdio, ElevatedStdio::OsascriptRelay);
+    }
+
+    #[test]
+    fn macos_gui_uses_the_macos_gate_not_the_posix_one() {
+        // .contain() is legal under sudo and illegal under osascript; the gate
+        // choice is what makes the difference, so assert the macOS message.
+        let mut c = Command::new();
+        c.args(["/usr/bin/id"]).contain().elevation_auth(Auth::Gui);
+        match rewrite_with_host(&mut c, &macos_gui_host(false)) {
+            Err(Error::Unsupported { platform, .. }) => assert_eq!(platform, "macos"),
+            other => panic!("expected a macos Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_macos_gui_gate_is_privilege_independent() {
+        // The crate's stated invariant: a structural verdict is a property of the
+        // REQUEST, never of ambient privilege. If this flipped, a developer testing
+        // as root would see .contain() accepted and ship it, and every unprivileged
+        // user would hit a hard Unsupported at runtime.
+        for elevated in [false, true] {
+            let mut c = Command::new();
+            c.args(["/usr/bin/id"]).contain().elevation_auth(Auth::Gui);
+            match rewrite_with_host(&mut c, &macos_gui_host(elevated)) {
+                Err(Error::Unsupported { platform, .. }) => assert_eq!(platform, "macos"),
+                other => panic!("expected a macos Unsupported (elevated={elevated}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_already_root_macos_gui_caller_runs_unwrapped() {
+        // With a clean config the short-circuit still applies: no osascript.
+        let mut c = Command::new();
+        c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
+        let rw = rewrite_with_host(&mut c, &macos_gui_host(true)).expect("already-root rewrite");
+        assert_eq!(rw.report.expect("a report").via, ElevatedVia::AlreadyElevated);
+        assert!(rw.backend_path.is_none(), "no wrapper runs when already elevated");
+    }
+
+    #[test]
+    fn a_forced_backend_with_gui_gets_the_planners_verdict_not_the_trampolines() {
+        // Backend::Sudo + Auth::Gui never reaches osascript, so the message must be
+        // about the backend pairing, not about the authorization trampoline.
+        let mut c = Command::new();
+        c.args(["/usr/bin/id"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::Gui);
+        match rewrite_with_host(&mut c, &macos_gui_host(false)) {
+            Err(Error::Unsupported { detail, .. }) => {
+                assert!(detail.contains("Backend::Auto"), "{detail}");
+                assert!(!detail.contains("trampoline"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_osascript_keeps_the_honest_backend_verdict_through_the_dispatch() {
+        // The gate is chosen from the REQUEST, so a missing osascript still takes
+        // the macOS gate; it passes on this clean config, and the planner's honest
+        // BackendUnavailable then reaches the caller verbatim rather than being
+        // pre-empted by a structural complaint.
+        let mut host = macos_gui_host(false);
+        host.available.osascript = None;
+        let mut c = Command::new();
+        c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
+        match rewrite_with_host(&mut c, &host) {
+            Err(Error::Elevation { kind, detail }) => {
+                assert_eq!(kind, crate::error::ElevationErrorKind::BackendUnavailable);
+                assert!(detail.contains("osascript"), "{detail}");
+            }
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macos_non_gui_auth_still_takes_the_posix_path() {
+        let mut c = Command::new();
+        c.args(["/usr/bin/id"]).elevation_auth(Auth::NonInteractive);
+        let rw = rewrite_with_host(&mut c, &macos_gui_host(false)).expect("sudo rewrite");
+        assert_eq!(rw.backend_path, Some(PathBuf::from("/usr/bin/sudo")));
     }
 }

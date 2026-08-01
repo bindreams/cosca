@@ -11,6 +11,11 @@ use zeroize::Zeroize;
 // public types below are exported. The one exception is `controlling_terminal_present`, a
 // `#[doc(hidden)]` probe the separate `testbin` binary (an external consumer) needs — re-exported
 // at this module's root so `posix` itself stays `pub(crate)`.
+// Pure and cross-tested, so it is compiled everywhere — but its only in-crate
+// caller is `posix.rs`, which is `cfg(unix)`. Off-unix every item is therefore
+// test-only, exactly like the `command.rs` accessors it calls.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) mod macos;
 pub(crate) mod plan;
 #[cfg(unix)]
 #[path = "elevation/posix.rs"]
@@ -59,6 +64,21 @@ pub enum Backend {
 /// How the backend authenticates. `Interactive` (default) prompts on the
 /// controlling TTY; with no controlling terminal it is a loud
 /// [`crate::error::ElevationErrorKind::NoTty`].
+///
+/// `Gui` is the system graphical authentication dialog — the one form of elevation
+/// that works in a windowed application, which has no controlling terminal to
+/// prompt on:
+///
+/// | Platform | `Auth::Gui` | Backend |
+/// |---|---|---|
+/// | Windows | the UAC consent gate | `Backend::Auto` |
+/// | macOS | Authorization Services, via `osascript` | `Backend::Auto` |
+/// | Linux | polkit, via `pkexec` | `Backend::Pkexec` |
+///
+/// The three are not interchangeable in what they can carry. Read
+/// [`ElevatedVia::MacosOsascript`] before using `Auth::Gui` on macOS: the elevated
+/// program leaves this process's tree, so stdio, exit-status fidelity, `kill()` and
+/// `.contain()` all behave differently there.
 #[derive(Debug, Clone, Default)]
 pub enum Auth {
     #[default]
@@ -84,16 +104,77 @@ pub enum ElevatedStdio {
     /// POSIX [`Auth::Stdin`]: fd0 is the elevation password channel (EOF after
     /// the password), not the caller's stdin.
     StdinConsumed,
+    /// macOS [`Auth::Gui`]: the caller's stdio was NOT given to the elevated
+    /// program. The stdout/stderr you configure are **osascript's**, and what flows
+    /// through them is a relay, not the program's own streams:
+    ///
+    /// - the program's stdout is captured in full by `osascript` and written to
+    ///   osascript's stdout once the program exits — **buffered**, never streamed;
+    /// - that stdout round-trips through UTF-8 text and loses its final line
+    ///   ending, so byte-exact binary output does not survive;
+    /// - the program's **stderr is not relayed at all**. osascript's stderr carries
+    ///   AppleScript's own error text (which quotes the program's stderr when it
+    ///   exits non-zero), not the program's stream;
+    /// - the program's stdin comes from Authorization Services, not the caller.
+    ///   Configuring a pipe or file on fd0 is rejected, because nothing would ever
+    ///   read it;
+    /// - the relay is written only when the program exits, so killing or dropping
+    ///   the child early yields an empty or truncated capture with no signal that
+    ///   the program is still running. See [`ElevatedVia::MacosOsascript`];
+    /// - **on a non-zero exit there is no relay at all.** `do shell script` raises
+    ///   an AppleScript error instead of returning a result, so the program's
+    ///   stdout is discarded entirely and only osascript's error text reaches
+    ///   stderr. A caller that needs output on the failure path must have the
+    ///   program write it somewhere the caller reads, not rely on the relay.
+    OsascriptRelay,
 }
 
 /// How elevation was achieved. Distinct from [`Backend`]: `WindowsUac` is the
 /// dedicated Windows runas disposition (NOT `Backend::Auto`, a POSIX concept).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ElevatedVia {
     /// A POSIX backend wrapped the child (the resolved backend that ran).
     Wrapped(Backend),
     /// Windows `ShellExecuteEx("runas")` elevated the child through UAC.
     WindowsUac,
+    /// macOS `osascript … with administrator privileges` asked Authorization
+    /// Services to run the command as root.
+    ///
+    /// The elevated program is **not in this process's tree**. macOS runs it under
+    /// `com.apple.security.authtrampoline`, parented to `launchd`, so the tracked
+    /// [`crate::Child`] is the `osascript` front-end, not the program:
+    ///
+    /// - **Left alone, osascript outlives the program**: it blocks until the program
+    ///   exits, so [`crate::Child::wait`] returning means the elevated work is
+    ///   finished.
+    /// - **Killed or dropped early, it does not.** [`crate::Child::kill`] — and the
+    ///   drop-kill that [`crate::Command::kill_on_drop`] performs, which is **on by
+    ///   default** — reaches only osascript. The root program keeps running, nothing
+    ///   unprivileged can stop it, and once the front-end is gone its completion and
+    ///   its exit status are unobservable. If you need the program's outcome, do not
+    ///   kill the child and do not drop it before [`crate::Child::wait`] returns. (An
+    ///   explicit `.kill_on_drop(true)` cannot currently be told apart from the
+    ///   builder default, so this is documented rather than refused.)
+    /// - `wait` reports **osascript's** exit status. It is zero if and only if the
+    ///   elevated program exited zero; a non-zero code is osascript's, not the
+    ///   program's — and on that path the program's stdout is discarded rather than
+    ///   relayed (see [`ElevatedStdio::OsascriptRelay`]).
+    /// - A **cancelled** authentication dialog is one such non-zero exit, not a
+    ///   spawn-time [`crate::error::ElevationErrorKind::AuthDeclined`].
+    /// - Process containment cannot span the boundary, so `.contain()` is rejected
+    ///   up front.
+    /// - A `current_dir()` the caller can traverse but root cannot (NFS
+    ///   `root_squash`) fails the `cd` on the far side of the trampoline: the program
+    ///   never runs and the failure surfaces as a bare non-zero exit, because the
+    ///   explaining stderr is not relayed.
+    ///
+    /// The command text is visible to anyone able to inspect the running processes —
+    /// a real difference from `sudo` and from UAC. Do not put a secret in the argv of
+    /// an elevated macOS command.
+    ///
+    /// See [`ElevatedStdio::OsascriptRelay`] for what happens to stdio.
+    MacosOsascript,
     /// The process was already elevated, so no wrapper was needed.
     AlreadyElevated,
 }

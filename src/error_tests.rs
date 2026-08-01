@@ -21,6 +21,24 @@ fn quote_error_kinds_have_distinct_messages() {
         "unterminated double quote"
     );
     assert_eq!(QuoteErrorKind::TrailingBackslash.to_string(), "trailing backslash");
+    assert_eq!(QuoteErrorKind::NonUtf8.to_string(), "not valid UTF-8");
+    assert_eq!(
+        QuoteErrorKind::UnrepresentableChar.to_string(),
+        "character cannot be represented in this grammar"
+    );
+    // The whole set, so a new variant colliding with an existing message fails here.
+    let all = [
+        QuoteErrorKind::UnterminatedSingleQuote,
+        QuoteErrorKind::UnterminatedDoubleQuote,
+        QuoteErrorKind::TrailingBackslash,
+        QuoteErrorKind::NonUtf8,
+        QuoteErrorKind::UnrepresentableChar,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a.to_string(), b.to_string(), "{a:?} vs {b:?}");
+        }
+    }
 }
 
 #[test]
@@ -62,6 +80,14 @@ fn elevation_error_displays_kind_and_detail() {
 }
 
 #[test]
+fn command_too_long_names_the_host_not_the_platform() {
+    // The wording matters: this verdict is per-host and per-command, so it must not
+    // read like a permanent platform limitation.
+    let m = crate::error::ElevationErrorKind::CommandTooLong.to_string();
+    assert_eq!(m, "the elevation command is too long for this host");
+}
+
+#[test]
 fn elevation_error_kinds_have_distinct_messages() {
     use crate::error::ElevationErrorKind::*;
     let all = [
@@ -71,6 +97,7 @@ fn elevation_error_kinds_have_distinct_messages() {
         NoTty,
         Unkillable,
         Untracked,
+        CommandTooLong,
     ];
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
