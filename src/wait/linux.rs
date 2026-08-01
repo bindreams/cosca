@@ -8,10 +8,10 @@ use rustix::event::{poll, PollFd, PollFlags};
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
 use crate::error::Error;
-use crate::identity::ProcessId;
+use crate::identity::{Existence, ProcessId};
 
 /// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
-pub(crate) fn open_verified(id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
         "pid {} exceeds i32::MAX; pidfd cast would truncate",
@@ -30,15 +30,24 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>
         }
         Err(e) => return Err(Error::Io(std::io::Error::from(e))),
     };
-    // Re-verify: a pid recycled before open means the original is already gone.
-    if !id.exists() {
-        return Ok(None);
+    // Re-verify: a pid recycled before open means the original is already gone. An
+    // unassessable pid (hidepid, EPERM) is NOT gone and must not be treated as one.
+    match id.exists() {
+        Existence::Present => Ok(Some(pidfd)),
+        Existence::Gone => Ok(None),
+        Existence::Unknown => {
+            // The decision site `read_stat`-s debug-level probe relies on.
+            log::warn!("wait: pid {} identity could not be confirmed; {what}", id.pid());
+            Err(Error::Unassessable {
+                detail: format!("pid {} identity could not be confirmed; {what}", id.pid()),
+                source: None,
+            })
+        }
     }
-    Ok(Some(pidfd))
 }
 
 pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
-    let Some(pidfd) = open_verified(id)? else {
+    let Some(pidfd) = open_verified(id, "its exit cannot be observed")? else {
         return Ok(true);
     };
     loop {
@@ -70,7 +79,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 }
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id)? else { return Ok(()) };
+    let Some(pidfd) = open_verified(id, "no signal was sent")? else { return Ok(()) };
     match pidfd_send_signal(&pidfd, Signal::KILL) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
@@ -79,7 +88,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 }
 
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id)? else { return Ok(()) };
+    let Some(pidfd) = open_verified(id, "no signal was sent")? else { return Ok(()) };
     match pidfd_send_signal(&pidfd, Signal::TERM) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal

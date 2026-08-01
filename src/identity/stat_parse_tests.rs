@@ -1,4 +1,5 @@
 use super::super::StartToken;
+use crate::identity::Liveness;
 use super::{parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat};
 
 fn tok(v: u64) -> StartToken {
@@ -73,35 +74,42 @@ fn stat_fixture(state: &str, starttime: u64) -> Vec<u8> {
 #[test]
 fn running_from_stat_running_state_matching_token() {
     let stat = stat_fixture("R", 8675309);
-    assert!(running_from_stat(&stat, tok(8675309)));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Alive);
 }
 
 #[test]
 fn running_from_stat_sleeping_state_matching_token() {
     let stat = stat_fixture("S", 8675309);
-    assert!(running_from_stat(&stat, tok(8675309)));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Alive);
 }
 
 #[test]
-fn running_from_stat_zombie_returns_false() {
+fn running_from_stat_zombie_is_dead() {
     let stat = stat_fixture("Z", 8675309);
-    assert!(!running_from_stat(&stat, tok(8675309)));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Dead);
 }
 
 #[test]
-fn running_from_stat_dead_uppercase_returns_false() {
+fn running_from_stat_dead_uppercase_is_dead() {
     let stat = stat_fixture("X", 8675309);
-    assert!(!running_from_stat(&stat, tok(8675309)));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Dead);
 }
 
 #[test]
-fn running_from_stat_dead_lowercase_returns_false() {
+fn running_from_stat_dead_lowercase_is_dead() {
     let stat = stat_fixture("x", 8675309);
-    assert!(!running_from_stat(&stat, tok(8675309)));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Dead);
 }
 
 #[test]
-fn running_from_stat_token_mismatch_returns_false() {
+fn running_from_stat_token_mismatch_is_dead() {
     let stat = stat_fixture("R", 8675309);
-    assert!(!running_from_stat(&stat, tok(9999999)));
+    assert_eq!(running_from_stat(&stat, tok(9999999)), Liveness::Dead);
+}
+
+#[test]
+fn running_from_stat_unparseable_record_is_unknown() {
+    // We read the file, so the process is there — we just could not read its state.
+    // Distinct from a token mismatch, which positively identifies a stranger.
+    assert_eq!(running_from_stat(b"not a stat line at all", tok(1)), Liveness::Unknown);
 }

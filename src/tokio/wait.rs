@@ -148,7 +148,7 @@ pub(crate) mod fault_observer {
 async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
-    let Some(pidfd) = crate::wait::backend::open_verified(id)? else {
+    let Some(pidfd) = crate::wait::backend::open_verified(id, "its exit cannot be observed")? else {
         return Ok(());
     };
     // The pidfd becomes readable (POLLIN) when the task becomes a zombie; POLLHUP once

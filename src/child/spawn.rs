@@ -230,17 +230,24 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // Unix its /proc entry persists; on Windows the std Child pins the process
     // handle so the pid cannot be reused — so this read is race-free.
     let id = match resolve_identity(child.id()) {
-        Some(id) => id,
-        // Same teardown (incl. the safe-to-discard `kill()`) as the attach arm above — never leak
-        // the spawned child on a failed read.
-        None => {
+        crate::identity::Resolved::Found(id) => id,
+        // Same teardown for both arms (never leak the spawned child), different diagnosis:
+        // an OS refusal is not a vanish. The teardown itself is unchanged from the
+        // attach-failure arm above, whose invariant holds here too - for a child we own and
+        // have not reaped, `kill` can only fail because it already exited, and `wait()` then
+        // reaps at once, never an unbounded block.
+        other => {
             let _ = child.kill();
-            if let Err(_e) = child.wait() {
-                debug_assert!(false, "sync spawn teardown failed to reap child: {_e}");
+            if let Err(e) = child.wait() {
+                // warn first: `debug_assert` is compiled out in release, and a swallowed
+                // reap failure would otherwise leave no trace at all there.
+                log::warn!("spawn teardown failed to reap pid {}: {e}", child.id());
+                debug_assert!(false, "sync spawn teardown failed to reap child: {e}");
             }
-            return Err(Error::Io(std::io::Error::other(
-                "spawned child vanished before its identity could be read",
-            )));
+            // The distinction must survive as a VARIANT, not as prose: a supervisor matching
+            // on `Unassessable` to retry elevated would otherwise see an I/O failure and
+            // treat a live, merely-unreadable child as a startup failure.
+            return Err(spawn_identity_error(other));
         }
     };
     // Adopt AFTER the identity read (and after the containment resume) so
@@ -624,15 +631,31 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
     }
 }
 
+/// The error for a spawn whose child could not be identified. `Gone` is an absence;
+/// `Unknown` is an OS refusal about a child that may be running fine - never report the
+/// second as the first. Mirrors `containment::dispatch::resolve_root_id`.
+pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>) -> Error {
+    match outcome {
+        crate::identity::Resolved::Unknown => Error::Unassessable {
+            detail: "the OS refused to report the spawned child's identity".into(),
+            source: None,
+        },
+        _ => Error::Io(std::io::Error::other(
+            "spawned child vanished before its identity could be read",
+        )),
+    }
+}
+
 /// Read the spawned child's stable identity. A test-only fault seam (`fault`) can force the
 /// vanished branch, exercising either spawn path's error-teardown arm deterministically.
-pub(crate) fn resolve_identity(pid: u32) -> Option<ProcessId> {
+pub(crate) fn resolve_identity(pid: u32) -> crate::identity::Resolved<ProcessId> {
     #[cfg(test)]
     if fault::force_identity_vanished() {
         // Capture the child's real identity for the test to prove it was reaped, then simulate a
         // vanish so `spawn` takes the teardown arm.
         fault::capture(ProcessId::of(pid));
-        return None;
+        // The seam simulates a VANISH, not a refusal.
+        return crate::identity::Resolved::Gone;
     }
     ProcessId::of(pid)
 }
@@ -674,7 +697,7 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
-        static CAPTURED: Cell<Option<ProcessId>> = const { Cell::new(None) };
+        static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {
@@ -689,10 +712,10 @@ pub(crate) mod fault {
     pub(crate) fn force_attach_failure() -> bool {
         FORCE_ATTACH_FAIL.with(|f| f.get())
     }
-    pub(crate) fn capture(id: Option<ProcessId>) {
-        CAPTURED.with(|c| c.set(id));
+    pub(crate) fn capture(id: crate::identity::Resolved<ProcessId>) {
+        CAPTURED.with(|c| c.set(Some(id)));
     }
-    pub(crate) fn take_captured() -> Option<ProcessId> {
+    pub(crate) fn take_captured() -> Option<crate::identity::Resolved<ProcessId>> {
         CAPTURED.with(|c| c.take())
     }
 
@@ -703,15 +726,29 @@ pub(crate) mod fault {
     /// recycled pid never false-fails. Windows has no zombies, and its process-object cleanup is not
     /// synchronous with `wait()`, so there we assert only that the child is dead (`!is_alive()`, also
     /// reuse-immune via the start token).
-    pub(crate) fn assert_child_reaped(captured: ProcessId) {
+    pub(crate) fn assert_child_reaped(captured: crate::identity::Resolved<ProcessId>) {
+        let crate::identity::Resolved::Found(captured) = captured else {
+            panic!("the seam must capture a resolved identity, got {captured:?}");
+        };
         #[cfg(unix)]
-        assert_ne!(
-            ProcessId::of(captured.pid()),
-            Some(captured),
-            "a failed spawn must fully reap its child (no lingering zombie at its identity)"
-        );
+        match ProcessId::of(captured.pid()) {
+            crate::identity::Resolved::Found(id) => assert_ne!(
+                id, captured,
+                "a failed spawn must fully reap its child (no lingering zombie at its identity)"
+            ),
+            crate::identity::Resolved::Gone => {}
+            // NOT a panic: once the child is reaped its pid is free host-wide, so a recycle
+            // between the failed `/proc` read and the `kill(pid, 0)` probe legitimately
+            // yields Unknown. What matters is only that the pid no longer resolves to OUR
+            // identity, and an unreadable stranger is not our child either.
+            crate::identity::Resolved::Unknown => {}
+        }
         #[cfg(windows)]
-        assert!(!captured.is_alive(), "a failed spawn must leave the child dead");
+        assert_eq!(
+            captured.is_alive(),
+            crate::identity::Liveness::Dead,
+            "a failed spawn must leave the child dead"
+        );
     }
 }
 

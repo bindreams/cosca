@@ -36,8 +36,7 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
     #[cfg(unix)]
-    assert!(
-        !id.exists(),
+    assert_eq!(id.exists(), crate::identity::Existence::Gone,
         "root must be swept AND reaped despite the watch error (a zombie would still exist)"
     );
     #[cfg(windows)]
@@ -72,8 +71,7 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
         "seam not consumed — the watch did not run on this thread"
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-    assert!(
-        !id.exists(),
+    assert_eq!(id.exists(), crate::identity::Existence::Gone,
         "child must be killed AND reaped despite the watch error (a zombie would still exist)"
     );
     let status = child.wait().expect("cached status — already reaped by the graceful op");

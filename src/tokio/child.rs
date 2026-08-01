@@ -101,7 +101,7 @@ impl Child {
     pub fn id(&self) -> ProcessId {
         self.id
     }
-    pub fn is_alive(&self) -> bool {
+    pub fn is_alive(&self) -> crate::identity::Liveness {
         self.id.is_alive()
     }
     pub fn containment(&self) -> Containment {

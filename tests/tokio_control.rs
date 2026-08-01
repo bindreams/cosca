@@ -204,7 +204,7 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
     // SIGTERM handler acks and returns), so its terminating signal cannot distinguish our
     // kill from an escalation — being alive here proves the cancelled graceful sent nothing
     // further.
-    assert!(child.is_alive(), "cancelled graceful must not have escalated");
+    assert_eq!(child.is_alive(), cosca::identity::Liveness::Alive, "cancelled graceful must not have escalated");
     child.kill().expect("explicit teardown after cancel");
     expect_eof("blocker", &mut sock);
     let _ = child.wait().await.expect("reap");
@@ -234,7 +234,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
             panic!("graceful future resolved at first poll instead of parking: {r:?}");
         }
     } // <- future dropped mid-grace here
-    assert!(child.is_alive(), "cancelled tree graceful must not have escalated");
+    assert_eq!(child.is_alive(), cosca::identity::Liveness::Alive, "cancelled tree graceful must not have escalated");
     child.kill_tree().expect("explicit sweep after cancel");
     expect_eof("root", &mut root);
     expect_eof("grandchild", &mut grand);
@@ -265,7 +265,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
             panic!("graceful future resolved at first poll instead of parking: {r:?}");
         }
     }
-    assert!(child.is_alive(), "cancelled tree graceful must not have escalated");
+    assert_eq!(child.is_alive(), cosca::identity::Liveness::Alive, "cancelled tree graceful must not have escalated");
     child.kill_tree().expect("explicit sweep after cancel");
     expect_eof("root", &mut root);
     expect_eof("grandchild", &mut grand);

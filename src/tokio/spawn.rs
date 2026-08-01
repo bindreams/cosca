@@ -295,14 +295,12 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // pins the pid against reuse, so `ProcessId::of` still resolves it (as the sync spawn documents).
     let pid = child.id().expect("a freshly spawned, un-awaited tokio child has a pid");
     let id = match resolve_identity(pid) {
-        Some(id) => id,
+        crate::identity::Resolved::Found(id) => id,
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process.
-        None => {
+        other => {
             reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
-            return Err(Error::Io(std::io::Error::other(
-                "spawned async child vanished before identity read",
-            )));
+            return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
 

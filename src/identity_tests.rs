@@ -1,4 +1,4 @@
-use super::{ProcessId, RawPid, StartToken};
+use super::{Existence, Liveness, ProcessId, RawPid, Resolved, StartToken};
 use std::collections::HashSet;
 
 // Build a ProcessId directly from parts (this test module can access the
@@ -46,9 +46,9 @@ fn is_copy_and_exposes_pid() {
 #[test]
 fn current_process_resolves_exists_and_is_alive() {
     let me = ProcessId::current();
-    assert!(me.exists());
-    assert!(me.is_alive());
-    assert_eq!(Some(me), ProcessId::of(me.pid()));
+    assert_eq!(me.exists(), crate::identity::Existence::Present);
+    assert_eq!(me.is_alive(), crate::identity::Liveness::Alive);
+    assert_eq!(ProcessId::of(me.pid()), Resolved::Found(me));
     assert!(me.created_at().is_some());
 }
 
@@ -58,7 +58,7 @@ fn start_token_raw_is_stable_and_matches_reresolved() {
     // Stable across two calls on the same identity.
     assert_eq!(me.start_token_raw(), me.start_token_raw());
     // Equals the token of a freshly re-resolved identity for the same pid.
-    let again = ProcessId::of(me.pid()).expect("current pid resolves");
+    let again = ProcessId::of(me.pid()).found().expect("current pid resolves");
     assert_eq!(me.start_token_raw(), again.start_token_raw());
 }
 
@@ -70,6 +70,40 @@ fn imposter_token_neither_exists_nor_is_alive() {
         pid: me.pid(),
         start: StartToken::from_raw(me.start.raw().wrapping_add(1)),
     };
-    assert!(!imposter.exists(), "wrong token must not resolve to our process");
-    assert!(!imposter.is_alive(), "wrong token is not a running process");
+    assert_eq!(imposter.exists(), crate::identity::Existence::Gone, "wrong token must not resolve to our process");
+    assert_eq!(imposter.is_alive(), crate::identity::Liveness::Dead, "wrong token is not a running process");
+}
+
+#[cfg(windows)]
+#[test]
+fn an_access_denied_live_process_is_unknown_everywhere() {
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    assert!(child.is_running(), "precondition: the subject must be live");
+    // We cannot name it by pid at all...
+    assert_eq!(ProcessId::of(child.pid()), Resolved::Unknown);
+    // ...and every question about the identity we DO hold is Unknown.
+    assert_eq!(id.exists(), Existence::Unknown, "denied must not read as Gone");
+    assert_eq!(id.is_alive(), Liveness::Unknown, "denied must not read as Dead");
+    assert!(child.is_running(), "and it must still have been live throughout");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_process_denying_only_synchronize_exists_but_has_unknown_liveness() {
+    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    assert!(child.is_running(), "precondition: the subject must be live");
+    let Resolved::Found(id) = ProcessId::of(child.pid()) else {
+        panic!("QUERY_LIMITED is granted, so the identity must resolve");
+    };
+    assert_eq!(id.exists(), Existence::Present);
+    assert_eq!(
+        id.is_alive(),
+        Liveness::Unknown,
+        "is_alive must never claim Dead for a process whose exit it could not establish"
+    );
+    assert!(child.is_running());
 }

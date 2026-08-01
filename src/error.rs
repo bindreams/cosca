@@ -66,6 +66,10 @@ pub enum ElevationErrorKind {
 }
 
 /// The crate's top-level error type.
+///
+/// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
+/// wildcard arm rather than have each new variant break them.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("argument parsing failed: {0}")]
@@ -85,6 +89,19 @@ pub enum Error {
     /// Privilege elevation could not be completed at runtime.
     #[error("elevation failed ({kind}): {detail}")]
     Elevation { kind: ElevationErrorKind, detail: String },
+    /// The OS refused to establish whether the target process exists or is running, so the
+    /// operation was not performed. Distinct from a failure of the operation: nothing is
+    /// known to have gone wrong with the target — the caller was not allowed to look.
+    /// Typically an unprivileged caller querying a service, or a parent that cannot open
+    /// its own elevated child. Also covers the crate's own refusal to act on a target it
+    /// cannot address safely — a pid that names a process *group* rather than a single
+    /// process — where nothing was asked of the OS at all; those carry no `source`.
+    #[error("could not determine the target process's state: {detail}")]
+    Unassessable {
+        detail: String,
+        #[source]
+        source: Option<std::io::Error>,
+    },
 }
 
 #[cfg(test)]
