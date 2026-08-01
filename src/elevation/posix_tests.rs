@@ -767,9 +767,12 @@ mod rewrite_tests {
         // choice is what makes the difference, so assert the macOS message.
         let mut c = Command::new();
         c.args(["/usr/bin/id"]).contain().elevation_auth(Auth::Gui);
+        // `PosixRewrite` has no `Debug`, so the error is named rather than the whole
+        // Result — the same reason the sibling arms below spell `Ok(_)` out.
         match rewrite_with_host(&mut c, &macos_gui_host(false)) {
             Err(Error::Unsupported { platform, .. }) => assert_eq!(platform, "macos"),
-            other => panic!("expected a macos Unsupported, got {other:?}"),
+            Err(other) => panic!("expected a macos Unsupported, got {other}"),
+            Ok(_) => panic!("expected a macos Unsupported, got a successful rewrite"),
         }
     }
 
@@ -784,7 +787,8 @@ mod rewrite_tests {
             c.args(["/usr/bin/id"]).contain().elevation_auth(Auth::Gui);
             match rewrite_with_host(&mut c, &macos_gui_host(elevated)) {
                 Err(Error::Unsupported { platform, .. }) => assert_eq!(platform, "macos"),
-                other => panic!("expected a macos Unsupported (elevated={elevated}), got {other:?}"),
+                Err(other) => panic!("expected a macos Unsupported (elevated={elevated}), got {other}"),
+                Ok(_) => panic!("the verdict must not flip on ambient privilege (elevated={elevated})"),
             }
         }
     }
@@ -812,7 +816,8 @@ mod rewrite_tests {
                 assert!(detail.contains("Backend::Auto"), "{detail}");
                 assert!(!detail.contains("trampoline"), "{detail}");
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            Err(other) => panic!("expected Unsupported, got {other}"),
+            Ok(_) => panic!("Backend::Sudo + Auth::Gui must not resolve on macOS"),
         }
     }
 
@@ -831,7 +836,8 @@ mod rewrite_tests {
                 assert_eq!(kind, crate::error::ElevationErrorKind::BackendUnavailable);
                 assert!(detail.contains("osascript"), "{detail}");
             }
-            other => panic!("expected BackendUnavailable, got {other:?}"),
+            Err(other) => panic!("expected BackendUnavailable, got {other}"),
+            Ok(_) => panic!("a missing osascript must not resolve to a rewrite"),
         }
     }
 
