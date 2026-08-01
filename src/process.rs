@@ -46,7 +46,7 @@ impl Process {
         ProcessId::of(pid).map(|id| Process { id })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn from_parts_for_test(id: ProcessId) -> Process {
         Process { id }
     }
@@ -97,7 +97,10 @@ impl Process {
             Existence::Present => {}
             Existence::Gone => return None,
             Existence::Unknown => {
-                log::warn!("Process::parent: pid {} is unassessable — returning None", self.id.pid());
+                log::warn!(
+                    "Process::parent: pid {} is unassessable — returning None",
+                    self.id.pid()
+                );
                 return None;
             }
         }
@@ -143,7 +146,10 @@ impl Process {
             Existence::Present => {}
             Existence::Gone => return Vec::new(),
             Existence::Unknown => {
-                log::warn!("Process::children: pid {} is unassessable — returning none", self.id.pid());
+                log::warn!(
+                    "Process::children: pid {} is unassessable — returning none",
+                    self.id.pid()
+                );
                 return Vec::new();
             }
         }

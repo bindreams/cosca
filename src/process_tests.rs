@@ -65,7 +65,11 @@ fn parent_and_children_of_an_unassessable_anchor_are_empty() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    assert_eq!(id.exists(), crate::identity::Existence::Unknown, "precondition: unassessable");
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Unknown,
+        "precondition: unassessable"
+    );
     let p = Process::from_parts_for_test(id);
     assert!(p.parent().is_none());
     assert!(p.children(crate::Recursive::No).is_empty());

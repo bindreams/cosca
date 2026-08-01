@@ -12,7 +12,9 @@ use common::spawn_blocker;
 #[test]
 fn foreign_wait_returns_when_the_process_exits() {
     let (child, mut sock) = spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("foreign process resolves");
+    let p = cosca::Process::from_pid(child.id().pid())
+        .found()
+        .expect("foreign process resolves");
     sock.write_all(b"x").expect("trigger child exit");
     p.wait().expect("foreign wait");
     // Prove the exit via a real event (the dead child's socket EOFs), not is_alive().
@@ -84,19 +86,31 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // liveness check, distinct from the zombie-inclusive exists()). Death is proven by the
     // reap, never by sleep.
     let (child, _sock) = spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).found().expect("live foreign child resolves");
+    let p = cosca::Process::from_pid(child.id().pid())
+        .found()
+        .expect("live foreign child resolves");
     assert_eq!(p.id(), child.id());
-    assert_eq!(p.is_alive(), cosca::identity::Liveness::Alive, "a freshly spawned foreign child is alive");
+    assert_eq!(
+        p.is_alive(),
+        cosca::identity::Liveness::Alive,
+        "a freshly spawned foreign child is alive"
+    );
     child.kill().expect("kill");
     child.wait().expect("reap"); // synchronously confirm exit before the liveness assertion
-    assert_eq!(p.is_alive(), cosca::identity::Liveness::Dead, "a killed+reaped foreign process must report not-alive");
+    assert_eq!(
+        p.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "a killed+reaped foreign process must report not-alive"
+    );
 }
 
 #[test]
 fn parent_and_children_resolve_the_spawned_tree() {
     let (child, mut sock) = spawn_blocker();
     let me = cosca::Process::current();
-    let kid = cosca::Process::from_pid(child.id().pid()).found().expect("child resolves");
+    let kid = cosca::Process::from_pid(child.id().pid())
+        .found()
+        .expect("child resolves");
 
     assert_eq!(kid.parent().expect("child has a parent").id(), me.id());
     assert!(me.children(cosca::Recursive::No).iter().any(|p| p.id() == kid.id()));
@@ -127,7 +141,9 @@ fn children_recursive_distinguishes_direct_from_descendant() {
         socks.push(s);
     }
     let me = cosca::Process::current();
-    let kid = cosca::Process::from_pid(child.id().pid()).found().expect("child resolves");
+    let kid = cosca::Process::from_pid(child.id().pid())
+        .found()
+        .expect("child resolves");
     // The grandchild is kid's only direct child — use it to learn the grandchild's identity.
     let grandkids = kid.children(cosca::Recursive::No);
     assert_eq!(
@@ -236,7 +252,11 @@ fn is_alive_is_false_for_a_real_zombie() {
     sock.write_all(b"x").expect("trigger exit");
     p.wait().expect("death-watch"); // returns at the zombie instant (no reap yet)
 
-    assert_eq!(p.is_alive(), cosca::identity::Liveness::Dead, "an exited-but-unreaped child is a zombie => not alive");
+    assert_eq!(
+        p.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "an exited-but-unreaped child is a zombie => not alive"
+    );
     // exists() is zombie-inclusive on ALL Unixes: Linux `/proc` persists, and macOS
     // resolves zombies via `sysctl KERN_PROC` (identity.rs).
     assert!(

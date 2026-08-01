@@ -139,7 +139,10 @@ fn unassessable_reads_as_a_refusal_not_a_failure() {
         source: Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
     };
     let s = e.to_string();
-    assert!(s.contains("could not determine"), "must not read as a failure of the target: {s}");
+    assert!(
+        s.contains("could not determine"),
+        "must not read as a failure of the target: {s}"
+    );
     assert!(s.contains("pid 4 could not be opened"), "detail must survive: {s}");
     // The OS cause stays reachable rather than flattened into prose.
     assert!(std::error::Error::source(&e).is_some(), "source is preserved");

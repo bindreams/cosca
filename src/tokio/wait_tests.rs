@@ -239,7 +239,11 @@ async fn wait_exit_cancel_leaves_child_untouched() {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
         }
     } // <- future dropped here; on Windows the drop-guard releases the blocking watcher
-    assert_eq!(id.is_alive(), crate::identity::Liveness::Alive, "a cancelled watch must not affect the child");
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "a cancelled watch must not affect the child"
+    );
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
@@ -263,7 +267,11 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     } // <- drop signals the cancel event
     rx.recv()
         .expect("the blocking watcher must return after the drop released it");
-    assert_eq!(id.is_alive(), crate::identity::Liveness::Alive, "release must be signal-free");
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "release must be signal-free"
+    );
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }

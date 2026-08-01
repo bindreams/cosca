@@ -233,7 +233,11 @@ async fn async_drop_tears_down_a_contained_tree() {
     let root_id = child.id();
     drop(child);
     // The root is deterministically dead — reap_now blocked until its exit before Drop returned.
-    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "the contained root must be torn down by Drop");
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "the contained root must be torn down by Drop"
+    );
     // The grandchild's death is proven by its control-socket EOF: a survivor blocks the read (a CI failure).
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
@@ -273,7 +277,9 @@ async fn async_detach_leaves_the_tree_running() {
     drop(child); // detached → Drop must NOT kill
                  // Positive liveness (no race — we never signaled it): a buggy detach that let Drop kill the
                  // root would make this false.
-    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Alive,
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Alive,
         "detach must leave the root running after the handle drops"
     );
     // Release it and observe a CLEAN voluntary exit (Ok(0) EOF), distinct from a kill's reset.
@@ -299,7 +305,9 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false);
     let root_id = child.id();
     drop(child); // kill_on_drop(false) → Drop early-returns; teardown must NOT run
-    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Alive,
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Alive,
         "kill_on_drop(false) must leave the root running after the handle drops"
     );
     // Release it and observe a CLEAN voluntary exit (Ok(0) EOF), best-effort tearing the tree down.
@@ -679,7 +687,11 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     );
     let root_id = child.id();
     drop(child);
-    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "the contained root must be torn down by Drop");
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "the contained root must be torn down by Drop"
+    );
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {

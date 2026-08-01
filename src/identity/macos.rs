@@ -95,9 +95,9 @@ pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
     // and a kinfo layout drift fails safe to the pre-fix answer (token mismatch => false).
     match kinfo::kinfo(pid) {
         Resolved::Found(info) => {
-            if token_of_kinfo(&info) != start {
-                Liveness::Dead // reused PID
-            } else if info.kp_proc.p_stat as u32 == libc::SZOMB {
+            // A reused PID names a different process; SZOMB is exited-but-unreaped. Both
+            // are "not running", and neither is an unassessable read.
+            if token_of_kinfo(&info) != start || info.kp_proc.p_stat as u32 == libc::SZOMB {
                 Liveness::Dead
             } else {
                 Liveness::Alive

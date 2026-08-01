@@ -1,6 +1,6 @@
 //! Test-only: a REAL live child process whose process-object DACL denies us rights.
 #![allow(dead_code)] // consumed by later tasks' tests; without this the `-D warnings`
-                     // pre-commit hook rejects this module's own commit.
+// pre-commit hook rejects this module's own commit.
 //!
 //! A live process we may not `OpenProcess` is needed to reproduce an access-denied identity
 //! read. Depending on a system service will not do — an elevated CI runner can open those.
@@ -24,9 +24,9 @@ use std::mem::size_of;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
-    AddAccessAllowedAce, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+    AddAccessAllowedAce, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
+    TokenUser, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -85,7 +85,11 @@ impl RestrictedChild {
     pub(crate) fn await_exit(&self) {
         // SAFETY: `self.handle` is our live, owned process handle.
         let waited = unsafe { WaitForSingleObject(self.handle, INFINITE) };
-        assert_eq!(waited, WAIT_OBJECT_0, "fixture: wait on pid {} returned {waited:?}", self.pid);
+        assert_eq!(
+            waited, WAIT_OBJECT_0,
+            "fixture: wait on pid {} returned {waited:?}",
+            self.pid
+        );
     }
 
     /// The pid of this fixture's first child, once the shell has spawned it. Polls the
@@ -132,13 +136,19 @@ impl RestrictedChild {
             }
             // Do NOT fall through to the wait: nothing asked the child to exit, so the wait
             // would park forever.
-            return Err(format!("fixture teardown: TerminateProcess(pid {}) failed: {e}", self.pid));
+            return Err(format!(
+                "fixture teardown: TerminateProcess(pid {}) failed: {e}",
+                self.pid
+            ));
         }
         // SAFETY: `self.handle` is live and we just asked the child to exit, so this wait is
         // bounded by that exit.
         let waited = unsafe { WaitForSingleObject(self.handle, INFINITE) };
         if waited != WAIT_OBJECT_0 {
-            return Err(format!("fixture teardown: wait on pid {} returned {waited:?}", self.pid));
+            return Err(format!(
+                "fixture teardown: wait on pid {} returned {waited:?}",
+                self.pid
+            ));
         }
         Ok(())
     }
@@ -327,7 +337,10 @@ fn spawn_with_ace_cmdline(granted: u32, cmdline: &str) -> RestrictedChild {
     };
     // A child that died on startup would still keep its kernel object alive through our
     // handle, so every OpenProcess verdict would look right while testing nothing.
-    assert!(child.is_running(), "the fixture child exited immediately — the command line is wrong");
+    assert!(
+        child.is_running(),
+        "the fixture child exited immediately — the command line is wrong"
+    );
     child
 }
 

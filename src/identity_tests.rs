@@ -1,4 +1,6 @@
-use super::{Existence, Liveness, ProcessId, RawPid, Resolved, StartToken};
+#[cfg(windows)]
+use super::{Existence, Liveness};
+use super::{ProcessId, RawPid, Resolved, StartToken};
 use std::collections::HashSet;
 
 // Build a ProcessId directly from parts (this test module can access the
@@ -70,8 +72,16 @@ fn imposter_token_neither_exists_nor_is_alive() {
         pid: me.pid(),
         start: StartToken::from_raw(me.start.raw().wrapping_add(1)),
     };
-    assert_eq!(imposter.exists(), crate::identity::Existence::Gone, "wrong token must not resolve to our process");
-    assert_eq!(imposter.is_alive(), crate::identity::Liveness::Dead, "wrong token is not a running process");
+    assert_eq!(
+        imposter.exists(),
+        crate::identity::Existence::Gone,
+        "wrong token must not resolve to our process"
+    );
+    assert_eq!(
+        imposter.is_alive(),
+        crate::identity::Liveness::Dead,
+        "wrong token is not a running process"
+    );
 }
 
 #[cfg(windows)]

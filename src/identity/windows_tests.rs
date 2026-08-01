@@ -28,7 +28,11 @@ fn is_running_alive_for_self_dead_for_wrong_token() {
     };
     assert_eq!(is_running(pid, tok), Liveness::Alive, "we are obviously running");
     let wrong = StartToken::from_raw(tok.raw().wrapping_add(1));
-    assert_eq!(is_running(pid, wrong), Liveness::Dead, "a wrong token is a different process");
+    assert_eq!(
+        is_running(pid, wrong),
+        Liveness::Dead,
+        "a wrong token is a different process"
+    );
 }
 
 /// A LIVE process we may not open at all: ERROR_ACCESS_DENIED must NOT read as absence.
@@ -193,7 +197,10 @@ fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
-    assert!(child.is_running(), "precondition: the pid's occupant is live and unreadable");
+    assert!(
+        child.is_running(),
+        "precondition: the pid's occupant is live and unreadable"
+    );
     crate::wait::block_until_exit(stale, Some(std::time::Duration::ZERO))
         .expect_err("an unreadable occupant cannot prove the original identity exited");
 }

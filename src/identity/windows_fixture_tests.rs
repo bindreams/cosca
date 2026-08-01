@@ -39,7 +39,10 @@ fn query_limited_is_denied_when_not_granted() {
         Some(ERROR_ACCESS_DENIED.0),
         "the fixture must make QUERY_LIMITED genuinely unopenable"
     );
-    assert!(child.is_running(), "and it must still be live at the point of the claim");
+    assert!(
+        child.is_running(),
+        "and it must still be live at the point of the claim"
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use super::super::StartToken;
-use crate::identity::Liveness;
 use super::{parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat};
+use crate::identity::Liveness;
 
 fn tok(v: u64) -> StartToken {
     StartToken::from_raw(v)

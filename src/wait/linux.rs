@@ -79,7 +79,9 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 }
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, "no signal was sent")? else { return Ok(()) };
+    let Some(pidfd) = open_verified(id, "no signal was sent")? else {
+        return Ok(());
+    };
     match pidfd_send_signal(&pidfd, Signal::KILL) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
@@ -88,7 +90,9 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 }
 
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, "no signal was sent")? else { return Ok(()) };
+    let Some(pidfd) = open_verified(id, "no signal was sent")? else {
+        return Ok(());
+    };
     match pidfd_send_signal(&pidfd, Signal::TERM) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal

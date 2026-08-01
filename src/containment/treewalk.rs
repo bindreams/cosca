@@ -222,7 +222,10 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
     match ProcessId::of(id.pid()) {
         Resolved::Found(live) if live == id => {}
         Resolved::Found(_) | Resolved::Gone => {
-            log::debug!("treewalk: skipping pid {pid} - identity changed since the snapshot", pid = id.pid());
+            log::debug!(
+                "treewalk: skipping pid {pid} - identity changed since the snapshot",
+                pid = id.pid()
+            );
             return KillOutcome::AlreadyGone;
         }
         Resolved::Unknown => {
@@ -236,7 +239,10 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
     // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
     // the CALLER-S ENTIRE PROCESS GROUP. Use the same total guard the `sig 0` probe uses.
     let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
-        log::warn!("treewalk: pid {} is not a single-process signal target - not signaled", id.pid());
+        log::warn!(
+            "treewalk: pid {} is not a single-process signal target - not signaled",
+            id.pid()
+        );
         return KillOutcome::NotAttempted;
     };
     match kill(Pid::from_raw(target), signal) {
@@ -284,7 +290,10 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
             }
         }
         HandleIdentity::Different => {
-            log::debug!("treewalk: skipping pid {} - identity changed since the snapshot", id.pid());
+            log::debug!(
+                "treewalk: skipping pid {} - identity changed since the snapshot",
+                id.pid()
+            );
             KillOutcome::AlreadyGone
         }
         HandleIdentity::Unreadable(e) => {

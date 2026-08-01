@@ -131,9 +131,7 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                 // is ever reached, and the compile-time size assert cannot fire because the
                 // Rust definition is what stayed still. Keep it loud.
                 _ => {
-                    super::contract_violation(format_args!(
-                        "sysctl(KERN_PROC selector {selector}, {pid}) failed: {e}"
-                    ));
+                    super::contract_violation(format_args!("sysctl(KERN_PROC selector {selector}, {pid}) failed: {e}"));
                     Resolved::Unknown
                 }
             };

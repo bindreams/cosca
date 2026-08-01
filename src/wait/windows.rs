@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
-    INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::error::Error;
@@ -57,7 +57,10 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             return Ok(true); // recycled before open - the original is gone
         }
         HandleIdentity::Unreadable(e) => {
-            log::warn!("wait: pid {} opened but its identity could not be verified ({e})", id.pid());
+            log::warn!(
+                "wait: pid {} opened but its identity could not be verified ({e})",
+                id.pid()
+            );
             close(handle);
             return Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
@@ -156,7 +159,10 @@ pub(crate) fn block_until_exit_or_cancel(
             return Ok(true); // recycled before open - the original is gone
         }
         HandleIdentity::Unreadable(e) => {
-            log::warn!("wait: pid {} opened but its identity could not be verified ({e})", id.pid());
+            log::warn!(
+                "wait: pid {} opened but its identity could not be verified ({e})",
+                id.pid()
+            );
             close(handle);
             return Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
@@ -204,29 +210,28 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     // Open for terminate AND query, so the SAME held handle both pins the kernel object
     // (pid-reuse-safe) and lets us re-verify identity before terminating.
     // SAFETY: OpenProcess tolerates an invalid pid; the handle is closed on every path below.
-    let handle = match crate::identity::windows_open_classified(
-        id.pid(),
-        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-    ) {
-        Opened::Found(h) => h,
-        Opened::Gone => return Ok(()), // no such pid => already dead is success
-        // Live-or-unassessable => Err. An Unknown liveness must NOT be reported as a
-        // successful kill.
-        Opened::Denied(e) => {
-            return if id.is_alive() == Liveness::Dead {
-                Ok(())
-            } else {
-                log::warn!(
-                    "wait: pid {} could not be opened to terminate it ({e}) - reporting an error, not a kill",
-                    id.pid()
-                );
-                Err(Error::Unassessable {
-                    detail: format!("pid {} could not be opened to terminate it", id.pid()),
-                    source: Some(e.into()),
-                })
+    let handle =
+        match crate::identity::windows_open_classified(id.pid(), PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)
+        {
+            Opened::Found(h) => h,
+            Opened::Gone => return Ok(()), // no such pid => already dead is success
+            // Live-or-unassessable => Err. An Unknown liveness must NOT be reported as a
+            // successful kill.
+            Opened::Denied(e) => {
+                return if id.is_alive() == Liveness::Dead {
+                    Ok(())
+                } else {
+                    log::warn!(
+                        "wait: pid {} could not be opened to terminate it ({e}) - reporting an error, not a kill",
+                        id.pid()
+                    );
+                    Err(Error::Unassessable {
+                        detail: format!("pid {} could not be opened to terminate it", id.pid()),
+                        source: Some(e.into()),
+                    })
+                }
             }
-        }
-    };
+        };
     // Re-verify identity on the HELD handle: a pid recycled before the open pins the NEW
     // process, whose creation token will not match. An UNREADABLE token is not proof the
     // target is gone, so it must not report a successful kill.
@@ -237,7 +242,10 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
             return Ok(()); // pid recycled; the original is already gone
         }
         HandleIdentity::Unreadable(e) => {
-            log::warn!("wait: pid {} opened but its identity could not be verified ({e})", id.pid());
+            log::warn!(
+                "wait: pid {} opened but its identity could not be verified ({e})",
+                id.pid()
+            );
             close(handle);
             return Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),

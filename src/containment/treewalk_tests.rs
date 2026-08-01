@@ -265,7 +265,10 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         super::KillOutcome::AlreadyGone,
         "a stale identity names a process that is gone - nothing to terminate"
     );
-    assert!(child.is_running(), "a stale identity must never terminate the pid-s occupant");
+    assert!(
+        child.is_running(),
+        "a stale identity must never terminate the pid-s occupant"
+    );
 
     assert_eq!(
         super::kill_by_identity(real),

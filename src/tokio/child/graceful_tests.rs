@@ -34,7 +34,9 @@ async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
     // zombie-inclusive); Windows skips the assert — exists() stays true there while
     // `child` still holds the process handle.
     #[cfg(unix)]
-    assert_eq!(id.exists(), crate::identity::Existence::Gone,
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
         "root must be swept AND reaped despite the watch error (a zombie would still exist)"
     );
     #[cfg(windows)]
@@ -69,7 +71,9 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
         "seam not consumed — the watch did not run on this thread"
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-    assert_eq!(id.exists(), crate::identity::Existence::Gone,
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
         "child must be killed AND reaped despite the watch error (a zombie would still exist)"
     );
     let status = child
