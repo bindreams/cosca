@@ -153,11 +153,25 @@ fn is_elevated_matches_effective_uid_ground_truth() {
     assert_eq!(super::is_elevated(), euid0, "is_elevated disagreed with geteuid()==0");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn detect_reports_unix_os() {
     let h = super::plan::Host::detect();
     assert_eq!(h.os, super::plan::Os::Unix);
+}
+
+/// macOS must NOT report `Os::Unix`: the whole point of the split is that the
+/// planner can tell it apart, and detection is the only place that decision is made.
+#[cfg(target_os = "macos")]
+#[test]
+fn detect_reports_macos() {
+    let h = super::plan::Host::detect();
+    assert_eq!(h.os, super::plan::Os::MacOs);
+    assert!(
+        h.available.osascript.is_some(),
+        "a macOS host must resolve /usr/bin/osascript"
+    );
+    assert!(h.arg_max.is_some(), "kern.argmax must be readable on macOS");
 }
 
 #[test]
