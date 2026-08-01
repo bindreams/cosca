@@ -18,18 +18,27 @@ fn drain_reports_none_when_no_event_pending() {
     child.wait().expect("reap");
 }
 
-/// The guard that stops `kill(0, sig)` from SIGKILLing the caller-s own process group must be
-/// consulted by the real entry points, not merely exist as a pure function. `ProcessId::of(0)`
-/// resolves on macOS (`kernel_task`), so nothing upstream rules the value out.
+/// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never reach
+/// `kill(2)`. Two independent layers stop it, and this pins the outer one: the identity
+/// re-verify. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that no
+/// caller-held identity matches, so a pid-0 identity is rejected as recycled before the
+/// signal is ever formed — and the test process, which is what `kill(0, ..)` would have
+/// killed, survives to make the assertion.
+///
+/// The inner layer, `probe::signal_target`, is defence in depth for a caller holding
+/// `kernel_task`'s *genuine* identity. It is not exercised here on purpose: a regression in
+/// it would SIGKILL the CI runner's process group rather than fail a test. Its own contract
+/// is pinned by `identity::probe::probe_tests::signal_target_is_the_guard_for_real_signals`.
 #[test]
-fn kill_and_terminate_refuse_a_group_directed_target() {
+fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
-    assert!(matches!(
-        crate::wait::kill(bogus),
-        Err(crate::error::Error::Unassessable { .. })
-    ));
-    assert!(matches!(
-        crate::wait::terminate(bogus),
-        Err(crate::error::Error::Unassessable { .. })
-    ));
+    // Already-gone is success: the pid holds a process, but not the one named.
+    crate::wait::kill(bogus).expect("a pid-0 identity resolves to a stranger, i.e. already gone");
+    crate::wait::terminate(bogus).expect("same for the graceful signal");
+    // If either call had reached `kill(2)`, this process would have died with it.
+    assert_eq!(
+        crate::identity::ProcessId::current().is_alive(),
+        crate::identity::Liveness::Alive,
+        "the caller must have survived - nothing may signal process group 0"
+    );
 }
