@@ -6,8 +6,12 @@
 //! read. Depending on a system service will not do — an elevated CI runner can open those.
 //! So we create one: `CreateProcessW` accepts a `SECURITY_ATTRIBUTES` for the new process
 //! object, and a DACL holding a single access-allowed ACE for our own user SID denies every
-//! right that ACE omits — to us and to an elevated caller with the same SID, since
-//! `OpenProcess` never enables `SeDebugPrivilege` on our behalf.
+//! right that ACE omits — to us and to an elevated caller with the same SID.
+//!
+//! One privilege defeats that: a token holding `SeDebugPrivilege` **enabled** bypasses the
+//! DACL outright. An interactive session does not hold it enabled; CI runners do. So
+//! [`drop_se_debug_privilege`] strips it from this process once, up front, making the DACL
+//! authoritative everywhere.
 //!
 //! Teardown is safe: the handle `CreateProcessW` hands the creator carries full access
 //! regardless of the DACL, and the child is assigned to a kill-on-close job object so any
@@ -22,11 +26,13 @@
 use std::mem::size_of;
 
 use windows::core::PWSTR;
+use windows::Win32::Foundation::LUID;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
-    AddAccessAllowedAce, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
-    TokenUser, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY,
-    TOKEN_USER,
+    AddAccessAllowedAce, AdjustTokenPrivileges, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+    LookupPrivilegeValueW, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, LUID_AND_ATTRIBUTES,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DEBUG_NAME, SE_PRIVILEGE_REMOVED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -37,6 +43,53 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
 };
+
+/// Runs [`drop_se_debug_privilege`] exactly once per test binary. Mirrors the crate's
+/// existing one-time test-setup idiom (`log_capture::install`).
+static SE_DEBUG_DROPPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Remove `SeDebugPrivilege` from THIS process's token.
+///
+/// A token holding that privilege **enabled** bypasses a process object's DACL outright, so
+/// every denial this module constructs would be quietly openable and every access-denied
+/// test would report green while proving nothing. An interactive session does not hold it
+/// enabled, which is why the fixture works locally; GitHub's Windows runners do, which is
+/// why it does not work there.
+///
+/// Removing it makes the DACL authoritative on every runner, so this is a real fix rather
+/// than a skip: if the precondition still fails to hold, `spawn_unkillable_denies_everything`
+/// and its siblings fail loudly instead of passing vacuously.
+///
+/// `SE_PRIVILEGE_REMOVED` is irreversible for the token, so this runs ONCE, before the first
+/// fixture exists — not lazily inside whichever denial test happens to run first. Tests run
+/// in parallel, and a privilege that vanished partway through a run would make behaviour
+/// depend on test order even though nothing currently reads it.
+fn drop_se_debug_privilege() {
+    SE_DEBUG_DROPPED.get_or_init(|| {
+        let mut token = HANDLE::default();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
+            .expect("OpenProcessToken(TOKEN_ADJUST_PRIVILEGES)");
+        let mut luid = LUID::default();
+        // SAFETY: `SE_DEBUG_NAME` is a static NUL-terminated wide string.
+        unsafe { LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid) }
+            .expect("LookupPrivilegeValueW(SeDebugPrivilege)");
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_REMOVED,
+            }],
+        };
+        // Succeeds with ERROR_NOT_ALL_ASSIGNED when the token never held the privilege —
+        // the normal local case, and exactly the state we want either way.
+        // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches.
+        let adjusted = unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) };
+        // SAFETY: `token` is an owned handle we are done with.
+        unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
+        adjusted.expect("AdjustTokenPrivileges(SeDebugPrivilege, SE_PRIVILEGE_REMOVED)");
+    });
+}
 
 /// Sentinel for [`spawn_with_ace`]: build the DACL with no ACE at all.
 const NO_ACE: u32 = u32::MAX;
@@ -219,6 +272,10 @@ fn spawn_with_ace(granted: u32) -> RestrictedChild {
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
 /// pass vacuously.
 fn spawn_with_ace_cmdline(granted: u32, cmdline: &str) -> RestrictedChild {
+    // Before ANY fixture exists, so no denial assertion can observe a token that still
+    // bypasses DACLs. Idempotent and one-shot.
+    drop_se_debug_privilege();
+
     // Our own user SID, from our own token. `token` is a real handle — closed below.
     let mut token = HANDLE::default();
     // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close.
