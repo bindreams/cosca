@@ -76,7 +76,11 @@ fn foreign_wait_timeout_huge_duration_does_not_panic() {
 fn current_and_from_id_round_trip() {
     let me = cosca::Process::current();
     assert_eq!(me.is_alive(), cosca::identity::Liveness::Alive);
-    assert_eq!(cosca::Process::from_id(me.id()).found().map(|p| p.id()), Some(me.id()));
+    assert_eq!(cosca::Process::from_id(me.id()).id(), me.id());
+    assert_eq!(
+        cosca::Process::from_id(me.id()).exists(),
+        cosca::identity::Existence::Present
+    );
 }
 
 #[test]
@@ -259,8 +263,9 @@ fn is_alive_is_false_for_a_real_zombie() {
     );
     // exists() is zombie-inclusive on ALL Unixes: Linux `/proc` persists, and macOS
     // resolves zombies via `sysctl KERN_PROC` (identity.rs).
-    assert!(
-        matches!(cosca::Process::from_id(p.id()), cosca::identity::Resolved::Found(_)),
+    assert_eq!(
+        cosca::Process::from_id(p.id()).exists(),
+        cosca::identity::Existence::Present,
         "a zombie identity still resolves"
     );
     raw.wait().expect("reap the zombie");

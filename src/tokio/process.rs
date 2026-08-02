@@ -25,13 +25,15 @@ impl From<crate::process::Process> for Process {
 }
 
 impl Process {
-    /// Resolve a foreign process by a saved identity. `None` if that exact identity is
-    /// gone or the pid was recycled.
-    pub fn from_id(id: ProcessId) -> crate::identity::Resolved<Process> {
-        crate::process::Process::from_id(id).map(Process::from)
+    /// A handle to the process with this identity. Infallible — see
+    /// [`Process::from_id`](crate::Process::from_id) for why construction does not check
+    /// that the process is still there.
+    pub fn from_id(id: ProcessId) -> Process {
+        Process::from(crate::process::Process::from_id(id))
     }
 
-    /// Resolve the process currently holding `pid`. `None` if no live process has it.
+    /// Resolve the process currently holding `pid`. Fallible, unlike
+    /// [`from_id`](Self::from_id): a bare pid has to be resolved into an identity first.
     pub fn from_pid(pid: RawPid) -> crate::identity::Resolved<Process> {
         crate::process::Process::from_pid(pid).map(Process::from)
     }
@@ -44,6 +46,12 @@ impl Process {
     /// The stable identity (`(pid, start_token)`).
     pub fn id(&self) -> ProcessId {
         self.inner.id()
+    }
+
+    /// Whether this exact identity still resolves (zombie-inclusive; see
+    /// [`ProcessId::exists`]).
+    pub fn exists(&self) -> crate::identity::Existence {
+        self.inner.exists()
     }
 
     /// Whether the process is still running (zombie-exclusive; see [`ProcessId::is_alive`]).
@@ -108,3 +116,7 @@ impl Process {
         self.inner.terminate_tree()
     }
 }
+
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod process_tests;

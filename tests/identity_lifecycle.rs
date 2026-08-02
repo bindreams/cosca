@@ -13,7 +13,7 @@ use cosca::identity::ProcessId;
 // would be unused imports with the feature off. The body above reaches `Liveness` through
 // fully-qualified paths, which does not count as a use of an import.
 #[cfg(feature = "serde")]
-use cosca::identity::{Liveness, ProcessIdRecord, Resolved};
+use cosca::identity::{Existence, Liveness, ProcessIdRecord};
 #[cfg(feature = "serde")]
 use std::io::BufRead;
 
@@ -231,7 +231,11 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let live = ProcessId::of(child.id()).found().expect("the live child resolves");
     assert_eq!(restored, live, "the restored identity must be the child's identity");
     assert_eq!(restored.pid(), child.id());
-    assert!(matches!(Process::from_id(restored), Resolved::Found(_)));
+    // The restored identity is usable as a handle, and querying through that handle finds
+    // the live child — the whole point of persisting it.
+    let restored_handle = Process::from_id(restored);
+    assert_eq!(restored_handle.exists(), Existence::Present);
+    assert_eq!(restored_handle.is_alive(), Liveness::Alive);
 
     // End it, and the same restored identity now reports the process is not running.
     // `is_alive`, not `exists`: `child` still holds the handle, which on Windows keeps the

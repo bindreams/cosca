@@ -64,7 +64,8 @@ async fn async_foreign_introspection_delegates() {
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert_eq!(p.id(), child.id());
     assert_eq!(p.is_alive(), cosca::identity::Liveness::Alive);
-    assert_eq!(Process::from_id(p.id()).found().expect("round-trip").id(), p.id());
+    assert_eq!(Process::from_id(p.id()).id(), p.id());
+    assert_eq!(Process::from_id(p.id()).exists(), cosca::identity::Existence::Present);
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
