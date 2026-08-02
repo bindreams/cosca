@@ -164,12 +164,10 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         }
     };
     let id = match resolve_identity(pid) {
-        Some(id) => id,
-        None => {
+        crate::identity::Resolved::Found(id) => id,
+        other => {
             raw_spawn_teardown(proc, pid);
-            return Err(Error::Io(std::io::Error::other(
-                "spawned child vanished before its identity could be read",
-            )));
+            return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
 
@@ -236,9 +234,17 @@ pub(crate) fn spawn_step(
 /// raw backend shares the identical error-teardown.
 pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
     let rc = RawChild::new(proc, pid);
-    let _ = rc.kill();
-    if let Err(_e) = rc.wait() {
-        debug_assert!(false, "raw spawn teardown failed to reap child: {_e}");
+    // Windows only, so the std path-s invariant does NOT carry: there is no zombie to reap
+    // and `rc.wait()` is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed,
+    // nothing asked the child to exit and that wait would park forever - a logged, leaked
+    // child is strictly better.
+    if let Err(e) = rc.kill() {
+        log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
+        return;
+    }
+    if let Err(e) = rc.wait() {
+        log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
+        debug_assert!(false, "raw spawn teardown failed to reap child: {e}");
     }
 }
 

@@ -195,7 +195,7 @@ fn process_terminate_sends_sigterm() {
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
     let (child, mut sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
     let mut buf = [0u8; 1];
     let _ = sock.read(&mut buf); // dead — EOF
@@ -210,7 +210,7 @@ fn process_graceful_shutdown_graceful_path() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     let (child, mut sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::from_secs(30)).expect("foreign graceful");
     let mut buf = [0u8; 1];
     let _ = sock.read(&mut buf);
@@ -227,7 +227,7 @@ fn process_graceful_shutdown_escalates() {
     // SIGTERM is ignored → SIGKILL is the only terminating signal the child can receive, so the
     // reaped status is unambiguously SIGKILL.
     let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::ZERO).expect("foreign escalates");
     let mut buf = [0u8; 1];
     let _ = sock.read(&mut buf);
@@ -240,7 +240,7 @@ fn process_graceful_shutdown_escalates() {
 fn process_lone_graceful_unsupported_on_windows() {
     use std::time::Duration;
     let (child, _sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)),
@@ -256,7 +256,7 @@ fn process_kill_tree_tears_down_tree() {
     // An UNcontained 2-level tree (root R + grandchild G). Take the root foreign and kill_tree
     // it: the identity-walk (snapshot-then-kill) reaches both. Both sockets EOF. All OSes.
     let (child, mut socks) = common::spawn_grandchild(false);
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
     for (i, s) in socks.iter_mut().enumerate() {
         let mut buf = [0u8; 1];
@@ -275,7 +275,7 @@ fn process_graceful_shutdown_tree_tears_down_tree() {
     use std::io::Read;
     use std::time::Duration;
     let (child, mut socks) = common::spawn_grandchild(false);
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown_tree(Duration::from_secs(30))
         .expect("foreign tree graceful");
     for (i, s) in socks.iter_mut().enumerate() {
@@ -294,7 +294,7 @@ fn process_graceful_shutdown_tree_tears_down_tree() {
 fn process_soft_tree_unsupported_on_windows() {
     use std::time::Duration;
     let (child, _sock) = common::spawn_blocker();
-    let p = cosca::Process::from_pid(child.id().pid()).expect("resolves");
+    let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(
         p.terminate_tree(),
         Err(cosca::error::Error::Unsupported { .. })

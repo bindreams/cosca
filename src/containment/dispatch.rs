@@ -142,9 +142,16 @@ pub(crate) fn is_nested(marker_present: bool) -> bool {
 /// un-reaped, and on Windows still suspended, hence resolvable).
 #[cfg(any(unix, windows))]
 fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, Error> {
-    crate::identity::ProcessId::of(pid).ok_or_else(|| Error::Containment {
-        detail: "tree-walk root vanished before its identity could be read".into(),
-    })
+    match crate::identity::ProcessId::of(pid) {
+        crate::identity::Resolved::Found(id) => Ok(id),
+        crate::identity::Resolved::Gone => Err(Error::Containment {
+            detail: "tree-walk root vanished before its identity could be read".into(),
+        }),
+        crate::identity::Resolved::Unknown => Err(Error::Unassessable {
+            detail: format!("tree-walk root pid {pid} identity could not be read"),
+            source: None,
+        }),
+    }
 }
 
 /// Which Unix setup action to apply to a root `Command` for a given mode.

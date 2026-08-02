@@ -187,3 +187,25 @@ async fn async_kill_tree_backstop_is_load_bearing() {
         "the handle backstop must be what killed the root, got {status:?}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    assert!(child.is_running(), "precondition: the subject must be live");
+
+    let Err(crate::error::Error::Unassessable { detail, .. }) = super::resolve_root_id(child.pid()) else {
+        panic!("a pid we may not query must not resolve to a root identity");
+    };
+    assert!(
+        detail.contains("identity could not be read"),
+        "denial must not read as vanishing: {detail}"
+    );
+
+    // Contrast: a pid no process holds.
+    let Err(crate::error::Error::Containment { detail }) = super::resolve_root_id(0xFFFF_FFF0) else {
+        panic!("a nonexistent pid must not resolve");
+    };
+    assert!(detail.contains("vanished"), "absence must not read as denial: {detail}");
+}

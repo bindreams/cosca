@@ -213,3 +213,69 @@ fn children_of_duplicate_edge_yields_pid_once() {
         "duplicate edge collapses to a single child"
     );
 }
+
+/// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
+/// from the walk AND leave a warn behind, never be silently folded in with a gone pid.
+#[cfg(windows)]
+#[test]
+fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    crate::log_capture::install();
+    let denied = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
+    assert!(denied.is_running(), "precondition: the subject must be live");
+    let mark = crate::log_capture::mark();
+    assert!(
+        super::resolve_or_drop(denied.pid()).is_none(),
+        "the walk cannot keep what it cannot verify"
+    );
+    assert!(crate::log_capture::contains_since(
+        mark,
+        &format!("treewalk: pid {} could not be queried", denied.pid())
+    ));
+    assert!(denied.is_running(), "and dropping it must not have touched it");
+}
+
+/// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.
+#[cfg(windows)]
+#[test]
+fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
+    let child = crate::identity::windows_fixture::spawn_unkillable();
+    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    assert!(child.is_running(), "precondition: the subject must be live");
+    assert_eq!(super::kill_by_identity(id), super::KillOutcome::NotAttempted);
+    assert!(child.is_running(), "a denied open must leave the process running");
+}
+
+/// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale
+/// identity names a recycled pid, and killing it would kill a stranger.
+#[cfg(windows)]
+#[test]
+fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
+    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    // The ACE must grant QUERY_LIMITED as well as TERMINATE: kill_by_identity opens for
+    // both, and a combined-mask OpenProcess fails entirely if ANY requested bit is ungranted.
+    let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+        .expect("the owned handle always yields an identity");
+    let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+
+    assert_eq!(
+        super::kill_by_identity(stale),
+        super::KillOutcome::AlreadyGone,
+        "a stale identity names a process that is gone - nothing to terminate"
+    );
+    assert!(
+        child.is_running(),
+        "a stale identity must never terminate the pid-s occupant"
+    );
+
+    assert_eq!(
+        super::kill_by_identity(real),
+        super::KillOutcome::Terminated,
+        "a matching identity must reach TerminateProcess - otherwise the wait below is unbounded"
+    );
+    // Bounded by the exit kill_by_identity just reported it requested.
+    child.await_exit();
+    assert!(!child.is_running(), "a matching identity must terminate the process");
+}

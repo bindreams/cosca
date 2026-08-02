@@ -22,7 +22,7 @@ fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
 #[tokio::test]
 async fn async_foreign_wait_resolves_on_exit() {
     let (child, mut sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     let watch = ::tokio::spawn(async move { p.wait().await });
     child.kill().expect("kill");
     expect_eof("blocker", &mut sock);
@@ -36,7 +36,7 @@ async fn async_foreign_wait_resolves_on_exit() {
 #[tokio::test]
 async fn async_foreign_wait_timeout_zero_is_deterministic() {
     let (child, _sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(
         !p.wait_timeout(std::time::Duration::ZERO).await.expect("poll"),
         "live child at ZERO"
@@ -48,7 +48,7 @@ async fn async_foreign_wait_timeout_zero_is_deterministic() {
 #[tokio::test]
 async fn async_foreign_wait_timeout_observes_an_exit() {
     let (child, mut sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     child.kill().expect("kill");
     expect_eof("blocker", &mut sock); // real exit event precedes the wait
     assert!(
@@ -61,10 +61,10 @@ async fn async_foreign_wait_timeout_observes_an_exit() {
 #[tokio::test]
 async fn async_foreign_introspection_delegates() {
     let (child, _sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert_eq!(p.id(), child.id());
-    assert!(p.is_alive());
-    assert_eq!(Process::from_id(p.id()).expect("round-trip").id(), p.id());
+    assert_eq!(p.is_alive(), cosca::identity::Liveness::Alive);
+    assert_eq!(Process::from_id(p.id()).found().expect("round-trip").id(), p.id());
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
@@ -72,7 +72,7 @@ async fn async_foreign_introspection_delegates() {
 #[tokio::test]
 async fn async_foreign_kill_terminates_the_process() {
     let (child, mut sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill().expect("foreign kill");
     expect_eof("blocker", &mut sock);
     let status = child.wait().expect("reap");
@@ -84,7 +84,7 @@ async fn async_foreign_kill_terminates_the_process() {
 async fn async_foreign_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (child, mut sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.terminate().expect("foreign terminate");
     expect_eof("blocker", &mut sock);
     let status = child.wait().expect("reap");
@@ -97,7 +97,7 @@ async fn async_foreign_graceful_shutdown_graceful_path() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
     let (child, mut sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::from_secs(30))
         .await
         .expect("foreign graceful");
@@ -114,7 +114,7 @@ async fn async_foreign_graceful_shutdown_escalates() {
     // SIG_IGN child + ZERO grace: provably alive at the single poll => deterministic
     // escalation; SIGKILL is the only terminating signal it can receive.
     let (child, mut sock) = common::spawn_control("control-block-ignore-term", &["R"], false);
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown(Duration::ZERO).await.expect("foreign escalates");
     expect_eof("blocker", &mut sock);
     let status = child.wait().expect("reap");
@@ -124,7 +124,7 @@ async fn async_foreign_graceful_shutdown_escalates() {
 #[tokio::test]
 async fn async_foreign_kill_tree_tears_down_tree() {
     let (child, mut socks) = common::spawn_grandchild(false);
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.kill_tree().expect("kill_tree");
     for (i, s) in socks.iter_mut().enumerate() {
         let mut buf = [0u8; 1];
@@ -142,7 +142,7 @@ async fn async_foreign_kill_tree_tears_down_tree() {
 async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
     use std::time::Duration;
     let (child, mut socks) = common::spawn_grandchild(false);
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     p.graceful_shutdown_tree(Duration::from_secs(30))
         .await
         .expect("foreign tree graceful");
@@ -162,7 +162,7 @@ async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
 async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
     use std::time::Duration;
     let (child, _sock) = common::spawn_blocker();
-    let p = Process::from_pid(child.id().pid()).expect("resolves");
+    let p = Process::from_pid(child.id().pid()).found().expect("resolves");
     assert!(matches!(p.terminate(), Err(cosca::error::Error::Unsupported { .. })));
     assert!(matches!(
         p.graceful_shutdown(Duration::from_secs(1)).await,

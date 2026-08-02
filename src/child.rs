@@ -94,9 +94,11 @@ impl Child {
         self.id
     }
 
-    /// Whether the child is still running — re-checked via its stable identity,
-    /// so a recycled pid never reads as alive.
-    pub fn is_alive(&self) -> bool {
+    /// Whether the child is still running — re-checked via its stable identity, so a
+    /// recycled pid never reads as alive. [`crate::identity::Liveness::Unknown`] when the OS
+    /// refuses the query: an unelevated parent cannot open a UAC-elevated child by pid, and
+    /// the honest answer there is not "dead".
+    pub fn is_alive(&self) -> crate::identity::Liveness {
         self.id.is_alive()
     }
 

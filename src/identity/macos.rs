@@ -8,7 +8,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::{RawPid, StartToken};
+use super::{Liveness, RawPid, Resolved, StartToken};
 
 #[path = "macos/kinfo.rs"]
 mod kinfo;
@@ -63,33 +63,49 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
     StartToken::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
 }
 
-pub(super) fn start_token(pid: RawPid) -> Option<StartToken> {
+pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
     if let Some(info) = bsd_info(pid) {
-        return Some(token_of_bsd(&info));
+        return Resolved::Found(token_of_bsd(&info));
     }
-    // libproc-invisible: gone or a ZOMBIE — only sysctl resolves the latter.
-    kinfo::kinfo(pid).as_ref().map(token_of_kinfo)
+    // libproc-invisible: gone, a ZOMBIE, or EPERM-hidden - only sysctl resolves the latter
+    // two, and it distinguishes an empty reply (gone) from a failure (unknown).
+    kinfo::kinfo(pid).map(|info| token_of_kinfo(&info))
 }
 
-pub(super) fn is_running(pid: RawPid, start: StartToken) -> bool {
+/// `proc_pidinfo` on self is always permitted, so the by-pid path cannot be denied here.
+pub(super) fn current_token() -> Resolved<StartToken> {
+    start_token(std::process::id())
+}
+
+pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
     if let Some(info) = bsd_info(pid) {
         if token_of_bsd(&info) != start {
-            return false; // reused PID
+            return Liveness::Dead; // reused PID
         }
         // SZOMB == zombie (exited, unreaped). Anything else is a live process.
-        return info.pbi_status != libc::SZOMB;
+        return if info.pbi_status == libc::SZOMB {
+            Liveness::Dead
+        } else {
+            Liveness::Alive
+        };
     }
     // libproc-invisible: gone, a ZOMBIE, or an EPERM-hidden LIVE process (an unprivileged
     // cross-user query — pid 1 on darwin CI proved a miss is NOT always gone-or-zombie).
     // The fallback keeps the same shape — token-guarded, zombie-EXCLUSIVE via `p_stat` —
     // and a kinfo layout drift fails safe to the pre-fix answer (token mismatch => false).
-    let Some(info) = kinfo::kinfo(pid) else {
-        return false; // gone => not running
-    };
-    if token_of_kinfo(&info) != start {
-        return false; // reused PID
+    match kinfo::kinfo(pid) {
+        Resolved::Found(info) => {
+            // A reused PID names a different process; SZOMB is exited-but-unreaped. Both
+            // are "not running", and neither is an unassessable read.
+            if token_of_kinfo(&info) != start || info.kp_proc.p_stat as u32 == libc::SZOMB {
+                Liveness::Dead
+            } else {
+                Liveness::Alive
+            }
+        }
+        Resolved::Gone => Liveness::Dead,
+        Resolved::Unknown => Liveness::Unknown,
     }
-    info.kp_proc.p_stat as u32 != libc::SZOMB
 }
 
 pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {

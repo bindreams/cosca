@@ -43,9 +43,17 @@ fn child_is_alive_while_running_then_not_after_exit() {
     let mut child = spawn_blocking_child();
     let pid = child.id();
 
-    let id = ProcessId::of(pid).expect("a running child has an identity");
-    assert!(id.is_alive(), "child must be alive (running) right after spawn");
-    assert!(id.exists(), "child must be resolvable right after spawn");
+    let id = ProcessId::of(pid).found().expect("a running child has an identity");
+    assert_eq!(
+        id.is_alive(),
+        cosca::identity::Liveness::Alive,
+        "child must be alive (running) right after spawn"
+    );
+    assert_eq!(
+        id.exists(),
+        cosca::identity::Existence::Present,
+        "child must be resolvable right after spawn"
+    );
     assert_ne!(id, ProcessId::current(), "child identity differs from ours");
 
     // End the child deterministically: close its stdin (EOF) and reap it.
@@ -57,7 +65,11 @@ fn child_is_alive_while_running_then_not_after_exit() {
     // synchronously — no teardown-window wait. (exists() may still be true here
     // on Windows during teardown; that is exists()'s documented behavior, so we
     // do not assert on it.)
-    assert!(!id.is_alive(), "child must read not-running immediately after it exits");
+    assert_eq!(
+        id.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "child must read not-running immediately after it exits"
+    );
 
     drop(child);
 }
@@ -88,8 +100,14 @@ fn identity_resolves_an_exited_unreaped_child() {
         .expect("piped stdout")
         .read_to_end(&mut buf)
         .expect("EOF");
-    let id = ProcessId::of(child.id()).expect("an unreaped exit must resolve by pid");
-    assert!(id.exists(), "an unreaped exit must remain visible to exists()");
+    let id = ProcessId::of(child.id())
+        .found()
+        .expect("an unreaped exit must resolve by pid");
+    assert_eq!(
+        id.exists(),
+        cosca::identity::Existence::Present,
+        "an unreaped exit must remain visible to exists()"
+    );
     child.wait().expect("reap");
 }
 
@@ -101,9 +119,9 @@ fn identity_resolves_an_exited_unreaped_child() {
 fn identity_survives_the_alive_to_zombie_transition() {
     // _sock must stay alive: dropping our socket end would unblock the child early.
     let (child, _sock) = common::spawn_blocker();
-    let id = ProcessId::of(child.id().pid()).expect("live child resolves");
-    assert!(id.exists(), "live child exists");
-    assert!(id.is_alive(), "live child is alive");
+    let id = ProcessId::of(child.id().pid()).found().expect("live child resolves");
+    assert_eq!(id.exists(), cosca::identity::Existence::Present, "live child exists");
+    assert_eq!(id.is_alive(), cosca::identity::Liveness::Alive, "live child is alive");
     child.kill().expect("kill");
     // WNOWAIT: leaves the zombie unreaped.
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -117,8 +135,16 @@ fn identity_survives_the_alive_to_zombie_transition() {
         )
     };
     assert_eq!(rc, 0, "waitid(WNOWAIT): {}", std::io::Error::last_os_error());
-    assert!(id.exists(), "the pre-exit token must still match the unreaped zombie");
-    assert!(!id.is_alive(), "a zombie is not alive");
+    assert_eq!(
+        id.exists(),
+        cosca::identity::Existence::Present,
+        "the pre-exit token must still match the unreaped zombie"
+    );
+    assert_eq!(id.is_alive(), cosca::identity::Liveness::Dead, "a zombie is not alive");
     child.wait().expect("reap");
-    assert!(!id.exists(), "a reaped process is gone");
+    assert_eq!(
+        id.exists(),
+        cosca::identity::Existence::Gone,
+        "a reaped process is gone"
+    );
 }

@@ -378,12 +378,10 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         }
     };
     let id = match resolve_identity(pid) {
-        Some(id) => id,
-        None => {
+        crate::identity::Resolved::Found(id) => id,
+        other => {
             sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(Error::Io(std::io::Error::other(
-                "spawned async child vanished before its identity could be read",
-            )));
+            return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
 

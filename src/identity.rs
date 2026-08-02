@@ -12,12 +12,21 @@
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity.
 
+pub(crate) mod probe;
 pub(crate) mod stat_parse;
+
+#[path = "identity/state.rs"]
+mod state;
+pub use state::{Existence, Liveness, Resolved};
 
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "identity/macos.rs")]
 mod backend;
+
+#[cfg(all(windows, test))]
+#[path = "identity/windows_fixture.rs"]
+pub(crate) mod windows_fixture;
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 compile_error!("cosca::identity is implemented only for Windows, Linux, and macOS");
@@ -63,11 +72,11 @@ impl ProcessId {
         self.start.raw()
     }
 
-    /// Resolve the live identity of `pid`, or `None` if no such process is
-    /// currently resolvable.
-    pub fn of(pid: RawPid) -> Option<ProcessId> {
-        let start = backend::start_token(pid)?;
-        Some(ProcessId { pid, start })
+    /// Resolve the live identity of `pid`. [`Resolved::Gone`] means the OS reports no such
+    /// process; [`Resolved::Unknown`] means it refused the question (typically an
+    /// unprivileged caller querying a service) — the process may well be running.
+    pub fn of(pid: RawPid) -> Resolved<ProcessId> {
+        backend::start_token(pid).map(|start| ProcessId { pid, start })
     }
 
     /// Test-only constructor from raw parts, so sibling modules can build
@@ -80,26 +89,47 @@ impl ProcessId {
         }
     }
 
-    /// This process's own identity.
+    /// This process's own identity. Windows reads the current-process pseudo-handle, which
+    /// performs no access check at all; Unix reads the caller's own entry by pid, which no
+    /// `hidepid` mount or sandbox policy hides from the task itself. Either way it is
+    /// resolvable even for a process whose own DACL would deny a foreign by-pid open.
+    ///
+    /// # Panics
+    /// If the process cannot read its own start token: on Linux, if `/proc` is not mounted
+    /// or its own `stat` record has no parseable `starttime` (both hard requirements of that
+    /// backend); on Windows and macOS, if a self-directed `GetProcessTimes` / `proc_pidinfo`
+    /// fails, which has no documented cause. Infallible by design — every caller, including
+    /// `Process::current()`, relies on it.
     pub fn current() -> ProcessId {
-        let pid = std::process::id();
-        ProcessId::of(pid).expect("the current process always has a resolvable identity")
+        let start = backend::current_token()
+            .found()
+            .expect("a process must be able to read its own start token (Linux: /proc must be mounted)");
+        ProcessId {
+            pid: std::process::id(),
+            start,
+        }
     }
 
     /// Whether a process with this exact identity is still *resolvable* (the
-    /// zombie-inclusive sense, matching psutil's `is_running`). True for a not-yet-reaped
-    /// zombie on every platform: Linux (`/proc` persists), macOS (`sysctl KERN_PROC`
-    /// resolves zombies), and Windows (during the post-exit handle window). For
-    /// "is it still running?", use [`ProcessId::is_alive`].
-    pub fn exists(&self) -> bool {
-        backend::start_token(self.pid) == Some(self.start)
+    /// zombie-inclusive sense, matching psutil's `is_running`). [`Existence::Present`] for a
+    /// not-yet-reaped zombie on every platform: Linux (`/proc` persists), macOS (`sysctl
+    /// KERN_PROC` resolves zombies), and Windows (during the post-exit handle window).
+    /// [`Existence::Unknown`] when the OS refuses the query — never `Gone`. For "is it still
+    /// running?", use [`ProcessId::is_alive`].
+    pub fn exists(&self) -> Existence {
+        match backend::start_token(self.pid) {
+            Resolved::Found(t) if t == self.start => Existence::Present,
+            Resolved::Found(_) | Resolved::Gone => Existence::Gone,
+            Resolved::Unknown => Existence::Unknown,
+        }
     }
 
-    /// Whether the process is currently *running* (has not exited). Authoritative
-    /// and synchronously correct the instant the process exits — on Windows via
-    /// the handle's signaled state, on Unix via process state / `/proc`
-    /// presence. A reused PID (different start token) is never alive.
-    pub fn is_alive(&self) -> bool {
+    /// Whether the process is currently *running* (has not exited). Authoritative and
+    /// synchronously correct the instant the process exits — on Windows via the handle's
+    /// signaled state, on Unix via process state / `/proc` presence. A reused PID (different
+    /// start token) is never alive. [`Liveness::Unknown`] when the OS refuses the query, or
+    /// answers ambiguously — never `Dead` on a process we could not assess.
+    pub fn is_alive(&self) -> Liveness {
         backend::is_running(self.pid, self.start)
     }
 
@@ -110,13 +140,31 @@ impl ProcessId {
     }
 }
 
-/// Re-verify identity on an ALREADY-OPEN Windows handle: does its creation token
-/// match `id`'s? The held handle pins the kernel object, so this is pid-reuse-safe
-/// (unlike re-resolving by raw pid). Reuses the backend FILETIME read — no duplicate
-/// packing.
 #[cfg(windows)]
-pub(crate) fn windows_handle_is(handle: windows::Win32::Foundation::HANDLE, id: ProcessId) -> bool {
-    backend::creation_token(handle) == Some(id.start)
+pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
+
+/// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
+/// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum HandleIdentity {
+    /// The handle's creation token matches — it IS this process.
+    Same,
+    /// The token differs — the pid was recycled; the original is gone.
+    Different,
+    /// `GetProcessTimes` failed, so nothing was established. Never treat as "gone". Carries
+    /// the failure for the same reason `Opened::Denied` does: by the time a caller wants to
+    /// report it, `GetLastError` has been overwritten.
+    Unreadable(windows::core::Error),
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_handle_identity(handle: windows::Win32::Foundation::HANDLE, id: ProcessId) -> HandleIdentity {
+    match backend::creation_token_result(handle) {
+        Ok(t) if t == id.start => HandleIdentity::Same,
+        Ok(_) => HandleIdentity::Different,
+        Err(e) => HandleIdentity::Unreadable(e),
+    }
 }
 
 /// Build a `ProcessId` from an already-open Windows handle + its pid, reusing the

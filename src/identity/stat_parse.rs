@@ -29,17 +29,21 @@ pub(crate) fn parse_ppid(stat: &[u8]) -> Option<u32> {
     tail(stat)?.split_whitespace().nth(1)?.parse::<u32>().ok()
 }
 
-/// Decide whether a process is *running* from its raw `/proc/<pid>/stat` bytes:
-/// the starttime token must match `start` (reject a reused PID) AND the state
-/// must not be zombie ('Z') or dead ('X'/'x'). Pure, so it is host-testable.
-pub(super) fn running_from_stat(stat: &[u8], start: super::StartToken) -> bool {
+/// Decide whether a process is *running* from its raw `/proc/<pid>/stat` bytes: the
+/// starttime token must match `start` (reject a reused PID) AND the state must not be zombie
+/// ('Z') or dead ('X'/'x'). An unparseable record is `Unknown` — we read the file, so the
+/// process is there; we just could not read its state. Pure, so it is host-testable.
+pub(super) fn running_from_stat(stat: &[u8], start: super::StartToken) -> super::Liveness {
+    use super::Liveness;
     match parse_starttime_jiffies(stat) {
         Some(j) if super::StartToken::from_raw(j) == start => {}
-        _ => return false,
+        Some(_) => return Liveness::Dead, // reused PID
+        None => return Liveness::Unknown, // unparseable — not evidence of death
     }
     match parse_state(stat) {
-        Some(s) => !matches!(s, b'Z' | b'X' | b'x'),
-        None => false,
+        Some(b'Z' | b'X' | b'x') => Liveness::Dead,
+        Some(_) => Liveness::Alive,
+        None => Liveness::Unknown,
     }
 }
 

@@ -37,7 +37,7 @@ fn spawn_term_ignoring_sleeper() -> std::process::Child {
 #[test]
 fn foreign_graceful_lone_watch_error_still_escalates() {
     let mut child = spawn_term_ignoring_sleeper();
-    let p = crate::Process::from_pid(child.id()).expect("resolves");
+    let p = crate::Process::from_pid(child.id()).found().expect("resolves");
     fault::set_force_watch_error(true);
     let err = p
         .graceful_shutdown(Duration::from_secs(30))
@@ -63,7 +63,7 @@ fn foreign_graceful_lone_watch_error_still_escalates() {
 #[test]
 fn foreign_graceful_tree_watch_error_still_sweeps() {
     let mut child = spawn_term_ignoring_sleeper();
-    let p = crate::Process::from_pid(child.id()).expect("resolves");
+    let p = crate::Process::from_pid(child.id()).found().expect("resolves");
     fault::set_force_watch_error(true);
     let err = p
         .graceful_shutdown_tree(Duration::from_secs(30))

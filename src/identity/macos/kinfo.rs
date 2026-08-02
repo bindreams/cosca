@@ -5,7 +5,7 @@
 //! below, the kernel-size oracle, and the token-vs-libproc oracle (kinfo_tests.rs).
 #![allow(non_camel_case_types)]
 
-use super::super::RawPid;
+use super::super::{RawPid, Resolved};
 
 /// `struct kinfo_proc` (LP64): `extern_proc` head + opaque `eproc` tail.
 #[repr(C)]
@@ -90,14 +90,14 @@ const _: () = assert!(std::mem::size_of::<extern_proc>() == 296);
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
 /// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
-pub(super) fn kinfo(pid: RawPid) -> Option<kinfo_proc> {
+pub(super) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     read_record(pid, libc::KERN_PROC_PID)
 }
 
 /// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production
 /// always passes `KERN_PROC_PID` via `kinfo()`) — it lets a unit test drive the
 /// contract-violation arm with an invalid selector.
-fn read_record(pid: RawPid, selector: libc::c_int) -> Option<kinfo_proc> {
+fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, selector, pid as libc::c_int];
     loop {
         let mut info: kinfo_proc = unsafe { std::mem::zeroed() };
@@ -115,14 +115,29 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Option<kinfo_proc> {
         };
         if rc != 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            super::contract_violation(format_args!("sysctl(KERN_PROC selector {selector}, {pid}) failed: {e}"));
-            return None;
+            return match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // The OS positively says there is no such process.
+                Some(libc::ESRCH) => Resolved::Gone,
+                // A sandbox or hardened runtime refusing the query is the DESIGNED Unknown,
+                // not a contract violation - `debug`, like every other per-pid probe.
+                Some(libc::EPERM) | Some(libc::EACCES) => {
+                    log::debug!("sysctl(KERN_PROC selector {selector}, {pid}) refused: {e}");
+                    Resolved::Unknown
+                }
+                // ENOMEM/EINVAL are neither race- nor permission-reachable. ENOMEM in
+                // particular is the ONLY runtime detector for a kernel `kinfo_proc` that has
+                // grown past our 648-byte definition: it fails before the size check below
+                // is ever reached, and the compile-time size assert cannot fire because the
+                // Rust definition is what stayed still. Keep it loud.
+                _ => {
+                    super::contract_violation(format_args!("sysctl(KERN_PROC selector {selector}, {pid}) failed: {e}"));
+                    Resolved::Unknown
+                }
+            };
         }
         if size == 0 {
-            return None;
+            return Resolved::Gone;
         }
         if size != std::mem::size_of::<kinfo_proc>() {
             // Layout drift — never trust a partial/foreign-sized record.
@@ -130,9 +145,9 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Option<kinfo_proc> {
                 "sysctl(KERN_PROC selector {selector}, {pid}) wrote {size} bytes, expected {}",
                 std::mem::size_of::<kinfo_proc>()
             ));
-            return None;
+            return Resolved::Unknown;
         }
-        return Some(info);
+        return Resolved::Found(info);
     }
 }
 

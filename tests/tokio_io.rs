@@ -19,7 +19,7 @@ async fn async_id_is_a_real_stable_identity() {
     let (mut child, mut sock) = common::spawn_blocker_async();
     let id = child.id();
     assert_eq!(
-        cosca::Process::from_id(id).map(|p| p.id()),
+        cosca::Process::from_id(id).found().map(|p| p.id()),
         Some(id),
         "id() is a resolvable identity"
     );
@@ -233,7 +233,11 @@ async fn async_drop_tears_down_a_contained_tree() {
     let root_id = child.id();
     drop(child);
     // The root is deterministically dead — reap_now blocked until its exit before Drop returned.
-    assert!(!root_id.is_alive(), "the contained root must be torn down by Drop");
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "the contained root must be torn down by Drop"
+    );
     // The grandchild's death is proven by its control-socket EOF: a survivor blocks the read (a CI failure).
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
@@ -254,7 +258,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
-    assert!(!root_id.is_alive(), "root exited");
+    assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
     drop(child); // root already reaped → reap_now no-op; attached.hard_kill must still kill the grandchild
     let mut buf = [0u8; 1];
     match grand.read(&mut buf) {
@@ -273,8 +277,9 @@ async fn async_detach_leaves_the_tree_running() {
     drop(child); // detached → Drop must NOT kill
                  // Positive liveness (no race — we never signaled it): a buggy detach that let Drop kill the
                  // root would make this false.
-    assert!(
+    assert_eq!(
         root_id.is_alive(),
+        cosca::identity::Liveness::Alive,
         "detach must leave the root running after the handle drops"
     );
     // Release it and observe a CLEAN voluntary exit (Ok(0) EOF), distinct from a kill's reset.
@@ -300,8 +305,9 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false);
     let root_id = child.id();
     drop(child); // kill_on_drop(false) → Drop early-returns; teardown must NOT run
-    assert!(
+    assert_eq!(
         root_id.is_alive(),
+        cosca::identity::Liveness::Alive,
         "kill_on_drop(false) must leave the root running after the handle drops"
     );
     // Release it and observe a CLEAN voluntary exit (Ok(0) EOF), best-effort tearing the tree down.
@@ -327,7 +333,7 @@ async fn async_drop_leaves_no_zombie() {
     drop(child);
     assert_ne!(
         cosca::identity::ProcessId::of(id.pid()),
-        Some(id),
+        cosca::identity::Resolved::Found(id),
         "Drop must fully reap the child (no lingering process/zombie at its identity)"
     );
 }
@@ -681,7 +687,11 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     );
     let root_id = child.id();
     drop(child);
-    assert!(!root_id.is_alive(), "the contained root must be torn down by Drop");
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Dead,
+        "the contained root must be torn down by Drop"
+    );
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {

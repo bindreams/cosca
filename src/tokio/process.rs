@@ -27,12 +27,12 @@ impl From<crate::process::Process> for Process {
 impl Process {
     /// Resolve a foreign process by a saved identity. `None` if that exact identity is
     /// gone or the pid was recycled.
-    pub fn from_id(id: ProcessId) -> Option<Process> {
+    pub fn from_id(id: ProcessId) -> crate::identity::Resolved<Process> {
         crate::process::Process::from_id(id).map(Process::from)
     }
 
     /// Resolve the process currently holding `pid`. `None` if no live process has it.
-    pub fn from_pid(pid: RawPid) -> Option<Process> {
+    pub fn from_pid(pid: RawPid) -> crate::identity::Resolved<Process> {
         crate::process::Process::from_pid(pid).map(Process::from)
     }
 
@@ -47,7 +47,7 @@ impl Process {
     }
 
     /// Whether the process is still running (zombie-exclusive; see [`ProcessId::is_alive`]).
-    pub fn is_alive(&self) -> bool {
+    pub fn is_alive(&self) -> crate::identity::Liveness {
         self.inner.is_alive()
     }
 

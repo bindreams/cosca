@@ -41,7 +41,38 @@
 //!   strict `>`. Its 100 ns FILETIME clock makes a same-tick *genuine* child
 //!   indistinguishable from impossible, so strict `>` loses nothing there.
 
-use crate::identity::{ProcessId, RawPid};
+use crate::identity::{ProcessId, RawPid, Resolved};
+
+/// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
+/// both "no signal was delivered", but only the first means there was nothing to deliver one
+/// to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// The signal reached the verified identity.
+    Terminated,
+    /// The pid holds no process, or holds a different one - nothing to kill.
+    AlreadyGone,
+    /// A live-or-unassessable process we did not signal. The only outcome that can leave a
+    /// process running.
+    NotAttempted,
+}
+
+/// The tree-walk resolver. A pid we may not query is dropped from the walk exactly like a
+/// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
+/// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
+pub(crate) fn resolve_or_drop(pid: RawPid) -> Option<ProcessId> {
+    match ProcessId::of(pid) {
+        Resolved::Found(id) => Some(id),
+        Resolved::Gone => None,
+        Resolved::Unknown => {
+            // The pid is IN the message on purpose: `log_capture` is one process-global
+            // buffer shared by every parallel test, so a test asserting on this line must be
+            // able to pin it to its own fixture rather than to any concurrent teardown.
+            log::warn!("treewalk: pid {pid} could not be queried (access denied?) - dropped from the walk");
+            None
+        }
+    }
+}
 
 #[cfg(unix)]
 use nix::sys::signal::Signal;
@@ -140,7 +171,7 @@ pub(crate) fn descendants_with(
 /// Live descendants of `root`: the pure filter wired to the host's
 /// `ProcessId::of` resolver and per-OS `ALLOW_EQUAL_TOKEN` rule.
 pub(crate) fn descendants(root: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    descendants_with(root, parents, ALLOW_EQUAL_TOKEN, ProcessId::of)
+    descendants_with(root, parents, ALLOW_EQUAL_TOKEN, resolve_or_drop)
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
@@ -177,33 +208,51 @@ pub(crate) fn children_of_with(
 /// Live one-level children of `parent`: the pure filter wired to `ProcessId::of` and the
 /// per-OS `ALLOW_EQUAL_TOKEN` rule.
 pub(crate) fn children_of(parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    children_of_with(parent, parents, ALLOW_EQUAL_TOKEN, ProcessId::of)
+    children_of_with(parent, parents, ALLOW_EQUAL_TOKEN, resolve_or_drop)
 }
 
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a
 /// recycled pid. Already-gone (`None`, or `ESRCH`) is success. Best-effort.
 #[cfg(unix)]
-pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) {
+pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
-    // Re-verify identity at the instant of the kill: if the pid was recycled
-    // since the snapshot, `of` returns a different (or no) identity and we skip.
-    if ProcessId::of(id.pid()) != Some(id) {
-        log::debug!(
-            "treewalk: skipping pid {pid} — identity changed since the snapshot",
-            pid = id.pid()
-        );
-        return;
+    // Re-verify identity at the instant of the kill. Three outcomes, not two: a denied
+    // re-verify is NOT a confirmed change, and must not be logged as one.
+    match ProcessId::of(id.pid()) {
+        Resolved::Found(live) if live == id => {}
+        Resolved::Found(_) | Resolved::Gone => {
+            log::debug!(
+                "treewalk: skipping pid {pid} - identity changed since the snapshot",
+                pid = id.pid()
+            );
+            return KillOutcome::AlreadyGone;
+        }
+        Resolved::Unknown => {
+            log::warn!(
+                "treewalk: pid {pid} could not be queried (access denied?) - not signaled, left running",
+                pid = id.pid()
+            );
+            return KillOutcome::NotAttempted;
+        }
     }
-    debug_assert!(
-        id.pid() <= i32::MAX as u32,
-        "pid {} exceeds i32::MAX; signal target cast would truncate",
-        id.pid()
-    );
-    match kill(Pid::from_raw(id.pid() as i32), signal) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => {} // already gone between re-verify and kill
-        Err(_) => {}                        // best-effort (EPERM etc.): nothing actionable to surface here
+    // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
+    // the CALLER-S ENTIRE PROCESS GROUP. Use the same total guard the `sig 0` probe uses.
+    let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
+        log::warn!(
+            "treewalk: pid {} is not a single-process signal target - not signaled",
+            id.pid()
+        );
+        return KillOutcome::NotAttempted;
+    };
+    match kill(Pid::from_raw(target), signal) {
+        Ok(()) => KillOutcome::Terminated,
+        // Exited between the re-verify and the signal - nothing was left to kill.
+        Err(nix::errno::Errno::ESRCH) => KillOutcome::AlreadyGone,
+        Err(e) => {
+            log::warn!("treewalk: kill(pid {}, {signal:?}) failed: {e}", id.pid());
+            KillOutcome::NotAttempted
+        }
     }
 }
 
@@ -211,29 +260,52 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) {
 /// Opens the process for terminate rights and calls `TerminateProcess`. Already
 /// gone (unresolvable / unopenable) is success. Best-effort.
 #[cfg(windows)]
-pub(crate) fn kill_by_identity(id: ProcessId) {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
+    use windows::Win32::System::Threading::{TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
 
-    // Re-verify identity against the live pid before opening it for terminate.
-    if ProcessId::of(id.pid()) != Some(id) {
-        log::debug!(
-            "treewalk: skipping pid {pid} — identity changed since the snapshot",
-            pid = id.pid()
-        );
-        return;
-    }
-    // SAFETY: OpenProcess tolerates an invalid/dead pid (returns Err); the handle
-    // is closed before return. We re-verified identity just above, so the pid is
-    // (was) ours; the worst case under a same-instant recycle is a no-op Err.
-    unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, id.pid()) else {
-            return; // gone or unopenable => already-dead is success
-        };
-        // best-effort (ERROR_ACCESS_DENIED etc.): nothing actionable to surface here
-        let _ = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
-    }
+    use crate::identity::{windows_close, windows_open_classified, HandleIdentity, Opened};
+
+    // Open for terminate AND query, so the SAME held handle both pins the kernel object
+    // (pid-reuse-safe) and lets us re-verify identity before terminating, race-free.
+    let handle = match windows_open_classified(id.pid(), PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION) {
+        Opened::Found(h) => h,
+        Opened::Gone => return KillOutcome::AlreadyGone,
+        Opened::Denied(e) => {
+            log::warn!(
+                "treewalk: pid {} could not be queried (access denied?) - not opened to terminate ({e}), left running",
+                id.pid()
+            );
+            return KillOutcome::NotAttempted;
+        }
+    };
+    let outcome = match crate::identity::windows_handle_identity(handle, id) {
+        HandleIdentity::Same => {
+            // SAFETY: `handle` is live and pins the verified process.
+            match unsafe { TerminateProcess(handle, 1) } {
+                Ok(()) => KillOutcome::Terminated,
+                Err(e) => {
+                    log::warn!("treewalk: TerminateProcess(pid {}) failed: {e}", id.pid());
+                    KillOutcome::NotAttempted
+                }
+            }
+        }
+        HandleIdentity::Different => {
+            log::debug!(
+                "treewalk: skipping pid {} - identity changed since the snapshot",
+                id.pid()
+            );
+            KillOutcome::AlreadyGone
+        }
+        HandleIdentity::Unreadable(e) => {
+            log::warn!(
+                "treewalk: pid {} opened but its identity could not be read ({e}) - not terminated",
+                id.pid()
+            );
+            KillOutcome::NotAttempted
+        }
+    };
+    windows_close(handle);
+    outcome
 }
 
 /// Hard-kill the tree rooted at `root` by identity: snapshot once, compute
@@ -250,19 +322,19 @@ pub(crate) fn hard_kill(root: ProcessId) {
     #[cfg(unix)]
     {
         if !skip_root {
-            kill_by_identity(root, Signal::SIGKILL);
+            let _ = kill_by_identity(root, Signal::SIGKILL);
         }
         for id in descendants {
-            kill_by_identity(id, Signal::SIGKILL);
+            let _ = kill_by_identity(id, Signal::SIGKILL);
         }
     }
     #[cfg(windows)]
     {
         if !skip_root {
-            kill_by_identity(root);
+            let _ = kill_by_identity(root);
         }
         for id in descendants {
-            kill_by_identity(id);
+            let _ = kill_by_identity(id);
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -308,9 +380,9 @@ pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
     {
         let parents = crate::containment::enumerate::process_parents();
         let descendants = descendants(root, &parents);
-        kill_by_identity(root, Signal::SIGTERM);
+        let _ = kill_by_identity(root, Signal::SIGTERM);
         for id in descendants {
-            kill_by_identity(id, Signal::SIGTERM);
+            let _ = kill_by_identity(id, Signal::SIGTERM);
         }
         Ok(())
     }

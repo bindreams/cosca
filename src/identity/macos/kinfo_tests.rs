@@ -40,11 +40,15 @@ fn kernel_writes_exactly_our_kinfo_proc_size() {
 // debug builds the tripwire panics AFTER the warn executed (this test expects the panic);
 // in the release lane the same straight-line code minus the compiled-out assert runs to
 // `None`, which the assert below pins.
+// SCOPE: the EPERM arm - a sandboxed sysctl refusal - is a DIFFERENT arm, reached by no
+// test on any available machine.
 #[cfg_attr(debug_assertions, should_panic(expected = "sysctl(KERN_PROC"))]
 #[test]
-fn read_record_flags_an_invalid_selector() {
+fn an_undiagnosable_sysctl_failure_trips_the_tripwire_and_reports_unknown() {
     let r = super::read_record(std::process::id() as super::super::RawPid, -1);
-    assert!(r.is_none(), "an invalid selector must never yield a record");
+    // `assert_eq!` is impossible here: `Resolved`-s derives are T-bounded and `kinfo_proc`
+    // embeds a union, so it can never be `PartialEq`/`Debug`.
+    assert!(r.is_unknown(), "a failed sysctl must never yield a record - or a Gone");
 }
 
 // Verifies contract_violation's warn is actually captured, not just that debug panics —
@@ -69,7 +73,9 @@ fn contract_violation_traces_then_trips() {
 fn sysctl_token_matches_libproc_for_a_live_process() {
     let pid = std::process::id() as libc::c_int;
 
-    let ours = kinfo(pid as super::super::RawPid).expect("self resolves via sysctl");
+    let crate::identity::Resolved::Found(ours) = kinfo(pid as super::super::RawPid) else {
+        panic!("self resolves via sysctl");
+    };
     let ours = {
         // SAFETY: as in token_of — the kernel fills p_starttime for KERN_PROC copies.
         let t = unsafe { ours.kp_proc.p_un.p_starttime };

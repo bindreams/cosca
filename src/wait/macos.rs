@@ -56,10 +56,24 @@ pub(crate) fn arm_proc_exit(id: ProcessId) -> Result<Option<Kqueue>, Error> {
     if arm_note_exit_on(&kq, id.pid())?.is_none() {
         return Ok(None); // pid already gone
     }
-    if !id.exists() {
-        return Ok(None); // recycled before the filter armed
+    // An unassessable identity is NOT gone and must not be reported as an exit.
+    match id.exists() {
+        crate::identity::Existence::Present => Ok(Some(kq)),
+        crate::identity::Existence::Gone => Ok(None), // recycled before the filter armed
+        crate::identity::Existence::Unknown => {
+            log::warn!(
+                "wait: pid {} identity could not be confirmed; its exit cannot be observed",
+                id.pid()
+            );
+            Err(Error::Unassessable {
+                detail: format!(
+                    "pid {} identity could not be confirmed; its exit cannot be observed",
+                    id.pid()
+                ),
+                source: None,
+            })
+        }
     }
-    Ok(Some(kq))
 }
 
 /// Drain one pending event from an armed kqueue without blocking. `Ok(Some(()))` = the exit
@@ -115,15 +129,37 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     // Re-verify identity immediately before signaling. The window between this check
     // and kill(2) is irreducible on macOS (no pidfd); a recycled pid in that window is
     // a documented best-effort limitation, mirroring treewalk::kill_by_identity.
-    if ProcessId::of(id.pid()) != Some(id) {
-        return Ok(()); // gone (or recycled) => already-dead is success
+    match ProcessId::of(id.pid()) {
+        crate::identity::Resolved::Found(live) if live == id => {}
+        // gone (or recycled) => already-dead is success
+        crate::identity::Resolved::Found(_) | crate::identity::Resolved::Gone => return Ok(()),
+        crate::identity::Resolved::Unknown => {
+            log::warn!(
+                "wait: pid {} identity could not be confirmed - no signal was sent",
+                id.pid()
+            );
+            return Err(Error::Unassessable {
+                detail: format!("pid {} identity could not be confirmed; no signal was sent", id.pid()),
+                source: None,
+            });
+        }
     }
-    debug_assert!(
-        id.pid() <= i32::MAX as u32,
-        "pid {} exceeds i32::MAX; signal target cast would truncate",
-        id.pid()
-    );
-    match nix_kill(Pid::from_raw(id.pid() as i32), Signal::SIGKILL) {
+    // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
+    // the CALLER-S ENTIRE PROCESS GROUP. `kernel_task` is pid 0 and macOS RESOLVES it, so the
+    // re-verify above does not rule the value out, and a `debug_assert` would vanish in
+    // release. Use the same total guard the `sig 0` probe uses.
+    let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
+        // A discard site: the Result can carry this, so it must not read as a silent success.
+        log::warn!(
+            "wait: pid {} is not a single-process signal target - not signaled",
+            id.pid()
+        );
+        return Err(Error::Unassessable {
+            detail: format!("pid {} is not a signalable single-process target", id.pid()),
+            source: None,
+        });
+    };
+    match nix_kill(Pid::from_raw(target), Signal::SIGKILL) {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::ESRCH) => Ok(()), // exited between re-verify and kill
         Err(e) => Err(Error::Io(e.into())),      // EPERM etc. surfaced, not swallowed
@@ -134,15 +170,37 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};
     use nix::unistd::Pid;
     // Re-verify identity immediately before signaling.
-    if ProcessId::of(id.pid()) != Some(id) {
-        return Ok(()); // gone (or recycled) => already-dead is success
+    match ProcessId::of(id.pid()) {
+        crate::identity::Resolved::Found(live) if live == id => {}
+        // gone (or recycled) => already-dead is success
+        crate::identity::Resolved::Found(_) | crate::identity::Resolved::Gone => return Ok(()),
+        crate::identity::Resolved::Unknown => {
+            log::warn!(
+                "wait: pid {} identity could not be confirmed - no signal was sent",
+                id.pid()
+            );
+            return Err(Error::Unassessable {
+                detail: format!("pid {} identity could not be confirmed; no signal was sent", id.pid()),
+                source: None,
+            });
+        }
     }
-    debug_assert!(
-        id.pid() <= i32::MAX as u32,
-        "pid {} exceeds i32::MAX; signal target cast would truncate",
-        id.pid()
-    );
-    match nix_kill(Pid::from_raw(id.pid() as i32), Signal::SIGTERM) {
+    // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
+    // the CALLER-S ENTIRE PROCESS GROUP. `kernel_task` is pid 0 and macOS RESOLVES it, so the
+    // re-verify above does not rule the value out, and a `debug_assert` would vanish in
+    // release. Use the same total guard the `sig 0` probe uses.
+    let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
+        // A discard site: the Result can carry this, so it must not read as a silent success.
+        log::warn!(
+            "wait: pid {} is not a single-process signal target - not signaled",
+            id.pid()
+        );
+        return Err(Error::Unassessable {
+            detail: format!("pid {} is not a signalable single-process target", id.pid()),
+            source: None,
+        });
+    };
+    match nix_kill(Pid::from_raw(target), Signal::SIGTERM) {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(e) => Err(Error::Io(e.into())),
