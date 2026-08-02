@@ -104,6 +104,7 @@ pub(super) fn detect() -> Host {
         has_tty: false, // Windows never prompts on a TTY — UAC is a GUI gate.
         available: BackendSet::default(),
         os: Os::Windows,
+        arg_max: None,
     }
 }
 
@@ -281,6 +282,9 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         Transition::RunAsIs => return Ok(RunasOutcome::AlreadyElevated),
         Transition::Reject { error } => return Err(error),
         Transition::ElevatePosix { .. } => unreachable!("planner never yields ElevatePosix on a windows host"),
+        Transition::ElevateMacosGui { .. } => {
+            unreachable!("planner never yields ElevateMacosGui on a windows host")
+        }
         Transition::ElevateWindows { .. } => {}
     }
 

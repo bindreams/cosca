@@ -15,6 +15,7 @@ impl QuoteError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum QuoteErrorKind {
     #[error("unterminated single quote")]
     UnterminatedSingleQuote,
@@ -22,11 +23,19 @@ pub enum QuoteErrorKind {
     UnterminatedDoubleQuote,
     #[error("trailing backslash")]
     TrailingBackslash,
+    /// The text is not valid UTF-8, and the target grammar (AppleScript) is
+    /// defined over UTF-8 text rather than bytes.
+    #[error("not valid UTF-8")]
+    NonUtf8,
+    /// A character the target grammar cannot express at all.
+    #[error("character cannot be represented in this grammar")]
+    UnrepresentableChar,
 }
 
 /// Runtime elevation failures — "could work here but failed now" (contrast
 /// [`Error::Unsupported`], which is "can never work on this platform").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ElevationErrorKind {
     /// The requested (or auto-detected) backend is not on PATH, or the resolved
     /// backend could not be executed.
@@ -49,6 +58,11 @@ pub enum ElevationErrorKind {
     /// manage it. Whether it was terminated is reported in the error `detail`.
     #[error("elevated child launched but could not be tracked")]
     Untracked,
+    /// The composed elevation command exceeded this host's exec argument budget
+    /// (`kern.argmax` on macOS). A property of THIS command on THIS host, not of
+    /// the platform: a shorter command, or a host with a larger budget, succeeds.
+    #[error("the elevation command is too long for this host")]
+    CommandTooLong,
 }
 
 /// The crate's top-level error type.

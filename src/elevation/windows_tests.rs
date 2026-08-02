@@ -92,6 +92,7 @@ fn win_host(elevated: bool) -> crate::elevation::plan::Host {
         has_tty: false,
         available: crate::elevation::plan::BackendSet::default(),
         os: crate::elevation::plan::Os::Windows,
+        arg_max: None,
     }
 }
 

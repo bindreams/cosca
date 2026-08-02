@@ -12,10 +12,26 @@ use crate::error::{ElevationErrorKind, Error};
 // Windows-shaped `Host` is planned on Linux and vice versa), so in a non-test single-platform
 // build the other platform's variant is never constructed. That is by design, not dead logic.
 #[allow(dead_code)]
+// The enum is named `Os` and `MacOs` names an OS, so the variant unavoidably ends
+// with the enum's name. Renaming either to satisfy the lint would make both worse.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
+    /// Every POSIX host EXCEPT macOS — Linux, the BSDs, illumos. Deliberately not
+    /// named `Linux`: nothing keyed off it is Linux-specific, and a Linux-shaped
+    /// name would invite gating genuinely Linux-only behavior on it.
     Unix,
+    MacOs,
     Windows,
+}
+
+/// Is this request the macOS graphical path? Deliberately privilege-free: it is a
+/// property of the REQUEST, so the same answer holds for a root and a non-root
+/// caller. Every site that needs "is this osascript?" calls THIS — the structural
+/// matrix, [`Host::plan`]'s resolution arm, and the effect layer's gate selection.
+/// Deriving it inline in three places is how they drift apart.
+pub(crate) fn is_macos_gui_auto(os: Os, backend: Backend, auth: &Auth) -> bool {
+    os == Os::MacOs && matches!(auth, Auth::Gui) && backend == Backend::Auto
 }
 
 /// The resolved absolute path of each CLI backend on PATH (`None` = absent),
@@ -28,6 +44,10 @@ pub struct BackendSet {
     pub sudo: Option<PathBuf>,
     pub doas: Option<PathBuf>,
     pub pkexec: Option<PathBuf>,
+    /// macOS only: the absolute path of `/usr/bin/osascript`, the graphical
+    /// elevation front-end. Not a [`Backend`]: it does not wrap the child, it asks
+    /// Authorization Services to run the command as root.
+    pub osascript: Option<PathBuf>,
 }
 
 impl BackendSet {
@@ -50,6 +70,13 @@ pub struct Host {
     pub has_tty: bool,
     pub available: BackendSet,
     pub os: Os,
+    /// `sysctl kern.argmax` — the exec argument budget, read at detect time
+    /// because it has changed across macOS releases and must never be guessed.
+    /// `None` when the query failed or the platform has no equivalent; the macOS
+    /// length guard is then skipped rather than run against an invented number.
+    /// Only the macOS graphical path reads it; it lives here because the planner
+    /// is plain data.
+    pub arg_max: Option<usize>,
 }
 
 /// The planner's decision. Not `PartialEq` — `Reject` wraps a non-comparable
@@ -67,6 +94,14 @@ pub enum Transition {
     },
     ElevateWindows {
         auth: Auth,
+    },
+    ElevateMacosGui {
+        /// The absolute path of `/usr/bin/osascript`, carried for the same reason
+        /// the POSIX backends carry theirs: the validated path is exactly the one
+        /// argv[0] emits, so nothing on PATH can be substituted for it.
+        osascript: PathBuf,
+        /// The detected `kern.argmax`, carried so the effect layer stays pure.
+        arg_max: Option<usize>,
     },
     Reject {
         error: Error,
@@ -90,6 +125,7 @@ impl Host {
                 has_tty: false,
                 available: BackendSet::default(),
                 os: Os::Unix,
+                arg_max: None,
             }
         }
     }
@@ -102,7 +138,7 @@ impl Host {
         // short-circuit, so an impossible combo never passes under root.
         let structural = match self.os {
             Os::Windows => structural_windows(backend, &auth),
-            Os::Unix => structural_posix(backend, &auth, &self.available),
+            os => structural_posix(os, backend, &auth, &self.available),
         };
         if let Some(error) = structural {
             return Transition::Reject { error };
@@ -112,7 +148,21 @@ impl Host {
         }
         match self.os {
             Os::Windows => Transition::ElevateWindows { auth },
-            Os::Unix => self.resolve_posix(backend, auth),
+            Os::MacOs if is_macos_gui_auto(self.os, backend, &auth) => {
+                match self.available.osascript.as_deref() {
+                    Some(p) => Transition::ElevateMacosGui {
+                        osascript: p.to_path_buf(),
+                        arg_max: self.arg_max,
+                    },
+                    // Honest here, unlike the pkexec verdict: /usr/bin/osascript
+                    // can genuinely be missing or non-executable.
+                    None => reject_backend_unavailable(
+                        "/usr/bin/osascript is missing or not executable; \
+                         macOS graphical elevation needs it",
+                    ),
+                }
+            }
+            Os::MacOs | Os::Unix => self.resolve_posix(backend, auth),
         }
     }
 
@@ -172,19 +222,49 @@ fn reject_backend_unavailable(detail: &str) -> Transition {
 /// `Backend::Auto` + `Auth::Stdin` on a doas-only host would return `Unsupported`
 /// unprivileged but `RunAsIs` once already root, a verdict that flips on ambient
 /// privilege instead of staying a property of the request.
-fn structural_posix(backend: Backend, auth: &Auth, available: &BackendSet) -> Option<Error> {
+fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSet) -> Option<Error> {
+    let platform = if os == Os::MacOs { "macos" } else { "unix" };
     let unsupported = |op: String, detail: &str| {
         Some(Error::Unsupported {
             op,
-            platform: "unix",
+            platform,
             detail: detail.into(),
         })
     };
-    if matches!(auth, Auth::Gui) && backend != Backend::Pkexec {
-        return unsupported(
-            format!("{backend:?} + Auth::Gui"),
-            "graphical (Gui) auth is only available through Backend::Pkexec",
-        );
+    // polkit and systemd are Linux stacks. Saying "not on PATH" on macOS reads as a
+    // fixable environment problem on a platform where neither will ever exist.
+    // sudo and doas are NOT in this list: both are portable and do run on macOS.
+    if os == Os::MacOs {
+        let impossible = match backend {
+            Backend::Pkexec => Some(
+                "pkexec is a polkit (Linux) program and does not exist on macOS; \
+                 use Backend::Auto with Auth::Gui for the macOS authentication dialog",
+            ),
+            Backend::Run0 => Some(
+                "run0 ships with systemd and does not exist on macOS; \
+                 use Backend::Auto (sudo), or Auth::Gui for the macOS authentication dialog",
+            ),
+            _ => None,
+        };
+        if let Some(detail) = impossible {
+            return unsupported(format!("Backend::{backend:?}"), detail);
+        }
+    }
+    if matches!(auth, Auth::Gui) {
+        if os == Os::MacOs {
+            if !is_macos_gui_auto(os, backend, auth) {
+                return unsupported(
+                    format!("{backend:?} + Auth::Gui"),
+                    "macOS graphical elevation goes through Authorization Services, not a \
+                     CLI wrapper; pair Auth::Gui with Backend::Auto",
+                );
+            }
+        } else if backend != Backend::Pkexec {
+            return unsupported(
+                format!("{backend:?} + Auth::Gui"),
+                "graphical (Gui) auth is only available through Backend::Pkexec",
+            );
+        }
     }
     if backend == Backend::Pkexec && !matches!(auth, Auth::Gui) {
         return unsupported(

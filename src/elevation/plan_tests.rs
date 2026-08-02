@@ -25,6 +25,7 @@ fn win_host(elevated: bool) -> Host {
         has_tty: false,
         available: BackendSet::default(),
         os: Os::Windows,
+        arg_max: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn all_backends() -> BackendSet {
         sudo: Some(PathBuf::from("/usr/bin/sudo")),
         doas: Some(PathBuf::from("/usr/bin/doas")),
         pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
+        osascript: None,
     }
 }
 
@@ -43,6 +45,7 @@ fn unix_host(available: BackendSet, elevated: bool, has_tty: bool) -> Host {
         has_tty,
         available,
         os: Os::Unix,
+        arg_max: None,
     }
 }
 
@@ -82,6 +85,7 @@ fn auto_prefers_sudo_then_doas() {
             sudo: None,
             doas: Some(PathBuf::from("/usr/bin/doas")),
             pkexec: None,
+            osascript: None,
         },
         false,
         true,
@@ -104,6 +108,7 @@ fn auto_never_selects_run0_or_pkexec() {
             sudo: None,
             doas: None,
             pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
+            osascript: None,
         },
         false,
         true,
@@ -136,6 +141,7 @@ fn windows_unprivileged_elevates_via_uac() {
         has_tty: false,
         available: BackendSet::default(),
         os: Os::Windows,
+        arg_max: None,
     };
     assert!(matches!(
         h.plan(Privilege::Elevated, Backend::Auto, Auth::Interactive),
@@ -247,6 +253,7 @@ fn auto_resolving_to_doas_rejects_stdin() {
                 sudo: None,
                 doas: Some(PathBuf::from("/usr/bin/doas")),
                 pkexec: None,
+                osascript: None,
             },
             elevated,
             true,
@@ -271,5 +278,173 @@ fn pkexec_with_gui_is_accepted() {
             backend: Backend::Pkexec,
             ..
         }
+    ));
+}
+
+/// A macOS host: sudo exists, pkexec/run0/doas do not, osascript does.
+fn macos_host(elevated: bool, has_tty: bool) -> Host {
+    Host {
+        elevated,
+        has_tty,
+        available: BackendSet {
+            run0: None,
+            sudo: Some(PathBuf::from("/usr/bin/sudo")),
+            doas: None,
+            pkexec: None,
+            osascript: Some(PathBuf::from("/usr/bin/osascript")),
+        },
+        os: Os::MacOs,
+        arg_max: Some(1_048_576),
+    }
+}
+
+fn unsupported_platform(t: Transition) -> &'static str {
+    match reject_error(t) {
+        Error::Unsupported { platform, .. } => platform,
+        other => panic!("expected Unsupported, got {other}"),
+    }
+}
+
+#[test]
+fn macos_pkexec_is_unsupported_not_backend_unavailable() {
+    // pkexec can never exist on macOS, so a "backend not on PATH" verdict would
+    // wrongly invite installing it. Even with a fabricated pkexec path present,
+    // the verdict must be a platform Unsupported.
+    let mut h = macos_host(false, true);
+    h.available.pkexec = Some(PathBuf::from("/usr/bin/pkexec"));
+    assert_eq!(
+        unsupported_platform(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui)),
+        "macos"
+    );
+}
+
+#[test]
+fn macos_run0_is_unsupported_not_backend_unavailable() {
+    // Same reasoning as pkexec: run0 ships with systemd, so "not on PATH" would
+    // invite installing something that does not exist for this platform.
+    let mut h = macos_host(false, true);
+    h.available.run0 = Some(PathBuf::from("/usr/bin/run0"));
+    for auth in [Auth::Interactive, Auth::NonInteractive] {
+        match reject_error(h.plan(Privilege::Elevated, Backend::Run0, auth)) {
+            Error::Unsupported { platform, detail, .. } => {
+                assert_eq!(platform, "macos");
+                assert!(detail.contains("systemd"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other}"),
+        }
+    }
+}
+
+#[test]
+fn macos_keeps_the_backends_that_really_do_run_there() {
+    // sudo and doas are portable and DO exist on macOS, so they must not be swept
+    // into the impossible-backend guard alongside pkexec/run0.
+    let mut h = macos_host(false, true);
+    h.available.doas = Some(PathBuf::from("/usr/local/bin/doas"));
+    for backend in [Backend::Sudo, Backend::Doas] {
+        assert!(
+            matches!(
+                h.plan(Privilege::Elevated, backend, Auth::Interactive),
+                Transition::ElevatePosix { .. }
+            ),
+            "{backend:?} must still be usable on macOS"
+        );
+    }
+}
+
+#[test]
+fn macos_sudo_still_works_like_other_unix() {
+    let h = macos_host(false, true);
+    assert!(matches!(
+        h.plan(Privilege::Elevated, Backend::Auto, Auth::Interactive),
+        Transition::ElevatePosix {
+            backend: Backend::Sudo,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn non_macos_unix_gui_still_requires_pkexec() {
+    let h = unix_host(all_backends(), false, true);
+    assert!(matches!(
+        h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui),
+        Transition::ElevatePosix {
+            backend: Backend::Pkexec,
+            ..
+        }
+    ));
+    assert!(is_unsupported(h.plan(Privilege::Elevated, Backend::Sudo, Auth::Gui)));
+}
+
+#[test]
+fn macos_gui_resolves_to_the_osascript_transition() {
+    let h = macos_host(false, /* has_tty */ false);
+    match h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui) {
+        Transition::ElevateMacosGui { osascript, arg_max } => {
+            assert_eq!(osascript, PathBuf::from("/usr/bin/osascript"));
+            assert_eq!(arg_max, Some(1_048_576));
+        }
+        other => panic!("expected ElevateMacosGui, got {other:?}"),
+    }
+}
+
+#[test]
+fn macos_gui_needs_no_controlling_terminal() {
+    // A windowed app has no controlling terminal, so Auth::Gui must not trip the
+    // NoTty gate the way Auth::Interactive does.
+    let h = macos_host(false, false);
+    assert!(matches!(
+        h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui),
+        Transition::ElevateMacosGui { .. }
+    ));
+    assert!(matches!(
+        reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Interactive)),
+        Error::Elevation {
+            kind: ElevationErrorKind::NoTty,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn macos_gui_with_a_non_auto_backend_is_still_unsupported() {
+    // Auth::Gui names Authorization Services on macOS; no CLI wrapper is involved,
+    // so a forced sudo/doas/run0 is a config error, not something osascript runs.
+    for backend in [Backend::Sudo, Backend::Doas, Backend::Run0] {
+        let h = macos_host(false, true);
+        // `plan_tests.rs` is NOT platform-gated, so asserting the message HERE is
+        // what keeps this arm's wording checked on the Windows CI leg too.
+        match reject_error(h.plan(Privilege::Elevated, backend, Auth::Gui)) {
+            Error::Unsupported { platform, detail, .. } => {
+                assert_eq!(platform, "macos", "{backend:?}");
+                assert!(detail.contains("Backend::Auto"), "{backend:?}: {detail}");
+            }
+            other => panic!("expected Unsupported for {backend:?}, got {other}"),
+        }
+    }
+}
+
+#[test]
+fn macos_gui_without_osascript_is_a_backend_problem_not_a_platform_one() {
+    // Here BackendUnavailable is honest: /usr/bin/osascript really can be absent
+    // or non-executable on a stripped system.
+    let mut h = macos_host(false, true);
+    h.available.osascript = None;
+    assert!(matches!(
+        reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui)),
+        Error::Elevation {
+            kind: ElevationErrorKind::BackendUnavailable,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn macos_gui_already_elevated_runs_as_is() {
+    let h = macos_host(true, false);
+    assert!(matches!(
+        h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui),
+        Transition::RunAsIs
     ));
 }

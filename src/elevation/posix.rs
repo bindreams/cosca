@@ -187,6 +187,31 @@ pub(super) fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<Pat
     })
 }
 
+/// Reads `sysctl kern.argmax` for [`Host::arg_max`]; `None` if the query fails.
+#[cfg(target_os = "macos")]
+fn kern_argmax() -> Option<usize> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a two-element MIB with a matching `c_int` out-buffer and its exact
+    // size; a read-only sysctl (null new-value, zero new-length).
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || value <= 0 {
+        log::debug!("could not read kern.argmax; the elevation length guard is disabled");
+        return None;
+    }
+    Some(value as usize)
+}
+
 pub(super) fn detect() -> Host {
     Host {
         elevated: is_elevated(),
@@ -196,8 +221,31 @@ pub(super) fn detect() -> Host {
             sudo: resolve_on_path("sudo"),
             doas: resolve_on_path("doas"),
             pkexec: resolve_on_path("pkexec"),
+            // A fixed system path, never PATH-resolved: a PATH lookup would let a
+            // shadowing `osascript` earlier on PATH receive an elevation request.
+            osascript: {
+                #[cfg(target_os = "macos")]
+                {
+                    let p = Path::new("/usr/bin/osascript");
+                    is_executable(p).then(|| p.to_path_buf())
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            },
         },
-        os: Os::Unix,
+        os: if cfg!(target_os = "macos") { Os::MacOs } else { Os::Unix },
+        arg_max: {
+            #[cfg(target_os = "macos")]
+            {
+                kern_argmax()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        },
     }
 }
 
@@ -387,21 +435,28 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
 /// Program + args, honoring `executable()`. An argv[0] distinct from a set
 /// `executable()` cannot survive the backend wrapper → `Unsupported`.
 fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
-    let CommandInput::Argv(argv) = cmd.input() else {
-        return Err(Error::Unsupported {
-            op: "elevation of a commandline() command".into(),
-            platform: "unix",
-            detail:
-                "elevation requires an argv command (set .args([...])); a raw command line cannot be safely wrapped"
-                    .into(),
-        });
+    // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
+    // `Argv(vec![])`, so folding it into the commandline arm would answer "no
+    // program set" with a message about re-quoting a command line that was never set.
+    let empty = || Error::Unsupported {
+        op: "elevation of an empty command".into(),
+        platform: "unix",
+        detail: "set a program via .args([...]) before .elevate()".into(),
     };
+    let argv =
+        match cmd.input() {
+            CommandInput::Argv(argv) => argv,
+            CommandInput::Empty => return Err(empty()),
+            CommandInput::CommandLine(_) => return Err(Error::Unsupported {
+                op: "elevation of a commandline() command".into(),
+                platform: "unix",
+                detail:
+                    "elevation requires an argv command (set .args([...])); a raw command line cannot be safely wrapped"
+                        .into(),
+            }),
+        };
     if argv.is_empty() {
-        return Err(Error::Unsupported {
-            op: "elevation of an empty command".into(),
-            platform: "unix",
-            detail: "set a program via .args([...]) before .elevate()".into(),
-        });
+        return Err(empty());
     }
     match cmd.executable_path() {
         Some(exe) => {
@@ -493,11 +548,33 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
     let requested_auth = cmd.elevation_request().auth.clone();
 
     // Structural config gates FIRST — privilege-independent (before the short-circuit).
-    reject_structural_posix_config(cmd, requested_backend, &requested_auth)?;
+    //
+    // Which gate applies is a property of the REQUEST, not the run — see
+    // `is_macos_gui_auto`'s doc and the ambient-privilege invariant
+    // `structural_posix` documents. Keying on the resolved `Transition` instead
+    // would break it: `plan()` yields `RunAsIs` under root, so the same request
+    // would be accepted as root and rejected as a normal user.
+    let macos_gui = super::plan::is_macos_gui_auto(host.os, requested_backend, &requested_auth);
+    if macos_gui {
+        super::macos::reject_structural_gui_config(cmd)?;
+    } else {
+        reject_structural_posix_config(cmd, requested_backend, &requested_auth)?;
+    }
 
     match host.plan(Privilege::Elevated, requested_backend, requested_auth) {
         Transition::Reject { error } => Err(error),
         Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
+        Transition::ElevateMacosGui { osascript, arg_max } => {
+            let (derived, report) = super::macos::build_rewrite(cmd, &osascript, arg_max)?;
+            Ok(PosixRewrite {
+                derived: Some(derived),
+                report: Some(report),
+                password_write: None,
+                // The derived program IS osascript, so an exec failure remaps to
+                // BackendUnavailable exactly as it does for the POSIX backends.
+                backend_path: Some(osascript),
+            })
+        }
         Transition::RunAsIs => {
             // Already elevated: no wrapper, but the sanitizer STILL runs so a dangerous
             // forwarded var never reaches the root child. Build a non-destructive derived
