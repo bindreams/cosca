@@ -65,6 +65,50 @@ pub enum ElevationErrorKind {
     CommandTooLong,
 }
 
+/// Why a [`ProcessIdRecord`](crate::identity::ProcessIdRecord) could not be produced from,
+/// or turned back into, a [`ProcessId`](crate::identity::ProcessId).
+///
+/// No variant says anything about whether the process is running — that is
+/// [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive). These are all statements
+/// about whether a start token can be *compared* on this host at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecordErrorKind {
+    /// The record's format version is not one this build knows how to read.
+    #[error("unknown record format version")]
+    UnknownVersion,
+    /// The record was written on a different OS. Start tokens are not comparable across
+    /// platforms — Linux's are boot-relative jiffies, Windows's and macOS's are absolute
+    /// timestamps — so a cross-platform comparison is meaningless, not merely wrong.
+    #[error("the record was written on a different platform")]
+    ForeignPlatform,
+    /// The record's pid cannot name a single process on this platform: zero anywhere, or
+    /// above `i32::MAX` on Unix, where it would wrap negative and address a whole process
+    /// *group*. A restored identity is used for `kill(2)` and `pidfd_open`, so this is
+    /// rejected up front rather than left to fail — or, worse, succeed — later.
+    #[error("the record's pid cannot name a single process")]
+    InvalidPid,
+    /// Linux: the record was written in a different boot session, where the jiffy counter
+    /// started over. The saved token would alias onto an unrelated process.
+    #[error("the record was written in a different boot session")]
+    ForeignBootSession,
+    /// Linux: the record carries no boot identifier, so its boot session cannot be checked.
+    #[error("the record carries no boot session identifier")]
+    MissingBootSession,
+    /// Linux: the record was written in a different pid namespace, where the same pid
+    /// number names a different process.
+    #[error("the record was written in a different pid namespace")]
+    ForeignPidNamespace,
+    /// Linux: the record carries no pid namespace identifier.
+    #[error("the record carries no pid namespace identifier")]
+    MissingPidNamespace,
+    /// This host's own boot session could not be read, so a record could neither be
+    /// written nor checked. The only variant that is not about the record's contents; the
+    /// failing path and the OS error are in the error's `detail` and `source`.
+    #[error("this host's boot session could not be read")]
+    ScopeUnreadable,
+}
+
 /// The crate's top-level error type.
 ///
 /// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
@@ -104,6 +148,16 @@ pub enum Error {
     /// process — where nothing was asked of the OS at all; those carry no `source`.
     #[error("could not determine the target process's state: {detail}")]
     Unassessable {
+        detail: String,
+        #[source]
+        source: Option<std::io::Error>,
+    },
+    /// A persisted process identity could not be produced or restored — see
+    /// [`RecordErrorKind`] for why. `source` carries the OS error when the failure was a
+    /// failed read of this host's boot session rather than a rejected record.
+    #[error("persisted process identity is not usable here ({kind}): {detail}")]
+    IdentityRecord {
+        kind: RecordErrorKind,
         detail: String,
         #[source]
         source: Option<std::io::Error>,

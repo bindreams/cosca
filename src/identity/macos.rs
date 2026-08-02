@@ -111,3 +111,9 @@ pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
 pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_micros(start.raw()))
 }
+
+/// The `kinfo_proc` / `proc_bsdinfo` start time is absolute µs since the Unix epoch,
+/// recorded once at creation, so it survives a reboot unchanged and needs no scope.
+pub(super) fn session_scope() -> Result<super::persist::Scope, super::persist::ScopeReadError> {
+    Ok(super::persist::Scope::none())
+}

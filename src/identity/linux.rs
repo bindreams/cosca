@@ -104,3 +104,61 @@ fn boot_time_secs() -> Option<u64> {
         .find_map(|l| l.strip_prefix("btime "))
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
+
+// Persisted-identity session scope ====================================================
+
+use super::persist::{Scope, ScopeReadError};
+
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+const PID_NS_PATH: &str = "/proc/self/ns/pid";
+
+/// This host's boot session, as the two things a `/proc` jiffy token is relative to.
+///
+/// `boot_id` scopes the jiffy counter, which restarts at every boot; the `/proc/self/ns/pid`
+/// inode scopes the PID, because a container shares the host's `boot_id` (it is not
+/// namespaced) while numbering its processes independently. Either one alone would let a
+/// saved token be compared against an unrelated process.
+///
+/// Both reads are of the caller's own `/proc` entries, which no `hidepid` mount hides from
+/// the task itself; a failure here means `/proc` is not mounted at all.
+pub(super) fn session_scope() -> Result<Scope, ScopeReadError> {
+    session_scope_at(std::path::Path::new(BOOT_ID_PATH), std::path::Path::new(PID_NS_PATH))
+}
+
+/// [`session_scope`] with the two `/proc` paths as parameters, so a test can point them at
+/// paths that really do not exist and exercise the failure without mocking a syscall.
+pub(super) fn session_scope_at(
+    boot_id_path: &std::path::Path,
+    pid_ns_path: &std::path::Path,
+) -> Result<Scope, ScopeReadError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let boot_id = std::fs::read_to_string(boot_id_path).map_err(|source| ScopeReadError {
+        path: boot_id_path.display().to_string(),
+        source,
+    })?;
+    // Trimmed: the kernel appends a newline, and an untrimmed value would never match a
+    // record written by anything else that reads this file.
+    let boot_id = boot_id.trim();
+    // A BLANK value is refused, not stored. A container runtime that masks this file by
+    // bind-mounting /dev/null over it makes the read SUCCEED and return "", which would be
+    // stored as `Some("")` and then compare equal to the next boot's `Some("")` — silently
+    // turning the boot-session check into a no-op, which is the exact aliasing this record
+    // exists to prevent. Failing here surfaces it as `ScopeUnreadable` instead.
+    if boot_id.is_empty() {
+        return Err(ScopeReadError {
+            path: boot_id_path.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, "boot_id is empty"),
+        });
+    }
+    let pid_ns = std::fs::metadata(pid_ns_path)
+        .map_err(|source| ScopeReadError {
+            path: pid_ns_path.display().to_string(),
+            source,
+        })?
+        .ino();
+    Ok(Scope {
+        boot_id: Some(boot_id.to_owned()),
+        pid_ns: Some(pid_ns),
+    })
+}

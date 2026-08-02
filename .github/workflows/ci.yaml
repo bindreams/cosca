@@ -91,6 +91,10 @@ jobs:
       - name: Run tests (tokio feature)
         run: cargo test --locked --features tokio --target ${{ matrix.target }}
 
+      # `serde` is an additive feature flag; exercise the persisted-identity wire format.
+      - name: Run tests (serde feature)
+        run: cargo test --locked --features serde --target ${{ matrix.target }}
+
       - name: Check rustdoc
         shell: bash
         env:

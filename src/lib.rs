@@ -26,6 +26,9 @@ mod wait;
 #[cfg(test)]
 mod log_capture;
 
+#[cfg(test)]
+mod test_child;
+
 pub mod process;
 pub use process::{Process, Recursive};
 

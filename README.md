@@ -2,7 +2,7 @@
 
 Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity, and elevation.
 
-`std::process` hands you a child and little else. It cannot tell you whether the process you spawned is still the process you think it is, cannot tear down a process tree, cannot address a process it did not spawn, and cannot run one elevated. This crate covers those, with one API across Linux, macOS, and Windows, and a `tokio` mirror behind a feature flag.
+`std::process` hands you a child and little else. It cannot tell you whether the process you spawned is still the process you think it is, cannot tear down a process tree, cannot address a process it did not spawn, and cannot run one elevated. This crate covers those, with one API across Linux, macOS, and Windows, a `tokio` mirror behind a feature flag, and identities that can be written to disk and restored after a restart (`serde` feature).
 
 The API is not stable; expect breaking changes in any 0.x release.
 

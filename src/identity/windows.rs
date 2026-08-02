@@ -214,3 +214,9 @@ fn liveness_without_synchronize(pid: RawPid, start: StartToken) -> Liveness {
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
+
+/// Windows creation `FILETIME` is an absolute count of 100 ns ticks since 1601-01-01 UTC:
+/// recorded once, at creation, and unchanged by a reboot. There is nothing to scope it by.
+pub(super) fn session_scope() -> Result<super::persist::Scope, super::persist::ScopeReadError> {
+    Ok(super::persist::Scope::none())
+}
