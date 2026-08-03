@@ -11,6 +11,9 @@
 //! wall-clock from boot time drifts under NTP and would silently break
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity.
+//!
+//! The token is not portable across a reboot on every platform — see [`ProcessIdRecord`]
+//! for the persist/restore round trip and what it refuses.
 
 pub(crate) mod probe;
 pub(crate) mod stat_parse;
@@ -18,6 +21,10 @@ pub(crate) mod stat_parse;
 #[path = "identity/state.rs"]
 mod state;
 pub use state::{Existence, Liveness, Resolved};
+
+#[path = "identity/persist.rs"]
+mod persist;
+pub use persist::{Platform, ProcessIdRecord, RECORD_VERSION};
 
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]

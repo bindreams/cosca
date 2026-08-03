@@ -18,6 +18,8 @@ targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-
 [features]
 pty = []
 tokio = ["dep:tokio"]
+# Serialize a ProcessIdRecord so an identity survives a supervisor restart.
+serde = ["dep:serde"]
 
 [dependencies]
 thiserror = "2"
@@ -25,6 +27,8 @@ shared_child = { version = "1", features = ["timeout"] }
 log = "0.4"
 # Zeroize the password held for Auth::Stdin so it never lingers in freed memory.
 zeroize = "1"
+# Only ProcessIdRecord is (de)serializable; `derive` is for its field attributes.
+serde = { version = "1", optional = true, features = ["derive"] }
 # `macros` is required by the library, not only tests: `communicate` uses `tokio::try_join!`,
 # which is gated behind tokio's `macros` feature. `net` is solely for `AsyncFd` (the
 # reactor-native death-watch); `time` solely for the grace bound on it. `sync` backs the
@@ -33,6 +37,8 @@ tokio = { version = "1", optional = true, features = ["process", "rt", "io-util"
 
 [dev-dependencies]
 tempfile = "3"
+# A concrete format to pin the persisted wire form against.
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Unpredictable merge-target pipe names (std parity: std randomizes its anon-pipe names).

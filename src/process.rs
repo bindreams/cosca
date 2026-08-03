@@ -29,26 +29,25 @@ pub struct Process {
 }
 
 impl Process {
-    /// Resolve a foreign process by a saved identity. [`Resolved::Gone`] if that exact
-    /// identity is gone or the pid was recycled; [`Resolved::Unknown`] if the OS refused the
-    /// query — the process may well be running.
-    pub fn from_id(id: ProcessId) -> Resolved<Process> {
-        match ProcessId::of(id.pid()) {
-            Resolved::Found(live) if live == id => Resolved::Found(Process { id }),
-            Resolved::Found(_) | Resolved::Gone => Resolved::Gone,
-            Resolved::Unknown => Resolved::Unknown,
-        }
+    /// A handle to the process with this identity. Infallible: the caller already holds the
+    /// identity, so there is nothing to resolve and nothing that can fail.
+    ///
+    /// This deliberately does NOT check that the process is still there. Existence is
+    /// ephemeral — it can change between this call and the next line — so a verdict bound to
+    /// construction is stale the instant it is returned, and gating construction on it would
+    /// discard a perfectly good identity whenever the OS merely declined to answer. Ask
+    /// [`exists`](Self::exists) or [`is_alive`](Self::is_alive) when you want the answer, as
+    /// late as you can.
+    pub fn from_id(id: ProcessId) -> Process {
+        Process { id }
     }
 
-    /// Resolve the process currently holding `pid`. [`Resolved::Gone`] if no process has it;
+    /// Resolve the process currently holding `pid`. Fallible, unlike
+    /// [`from_id`](Self::from_id): a bare pid is not an identity, so this has to obtain the
+    /// start token, and that query can fail. [`Resolved::Gone`] if no process has the pid;
     /// [`Resolved::Unknown`] if the OS refused the query.
     pub fn from_pid(pid: RawPid) -> Resolved<Process> {
         ProcessId::of(pid).map(|id| Process { id })
-    }
-
-    #[cfg(all(test, windows))]
-    pub(crate) fn from_parts_for_test(id: ProcessId) -> Process {
-        Process { id }
     }
 
     /// This process's own handle. Infallible.
@@ -61,6 +60,14 @@ impl Process {
     /// The stable identity (`(pid, start_token)`).
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// Whether this exact identity still resolves (zombie-*inclusive*; see
+    /// [`ProcessId::exists`]). [`Existence::Gone`] also covers a recycled pid — a different
+    /// process holding it now is not this one. [`Existence::Unknown`] when the OS refuses the
+    /// query; never `Gone` for a process we could not assess.
+    pub fn exists(&self) -> Existence {
+        self.id.exists()
     }
 
     /// Whether the process is still running (zombie-exclusive; see [`ProcessId::is_alive`]).
