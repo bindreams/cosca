@@ -388,7 +388,7 @@ pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
     }
     #[cfg(windows)]
     {
-        crate::containment::windows::terminate(root.pid()).map_err(crate::error::Error::Io)
+        crate::containment::windows::terminate(root.pid())
     }
     #[cfg(not(any(unix, windows)))]
     {

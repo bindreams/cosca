@@ -9,6 +9,17 @@ fn containment_error_displays_detail() {
 }
 
 #[test]
+fn no_console_error_names_the_cause() {
+    let e = Error::NoConsole {
+        detail: "CTRL_BREAK to group 1234".into(),
+    };
+    let s = e.to_string();
+    assert!(s.contains("no attached console"), "{s}");
+    assert!(s.contains("CTRL_BREAK to group 1234"), "{s}");
+    assert!(matches!(e, Error::NoConsole { .. }));
+}
+
+#[test]
 fn quote_error_displays_kind_and_offset() {
     let e = QuoteError::new(7, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.to_string(), "unterminated single quote at offset 7");

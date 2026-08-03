@@ -93,7 +93,7 @@ impl Attached {
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]
-            Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid).map_err(Error::Io),
+            Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
         }
     }

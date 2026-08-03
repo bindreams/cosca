@@ -339,6 +339,215 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
         }
+        #[cfg(windows)]
+        "control-block-ack-break" => {
+            // Ack a CTRL_BREAK by writing "B" to the control socket and STAY ALIVE (the handler
+            // returns "handled"). Receipt is then an observed event that cannot race a later
+            // teardown, unlike a child that dies on the break.
+            use std::sync::Mutex;
+            use windows::core::BOOL;
+            use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+            // A console ctrl handler runs on an OS-spawned thread, not in signal context, so
+            // ordinary allocating I/O is fine here. It writes through its OWN clone of the
+            // socket, so it never contends with the main thread's blocking read. Only
+            // CTRL_BREAK is acked: acking any event would let a stray CTRL_C or CTRL_CLOSE
+            // satisfy a "the child received CTRL_BREAK" assertion.
+            static ACK: std::sync::OnceLock<Mutex<std::net::TcpStream>> = std::sync::OnceLock::new();
+            unsafe extern "system" fn ack(event: u32) -> BOOL {
+                if event != windows::Win32::System::Console::CTRL_BREAK_EVENT {
+                    return BOOL(0); // not handled — default disposition applies
+                }
+                // Every failure below traces and returns NOT-handled instead of fabricating a
+                // success — including a poisoned lock, same disposition as the unset-ACK case.
+                // Nothing panics: unwinding out of an `extern "system"` fn aborts.
+                let Some(m) = ACK.get() else {
+                    eprintln!("cosca_testbin: ctrl handler fired before ACK was set");
+                    return BOOL(0);
+                };
+                let Ok(mut s) = m.lock() else {
+                    eprintln!("cosca_testbin: ack socket mutex poisoned");
+                    return BOOL(0);
+                };
+                if let Err(e) = s.write_all(b"B").and_then(|()| s.flush()) {
+                    eprintln!("cosca_testbin: ack write failed: {e}");
+                }
+                BOOL(1) // handled — do not die
+            }
+
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            ACK.set(Mutex::new(sock.try_clone().unwrap()))
+                .expect("this arm runs exactly once per process");
+            // SAFETY: installing a console ctrl handler has no preconditions.
+            unsafe { SetConsoleCtrlHandler(Some(ack), true) }.expect("install ctrl handler");
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf); // blocks until the socket closes (our death)
+        }
+        #[cfg(windows)]
+        "report-console-terminate" => {
+            use std::fmt::Write as _;
+            use std::time::Duration;
+
+            // Connect FIRST. The test blocks on accept(), so a panic anywhere below must still
+            // reach it as socket EOF instead of hanging the suite.
+            let mut report_sock = std::net::TcpStream::connect(&args[2]).unwrap();
+
+            // Three-way: a zero return is also how this API reports failure, so "?" must never
+            // be able to satisfy the test's `console=0` vacuity guard. The last error is
+            // cleared first so the code read below is provably the one this call set.
+            let mut list = [0u32; 1];
+            // SAFETY: both calls are standard Win32; `list` is a valid writable slice.
+            let n = unsafe {
+                windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
+                windows::Win32::System::Console::GetConsoleProcessList(&mut list)
+            };
+            let console = if n != 0 {
+                "1"
+            } else if std::io::Error::last_os_error().raw_os_error()
+                == Some(windows::Win32::Foundation::ERROR_INVALID_HANDLE.0 as i32)
+            {
+                "0" // genuinely no console
+            } else {
+                "?" // the probe itself failed
+            };
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let ack_addr = listener.local_addr().unwrap().to_string();
+            let exe = std::env::current_exe().unwrap();
+
+            // A contained root that acks CTRL_BREAK over its own socket and keeps running.
+            let spawn_acker = |tag: &str| {
+                let mut cmd = cosca::Command::new();
+                cmd.executable(&exe)
+                    .args(["cosca_testbin", "control-block-ack-break", &ack_addr, tag])
+                    .contain();
+                let child = cmd.spawn().expect("spawn contained root");
+                let (mut sock, _) = listener.accept().expect("accept ack socket");
+                let mut t = [0u8; 1];
+                sock.read_exact(&mut t).expect("read ack tag");
+                assert_eq!(&t, tag.as_bytes(), "wrong ack tag");
+                (child, sock)
+            };
+            // Is a given pid attached to OUR console? Measured, not assumed: `console=1` alone
+            // only says WE have a console, not that the root is in it, and a blocking read
+            // gated on that weaker fact could hang forever. The acker has already handshaked
+            // its tag by the time this runs, so it has completed console registration.
+            let in_our_console = |pid: u32| {
+                // Grow to whatever count the API reports rather than capping: a too-small
+                // buffer makes it return the REQUIRED count without filling, which a fixed cap
+                // would silently read as "absent".
+                let mut buf = vec![0u32; 16];
+                loop {
+                    // SAFETY: standard Win32; `buf` is a valid writable slice.
+                    let n = unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut buf) } as usize;
+                    if n == 0 {
+                        return false; // no console at all
+                    }
+                    if n <= buf.len() {
+                        return buf[..n].contains(&pid);
+                    }
+                    buf.resize(n, 0);
+                }
+            };
+            // "1" delivered, "0" EOF (died without acking), "?" unexpected byte, "E" socket
+            // failure, "K" not read because the teardown that should have ended the child
+            // failed. A transport error must not masquerade as "no delivery".
+            let saw_break = |sock: &mut std::net::TcpStream| -> &'static str {
+                let mut b = [0u8; 1];
+                match sock.read(&mut b) {
+                    Ok(1) if &b == b"B" => "1",
+                    Ok(1) => "?",
+                    Ok(_) => "0",
+                    Err(_) => "E",
+                }
+            };
+            // Every field must stay ONE whitespace-free token: the report is parsed by
+            // splitting on whitespace, and an Error's Display is full of spaces.
+            let describe = |e: &cosca::error::Error| match e {
+                cosca::error::Error::NoConsole { .. } => "NoConsole".to_string(),
+                other => format!("Other({})", other.to_string().replace(char::is_whitespace, "_")),
+            };
+            let classify = |r: Result<(), cosca::error::Error>| match r {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => describe(&e),
+            };
+
+            // (1) terminate_tree — signal-only, so delivery is observable without escalation.
+            let (c1, mut ack1) = spawn_acker("R");
+            // One whitespace-free token per field, so the report parses unambiguously; the
+            // Display form ("job object") would split across two fields.
+            let containment_tag = match c1.containment() {
+                cosca::Containment::JobObject => "job",
+                _ => "other", // anything else fails the assertion, which is the point
+            };
+            // One unambiguous token per liveness state. Never fold `Unknown` in with
+            // `Dead`: "couldn't tell" is not evidence that the tree went away, and each
+            // assertion below is proving something concrete about survival.
+            let liveness = |l: cosca::identity::Liveness| match l {
+                cosca::identity::Liveness::Alive => "alive",
+                cosca::identity::Liveness::Dead => "dead",
+                cosca::identity::Liveness::Unknown => "unknown",
+            };
+            let c1_in_console = in_our_console(c1.id().pid());
+            let terminate = classify(c1.terminate_tree());
+            let alive_after_terminate = liveness(c1.is_alive());
+            // The blocking wait for delivery happens ONLY where delivery is guaranteed: the
+            // root was MEASURED to be in our console AND terminate reported success. Every
+            // other combination kills first and collects EOF, so it always reaches the report
+            // and fails as an assertion rather than as a suite hang. The post-kill read/reap
+            // only runs when the kill itself succeeded — on a failed kill the child is still
+            // alive and blocked, so both would block forever and discard the kill error.
+            let (terminate_break, kill_tree) = if c1_in_console && terminate == "Ok" {
+                let seen = saw_break(&mut ack1);
+                (seen, classify(c1.kill_tree()))
+            } else {
+                let killed = classify(c1.kill_tree());
+                let seen = if killed == "Ok" { saw_break(&mut ack1) } else { "K" };
+                (seen, killed)
+            };
+            if kill_tree == "Ok" {
+                c1.wait().expect("reap probe root 1");
+            }
+
+            // (2) graceful_shutdown_tree — the escalation trio, ZERO grace. Delivery is proved
+            // by (1); this leg proves the trio's own classification and that a failure leaves
+            // the tree untouched.
+            let (c2, _ack2) = spawn_acker("S");
+            let graceful = match c2.graceful_shutdown_tree(Duration::ZERO) {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => describe(&e),
+            };
+            let alive_after_graceful = liveness(c2.is_alive());
+            // "Skipped" — NOT "Ok": nothing was called on this path, so reporting a success
+            // would be a tautology. Whether the tree really went away is carried by the
+            // measured `alive_after_graceful`.
+            let graceful_cleanup = if graceful == "Ok" {
+                "Skipped".to_string()
+            } else {
+                let killed = classify(c2.kill_tree());
+                if killed == "Ok" {
+                    c2.wait().expect("reap probe root 2"); // a failed sweep leaves it alive
+                }
+                killed
+            };
+
+            let mut line = String::new();
+            write!(
+                line,
+                "console={console} c1_in_console={} containment={containment_tag} \
+                 terminate_tree={terminate} alive_after_terminate={alive_after_terminate} \
+                 terminate_break={terminate_break} kill_tree={kill_tree} graceful={graceful} \
+                 alive_after_graceful={alive_after_graceful} graceful_cleanup={graceful_cleanup}",
+                u8::from(c1_in_console),
+            )
+            .unwrap();
+            report_sock.write_all(line.as_bytes()).unwrap();
+            report_sock.flush().unwrap();
+        }
         #[cfg(unix)]
         "sid-report" => {
             // Print our session id (getsid(0)) to stdout so the test can verify

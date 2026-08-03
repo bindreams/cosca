@@ -178,14 +178,142 @@ pub(crate) fn clear_std_handle_inheritance() {
     }
 }
 
+/// Whether THIS process is attached to a console: `Ok(true)` attached, `Ok(false)` genuinely
+/// none, `Err` the probe itself failed.
+///
+/// `GetConsoleProcessList` returns 0 both for "no console" and for an API-level failure, so
+/// the two are told apart by the last OS error: a console-less caller gets 0 with
+/// `ERROR_INVALID_HANDLE`. Unlike `GetConsoleWindow` this is correct for a *windowless*
+/// console (`CREATE_NO_WINDOW`, ConPTY), which can signal fine.
+///
+/// Used only to CONFIRM a failure that already happened, never to gate one before it. Both
+/// orderings race a concurrent `AttachConsole`/`FreeConsole`; a confirmation at worst
+/// withholds the typed error, while a guard decides the outcome from state that may already
+/// be gone.
+pub(crate) fn caller_has_console() -> io::Result<bool> {
+    use windows::Win32::Foundation::{SetLastError, ERROR_INVALID_HANDLE, WIN32_ERROR};
+    use windows::Win32::System::Console::GetConsoleProcessList;
+    #[cfg(test)]
+    if fault::take_force_console_probe_error() {
+        return Err(io::Error::from_raw_os_error(
+            windows::Win32::Foundation::ERROR_INVALID_PARAMETER.0 as i32,
+        ));
+    }
+    let mut list = [0u32; 1];
+    // SAFETY: both calls are standard Win32; `list` is a valid writable slice. A buffer
+    // smaller than the attached-process count is fine — the return is then the required
+    // count, and only "is it zero" is read here. The last error is cleared first: a zero
+    // return is only meaningful together with the code THIS call set, and the live caller
+    // reaches here right after a `GenerateConsoleCtrlEvent` that itself failed with
+    // `ERROR_INVALID_HANDLE` — reading that stale value would let the probe "confirm" an
+    // absence it never measured.
+    let n = unsafe {
+        SetLastError(WIN32_ERROR(0));
+        GetConsoleProcessList(&mut list)
+    };
+    if n != 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_INVALID_HANDLE.0 as i32) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+/// Classify a `GenerateConsoleCtrlEvent` failure. Pure — the Win32 result and the console
+/// probe are both parameters — so every arm is unit-testable without hooking the OS calls the
+/// live path depends on (the same injection idiom as `treewalk::descendants_with`).
+///
+/// `err` is the `io::Error` converted from `windows::core::Error`, so its `raw_os_error` is
+/// the **HRESULT**, not the bare Win32 code.
+///
+/// `Error::NoConsole` is returned ONLY when the failure code matches AND the probe confirms
+/// there is no console. A contradicted probe, a failed probe, or any other failure code keeps
+/// the raw `Error::Io`: the typed variant must never assert a cause the process just measured
+/// to be false.
+pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io::Result<bool>) -> crate::error::Error {
+    use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
+    let no_console = windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0).0;
+    if err.raw_os_error() == Some(no_console) && matches!(console, Ok(true)) {
+        // warn, not debug: the crate's core mapping (this code <=> no console) was just
+        // contradicted. Either another thread attached a console in the confirmation gap, or
+        // the mapping does not hold on this host — both deserve to be visible, and neither
+        // may be reported as an ordinary Io passthrough without a trace.
+        log::warn!(
+            "CTRL_BREAK to group {pid} failed with ERROR_INVALID_HANDLE, but a console is \
+             attached; surfacing the raw error rather than claiming NoConsole"
+        );
+        return crate::error::Error::Io(err);
+    }
+    if err.raw_os_error() == Some(no_console) {
+        if let Err(probe) = &console {
+            log::warn!("CTRL_BREAK to group {pid}: the console probe failed ({probe}); cannot classify");
+            return crate::error::Error::Io(err);
+        }
+        return crate::error::Error::NoConsole {
+            detail: format!(
+                "cannot send CTRL_BREAK to process group {pid}: this process has no attached \
+                 console. A GUI-subsystem binary, a service, or a detached spawn cannot deliver \
+                 console control events — Windows delivers them only within the caller's \
+                 console. Attach a console before spawning the tree, or use kill_tree() for a \
+                 hard teardown."
+            ),
+        };
+    }
+    // The probe cannot change this classification, but if it ALSO failed that is a second,
+    // independent OS failure and the arms above log theirs — say so here too rather than
+    // dropping it silently.
+    if let Err(probe) = &console {
+        log::warn!("CTRL_BREAK to group {pid} failed, and the console probe also failed ({probe})");
+    }
+    crate::error::Error::Io(err)
+}
+
 /// Send `CTRL_BREAK_EVENT` to the process group rooted at `pid`.
 /// The child was spawned with `CREATE_NEW_PROCESS_GROUP`, making it the leader;
 /// targeting its `pid` reaches the whole group without affecting the parent's console.
-/// Note: `CTRL_C` cannot be group-targeted; `CTRL_BREAK` is the only option here.
-pub(crate) fn terminate(pid: u32) -> io::Result<()> {
+/// `CTRL_C` cannot be group-targeted; `CTRL_BREAK` is the only option here.
+///
+/// **Requires the CALLER to have a console.** That is the failure this classifies; Windows
+/// can also report `ERROR_INVALID_PARAMETER` for a pid that names no process at all, which
+/// stays a raw `Error::Io`. A group that merely *drained* is not a failure — measured, a dead
+/// group leader still returns success. The failure code is authoritative; the console probe that follows only *confirms* it, so a
+/// console state change in the gap degrades the result to a raw `Error::Io` rather than to a
+/// false `NoConsole`. Targeting a group that is in a *different* console is NOT reported by
+/// Windows at all — it returns success and delivers nothing.
+pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
     // SAFETY: standard Win32 call targeting the child's own console group.
-    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) }.map_err(io::Error::from)
+    match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
+        Ok(()) => Ok(()),
+        Err(e) => Err(classify_ctrl_event_failure(
+            pid,
+            io::Error::from(e),
+            caller_has_console(),
+        )),
+    }
+}
+
+/// Test-only: force the NEXT `caller_has_console` on THIS thread to report a probe failure,
+/// so that arm's production is covered — a live `GetConsoleProcessList` cannot be made to
+/// fail. Take semantics, mirroring `treewalk::fault`.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    thread_local! {
+        static FORCE_CONSOLE_PROBE_ERROR: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn set_force_console_probe_error(on: bool) {
+        FORCE_CONSOLE_PROBE_ERROR.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_console_probe_error() -> bool {
+        FORCE_CONSOLE_PROBE_ERROR.with(|f| f.replace(false))
+    }
+    pub(crate) fn armed() -> bool {
+        FORCE_CONSOLE_PROBE_ERROR.with(|f| f.get())
+    }
 }
 
 /// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
