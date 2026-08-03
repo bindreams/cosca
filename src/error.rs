@@ -86,6 +86,12 @@ pub enum Error {
     /// A containment mechanism could not be established or torn down.
     #[error("process containment failed: {detail}")]
     Containment { detail: String },
+    /// The calling process has no attached console, so Windows' console-group graceful
+    /// signal (`CTRL_BREAK`) cannot be delivered — the caller is a GUI-subsystem binary,
+    /// a service, or was spawned detached. Only the *graceful* tree ops are affected;
+    /// `kill_tree` needs no console.
+    #[error("no attached console for the graceful console-group signal: {detail}")]
+    NoConsole { detail: String },
     /// Privilege elevation could not be completed at runtime.
     #[error("elevation failed ({kind}): {detail}")]
     Elevation { kind: ElevationErrorKind, detail: String },

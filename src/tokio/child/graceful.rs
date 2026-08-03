@@ -65,6 +65,22 @@ impl Child {
     /// `Unsupported` otherwise — use [`graceful_shutdown`](Child::graceful_shutdown) for a lone
     /// child). Works on all platforms.
     ///
+    /// **Windows: what this actually signals, and what the grace costs.** `CTRL_BREAK` goes
+    /// to the root's **process group** only. A nested contained descendant leads its own
+    /// group and never receives it — so it does not exit during the grace, idles through the
+    /// whole window, and is then killed by the sweep. The call reports no error either way:
+    /// on Windows the grace is spent regardless of how much of the tree the signal reached.
+    /// Size it accordingly, and treat [`kill_tree`](Child::kill_tree) as the only op that
+    /// reaches every member.
+    ///
+    /// **The caller must also have a console.** The event is deliverable only within the
+    /// *calling* process's console, so a GUI-subsystem binary, a service, or anything spawned
+    /// detached fails up front: no signal is sent, no grace is waited, and the tree is left
+    /// running for the caller to `kill_tree` (which needs no console). The cause is
+    /// classified best-effort — usually [`Error::NoConsole`](crate::error::Error::NoConsole),
+    /// but a raw `Error::Io` when the crate cannot confirm it — so treat **any** error here
+    /// as "not delivered, tree still running".
+    ///
     /// The grace-wait is **non-reaping** (watches the root's exit without collecting it), so the
     /// subsequent hard sweep runs while the root's pid — and thus the `killpg` group id — is
     /// still valid; reaping first could let `killpg` hit a recycled group. The sweep is

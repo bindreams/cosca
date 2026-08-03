@@ -387,6 +387,19 @@ impl Child {
     /// `Unsupported` otherwise). Cooperative best-effort: on the `TreeWalk` mechanism a
     /// descendant whose identity transiently fails to resolve is intentionally left
     /// unsignaled; [`kill_tree`](Child::kill_tree) is the guaranteed hard teardown.
+    ///
+    /// **Windows: what this actually signals.** `CTRL_BREAK` is delivered to the root's
+    /// **process group**, not to the tree. A nested contained descendant leads its own
+    /// group and never receives it; only [`kill_tree`](Child::kill_tree) reaches every
+    /// member.
+    ///
+    /// **And it needs the caller to have a console.** The event is deliverable only within
+    /// the *calling* process's console, so a GUI-subsystem binary, a service, or anything
+    /// spawned detached cannot deliver it. The failure is classified best-effort: usually
+    /// [`Error::NoConsole`](crate::error::Error::NoConsole), but a raw `Error::Io` when the
+    /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
+    /// tree is still running" rather than keying a fallback on the variant alone. Attach a
+    /// console before spawning the tree, or use `kill_tree`, which needs none.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         self.attached.terminate(self.id.pid())
