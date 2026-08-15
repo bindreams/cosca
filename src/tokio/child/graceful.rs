@@ -95,6 +95,19 @@ impl Child {
     /// a graceful root exit (survivors may remain; the root is still reaped first when its
     /// exit was observed, otherwise the child stays owned for `Drop`).
     ///
+    /// **A refused or unconfirmed graceful signal never skips the grace wait and hard sweep
+    /// either.** If the initial group signal reaches a live member that refuses it, or a
+    /// member's post-signal state cannot be confirmed
+    /// ([`Error::Containment`](crate::error::Error::Containment) or
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) with no I/O `source` — see
+    /// [`terminate_tree`](Child::terminate_tree)), the grace is still waited and the sweep
+    /// still runs; the held error resurfaces only after a successful sweep and reap (mirroring
+    /// how a watch failure is held above), so a member that only needed the follow-up `SIGKILL`
+    /// does not strand the rest of the tree. A genuine listing-mechanism failure (an
+    /// `Unassessable` with an I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`,
+    /// it returns immediately: no signal is confirmed sent, so there is nothing for a grace
+    /// wait or sweep to act on yet.
+    ///
     /// # Runtime
     ///
     /// On Unix, needs a runtime with the IO **and** time drivers enabled (the
@@ -105,13 +118,35 @@ impl Child {
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         // terminate_tree's own require_contained guard fires before any signal, so an
         // uncontained child errors up front.
-        self.terminate_tree()?;
+        #[cfg(test)]
+        let term_result = match fault::take_force_terminate() {
+            fault::Forced::None => self.terminate_tree(),
+            kind => Err(fault::forced_terminate_error(kind)),
+        };
+        #[cfg(not(test))]
+        let term_result = self.terminate_tree();
+
+        // Hold-and-continue ONLY for the error shapes #61's fix can produce as ORDINARY
+        // outcomes — see the sync `src/child/graceful.rs` twin's identical match for the full
+        // rationale.
+        let term = match term_result {
+            Ok(()) => Ok(()),
+            Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
+                log::debug!(
+                    "graceful_shutdown_tree({id}): terminate_tree refused (subsumed if the sweep also fails): {e}",
+                    id = self.id().pid()
+                );
+                Err(e)
+            }
+            Err(e) => return Err(e), // unchanged pre-existing behavior: no signal sent, no grace, no sweep
+        };
+
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
-        // drained (the survivor-sweep scenario). A sweep Err subsumes any watch Err; it must
-        // propagate before the reap on a LIVE root (waiting unswept would hang), but once the
-        // root's exit was observed, the reap runs first so no zombie is stranded.
+        // drained (the survivor-sweep scenario). A sweep Err subsumes any watch or terminate Err;
+        // it must propagate before the reap on a LIVE root (waiting unswept would hang), but once
+        // the root's exit was observed, the reap runs first so no zombie is stranded.
         if let Err(e) = &watch {
             log::debug!(
                 "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
@@ -120,17 +155,85 @@ impl Child {
         }
         if let Err(sweep) = self.kill_tree() {
             if matches!(watch, Ok(true)) {
-                // The root is a zombie — this reap cannot hang (which is why it is gated on the
-                // observed exit). The sweep Err stays the verdict: the status, and even a distinct
-                // reap Err (a wait failure on the zombie), are subsumed — live survivors are the
-                // actionable failure, and the child stays owned for Drop's teardown.
-                let _ = self.wait().await;
+                // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
+                // (below) is already the error this call reports, so a failure here is
+                // secondary — but every other discarded error in this module is still logged,
+                // and a silent one here would obscure a second, independent failure mode.
+                if let Err(e) = self.wait().await {
+                    log::debug!(
+                        "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {e}",
+                        id = self.id().pid()
+                    );
+                }
             }
             return Err(sweep);
         }
         let status = self.wait().await?;
         watch?;
+        term?;
         Ok(status)
+    }
+}
+
+/// Test-only fault-injection seam for a forced `terminate_tree` failure inside
+/// `graceful_shutdown_tree`, mirroring `crate::wait::fault`'s shape. Duplicated (not shared)
+/// with `crate::child::graceful::fault` — see this crate's `#61` implementation plan, Task 7,
+/// "Structural note", for why: `mod graceful;` is private in both `src/child.rs` and
+/// `src/tokio/child.rs`, so a seam here is not nameable from the sync tree without widening
+/// that visibility, which is out of scope here.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    /// Which `terminate_tree` failure to fabricate on the next call, on this thread.
+    /// `Containment` and `UnassessablePerMember` exercise the hold-and-continue path this
+    /// task adds — both ORDINARY #61 outcomes, a signal was attempted. `Unsupported` and
+    /// `UnassessableMechanism` exercise fail-fast paths: `Unsupported` models the
+    /// PRE-EXISTING console-less-caller shape (`NoConsole`/`Unsupported`) this task must not
+    /// touch; `UnassessableMechanism` models `Error::Unassessable { source: Some(_), .. }` —
+    /// `group::state`'s own listing failure, `crate::child::is_teardown_mechanism_failure`'s
+    /// classification for the identical shape reaching `Child::drop` — which this task's
+    /// `graceful_shutdown_tree` match must treat the SAME way (fail-fast), not fold into the
+    /// per-member `Unassessable{source: None}` hold-and-continue case.
+    #[derive(Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) enum Forced {
+        #[default]
+        None,
+        Containment,
+        UnassessablePerMember,
+        UnassessableMechanism,
+        Unsupported,
+    }
+    thread_local! {
+        static FORCE_TERMINATE: Cell<Forced> = const { Cell::new(Forced::None) };
+    }
+    pub(crate) fn set_force_terminate(kind: Forced) {
+        FORCE_TERMINATE.with(|f| f.set(kind));
+    }
+    pub(crate) fn take_force_terminate() -> Forced {
+        FORCE_TERMINATE.with(|f| f.replace(Forced::None))
+    }
+    // No `armed()` here — see the sync twin's identical note.
+    pub(crate) fn forced_terminate_error(kind: Forced) -> crate::error::Error {
+        match kind {
+            Forced::None => unreachable!("forced_terminate_error called with Forced::None"),
+            Forced::Containment => crate::error::Error::Containment {
+                detail: "forced term_group refusal (test seam)".into(),
+            },
+            Forced::UnassessablePerMember => crate::error::Error::Unassessable {
+                detail: "forced per-member unconfirmed state (test seam) — group::decide's shape".into(),
+                source: None,
+            },
+            Forced::UnassessableMechanism => crate::error::Error::Unassessable {
+                detail: "forced listing-mechanism failure (test seam) — group::state's shape".into(),
+                source: Some(std::io::Error::other("forced (test seam)")),
+            },
+            Forced::Unsupported => crate::error::Error::Unsupported {
+                op: "terminate_tree".into(),
+                platform: "test",
+                detail: "forced (test seam) — models NoConsole/Unsupported, NOT a #61 refusal".into(),
+            },
+        }
     }
 }
 
