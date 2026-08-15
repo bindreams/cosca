@@ -73,7 +73,9 @@ fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member)
     for _ in 0..2 {
         let (s, _) = listener.accept().expect("accept");
         let mut line = String::new();
-        BufReader::new(s.try_clone().expect("clone")).read_line(&mut line).expect("read tag+pid");
+        BufReader::new(s.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("read tag+pid");
         let (tag, pid) = line.trim().split_at(1);
         let m = Member {
             pid: pid.parse().expect("member pid"),
@@ -100,13 +102,18 @@ fn assert_escaped(root_pid: u32, grand_pid: u32) {
     let ppid: u32 = it.next().expect("ppid").parse().expect("ppid number");
     let pgid: u32 = it.next().expect("pgid").parse().expect("pgid number");
     assert_eq!(ppid, 1, "precondition: the orphan must be reparented to launchd");
-    assert_ne!(pgid, root_pid, "precondition: the orphan must have left the root's process group");
+    assert_ne!(
+        pgid, root_pid,
+        "precondition: the orphan must have left the root's process group"
+    );
 }
 
 /// Cleanup that is never an assertion: SIGKILL anything the test deliberately left running.
 fn reap(pids: &[u32]) {
     for pid in pids {
-        let _ = std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
 }
 
@@ -195,7 +202,9 @@ fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Child, Me
     for _ in 0..2 {
         let (s, _) = listener.accept().expect("accept");
         let mut line = String::new();
-        BufReader::new(s.try_clone().expect("clone")).read_line(&mut line).expect("read tag+pid");
+        BufReader::new(s.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("read tag+pid");
         let (tag, pid) = line.trim().split_at(1);
         let m = Member {
             pid: pid.parse().expect("member pid"),
@@ -250,14 +259,18 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     for slot in 64..=90 {
         cmd.fd(slot, cosca::Stdio::null()).expect("map a real child fd");
     }
-    let child = cmd.spawn().expect("spawn the orphan tree with a wide reserved-fd range");
+    let child = cmd
+        .spawn()
+        .expect("spawn the orphan tree with a wide reserved-fd range");
 
     let mut root = None;
     let mut grand = None;
     for _ in 0..2 {
         let (s, _) = listener.accept().expect("accept");
         let mut line = String::new();
-        BufReader::new(s.try_clone().expect("clone")).read_line(&mut line).expect("read tag+pid");
+        BufReader::new(s.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("read tag+pid");
         let (tag, pid) = line.trim().split_at(1);
         let m = Member {
             pid: pid.parse().expect("member pid"),

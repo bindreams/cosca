@@ -282,7 +282,7 @@ fn main() {
             }
             let mut relay = relay.spawn().unwrap();
             relay.wait().unwrap(); // its exit is the reparenting event
-            // Same wire format as the grandchild, so the test parses one shape.
+                                   // Same wire format as the grandchild, so the test parses one shape.
             run_control_echo_pid(&addr, "R");
         }
         #[cfg(unix)]
