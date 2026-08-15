@@ -288,9 +288,12 @@ const DROP_SAMPLE_CAP: usize = 5;
 /// contain a non-positive pid at all. Returns the edges, how many attempted joins failed,
 /// and a bounded sample of the failed pids for logging.
 fn join_ppids(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>) {
-    // A plain `Vec::with_capacity`, not a fallible reservation - deliberately outside the
-    // no-abort rule's scope, see the Global Constraints note. `pids.len()` over-estimates,
-    // since some entries are filtered or fail the join.
+    // A plain `Vec::with_capacity`, not a fallible reservation: the only caller,
+    // `treewalk::descendants_with`, already does an unconditional `to_vec` and
+    // `Vec::with_capacity` on this same data one frame up, so reserving fallibly here would
+    // relocate the abort rather than remove it - while making this function's refusal path
+    // report an allocation failure as a successfully empty process tree. `pids.len()`
+    // over-estimates, since some entries are filtered or fail the join.
     let mut out = Vec::with_capacity(pids.len());
     let mut dropped = 0usize;
     let mut sample = Vec::new();
