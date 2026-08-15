@@ -10,8 +10,8 @@ use super::super::{RawPid, Resolved};
 
 /// `struct kinfo_proc` (LP64): `extern_proc` head + opaque `eproc` tail.
 #[repr(C)]
-pub(super) struct kinfo_proc {
-    pub(super) kp_proc: extern_proc,
+pub(crate) struct kinfo_proc {
+    pub(crate) kp_proc: extern_proc,
     kp_eproc: [u8; 352],
 }
 
@@ -46,13 +46,13 @@ const _: () = assert!(kinfo_proc::E_PPID_OFFSET + std::mem::size_of::<libc::pid_
 /// `struct extern_proc` (LP64 user copy, from XNU's proc.h). Kernel pointers are
 /// represented as `u64` (they are opaque user_addr_t values in the sysctl copy).
 #[repr(C)]
-pub(super) struct extern_proc {
-    pub(super) p_un: p_un,
+pub(crate) struct extern_proc {
+    pub(crate) p_un: p_un,
     p_vmspace: u64,
     p_sigacts: u64,
-    p_flag: libc::c_int,
+    pub(crate) p_flag: libc::c_int,
     pub(super) p_stat: libc::c_char,
-    p_pid: libc::pid_t,
+    pub(crate) p_pid: libc::pid_t,
     p_oppid: libc::pid_t,
     p_dupfd: libc::c_int,
     user_stack: u64,
@@ -91,9 +91,9 @@ pub(super) struct extern_proc {
 }
 
 #[repr(C)]
-pub(super) union p_un {
+pub(crate) union p_un {
     p_st1: run_sleep_queue,
-    pub(super) p_starttime: libc::timeval,
+    pub(crate) p_starttime: libc::timeval,
 }
 
 #[repr(C)]
@@ -114,6 +114,15 @@ struct itimerval {
 // against the running kernel.
 const _: () = assert!(std::mem::size_of::<kinfo_proc>() == 648);
 const _: () = assert!(std::mem::size_of::<extern_proc>() == 296);
+
+/// `p_flag`'s "system process" bit, source-verified against the Xcode Command Line Tools
+/// SDK: `#define P_SYSTEM 0x00000200` in `usr/include/sys/proc.h`. xnu's `killpg1` excludes
+/// it from a process-group signal alongside — but independently of — `initproc` (pid 1),
+/// confirmed against xnu's own `bsd/kern/kern_sig.c`. `containment::unix::group` restates
+/// both exclusions (`excluded_from_sigkill_resend`). `kinfo_tests.rs` cross-checks this bit's
+/// value against a second, independently-issued sysctl query and, where a live process allows
+/// it, `proc_pidinfo`'s own `PROC_FLAG_SYSTEM` bit.
+pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a

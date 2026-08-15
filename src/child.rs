@@ -25,11 +25,45 @@ mod lifecycle;
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[cfg(test)]
+#[path = "child_tests.rs"]
+mod child_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
     Reader(PipeReader),
     Writer(PipeWriter),
+}
+
+/// True only when there is POSITIVE evidence that a contained root's pid was reaped **and**
+/// recycled: it now resolves to a DIFFERENT identity than `original`, and that different
+/// identity is confirmed [`Liveness::Alive`](crate::identity::Liveness::Alive) — not merely
+/// resolvable, since a not-yet-reaped zombie also resolves. Reaping alone, without a
+/// subsequent recycle, is harmless to a pgid-based mechanism: `killpg` on an absent pgid
+/// returns `ESRCH`, which `signal_group`/`verify` in `containment::unix` already treat as
+/// `Cleared`. [`Existence`](crate::identity::Existence) cannot distinguish these two cases — it
+/// collapses "reaped, nothing there yet" and "reaped, a different live process now holds the
+/// pid" into the same `Gone` — which is why `kill_tree`/`terminate_tree`'s precondition assert
+/// needs this finer, two-value read (a fresh [`Resolved`](crate::identity::Resolved) plus a
+/// [`Liveness`](crate::identity::Liveness) reading of whatever it found) instead.
+///
+/// A pure function of already-resolved values, deliberately: it is unit-tested (`child_tests.rs`)
+/// with synthetic `ProcessId`s rather than by racing the kernel's own pid allocator to construct
+/// a genuine recycle — that would be synchronizing on luck, not a real test.
+#[cfg_attr(not(unix), allow(dead_code))] // only called from the `#[cfg(unix)]` debug_assert!s below
+                                         // and in `tokio/child.rs`; still unit-tested everywhere.
+pub(crate) fn root_pid_was_recycled(
+    original: ProcessId,
+    current: crate::identity::Resolved<ProcessId>,
+    current_liveness: crate::identity::Liveness,
+) -> bool {
+    match current {
+        crate::identity::Resolved::Found(now) => {
+            now != original && current_liveness == crate::identity::Liveness::Alive
+        }
+        crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => false,
+    }
 }
 
 /// A spawned child process the crate owns.
@@ -134,8 +168,68 @@ impl Child {
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use `kill()` for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
+    ///
+    /// On the Unix process-group and session mechanisms this returns
+    /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
+    /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
+    /// tree is still running and this process cannot bring it down.
+    ///
+    /// **This guarantee, and its converse — that `Ok` is positive proof the group cleared —
+    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: `TreeWalk`
+    /// does not yet propagate a live refuser's outcome into this call's result (#63).
+    ///
+    /// **A `hidepid`-restricted Linux host can still return `Ok` with a live refuser left
+    /// running.** `/proc` is this mechanism's only way to confirm the group cleared, and
+    /// `hidepid=invisible`/`hidepid=2` hides a foreign-uid process from it entirely — the
+    /// ordinary setuid-in-a-container case. That member is then never listed, never
+    /// classified, never signaled, and the group can report cleared regardless. No fix
+    /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
+    /// value is not trustworthy evidence either.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // Precondition (sibling #54's territory — asserted, not fixed, here): if the pgid-based
+        // mechanism's (Attached::ProcessGroup — covers both Containment::ProcessGroup and
+        // Containment::Session, which also lands in this variant at spawn time) leader pid has
+        // been reaped AND RECYCLED onto a DIFFERENT, LIVE process group, `killpg` would signal
+        // that unrelated group instead. Reaping alone is harmless — `killpg` on an absent pgid
+        // returns `ESRCH`, which `containment::unix::signal_group`/`verify` already treat as
+        // `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle (see
+        // `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
+        // reachable on the ORDINARY spawn-then-teardown path for any fast-exiting child, not
+        // only via an explicit `wait()` before `kill_tree()`/`terminate_tree()`: `std`'s
+        // `SharedChild::new` (inside `Command::spawn`, see `child/spawn.rs`'s own comment on
+        // this) can reap a fast-exiting leader itself, before the caller ever gets a `Child`
+        // handle back — this assert can therefore fire on the very first call the caller makes,
+        // whatever ordering they use. Gated to this ONE mechanism: a recycled pgid is
+        // meaningless for Cgroup (keyed by an fd), JobObject (no pgid), Delegated (no
+        // mechanism), or TreeWalk (re-resolves identity per member, immune to this by
+        // construction) — asserting it there would be a false alarm unrelated to what this
+        // precondition is about. An OS refusal to answer either resolve (`Resolved::Unknown` /
+        // `Liveness::Unknown`) is permitted through: this asserts against POSITIVE evidence of a
+        // violation, not against every case we merely couldn't rule out.
+        //
+        // `#[cfg(unix)]`: `Attached::ProcessGroup` is itself a Unix-only variant (see
+        // `containment/dispatch.rs`) — referencing it unconditionally does not compile on
+        // Windows (`cargo check --target x86_64-pc-windows-msvc` confirmed E0599 without this
+        // gate). Windows has no pgid to recycle, so there is nothing for this precondition to
+        // assert there.
+        #[cfg(unix)]
+        debug_assert!(
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+                let now = ProcessId::of(self.id.pid());
+                let now_liveness = match now {
+                    crate::identity::Resolved::Found(id) => id.is_alive(),
+                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
+                        crate::identity::Liveness::Unknown
+                    }
+                };
+                !root_pid_was_recycled(self.id, now, now_liveness)
+            },
+            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
+             recycled onto a different, live process; a pgid-based mechanism would now signal an \
+             unrelated process group (see #54)",
+            self.id.pid()
+        );
         let group_result = self.attached.hard_kill();
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
@@ -169,8 +263,36 @@ impl Child {
     /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
     /// tree is still running" rather than keying a fallback on the variant alone. Attach a
     /// console before spawning the tree, or use `kill_tree`, which needs none.
+    ///
+    /// On the Unix process-group and session mechanisms this returns
+    /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
+    /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
+    /// tree is still running and this process cannot bring it down.
+    ///
+    /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
+    /// `ProcessGroup`/`Session`-only scope of this guarantee (`TreeWalk` is #63's territory),
+    /// and the residual `hidepid` gap on Linux.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // See kill_tree's identical precondition assert for the full rationale, including the
+        // `#[cfg(unix)]` gate (Attached::ProcessGroup does not exist on Windows).
+        #[cfg(unix)]
+        debug_assert!(
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+                let now = ProcessId::of(self.id.pid());
+                let now_liveness = match now {
+                    crate::identity::Resolved::Found(id) => id.is_alive(),
+                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
+                        crate::identity::Liveness::Unknown
+                    }
+                };
+                !root_pid_was_recycled(self.id, now, now_liveness)
+            },
+            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
+             recycled onto a different, live process; a pgid-based mechanism would now signal an \
+             unrelated process group (see #54)",
+            self.id.pid()
+        );
         self.attached.terminate(self.proc.id())
     }
 
@@ -243,6 +365,34 @@ impl Child {
     }
 }
 
+/// Whether a `hard_kill`/`terminate` result is still a genuine teardown MECHANISM failure —
+/// as opposed to `Error::Containment` (a live member refused the signal), both ORDINARY,
+/// expected outcomes after #61's fix and specifically the scenario it exists to report
+/// honestly, not bugs. Shared by both `Child::drop` impls (sync here, async in
+/// `src/tokio/child.rs`) so the classification has exactly one implementation instead of two
+/// hand-copied ones drifting apart.
+///
+/// **`Error::Unassessable` is NOT uniformly one or the other — it splits on `source`.**
+/// `group::decide` produces `source: None` when the group WAS listed successfully but one or
+/// more of its individual members could not be confirmed cleared (`check_or_signal` /
+/// `check_or_signal_linux_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
+/// — an ordinary, expected outcome of the feature this issue adds, not a bug. `signal_group`'s
+/// `pgid <= 0` guard ALSO produces `source: None`, for a different but equally ORDINARY
+/// reason: a directly and deliberately TESTED input-validation refusal
+/// (`kill_group_and_term_group_reject_non_positive_pgid`, Task 5), not a "should never
+/// happen" internal contract violation — this function never got as far as attempting
+/// anything, the same way `group::decide`'s per-member case never got a confirmable answer.
+/// Neither provenance indicates the teardown MECHANISM'S OWN plumbing broke, which is the
+/// actual line this classifier draws. `group::state` produces `source: Some(io_error)` when
+/// `converge` itself returned `Err` — the listing syscall (`members()`'s `sysctl`/`/proc`
+/// scan) failed outright, before any member was even examined. THAT is a failure of the
+/// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
+/// statement about any member or any input — so it, alone, is treated as a mechanism failure
+/// here.
+pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
+    matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -251,7 +401,18 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
-        let _ = self.attached.hard_kill();
+        let tree = self.attached.hard_kill();
+        if let Err(e) = &tree {
+            // A live member refused, or couldn't be confirmed — visible, not silently
+            // discarded, on the RAII teardown path most callers actually hit. A genuine
+            // mechanism failure (is_teardown_mechanism_failure) is a debug_assert instead,
+            // matching the async twin's disposition for the identical condition.
+            debug_assert!(
+                !is_teardown_mechanism_failure(e),
+                "contained-tree teardown failed on sync Drop: {e:?}"
+            );
+            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+        }
         self.proc.teardown_on_drop();
     }
 }

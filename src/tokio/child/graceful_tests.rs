@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::fault as term_fault;
 use crate::wait::fault;
 
 #[tokio::test]
@@ -84,4 +85,158 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
         !status.success(),
         "escalated child cannot report success, got {status:?}"
     );
+}
+
+// Async twin of `graceful_tree_terminate_refusal_still_sweeps_and_reaps` in
+// `src/child/graceful_tests.rs` — see there for the full rationale.
+#[tokio::test]
+async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    term_fault::set_force_terminate(term_fault::Forced::Containment);
+    // A successful sweep is fresher, positive proof the group cleared, superseding the held
+    // refusal — the call must report `Ok`, not resurface the disproved `Containment` error.
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("a successful sweep must supersede the forced terminate refusal");
+    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
+        ),
+        "the terminate-refusal trace specifically must fire"
+    );
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!(
+                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                pid = id.pid()
+            )
+        ),
+        "the refusal must be logged as discarded, not silently dropped"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "root must be swept AND reaped despite the forced terminate refusal"
+    );
+    #[cfg(windows)]
+    let _ = id;
+}
+
+// Async twin of `graceful_tree_unassessable_per_member_still_sweeps_and_reaps`.
+#[tokio::test]
+async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    term_fault::set_force_terminate(term_fault::Forced::UnassessablePerMember);
+    // Same supersession as the `Containment` test above: the sweep's success disproves the
+    // held per-member-unconfirmed state, so the call must report `Ok`.
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("a successful sweep must supersede the forced unassessable state");
+    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
+        ),
+        "the terminate-refusal trace specifically must fire"
+    );
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!(
+                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                pid = id.pid()
+            )
+        ),
+        "the refusal must be logged as discarded, not silently dropped"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "root must be swept AND reaped despite the forced unassessable state"
+    );
+    #[cfg(windows)]
+    let _ = id;
+}
+
+// Async twin of `graceful_tree_unassessable_mechanism_failure_fails_fast`.
+#[tokio::test]
+async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect_err("the forced listing-mechanism failure must surface immediately");
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { source: Some(_), .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "a listing-mechanism failure must return before any grace wait or sweep"
+    );
+    // Clean up: the child is still running by design (no sweep happened above).
+    let _ = child.kill_tree();
+    let _ = child.wait().await;
+}
+
+// Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.
+#[tokio::test]
+async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    term_fault::set_force_terminate(term_fault::Forced::Unsupported);
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect_err("the forced Unsupported error must surface immediately");
+    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "a non-containment terminate error must return before any grace wait or sweep"
+    );
+    // Clean up: the child is still running by design (no sweep happened above).
+    let _ = child.kill_tree();
+    let _ = child.wait().await;
 }

@@ -54,9 +54,7 @@ impl Attached {
         match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => {
-                crate::containment::unix::kill_group(*pgid).map_err(crate::error::Error::Io)
-            }
+            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => {
                 leaf.hard_kill();
@@ -89,7 +87,7 @@ impl Attached {
                 })
             }
             #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid).map_err(Error::Io),
+            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group(*pgid),
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]

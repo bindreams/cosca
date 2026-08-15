@@ -14,7 +14,7 @@ fn tail(stat: &[u8]) -> Option<&str> {
 }
 
 /// Field 22 (`starttime`) as RAW jiffies since boot.
-pub(super) fn parse_starttime_jiffies(stat: &[u8]) -> Option<u64> {
+pub(crate) fn parse_starttime_jiffies(stat: &[u8]) -> Option<u64> {
     tail(stat)?.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
@@ -27,6 +27,12 @@ pub(super) fn parse_state(stat: &[u8]) -> Option<u8> {
 /// containment tree-walk's `/proc` enumerator; comm-safe via the same anchor.
 pub(crate) fn parse_ppid(stat: &[u8]) -> Option<u32> {
     tail(stat)?.split_whitespace().nth(1)?.parse::<u32>().ok()
+}
+
+/// Field 5 (`pgrp`, index 2 of the tail) — the process-group id. Used by the
+/// containment group-membership listing; comm-safe via the same anchor.
+pub(crate) fn parse_pgrp(stat: &[u8]) -> Option<u32> {
+    tail(stat)?.split_whitespace().nth(2)?.parse::<u32>().ok()
 }
 
 /// Decide whether a process is *running* from its raw `/proc/<pid>/stat` bytes: the

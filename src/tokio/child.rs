@@ -367,8 +367,45 @@ impl Child {
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
+    ///
+    /// On the Unix process-group and session mechanisms this returns
+    /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
+    /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
+    /// tree is still running and this process cannot bring it down.
+    ///
+    /// **This guarantee, and its converse — that `Ok` is positive proof the group cleared —
+    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: `TreeWalk`
+    /// does not yet propagate a live refuser's outcome into this call's result (#63).
+    ///
+    /// **A `hidepid`-restricted Linux host can still return `Ok` with a live refuser left
+    /// running.** `/proc` is this mechanism's only way to confirm the group cleared, and
+    /// `hidepid=invisible`/`hidepid=2` hides a foreign-uid process from it entirely — the
+    /// ordinary setuid-in-a-container case. That member is then never listed, never
+    /// classified, never signaled, and the group can report cleared regardless. No fix
+    /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
+    /// value is not trustworthy evidence either.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.require_contained()?;
+        // Precondition (sibling #54's territory — asserted, not fixed, here): see the sync
+        // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including why
+        // this is gated to `Attached::ProcessGroup` alone, and why it is `#[cfg(unix)]`).
+        #[cfg(unix)]
+        debug_assert!(
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+                let now = ProcessId::of(self.id.pid());
+                let now_liveness = match now {
+                    crate::identity::Resolved::Found(id) => id.is_alive(),
+                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
+                        crate::identity::Liveness::Unknown
+                    }
+                };
+                !crate::child::root_pid_was_recycled(self.id, now, now_liveness)
+            },
+            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
+             recycled onto a different, live process; a pgid-based mechanism would now signal an \
+             unrelated process group (see #54)",
+            self.id.pid()
+        );
         let group_result = self.attached.hard_kill();
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
@@ -400,8 +437,36 @@ impl Child {
     /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
     /// tree is still running" rather than keying a fallback on the variant alone. Attach a
     /// console before spawning the tree, or use `kill_tree`, which needs none.
+    ///
+    /// On the Unix process-group and session mechanisms this returns
+    /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
+    /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
+    /// tree is still running and this process cannot bring it down.
+    ///
+    /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
+    /// `ProcessGroup`/`Session`-only scope of this guarantee (`TreeWalk` is #63's territory),
+    /// and the residual `hidepid` gap on Linux.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // See kill_tree's identical precondition assert for the full rationale, including the
+        // `#[cfg(unix)]` gate (Attached::ProcessGroup does not exist on Windows).
+        #[cfg(unix)]
+        debug_assert!(
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+                let now = ProcessId::of(self.id.pid());
+                let now_liveness = match now {
+                    crate::identity::Resolved::Found(id) => id.is_alive(),
+                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
+                        crate::identity::Liveness::Unknown
+                    }
+                };
+                !crate::child::root_pid_was_recycled(self.id, now, now_liveness)
+            },
+            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
+             recycled onto a different, live process; a pgid-based mechanism would now signal an \
+             unrelated process group (see #54)",
+            self.id.pid()
+        );
         self.attached.terminate(self.id.pid())
     }
 
@@ -418,6 +483,10 @@ impl Child {
         self.attached.disarm();
     }
 }
+
+#[cfg(test)]
+#[path = "child_drop_tests.rs"]
+mod child_drop_tests;
 
 #[cfg(all(test, windows))]
 impl Child {
@@ -440,11 +509,13 @@ impl Drop for Child {
         // Tree teardown — the SOLE coverage for descendants (reap_now only guarantees the root),
         // so surface a real mechanism failure in debug. A no-op for an uncontained child.
         let tree = self.attached.hard_kill();
-        debug_assert!(
-            tree.is_ok(),
-            "contained-tree teardown failed on async Drop: {:?}",
-            tree.err()
-        );
+        if let Err(e) = &tree {
+            debug_assert!(
+                !crate::child::is_teardown_mechanism_failure(e),
+                "contained-tree teardown failed on async Drop: {e:?}"
+            );
+            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+        }
         let _ = tree;
         // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
         // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend

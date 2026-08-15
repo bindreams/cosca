@@ -225,3 +225,112 @@ fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
         "must observe at least one libproc/sysctl agreement on a live host (self, if nothing else)"
     );
 }
+
+// Value oracle for `P_SYSTEM`. On this host (and every recent Darwin release checked, up to
+// 26.5.2), `kernproc` (pid 0) is the ONLY process carrying the flag — not `launchd`/`initproc`
+// (pid 1), which xnu's `killpg1` excludes from a process-group signal by a direct `p ==
+// initproc` pointer check, entirely separate from its `P_SYSTEM` test (confirmed against
+// xnu's own `bsd/kern/kern_sig.c`). `libc::proc_pidinfo` cannot serve as an oracle for either
+// root-owned pid measured here (pid 0 or pid 1): it fails to resolve a foreign-uid process
+// without root, the same as it fails for pid 0. The positive case (pid 0) is instead
+// cross-checked against a second, independently-issued sysctl call reading the WHOLE process
+// table (`KERN_PROC_ALL`, a different selector/code path from `kinfo()`'s own `KERN_PROC_PID`)
+// rather than trusting one query alone. The negative case is checked for both pid 1 (sysctl
+// only) and this test's own process — the latter additionally cross-checked against
+// `proc_pidinfo`'s independently-defined `PROC_FLAG_SYSTEM` (`sys/proc_info.h`, no `libc`
+// crate constant, restated here as a local, source-cited value).
+#[test]
+fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non_system() {
+    const PROC_FLAG_SYSTEM: u32 = 1;
+
+    // Positive: kernproc (pid 0), read via `kinfo()` (production code path, KERN_PROC_PID).
+    let crate::identity::Resolved::Found(k) = kinfo(0) else {
+        panic!("pid 0 (kernproc) resolves via sysctl KERN_PROC_PID");
+    };
+    assert!(
+        k.kp_proc.p_flag & P_SYSTEM != 0,
+        "kernproc (pid 0) must be P_SYSTEM-flagged via KERN_PROC_PID"
+    );
+
+    // Cross-check: an independently-issued KERN_PROC_ALL scan must agree pid 0 carries the
+    // same bit — a different selector/code path from the KERN_PROC_PID query above.
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL, 0];
+    let mut len: libc::size_t = 0;
+    // SAFETY: a size query — null buffer, `len` receives the byte count.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "KERN_PROC_ALL sizing query failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let record = std::mem::size_of::<kinfo_proc>();
+    let mut buf: Vec<kinfo_proc> = Vec::with_capacity(len / record + 8);
+    let mut got = buf.capacity() * record;
+    // SAFETY: `buf` has room for `got` bytes of records; sysctl writes at most `got`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut got,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0, "KERN_PROC_ALL fetch failed: {}", std::io::Error::last_os_error());
+    // SAFETY: sysctl initialised exactly `got / record` whole records.
+    unsafe { buf.set_len(got / record) };
+    let kernproc = buf
+        .iter()
+        .find(|k| k.kp_proc.p_pid == 0)
+        .expect("pid 0 (kernproc) present in a KERN_PROC_ALL scan");
+    assert!(
+        kernproc.kp_proc.p_flag & P_SYSTEM != 0,
+        "kernproc (pid 0) must be P_SYSTEM-flagged via the independent KERN_PROC_ALL scan too"
+    );
+
+    // Negative, sysctl-only: neither pid 1 (launchd, root-owned) nor this test process is
+    // P_SYSTEM-flagged. `proc_pidinfo` cannot cross-check pid 1 here — measured, it also
+    // fails to resolve a foreign-uid pid without root, same as it fails for pid 0 above — so
+    // only this test's own pid gets the `proc_pidinfo` cross-check, right below.
+    for pid in [1, std::process::id() as libc::c_int] {
+        let crate::identity::Resolved::Found(k) = kinfo(pid as super::super::RawPid) else {
+            panic!("pid {pid} resolves via sysctl");
+        };
+        assert!(
+            k.kp_proc.p_flag & P_SYSTEM == 0,
+            "pid {pid} must not be P_SYSTEM-flagged via sysctl"
+        );
+    }
+
+    // Negative, cross-checked: this test process itself is not PROC_FLAG_SYSTEM-flagged
+    // either, via proc_pidinfo's independently-defined bit.
+    let me = std::process::id() as libc::c_int;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            me,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    assert_eq!(n, size, "proc_pidinfo oracle failed for self");
+    assert!(
+        info.pbi_flags & PROC_FLAG_SYSTEM == 0,
+        "this test process must not be PROC_FLAG_SYSTEM-flagged via proc_pidinfo"
+    );
+}

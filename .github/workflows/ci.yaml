@@ -163,3 +163,32 @@ jobs:
             export COSCA_TEST_CGROUP=1
             exec "$0" cgroup --nocapture --test-threads=1
           ' "$BIN"
+
+      # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
+      # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo test`
+      # anywhere, including the steps above, reports it as `ignored`, never a vacuous `ok`.
+      # This is the one step that opts in, via `-- --ignored`, after provisioning a COPY of
+      # cosca_testbin that is genuinely setuid-root (owned by root, mode u+s) so the spawned
+      # helper process can call setuid(0) itself and become truly unsignalable by this job's
+      # ordinary unprivileged user — proving #61's fix against a REAL mixed process group
+      # (one signalable member, one genuinely not), not a synthetic one. Only preparing the
+      # helper copy needs root; the test itself runs as the normal unprivileged runner user,
+      # no sudo. Once opted in, an unset/unusable helper FAILS LOUDLY (wrong owner/mode, or a
+      # nosuid mount) — never a silent skip.
+      - name: Set up setuid-root helper (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          set -euxo pipefail
+          BIN=$(cargo build --locked --target ${{ matrix.target }} --bin cosca_testbin --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
+            | grep -v '^null$' | grep . | head -n1)
+          test -x "$BIN"
+          HELPER="${RUNNER_TEMP}/cosca_testbin_setuid"
+          cp "$BIN" "$HELPER"
+          sudo chown root:root "$HELPER"
+          sudo chmod 4755 "$HELPER"
+          echo "COSCA_TEST_SETUID_HELPER=$HELPER" >> "$GITHUB_ENV"
+
+      - name: Run setuid-root process-group teardown test (Linux)
+        if: matrix.os == 'linux'
+        run: cargo test --locked --target ${{ matrix.target }} --test group_teardown_setuid -- --ignored

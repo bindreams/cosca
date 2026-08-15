@@ -1,5 +1,5 @@
 use super::super::StartToken;
-use super::{parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat};
+use super::{parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat};
 use crate::identity::Liveness;
 
 fn tok(v: u64) -> StartToken {
@@ -41,6 +41,27 @@ fn parses_ppid_with_comm_containing_parens_and_spaces() {
 fn ppid_rejects_truncated_stat() {
     let stat = b"1 (init) S"; // no ppid token after the state
     assert_eq!(parse_ppid(stat), None);
+}
+
+/// Field 5 is the process-group id. Offsets are anchored on the last ')', so a
+/// comm containing spaces and parens must not shift the answer.
+#[test]
+fn parse_pgrp_reads_field_five() {
+    // pid 1234, comm "sh", state S, ppid 1, pgrp 4321, session 4321, ...
+    let stat = b"1234 (sh) S 1 4321 4321 0 -1 4194304 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0";
+    assert_eq!(parse_pgrp(stat), Some(4321));
+}
+
+#[test]
+fn parse_pgrp_survives_a_hostile_comm() {
+    let stat = b"1234 (evil ) S 9 9 9) S 1 4321 4321 0 -1 4194304 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0";
+    assert_eq!(parse_pgrp(stat), Some(4321));
+}
+
+#[test]
+fn parse_pgrp_rejects_a_truncated_record() {
+    assert_eq!(parse_pgrp(b"1234 (sh) S 1"), None);
+    assert_eq!(parse_pgrp(b"no parens here"), None);
 }
 
 #[test]
