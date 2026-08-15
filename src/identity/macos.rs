@@ -7,10 +7,10 @@
 //! kinfo_proc ABI degrades only zombie/cross-user resolution (a token mismatch — the
 //! pre-fix behavior), never live same-uid identity.
 //!
-//! [`ppid_of`] exposes the same sysctl source's `e_ppid` field for
-//! `containment::enumerate::macos`, which keeps its own separate `proc_pidinfo`-primary ppid
-//! resolver and needs only this module's sysctl knowledge for its miss — never a second copy
-//! of `kinfo_proc`'s layout.
+//! [`ppid_of`] resolves a pid's parent the same primary/fallback way — `proc_pidinfo` first,
+//! the sysctl fallback on a miss — and is reused whole by `containment::enumerate::macos`,
+//! rather than that module keeping a second `proc_pidinfo` call and a second copy of the
+//! zero-ppid guard ([`trusted_ppid`]) next to a duplicated `kinfo_proc` layout.
 
 use std::time::{Duration, SystemTime};
 
@@ -78,33 +78,66 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
     kinfo::kinfo(pid).map(|info| token_of_kinfo(&info))
 }
 
-/// `eproc.e_ppid` via the sysctl fallback ONLY — no libproc call. `containment::enumerate`
-/// already has its own `proc_pidinfo`-primary ppid resolver and only needs this module's
-/// sysctl knowledge for ITS miss (EPERM cross-user, or a ZOMBIE), the same fallback shape
-/// [`start_token`] uses for its own libproc miss.
+/// Whether a raw ppid value read from the kernel for `pid` is trustworthy - shared by BOTH
+/// [`ppid_of`]'s primary read (`proc_bsdinfo.pbi_ppid`, via `proc_pidinfo`) and its sysctl
+/// fallback (`kinfo_proc.kp_eproc.e_ppid`), which read the same underlying kernel field,
+/// `p->p_ppid` (confirmed live, across the whole process table, by
+/// `sysctl_e_ppid_matches_libproc_across_the_live_process_table`, which also calls this
+/// function rather than re-deriving the rule) - a single function so production's two call
+/// sites and that oracle test cannot silently drift apart on what counts as trustworthy.
 ///
-/// `e_ppid == 0` for any pid but 1 is never trusted as `Found`: pid 1 (launchd) is the only
-/// real process whose parent is the kernel, so a `0` elsewhere means XNU served this pid's
-/// `kinfo_proc` before `fork()` finished filling in `eproc` (measured live: a busy host
-/// occasionally does, `e_ppid` momentarily 0 while `proc_pidinfo` already sees the real
-/// value — see `sysctl_e_ppid_matches_libproc_across_the_live_process_table`). The record
-/// itself is valid (correctly sized, no sysctl error) - this is not `contract_violation`'s
-/// "layout drifted or the kernel misbehaved" case, only a narrow timing window - so it is a
-/// DESIGNED `Unknown`, `debug`-logged like every other per-pid probe.
+/// `0` is legitimate ONLY for pid 1 (launchd, the one real process whose parent is the
+/// kernel). For any other pid, a `0` here means XNU served this pid's process-info record
+/// before `fork()` finished filling in its parent field. This IS a real, live race, not a
+/// theoretical one: measured directly on a busy host during this crate's own test runs (a
+/// live, non-pid-1, freshly-forked process's sysctl record read `e_ppid == 0` while
+/// `proc_pidinfo` already reported the true value moments earlier), diagnosed against
+/// `ps -eo pid,ppid,comm` to confirm genuine process churn rather than an offset bug. A
+/// separate synthetic stress harness (two threads, 30k `fork()`+`_exit` and 4k
+/// `posix_spawn` iterations, ~2.3M records) did NOT reproduce it - which sharpens rather
+/// than clears the finding, since a targeted fork-storm and ordinary host churn during a
+/// parallel test run are different windows onto the same kernel-internal, userspace-
+/// invisible race, the same class already documented for `proc_listallpids`'s walk cap.
+/// Never trusted as a real ppid, and never retried: excluded by the pid it names (a fixed,
+/// data-driven rule), not chased with a timing guess. The record itself is otherwise valid
+/// (correctly sized, no sysctl/libproc error) - this is not `contract_violation`'s "layout
+/// drifted or the kernel misbehaved" case, only a narrow timing window - so an excluded `0`
+/// is a DESIGNED `None`, `debug`-logged like every other per-pid probe.
+fn trusted_ppid(pid: RawPid, raw: RawPid) -> Option<RawPid> {
+    if raw == 0 && pid != 1 {
+        log::debug!(
+            "pid {pid}'s process-info record reported ppid == 0 for a non-pid-1 process - a \
+             fork()-in-progress record, not a resolvable ppid"
+        );
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+/// `pid`'s parent pid: `proc_pidinfo` (the same primary read [`bsd_info`] makes) first, the
+/// sysctl fallback on a miss - the shape [`start_token`] already uses for its own libproc
+/// miss, reused whole by `containment::enumerate::macos` instead of that module keeping a
+/// second `proc_pidinfo` call. An untrusted `0` from the primary ([`trusted_ppid`]) falls
+/// through to the fallback exactly like any other miss, rather than being returned as a
+/// bogus `Found(0)` parent.
+///
+/// `Unknown` covers: a genuinely unresolvable pid (gone, or an EPERM/EACCES sysctl refusal),
+/// or BOTH reads producing an untrusted `0` (the fork-window race hitting the same pid on
+/// both syscalls - see [`trusted_ppid`]). `Gone` is only returned when the fallback itself
+/// positively confirms the pid no longer exists.
 pub(crate) fn ppid_of(pid: RawPid) -> Resolved<RawPid> {
-    match kinfo::kinfo(pid) {
-        Resolved::Found(info) => {
-            let ppid = info.e_ppid();
-            if ppid == 0 && pid != 1 {
-                log::debug!(
-                    "sysctl(KERN_PROC_PID, {pid}) reported e_ppid == 0 for a non-pid-1 process \
-                     - a fork()-in-progress record, not a resolvable ppid"
-                );
-                Resolved::Unknown
-            } else {
-                Resolved::Found(ppid as RawPid)
-            }
+    if let Some(info) = bsd_info(pid) {
+        if let Some(ppid) = trusted_ppid(pid, info.pbi_ppid) {
+            return Resolved::Found(ppid);
         }
+        // An untrusted primary `0`: fall through to the fallback below, same as a miss.
+    }
+    match kinfo::kinfo(pid) {
+        Resolved::Found(info) => match trusted_ppid(pid, info.e_ppid() as RawPid) {
+            Some(ppid) => Resolved::Found(ppid),
+            None => Resolved::Unknown,
+        },
         Resolved::Gone => Resolved::Gone,
         Resolved::Unknown => Resolved::Unknown,
     }

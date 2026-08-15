@@ -1,19 +1,16 @@
 //! macOS `(pid, ppid)` snapshot: `proc_listallpids` for the pid set, then
-//! `proc_pidinfo(PROC_PIDTBSDINFO).pbi_ppid` per pid (the same call `identity`
-//! uses for its start token).
+//! `identity::macos_ppid_of` per pid (the same `proc_pidinfo`-primary,
+//! sysctl-fallback resolver `identity` uses for its own start token / liveness checks).
 //!
 //! Three things worth knowing (an EPERM gap — an unprivileged caller getting no edge for
-//! another user's process — is CLOSED: `ppid_of` now falls back to `identity::macos_ppid_of`'s
-//! `sysctl(KERN_PROC_PID)` read on a `proc_pidinfo` miss, the same fallback `identity`
-//! itself uses for zombies and EPERM-hidden cross-user processes):
+//! another user's process — is CLOSED: `identity::macos_ppid_of` falls back to
+//! `sysctl(KERN_PROC_PID)` on a `proc_pidinfo` miss, the same fallback `identity` itself uses
+//! for zombies and EPERM-hidden cross-user processes):
 //!
 //! - Even with the fallback, an edge can still be dropped: the target pid genuinely exited
-//!   between the snapshot and the query (ESRCH on both paths), a sandbox denies the
-//!   fallback's own sysctl (rare — EPERM/EACCES there is a DESIGNED `Unknown`, not a second
-//!   EPERM gap), or the fallback's own pid, 1 excepted, momentarily reads `e_ppid == 0` mid
-//!   fork() (see `identity::macos::ppid_of`'s doc). `process_parents` reports the aggregate
-//!   drop count (and a bounded pid sample) at `warn`; individual drops are not logged - a
-//!   snapshot with many drops must not become one log record per pid.
+//!   between the snapshot and the query, a sandbox denies the fallback's own sysctl (rare —
+//!   EPERM/EACCES there is a DESIGNED `Unknown`, not a second EPERM gap), or `e_ppid == 0`
+//!   mid fork() on both reads (pid 1 excepted — see `identity::macos::ppid_of`'s doc).
 //! - A failed snapshot is reported as an EMPTY one, because `process_parents` has no error
 //!   channel. A tree walk over an empty snapshot finds no descendants, so the failure is
 //!   logged at `warn` naming that consequence.
@@ -37,35 +34,15 @@ use crate::identity::RawPid;
 /// needs exactly one fill: the process set can grow between the sizing call and the fill.
 const HEADROOM: usize = 16;
 
-/// Read the parent pid of `pid`: `proc_bsdinfo` primary, `identity::macos_ppid_of`'s sysctl
-/// fallback on a miss (the same primary/fallback shape `identity::macos::start_token` uses
-/// for its own libproc miss — see that module's doc for why the fallback's sysctl knowledge
-/// lives there rather than a second copy of `kinfo_proc`'s layout here). `None` only when
-/// BOTH fail to resolve: gone (ESRCH mid-snapshot exit) or a sandboxed sysctl refusal
-/// (EPERM/EACCES on the fallback itself) or the fork-in-progress `e_ppid == 0` window
-/// `identity::macos::ppid_of` documents. Silent per-call: a dropped edge drops the pid's
-/// whole subtree in `treewalk::descendants_with`, so the drop matters, but the caller
-/// (`process_parents`, via `join_ppids`) reports it aggregated, not one log record per pid.
+/// Read the parent pid of `pid` via `identity::macos_ppid_of` — `proc_pidinfo` primary,
+/// sysctl fallback on a miss, and the shared zero-ppid guard, all owned by `identity::macos`
+/// (see that module's `ppid_of` doc for why: this backend reuses it whole rather than
+/// keeping a second `proc_pidinfo` call and a second copy of the guard here). `None` covers
+/// every resolution failure `identity::macos::ppid_of`'s doc lists: gone, a sandboxed sysctl
+/// refusal, or the fork-in-progress `e_ppid == 0` window hitting both reads for this pid.
+/// Silent per-call: a dropped edge drops the pid's whole subtree in
+/// `treewalk::descendants_with`, so the drop matters.
 fn ppid_of(pid: libc::c_int) -> Option<RawPid> {
-    // SAFETY: proc_bsdinfo is repr(C) and every field is an integer type, for which an
-    // all-zeros bit pattern is a valid value.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; pointer/size match.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    if n == size {
-        return Some(info.pbi_ppid);
-    }
-    // libproc miss: EPERM cross-user, a ZOMBIE (ESRCH is also possible here but resolves
-    // the same way through the fallback — Gone either way), or a genuine ESRCH exit.
     crate::identity::macos_ppid_of(pid as RawPid).found()
 }
 
@@ -307,12 +284,19 @@ const DROP_SAMPLE_CAP: usize = 5;
 /// contain a non-positive pid at all. Returns the edges, how many attempted joins failed,
 /// and a bounded sample of the failed pids for logging.
 fn join_ppids(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>) {
-    // A plain `Vec::with_capacity`, not a fallible reservation: the only caller,
-    // `treewalk::descendants_with`, already does an unconditional `to_vec` and
-    // `Vec::with_capacity` on this same data one frame up, so reserving fallibly here would
-    // relocate the abort rather than remove it - while making this function's refusal path
-    // report an allocation failure as a successfully empty process tree. `pids.len()`
-    // over-estimates, since some entries are filtered or fail the join.
+    // A plain `Vec::with_capacity`, not a fallible reservation. `process_parents()` has FOUR
+    // live callers, and this allocation is not the only abort on every path to it:
+    // `treewalk::hard_kill`/`terminate` already do an unconditional `to_vec` on this same
+    // data one frame up (`descendants_with`), so reserving fallibly HERE would only relocate
+    // that abort, not remove it. But `Process::parent` (a plain `.iter().find(..)`, no copy)
+    // and `Process::children(Recursive::No)` (`treewalk::children_of_with`, which iterates
+    // the slice without copying it) do NOT allocate upstream - on those two paths this
+    // `Vec::with_capacity` is the only unbounded allocation in the chain, and it DOES abort.
+    // Making it fallible everywhere is blocked on `process_parents` gaining an error channel
+    // (#76): with none today, a fallible reservation here would turn an allocation failure
+    // into a successfully EMPTY process tree - the exact silent-absence shape this module's
+    // fallback work exists to eliminate, traded for a still-real abort on two of four
+    // callers. `pids.len()` over-estimates, since some entries are filtered or fail the join.
     let mut out = Vec::with_capacity(pids.len());
     let mut dropped = 0usize;
     let mut sample = Vec::new();
