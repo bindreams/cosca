@@ -1,8 +1,9 @@
-//! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES
-//! (libproc's `proc_pidinfo` does not). libc has no apple definition for these structs,
-//! so this is a minimal faithful local one. Only `p_un.p_starttime` and `p_stat` are read;
-//! everything else is layout. Layout is triple-checked: the compile-time size tripwires
-//! below, the kernel-size oracle, and the token-vs-libproc oracle (kinfo_tests.rs).
+//! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES and
+//! EPERM-hidden cross-user processes (libproc's `proc_pidinfo` does not). libc has no apple
+//! definition for these structs, so this is a minimal faithful local one. Only
+//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read; everything else is layout.
+//! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
+//! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
 #![allow(non_camel_case_types)]
 
 use super::super::{RawPid, Resolved};
@@ -13,6 +14,34 @@ pub(crate) struct kinfo_proc {
     pub(crate) kp_proc: extern_proc,
     kp_eproc: [u8; 352],
 }
+
+impl kinfo_proc {
+    /// Byte offset of `eproc.e_ppid` within the opaque `kp_eproc` tail (`struct eproc`:
+    /// `e_paddr` + `e_sess` pointers, then `struct _pcred e_pcred`, `struct _ucred e_ucred`,
+    /// `struct vmspace e_vm`, then `e_ppid`). Determined two ways before landing here — an
+    /// `offsetof` probe compiled against Apple's real `sys/sysctl.h`, and a live `sysctl`
+    /// call compared against `getppid()` — and re-checked on every test run by
+    /// `sysctl_e_ppid_matches_libproc_across_the_live_process_table` (kinfo_tests.rs), the
+    /// permanent oracle: a future SDK layout drift fails that test rather than silently
+    /// misreading ppids.
+    const E_PPID_OFFSET: usize = 264;
+
+    /// `eproc.e_ppid` — the parent pid the kernel recorded in this snapshot. A checked-offset
+    /// read rather than fielding the rest of `eproc`: nothing else in it is needed, and every
+    /// additional fielded sub-struct (`_pcred`, `_ucred`, `vmspace`, ...) would be more
+    /// hand-copied kernel ABI to keep in sync for zero benefit (see the module doc).
+    pub(super) fn e_ppid(&self) -> libc::pid_t {
+        const LEN: usize = std::mem::size_of::<libc::pid_t>();
+        let bytes: [u8; LEN] = self.kp_eproc[kinfo_proc::E_PPID_OFFSET..kinfo_proc::E_PPID_OFFSET + LEN]
+            .try_into()
+            .expect("kp_eproc is 352 bytes; E_PPID_OFFSET + LEN fits with room to spare (see the tripwire below)");
+        libc::pid_t::from_ne_bytes(bytes)
+    }
+}
+
+// E_PPID_OFFSET must stay inside the opaque tail it reads from - a compile-time companion to
+// the two size tripwires below, same reasoning.
+const _: () = assert!(kinfo_proc::E_PPID_OFFSET + std::mem::size_of::<libc::pid_t>() <= 352);
 
 /// `struct extern_proc` (LP64 user copy, from XNU's proc.h). Kernel pointers are
 /// represented as `u64` (they are opaque user_addr_t values in the sysctl copy).

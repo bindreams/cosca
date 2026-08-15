@@ -100,6 +100,132 @@ fn sysctl_token_matches_libproc_for_a_live_process() {
     assert_eq!(ours, theirs, "sysctl and libproc disagree on self's start token");
 }
 
+// Value oracle for E_PPID_OFFSET, over the WHOLE live process table rather than just self:
+// for every pid where `proc_pidinfo` succeeds, the sysctl-derived `e_ppid` must be
+// byte-identical to `proc_bsdinfo.pbi_ppid` — a wrong offset fails here on real ppid values,
+// not a coincidental zero. Also reports the two things the offset makes possible: how many
+// pids ONLY sysctl could resolve (the `containment::enumerate::macos::ppid_of` fallback's
+// rescue set — EPERM cross-user or a ZOMBIE), and how many resolved on NEITHER path (the
+// genuine residual — see that module's doc). Run with `--nocapture` to see the counts.
+//
+// Both raw values are passed through `super::super::trusted_ppid` - the SAME function
+// `identity::macos::ppid_of` applies to both its primary and fallback reads in production -
+// rather than this test re-deriving the "`e_ppid == 0` is untrustworthy" rule a third time.
+// A wrong offset still fails loudly: `trusted_ppid` only ever excludes a `0` (never a
+// nonzero value), so a genuine layout bug still surfaces as a real `assert_eq!` mismatch on
+// real ppid values, not silent exclusion.
+//
+// Applying the SAME rule to BOTH sides (not sysctl only) matters: a fork()-in-progress `0`
+// is not sysctl-specific — libproc and sysctl read the same underlying kernel field,
+// `p->p_ppid` (that is what this very oracle exists to confirm), so either syscall can serve
+// the pre-fork()-fill `0` for a live, non-pid-1 pid. Excluding it on one side only would make
+// an untrusted libproc `0` hard-fail this test via `assert_eq!(0, <real ppid>)` on whatever
+// host process happens to be mid-fork() during a parallel `cargo test` run - a latent flake
+// whose message would point at layout drift instead of the race.
+//
+// `identity::macos::trusted_ppid`'s doc has the full evidence for why this is a REAL,
+// measured race (diagnosed live against `ps -eo pid,ppid,comm`, not reproduced by a targeted
+// synthetic fork-storm) rather than a retry-worthy flake: not a race to synchronize away with
+// a retry loop (which would just move the same "how many tries is enough" guess into this
+// test), but a value both production call sites treat the same way: excluded by the pid it
+// names, never trusted as a real ppid.
+//
+// A simple grow-until-it-fits pid listing, not `collect_pids`'s hot-path doubling discipline
+// (see `containment::enumerate::macos`) — this test only needs one complete snapshot, not a
+// `hard_kill`-safe allocator.
+#[test]
+fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
+    let mut cap = 1024usize;
+    let pids = loop {
+        let mut buf = vec![0i32; cap];
+        let bytes = (buf.len() * std::mem::size_of::<i32>()) as libc::c_int;
+        // SAFETY: `buf` owns exactly `bytes` writable bytes; proc_listallpids writes c_ints
+        // into it and never past the size it is given.
+        let written = unsafe { libc::proc_listallpids(buf.as_mut_ptr() as *mut libc::c_void, bytes) };
+        assert!(
+            written > 0,
+            "proc_listallpids failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let written = written as usize;
+        if written < buf.len() {
+            buf.truncate(written);
+            break buf;
+        }
+        cap *= 2;
+    };
+
+    let (mut agreed, mut rescued, mut both_failed) = (0usize, 0usize, 0usize);
+    // Split by WHICH side read the untrusted `0`, purely for reporting - both raw reads hit
+    // the same guard either way (see the doc above), and a pid where both sides read `0`
+    // counts in both breakdowns, not a third bucket.
+    let (mut ambiguous_zero_libproc, mut ambiguous_zero_sysctl) = (0usize, 0usize);
+
+    for pid in pids {
+        if pid <= 0 {
+            continue; // pid 0 is the kernel process, not a real pid
+        }
+        let pid_raw = pid as super::super::RawPid;
+
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes up to `size` bytes into `info`.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        let libproc_ppid = (n == size).then_some(info.pbi_ppid);
+
+        let sysctl_ppid = match kinfo(pid_raw) {
+            crate::identity::Resolved::Found(k) => Some(k.e_ppid() as super::super::RawPid),
+            crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => None,
+        };
+
+        // The SAME guard, applied identically to both raw reads - see the doc above for why
+        // asymmetry here is a latent flake, not just an inconsistency.
+        let libproc_untrusted = libproc_ppid.is_some_and(|raw| super::super::trusted_ppid(pid_raw, raw).is_none());
+        let sysctl_untrusted = sysctl_ppid.is_some_and(|raw| super::super::trusted_ppid(pid_raw, raw).is_none());
+
+        match (libproc_ppid, sysctl_ppid) {
+            _ if libproc_untrusted || sysctl_untrusted => {
+                if libproc_untrusted {
+                    ambiguous_zero_libproc += 1;
+                }
+                if sysctl_untrusted {
+                    ambiguous_zero_sysctl += 1;
+                }
+            }
+            (Some(a), Some(b)) => {
+                assert_eq!(a, b, "pid {pid}: libproc ppid {a} disagrees with sysctl ppid {b}");
+                agreed += 1;
+            }
+            (None, Some(_)) => rescued += 1,
+            // libproc succeeded but sysctl did not - the reverse fork/exit-window race, or a
+            // genuinely narrower gap than the fallback's target case. `both_failed`, not a
+            // separate bucket: from `identity::macos::ppid_of`'s perspective (proc_pidinfo
+            // primary, sysctl fallback) this pid is unresolved either way, since its own
+            // primary already succeeded and it never reaches the fallback at all.
+            (Some(_), None) => both_failed += 1,
+            (None, None) => both_failed += 1,
+        }
+    }
+
+    eprintln!(
+        "sysctl_e_ppid oracle over the live process table: agreed={agreed} rescued={rescued} \
+         both_failed={both_failed} ambiguous_zero_libproc={ambiguous_zero_libproc} \
+         ambiguous_zero_sysctl={ambiguous_zero_sysctl}"
+    );
+    assert!(
+        agreed > 0,
+        "must observe at least one libproc/sysctl agreement on a live host (self, if nothing else)"
+    );
+}
+
 // Value oracle for `P_SYSTEM`. On this host (and every recent Darwin release checked, up to
 // 26.5.2), `kernproc` (pid 0) is the ONLY process carrying the flag — not `launchd`/`initproc`
 // (pid 1), which xnu's `killpg1` excludes from a process-group signal by a direct `p ==
