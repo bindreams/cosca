@@ -118,7 +118,7 @@ fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
             read_handle,
             fd: write.as_fd().as_raw_fd(),
         };
-        crate::containment::fdmarker::Marker::new(prepared, None, pgid)
+        crate::containment::fdmarker::Marker::new(prepared, None, pgid, false)
     }
 
     assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).carries_recyclable_pgid());
@@ -298,7 +298,7 @@ fn attached_fd_marker_is_actionable() {
         read_handle,
         fd: write.as_fd().as_raw_fd(),
     };
-    let marker = crate::containment::fdmarker::Marker::new(prepared, None, None);
+    let marker = crate::containment::fdmarker::Marker::new(prepared, None, None, false);
     assert!(Attached::FdMarker(marker).is_actionable());
 }
 

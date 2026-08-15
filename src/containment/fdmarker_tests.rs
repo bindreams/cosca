@@ -160,18 +160,6 @@ fn the_sweep_finds_this_process_holding_the_marker() {
     );
 }
 
-// The AND-fold in `holders()` (`all_clexec &= …`) — a one-line, directly reviewable change from
-// a first-fd-wins `break` — is NOT independently unit-tested. Proving it needs a real process
-// holding two descriptors for the same marker in genuinely different CLOEXEC states, and that
-// state is only reachable by a live process calling `fcntl` AFTER it is already running (arming
-// CLOEXEC before an exec only ever produces "closed at THIS exec", never "held past it"). Nothing
-// available to a unit test can produce that: `/bin/sh` has no `fcntl` builtin, a compiled testbin
-// mode is unavailable to unit tests, and creating the needed non-CLOEXEC descriptor directly in
-// THIS shared test process is exactly what the "never clear FD_CLOEXEC on this process's own
-// descriptors" rule forbids. A real end-to-end reproduction is possible in the Task 7 INTEGRATION
-// tests (testbin allowed there) — left for that task if this coverage gap matters enough to Anna
-// to add it; this task does not decide that silently by omission.
-
 /// `PROC_PIDLISTFDS` denial is measured to return `0` with `errno == EPERM`, not a negative
 /// value — pinned here (independent of `pipe_fds_of`/`clear_errno_and_call`, which this fact
 /// drives) so the `<= 0` failure gate cannot silently regress to the wrong assumption. pid 1
@@ -664,7 +652,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     assert_eq!(ppid, Some(1), "precondition: the orphan must be reparented to launchd");
 
     // No root identity: sh is reaped, so ONLY the marker channel can reach the orphan.
-    let marker = super::Marker::new(prepared, None, None);
+    let marker = super::Marker::new(prepared, None, None, false);
     marker.hard_kill().expect("hard_kill");
 
     // The proof: `sleep` is the pipe's sole remaining writer, so EOF fires exactly on its
@@ -725,7 +713,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
         "precondition: the escapee no longer holds the marker"
     );
 
-    let marker = super::Marker::new(prepared, None, None);
+    let marker = super::Marker::new(prepared, None, None, false);
     marker.hard_kill().expect("hard_kill");
 
     // Alive, proven positively: a line in, the same line back — the sweep must not have
@@ -742,6 +730,32 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
 
     drop(stdin);
     let _ = child.wait();
+}
+
+/// A root whose identity could not be read because the OS refused (`root_denied` — set only
+/// for `Resolved::Unknown`, never for a root that had simply already exited; see
+/// `dispatch.rs`) is a standing gap for the marker's whole life: `hard_kill` must report
+/// `incomplete` even on a pass that converges immediately with nothing else to signal — proving
+/// the flag actually reaches `finish_sweep`, not merely that `Marker::new` accepts it.
+#[test]
+fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_signal() {
+    let (read, write) = std::io::pipe().expect("pipe");
+    let handle = super::pipe_handle_of(write.as_fd()).expect("handle");
+    let read_handle = super::pipe_handle_of(read.as_fd()).expect("read handle");
+    let prepared = super::PreparedMarker {
+        read: std::os::fd::OwnedFd::from(read),
+        handle,
+        read_handle,
+        fd: write.as_fd().as_raw_fd(),
+    };
+    drop(write); // nobody holds the write end: nothing for the sweep to find or signal
+
+    let marker = super::Marker::new(prepared, None, None, true);
+    let err = marker.hard_kill().expect_err("a denied root must report incomplete");
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
+        "unexpected error shape: {err:?}"
+    );
 }
 
 /// `pid_is_live_group_member` — the group-signal re-fire gate's anchor — confirms a real,
@@ -835,7 +849,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     drop(p_cmd);
     let pgid = p_child.id() as i32;
 
-    let pass1_marker = super::Marker::new(scratch, None, Some(pgid));
+    let pass1_marker = super::Marker::new(scratch, None, Some(pgid), false);
     let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::new();
     let mut group_result: Result<(), crate::error::Error> = Ok(());
     let mut incomplete = false;
@@ -864,7 +878,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     q_cmd.arg("600").process_group(pgid);
     let mut q_child = q_cmd.spawn().expect("spawn Q");
 
-    let marker = super::Marker::new(prepared, None, Some(pgid));
+    let marker = super::Marker::new(prepared, None, Some(pgid), false);
     let mark = crate::log_capture::mark();
 
     // Pass 2: T's own holder scan on THIS pass confirms a live member of `pgid` (T itself), so
@@ -916,7 +930,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::install(&mut cmd, &[]).expect("install");
-    let marker = super::Marker::new(prepared, None, None);
+    let marker = super::Marker::new(prepared, None, None, false);
 
     let id = match crate::identity::ProcessId::of(1) {
         crate::identity::Resolved::Found(id) => id,
@@ -947,7 +961,7 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::install(&mut cmd, &[]).expect("install");
-    let marker = super::Marker::new(prepared, None, None);
+    let marker = super::Marker::new(prepared, None, None, false);
 
     crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
     let result = marker.hard_kill();

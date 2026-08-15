@@ -73,28 +73,24 @@ fn recycled_root_pid_a_different_live_identity_is_recycled() {
     ));
 }
 
-/// Regression test for a defect introduced while reconciling this crate's macOS fd-marker
-/// enumeration refactor with #56/#61: the group-signal step's `crate::error::Error` — which,
-/// since #61, distinguishes an ORDINARY "a member refused"/"could not be assessed" outcome
-/// (`Error::Containment` / `Error::Unassessable { source: None, .. }`) from a genuine
-/// teardown-mechanism failure — was being stringified into an opaque `Error::Io` on its way
-/// out of `Marker::sweep`. That reintroduced, one layer up, precisely the bug #61 fixed:
-/// `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e), ...)` would fire on an
-/// entirely ordinary, expected outcome.
+/// Regression test: the group-signal step's ordinary refusal outcomes (`Error::Containment` /
+/// `Error::Unassessable { source: None, .. }`, distinguished from a genuine teardown-mechanism
+/// failure since #61) were being stringified into an opaque `Error::Io` on the way out of
+/// `Marker::sweep`, which made `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
+/// ...)` fire on an entirely ordinary outcome — reintroducing the bug #61 fixed.
 ///
-/// `fdmarker_tests.rs`'s own tests call `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
-/// `containment::dispatch.rs`'s `Attached::FdMarker` arm — exactly where the laundering used
-/// to sit — so none of them could have caught this. This test goes through the crate's real
-/// public path instead: `Command::spawn` → `dispatch.rs`'s `Attached::FdMarker` →
-/// `Child::kill_tree`/`Drop` → `is_teardown_mechanism_failure`.
+/// `fdmarker_tests.rs` calls `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
+/// `dispatch.rs`'s `Attached::FdMarker` arm where the laundering sat, so none of those tests
+/// could catch this. This test goes through the real public path instead: `Command::spawn` →
+/// `dispatch.rs`'s `Attached::FdMarker` → `Child::kill_tree`/`Drop` →
+/// `is_teardown_mechanism_failure`.
 ///
-/// A live cross-uid refuser (the actual `Error::Containment` scenario) needs real root to
-/// construct — see `tests/group_teardown_setuid.rs`'s own module docs for why that is not
-/// reliably provisionable on macOS at all (SIP). This drives the group channel's OTHER real,
-/// privilege-free path instead: `containment::unix::signal_group`'s own `pgid <= 0` guard,
-/// reached via `Child::test_force_fdmarker_pgid` — a real code path, not a synthetic `Error`
-/// value, forced into range the same way this codebase's other otherwise-untriggerable
-/// branches already are (`force_blind_snapshot_for_next_call` and friends).
+/// A live cross-uid refuser needs real root to construct (see `tests/group_teardown_setuid.rs`
+/// for why that is not reliably provisionable on macOS: SIP). This instead drives the group
+/// channel's OTHER real, privilege-free refusal path: `containment::unix::signal_group`'s
+/// `pgid <= 0` guard, reached via `Child::test_force_fdmarker_pgid` the same way this codebase's
+/// other otherwise-untriggerable branches already are (`force_blind_snapshot_for_next_call` and
+/// friends).
 #[cfg(target_os = "macos")]
 #[test]
 fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_classifier_path() {

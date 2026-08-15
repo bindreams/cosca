@@ -34,25 +34,16 @@
 //! change can control a third party's fork timing in the same process.
 //!
 //! **A tree member that `exec`s a setuid binary, or otherwise changes credentials, becomes
-//! unqueryable via `PROC_PIDLISTFDS` (`EPERM`) — and this design's disposition for that pid
-//! depends on which OTHER channel, if any, can still see it, not on one uniform "logged, left
-//! running" answer.** If the ppid-walk channel can still place it as a descendant of the
-//! contained root (its own ppid-read is not ALSO denied, nor any ancestor's), `sweep` already
-//! folds that gap into `incomplete` via the ppid-walk channel's own denial accounting —
-//! `holders()`'s OWN denial for the identical pid is then redundant, correctly left as an
-//! aggregate `debug!` (below), not a second `warn!` for the same known gap. But a pid the
-//! ppid-walk channel CANNOT place — the double-fork-reparented-to-launchd orphan this whole
-//! mechanism exists to reach, the module's own primary scenario — that ALSO becomes
-//! `PROC_PIDLISTFDS`-denied has no channel left to catch it at all: `holders()` folds it into
-//! the SAME aggregate, never-escalated denial count as ordinary unrelated-host-pid noise
-//! (below), so `sweep` can return `Ok(())` while that one pid is a real, live, completely
-//! un-swept member. This is deliberately NOT escalated to `incomplete` — doing so would
-//! require folding `holders()`'s bulk per-scan denial count in (hundreds of unrelated host
-//! pids on a real multi-user host, matching exactly the reasoning `enumerate::snapshot()`'s
-//! ppid-denial count is ALSO deliberately excluded from `incomplete`), making `Ok(())`
-//! unreachable on any real host. Accepted as a symmetric extension of that already-accepted
-//! tradeoff, not a new one — but stated here plainly, since a reparented orphan that ALSO
-//! changes credentials is exactly the intersection this module's own name promises to close.
+//! unqueryable via `PROC_PIDLISTFDS` (`EPERM`).** If the ppid-walk channel can still place it as
+//! a descendant, `sweep` already folds the gap into `incomplete` there, so `holders()`'s own
+//! denial for the same pid stays an aggregate `debug!`, not a second `warn!`. But for a pid
+//! ppid-walk cannot place — a double-fork-reparented-to-launchd orphan, this module's primary
+//! scenario — a denial leaves no channel able to catch it: `holders()` folds it into the same
+//! aggregate, never-escalated denial count as ordinary host noise, so `sweep` can return
+//! `Ok(())` while that pid is a real, un-swept member. Not escalated to `incomplete`, for the
+//! same reason `enumerate::snapshot()`'s ppid-denial count is excluded: folding in bulk
+//! per-scan denials (hundreds of unrelated pids on a real host) would make `Ok(())`
+//! unreachable in practice.
 //!
 //! **The marker fd is inherited-only, not an IPC channel — do not write to it.** Every
 //! descendant is handed the WRITE end of a pipe whose read end the supervisor holds but never
@@ -356,6 +347,23 @@ pub(crate) fn holds_marker_query(pid: RawPid, handle: u64) -> MarkerQuery {
 /// short list is indistinguishable from a complete one unless the buffer was provably larger
 /// than the answer. Re-read with a doubled capacity until it is — a truncated fd list means a
 /// holder silently missed.
+/// The `proc_pidinfo` buffer-size argument for `cap` `proc_fdinfo` entries. Mirrors
+/// `size_argument_for` in `enumerate/macos.rs`, guarding the identical hazard: `cap` doubles
+/// unbounded in `pipe_fds_of`'s retry loop below, and an unchecked `as libc::c_int` cast wraps
+/// once `cap * entry` passes `i32::MAX`, producing an arbitrary size that no longer describes
+/// the buffer `fds` actually is — the exact correspondence the caller's `// SAFETY:` comment
+/// depends on.
+fn fd_list_buf_bytes(cap: usize, entry: usize) -> std::io::Result<libc::c_int> {
+    cap.checked_mul(entry)
+        .and_then(|bytes| libc::c_int::try_from(bytes).ok())
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "a {cap}-entry proc_fdinfo buffer cannot be described in proc_pidinfo's int \
+                 size argument"
+            ))
+        })
+}
+
 fn pipe_fds_of(pid: RawPid) -> PipeQuery {
     let entry = std::mem::size_of::<libc::proc_fdinfo>();
     let needed = clear_errno_and_call(|| unsafe {
@@ -366,9 +374,25 @@ fn pipe_fds_of(pid: RawPid) -> PipeQuery {
     }
     let mut cap = needed as usize / entry + 16;
     loop {
+        let buf_bytes = match fd_list_buf_bytes(cap, entry) {
+            Ok(b) => b,
+            Err(e) => {
+                // A loud, per-pid denial, not a wrapped cast: matches `collect_pids`'s sibling
+                // over-report guard in spirit — a contract this call cannot honor must fail
+                // rather than silently truncate. Folded into `Denied` (counted, aggregated by
+                // `holders()`) rather than propagated as a hard error: one pid with an
+                // unenumerable fd table must not abort a whole-host sweep.
+                log::warn!(
+                    "fd marker: pid {pid}'s open-fd count cannot be enumerated ({e}); treating \
+                     as denied for this pass"
+                );
+                return PipeQuery::Denied;
+            }
+        };
         let mut fds: Vec<libc::proc_fdinfo> = vec![unsafe { std::mem::zeroed() }; cap];
-        let buf_bytes = (cap * entry) as libc::c_int;
-        // SAFETY: `fds` owns `buf_bytes` writable bytes; proc_pidinfo writes proc_fdinfo records.
+        // SAFETY: `fds` owns `buf_bytes` writable bytes (`fd_list_buf_bytes` computed it from
+        // the SAME `cap`/`entry` that sized `fds`, and failed loudly above rather than wrap);
+        // proc_pidinfo writes proc_fdinfo records.
         let written = clear_errno_and_call(|| unsafe {
             libc::proc_pidinfo(
                 pid as libc::c_int,
@@ -382,6 +406,17 @@ fn pipe_fds_of(pid: RawPid) -> PipeQuery {
             return classify_pidlistfds_failure();
         }
         let count = written as usize / entry;
+        if count > cap {
+            // The over-report guard `collect_pids` has too: the kernel cannot legitimately
+            // write more entries than the buffer it was handed. Folding this into "ask again
+            // with more room" would silently accept an out-of-contract overwrite past `fds`'s
+            // own allocation instead of failing loudly on it.
+            log::warn!(
+                "fd marker: pid {pid}'s proc_pidinfo(PROC_PIDLISTFDS) reported {count} entries \
+                 into a {cap}-entry buffer; treating as denied for this pass"
+            );
+            return PipeQuery::Denied;
+        }
         if count == cap {
             cap *= 2;
             continue;
@@ -709,8 +744,8 @@ pub(crate) mod fault {
     /// per-call discriminator — there is no handle yet to key on, since `install` hasn't
     /// succeeded. Two DIFFERENT tests asserting on the same literal text via `log_capture`
     /// (`fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`
-    /// and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one`, both
-    /// Task 3/5) would otherwise be able to satisfy each other's `contains_since` check across
+    /// and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one`)
+    /// would otherwise be able to satisfy each other's `contains_since` check across
     /// threads, since `log_capture` is one process-global buffer and `cargo test` runs each
     /// `#[test]` on its own thread. `FAULT` itself is thread-local (race-free), but the LOG
     /// ASSERTION is not, so both tests must hold this for their whole body instead.
@@ -740,6 +775,11 @@ pub(crate) struct Marker {
     /// The root's identity, for the ppid-walk channel. `None` when it could not be read at
     /// attach — the marker channel still runs.
     root: Option<ProcessId>,
+    /// `true` only when `root` is `None` BECAUSE the OS refused to answer (`Resolved::Unknown`)
+    /// — never for a root that had already exited (`Resolved::Gone`, a routine outcome; see
+    /// `dispatch.rs`). `sweep_pass` folds this into `incomplete` on every pass for the marker's
+    /// whole life, since a denial (unlike a dead root) is a real, standing teardown gap.
+    root_denied: bool,
     /// The root's process group, when the requested mode created one. `None` for TreeWalk.
     pgid: Option<i32>,
 }
@@ -799,12 +839,22 @@ fn combine_group_errors(first: Error, latest: Error) -> Error {
 }
 
 impl Marker {
-    pub(crate) fn new(prepared: PreparedMarker, root: Option<ProcessId>, pgid: Option<i32>) -> Marker {
+    pub(crate) fn new(
+        prepared: PreparedMarker,
+        root: Option<ProcessId>,
+        pgid: Option<i32>,
+        root_denied: bool,
+    ) -> Marker {
+        debug_assert!(
+            !(root_denied && root.is_some()),
+            "root_denied must only be set when root is None"
+        );
         Marker {
             read: prepared.read,
             handle: prepared.handle,
             read_handle: prepared.read_handle,
             root,
+            root_denied,
             pgid,
         }
     }
@@ -985,20 +1035,27 @@ impl Marker {
     /// — none of them is convergence, and NONE of them may be reported as `Ok(())`.**
     /// `enumerate::snapshot()` returns an empty pid list on its own internal failure (logged
     /// there) — never on a genuinely converged pass (there is always at least launchd and this
-    /// process on a real host). The root (`self.root`, already a resolved `ProcessId`) and the
-    /// process group (`self.pgid`, a plain integer) need no snapshot at all, so a blind pass
-    /// still attempts both; only the ppid-walk descendants and the marker-holder scan are
-    /// skipped, since both need the process table this pass could not read. A marker-holder pid
-    /// that resolves `Resolved::Unknown` (access denied), a `MarkerQuery::Denied` re-check, and
-    /// a `kill_by_identity`/`kill_holder` outcome of `KillOutcome::NotAttempted` (the OS refused
-    /// to query or signal an identity that WAS resolved), are each a known member this pass
-    /// could not verify or reach; the caller folds every one of them into one `incomplete` flag
-    /// across every pass, checked exactly once by `finish_sweep`.
+    /// process on a real host). Neither the root (`self.root`, already a resolved `ProcessId`)
+    /// nor the process group (`self.pgid`, a plain integer) needs a snapshot, so a blind FIRST
+    /// pass still attempts both: the root is not yet in `seen`, and pass 1's group signal fires
+    /// unconditionally. A blind LATER pass attempts NEITHER: the root is already in `seen` (see
+    /// below), and the group signal's re-fire gate needs THIS pass's own holder scan to confirm
+    /// a live member — a scan a blind pass never ran. "Not observed" is not "observed absent",
+    /// and this function's log messages say so explicitly rather than crediting a channel with
+    /// running when it could not have; `*incomplete = true` is what keeps `finish_sweep` from
+    /// reporting `Ok(())` regardless. A marker-holder pid that resolves `Resolved::Unknown`
+    /// (access denied), a `MarkerQuery::Denied` re-check, and a `kill_by_identity`/`kill_holder`
+    /// outcome of `KillOutcome::NotAttempted` (the OS refused to query or signal an identity
+    /// that WAS resolved), are each a known member this pass could not verify or reach; the
+    /// caller folds every one of them into the same `incomplete` flag, checked exactly once by
+    /// `finish_sweep`.
     ///
     /// A `NotAttempted` identity is NOT retried on a later pass — retrying would hit the same OS
     /// refusal again — but it IS already in `seen`, so it does not re-enter `new_walk`/
     /// `new_holders` either; it is simply left running, logged, and folded into `incomplete`,
-    /// the same disposition `treewalk::hard_kill`'s single pass already gives it.
+    /// the same disposition `treewalk::hard_kill`'s single pass already gives it. The same
+    /// `seen` membership is why the root itself is never retried on any later pass, blind or
+    /// not: pass 1 already inserted it.
     ///
     /// **Deliberately NOT in `incomplete`: `snapshot()`'s bulk denied-ppid-read count.**
     /// `PROC_PIDTBSDINFO` denies for every process this caller does not own — measured on this
@@ -1066,12 +1123,31 @@ impl Marker {
         let blind = pids.is_empty();
         if blind {
             *incomplete = true;
-            log::warn!(
-                "fd marker {:#x}: the host process table could not be read this pass; the \
-                 ppid-walk and marker channels are blind this pass (the group signal and root \
-                 kill below still run, since neither needs the process table)",
-                self.handle
-            );
+            if first_pass {
+                log::warn!(
+                    "fd marker {:#x}: the host process table could not be read on the first \
+                     pass; the ppid-walk and marker channels are blind (the group signal and \
+                     root kill below still run, since neither needs the process table)",
+                    self.handle
+                );
+            } else {
+                log::warn!(
+                    "fd marker {:#x}: the host process table could not be read this pass; \
+                     every channel is blind this pass — the root was already handled on an \
+                     earlier pass and is not retried, and the group signal does not re-fire \
+                     without a live member freshly confirmed THIS pass (not observed this \
+                     pass is not the same as observed absent). This pass performs no teardown \
+                     on any channel",
+                    self.handle
+                );
+            }
+        }
+
+        // A root that could not be resolved BECAUSE the OS refused (not because it had already
+        // exited — see `Marker::root_denied`'s doc) is a standing gap for this marker's whole
+        // life: fold it in every pass, the same as a blind pass or an unqueryable holder.
+        if self.root_denied {
+            *incomplete = true;
         }
 
         // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus its
@@ -1147,11 +1223,16 @@ impl Marker {
         // earlier failure, and vice versa) so a transient failure on one pass is not silently
         // dropped by the next pass's success.
         {
-            let live_holder_confirms_pgid = self.pgid.is_some_and(|pgid| {
-                this_pass_holders
-                    .iter()
-                    .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
-            });
+            // `!blind &&`, not merely an empty `this_pass_holders`: a blind pass never ran the
+            // scan at all ("not observed"), which must not read the same as a genuine scan that
+            // found nobody ("observed absent") — both happen to produce an empty `Vec`, but only
+            // the second is evidence the pgid was not confirmed live this pass.
+            let live_holder_confirms_pgid = !blind
+                && self.pgid.is_some_and(|pgid| {
+                    this_pass_holders
+                        .iter()
+                        .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
+                });
             let should_fire = first_pass || live_holder_confirms_pgid;
             if should_fire {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
@@ -1169,11 +1250,20 @@ impl Marker {
                     (Err(first), Err(latest)) => Err(combine_group_errors(first, latest)),
                 };
             } else if self.pgid.is_some() {
-                log::debug!(
-                    "fd marker {:#x}: skipping this pass's group signal — no live member \
-                     confirmed this pass's pgid, so it may have been recycled",
-                    self.handle
-                );
+                if blind {
+                    log::debug!(
+                        "fd marker {:#x}: skipping this pass's group signal — the process \
+                         table could not be read this pass, so no live member of this pass's \
+                         pgid was observed (not: none was found)",
+                        self.handle
+                    );
+                } else {
+                    log::debug!(
+                        "fd marker {:#x}: skipping this pass's group signal — no live member \
+                         confirmed this pass's pgid, so it may have been recycled",
+                        self.handle
+                    );
+                }
             }
         }
 

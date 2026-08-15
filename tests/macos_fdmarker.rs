@@ -9,6 +9,10 @@ use std::net::{TcpListener, TcpStream};
 mod common;
 use common::testbin;
 
+/// `Holder.clexec` is `pub(crate)`, unreachable from this crate; the ONLY observable production
+/// effect of `holders()`'s CLOEXEC AND-fold is this warning, so that is what this test asserts on.
+const WOULD_LOSE_MARKER_LOG_NEEDLE: &str = "will lose the marker at its next";
+
 /// One tree member's control channel: its pid, and the socket that proves it alive or dead.
 struct Member {
     pid: u32,
@@ -93,10 +97,13 @@ fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member)
 /// The orphan is provably outside both legacy channels: launchd is its parent, so the ppid
 /// walk cannot reach it, and its pgid differs from the root's, so `killpg` misses it.
 fn assert_escaped(root_pid: u32, grand_pid: u32) {
-    let out = std::process::Command::new("/bin/ps")
-        .args(["-o", "ppid=,pgid=", "-p", &grand_pid.to_string()])
-        .output()
-        .expect("ps the orphan");
+    let out = common::output_locked(std::process::Command::new("/bin/ps").args([
+        "-o",
+        "ppid=,pgid=",
+        "-p",
+        &grand_pid.to_string(),
+    ]))
+    .expect("ps the orphan");
     let text = String::from_utf8_lossy(&out.stdout);
     let mut it = text.split_whitespace();
     let ppid: u32 = it.next().expect("ppid").parse().expect("ppid number");
@@ -111,9 +118,7 @@ fn assert_escaped(root_pid: u32, grand_pid: u32) {
 /// Cleanup that is never an assertion: SIGKILL anything the test deliberately left running.
 fn reap(pids: &[u32]) {
     for pid in pids {
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        let _ = common::status_locked(std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]));
     }
 }
 
@@ -287,4 +292,23 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     assert_escaped(child.id().pid(), grand.pid);
     child.kill_tree().expect("kill_tree");
     grand.assert_dead("the orphan, reachable only via a marker that must have survived a real, wide caller fd mapping");
+}
+
+/// `holders()` reports a holder as CLOEXEC only when EVERY matching descriptor is (#59): a
+/// regression to first-fd-wins would misreport a holder that also keeps a non-CLOEXEC copy. The
+/// testbin dups a second, CLOEXEC copy of its inherited marker fd at a lower fd number, which
+/// `PROC_PIDLISTFDS` (measured to enumerate ascending) scans before the marker's own high fd, so
+/// first-fd-wins would see the CLOEXEC copy first and warn that this holder will lose the marker.
+/// The correct AND-fold sees the still-open, non-CLOEXEC original too and must not warn.
+#[test]
+fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
+    common::install_log_capture();
+    let mark = common::log_mark();
+    let (child, _sock) = common::spawn_control("control-block-mixed-cloexec-marker", &["R"], true);
+    child.kill_tree().expect("kill_tree");
+    assert!(
+        !common::contains_since(mark, WOULD_LOSE_MARKER_LOG_NEEDLE),
+        "a holder that still keeps a non-CLOEXEC copy of the marker must not be reported as \
+         about to lose it — the AND-fold must have regressed to first-fd-wins"
+    );
 }

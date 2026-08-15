@@ -460,20 +460,35 @@ pub(crate) fn attach(
     {
         if prepared.mode.is_some() {
             if prepared.is_root {
-                // macOS fd marker: installed for every contained root regardless of mode
-                // (decision 2), so it takes priority over the mode-specific mechanism below —
-                // it is what survives setsid/reparenting/exec that the mode-specific mechanism
-                // does not.
+                // macOS fd marker: installed for every contained root regardless of mode, so
+                // it takes priority over the mode-specific mechanism below — it is what
+                // survives setsid/reparenting/exec that the mode-specific mechanism does not.
                 #[cfg(target_os = "macos")]
                 if let Some(marker) = prepared.marker {
-                    let root = match crate::identity::ProcessId::of(pid) {
-                        crate::identity::Resolved::Found(id) => Some(id),
-                        other => {
-                            log::warn!(
-                                "fd marker: the root's identity could not be read ({other:?}); \
-                                 the sweep runs without its ppid-walk channel"
+                    // `Gone` is routine, not an anomaly: `SharedChild::new`'s internal
+                    // `try_wait` can reap a fast-exiting child inside `spawn()` itself (#61) —
+                    // `debug!`, no `incomplete`. The marker and group channels below don't need
+                    // `root`, so a reparented-away live descendant stays reachable through them.
+                    // `Unknown` means the OS refused to answer — a real gap — so it is `warn!`
+                    // and carries `root_denied` into `Marker`, the only way `sweep_pass` can
+                    // tell "denied" apart from an ordinary `Gone` on every later pass.
+                    let (root, root_denied) = match crate::identity::ProcessId::of(pid) {
+                        crate::identity::Resolved::Found(id) => (Some(id), false),
+                        crate::identity::Resolved::Gone => {
+                            log::debug!(
+                                "fd marker: the root exited before its identity could be read; \
+                                 the sweep runs without its ppid-walk channel (the marker and \
+                                 group channels do not need it)"
                             );
-                            None
+                            (None, false)
+                        }
+                        crate::identity::Resolved::Unknown => {
+                            log::warn!(
+                                "fd marker: the root's identity could not be read (access \
+                                 denied); the sweep runs without its ppid-walk channel, and \
+                                 every pass reports this marker as incomplete"
+                            );
+                            (None, true)
                         }
                     };
                     let pgid = match prepared.mode {
@@ -488,7 +503,12 @@ pub(crate) fn attach(
                     };
                     return Ok((
                         Containment::FdMarker,
-                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(marker, root, pgid)),
+                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(
+                            marker,
+                            root,
+                            pgid,
+                            root_denied,
+                        )),
                     ));
                 }
                 // TreeWalk root: no process group; identity teardown.

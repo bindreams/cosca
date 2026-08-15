@@ -72,6 +72,31 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     }
 }
 
+/// The one open fd beyond `known` — used by `control-block-mixed-cloexec-marker` to find the
+/// inherited fd-marker descriptor, which this process never opened itself and so cannot
+/// otherwise name by number. Panics loudly if there is not EXACTLY one such fd, rather than
+/// silently guessing among several.
+#[cfg(target_os = "macos")]
+fn find_one_unexplained_open_fd(known: &[i32]) -> i32 {
+    let mut found = None;
+    for fd in 0..1024 {
+        if known.contains(&fd) {
+            continue;
+        }
+        // SAFETY: F_GETFD has no preconditions beyond a valid fd number; -1 means closed.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            continue;
+        }
+        assert!(
+            found.is_none(),
+            "multiple unexplained open fds found ({found:?} and {fd}); cannot identify the \
+             marker descriptor unambiguously"
+        );
+        found = Some(fd);
+    }
+    found.expect("no inherited marker fd found beyond the known descriptors")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("");
@@ -206,6 +231,44 @@ fn main() {
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
             let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
+        }
+        #[cfg(target_os = "macos")]
+        "control-block-mixed-cloexec-marker" => {
+            // Like control-block, but first `F_DUPFD_CLOEXEC`s a second copy of the inherited
+            // fd-marker descriptor, so this pid holds BOTH a CLOEXEC copy and the original
+            // non-CLOEXEC one — exercising `holders()`'s AND-fold coverage gap (#59). The dup
+            // lands at the lowest free fd (well below the marker's own high, reserved number —
+            // see `HIGH_FLOOR` in `fdmarker.rs`), and `PROC_PIDLISTFDS` enumerates a process's
+            // fd table in ascending order (measured on this host), so the CLOEXEC dup is
+            // scanned FIRST. A regression to first-fd-wins would therefore misreport
+            // `clexec: true`; the correct AND-fold reports `false`, since the original,
+            // still-open copy is not CLOEXEC.
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let control_fd = {
+                use std::os::fd::AsRawFd;
+                sock.as_raw_fd()
+            };
+            let marker_fd = find_one_unexplained_open_fd(&[0, 1, 2, control_fd]);
+            // SAFETY: `marker_fd` was just confirmed open by the scan above; F_DUPFD_CLOEXEC
+            // duplicates it, setting FD_CLOEXEC on the NEW copy only — the original descriptor
+            // is untouched (still open, still non-CLOEXEC).
+            let dup = unsafe { libc::fcntl(marker_fd, libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                dup >= 0,
+                "F_DUPFD_CLOEXEC({marker_fd}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(
+                dup < marker_fd,
+                "the CLOEXEC dup (fd {dup}) must land below the marker's own high fd \
+                 ({marker_fd}) for this test to exercise the ordering its coverage depends on"
+            );
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
