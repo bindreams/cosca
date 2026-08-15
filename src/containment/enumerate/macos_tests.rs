@@ -22,3 +22,6 @@ mod failure_fallback;
 
 #[path = "macos_tests/ppid_join.rs"]
 mod ppid_join;
+
+#[path = "macos_tests/snapshot.rs"]
+mod snapshot;

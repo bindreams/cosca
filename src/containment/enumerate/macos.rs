@@ -28,7 +28,7 @@
 //!   unlocked-read-to-locked-walk window. Nothing in this module can close it without
 //!   changing the underlying syscall.
 
-use crate::identity::RawPid;
+use crate::identity::{RawPid, Resolved};
 
 /// Extra pid slots asked for on top of the kernel's sizing answer, so the common case
 /// needs exactly one fill: the process set can grow between the sizing call and the fill.
@@ -37,13 +37,13 @@ const HEADROOM: usize = 16;
 /// Read the parent pid of `pid` via `identity::macos_ppid_of` — `proc_pidinfo` primary,
 /// sysctl fallback on a miss, and the shared zero-ppid guard, all owned by `identity::macos`
 /// (see that module's `ppid_of` doc for why: this backend reuses it whole rather than
-/// keeping a second `proc_pidinfo` call and a second copy of the guard here). `None` covers
-/// every resolution failure `identity::macos::ppid_of`'s doc lists: gone, a sandboxed sysctl
-/// refusal, or the fork-in-progress `e_ppid == 0` window hitting both reads for this pid.
-/// Silent per-call: a dropped edge drops the pid's whole subtree in
-/// `treewalk::descendants_with`, so the drop matters.
-fn ppid_of(pid: libc::c_int) -> Option<RawPid> {
-    crate::identity::macos_ppid_of(pid as RawPid).found()
+/// keeping a second `proc_pidinfo` call and a second copy of the guard here). The tri-state is
+/// forwarded whole, not collapsed to `Option`: [`join_edges`] needs to tell a genuine absence
+/// (`Gone` — the pid exited, a legitimate exclusion) apart from a refused query (`Unknown` —
+/// e.g. a sandboxed sysctl refusal, or the fork-in-progress `e_ppid == 0` window hitting both
+/// reads for this pid — a real gap in the ppid-walk channel, not a legitimate one).
+fn ppid_of(pid: libc::c_int) -> Resolved<RawPid> {
+    crate::identity::macos_ppid_of(pid as RawPid)
 }
 
 /// Buffer capacity, in PIDS, for a sizing answer of `needed` pids.
@@ -270,20 +270,45 @@ fn all_pids_via(fill_all: impl FnOnce() -> std::io::Result<Filled>) -> Vec<libc:
 }
 
 /// Every pid the kernel will list. Empty on failure — see the module docs.
+///
+/// Test-only fault seam: [`force_blind_snapshot_for_next_call`] arms a thread-local that makes
+/// the NEXT call on the calling thread report empty without touching the real syscall, as if
+/// `proc_listallpids` itself had failed. This exists so `Marker::sweep`'s `incomplete`/`Err`
+/// path can be exercised end-to-end through the real public `hard_kill()`/`terminate()` API
+/// with a genuinely blind pass, rather than a synthetic in-process mock of `sweep`'s internals.
 fn all_pids() -> Vec<libc::c_int> {
+    #[cfg(test)]
+    if FORCE_BLIND.with(|c| c.take()) {
+        log::warn!(
+            "proc_listallpids sizing call returned 0 (test fault injected); every containment \
+             teardown channel that reads the process table is blind this round"
+        );
+        return Vec::new();
+    }
     all_pids_via(fill_all)
 }
 
-/// How many pids to name in a drop-sample log line - enough to start a debugging session
-/// from, not so many that a snapshot with hundreds of drops floods the log.
-const DROP_SAMPLE_CAP: usize = 5;
+#[cfg(test)]
+thread_local! {
+    static FORCE_BLIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms (`true`) or disarms (`false`) the blind-snapshot fault for the next [`all_pids`] call
+/// (via [`snapshot`]/[`process_parents`]) on the CALLING thread only — consumed automatically
+/// on that one call, so a test does not need to remember to disarm it afterward.
+#[cfg(test)]
+pub(crate) fn force_blind_snapshot_for_next_call(force: bool) {
+    FORCE_BLIND.with(|c| c.set(force));
+}
 
 /// Join pids to `(pid, ppid)` edges, filtering non-positive pids first. Pure and taking its
 /// input as a plain slice - deterministically testable with a synthetic `[0, -1, <a real
 /// pid>]` input, unlike a live call, which depends on the host's process table happening to
-/// contain a non-positive pid at all. Returns the edges, how many attempted joins failed,
-/// and a bounded sample of the failed pids for logging.
-fn join_ppids(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>) {
+/// contain a non-positive pid at all. Returns the edges and how many pids the OS DENIED a
+/// ppid read for — a `Gone` pid is a legitimate exclusion (it simply exited) and is not
+/// counted; only `Unknown` (denied) is, since that subtree is a real gap for a caller tracking
+/// completeness (`snapshot`'s doc, `Marker::sweep`).
+fn join_edges(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize) {
     // A plain `Vec::with_capacity`, not a fallible reservation. `process_parents()` has FOUR
     // live callers, and this allocation is not the only abort on every path to it:
     // `treewalk::hard_kill`/`terminate` already do an unconditional `to_vec` on this same
@@ -297,42 +322,51 @@ fn join_ppids(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize, Vec<libc::
     // into a successfully EMPTY process tree - the exact silent-absence shape this module's
     // fallback work exists to eliminate, traded for a still-real abort on two of four
     // callers. `pids.len()` over-estimates, since some entries are filtered or fail the join.
-    let mut out = Vec::with_capacity(pids.len());
-    let mut dropped = 0usize;
-    let mut sample = Vec::new();
+    let mut edges = Vec::with_capacity(pids.len());
+    let mut denied = 0usize;
     for &pid in pids {
         if pid <= 0 {
             continue; // pid 0 is the kernel process, not a real ppid edge
         }
         match ppid_of(pid) {
-            Some(ppid) => out.push((pid as RawPid, ppid)),
-            None => {
-                dropped += 1;
-                if sample.len() < DROP_SAMPLE_CAP {
-                    sample.push(pid);
-                }
-            }
+            Resolved::Found(ppid) => edges.push((pid as RawPid, ppid)),
+            Resolved::Gone => {}
+            Resolved::Unknown => denied += 1,
         }
     }
-    (out, dropped, sample)
+    (edges, denied)
 }
 
 pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
-    let pids = all_pids();
-    let (out, dropped, sample) = join_ppids(&pids);
-    if dropped > 0 {
-        // One line per call, not one per dropped pid: `ppid_of` itself stays silent (see its
-        // doc) so a snapshot with many EPERM/ESRCH drops does not flood the log.
-        log::warn!(
-            "enumerate: {dropped} of {} pids had no resolvable ppid even after the sysctl \
-             fallback (commonly a genuine ESRCH exit mid-snapshot, occasionally a sandboxed \
-             sysctl refusal or a fork()-in-progress read - see `ppid_of`'s doc - though the \
-             exact per-pid cause is not recorded) - a tree walk may miss the descendants under \
-             each dropped edge; sample: {sample:?}",
-            out.len() + dropped
+    snapshot().1
+}
+
+/// Every listable pid, the `(pid, ppid)` edges readable from those pids, and how many pids the
+/// OS DENIED a ppid read for (as opposed to simply having exited) — all from ONE enumeration,
+/// so the ppid-walk teardown channel and macOS's fd-marker sweep (which additionally needs the
+/// raw pid list to search for marker holders) cannot disagree about the host.
+///
+/// A denied pid's subtree is a real gap in the ppid-walk channel — e.g. after a
+/// credential-changing `exec`, the same scenario the marker channel already names — not a
+/// legitimate absence like a pid that simply exited; a caller tracking completeness
+/// (`Marker::sweep`) folds this count into its own `incomplete` accounting instead of treating
+/// it as one. There is no deterministic unit test that forces the `Unknown`/denied branch
+/// itself: the one reliable cross-privilege trigger this crate has (querying pid 1 as a
+/// non-root caller) resolves via `identity::macos_ppid_of`'s own sysctl fallback into `Found`,
+/// not `Unknown` — see `ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback`.
+pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
+    let raw = all_pids();
+    let (edges, denied) = join_edges(&raw);
+    if denied > 0 {
+        log::debug!(
+            "containment snapshot: {denied} of {} pids denied a ppid read (access denied, or a \
+             fork()-in-progress read); their subtrees are invisible to the ppid-walk channel \
+             this round",
+            raw.len()
         );
     }
-    out
+    let pids = raw.into_iter().filter(|&p| p > 0).map(|p| p as RawPid).collect();
+    (pids, edges, denied)
 }
 
 #[cfg(test)]
