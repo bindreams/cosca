@@ -134,8 +134,41 @@ impl Child {
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use `kill()` for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
+    ///
+    /// On the Unix process-group and session mechanisms this returns
+    /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
+    /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
+    /// tree is still running and this process cannot bring it down.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // Precondition (sibling #54's territory — asserted, not fixed, here): the contained
+        // root must not already be reaped when the mechanism is pgid-based (Attached::
+        // ProcessGroup — covers both Containment::ProcessGroup and Containment::Session, which
+        // also lands in this variant at spawn time), or the kernel may have recycled the pgid
+        // onto an unrelated process group. This crate's own `Drop` always kills before it
+        // reaps, so the common path never violates this; an explicit `wait()` then
+        // `kill_tree()`/`terminate_tree()` does — exactly the footgun #54 is about. Gated to
+        // this ONE mechanism: a recycled pgid is meaningless for Cgroup (keyed by an fd),
+        // JobObject (no pgid), Delegated (no mechanism), or TreeWalk (re-resolves identity per
+        // member, immune to this by construction) — asserting it there would be a false alarm
+        // unrelated to what this precondition is about. `Existence::Unknown` (the OS refused
+        // the query) is permitted through: this asserts against POSITIVE evidence of a
+        // violation, not against every case we merely couldn't rule out.
+        //
+        // `#[cfg(unix)]`: `Attached::ProcessGroup` is itself a Unix-only variant (see
+        // `containment/dispatch.rs`) — referencing it unconditionally does not compile on
+        // Windows (`cargo check --target x86_64-pc-windows-msvc` confirmed E0599 without this
+        // gate). Windows has no pgid to recycle, so there is nothing for this precondition to
+        // assert there.
+        #[cfg(unix)]
+        debug_assert!(
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_))
+                || !matches!(self.id.exists(), crate::identity::Existence::Gone),
+            "kill_tree/terminate_tree called after the contained root (pid {}) was already \
+             reaped; a pgid-based mechanism may now signal a recycled, unrelated process group \
+             (see #54)",
+            self.id.pid()
+        );
         let group_result = self.attached.hard_kill();
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
@@ -169,8 +202,24 @@ impl Child {
     /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
     /// tree is still running" rather than keying a fallback on the variant alone. Attach a
     /// console before spawning the tree, or use `kill_tree`, which needs none.
+    ///
+    /// On the Unix process-group and session mechanisms this returns
+    /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
+    /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
+    /// tree is still running and this process cannot bring it down.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // See kill_tree's identical precondition assert for the full rationale, including the
+        // `#[cfg(unix)]` gate (Attached::ProcessGroup does not exist on Windows).
+        #[cfg(unix)]
+        debug_assert!(
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_))
+                || !matches!(self.id.exists(), crate::identity::Existence::Gone),
+            "kill_tree/terminate_tree called after the contained root (pid {}) was already \
+             reaped; a pgid-based mechanism may now signal a recycled, unrelated process group \
+             (see #54)",
+            self.id.pid()
+        );
         self.attached.terminate(self.proc.id())
     }
 
@@ -243,6 +292,34 @@ impl Child {
     }
 }
 
+/// Whether a `hard_kill`/`terminate` result is still a genuine teardown MECHANISM failure —
+/// as opposed to `Error::Containment` (a live member refused the signal), both ORDINARY,
+/// expected outcomes after #61's fix and specifically the scenario it exists to report
+/// honestly, not bugs. Shared by both `Child::drop` impls (sync here, async in
+/// `src/tokio/child.rs`) so the classification has exactly one implementation instead of two
+/// hand-copied ones drifting apart.
+///
+/// **`Error::Unassessable` is NOT uniformly one or the other — it splits on `source`.**
+/// `group::decide` produces `source: None` when the group WAS listed successfully but one or
+/// more of its individual members could not be confirmed cleared (`check_or_signal` /
+/// `check_or_signal_linux_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
+/// — an ordinary, expected outcome of the feature this issue adds, not a bug. `signal_group`'s
+/// `pgid <= 0` guard ALSO produces `source: None`, for a different but equally ORDINARY
+/// reason: a directly and deliberately TESTED input-validation refusal
+/// (`kill_group_and_term_group_reject_non_positive_pgid`, Task 5), not a "should never
+/// happen" internal contract violation — this function never got as far as attempting
+/// anything, the same way `group::decide`'s per-member case never got a confirmable answer.
+/// Neither provenance indicates the teardown MECHANISM'S OWN plumbing broke, which is the
+/// actual line this classifier draws. `group::state` produces `source: Some(io_error)` when
+/// `converge` itself returned `Err` — the listing syscall (`members()`'s `sysctl`/`/proc`
+/// scan) failed outright, before any member was even examined. THAT is a failure of the
+/// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
+/// statement about any member or any input — so it, alone, is treated as a mechanism failure
+/// here.
+pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
+    matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -251,7 +328,18 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
-        let _ = self.attached.hard_kill();
+        let tree = self.attached.hard_kill();
+        if let Err(e) = &tree {
+            // A live member refused, or couldn't be confirmed — visible, not silently
+            // discarded, on the RAII teardown path most callers actually hit. A genuine
+            // mechanism failure (is_teardown_mechanism_failure) is a debug_assert instead,
+            // matching the async twin's disposition for the identical condition.
+            debug_assert!(
+                !is_teardown_mechanism_failure(e),
+                "contained-tree teardown failed on sync Drop: {e:?}"
+            );
+            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+        }
         self.proc.teardown_on_drop();
     }
 }
