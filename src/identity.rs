@@ -150,6 +150,12 @@ impl ProcessId {
 #[cfg(windows)]
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
 
+/// `containment::enumerate::macos`'s sysctl fallback for a pid's parent pid — see
+/// `identity::macos::ppid_of`'s doc for why it lives here instead of a second copy of
+/// `kinfo_proc`'s layout.
+#[cfg(target_os = "macos")]
+pub(crate) use backend::ppid_of as macos_ppid_of;
+
 /// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
 /// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).
 #[cfg(windows)]

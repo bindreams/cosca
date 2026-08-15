@@ -2,14 +2,18 @@
 //! `proc_pidinfo(PROC_PIDTBSDINFO).pbi_ppid` per pid (the same call `identity`
 //! uses for its start token).
 //!
-//! Three known gaps:
+//! Three things worth knowing (an EPERM gap — an unprivileged caller getting no edge for
+//! another user's process — is CLOSED: `ppid_of` now falls back to `identity::macos_ppid_of`'s
+//! `sysctl(KERN_PROC_PID)` read on a `proc_pidinfo` miss, the same fallback `identity`
+//! itself uses for zombies and EPERM-hidden cross-user processes):
 //!
-//! - `proc_pidinfo` is denied (EPERM) for another user's process, so an unprivileged
-//!   caller gets no edge for one. `identity` covers the same case with a
-//!   `sysctl(KERN_PROC_PID)` fallback; this backend has none. Everything cosca spawns
-//!   itself is same-uid and unaffected. `process_parents` reports the aggregate drop count
-//!   (and a bounded pid sample) at `warn`; individual drops are not logged - a snapshot with
-//!   many drops must not become one log record per pid.
+//! - Even with the fallback, an edge can still be dropped: the target pid genuinely exited
+//!   between the snapshot and the query (ESRCH on both paths), a sandbox denies the
+//!   fallback's own sysctl (rare — EPERM/EACCES there is a DESIGNED `Unknown`, not a second
+//!   EPERM gap), or the fallback's own pid, 1 excepted, momentarily reads `e_ppid == 0` mid
+//!   fork() (see `identity::macos::ppid_of`'s doc). `process_parents` reports the aggregate
+//!   drop count (and a bounded pid sample) at `warn`; individual drops are not logged - a
+//!   snapshot with many drops must not become one log record per pid.
 //! - A failed snapshot is reported as an EMPTY one, because `process_parents` has no error
 //!   channel. A tree walk over an empty snapshot finds no descendants, so the failure is
 //!   logged at `warn` naming that consequence.
@@ -33,8 +37,13 @@ use crate::identity::RawPid;
 /// needs exactly one fill: the process set can grow between the sizing call and the fill.
 const HEADROOM: usize = 16;
 
-/// Read the parent pid of `pid` via `proc_bsdinfo`, or `None` if not resolvable (EPERM
-/// cross-user, ESRCH mid-snapshot exit). Silent per-call: a dropped edge drops the pid's
+/// Read the parent pid of `pid`: `proc_bsdinfo` primary, `identity::macos_ppid_of`'s sysctl
+/// fallback on a miss (the same primary/fallback shape `identity::macos::start_token` uses
+/// for its own libproc miss — see that module's doc for why the fallback's sysctl knowledge
+/// lives there rather than a second copy of `kinfo_proc`'s layout here). `None` only when
+/// BOTH fail to resolve: gone (ESRCH mid-snapshot exit) or a sandboxed sysctl refusal
+/// (EPERM/EACCES on the fallback itself) or the fork-in-progress `e_ppid == 0` window
+/// `identity::macos::ppid_of` documents. Silent per-call: a dropped edge drops the pid's
 /// whole subtree in `treewalk::descendants_with`, so the drop matters, but the caller
 /// (`process_parents`, via `join_ppids`) reports it aggregated, not one log record per pid.
 fn ppid_of(pid: libc::c_int) -> Option<RawPid> {
@@ -52,7 +61,12 @@ fn ppid_of(pid: libc::c_int) -> Option<RawPid> {
             size,
         )
     };
-    (n == size).then_some(info.pbi_ppid)
+    if n == size {
+        return Some(info.pbi_ppid);
+    }
+    // libproc miss: EPERM cross-user, a ZOMBIE (ESRCH is also possible here but resolves
+    // the same way through the fallback — Gone either way), or a genuine ESRCH exit.
+    crate::identity::macos_ppid_of(pid as RawPid).found()
 }
 
 /// Buffer capacity, in PIDS, for a sizing answer of `needed` pids.
@@ -326,10 +340,11 @@ pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
         // One line per call, not one per dropped pid: `ppid_of` itself stays silent (see its
         // doc) so a snapshot with many EPERM/ESRCH drops does not flood the log.
         log::warn!(
-            "enumerate: {dropped} of {} pids had no resolvable ppid (commonly EPERM cross-user \
-             or ESRCH mid-snapshot exit, though `proc_pidinfo`'s exact failure per pid is not \
-             recorded) - a tree walk may miss the descendants under each dropped edge; \
-             sample: {sample:?}",
+            "enumerate: {dropped} of {} pids had no resolvable ppid even after the sysctl \
+             fallback (commonly a genuine ESRCH exit mid-snapshot, occasionally a sandboxed \
+             sysctl refusal or a fork()-in-progress read - see `ppid_of`'s doc - though the \
+             exact per-pid cause is not recorded) - a tree walk may miss the descendants under \
+             each dropped edge; sample: {sample:?}",
             out.len() + dropped
         );
     }

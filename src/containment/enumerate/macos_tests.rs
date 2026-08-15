@@ -473,24 +473,22 @@ fn parents_contains_this_process_edge() {
     );
 }
 
-/// The `None` branch of `ppid_of` — the EPERM gap the module docs trace. pid 1 (launchd) is
+/// The EPERM gap the module docs traced is now CLOSED for this case: pid 1 (launchd) is
 /// guaranteed to exist and, outside a root process, guaranteed to be owned by a different
-/// (root) user, so it is a deterministic trigger without spawning a cross-uid process. If
-/// the test itself runs as root (some CI containers do), the call is expected to SUCCEED
-/// instead — that branch is asserted explicitly, not skipped, so the test always checks
-/// something regardless of the runner's privilege.
+/// (root) user - a deterministic trigger for the sysctl fallback without spawning a
+/// cross-uid process. Its real ppid is 0 (the kernel) on every macOS version - the one case
+/// `identity::macos::ppid_of`'s "`e_ppid == 0` is never trusted" rule exempts by pid rather
+/// than discards (see that function's doc). `ppid_of(1)` therefore resolves the same way
+/// whether the caller is root (via `proc_pidinfo`, the primary) or unprivileged (via the
+/// fallback) - unlike before the fallback existed, when only root could resolve it at all.
 #[test]
-fn ppid_of_denies_a_different_users_process() {
-    let result = ppid_of(1);
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    if unsafe { libc::geteuid() } == 0 {
-        assert!(result.is_some(), "root can read launchd's ppid");
-    } else {
-        assert!(
-            result.is_none(),
-            "an unprivileged caller must not read another user's process info"
-        );
-    }
+fn ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback() {
+    assert_eq!(
+        ppid_of(1),
+        Some(0),
+        "pid 1 (launchd)'s parent is the kernel (ppid 0) - resolvable via proc_pidinfo (root) \
+         or the sysctl fallback (unprivileged) either way"
+    );
 }
 
 /// The OTHER cause of `ppid_of`'s `None` branch: ESRCH, a pid that does not exist. Triggered

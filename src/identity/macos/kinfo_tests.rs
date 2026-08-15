@@ -99,3 +99,102 @@ fn sysctl_token_matches_libproc_for_a_live_process() {
 
     assert_eq!(ours, theirs, "sysctl and libproc disagree on self's start token");
 }
+
+// Value oracle for E_PPID_OFFSET, over the WHOLE live process table rather than just self:
+// for every pid where `proc_pidinfo` succeeds, the sysctl-derived `e_ppid` must be
+// byte-identical to `proc_bsdinfo.pbi_ppid` — a wrong offset fails here on real ppid values,
+// not a coincidental zero. Also reports the two things the offset makes possible: how many
+// pids ONLY sysctl could resolve (the `containment::enumerate::macos::ppid_of` fallback's
+// rescue set — EPERM cross-user or a ZOMBIE), and how many resolved on NEITHER path (the
+// genuine residual — see that module's doc). Run with `--nocapture` to see the counts.
+//
+// `e_ppid == 0` for any pid but 1 (launchd, the only real process whose parent is the
+// kernel) is EXCLUDED from the comparison rather than asserted, not retried: measured live,
+// a busy host occasionally serves a freshly-forked pid's sysctl record with `e_ppid == 0`
+// while `proc_pidinfo` already sees the real value - XNU does not fill `eproc.e_ppid` and
+// `proc_bsdinfo` atomically with respect to an outside reader. This is a narrow,
+// kernel-internal, userspace-invisible race, the same class the module docs already name for
+// the walk cap - not a race to synchronize away with a retry loop (which would just move the
+// same "how many tries is enough" guess into this test), but a value `identity::macos::ppid_of`
+// treats the same way in production: `Resolved::Unknown`, never a trusted `0`.
+//
+// A simple grow-until-it-fits pid listing, not `collect_pids`'s hot-path doubling discipline
+// (see `containment::enumerate::macos`) — this test only needs one complete snapshot, not a
+// `hard_kill`-safe allocator.
+#[test]
+fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
+    let mut cap = 1024usize;
+    let pids = loop {
+        let mut buf = vec![0i32; cap];
+        let bytes = (buf.len() * std::mem::size_of::<i32>()) as libc::c_int;
+        // SAFETY: `buf` owns exactly `bytes` writable bytes; proc_listallpids writes c_ints
+        // into it and never past the size it is given.
+        let written = unsafe { libc::proc_listallpids(buf.as_mut_ptr() as *mut libc::c_void, bytes) };
+        assert!(
+            written > 0,
+            "proc_listallpids failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let written = written as usize;
+        if written < buf.len() {
+            buf.truncate(written);
+            break buf;
+        }
+        cap *= 2;
+    };
+
+    let (mut agreed, mut rescued, mut both_failed, mut ambiguous_zero) = (0usize, 0usize, 0usize, 0usize);
+
+    for pid in pids {
+        if pid <= 0 {
+            continue; // pid 0 is the kernel process, not a real pid
+        }
+
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes up to `size` bytes into `info`.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        let libproc_ppid = (n == size).then_some(info.pbi_ppid);
+
+        let sysctl_ppid = match kinfo(pid as super::super::RawPid) {
+            crate::identity::Resolved::Found(k) => Some(k.e_ppid()),
+            crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => None,
+        };
+
+        match (libproc_ppid, sysctl_ppid) {
+            (Some(_), Some(0)) if pid != 1 => ambiguous_zero += 1,
+            (Some(a), Some(b)) => {
+                assert_eq!(
+                    a, b as u32,
+                    "pid {pid}: libproc ppid {a} disagrees with sysctl ppid {b}"
+                );
+                agreed += 1;
+            }
+            (None, Some(_)) => rescued += 1,
+            // libproc succeeded but sysctl did not - the reverse fork/exit-window race, or a
+            // genuinely narrower gap than the fallback's target case. `both_failed`, not a
+            // separate bucket: from `containment::enumerate::macos::ppid_of`'s perspective
+            // (proc_pidinfo primary, sysctl fallback) this pid is unresolved either way, since
+            // its own primary already succeeded and it never reaches the fallback at all.
+            (Some(_), None) => both_failed += 1,
+            (None, None) => both_failed += 1,
+        }
+    }
+
+    eprintln!(
+        "sysctl_e_ppid oracle over the live process table: agreed={agreed} rescued={rescued} \
+         both_failed={both_failed} ambiguous_zero={ambiguous_zero}"
+    );
+    assert!(
+        agreed > 0,
+        "must observe at least one libproc/sysctl agreement on a live host (self, if nothing else)"
+    );
+}
