@@ -102,17 +102,29 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::Containment);
-    let err = child
+    // A successful sweep is fresher, positive proof the group cleared, superseding the held
+    // refusal — the call must report `Ok`, not resurface the disproved `Containment` error.
+    let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .await
-        .expect_err("the forced terminate refusal must surface");
-    assert!(matches!(err, crate::error::Error::Containment { .. }), "got {err:?}");
+        .expect("a successful sweep must supersede the forced terminate refusal");
+    assert!(!status.success(), "swept root cannot report success, got {status:?}");
     assert!(
         crate::log_capture::contains_since(
             mark,
             &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
         ),
         "the terminate-refusal trace specifically must fire"
+    );
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!(
+                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                pid = id.pid()
+            )
+        ),
+        "the refusal must be logged as discarded, not silently dropped"
     );
     #[cfg(unix)]
     assert_eq!(
@@ -122,11 +134,6 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
-    let status = child
-        .wait()
-        .await
-        .expect("cached status — already reaped by the graceful op");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
 }
 
 // Async twin of `graceful_tree_unassessable_per_member_still_sweeps_and_reaps`.
@@ -143,20 +150,29 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::UnassessablePerMember);
-    let err = child
+    // Same supersession as the `Containment` test above: the sweep's success disproves the
+    // held per-member-unconfirmed state, so the call must report `Ok`.
+    let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .await
-        .expect_err("the forced per-member-unassessable state must surface");
-    assert!(
-        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
-        "got {err:?}"
-    );
+        .expect("a successful sweep must supersede the forced unassessable state");
+    assert!(!status.success(), "swept root cannot report success, got {status:?}");
     assert!(
         crate::log_capture::contains_since(
             mark,
             &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
         ),
         "the terminate-refusal trace specifically must fire"
+    );
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!(
+                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                pid = id.pid()
+            )
+        ),
+        "the refusal must be logged as discarded, not silently dropped"
     );
     #[cfg(unix)]
     assert_eq!(
@@ -166,11 +182,6 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
-    let status = child
-        .wait()
-        .await
-        .expect("cached status — already reaped by the graceful op");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
 }
 
 // Async twin of `graceful_tree_unassessable_mechanism_failure_fails_fast`.

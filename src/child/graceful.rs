@@ -85,12 +85,14 @@ impl Child {
     /// ([`Error::Containment`](crate::error::Error::Containment) or
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) with no I/O `source` — see
     /// [`terminate_tree`](Child::terminate_tree)), the grace is still waited and the sweep
-    /// still runs; the held error resurfaces only after a successful sweep and reap (mirroring
-    /// how a watch failure is held above), so a member that only needed the follow-up `SIGKILL`
-    /// does not strand the rest of the tree. A genuine listing-mechanism failure (an
-    /// `Unassessable` with an I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`,
-    /// it returns immediately: no signal is confirmed sent, so there is nothing for a grace
-    /// wait or sweep to act on yet.
+    /// still runs, so a member that only needed the follow-up `SIGKILL` does not strand the
+    /// rest of the tree. A subsequent successful sweep is fresher, positive proof the group
+    /// cleared, which supersedes the earlier refusal: it is logged and discarded, and this
+    /// call reports `Ok`. It resurfaces only indirectly, as the sweep's own error, if the
+    /// sweep then fails too. A genuine listing-mechanism failure (an `Unassessable` with an
+    /// I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`, it returns
+    /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
+    /// sweep to act on yet.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
         // Fail fast before sending any signal. terminate_tree/kill_tree re-check this guard
         // internally; the redundancy is intentional so an uncontained child errors up front.
@@ -125,7 +127,7 @@ impl Child {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
                 log::debug!(
-                    "graceful_shutdown_tree({id}): terminate_tree refused (subsumed if the sweep also fails): {e}",
+                    "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {e}",
                     id = self.id.pid()
                 );
                 Err(e)
@@ -163,7 +165,15 @@ impl Child {
         }
         let status = self.wait()?;
         watch?;
-        term?;
+        // The sweep just returned `Ok`: positive, freshly-measured proof the group cleared,
+        // superseding whatever `term` held. Discard it here rather than returning it — an
+        // already-disproved refusal must never outrank the evidence that disproved it.
+        if let Err(e) = &term {
+            log::debug!(
+                "graceful_shutdown_tree({id}): sweep succeeded; discarding the superseded terminate_tree refusal: {e}",
+                id = self.id.pid()
+            );
+        }
         Ok(status)
     }
 }
@@ -210,7 +220,7 @@ pub(crate) mod fault {
     // unconditionally at the very top of `graceful_shutdown_tree`, so by the time any test
     // assertion runs the seam is ALWAYS already consumed — an `armed()` check would be
     // tautologically true and, worse, an unused `pub(crate)` item once nothing calls it,
-    // which `cargo clippy -D warnings` (Task 7 Step 4) would hard-fail on.
+    // which `cargo clippy -D warnings` would hard-fail on.
     pub(crate) fn forced_terminate_error(kind: Forced) -> crate::error::Error {
         match kind {
             Forced::None => unreachable!("forced_terminate_error called with Forced::None"),

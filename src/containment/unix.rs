@@ -111,15 +111,12 @@ pub(crate) fn term_group(pgid: i32) -> Result<(), Error> {
 /// `verify` for why none of `Ok`/`ESRCH`/`EPERM` can be trusted alone on either platform.
 ///
 /// **The `pgid` guard lives HERE, before any signal is sent — not only in `group::state`.**
-/// An earlier draft of this fix placed the `pgid <= 0` rejection inside `group::state`,
-/// downstream of this function's own `killpg`/`signal_direct` calls — meaning a `pgid` of `0`
-/// (which signals the CALLER's own process group, per POSIX) or a negative one (the
-/// broadcast/double-negation hazard this file's Background measures) would already have been
-/// signalled for real before the "guard" ever ran. A check placed after the dangerous syscall
-/// it claims to guard is not a guard.
+/// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
+/// the broadcast/double-negation hazard this file's Background measures. A check placed after
+/// the dangerous syscall it claims to guard is not a guard.
 fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
     // NOT a debug_assert!: unlike the reaped-root precondition in `Child::kill_tree`/
-    // `terminate_tree` (Task 5, below), an invalid `pgid` reaching this function is a directly
+    // `terminate_tree`, an invalid `pgid` reaching this function is a directly
     // and deliberately TESTED, ordinary input-validation outcome, not a "should never happen"
     // internal contract — `kill_group_and_term_group_reject_non_positive_pgid` (this file)
     // calls this path with `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a
@@ -197,8 +194,8 @@ fn verify(pgid: i32, signal: Signal) -> Result<(), Error> {
 ///   calls can have different, divergent targets. Kept because #54 forbids removing it, not
 ///   because it is proven safe or proven duplicative.
 /// - **`term_group` (`SIGTERM`)**: NOT redundant — the only real one. `converge`'s `SIGTERM`
-///   path deliberately never resends (Task 4's design: only probes, to avoid tripping a
-///   program's own double-signal escalation convention), so this is the ONLY actual `SIGTERM`
+///   path deliberately never resends — only probes, to avoid tripping a program's own
+///   double-signal escalation convention — so this is the ONLY actual `SIGTERM`
 ///   delivery attempt to the leader after `killpg` reports `EPERM`. Do not remove or reframe
 ///   this arm as optional for the graceful path.
 ///

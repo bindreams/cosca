@@ -12,8 +12,9 @@ fn is_alive(m: &Member) -> bool {
 /// kernel still lists in its process group. `waitid(WEXITED | WNOWAIT)` is the
 /// real primitive for this — nothing here is timed. `nix` does not expose
 /// `waitid` on macOS (0.31 configures it out), so call `libc` directly,
-/// following `src/tokio/child.rs:488-506`'s idiom — including its EINTR
-/// retry, so a stray signal to the test process fails the wait, not the test.
+/// following the same `waitid(WEXITED | WNOWAIT)` idiom `reap_now` uses in
+/// `src/tokio/child.rs` — including its EINTR retry, so a stray signal to the
+/// test process fails the wait, not the test.
 fn await_zombie(pid: u32) {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {
@@ -81,13 +82,13 @@ fn members_marks_an_unreaped_leader_as_dead() {
 }
 
 /// A pgid with no members at all lists nothing, and that is not an error. Uses `i32::MAX`
-/// (2147483647), not a forward scan from the test's own pid: an earlier draft scanned
-/// upward and asserted on the exact predicate the scan itself already satisfied — a
-/// tautology proving nothing beyond what the helper's own loop condition already
-/// established, AND a genuine (if narrow) check-then-act gap, since the scanned range is
-/// exactly where the kernel's allocator is likely to hand out a NEW pid next, including to
-/// this crate's own sibling tests, several of which spawn `process_group(0)` children whose
-/// pgid == their pid. `i32::MAX` cannot collide: measured directly on this host,
+/// (2147483647), not a forward scan from the test's own pid: a forward scan would assert on
+/// the exact predicate the scan itself already satisfied — a tautology proving nothing beyond
+/// what the loop condition already established — AND a genuine (if narrow) check-then-act
+/// gap, since the scanned range is exactly where the kernel's allocator is likely to hand out
+/// a NEW pid next, including to this crate's own sibling tests, several of which spawn
+/// `process_group(0)` children whose pgid == their pid. `i32::MAX` cannot collide: measured
+/// directly on this host,
 /// `sysctl(KERN_PROC_PGRP, i32::MAX)` returns `rc=0` with zero actual records (confirming no
 /// real pid/pgid is ever allocated anywhere near it — `kern.maxproc`/`pid_max` stay far
 /// below `2^31` on every real system), so this is a fixed value, not a scan, and the
@@ -200,9 +201,8 @@ fn classify_member_is_total_over_liveness_and_reached() {
 /// `Survivor` is downgraded ONLY on a positive `Dead` disagreement — a denied reconfirmation
 /// (`Liveness::Unknown`) does NOT overturn the already-observed, authoritative `EPERM` a
 /// `Survivor` carries (see this function's own doc comment for why `Unknown` and `Dead` are
-/// not equivalent here, unlike an earlier round of this plan). `NotASurvivor`/`Unassessable`
-/// pass through untouched (the panicking closure proves no second check runs for them at all
-/// — there is nothing to reconfirm).
+/// not equivalent here). `NotASurvivor`/`Unassessable` pass through untouched (the panicking
+/// closure proves no second check runs for them at all — there is nothing to reconfirm).
 #[test]
 fn reconfirm_survivor_downgrades_only_on_dead() {
     use super::{reconfirm_survivor, MemberOutcome};
@@ -264,6 +264,28 @@ fn decide_prioritizes_refused_over_unassessable_over_cleared() {
         }
         other => panic!("expected Refused, got {other:?}"),
     }
+}
+
+/// `excluded_from_sigkill_resend`'s pure predicate, isolated from any real listing or signal:
+/// pid 1 is excluded regardless of `system`, a `system`-flagged pid is excluded regardless of
+/// its number, and an ordinary user pid is excluded by neither rule.
+#[test]
+fn excluded_from_sigkill_resend_covers_pid_1_and_system_independently() {
+    use super::excluded_from_sigkill_resend;
+
+    assert!(excluded_from_sigkill_resend(1, false), "pid 1 must be excluded");
+    assert!(
+        excluded_from_sigkill_resend(1, true),
+        "pid 1 must be excluded even if also flagged system"
+    );
+    assert!(
+        excluded_from_sigkill_resend(12345, true),
+        "a system-flagged pid other than 1 must be excluded"
+    );
+    assert!(
+        !excluded_from_sigkill_resend(12345, false),
+        "an ordinary, non-system pid must not be excluded"
+    );
 }
 
 /// `term_group`'s probe path against pid 1 — the one live, unsignalable-by-an-unprivileged-

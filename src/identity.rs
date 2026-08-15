@@ -95,7 +95,7 @@ impl ProcessId {
     /// `cfg(any(unix, test))`: the only non-test caller (`containment::unix::group`) is
     /// Unix-only, so a Windows *release* build has no caller for this at all — gated to avoid
     /// a `dead_code` warning there (`cargo build --target *-pc-windows-msvc` is a real CI job,
-    /// `ci.yaml:82`, and this crate is otherwise warning-clean). Still available under
+    /// and this crate is otherwise warning-clean). Still available under
     /// `cfg(test)` on every platform, because `from_parts_for_test` below calls it everywhere.
     #[cfg(any(unix, test))]
     pub(crate) fn from_parts(pid: RawPid, token: u64) -> ProcessId {

@@ -13,7 +13,7 @@ use super::{kill_group, term_group};
 // which spawn `process_group(0)` children (pgid == pid). A collision would deliver a REAL
 // SIGKILL to an unrelated process. That coverage is not missing: `converge`'s "empty result
 // list ⇒ Cleared" path is identical whether the listing found zero members or one member
-// `classify_member` immediately drops as `NotASurvivor` (Task 4's pure
+// `classify_member` immediately drops as `NotASurvivor` (the pure
 // `classify_member_is_total_over_liveness` test proves the classification directly, with no
 // listing involved at all), and `kill_group_on_an_all_zombie_group_is_ok`/
 // `term_group_on_an_all_zombie_group_is_ok` below exercise that exact shape through the real
@@ -21,8 +21,9 @@ use super::{kill_group, term_group};
 
 // Block until `pid` has exited WITHOUT reaping it, so it stays a zombie the
 // kernel still lists in its process group. Nothing here is timed. Retries on
-// EINTR, matching src/tokio/child.rs:488-506's idiom, so a stray signal to
-// the test process fails the wait, not the test.
+// EINTR, matching the `waitid(WEXITED | WNOWAIT)` idiom `reap_now` uses in
+// `src/tokio/child.rs`, so a stray signal to the test process fails the wait,
+// not the test.
 fn await_zombie(pid: u32) {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {

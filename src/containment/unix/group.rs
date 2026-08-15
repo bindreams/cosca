@@ -20,10 +20,17 @@ use crate::identity::RawPid;
 /// One process-group member as the listing found it, carrying the start token needed to
 /// re-verify later that a check still lands on the SAME process (`converge`, below) rather
 /// than a zombie or a pid recycled onto someone else.
+///
+/// `system`: xnu's own `P_SYSTEM` flag (see `identity::kinfo::P_SYSTEM`), read directly from
+/// the same `kinfo_proc` record the listing already fetched — no second syscall. Always
+/// `false` on Linux and other Unix: their listings carry no equivalent flag, and `killpg`'s
+/// own kernel-side exclusion this crate must mirror (see `excluded_from_sigkill_resend`) is
+/// specifically xnu's `killpg1` behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Member {
     pub(crate) pid: RawPid,
     pub(crate) token: u64,
+    pub(crate) system: bool,
 }
 
 /// Every process the kernel currently lists in process group `pgid`. An empty result means
@@ -41,17 +48,13 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PGRP, pgid];
     // Extra headroom beyond the (padded) sizing query's own answer, doubled on every genuine
     // ENOMEM retry below — NOT a retry cap (the loop itself stays uncapped; only the buffer
-    // grows). Flagged by review: a single fixed record of slack, re-derived fresh from a new
-    // sizing query on every retry, has no independent termination argument against a group
-    // that keeps growing faster than that one-record margin between the sizing and fetch
-    // calls — the same shape `converge`'s rejected repeat-until-stable loop was cut for. This
-    // is a real but much narrower version of that risk (the sizing-to-fetch gap here is two
-    // syscalls back to back, not a full signal-and-relist pass), so it was not promoted to a
-    // must-fix by review, but the fix is free and removes the gap rather than merely narrowing
-    // it: doubling `slack` on each ENOMEM guarantees it eventually exceeds any BOUNDED
+    // grows). A single fixed slack, re-derived fresh from a new sizing query on every retry,
+    // has no termination argument against a group that keeps growing faster than that
+    // one-record margin between the sizing and fetch calls (the sizing-to-fetch gap here is
+    // two syscalls back to back, narrower than a full signal-and-relist pass but still real).
+    // Doubling `slack` on each ENOMEM guarantees it eventually exceeds any BOUNDED
     // per-iteration growth rate (forking still takes non-zero wall-clock time even in a tight
-    // loop), giving a genuine, finite termination argument — not a probability one — matching
-    // what this plan's own Self-review section already claims for this loop.
+    // loop), giving a genuine, finite termination argument, not a probability one.
     let mut slack: usize = 1;
     loop {
         let mut len: libc::size_t = 0;
@@ -110,10 +113,10 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
         }
         // A partial trailing record means the kernel's `kinfo_proc` no longer matches this
         // crate's 648-byte definition — the same ENOMEM-is-the-only-runtime-detector situation
-        // `identity/macos/kinfo.rs`'s single-pid reader already guards (`kinfo.rs:126-137`,
-        // its own size-mismatch `contract_violation`). Reject rather than reinterpret at the
-        // wrong stride, which would silently produce garbage `p_pid` values that `converge`
-        // would then send a real signal to.
+        // `identity/macos/kinfo.rs`'s single-pid reader already guards, via its own
+        // size-mismatch `contract_violation`. Reject rather than reinterpret at the wrong
+        // stride, which would silently produce garbage `p_pid` values that `converge` would
+        // then send a real signal to.
         if !got.is_multiple_of(RECORD) {
             return Err(std::io::Error::other(format!(
                 "sysctl(KERN_PROC_PGRP, {pgid}) returned {got} bytes, not a whole multiple of \
@@ -131,6 +134,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
                 token: unsafe {
                     k.kp_proc.p_un.p_starttime.tv_sec as u64 * 1_000_000 + k.kp_proc.p_un.p_starttime.tv_usec as u64
                 },
+                system: k.kp_proc.p_flag & crate::identity::kinfo::P_SYSTEM != 0,
             })
             .collect());
     }
@@ -154,21 +158,18 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
         };
         let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(bytes) => bytes,
-            // Deliberately NOT propagated as a listing failure, and deliberately NOT trying to
-            // disambiguate the cause (an earlier version of this plan tried: probe with
-            // `kill(pid, 0)` and propagate unless it confirms ESRCH). That attempt made things
-            // WORSE, not better: this loop scans ALL of `/proc`, not just `pgid`'s members, and
-            // a `hidepid`-restricted `/proc` answers a foreign-uid signal probe with `EPERM`
-            // (permission and /proc-visibility are separate kernel subsystems; hidepid governs
-            // only the latter) — so on a `hidepid` host, the very FIRST foreign-uid process
-            // encountered anywhere on the host, however unrelated to `pgid`, would abort the
-            // entire listing and turn every `kill_group`/`term_group` call into `Unassessable`,
-            // including a fully-torn-down group of the caller's own same-uid children. A read
-            // failure on a pid we have not yet even determined belongs to `pgid` at all carries
-            // no information about `pgid` specifically — it is simply excluded, the same as any
-            // other non-matching entry. What THIS does leave open, honestly: on a `hidepid`
-            // host, a genuine FOREIGN-uid member of `pgid` itself is invisible to this scan and
-            // silently excluded, undercounting the group — see the report's open question.
+            // Deliberately NOT propagated as a listing failure, and deliberately NOT
+            // disambiguated by probing with `kill(pid, 0)`: this loop scans ALL of `/proc`, not
+            // just `pgid`'s members, and a `hidepid`-restricted `/proc` answers a foreign-uid
+            // probe with `EPERM` too — so the first foreign-uid process anywhere on the host,
+            // however unrelated to `pgid`, would abort the entire listing and turn every
+            // `kill_group`/`term_group` call into `Unassessable`, including a fully-torn-down
+            // group of the caller's own same-uid children. A read failure on a pid not yet
+            // determined to belong to `pgid` carries no information about `pgid` specifically,
+            // so it is simply excluded like any other non-matching entry. The residual this
+            // leaves — a genuine foreign-uid member of `pgid` itself, invisible to this scan and
+            // silently excluded — is documented on `Child::kill_tree`'s public rustdoc, the
+            // guarantee it actually weakens.
             Err(e) => {
                 log::debug!(
                     "containment::unix::group::members: /proc/{pid}/stat unreadable ({e}); \
@@ -201,7 +202,11 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
             );
             continue;
         };
-        out.push(Member { pid, token });
+        out.push(Member {
+            pid,
+            token,
+            system: false,
+        });
     }
     Ok(out)
 }
@@ -249,10 +254,9 @@ pub(crate) enum GroupState {
 
 /// Whether a live-confirmed member was actually reached by the signal/probe. A THIRD
 /// answer, `Unknown`, is threaded all the way from the deepest primitive up through
-/// `classify_member` — this round's review found the previous draft collapsing "could not
-/// assess" into a binary `bool` at exactly the boundary where the distinction mattered most
-/// (inside `converge`'s `reached` closure), silently re-narrowing the `Liveness::Unknown`
-/// handling `classify_member` otherwise protects.
+/// `classify_member`: collapsing "could not assess" into a binary `bool` at the boundary
+/// where the distinction matters most (inside `converge`'s `reached` closure) would silently
+/// re-narrow the `Liveness::Unknown` handling `classify_member` otherwise protects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reached {
     Yes,
@@ -264,15 +268,14 @@ enum Reached {
 /// attempt could still teach us something) whether the real check reached it. Pure — a unit
 /// test drives all `Liveness`/`Reached` combinations directly, without needing a real OS
 /// condition for `Unknown` (which normally needs a permission-denying host like `hidepid`).
-/// `reached` is called for `Liveness::Alive` OR `Liveness::Unknown` — NOT only `Alive` (an
-/// earlier round of this plan gated it on `Alive` alone; review correctly caught that this
-/// is guard-then-do backwards for an operation the plan itself calls idempotent and
-/// self-reporting: `SIGKILL`/a probe answers the permission question directly and
-/// authoritatively, so gating the ATTEMPT on a separate LIVENESS QUERY that can itself be
+/// `reached` is called for `Liveness::Alive` OR `Liveness::Unknown` — NOT only `Alive`.
+/// Gating the attempt on `Alive` alone is guard-then-do backwards for an operation that is
+/// idempotent and self-reporting: `SIGKILL`/a probe answers the permission question directly
+/// and authoritatively, so gating the ATTEMPT on a separate LIVENESS QUERY that can itself be
 /// denied — e.g. under App Sandbox / a hardened runtime, where `is_alive`'s own fallback can
 /// legitimately answer `Unknown` for a foreign-uid member — needlessly turns a recoverable
 /// teardown into `Error::Unassessable` without ever trying the one call that would have
-/// answered the real question). Only a POSITIVE `Liveness::Dead` skips the attempt entirely
+/// answered the real question. Only a POSITIVE `Liveness::Dead` skips the attempt entirely
 /// — there is nothing left to prove for a zombie, a departed pid, or a pid recycled onto an
 /// unrelated process, however a signal/probe of the raw pid might answer.
 enum MemberOutcome {
@@ -300,37 +303,35 @@ fn classify_member(
 /// the ONE implementation both the `SIGKILL` and `SIGTERM` paths use, differing only in
 /// `signal` (`Some(SIGKILL)` resends for real; `None` probes with `kill(pid, 0)`).
 ///
-/// **Why this replaced `treewalk::kill_by_identity` from an earlier round of this plan.**
-/// That primitive's `KillOutcome::NotAttempted` conflates TWO different causes — a denied
-/// identity re-verify, and a genuine `EPERM` from the real `kill(2)` call — into one variant
-/// (`src/containment/treewalk.rs:222-256`), with nothing in the return value to tell them
-/// apart. An earlier round tried to route around this by pre-checking identity here and
-/// *assuming* `kill_by_identity`'s own internal re-check, a moment later, would agree — a
-/// probability argument, not a proof, and review correctly rejected it: a transient
-/// disagreement in that gap still mislabels "unassessable" as a confirmed refusal. Reusing
-/// `kill_by_identity` here cannot be made precise without changing its return type (out of
-/// scope — it is a sibling module's primitive), so this performs the identity check AND the
-/// `kill(2)` call directly, observing the real errno first-hand. `EPERM` and only `EPERM`
-/// classifies as a confirmed refusal; every other unexpected errno is `Unknown`, not `No` —
-/// conservative, and consistent with every other "not EPERM/ESRCH" disposition in this
+/// **Why this doesn't reuse `treewalk::kill_by_identity`.** That primitive's
+/// `KillOutcome::NotAttempted` conflates TWO different causes — a denied identity re-verify,
+/// and a genuine `EPERM` from the real `kill(2)` call — into one variant, with nothing in the
+/// return value to tell them apart. Pre-checking identity here and assuming
+/// `kill_by_identity`'s own internal re-check, a moment later, would agree is not reliable: a
+/// transient disagreement in that gap would mislabel "unassessable" as a confirmed refusal.
+/// Reusing `kill_by_identity` here cannot be made precise without changing its return type
+/// (out of scope — it is a sibling module's primitive), so this performs the identity check
+/// AND the `kill(2)` call directly, observing the real errno first-hand. `EPERM` and only
+/// `EPERM` classifies as a confirmed refusal; every other unexpected errno is `Unknown`, not
+/// `No` — conservative, and consistent with every other "not EPERM/ESRCH" disposition in this
 /// module.
 ///
 /// **The identity check and the act are still two separate syscalls on macOS — a narrowed,
-/// not eliminated, race.** Review correctly caught an earlier claim here that a pid recycled
-/// between the listing and this call is "never mistakenly signalled" — false: the re-verify
-/// and the `kill(2)` below are non-atomic, so a recycle in THAT gap (not the earlier,
-/// listing-to-here gap the re-verify closes) is still possible. On Linux this is closed for
-/// real, not just narrowed: `SIGKILL` delivery goes through `pidfd_open`+`pidfd_send_signal`
-/// (`check_or_signal_linux_sigkill`, below), reusing `crate::wait::backend::open_verified`
-/// verbatim rather than a second implementation — the fd itself pins the identity at the
-/// kernel level, so a pid reused after `pidfd_open` cannot be hit even in principle. macOS has
-/// no pidfd equivalent, so `kill(2)` here keeps the same irreducible, ALREADY-ACCEPTED window
-/// `src/wait/macos.rs::kill`'s own doc comment documents verbatim ("The window between this
-/// check and kill(2) is irreducible on macOS (no pidfd); a recycled pid in that window is a
-/// documented best-effort limitation, mirroring treewalk::kill_by_identity") — this function
-/// is that same, already-reviewed trade-off, not a new one.
+/// not eliminated, race.** A pid recycled between the listing and this call is not "never
+/// mistakenly signalled": the re-verify and the `kill(2)` below are non-atomic, so a recycle
+/// in THAT gap (not the earlier, listing-to-here gap the re-verify closes) is still possible.
+/// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
+/// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), reusing
+/// `crate::wait::backend::open_verified` verbatim rather than a second implementation — the fd
+/// itself pins the identity at the kernel level, so a pid reused after `pidfd_open` cannot be
+/// hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
+/// irreducible window `src/wait/macos.rs::kill`'s own doc comment documents verbatim ("The
+/// window between this check and kill(2) is irreducible on macOS (no pidfd); a recycled pid
+/// in that window is a documented best-effort limitation, mirroring
+/// treewalk::kill_by_identity") — this function is that same accepted trade-off, not a new
+/// one.
 fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<Signal>) -> Reached {
-    // Contract (repo-wide policy, this round): this module's whole design rests on
+    // Contract (repo-wide policy): this module's whole design rests on
     // `SIGTERM` never being resent for real (the double-signal-escalation avoidance —
     // `converge`'s design note above) — only `SIGKILL` may be `Some`, everything else must
     // probe (`None`). A future caller passing e.g. `Some(Signal::SIGTERM)` through here would
@@ -351,19 +352,17 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
             return Reached::Yes;
         }
         crate::identity::Resolved::Gone => return Reached::Yes,
-        // **Reverted this round — a prior round's "ask forgiveness" change here was itself a
-        // bug, caught by review.** An earlier version of this arm signalled the bare `pid`
-        // for real whenever `signal.is_some()`, reasoning that "a genuinely recycled pid still
-        // answers ESRCH/EPERM on its own terms, same as `Resolved::Found(_)`'s recycle case
-        // above." That reasoning does not hold: `Resolved::Found(_)` is safe BECAUSE identity
-        // was resolved and compared (we KNOW it's a different, and therefore not-our-business,
-        // process). `Resolved::Unknown` means the re-verify could not be performed AT ALL — if
-        // the pid was recycled onto a process the caller MAY signal, `kill(2)` returns
-        // `Ok(())` and a completely unrelated process gets killed, not `ESRCH`/`EPERM`. There
-        // is no analogy to lean on; the two cases are opposite, not equivalent. Conservative
-        // bail, for BOTH the resend and the probe: an unverifiable identity is never signalled
-        // on this platform (no atomic handle exists here — `check_or_signal_linux_sigkill`,
-        // below, is the platform where a genuinely atomic alternative exists and is used).
+        // `Resolved::Unknown` must NOT be treated like `Resolved::Found(_)`'s recycle case
+        // above, even though both look like "a pid that no longer names the expected
+        // process": `Resolved::Found(_)` is safe BECAUSE identity was resolved and compared
+        // (we KNOW it's a different, and therefore not-our-business, process).
+        // `Resolved::Unknown` means the re-verify could not be performed AT ALL — if the pid
+        // was recycled onto a process the caller MAY signal, `kill(2)` returns `Ok(())` and a
+        // completely unrelated process gets killed, not `ESRCH`/`EPERM`. There is no analogy
+        // to lean on; the two cases are opposite, not equivalent. Conservative bail, for BOTH
+        // the resend and the probe: an unverifiable identity is never signalled on this
+        // platform (no atomic handle exists here — `check_or_signal_linux_sigkill`, below, is
+        // the platform where a genuinely atomic alternative exists and is used).
         crate::identity::Resolved::Unknown => {
             log::warn!(
                 "containment::unix::group: pid {pid} could not be re-verified (access denied?) \
@@ -420,8 +419,8 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// `Unsupported`; every other errno, including `EPERM`, falls into the generic `Error::Io`
 /// arm). A seccomp profile is free to pick either errno for a denied syscall, so treating only
 /// `Unsupported` as fallback-eligible silently reclassifies "we couldn't even ask" as
-/// `Reached::Unknown` on exactly the containers this fallback exists for (Task 6's setuid
-/// helper test runs under Docker's default seccomp profile). Both variants get the SAME
+/// `Reached::Unknown` on exactly the containers this fallback exists for (a seccomp-restricted
+/// container, e.g. Docker's default profile). Both variants get the SAME
 /// treatment: fall back to `check_or_signal`'s plain `kill(2)`, which observes envelopes IT
 /// controls directly rather than trusting `open_verified`'s errno classification a second
 /// time. Only `Error::Unassessable` — identity genuinely denied by `id.exists()`, or the pid
@@ -429,11 +428,11 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// PID's identity, not about whether the kernel can open a pidfd at all, and no fallback
 /// resolves it.
 ///
-/// **Considered and rejected: signalling via the already-open pidfd anyway when `id.exists()`
-/// answers `Unknown` inside `open_verified`.** This looks tempting — `pidfd_open` already
-/// succeeded, so *something* is there — but it does not actually close the gap, for the same
-/// reason `check_or_signal`'s own `Resolved::Unknown` arm (above) must never signal a bare
-/// pid: `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is
+/// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
+/// inside `open_verified`.** This looks tempting — `pidfd_open` already succeeded, so
+/// *something* is there — but it does not actually close the gap, for the same reason
+/// `check_or_signal`'s own `Resolved::Unknown` arm (above) must never signal a bare pid:
+/// `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is
 /// called, exactly like a bare `kill(2)`. If the member `members()` listed at T0 exited and
 /// its pid was recycled onto an unrelated, signalable process before `pidfd_open` runs at T1,
 /// `pidfd_open` succeeds — for the WRONG process. `id.exists()`'s subsequent `Unknown` answer
@@ -444,13 +443,12 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// successful open, not that the identity was already correct AT open time — exactly the gap
 /// `open_verified`'s own `id.exists()` step exists to close, and exactly the gap `Existence::
 /// Unknown` says was NOT closed this time. Signalling anyway would reintroduce, on Linux, the
-/// identical "unrelated-process-killed" failure mode `check_or_signal`'s reverted "ask
-/// forgiveness" arm had on macOS — not a smaller version of it. Left as a disclosed,
-/// asymmetric gap (see the report / Verification gaps) rather than closed with an unsound
-/// fix: on a genuinely `hidepid`-restricted host, a live member whose identity cannot be
-/// re-confirmed at delivery time is correctly left unsignalled and reported `Unassessable`,
-/// even though the earlier `Liveness::Unknown`-admitting gate (`classify_member`) let it
-/// through to the attempt.
+/// identical "unrelated-process-killed" failure mode a bare-pid signal has on macOS's
+/// `Resolved::Unknown` arm — not a smaller version of it. Left as a disclosed, asymmetric gap
+/// rather than closed with an unsound fix: on a genuinely `hidepid`-restricted host, a live
+/// member whose identity cannot be re-confirmed at delivery time is correctly left unsignalled
+/// and reported `Unassessable`, even though the earlier `Liveness::Unknown`-admitting gate
+/// (`classify_member`) let it through to the attempt.
 #[cfg(target_os = "linux")]
 fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId) -> Reached {
     match crate::wait::backend::open_verified(id, "process-group teardown verification") {
@@ -505,23 +503,22 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId) ->
 /// debug session starting from "why did teardown report Cleared/Unassessable despite the
 /// EPERM in the logs" needs this decision to be visible too, not just the original refusal.
 ///
-/// **Downgrades on `Liveness::Dead` only — `Liveness::Unknown` keeps `Survivor`, fixed this
-/// round.** An earlier version of this match also downgraded on `Unknown`, reasoning that a
-/// denied liveness re-check should not be trusted either way. Review correctly caught that
-/// this throws away STRONGER evidence for WEAKER: the `Survivor` this function receives
-/// already carries a REAL, directly-observed `EPERM` from `check_or_signal`'s own `kill(2)`/
-/// `pidfd_send_signal` call — the kernel's authoritative, first-hand answer to "may this
-/// caller signal this process". `recheck`'s liveness query is a WEAKER, independently-deniable
-/// signal (the same class of query that can itself answer `Unknown` under `hidepid` or a
-/// sandboxed runtime); a denied liveness reconfirmation is not evidence the EPERM was wrong,
-/// only that this SECOND, unrelated query could not be answered. Combined with `classify_member`
-/// proceeding on `Liveness::Unknown` (a separate, correct fix from an earlier round), the
-/// prior `Unknown`-downgrades-too shape made that fix produce no benefit for the refusal
-/// verdict at all — `Unknown` at the first check could only ever end in `NotASurvivor` or
-/// `Unassessable`, never the `Refused` a genuine, already-observed `EPERM` earns. The member
-/// was already established not-`Dead` by the first liveness check (`classify_member`'s own
-/// gate) before the signal was ever attempted, so `Dead` is the only recheck answer that
-/// actually contradicts the `Survivor` verdict; `Unknown` contradicts nothing.
+/// **Downgrades on `Liveness::Dead` only — `Liveness::Unknown` keeps `Survivor`.** Downgrading
+/// on `Unknown` too would throw away STRONGER evidence for WEAKER: the `Survivor` this
+/// function receives already carries a REAL, directly-observed `EPERM` from
+/// `check_or_signal`'s own `kill(2)`/`pidfd_send_signal` call — the kernel's authoritative,
+/// first-hand answer to "may this caller signal this process". `recheck`'s liveness query is a
+/// WEAKER, independently-deniable signal (the same class of query that can itself answer
+/// `Unknown` under `hidepid` or a sandboxed runtime); a denied liveness reconfirmation is not
+/// evidence the EPERM was wrong, only that this SECOND, unrelated query could not be answered.
+/// `classify_member` already proceeds on `Liveness::Unknown` rather than stopping there, so an
+/// `Unknown`-downgrades-too shape here would make that upstream permissiveness produce no
+/// benefit for the refusal verdict at all — `Unknown` at the first check could only ever end in
+/// `NotASurvivor` or `Unassessable`, never the `Refused` a genuine, already-observed `EPERM`
+/// earns. The member was already established not-`Dead` by the first liveness check
+/// (`classify_member`'s own gate) before the signal was ever attempted, so `Dead` is the only
+/// recheck answer that actually contradicts the `Survivor` verdict; `Unknown` contradicts
+/// nothing.
 fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::identity::Liveness) -> MemberOutcome {
     let MemberOutcome::Survivor(pid) = outcome else {
         return outcome;
@@ -549,20 +546,10 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// short would silently skip signalling every member listed after it. `decide` (below) is
 /// what turns the fully-accumulated result into one verdict.
 ///
-/// `pid == 1` is excluded from the `SIGKILL` resend specifically (not the `SIGTERM` probe,
-/// which never delivers anything). xnu's own `killpg1` (this file's Background) explicitly
-/// excludes `kernproc`, `initproc`, and any `P_SYSTEM` process from group signalling before
-/// it even counts `nfound` — a protection `killpg` gave for free that a per-member resend
-/// bypasses unless restated here. Only the `initproc`/pid-1 case is covered here (the
-/// practically reachable one: `kernproc` is pid 0 and never appears in a user-visible pgroup
-/// listing). The broader `P_SYSTEM` flag is NOT filtered — `p_flag` is not currently read
-/// from `kinfo_proc`, and guessing its bit value (`P_SYSTEM` is not exposed by the `libc`
-/// crate for macOS) rather than measuring it would break this plan's own rule of never
-/// resting on an unverified constant. Left as an explicit open question for Anna — see the
-/// report — rather than silently shipped as equivalent to xnu's full check. Excluded pid 1
-/// classifies `Unassessable`, NOT `Cleared`: it was never actually reached, so folding it
-/// into "not a survivor" would manufacture the same false-`Ok` #61 exists to eliminate, just
-/// for pid 1 specifically.
+/// A pid excluded from the `SIGKILL` resend (see `excluded_from_sigkill_resend`, just below)
+/// classifies `Unassessable`, NOT `Cleared`: it was never actually reached, so folding it into
+/// "not a survivor" would manufacture the same false-`Ok` #61 exists to eliminate, just for
+/// this pid specifically.
 ///
 /// **Interaction with sibling #54 (pgid reuse), read before touching the resend below.** This
 /// function does not obtain, trust, or pin `pgid` itself — it is handed the same, still
@@ -577,7 +564,7 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// loop can deliver a real `SIGKILL` into that unrelated group, not merely misreport its
 /// state. This is a consequence of #54's still-open race showing up on this new code path; it
 /// is #54's fix to close (by pinning the pgid before either call), not something this function
-/// can safely work around on its own — see the report's sequencing question to Anna.
+/// can safely work around on its own.
 pub(crate) fn converge(pgid: i32, signal: Signal) -> std::io::Result<GroupState> {
     let listed = members(pgid)?;
     let mut refused = Vec::new();
@@ -585,11 +572,13 @@ pub(crate) fn converge(pgid: i32, signal: Signal) -> std::io::Result<GroupState>
     for m in &listed {
         let id = crate::identity::ProcessId::from_parts(m.pid, m.token);
         let outcome = classify_member(m.pid, id.is_alive(), || {
-            if signal == Signal::SIGKILL && m.pid == 1 {
+            if signal == Signal::SIGKILL && excluded_from_sigkill_resend(m.pid, m.system) {
                 log::warn!(
-                    "containment::unix::group: pid 1 (init) listed in process group {pgid}; \
-                     excluded from the SIGKILL resend (mirrors xnu's own killpg1 exclusion) \
-                     and reported unassessable, not cleared, since it was never actually reached"
+                    "containment::unix::group: pid {pid} in process group {pgid} is excluded \
+                     from the SIGKILL resend (mirrors xnu's own killpg1 exclusion for init/ \
+                     P_SYSTEM) and reported unassessable, not cleared, since it was never \
+                     actually reached",
+                    pid = m.pid
                 );
                 return Reached::Unknown;
             }
@@ -618,13 +607,27 @@ pub(crate) fn converge(pgid: i32, signal: Signal) -> std::io::Result<GroupState>
     Ok(decide(pgid, signal, refused, unassessable))
 }
 
+/// Mirrors xnu's own `killpg1` exclusion set for the `SIGKILL` resend above: `killpg1` skips
+/// `kernproc`, `initproc` (pid 1), and every `P_SYSTEM`-flagged process before it even counts a
+/// group as reachable. `kernproc` (pid 0) never appears in a listed group's membership, so only
+/// the other two need restating here — this crate's own per-member resend does not inherit
+/// `killpg`'s kernel-side exclusion for free, and without it a live `P_SYSTEM` process would
+/// receive a real `SIGKILL` that `killpg` itself would have refused to send. Pure, and tested
+/// directly against synthetic pid/`system` combinations (`group_tests.rs`) rather than only
+/// through `converge`'s live path.
+///
+/// `system` comes from the listing's own `Member::system` — real on macOS, always `false`
+/// elsewhere, where no equivalent kernel flag exists to restate.
+fn excluded_from_sigkill_resend(pid: RawPid, system: bool) -> bool {
+    pid == 1 || system
+}
+
 /// Turn an accumulated pass into one verdict. Pure — a unit test drives all three shapes
 /// without a real listing. A known refusal always wins over unresolved members elsewhere in
 /// the same group (`Refused` is strictly more informative than a bare `Unlistable`), but the
 /// unassessable pids are carried in `Refused`'s own `unassessable` field rather than merely
-/// logged — an earlier round of this plan discarded them there with only a debug log line;
-/// review correctly called that an incomplete payload on the one issue whose entire point is
-/// not under-reporting teardown state.
+/// logged: a debug log line alone would be an incomplete payload on the one issue whose entire
+/// point is not under-reporting teardown state.
 fn decide(pgid: i32, signal: Signal, refused: Vec<RawPid>, unassessable: Vec<RawPid>) -> GroupState {
     if !refused.is_empty() {
         return GroupState::Refused { refused, unassessable };

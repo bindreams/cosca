@@ -101,12 +101,14 @@ impl Child {
     /// ([`Error::Containment`](crate::error::Error::Containment) or
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) with no I/O `source` — see
     /// [`terminate_tree`](Child::terminate_tree)), the grace is still waited and the sweep
-    /// still runs; the held error resurfaces only after a successful sweep and reap (mirroring
-    /// how a watch failure is held above), so a member that only needed the follow-up `SIGKILL`
-    /// does not strand the rest of the tree. A genuine listing-mechanism failure (an
-    /// `Unassessable` with an I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`,
-    /// it returns immediately: no signal is confirmed sent, so there is nothing for a grace
-    /// wait or sweep to act on yet.
+    /// still runs, so a member that only needed the follow-up `SIGKILL` does not strand the
+    /// rest of the tree. A subsequent successful sweep is fresher, positive proof the group
+    /// cleared, which supersedes the earlier refusal: it is logged and discarded, and this
+    /// call reports `Ok`. It resurfaces only indirectly, as the sweep's own error, if the
+    /// sweep then fails too. A genuine listing-mechanism failure (an `Unassessable` with an
+    /// I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`, it returns
+    /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
+    /// sweep to act on yet.
     ///
     /// # Runtime
     ///
@@ -133,7 +135,7 @@ impl Child {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
                 log::debug!(
-                    "graceful_shutdown_tree({id}): terminate_tree refused (subsumed if the sweep also fails): {e}",
+                    "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {e}",
                     id = self.id().pid()
                 );
                 Err(e)
@@ -170,7 +172,15 @@ impl Child {
         }
         let status = self.wait().await?;
         watch?;
-        term?;
+        // The sweep just returned `Ok`: positive, freshly-measured proof the group cleared,
+        // superseding whatever `term` held. Discard it here rather than returning it — an
+        // already-disproved refusal must never outrank the evidence that disproved it.
+        if let Err(e) = &term {
+            log::debug!(
+                "graceful_shutdown_tree({id}): sweep succeeded; discarding the superseded terminate_tree refusal: {e}",
+                id = self.id().pid()
+            );
+        }
         Ok(status)
     }
 }

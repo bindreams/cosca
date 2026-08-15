@@ -372,32 +372,23 @@ impl Child {
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
+    ///
+    /// **This guarantee, and its converse — that `Ok` is positive proof the group cleared —
+    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: `TreeWalk`
+    /// does not yet propagate a live refuser's outcome into this call's result (#63).
+    ///
+    /// **A `hidepid`-restricted Linux host can still return `Ok` with a live refuser left
+    /// running.** `/proc` is this mechanism's only way to confirm the group cleared, and
+    /// `hidepid=invisible`/`hidepid=2` hides a foreign-uid process from it entirely — the
+    /// ordinary setuid-in-a-container case. That member is then never listed, never
+    /// classified, never signaled, and the group can report cleared regardless. No fix
+    /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
+    /// value is not trustworthy evidence either.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.require_contained()?;
-        // Precondition (sibling #54's territory — asserted, not fixed, here): if the pgid-based
-        // mechanism's (Attached::ProcessGroup — covers both Containment::ProcessGroup and
-        // Containment::Session, which also lands in this variant at spawn time) leader pid has
-        // been reaped AND RECYCLED onto a DIFFERENT, LIVE process group, `killpg` would signal
-        // that unrelated group instead. Reaping alone is harmless — `killpg` on an absent pgid
-        // returns `ESRCH`, which `containment::unix::signal_group`/`verify` already treat as
-        // `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle (see
-        // `crate::child::root_pid_was_recycled`), never on a mere reap. That positive-evidence
-        // case is reachable on the ORDINARY spawn-then-teardown path for any fast-exiting
-        // child, not only via an explicit `wait()` before `kill_tree()`/`terminate_tree()`:
-        // `std`'s `SharedChild::new` (inside the sync spawn path, see `child/spawn.rs`'s own
-        // comment on this) can reap a fast-exiting leader itself, before the caller ever gets a
-        // `Child` handle back — this assert can therefore fire on the very first call the
-        // caller makes, whatever ordering they use. Gated to this ONE mechanism: a recycled
-        // pgid is meaningless for Cgroup (keyed by an fd), JobObject (no pgid), Delegated (no
-        // mechanism), or TreeWalk (re-resolves identity per member, immune to this by
-        // construction) — asserting it there would be a false alarm unrelated to what this
-        // precondition is about. An OS refusal to answer either resolve (`Resolved::Unknown` /
-        // `Liveness::Unknown`) is permitted through: this asserts against POSITIVE evidence of a
-        // violation, not against every case we merely couldn't rule out.
-        //
-        // `#[cfg(unix)]`: `Attached::ProcessGroup` is itself a Unix-only variant — referencing
-        // it unconditionally does not compile on Windows (confirmed via `cargo check --target
-        // x86_64-pc-windows-msvc`, E0599, while implementing the sync twin in `src/child.rs`).
+        // Precondition (sibling #54's territory — asserted, not fixed, here): see the sync
+        // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including why
+        // this is gated to `Attached::ProcessGroup` alone, and why it is `#[cfg(unix)]`).
         #[cfg(unix)]
         debug_assert!(
             !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
@@ -451,6 +442,10 @@ impl Child {
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
     /// tree is still running and this process cannot bring it down.
+    ///
+    /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
+    /// `ProcessGroup`/`Session`-only scope of this guarantee (`TreeWalk` is #63's territory),
+    /// and the residual `hidepid` gap on Linux.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // See kill_tree's identical precondition assert for the full rationale, including the

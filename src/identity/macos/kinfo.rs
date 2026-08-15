@@ -21,7 +21,7 @@ pub(crate) struct extern_proc {
     pub(crate) p_un: p_un,
     p_vmspace: u64,
     p_sigacts: u64,
-    p_flag: libc::c_int,
+    pub(crate) p_flag: libc::c_int,
     pub(super) p_stat: libc::c_char,
     pub(crate) p_pid: libc::pid_t,
     p_oppid: libc::pid_t,
@@ -85,6 +85,15 @@ struct itimerval {
 // against the running kernel.
 const _: () = assert!(std::mem::size_of::<kinfo_proc>() == 648);
 const _: () = assert!(std::mem::size_of::<extern_proc>() == 296);
+
+/// `p_flag`'s "system process" bit, source-verified against the Xcode Command Line Tools
+/// SDK: `#define P_SYSTEM 0x00000200` in `usr/include/sys/proc.h`. xnu's `killpg1` excludes
+/// it from a process-group signal alongside — but independently of — `initproc` (pid 1),
+/// confirmed against xnu's own `bsd/kern/kern_sig.c`. `containment::unix::group` restates
+/// both exclusions (`excluded_from_sigkill_resend`). `kinfo_tests.rs` cross-checks this bit's
+/// value against a second, independently-issued sysctl query and, where a live process allows
+/// it, `proc_pidinfo`'s own `PROC_FLAG_SYSTEM` bit.
+pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
