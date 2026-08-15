@@ -391,6 +391,28 @@ impl Child {
             _ => None,
         }
     }
+
+    /// Test-only: force the FdMarker mechanism's process-group id, so a test can drive
+    /// `containment::unix::signal_group`'s real `pgid <= 0` guard — a real,
+    /// privilege-free `Error::Unassessable { source: None, .. }` outcome, not a synthetic
+    /// `Error` value — through this crate's own public `kill_tree`/`terminate_tree`/`Drop`
+    /// path and `is_teardown_mechanism_failure` below. Exists because a live cross-uid
+    /// refuser (the `Error::Containment` scenario) needs real root to construct at all — see
+    /// `tests/group_teardown_setuid.rs`'s own module docs for why that is not reliably
+    /// provisionable on macOS (SIP) — and because calling `Marker::hard_kill`/`terminate`
+    /// directly, the way `fdmarker_tests.rs` otherwise does, bypasses `dispatch.rs`'s
+    /// `Attached::FdMarker` arm entirely: exactly where an earlier version of this fix
+    /// laundered `Error::Containment` into `Error::Io` without any test noticing.
+    ///
+    /// Panics if `self` is not `Attached::FdMarker` — a misuse of this seam by the caller,
+    /// not a case to silently no-op past.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_force_fdmarker_pgid(&mut self, pgid: i32) {
+        match &mut self.attached {
+            crate::containment::Attached::FdMarker(m) => m.force_pgid_for_test(pgid),
+            other => panic!("test_force_fdmarker_pgid called on a non-FdMarker child: {other:?}"),
+        }
+    }
 }
 
 /// Whether a `hard_kill`/`terminate` result is still a genuine teardown MECHANISM failure —

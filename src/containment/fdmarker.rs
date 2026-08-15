@@ -725,6 +725,7 @@ pub(crate) mod fault {
 
 use std::io;
 
+use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
 /// The live marker for one contained tree.
@@ -759,6 +760,29 @@ pub(crate) fn is_signalable(pid: RawPid) -> bool {
     pid > 1 && pid != std::process::id()
 }
 
+/// Fold two `Error`s from different `sweep` passes (or a pass's group-signal result against
+/// the `incomplete` summary) into one, choosing the merged VARIANT by severity rather than by
+/// which side happened to be checked first. `is_teardown_mechanism_failure`
+/// (`src/child.rs`) is the single source of truth for "is this a genuine mechanism failure,
+/// or an ordinary refusal" — reused here rather than re-derived, so this function and the
+/// classifier can never quietly drift apart on what counts as which.
+///
+/// If EITHER side is a genuine mechanism failure, the merged result must be too: a later
+/// pass's merely-ordinary refusal must never mask an earlier pass's real plumbing break (or
+/// vice versa — an earlier ordinary refusal must never mask a LATER genuine failure). Only
+/// when NEITHER side is a mechanism failure does the merged result stay in the ordinary
+/// (`Containment`) bucket. Either way, both sides' messages are preserved in the combined
+/// `detail`/`io::Error` text — only the final Rust VARIANT is decided by severity, not by
+/// which `Error` happened to already exist when the second one arrived.
+fn combine_group_errors(first: Error, latest: Error) -> Error {
+    let detail = format!("{first}; {latest}");
+    if crate::child::is_teardown_mechanism_failure(&first) || crate::child::is_teardown_mechanism_failure(&latest) {
+        Error::Io(io::Error::other(detail))
+    } else {
+        Error::Containment { detail }
+    }
+}
+
 impl Marker {
     pub(crate) fn new(prepared: PreparedMarker, root: Option<ProcessId>, pgid: Option<i32>) -> Marker {
         Marker {
@@ -775,6 +799,16 @@ impl Marker {
         self.handle
     }
 
+    /// Test-only: force the group channel's pgid, to drive `unix::signal_group`'s real
+    /// `pgid <= 0` guard — a real, privilege-free `Error::Unassessable { source: None, .. }`
+    /// path — deterministically through the REAL public `Child::kill_tree`/`Drop` path.
+    /// Consumed by `Child::test_force_fdmarker_pgid` (`src/child.rs`), which is what a test
+    /// outside this module actually calls; see its doc for why this exists.
+    #[cfg(test)]
+    pub(crate) fn force_pgid_for_test(&mut self, pgid: i32) {
+        self.pgid = Some(pgid);
+    }
+
     /// The supervisor's read end. `read()` on it returns EOF exactly when the last holder of
     /// the write end is gone.
     #[allow(dead_code)]
@@ -782,11 +816,20 @@ impl Marker {
         self.read.as_fd()
     }
 
-    pub(crate) fn hard_kill(&self) -> io::Result<()> {
+    /// `Err` distinguishes a genuine teardown-mechanism failure (`Error::Io`/`Unsupported`,
+    /// or `Unassessable` with a `source`) from an ORDINARY outcome — a live member refused
+    /// the signal, or could not be fully assessed/reached (`Error::Containment` /
+    /// `Error::Unassessable { source: None, .. }`) — the same distinction #61 established
+    /// for `ProcessGroup`/`Session` (`src/containment/unix.rs`'s `verify`). Callers, in
+    /// particular `is_teardown_mechanism_failure` (`src/child.rs`), rely on that distinction
+    /// surviving intact through this return value; see `sweep`'s own doc for where it is
+    /// preserved.
+    pub(crate) fn hard_kill(&self) -> Result<(), Error> {
         self.sweep(nix::sys::signal::Signal::SIGKILL)
     }
 
-    pub(crate) fn terminate(&self) -> io::Result<()> {
+    /// See [`hard_kill`](Self::hard_kill)'s doc for what `Err` does and does not mean here.
+    pub(crate) fn terminate(&self) -> Result<(), Error> {
         self.sweep(nix::sys::signal::Signal::SIGTERM)
     }
 
@@ -924,7 +967,23 @@ impl Marker {
     /// is combined into the returned message rather than silently discarded by `Result::and`
     /// (which would otherwise mask an `incomplete` teardown behind an unrelated group-signal
     /// failure, or vice versa, whichever happened to be checked first).
-    fn sweep(&self, signal: nix::sys::signal::Signal) -> io::Result<()> {
+    ///
+    /// **The returned `Error`'s VARIANT, not only its message, is load-bearing.**
+    /// `crate::containment::unix::kill_group`/`term_group` (the group-signal channel) return
+    /// `Error::Containment` for an ordinary "a live member refused the signal" outcome —
+    /// exactly the distinction #61 introduced so `is_teardown_mechanism_failure`
+    /// (`src/child.rs`) does not misreport a routine refusal as a broken teardown mechanism.
+    /// Collapsing that into a stringified `Error::Io` (once done here, by mistake, in the
+    /// very fix that reconciled this file with #61) reintroduces precisely the bug #61 fixed,
+    /// one layer up — see `src/tokio/child_drop_tests.rs` for the classifier's own pinned
+    /// contract and `child_tests.rs`'s
+    /// `kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_classifier_path`
+    /// for this mechanism's own end-to-end coverage of it (through `dispatch.rs`, not a
+    /// direct `Marker::hard_kill` call, which is what let this regression through the first
+    /// time). `combine_group_errors` (below) is the one place two `Error`s are folded into
+    /// one across passes or against `incomplete`, and it decides the merged VARIANT by
+    /// severity, never by stringifying first and only THEN picking a variant.
+    fn sweep(&self, signal: nix::sys::signal::Signal) -> Result<(), Error> {
         // CONTRACT, re-checked on every sweep, not just at `Marker::new` time: `self.read`
         // must STILL be a pipe descriptor naming its OWN recorded handle. Rust ownership
         // already makes "a sweep cannot run after `self.read` is dropped" a compile error
@@ -965,13 +1024,16 @@ impl Marker {
                 self.handle
             );
             log::error!("{msg}");
-            return Err(io::Error::other(msg));
+            // A genuine mechanism failure (this process's own bookkeeping is stale, not a
+            // member's refusal) — `Error::Io` is the correct classification here, not
+            // `Containment`/`Unassessable`.
+            return Err(Error::Io(io::Error::other(msg)));
         }
 
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see the group-signal block below for why an
         // earlier pass's failure must not be erased by a later pass's success or vice versa.
-        let mut group_result: io::Result<()> = Ok(());
+        let mut group_result: Result<(), Error> = Ok(());
         // True if ANY pass was blind, ANY marker holder could not be resolved, or ANY signal
         // attempt was refused by the OS — checked exactly once, after the loop, regardless of
         // which exit path was taken.
@@ -1123,22 +1185,20 @@ impl Marker {
                     .is_some_and(|root| root.is_alive() == crate::identity::Liveness::Alive);
                 let should_fire = first_pass || root_confirmed_alive;
                 if should_fire {
-                    // `kill_group`/`term_group` return `crate::error::Error` (they may now fail
-                    // on the real-membership verification #61 added, not just the raw signal
-                    // syscall) — this function's own return type predates that and stays
-                    // `io::Result<()>` (dispatch.rs's caller re-wraps it in `Error::Io`
-                    // regardless), so the conversion happens right here, at the one place a
-                    // non-io `Error` can appear in this loop.
-                    let this_pass_group_result: io::Result<()> = match (self.pgid, signal) {
+                    // `kill_group`/`term_group` already return `crate::error::Error`, carrying
+                    // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
+                    // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
+                    // `io::Error` (that laundering is exactly the bug this comment replaces;
+                    // see `sweep`'s doc above and `combine_group_errors` below).
+                    let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
                         (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid),
                         (Some(pgid), _) => crate::containment::unix::term_group(pgid),
                         (None, _) => Ok(()),
-                    }
-                    .map_err(|e| io::Error::other(e.to_string()));
+                    };
                     group_result = match (group_result, this_pass_group_result) {
                         (Ok(()), r) => r,
                         (e @ Err(_), Ok(())) => e,
-                        (Err(first), Err(latest)) => Err(io::Error::other(format!("{first}; {latest}"))),
+                        (Err(first), Err(latest)) => Err(combine_group_errors(first, latest)),
                     };
                 } else if self.pgid.is_some() {
                     log::debug!(
@@ -1211,11 +1271,22 @@ impl Marker {
                  not be assessed or signalled",
                 self.handle
             );
+            // `incomplete` alone (no io::Error anywhere in its own tracking — it is a summary
+            // bool, not a captured syscall failure) is the SAME kind of ordinary, expected
+            // outcome `Error::Unassessable { source: None, .. }` already names for
+            // `ProcessGroup`/`Session` (`unix.rs`'s `verify`, `group::state`'s per-member
+            // `Refused { unassessable, .. }` arm): specific members left running or
+            // unconfirmed, not proof the mechanism's own plumbing broke. `source: None` here
+            // is not a downgrade of real information — this path never had a captured
+            // `io::Error` to attach; `enumerate::snapshot()` already logs a blind pass itself
+            // (see its own module docs) rather than surfacing one to `sweep`.
+            let incomplete_err = Error::Unassessable {
+                detail: msg,
+                source: None,
+            };
             return match group_result {
-                Ok(()) => Err(io::Error::other(msg)),
-                Err(group_err) => Err(io::Error::other(format!(
-                    "{msg}; additionally, the group signal failed: {group_err}"
-                ))),
+                Ok(()) => Err(incomplete_err),
+                Err(group_err) => Err(combine_group_errors(incomplete_err, group_err)),
             };
         }
         group_result

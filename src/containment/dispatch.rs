@@ -76,7 +76,7 @@ impl Attached {
                 Ok(())
             }
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill().map_err(crate::error::Error::Io),
+            Attached::FdMarker(m) => m.hard_kill(),
             Attached::TreeWalk(root) => {
                 crate::containment::treewalk::hard_kill(*root);
                 Ok(())
@@ -105,7 +105,7 @@ impl Attached {
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.terminate().map_err(Error::Io),
+            Attached::FdMarker(m) => m.terminate(),
             Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
         }
     }
