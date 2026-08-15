@@ -371,10 +371,7 @@ pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
 /// credential-changing `exec`, the same scenario the marker channel already names — not a
 /// legitimate absence like a pid that simply exited; a caller tracking completeness
 /// (`Marker::sweep`) folds this count into its own `incomplete` accounting instead of treating
-/// it as one. There is no deterministic unit test that forces the `Unknown`/denied branch
-/// itself: the one reliable cross-privilege trigger this crate has (querying pid 1 as a
-/// non-root caller) resolves via `identity::macos_ppid_of`'s own sysctl fallback into `Found`,
-/// not `Unknown` — see `ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback`.
+/// it as one.
 pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
     let raw = all_pids();
     let (edges, denied, sample) = join_edges(&raw);
