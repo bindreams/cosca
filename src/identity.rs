@@ -150,6 +150,11 @@ impl ProcessId {
 #[cfg(windows)]
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
 
+/// The `kinfo_proc` ABI is defined once, here, behind the size tripwires in
+/// `macos/kinfo.rs`. Containment's process-group listing reads it too.
+#[cfg(target_os = "macos")]
+pub(crate) use backend::kinfo;
+
 /// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
 /// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).
 #[cfg(windows)]

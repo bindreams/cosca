@@ -9,21 +9,21 @@ use super::super::{RawPid, Resolved};
 
 /// `struct kinfo_proc` (LP64): `extern_proc` head + opaque `eproc` tail.
 #[repr(C)]
-pub(super) struct kinfo_proc {
-    pub(super) kp_proc: extern_proc,
+pub(crate) struct kinfo_proc {
+    pub(crate) kp_proc: extern_proc,
     kp_eproc: [u8; 352],
 }
 
 /// `struct extern_proc` (LP64 user copy, from XNU's proc.h). Kernel pointers are
 /// represented as `u64` (they are opaque user_addr_t values in the sysctl copy).
 #[repr(C)]
-pub(super) struct extern_proc {
-    pub(super) p_un: p_un,
+pub(crate) struct extern_proc {
+    pub(crate) p_un: p_un,
     p_vmspace: u64,
     p_sigacts: u64,
     p_flag: libc::c_int,
     pub(super) p_stat: libc::c_char,
-    p_pid: libc::pid_t,
+    pub(crate) p_pid: libc::pid_t,
     p_oppid: libc::pid_t,
     p_dupfd: libc::c_int,
     user_stack: u64,
@@ -62,9 +62,9 @@ pub(super) struct extern_proc {
 }
 
 #[repr(C)]
-pub(super) union p_un {
+pub(crate) union p_un {
     p_st1: run_sleep_queue,
-    pub(super) p_starttime: libc::timeval,
+    pub(crate) p_starttime: libc::timeval,
 }
 
 #[repr(C)]

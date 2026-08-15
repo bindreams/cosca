@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use super::{Liveness, RawPid, Resolved, StartToken};
 
 #[path = "macos/kinfo.rs"]
-mod kinfo;
+pub(crate) mod kinfo;
 
 fn bsd_info(pid: RawPid) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
