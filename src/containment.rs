@@ -169,6 +169,10 @@ pub(crate) mod windows;
 #[path = "containment/enumerate.rs"]
 pub(crate) mod enumerate;
 
+#[cfg(target_os = "macos")]
+#[path = "containment/fdmarker.rs"]
+pub(crate) mod fdmarker;
+
 #[path = "containment/treewalk.rs"]
 pub(crate) mod treewalk;
 
