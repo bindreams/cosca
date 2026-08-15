@@ -54,6 +54,24 @@ fn install_ignore_break() {
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
 }
 
+/// Shared body of `control-echo-pid` and the grandchild arm of `spawn-orphan-escapee`'s
+/// relay: publish `<tag><pid>\n`, then echo each byte received. `Ok(0)`/`Interrupted` are the
+/// only expected outcomes besides a live echo; anything else is a genuine test-harness bug.
+fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
+    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    writeln!(sock, "{tag}{}", std::process::id()).unwrap();
+    sock.flush().unwrap();
+    let mut b = [0u8; 1];
+    loop {
+        match sock.read(&mut b) {
+            Ok(0) => std::process::exit(0), // the test dropped the socket
+            Ok(_) => sock.write_all(&b).unwrap(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("control socket read failed: {e}"),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("");
@@ -193,6 +211,14 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
         }
+        "control-echo-pid" => {
+            // Like control-block, but publishes its own pid on the wire: `<tag><pid>\n`. Then
+            // echoes each byte it receives, so a test can prove a member is ALIVE (a real
+            // 1-byte round trip) as well as dead (EOF) — without a timer in either direction.
+            let addr = args[2].clone();
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            run_control_echo_pid(&addr, tag);
+        }
         "spawn-grandchild" => {
             // Spawn a grandchild that holds its own control connection (tag "G"),
             // then hold ours (tag "R"). Both die together iff containment works.
@@ -236,6 +262,39 @@ fn main() {
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
+        }
+        // The shape both current macOS mechanisms lose: a grandchild that leaves the session,
+        // is reparented to launchd when its parent exits, and execs. The relay does the setsid
+        // and exits at once; the grandchild it spawned reparents to pid 1 with its own pgid.
+        #[cfg(unix)]
+        "spawn-orphan-escapee" => {
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            let mut relay = std::process::Command::new(&exe);
+            relay.args(["orphan-relay", &addr]);
+            // SAFETY: pre_exec runs post-fork, pre-exec; libc::setsid is async-signal-safe.
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                relay.pre_exec(|| {
+                    libc::setsid(); // best-effort: EPERM only if already a leader
+                    Ok(())
+                });
+            }
+            let mut relay = relay.spawn().unwrap();
+            relay.wait().unwrap(); // its exit is the reparenting event
+            // Same wire format as the grandchild, so the test parses one shape.
+            run_control_echo_pid(&addr, "R");
+        }
+        #[cfg(unix)]
+        "orphan-relay" => {
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us
+            let _ = std::process::Command::new(&exe)
+                .args(["control-echo-pid", &addr, "G"])
+                .spawn()
+                .unwrap();
+            std::process::exit(0);
         }
         #[cfg(unix)]
         "spawn-grandchild-ignore-term" => {
