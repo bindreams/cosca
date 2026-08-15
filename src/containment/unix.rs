@@ -35,12 +35,18 @@
 //! the group's actual membership — see the `group` submodule.
 //!
 //! # PGID-reuse caveat
-//! `kill_tree` must run *before* the leader is reaped (`wait`): once reaped, the
-//! kernel may recycle the leader's PID/PGID, so `killpg` could signal an
-//! unrelated process group. The crate's `Drop` kills before it reaps, so the
-//! common path is safe; an explicit `wait()` then `kill_tree()` is the unsafe
-//! ordering. cgroup v2 and the identity-reverifying TreeWalk mechanism do not
-//! have this hole — prefer them when the guarantee matters.
+//! Reaping the leader (`wait`) alone is harmless: `killpg` on an absent pgid returns `ESRCH`,
+//! which `signal_group`/`verify` above already treat as `Cleared`. The actual hazard is
+//! narrower — the kernel recycling the leader's already-reaped PID/PGID onto a *different,
+//! live* process group before `kill_tree`/`term_group` next runs: only then does `killpg` risk
+//! signalling that unrelated group. This is reachable on the ORDINARY spawn-then-teardown path
+//! for any fast-exiting child, not only via an explicit `wait()` before `kill_tree()`: `std`'s
+//! `SharedChild::new` (inside `Command::spawn`) can reap a fast-exiting leader itself, before
+//! the caller ever gets a `Child` handle back — see `child/spawn.rs`'s own comment on this race,
+//! and `Child::kill_tree`'s precondition assert (`src/child.rs`), which fires on POSITIVE
+//! evidence of an actual recycle (a different, live identity at the same pid), not on a mere
+//! reap. cgroup v2 and the identity-reverifying TreeWalk mechanism do not have this hole at
+//! all — prefer them when the guarantee matters.
 
 use std::io;
 

@@ -25,11 +25,45 @@ mod lifecycle;
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[cfg(test)]
+#[path = "child_tests.rs"]
+mod child_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
     Reader(PipeReader),
     Writer(PipeWriter),
+}
+
+/// True only when there is POSITIVE evidence that a contained root's pid was reaped **and**
+/// recycled: it now resolves to a DIFFERENT identity than `original`, and that different
+/// identity is confirmed [`Liveness::Alive`](crate::identity::Liveness::Alive) — not merely
+/// resolvable, since a not-yet-reaped zombie also resolves. Reaping alone, without a
+/// subsequent recycle, is harmless to a pgid-based mechanism: `killpg` on an absent pgid
+/// returns `ESRCH`, which `signal_group`/`verify` in `containment::unix` already treat as
+/// `Cleared`. [`Existence`](crate::identity::Existence) cannot distinguish these two cases — it
+/// collapses "reaped, nothing there yet" and "reaped, a different live process now holds the
+/// pid" into the same `Gone` — which is why `kill_tree`/`terminate_tree`'s precondition assert
+/// needs this finer, two-value read (a fresh [`Resolved`](crate::identity::Resolved) plus a
+/// [`Liveness`](crate::identity::Liveness) reading of whatever it found) instead.
+///
+/// A pure function of already-resolved values, deliberately: it is unit-tested (`child_tests.rs`)
+/// with synthetic `ProcessId`s rather than by racing the kernel's own pid allocator to construct
+/// a genuine recycle — that would be synchronizing on luck, not a real test.
+#[cfg_attr(not(unix), allow(dead_code))] // only called from the `#[cfg(unix)]` debug_assert!s below
+                                         // and in `tokio/child.rs`; still unit-tested everywhere.
+pub(crate) fn root_pid_was_recycled(
+    original: ProcessId,
+    current: crate::identity::Resolved<ProcessId>,
+    current_liveness: crate::identity::Liveness,
+) -> bool {
+    match current {
+        crate::identity::Resolved::Found(now) => {
+            now != original && current_liveness == crate::identity::Liveness::Alive
+        }
+        crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => false,
+    }
 }
 
 /// A spawned child process the crate owns.
@@ -141,18 +175,25 @@ impl Child {
     /// tree is still running and this process cannot bring it down.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // Precondition (sibling #54's territory — asserted, not fixed, here): the contained
-        // root must not already be reaped when the mechanism is pgid-based (Attached::
-        // ProcessGroup — covers both Containment::ProcessGroup and Containment::Session, which
-        // also lands in this variant at spawn time), or the kernel may have recycled the pgid
-        // onto an unrelated process group. This crate's own `Drop` always kills before it
-        // reaps, so the common path never violates this; an explicit `wait()` then
-        // `kill_tree()`/`terminate_tree()` does — exactly the footgun #54 is about. Gated to
-        // this ONE mechanism: a recycled pgid is meaningless for Cgroup (keyed by an fd),
-        // JobObject (no pgid), Delegated (no mechanism), or TreeWalk (re-resolves identity per
-        // member, immune to this by construction) — asserting it there would be a false alarm
-        // unrelated to what this precondition is about. `Existence::Unknown` (the OS refused
-        // the query) is permitted through: this asserts against POSITIVE evidence of a
+        // Precondition (sibling #54's territory — asserted, not fixed, here): if the pgid-based
+        // mechanism's (Attached::ProcessGroup — covers both Containment::ProcessGroup and
+        // Containment::Session, which also lands in this variant at spawn time) leader pid has
+        // been reaped AND RECYCLED onto a DIFFERENT, LIVE process group, `killpg` would signal
+        // that unrelated group instead. Reaping alone is harmless — `killpg` on an absent pgid
+        // returns `ESRCH`, which `containment::unix::signal_group`/`verify` already treat as
+        // `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle (see
+        // `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
+        // reachable on the ORDINARY spawn-then-teardown path for any fast-exiting child, not
+        // only via an explicit `wait()` before `kill_tree()`/`terminate_tree()`: `std`'s
+        // `SharedChild::new` (inside `Command::spawn`, see `child/spawn.rs`'s own comment on
+        // this) can reap a fast-exiting leader itself, before the caller ever gets a `Child`
+        // handle back — this assert can therefore fire on the very first call the caller makes,
+        // whatever ordering they use. Gated to this ONE mechanism: a recycled pgid is
+        // meaningless for Cgroup (keyed by an fd), JobObject (no pgid), Delegated (no
+        // mechanism), or TreeWalk (re-resolves identity per member, immune to this by
+        // construction) — asserting it there would be a false alarm unrelated to what this
+        // precondition is about. An OS refusal to answer either resolve (`Resolved::Unknown` /
+        // `Liveness::Unknown`) is permitted through: this asserts against POSITIVE evidence of a
         // violation, not against every case we merely couldn't rule out.
         //
         // `#[cfg(unix)]`: `Attached::ProcessGroup` is itself a Unix-only variant (see
@@ -162,11 +203,19 @@ impl Child {
         // assert there.
         #[cfg(unix)]
         debug_assert!(
-            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_))
-                || !matches!(self.id.exists(), crate::identity::Existence::Gone),
-            "kill_tree/terminate_tree called after the contained root (pid {}) was already \
-             reaped; a pgid-based mechanism may now signal a recycled, unrelated process group \
-             (see #54)",
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+                let now = ProcessId::of(self.id.pid());
+                let now_liveness = match now {
+                    crate::identity::Resolved::Found(id) => id.is_alive(),
+                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
+                        crate::identity::Liveness::Unknown
+                    }
+                };
+                !root_pid_was_recycled(self.id, now, now_liveness)
+            },
+            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
+             recycled onto a different, live process; a pgid-based mechanism would now signal an \
+             unrelated process group (see #54)",
             self.id.pid()
         );
         let group_result = self.attached.hard_kill();
@@ -213,11 +262,19 @@ impl Child {
         // `#[cfg(unix)]` gate (Attached::ProcessGroup does not exist on Windows).
         #[cfg(unix)]
         debug_assert!(
-            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_))
-                || !matches!(self.id.exists(), crate::identity::Existence::Gone),
-            "kill_tree/terminate_tree called after the contained root (pid {}) was already \
-             reaped; a pgid-based mechanism may now signal a recycled, unrelated process group \
-             (see #54)",
+            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+                let now = ProcessId::of(self.id.pid());
+                let now_liveness = match now {
+                    crate::identity::Resolved::Found(id) => id.is_alive(),
+                    crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => {
+                        crate::identity::Liveness::Unknown
+                    }
+                };
+                !root_pid_was_recycled(self.id, now, now_liveness)
+            },
+            "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
+             recycled onto a different, live process; a pgid-based mechanism would now signal an \
+             unrelated process group (see #54)",
             self.id.pid()
         );
         self.attached.terminate(self.proc.id())
