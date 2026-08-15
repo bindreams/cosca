@@ -38,6 +38,7 @@
 //! parallelism for the affected tests, or the risk is accepted and documented as a known,
 //! narrow test-suite flake source. Surfaced as a real question, not resolved here.
 
+use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd};
 
 use super::{holders, holds_marker, holds_marker_query, pipe_handle_of, MarkerQuery, PipeFdInfo, PROC_PIDFDPIPEINFO};
@@ -264,4 +265,321 @@ fn a_dead_handle_finds_no_holders() {
         !holds_marker(std::process::id(), 0),
         "handle 0 is never a valid pipe_handle and must not be reported as held"
     );
+}
+
+// Installing the marker on a spawn =====
+
+/// `preserved_fds` only clears FD_CLOEXEC — it does not renumber, so the marker keeps the
+/// parent's descriptor NUMBER inside the child. `command-fds`' user mappings `dup2` onto
+/// their `child_fd` numbers in the same forked child, closing whatever occupies them, so a
+/// marker on one of those numbers would be silently clobbered and the tree would silently
+/// lose membership. `F_DUPFD_CLOEXEC` never overwrites an open descriptor, so only `child_fd`
+/// values are hazards; std `dup2`s the stdio slots before any pre_exec hook runs, so 0-2 are too.
+#[test]
+fn the_marker_fd_is_chosen_clear_of_reserved_child_fds_stdio_and_the_conventional_shell_range() {
+    use super::{safe_marker_fd, HIGH_FLOOR};
+    assert_eq!(
+        safe_marker_fd(7, &[]),
+        HIGH_FLOOR,
+        "even a low, uncontested candidate is raised clear of the conventional shell-\
+         redirection range (3-9), not merely clear of stdio"
+    );
+    assert_eq!(
+        safe_marker_fd(HIGH_FLOOR + 3, &[]),
+        HIGH_FLOOR + 3,
+        "a candidate already above the floor is kept"
+    );
+    assert!(
+        safe_marker_fd(7, &[HIGH_FLOOR]) > HIGH_FLOOR,
+        "a candidate colliding with a reserved fd must move up, even above the floor"
+    );
+    assert!(
+        safe_marker_fd(4, &[3, 4, HIGH_FLOOR + 5]) > HIGH_FLOOR + 5,
+        "the marker must clear the HIGHEST reserved fd, whether below or above the floor"
+    );
+    assert!(safe_marker_fd(1, &[]) >= 3, "the marker must never sit on a stdio slot");
+    assert!(
+        safe_marker_fd(0, &[3]) >= HIGH_FLOOR,
+        "the high floor applies regardless of how low the reserved set is"
+    );
+}
+
+/// The placement contract, asserted on the placed number itself: `install` must move the
+/// marker above every reserved child fd it is told about.
+///
+/// `cmd` is never spawned here, but `install()` still opens a real, CLOEXEC'd write end in
+/// THIS process that stays open for the rest of the test's body (module docs above) — the
+/// fork-bystander exposure the lock guards against does not depend on this specific test ever
+/// spawning, only on the write end being open while ANY sibling test forks.
+#[test]
+fn install_places_the_marker_above_every_reserved_child_fd() {
+    let _serialize = test_spawn_lock();
+    let reserved = [3, 4, 5, 6, 7, 8, 9, 10];
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = super::install(&mut cmd, &reserved).expect("install");
+    assert!(
+        prepared.fd > 10,
+        "the marker landed on fd {}, which a user mapping would dup2 over",
+        prepared.fd
+    );
+}
+
+/// The same contract end to end, against a REAL colliding mapping: the child gets an fd
+/// mapping on the number the marker would naturally have taken, and must still be a holder.
+#[test]
+fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
+    let _serialize = test_spawn_lock();
+    use command_fds::{CommandFdExt, FdMapping};
+
+    let (_probe_r, probe_w) = std::io::pipe().expect("probe pipe");
+    // The number `install` would pick with nothing reserved.
+    let natural = super::safe_marker_fd(probe_w.as_fd().as_raw_fd(), &[]);
+    drop(probe_w);
+
+    let filler = std::fs::File::open("/dev/null").expect("open /dev/null");
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let prepared = super::install(&mut cmd, &[natural]).expect("install");
+    let handle = prepared.handle;
+    cmd.fd_mappings(vec![FdMapping {
+        parent_fd: filler.into(),
+        child_fd: natural,
+    }])
+    .expect("unique child fd");
+
+    let mut child = cmd.spawn().expect("spawn sh");
+    drop(cmd);
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read pid line");
+    let kid: crate::identity::RawPid = line.trim().parse().expect("child pid");
+
+    assert!(
+        holds_marker(kid, handle),
+        "a user fd mapping on fd {natural} must not clobber the marker in the child"
+    );
+    let _keep_alive = prepared.read;
+
+    drop(child.stdin.take()); // EOF releases the child (cleanup, not an assertion)
+    let _ = child.wait();
+}
+
+/// A real spawn through the real installer: the child must be a holder, and the SUPERVISOR
+/// must not be — it hands the write end away, so it is never a member of its own tree.
+#[test]
+fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let handle = prepared.handle;
+    let mut child = cmd.spawn().expect("spawn sh");
+    drop(cmd); // the Command owns the write end; dropping it closes the supervisor's copy
+
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read pid line");
+    let kid: crate::identity::RawPid = line.trim().parse().expect("child pid");
+
+    let found = holders(handle, &all_pids());
+    assert!(
+        found.iter().any(|h| h.pid == kid),
+        "the child must inherit the marker across exec; found {found:?}"
+    );
+    assert!(
+        !found.iter().any(|h| h.pid == std::process::id()),
+        "the supervisor must not hold the marker, or a sweep could signal it; found {found:?}"
+    );
+    let _keep_alive = prepared.read;
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A holder whose descriptor survives exec is NOT an imminent membership loss, so no warning
+/// is due. The check runs against a spawned child (whose copy `preserved_fds` has already
+/// un-CLOEXEC'd) rather than by mutating this process's own fd table, which a concurrent
+/// fork+exec on another thread would leak. The assertion keys on the per-pid message
+/// (`fd marker {handle:#x}: holder pid {kid} will lose the marker…`), not on the handle alone:
+/// unit tests run in parallel in ONE process, and the marker write end is open in that shared
+/// process from `install()` until `drop(cmd)` — a SIBLING test's `Command::spawn()` forking in
+/// that window transiently inherits this fd into a not-yet-`exec`'d bystander (documented in
+/// "Holding the read end is a precondition of soundness"), whose CLOEXEC-armed copy of THIS
+/// handle would satisfy a handle-only negative check by accident. Keying on the child's own pid
+/// too makes that bystander unable to satisfy or spoil the assertion.
+#[test]
+fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
+    let _serialize = test_spawn_lock();
+    crate::log_capture::install();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let handle = prepared.handle;
+    let mut child = cmd.spawn().expect("spawn sh");
+    drop(cmd);
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read pid line");
+    let kid: crate::identity::RawPid = line.trim().parse().expect("child pid");
+
+    let mark = crate::log_capture::mark();
+    let found = holders(handle, &all_pids());
+    let theirs = found.iter().find(|h| h.pid == kid).expect("the child holds the marker");
+    assert!(
+        !theirs.clexec,
+        "preserved_fds clears FD_CLOEXEC in the child, so the marker survives its next exec"
+    );
+    assert!(
+        !crate::log_capture::contains_since(
+            mark,
+            &format!("fd marker {handle:#x}: holder pid {kid} will lose the marker")
+        ),
+        "no exec warning is due for pid {kid}, whose own descriptor survives exec"
+    );
+    let _keep_alive = prepared.read;
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The complement: a holder whose descriptor is CLOEXEC WILL lose membership at its next exec,
+/// and that must be visible one exec in advance via both `Holder.clexec` and a log line.
+///
+/// Constructed self-referentially against THIS test process, not a spawned child. A live
+/// holder whose ONLY copy is CLOEXEC needs to be observed AFTER the exec that starts it, but
+/// arming `FD_CLOEXEC` in a `pre_exec` hook closes the descriptor AT the exec that immediately
+/// follows — it never survives to be observed as a live holder at all. Setting the flag from
+/// WITHIN a live, already-running process is what the real property requires, and nothing
+/// available to a unit test (`/bin/sh` has no `fcntl` builtin; a compiled testbin mode is
+/// unavailable here — Global Constraints) can do that post-exec. `std::io::pipe()` sets
+/// `FD_CLOEXEC` on both ends by default (the reason `install()` needs `F_DUPFD_CLOEXEC` +
+/// `preserved_fds` to make the write end survive an exec at all), so a bare pipe's write end,
+/// right here in this process, IS already the exact state under test — no fd-table mutation
+/// needed, so this does not touch the "never clear FD_CLOEXEC on this process's own
+/// descriptors" rule (that rule is about CLEARING an existing flag; this relies on the
+/// default, never-cleared SET state).
+#[test]
+fn a_cloexec_holder_is_reported_and_warned_about() {
+    crate::log_capture::install();
+    let (_r, w) = std::io::pipe().expect("pipe");
+    let handle = pipe_handle_of(w.as_fd()).expect("write end handle");
+    let me = std::process::id();
+
+    let mark = crate::log_capture::mark();
+    let found = holders(handle, &all_pids());
+    let theirs = found.iter().find(|h| h.pid == me).expect("this process holds the marker");
+    assert!(theirs.clexec, "std::io::pipe() sets FD_CLOEXEC on both ends by default");
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!("fd marker {handle:#x}: holder pid {me} will lose the marker at its next exec")
+        ),
+        "an imminent membership loss must leave a log line naming the marker and the pid"
+    );
+}
+
+/// THE DOCUMENTED ESCAPE, pinned by a test rather than by prose: a child that closes the
+/// inherited descriptor leaves the containment set.
+///
+/// Ordered by a real handshake on BOTH sides of the close, not merely on the print after it:
+/// printing `$$` alone orders nothing against the very next statement in the same script, since
+/// nothing blocks the child between them — a shell runs its own script far faster than the
+/// parent can complete a multi-syscall `holders()` scan, so the first check would otherwise race
+/// the close and could observe it already gone (measured: it reliably does, on this host). The
+/// child instead blocks on its own `read` immediately after printing `$$`, and only the
+/// PARENT'S write releases it into the close — so the first `holds_marker` check is guaranteed
+/// to run while the descriptor is still open, not merely likely to.
+#[test]
+fn a_child_that_closes_the_marker_leaves_the_holder_set() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let (handle, marker_fd) = (prepared.handle, prepared.fd);
+    cmd.arg("-c")
+        .arg(format!("echo $$; read _go; exec {marker_fd}>&-; echo closed; read _ignored"));
+    let mut child = cmd.spawn().expect("spawn sh");
+    drop(cmd);
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read pid line");
+    let kid: crate::identity::RawPid = line.trim().parse().expect("child pid");
+    assert!(
+        holds_marker(kid, handle),
+        "the child inherited the marker, and must still hold it while blocked before its own close"
+    );
+
+    use std::io::Write;
+    stdin.write_all(b"go\n").expect("release the child into its close");
+
+    line.clear();
+    out.read_line(&mut line).expect("read closed line");
+    assert_eq!(line.trim(), "closed", "the child must confirm the close before the second check");
+    assert!(
+        !holds_marker(kid, handle),
+        "close(fd) leaves the containment set — the documented limit"
+    );
+    let _keep_alive = prepared.read;
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Each real failure arm of `install` degrades to "no marker" and says so, with the message
+/// naming which step failed. The seams replace the SYSCALL result, so the genuine branch —
+/// its own log line and its own early return — is what executes.
+///
+/// **Deliberate, documented exception to this crate's no-mocks rule**, not an oversight: these
+/// three syscalls (`pipe()`, `F_DUPFD_CLOEXEC`, and "the marker pipe has no readable handle")
+/// are genuinely hard to fail for real inside this suite without collateral damage.
+/// `RLIMIT_NOFILE` (the textbook way to force `pipe()`/`fcntl` to fail) is PROCESS-WIDE, and
+/// this suite runs every unit test in parallel in ONE process — lowering it would spuriously
+/// fail any concurrently-running sibling test that happens to open a file or pipe at that
+/// moment. The third arm (`pipe_handle_of` returning `None`) has no realistic real-world
+/// trigger at all on a healthy pipe. The seam exercises exactly the code adjacent to each
+/// injection point (each wrapper's own `if fault::take_if(X) { … }` arm), which is what needs
+/// covering here; the SYSCALLS themselves (`pipe()`, `F_DUPFD_CLOEXEC`, `proc_pidfdinfo`) are
+/// exercised for real, unmocked, by every OTHER test in this file's success paths. **State this
+/// plainly rather than implying more:** this test proves `install`'s three early-return arms
+/// compile, log the right message, and degrade to `None` — it does NOT prove `install` degrades
+/// correctly under a genuine OS-level `pipe()`/`fcntl`/`proc_pidfdinfo` failure (`EMFILE`,
+/// `ENFILE`, …), whose exact errno/shape this seam does not attempt to reproduce.
+#[test]
+fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
+    use super::fault::{set_fault, Fault};
+    // Held for the whole test: these log lines carry no per-call discriminator, so this test
+    // and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one` (which
+    // asserts on the identical text) could otherwise satisfy each other's `contains_since`
+    // check across threads in the shared `log_capture` buffer.
+    let _serialize = super::fault::lock_for_log_assertion();
+    crate::log_capture::install();
+    for (fault, marker) in [
+        (Fault::Pipe, "fd marker: pipe() failed"),
+        (Fault::Place, "fd marker: could not place the marker descriptor"),
+        (Fault::Handle, "fd marker: the marker pipe has no readable handle"),
+    ] {
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        set_fault(Some(fault));
+        let mark = crate::log_capture::mark();
+        assert!(
+            super::install(&mut cmd, &[]).is_none(),
+            "a failed {fault:?} step must yield no marker"
+        );
+        assert!(
+            crate::log_capture::contains_since(mark, marker),
+            "the {fault:?} failure must log {marker:?}"
+        );
+        assert!(super::fault::take_fault().is_none(), "the seam must be consumed by install");
+    }
 }

@@ -65,7 +65,7 @@
 //! in practice, but it is a real behavior of an fd a tree member's own code could, in
 //! principle, stumble onto by number.
 
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use crate::identity::RawPid;
 
@@ -414,6 +414,272 @@ fn classify_pidlistfds_failure() -> PipeQuery {
         None | Some(0) => PipeQuery::Found(Vec::new()), // genuine empty success, not a failure
         Some(libc::ESRCH) => PipeQuery::Gone,
         _ => PipeQuery::Denied,
+    }
+}
+
+// Installing the marker on a spawn =====
+
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+
+use crate::containment::ContainMode;
+
+/// Whether this spawn installs a marker. Pure, so the policy is directly unit-testable —
+/// the same shape as `unix_setup_for` and `windows_contain_setup`.
+///
+/// Only the outermost root installs one: a nested member inherits the root's marker across
+/// `fork`, so a second pipe would add an fd per nesting level and buy nothing. `suppressed`
+/// is set for an elevation-derived spawn, whose `sudo`/`doas`/`pkexec` wrapper closes every
+/// descriptor >= 3 before exec — installing there would report a guarantee that cannot hold.
+pub(crate) fn marker_wanted(mode: Option<ContainMode>, is_root: bool, suppressed: bool) -> bool {
+    mode.is_some() && is_root && !suppressed
+}
+
+/// A descriptor number clear of everything that could overwrite the marker inside the forked
+/// child: `command-fds` `dup2`s each user mapping onto its `child_fd`, std `dup2`s the stdio
+/// slots before any `pre_exec` hook runs, AND ordinary, non-adversarial shell scripts and
+/// libraries conventionally claim LOW numbers for their own redirections (`exec 3>&1`,
+/// `exec 4<file`, a library's own `dup2` bookkeeping) — `dup2` silently closes whatever
+/// occupied that number first. A floor of merely "above stdio" (3) still lands the marker at
+/// 4-6 in the common case (nothing reserved), squarely inside that conventional range: a
+/// script doing `exec 4>log` would then silently drop the marker for itself and everything it
+/// spawns afterward — a far likelier ACCIDENTAL escape than the documented deliberate
+/// `close(fd)` one, and nothing in this design would log or detect it. `HIGH_FLOOR` puts the
+/// marker well clear of that whole range at negligible cost (one descriptor number, unused by
+/// convention).
+const HIGH_FLOOR: RawFd = 64;
+
+/// `reserved` is caller-supplied (ultimately from `Command::fd()`'s child fd numbers), so
+/// `m + 1` must not silently wrap: `saturating_add` keeps a `RawFd::MAX` entry from wrapping to
+/// `RawFd::MIN`, which `.max(HIGH_FLOOR)` would otherwise "recover" from into a floor BELOW
+/// that reserved fd — silently defeating the entire purpose of this function.
+pub(crate) fn safe_marker_fd(candidate: RawFd, reserved: &[RawFd]) -> RawFd {
+    let floor = reserved
+        .iter()
+        .copied()
+        .max()
+        .map_or(HIGH_FLOOR, |m| m.saturating_add(1))
+        .max(HIGH_FLOOR);
+    candidate.max(floor)
+}
+
+/// A marker pipe created for a spawn: the write end is already owned by the `Command`.
+pub(crate) struct PreparedMarker {
+    /// The supervisor's read end. See the module docs: holding it is what keeps `handle`
+    /// from being re-issued to an unrelated pipe.
+    pub read: OwnedFd,
+    pub handle: u64,
+    /// `read`'s OWN `pipe_handle` (a distinct kernel object from `handle`, the write end's —
+    /// see `a_live_pipe_has_a_nonzero_handle_distinct_per_end`), captured while both ends are
+    /// provably still open. Unlike `read`'s PEER handle (which reports `0` once every write
+    /// end anywhere closes — measured; see `Marker::sweep`'s entry contract for why that
+    /// matters), `read`'s OWN handle stays valid for as long as `read` itself stays open,
+    /// letting `Marker` re-assert "this really is still my pipe" at sweep time without
+    /// depending on the write side's state.
+    pub read_handle: u64,
+    /// The descriptor number the marker occupies in the child (`preserved_fds` does not
+    /// renumber, so it is the parent's number too).
+    pub fd: RawFd,
+}
+
+/// Create the marker pipe and hand its write end to `std_cmd`. `reserved` is every child fd
+/// number the spawn will `dup2` into (the caller's `fd()` mappings).
+///
+/// `preserved_fds` registers a `pre_exec` hook that clears `FD_CLOEXEC` on the descriptor
+/// **in the forked child only**, so the supervisor's copy stays CLOEXEC and is never inherited
+/// by a concurrent, unrelated spawn's EXEC'D process image. `command-fds`' own doc comment
+/// notes the `Command` retains ownership of (and does not close) the write end until the
+/// `Command` itself is dropped — so the CALLER must drop `std_cmd` promptly after `.spawn()`
+/// returns to bound the (documented, non-zero) window where a truly concurrent `fork()` in this
+/// same process could transiently see this fd before its own `exec`; see the module docs.
+///
+/// `None` on any failure — the caller falls back to the pre-existing mechanism rather than
+/// failing the spawn.
+pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -> Option<PreparedMarker> {
+    use command_fds::CommandFdExt;
+
+    let (read, write) = match create_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("fd marker: pipe() failed ({e}); falling back to the pre-existing containment channel for this mode");
+            return None;
+        }
+    };
+
+    // A supervisor whose soft RLIMIT_NOFILE sits below `want` (HIGH_FLOOR=64 in the common
+    // case, or higher with a large reserved set) makes F_DUPFD_CLOEXEC fail EINVAL here on
+    // EVERY contained spawn, not just an occasional one — diagnosable from this log line alone
+    // since `nix::errno::Errno`'s `Display` names the symbolic errno (e.g. "EINVAL: Invalid
+    // argument"), not just a bare OS error number.
+    let want = safe_marker_fd(write.as_fd().as_raw_fd(), reserved);
+    let write: OwnedFd = match place_write_end(write, want) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::warn!("fd marker: could not place the marker descriptor ({e}); falling back to the pre-existing containment channel for this mode");
+            return None;
+        }
+    };
+    let fd = write.as_raw_fd();
+    // CONTRACT: `place_write_end` used `F_DUPFD_CLOEXEC`, which must place the copy WITH
+    // FD_CLOEXEC set — the supervisor's own copy staying CLOEXEC (so no concurrent, unrelated
+    // fork can inherit it into an exec'd image) is a documented safety property this whole
+    // design leans on, not an incidental detail. Asserted, not just documented: a future
+    // refactor that swaps in a non-CLOEXEC placement call must fail loudly in a debug/test
+    // build, not silently in release.
+    // SAFETY: F_GETFD is a plain fcntl read, no allocation.
+    debug_assert!(
+        unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0,
+        "the marker's supervisor-side write-end copy must be FD_CLOEXEC"
+    );
+
+    let Some(handle) = read_handle(write.as_fd()) else {
+        log::warn!("fd marker: the marker pipe has no readable handle; falling back to the pre-existing containment channel for this mode");
+        return None;
+    };
+    // CONTRACT: `handle == 0` must never reach a live `Marker` — 0 is the sentinel this whole
+    // mechanism treats as "matches no live pipe" (see `a_dead_handle_finds_no_holders`'s doc
+    // comment: 0 is never a valid `pipe_handle` and cannot become one through any amount of
+    // churn). If `proc_pidfdinfo` ever DID hand back 0 for a real, live pipe here, installing
+    // it anyway would make `Marker.handle == 0` — the one value documented to match NOTHING —
+    // instead match the WIDEST possible set: every host pid whose own unrelated pipe fds
+    // happen to read back the same sentinel. Rejected as a failed install, exactly like the
+    // other two `install()` failure arms, rather than trusted silently.
+    if handle == 0 {
+        log::warn!("fd marker: the marker pipe's write end reported a zero handle; falling back to the pre-existing containment channel for this mode");
+        debug_assert!(false, "fd marker: pipe_handle_of the write end returned 0, the reserved sentinel");
+        return None;
+    }
+    // CONTRACT, checked HERE specifically because both ends are provably still open (unlike
+    // at `Marker::sweep` time, where the write side may already be fully drained — see there):
+    // `read` must pin the SAME kernel pipe object `handle` names. The measured invariant
+    // (facts C/E) this whole mechanism rests on is exactly "holding a live descriptor on this
+    // pipe keeps `handle` from being reissued", and that is only true if `read` really is a
+    // descriptor on THIS pipe, not assumed from having called `create_pipe()` moments earlier.
+    debug_assert!(
+        matches!(
+            fd_pipe_info(std::process::id(), read.as_raw_fd()),
+            FdPipeInfoQuery::Found(info) if info.pipe_peerhandle == handle
+        ),
+        "the marker's read end must report the write end's handle as its peer"
+    );
+    // `read`'s OWN handle (a distinct kernel object from `handle` — see `PreparedMarker::
+    // read_handle`'s doc comment for why `Marker` needs this instead of re-deriving a peer
+    // check later): captured now, while it is certain to succeed, rather than assumed later.
+    let Some(read_handle_value) = pipe_handle_of(read.as_fd()) else {
+        log::warn!("fd marker: the marker pipe's read end has no readable handle; falling back to the pre-existing containment channel for this mode");
+        return None;
+    };
+    // Same CONTRACT as the write end's handle above, and for the identical reason:
+    // `Marker::sweep`'s entry check compares a LIVE read against this exact value, so a zero
+    // here would make that check accept any other pipe descriptor that also happens to report
+    // a zero handle, defeating the whole point of the entry contract.
+    if read_handle_value == 0 {
+        log::warn!("fd marker: the marker pipe's read end reported a zero handle; falling back to the pre-existing containment channel for this mode");
+        debug_assert!(false, "fd marker: pipe_handle_of the read end returned 0, the reserved sentinel");
+        return None;
+    }
+
+    std_cmd.preserved_fds(vec![write]);
+    Some(PreparedMarker {
+        read: OwnedFd::from(read),
+        handle,
+        read_handle: read_handle_value,
+        fd,
+    })
+}
+
+// Fault-seam wrappers: each is the ONE place `install`'s corresponding real syscall is called,
+// so the `#[cfg(test)]` injection is visibly separated from `install`'s own control flow rather
+// than interleaved with it. Each takes the SAME `fault::take_fault()` value implicitly (via its
+// own `#[cfg(test)]` check) — see the `fault` module doc for why exactly one of the three fires
+// per test, never more.
+
+fn create_pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    #[cfg(test)]
+    if fault::take_if(fault::Fault::Pipe) {
+        return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    std::io::pipe()
+}
+
+fn place_write_end(write: std::io::PipeWriter, want: RawFd) -> Result<OwnedFd, nix::errno::Errno> {
+    #[cfg(test)]
+    if fault::take_if(fault::Fault::Place) {
+        return Err(nix::errno::Errno::EMFILE);
+    }
+    let placed = nix::fcntl::fcntl(write.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(want))?;
+    // CONTRACT: POSIX guarantees `F_DUPFD_CLOEXEC(want)` returns a descriptor `>= want`, which
+    // is the ENTIRE reason `safe_marker_fd` exists (clearing every reserved child fd and the
+    // shell-redirection range). Asserted, not just relied on, so a libc/kernel surprise on this
+    // platform would fail loudly here rather than resurface as an inexplicable containment
+    // escape much later.
+    debug_assert!(placed >= want, "F_DUPFD_CLOEXEC({want}) returned {placed}, below the floor it was given");
+    // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(placed) })
+}
+
+fn read_handle(fd: BorrowedFd<'_>) -> Option<u64> {
+    #[cfg(test)]
+    if fault::take_if(fault::Fault::Handle) {
+        return None;
+    }
+    pipe_handle_of(fd)
+}
+
+/// Test-only: force the NEXT `install` on THIS thread to take one of its real failure arms, by
+/// replacing that step's syscall result. `take_if` is what each fault-seam wrapper above
+/// actually calls: it consumes the armed fault ONLY if it matches `want`, leaving it untouched
+/// (for a DIFFERENT wrapper's own check) otherwise — so exactly one of the three wrappers in
+/// one `install` call ever sees a match, matching the single-fault-per-call contract
+/// `each_install_failure_arm_falls_back_and_says_which_step_failed` relies on.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        Pipe,
+        Place,
+        Handle,
+    }
+
+    thread_local! {
+        static FAULT: Cell<Option<Fault>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn set_fault(f: Option<Fault>) {
+        FAULT.with(|c| c.set(f));
+    }
+
+    /// True and CONSUMED if the armed fault is exactly `want`; false and left untouched
+    /// otherwise.
+    pub(crate) fn take_if(want: Fault) -> bool {
+        FAULT.with(|c| {
+            if c.get() == Some(want) {
+                c.set(None);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub(crate) fn take_fault() -> Option<Fault> {
+        FAULT.with(|c| c.take())
+    }
+
+    /// Every `install` failure log line (`"fd marker: pipe() failed"`, etc.) carries no
+    /// per-call discriminator — there is no handle yet to key on, since `install` hasn't
+    /// succeeded. Two DIFFERENT tests asserting on the same literal text via `log_capture`
+    /// (`fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`
+    /// and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one`, both
+    /// Task 3/5) would otherwise be able to satisfy each other's `contains_since` check across
+    /// threads, since `log_capture` is one process-global buffer and `cargo test` runs each
+    /// `#[test]` on its own thread. `FAULT` itself is thread-local (race-free), but the LOG
+    /// ASSERTION is not, so both tests must hold this for their whole body instead.
+    static LOG_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn lock_for_log_assertion() -> std::sync::MutexGuard<'static, ()> {
+        LOG_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
