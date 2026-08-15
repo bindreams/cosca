@@ -160,7 +160,10 @@ fn the_sweep_finds_this_process_holding_the_marker() {
         found.iter().any(|h| h.pid == me),
         "the sweep must find pid {me}, which holds the marker; found {found:?}"
     );
-    assert!(holds_marker(me, handle), "the single-pid membership check must agree with the sweep");
+    assert!(
+        holds_marker(me, handle),
+        "the single-pid membership check must agree with the sweep"
+    );
 }
 
 // The AND-fold in `holders()` (`all_clexec &= …`) — a one-line, directly reviewable change from
@@ -229,7 +232,10 @@ fn proc_pidfdinfo_on_a_non_pipe_fd_returns_zero_with_ebadf_not_a_type_specific_c
         )
     };
     let e = std::io::Error::last_os_error();
-    assert_eq!(n, 0, "a non-pipe fd is measured to return 0, not a negative value; got {n}");
+    assert_eq!(
+        n, 0,
+        "a non-pipe fd is measured to return 0, not a negative value; got {n}"
+    );
     assert_eq!(
         e.raw_os_error(),
         Some(libc::EBADF),
@@ -476,7 +482,10 @@ fn a_cloexec_holder_is_reported_and_warned_about() {
 
     let mark = crate::log_capture::mark();
     let found = holders(handle, &all_pids());
-    let theirs = found.iter().find(|h| h.pid == me).expect("this process holds the marker");
+    let theirs = found
+        .iter()
+        .find(|h| h.pid == me)
+        .expect("this process holds the marker");
     assert!(theirs.clexec, "std::io::pipe() sets FD_CLOEXEC on both ends by default");
     assert!(
         crate::log_capture::contains_since(
@@ -502,11 +511,13 @@ fn a_cloexec_holder_is_reported_and_warned_about() {
 fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
     let (handle, marker_fd) = (prepared.handle, prepared.fd);
-    cmd.arg("-c")
-        .arg(format!("echo $$; read _go; exec {marker_fd}>&-; echo closed; read _ignored"));
+    cmd.arg("-c").arg(format!(
+        "echo $$; read _go; exec {marker_fd}>&-; echo closed; read _ignored"
+    ));
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
 
@@ -525,7 +536,11 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
 
     line.clear();
     out.read_line(&mut line).expect("read closed line");
-    assert_eq!(line.trim(), "closed", "the child must confirm the close before the second check");
+    assert_eq!(
+        line.trim(),
+        "closed",
+        "the child must confirm the close before the second check"
+    );
     assert!(
         !holds_marker(kid, handle),
         "close(fd) leaves the containment set — the documented limit"
@@ -580,7 +595,10 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
             crate::log_capture::contains_since(mark, marker),
             "the {fault:?} failure must log {marker:?}"
         );
-        assert!(super::fault::take_fault().is_none(), "the seam must be consumed by install");
+        assert!(
+            super::fault::take_fault().is_none(),
+            "the seam must be consumed by install"
+        );
     }
 }
 
@@ -591,10 +609,16 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
 /// were wrong and the signal merely failed.
 #[test]
 fn the_kill_filter_excludes_this_process_and_pid_one() {
-    assert!(!super::is_signalable(std::process::id()), "the supervisor is never a sweep target");
+    assert!(
+        !super::is_signalable(std::process::id()),
+        "the supervisor is never a sweep target"
+    );
     assert!(!super::is_signalable(1), "pid 1 is never a sweep target");
     assert!(!super::is_signalable(0), "pid 0 is never a sweep target");
-    assert!(super::is_signalable(std::process::id() + 1), "an ordinary pid is signalable");
+    assert!(
+        super::is_signalable(std::process::id() + 1),
+        "an ordinary pid is signalable"
+    );
 }
 
 /// The shape the ppid walk structurally cannot reach: a descendant that calls `setsid`,
@@ -617,7 +641,9 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
     // `sleep` inherits the marker across sh's fork and its own exec; `echo $!` publishes it.
-    cmd.arg("-c").arg("sleep 600 & echo $!").stdout(std::process::Stdio::piped());
+    cmd.arg("-c")
+        .arg("sleep 600 & echo $!")
+        .stdout(std::process::Stdio::piped());
     // setsid: the orphan leaves this process's session AND process group, so killpg misses it.
     // SAFETY: pre_exec runs post-fork, pre-exec; `libc::setsid` is async-signal-safe.
     unsafe {
@@ -680,11 +706,13 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
 fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
     let (handle, marker_fd) = (prepared.handle, prepared.fd);
-    cmd.arg("-c")
-        .arg(format!(r#"echo $$; exec {marker_fd}>&-; echo closed; while read x; do echo "$x"; done"#));
+    cmd.arg("-c").arg(format!(
+        r#"echo $$; exec {marker_fd}>&-; echo closed; while read x; do echo "$x"; done"#
+    ));
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -693,8 +721,15 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let kid: crate::identity::RawPid = line.trim().parse().expect("child pid");
     line.clear();
     out.read_line(&mut line).expect("read closed confirmation");
-    assert_eq!(line.trim(), "closed", "the child must confirm the close before the sweep runs");
-    assert!(!holds_marker(kid, handle), "precondition: the escapee no longer holds the marker");
+    assert_eq!(
+        line.trim(),
+        "closed",
+        "the child must confirm the close before the sweep runs"
+    );
+    assert!(
+        !holds_marker(kid, handle),
+        "precondition: the escapee no longer holds the marker"
+    );
 
     let marker = super::Marker::new(prepared, None, None);
     marker.hard_kill().expect("hard_kill");

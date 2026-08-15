@@ -69,7 +69,10 @@ fn every_still_live_pid_that_ps_reports_is_in_the_snapshot() {
         }
         // Not in our list: it must be because it has since exited.
         let gone = matches!(crate::identity::ProcessId::of(pid), crate::identity::Resolved::Gone);
-        assert!(gone, "pid {pid} is live and reported by ps but missing from the snapshot");
+        assert!(
+            gone,
+            "pid {pid} is live and reported by ps but missing from the snapshot"
+        );
     }
 }
 
@@ -79,6 +82,9 @@ fn every_ppid_edge_names_a_pid_from_the_same_snapshot() {
     let (pids, parents, _) = snapshot();
     let set: std::collections::HashSet<u32> = pids.into_iter().collect();
     for (pid, _) in &parents {
-        assert!(set.contains(pid), "pid {pid} has a ppid edge but is not in the pid list");
+        assert!(
+            set.contains(pid),
+            "pid {pid} has a ppid edge but is not in the pid list"
+        );
     }
 }

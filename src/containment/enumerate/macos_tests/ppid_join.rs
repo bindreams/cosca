@@ -2,7 +2,7 @@
 
 use crate::identity::Resolved;
 
-use super::super::{join_edges, ppid_of, process_parents};
+use super::super::{join_edges, ppid_of, process_parents, push_denied_sample, DENIED_SAMPLE_CAP};
 
 /// The `pid <= 0` filter, pinned deterministically with a synthetic pid list rather than a
 /// live one: depending on a live run to happen to contain pid 0 (a kernel-internal fact
@@ -16,9 +16,13 @@ fn join_edges_filters_non_positive_pids() {
     // Read before and after, same reasoning as `parents_contains_this_process_edge`:
     // nothing holds this process's real parent fixed across the call.
     let parent_before = std::os::unix::process::parent_id();
-    let (out, denied) = join_edges(&[0, -1, me]);
+    let (out, denied, sample) = join_edges(&[0, -1, me]);
     let parent_after = std::os::unix::process::parent_id();
     assert_eq!(denied, 0, "0 and -1 must not be counted as denied ppid lookups");
+    assert!(
+        sample.is_empty(),
+        "nothing was attempted-and-denied, so nothing should be sampled"
+    );
     assert_eq!(out.len(), 1, "only the real pid should produce an edge");
     let (pid, ppid) = out[0];
     assert_eq!(pid, me as u32, "the filtered edge must be for the real pid");
@@ -34,9 +38,37 @@ fn join_edges_filters_non_positive_pids() {
 #[test]
 fn join_edges_does_not_count_gone_pids_as_denied() {
     let unresolvable = vec![libc::c_int::MAX; 8];
-    let (out, denied) = join_edges(&unresolvable);
+    let (out, denied, sample) = join_edges(&unresolvable);
     assert!(out.is_empty(), "none of these pids can resolve to an edge");
     assert_eq!(denied, 0, "a pid that is simply gone must not be counted as denied");
+    assert!(
+        sample.is_empty(),
+        "a Gone pid must not be sampled either — only Unknown is"
+    );
+}
+
+/// The denied-sample cap, pinned directly against [`push_denied_sample`] rather than through
+/// a live `join_edges` call: there is no deterministic way to force `Resolved::Unknown` from
+/// a real `ppid_of` call (see `snapshot`'s doc), so this is the only way to exercise the cap
+/// at all. Pushing `DENIED_SAMPLE_CAP + 2` entries must still keep exactly the first
+/// `DENIED_SAMPLE_CAP` of them — capped, not merely bounded by coincidence, and not silently
+/// replacing earlier entries with later ones.
+#[test]
+fn push_denied_sample_caps_at_the_limit() {
+    let mut sample = Vec::new();
+    for pid in 0..(DENIED_SAMPLE_CAP as libc::c_int + 2) {
+        push_denied_sample(&mut sample, pid);
+    }
+    assert_eq!(
+        sample.len(),
+        DENIED_SAMPLE_CAP,
+        "the sample must be capped, not grow with every push"
+    );
+    assert_eq!(
+        sample,
+        (0..DENIED_SAMPLE_CAP as libc::c_int).collect::<Vec<_>>(),
+        "a capped sample must keep the FIRST N pushes, not the last"
+    );
 }
 
 /// The delivered `(pid, ppid)` snapshot carries this test process's own edge.

@@ -266,7 +266,10 @@ pub(crate) fn holders(handle: u64, pids: &[RawPid]) -> Vec<Holder> {
                  exec (every copy of its inherited descriptor is FD_CLOEXEC)"
             );
         }
-        out.push(Holder { pid, clexec: all_clexec });
+        out.push(Holder {
+            pid,
+            clexec: all_clexec,
+        });
     }
     if denied > 0 {
         log::debug!(
@@ -502,7 +505,9 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -
     let (read, write) = match create_pipe() {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("fd marker: pipe() failed ({e}); falling back to the pre-existing containment channel for this mode");
+            log::warn!(
+                "fd marker: pipe() failed ({e}); falling back to the pre-existing containment channel for this mode"
+            );
             return None;
         }
     };
@@ -547,7 +552,10 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -
     // other two `install()` failure arms, rather than trusted silently.
     if handle == 0 {
         log::warn!("fd marker: the marker pipe's write end reported a zero handle; falling back to the pre-existing containment channel for this mode");
-        debug_assert!(false, "fd marker: pipe_handle_of the write end returned 0, the reserved sentinel");
+        debug_assert!(
+            false,
+            "fd marker: pipe_handle_of the write end returned 0, the reserved sentinel"
+        );
         return None;
     }
     // CONTRACT, checked HERE specifically because both ends are provably still open (unlike
@@ -576,7 +584,10 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -
     // a zero handle, defeating the whole point of the entry contract.
     if read_handle_value == 0 {
         log::warn!("fd marker: the marker pipe's read end reported a zero handle; falling back to the pre-existing containment channel for this mode");
-        debug_assert!(false, "fd marker: pipe_handle_of the read end returned 0, the reserved sentinel");
+        debug_assert!(
+            false,
+            "fd marker: pipe_handle_of the read end returned 0, the reserved sentinel"
+        );
         return None;
     }
 
@@ -614,7 +625,10 @@ fn place_write_end(write: std::io::PipeWriter, want: RawFd) -> Result<OwnedFd, n
     // shell-redirection range). Asserted, not just relied on, so a libc/kernel surprise on this
     // platform would fail loudly here rather than resurface as an inexplicable containment
     // escape much later.
-    debug_assert!(placed >= want, "F_DUPFD_CLOEXEC({want}) returned {placed}, below the floor it was given");
+    debug_assert!(
+        placed >= want,
+        "F_DUPFD_CLOEXEC({want}) returned {placed}, below the floor it was given"
+    );
     // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor we now own.
     Ok(unsafe { OwnedFd::from_raw_fd(placed) })
 }
@@ -1109,11 +1123,18 @@ impl Marker {
                     .is_some_and(|root| root.is_alive() == crate::identity::Liveness::Alive);
                 let should_fire = first_pass || root_confirmed_alive;
                 if should_fire {
-                    let this_pass_group_result = match (self.pgid, signal) {
+                    // `kill_group`/`term_group` return `crate::error::Error` (they may now fail
+                    // on the real-membership verification #61 added, not just the raw signal
+                    // syscall) — this function's own return type predates that and stays
+                    // `io::Result<()>` (dispatch.rs's caller re-wraps it in `Error::Io`
+                    // regardless), so the conversion happens right here, at the one place a
+                    // non-io `Error` can appear in this loop.
+                    let this_pass_group_result: io::Result<()> = match (self.pgid, signal) {
                         (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid),
                         (Some(pgid), _) => crate::containment::unix::term_group(pgid),
                         (None, _) => Ok(()),
-                    };
+                    }
+                    .map_err(|e| io::Error::other(e.to_string()));
                     group_result = match (group_result, this_pass_group_result) {
                         (Ok(()), r) => r,
                         (e @ Err(_), Ok(())) => e,

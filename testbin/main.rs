@@ -237,6 +237,91 @@ fn main() {
             let _ = sock.read(&mut buf);
         }
         #[cfg(unix)]
+        "spawn-grandchild-setuid" => {
+            // Like spawn-grandchild, but the grandchild is a SEPARATE, pre-provisioned
+            // setuid-root binary (argv[3]) rather than this same executable — proving issue
+            // #61's fix against a mixed real process group: an ordinary member (us, the
+            // group leader) plus one the caller genuinely cannot signal. The grandchild
+            // inherits OUR process group (no setpgid call), so `killpg`/`kill_group` on our
+            // pgid addresses both.
+            let addr = args[2].clone();
+            let setuid_helper = args[3].clone();
+            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills/refuses us
+            let _gc = std::process::Command::new(setuid_helper)
+                .args(["setuid-control-block", &addr, "P"])
+                .spawn()
+                .unwrap();
+            // Become a control-block ourselves (no test-owned stdin → no EOF confound).
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R\n").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(unix)]
+        "setuid-control-block" => {
+            // Only ever exec'd from a SEPARATE, pre-provisioned copy of this binary that CI
+            // chowns root:root and chmods u+s (see `COSCA_TEST_SETUID_HELPER` in
+            // tests/group_teardown_setuid.rs). Reports readiness (or a provisioning
+            // failure) as ONE line, then blocks like control-block. A single connect: every
+            // outcome — success or failure — is reported over the SAME socket, so the
+            // harness always gets a definite answer instead of an ambiguous connect-refused.
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+
+            // The setuid-root file bit must already have made us effective-root at exec
+            // time. If not, the copy is not actually setuid-root (wrong owner/mode) or the
+            // filesystem it lives on is mounted `nosuid` — report loudly, never silently
+            // proceed as an ordinary (killable) process, which would make the caller's
+            // later "still alive" assertion pass for the wrong reason.
+            // Safety: geteuid() has no preconditions.
+            let euid_before = unsafe { libc::geteuid() };
+            if euid_before != 0 {
+                sock.write_all(
+                    format!(
+                        "F effective uid is {euid_before}, not 0 at exec — the setuid-root bit \
+                         did not take effect (wrong owner/mode on COSCA_TEST_SETUID_HELPER's \
+                         target, or a nosuid mount)\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                sock.flush().unwrap();
+                exit(3);
+            }
+            // setuid(0): collapse the REAL uid to 0 too, not just the effective/saved uid the
+            // exec-time setuid bit already granted. This is what makes us unsignalable by the
+            // original unprivileged caller IN FACT: the kernel's own permission check
+            // (`kill_ok_by_cred`) treats a matching REAL uid as sufficient permission on its
+            // own, so without this call our real uid would still equal the caller's and this
+            // whole scenario would not reproduce the bug at all — see group.rs's module docs.
+            // Safety: setuid() has no preconditions; failure is reported below, not ignored.
+            let rc = unsafe { libc::setuid(0) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                sock.write_all(format!("F setuid(0) failed: {err}\n").as_bytes())
+                    .unwrap();
+                sock.flush().unwrap();
+                exit(3);
+            }
+            // Safety: getuid()/geteuid() have no preconditions.
+            let (ruid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+            if ruid != 0 || euid != 0 {
+                sock.write_all(format!("F post-setuid(0) ids are ruid={ruid} euid={euid}, expected 0/0\n").as_bytes())
+                    .unwrap();
+                sock.flush().unwrap();
+                exit(3);
+            }
+            // Success: report OUR pid so the harness can independently probe kill(pid, 0)
+            // from the ORIGINAL caller's uid — an oracle outside this crate's own code path.
+            sock.write_all(format!("{tag} {}\n", std::process::id()).as_bytes())
+                .unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(unix)]
         "spawn-grandchild-escapee" => {
             // Like spawn-grandchild, but FIRST escape any process group / session
             // the parent put us in by calling setsid(2). A killpg-based teardown
