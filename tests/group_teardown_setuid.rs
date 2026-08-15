@@ -25,15 +25,25 @@
 //! regardless.
 //!
 //! # Gating
+//! This test is `#[ignore]`d by default, so an ordinary `cargo test` — locally, or in every CI
+//! step that doesn't explicitly ask for it — prints `... ignored`, never `... ok`. A vacuous pass
+//! that merely returned early (the shape this file used at first) is indistinguishable in the log
+//! from a real one, which is exactly the failure this rule exists to prevent: a test name reading
+//! "ok" must mean the scenario it describes was actually exercised. Only the one CI step that has
+//! provisioned the helper runs it, via `cargo test --test group_teardown_setuid -- --ignored` (see
+//! `.github/workflows/ci.yaml`, the "Run setuid-root process-group teardown test" step, which
+//! follows "Set up setuid-root helper").
+//!
 //! `COSCA_TEST_SETUID_HELPER` must hold the absolute path to a pre-provisioned COPY of
-//! `cosca_testbin` that CI has `chown root:root` + `chmod u+s`'d (see `.github/workflows/
-//! ci.yaml`, the "Set up setuid-root helper" step). Absent: a true no-op (the marker precedent
-//! `COSCA_TEST_CGROUP` already established for a live, root-requiring facility). Present: the
-//! test must fail LOUDLY if the helper does not actually achieve real uid 0 — never silently
-//! pass or skip. That check is performed by the spawned helper itself (`setuid-control-block` in
-//! `testbin/main.rs`) and reported back over the same control socket used for the readiness
-//! handshake, so a nosuid mount or a wrong owner/mode surfaces as a loud panic here, not a false
-//! green.
+//! `cosca_testbin` that CI has `chown root:root` + `chmod u+s`'d (see the "Set up setuid-root
+//! helper" step). Once a caller has explicitly opted in to running this ignored test, there is no
+//! honest silent case left: the variable being unset there is a misconfiguration, not an
+//! environment the test doesn't apply to, so it panics rather than no-op-returning. And with the
+//! variable set, the test must fail LOUDLY if the helper does not actually achieve real uid 0 —
+//! never silently pass. That check is performed by the spawned helper itself
+//! (`setuid-control-block` in `testbin/main.rs`) and reported back over the same control socket
+//! used for the readiness handshake, so a nosuid mount or a wrong owner/mode surfaces as a loud
+//! panic here, not a false green.
 
 // The whole file is Linux-only in purpose (see the module docs above) — gated here, once, rather
 // than on every item, so the file compiles to nothing (no unused-code warnings) elsewhere.
@@ -46,8 +56,18 @@ fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
-fn gated() -> Option<String> {
-    std::env::var("COSCA_TEST_SETUID_HELPER").ok()
+/// Panics if unset: by the time this runs, the caller has already explicitly opted in (the test
+/// is `#[ignore]`d, so it only executes given `--ignored`/`--include-ignored` or an exact-name
+/// filter combined with one of those). An unset variable at that point is a misconfigured CI lane
+/// or a developer who ran the wrong command, not a platform this test legitimately doesn't apply
+/// to — see the module docs' "Gating" section.
+fn gated() -> String {
+    std::env::var("COSCA_TEST_SETUID_HELPER").unwrap_or_else(|_| {
+        panic!(
+            "this test was explicitly requested (it is #[ignore]d) but COSCA_TEST_SETUID_HELPER \
+             is not set — see the module docs' \"Gating\" section for what it must point at"
+        )
+    })
 }
 
 /// `kill(pid, 0)` performs only the existence/permission check, sending nothing. `Ok(())` means
@@ -104,11 +124,15 @@ fn accept_one(listener: &TcpListener) -> Handshake {
 /// The one test that proves issue #61's fix actually works end to end, through the REAL public
 /// `Child::kill_tree` path (not a pure helper, not a fault-injection seam) against a REAL mixed
 /// process group.
+///
+/// `#[ignore]`d by default so an ordinary `cargo test` reports it honestly as `ignored`, not a
+/// vacuous `ok` — see the module docs' "Gating" section for why, and for the one CI step that
+/// runs it with `--ignored` after provisioning `COSCA_TEST_SETUID_HELPER`.
 #[test]
+#[ignore = "requires COSCA_TEST_SETUID_HELPER (a real setuid-root helper); run with `cargo test \
+            --test group_teardown_setuid -- --ignored` — see this file's module docs"]
 fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
-    let Some(helper) = gated() else {
-        return; // unprovisioned: not a CI lane that has set up the setuid-root helper.
-    };
+    let helper = gated();
     assert!(
         std::path::Path::new(&helper).is_file(),
         "COSCA_TEST_SETUID_HELPER={helper:?} does not point at an existing file"
