@@ -5,6 +5,7 @@
 //! - [`Containment::CgroupV2`] (Linux): leaf cgroup + `cgroup.kill` — fork-proof.
 //! - [`Containment::JobObject`] (Windows): Job + `KILL_ON_JOB_CLOSE`.
 //! - [`Containment::ProcessGroup`]/[`Containment::Session`] (Unix): `killpg`.
+//! - [`Containment::FdMarker`] (macOS): inherited-fd marker sweep — survives setsid/reparenting.
 //! - [`Containment::TreeWalk`] (all): identity-aware descendant kill at teardown.
 //! - [`Containment::Delegated`]: a nested member — the outermost root tears it down.
 //! - [`Containment::None`]: not contained — lone-process semantics.
@@ -29,6 +30,32 @@ pub enum Containment {
     ProcessGroup,
     /// Unix session (`setsid`) + `killpg`. A nested-`setsid` child escapes.
     Session,
+    /// macOS inherited-fd marker: every descendant carries an inherited pipe descriptor, so
+    /// membership survives `setsid`, `setpgid`, double-fork reparenting to launchd and `exec`.
+    /// Teardown kills the union of three channels: marker holders and the ppid walk each
+    /// verify the target's identity before signalling; the process group (when one was
+    /// created) is signalled by `killpg(pgid)` with no additional re-verification beyond what
+    /// `Attached::ProcessGroup` already does — the same pgid-reuse caveat documented in
+    /// `src/containment/unix.rs` applies to the FIRST group signal exactly as it does today.
+    /// `kill_tree` (SIGKILL) re-snapshots the host and repeats until nothing new appears AND
+    /// each pass makes actual progress (no fixed pass count); a LATER pass re-signals the group
+    /// too (closing a gap the single-shot `ProcessGroup` mechanism does not need to close: a
+    /// process joining the group strictly between passes), but ONLY when the root's own
+    /// identity still resolves alive — proof its pgid cannot yet have been recycled — so a
+    /// later pass never adds a NEW instance of the reuse risk beyond pass 1's existing one.
+    /// `terminate_tree` (SIGTERM, catchable and ignorable) takes exactly one pass and does not
+    /// chase forks.
+    ///
+    /// Naive-child containment, not a sandbox. A member leaves the set by closing the
+    /// descriptor, by being spawned through a path that scrubs inherited descriptors (Python's
+    /// `subprocess`, Node's `child_process`, `POSIX_SPAWN_CLOEXEC_DEFAULT`), by changing
+    /// credentials (e.g. `exec`ing a setuid binary makes its fd table unqueryable), or by being
+    /// otherwise unqueryable — a holder whose identity or fd table the OS refuses to report is
+    /// left running rather than signalled blind. The marker descriptor is inherited-only, not
+    /// an IPC channel: a member that writes to it blocks (nothing drains it), and after
+    /// `detach()` a write raises `SIGPIPE` instead. An elevated spawn never reports this
+    /// variant: its `sudo` wrapper closes every descriptor >= 3.
+    FdMarker,
     /// Identity-aware descendant enumeration at teardown. Misses reparented orphans.
     TreeWalk,
     /// A nested member of an ancestor's containment group/job: this child joined the
@@ -48,6 +75,7 @@ impl Containment {
             | Containment::JobObject
             | Containment::ProcessGroup
             | Containment::Session
+            | Containment::FdMarker
             | Containment::TreeWalk => true,
             Containment::None | Containment::Delegated => false,
         }
@@ -83,6 +111,7 @@ impl fmt::Display for Containment {
             Containment::JobObject => "job object",
             Containment::ProcessGroup => "process group",
             Containment::Session => "session",
+            Containment::FdMarker => "inherited-fd marker",
             Containment::TreeWalk => "process-tree walk",
             Containment::Delegated => "delegated",
             Containment::None => "none",

@@ -283,6 +283,7 @@ pub(crate) fn holders(handle: u64, pids: &[RawPid]) -> Vec<Holder> {
 /// (including this file's own tests) want; folds `MarkerQuery::Denied` into `false` alongside
 /// `NotHeld`, which is correct for a caller that does not need to distinguish them. `kill_holder`
 /// uses `holds_marker_query` directly instead, because IT does need to.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn holds_marker(pid: RawPid, handle: u64) -> bool {
     matches!(holds_marker_query(pid, handle), MarkerQuery::Held)
 }
@@ -478,6 +479,7 @@ pub(crate) struct PreparedMarker {
     pub read_handle: u64,
     /// The descriptor number the marker occupies in the child (`preserved_fds` does not
     /// renumber, so it is the parent's number too).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fd: RawFd,
 }
 
@@ -667,6 +669,28 @@ pub(crate) mod fault {
         FAULT.with(|c| c.take())
     }
 
+    // Test-only: force the NEXT `sweep` on THIS thread to skip the root's identity kill
+    // (makes the `kill_tree` handle backstop forcible). Take semantics: `sweep` consumes the
+    // flag — arm and call on one thread; assert consumption via `armed`. Mirrors
+    // `treewalk::fault::set_force_root_kill_noop`/`take_force_root_kill_noop`/`armed`, which
+    // this module's `sweep` does NOT go through (it calls `treewalk::kill_by_identity`
+    // directly, not `treewalk::hard_kill`), hence a separate seam here.
+    thread_local! {
+        static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set_force_root_kill_noop(on: bool) {
+        FORCE_ROOT_KILL_NOOP.with(|f| f.set(on));
+    }
+
+    pub(crate) fn take_force_root_kill_noop() -> bool {
+        FORCE_ROOT_KILL_NOOP.with(|f| f.replace(false))
+    }
+
+    pub(crate) fn armed() -> bool {
+        FORCE_ROOT_KILL_NOOP.with(|f| f.get())
+    }
+
     /// Every `install` failure log line (`"fd marker: pipe() failed"`, etc.) carries no
     /// per-call discriminator — there is no handle yet to key on, since `install` hasn't
     /// succeeded. Two DIFFERENT tests asserting on the same literal text via `log_capture`
@@ -732,6 +756,9 @@ impl Marker {
         }
     }
 
+    // Task 6 wires a test-only consumer (`Child::test_marker_handle`); until then this is
+    // dead under a non-test build, matching `read_end` below.
+    #[allow(dead_code)]
     pub(crate) fn handle(&self) -> u64 {
         self.handle
     }
@@ -1113,6 +1140,14 @@ impl Marker {
             // why the loop must stop, not continue, when the answer is no.
             let mut progressed = false;
             for id in new_walk {
+                // Test-only fault seam: skip the root's identity kill (take semantics — see
+                // `fault`), mirroring `treewalk::hard_kill`'s own seam so a test can force the
+                // `kill_tree` handle backstop to be the sole killer regardless of which
+                // mechanism a given platform actually attaches for a request.
+                #[cfg(test)]
+                if Some(id) == self.root && fault::take_force_root_kill_noop() {
+                    continue;
+                }
                 // `KillOutcome::NotAttempted` means the OS refused to query or signal an
                 // identity that WAS resolved — a known member left running, not a gap in
                 // discovery. Not retried (see the doc comment above); folded into `incomplete`.

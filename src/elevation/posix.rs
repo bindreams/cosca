@@ -531,6 +531,7 @@ fn transfer_process_attrs(derived: &mut Command, cmd: &Command) {
     }
     derived.set_contain(cmd.contain_request());
     derived.kill_on_drop(cmd.kill_on_drop_flag());
+    derived.suppress_fd_marker();
 }
 
 /// Detect-then-plan-then-rewrite. Thin wrapper over the pure form.

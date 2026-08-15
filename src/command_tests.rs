@@ -249,3 +249,11 @@ fn default_stdin_is_forced_without_auth_stdin() {
     c.apply_default_stdin(Stdio::null()).unwrap();
     assert!(matches!(c.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
 }
+
+#[test]
+fn suppress_fd_marker_sets_the_flag_a_fresh_command_does_not_have() {
+    let mut derived = crate::Command::new();
+    assert!(!derived.fd_marker_suppressed(), "a fresh command suppresses nothing");
+    derived.suppress_fd_marker();
+    assert!(derived.fd_marker_suppressed());
+}

@@ -350,12 +350,18 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
     }
+    // On macOS, `Attached::TreeWalk` (and so `hard_kill`) is only reached when the fd marker
+    // failed to install or is suppressed (decision 2: the marker otherwise takes priority) —
+    // dispatch_tests.rs's backstop tests exercise the always-installed `fdmarker::fault` seam
+    // there instead, leaving these two callers-only-on-other-platforms.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn set_force_root_kill_noop(on: bool) {
         FORCE_ROOT_KILL_NOOP.with(|f| f.set(on));
     }
     pub(crate) fn take_force_root_kill_noop() -> bool {
         FORCE_ROOT_KILL_NOOP.with(|f| f.replace(false))
     }
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn armed() -> bool {
         FORCE_ROOT_KILL_NOOP.with(|f| f.get())
     }

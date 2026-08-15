@@ -848,4 +848,30 @@ mod rewrite_tests {
         let rw = rewrite_with_host(&mut c, &macos_gui_host(false)).expect("sudo rewrite");
         assert_eq!(rw.backend_path, Some(PathBuf::from("/usr/bin/sudo")));
     }
+
+    /// The elevation rewrite must carry the marker suppression onto the derived command, or the
+    /// derived `sudo …` spawn would install a marker its own wrapper immediately destroys.
+    /// `.contain()` + `Backend::Sudo` is NOT structurally rejected (only `Run0` is), so this path
+    /// is reachable and must be tested through the REAL rewrite, not just the setter/getter pair.
+    #[test]
+    fn rewrite_suppresses_the_fd_marker_on_the_derived_command_while_keeping_containment() {
+        let mut c = Command::new();
+        c.args(["id", "-u"])
+            .contain_with(crate::ContainMode::Strongest)
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
+        let derived = rw.derived.as_ref().expect("derived");
+        assert!(
+            derived.fd_marker_suppressed(),
+            "transfer_process_attrs must suppress the fd marker on the derived sudo command, or \
+             an elevated contained spawn would claim a guarantee sudo's closefrom destroys"
+        );
+        assert_eq!(
+            derived.contain_request().mode,
+            Some(crate::ContainMode::Strongest),
+            "the caller's containment REQUEST must still cross the rewrite unchanged — only the \
+             fd marker specifically is suppressed, not containment as a whole"
+        );
+    }
 }

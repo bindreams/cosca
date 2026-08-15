@@ -15,6 +15,11 @@ pub(crate) struct Prepared {
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
+    /// The marker pipe for a contained macOS root. `None` for a nested member, an
+    /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
+    /// process group).
+    #[cfg(target_os = "macos")]
+    pub marker: Option<crate::containment::fdmarker::PreparedMarker>,
 }
 
 /// Owns the OS containment resource for a spawned child; `hard_kill`/`terminate`
@@ -34,6 +39,11 @@ pub(crate) enum Attached {
     Cgroup(crate::containment::cgroup::CgroupLeaf),
     #[cfg(windows)]
     JobObject(crate::containment::windows::JobHandle),
+    /// macOS inherited-fd marker: membership survives `setsid`, `setpgid`, reparenting and
+    /// `exec`. Owns the supervisor's read end of the marker pipe — which is what keeps the
+    /// pipe's kernel identity from being re-issued — plus, when the mode created one, the pgid.
+    #[cfg(target_os = "macos")]
+    FdMarker(crate::containment::fdmarker::Marker),
     /// Identity-aware tree-walk teardown (cross-platform; the root identity is
     /// re-enumerated and killed by identity at teardown). No cfg gate: this is
     /// the universal fallback and a directly-selectable mode on every OS.
@@ -67,6 +77,8 @@ impl Attached {
                 job.hard_kill();
                 Ok(())
             }
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.hard_kill().map_err(crate::error::Error::Io),
             Attached::TreeWalk(root) => {
                 crate::containment::treewalk::hard_kill(*root);
                 Ok(())
@@ -94,6 +106,8 @@ impl Attached {
             Attached::Cgroup(leaf) => leaf.terminate().map_err(Error::Io),
             #[cfg(windows)]
             Attached::JobObject(_) => crate::containment::windows::terminate(_child_pid),
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.terminate().map_err(Error::Io),
             Attached::TreeWalk(root) => crate::containment::treewalk::terminate(*root),
         }
     }
@@ -110,6 +124,9 @@ impl Attached {
             Attached::Cgroup(_) => {} // cgroup.kill is explicit — drop doesn't kill
             #[cfg(windows)]
             Attached::JobObject(job) => job.disarm(), // clear KILL_ON_JOB_CLOSE before handle drops
+            // dropping the read end does not kill; detach opts out via kill_on_drop
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(_) => {}
             Attached::TreeWalk(_) => {} // no kernel resource whose drop kills; detach opts out via kill_on_drop
         }
     }
@@ -124,6 +141,8 @@ impl Attached {
             Attached::Cgroup(_) => true,
             #[cfg(windows)]
             Attached::JobObject(_) => true,
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(_) => true,
             Attached::TreeWalk(_) => true,
         }
     }
@@ -221,7 +240,15 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 }
 
 /// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup.
-pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest) -> Prepared {
+///
+/// `reserved_fds` and `marker_suppressed` drive the macOS fd-marker install only; every
+/// other platform ignores them.
+pub(crate) fn prepare(
+    std_cmd: &mut std::process::Command,
+    req: &ContainRequest,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] reserved_fds: &[i32],
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] marker_suppressed: bool,
+) -> Prepared {
     let mode = req.mode;
     if mode.is_none() {
         return Prepared {
@@ -229,6 +256,8 @@ pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest)
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
+            #[cfg(target_os = "macos")]
+            marker: None,
         };
     }
     let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
@@ -313,6 +342,17 @@ pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest)
         }
     }
 
+    // macOS: install the inherited-fd marker for every contained root, regardless of the
+    // requested mode (decision: the marker survives what the mode-specific mechanism above
+    // does not). `marker_wanted` gates on root/mode/suppression; `install` degrades to `None`
+    // on any failure rather than failing the spawn.
+    #[cfg(target_os = "macos")]
+    let marker = if crate::containment::fdmarker::marker_wanted(mode, is_root, marker_suppressed) {
+        crate::containment::fdmarker::install(std_cmd, reserved_fds)
+    } else {
+        None
+    };
+
     // Windows: clear handle inheritance + apply creation_flags. The flag/marker decision
     // lives in `windows_contain_setup` (shared with the raw `CreateProcessW` backend); the
     // root marker itself is applied above (shared with the Unix path), so only the creation
@@ -331,6 +371,8 @@ pub(crate) fn prepare(std_cmd: &mut std::process::Command, req: &ContainRequest)
         is_root,
         #[cfg(target_os = "linux")]
         cgroup_leaf: None,
+        #[cfg(target_os = "macos")]
+        marker,
     }
 }
 
@@ -401,6 +443,31 @@ pub(crate) fn attach(
     {
         if prepared.mode.is_some() {
             if prepared.is_root {
+                // macOS fd marker: installed for every contained root regardless of mode
+                // (decision 2), so it takes priority over the mode-specific mechanism below —
+                // it is what survives setsid/reparenting/exec that the mode-specific mechanism
+                // does not.
+                #[cfg(target_os = "macos")]
+                if let Some(marker) = prepared.marker {
+                    let root = match crate::identity::ProcessId::of(pid) {
+                        crate::identity::Resolved::Found(id) => Some(id),
+                        other => {
+                            log::warn!(
+                                "fd marker: the root's identity could not be read ({other:?}); \
+                                 the sweep runs without its ppid-walk channel"
+                            );
+                            None
+                        }
+                    };
+                    let pgid = match prepared.mode {
+                        Some(ContainMode::TreeWalk) => None,
+                        _ => Some(pid as i32),
+                    };
+                    return Ok((
+                        Containment::FdMarker,
+                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(marker, root, pgid)),
+                    ));
+                }
                 // TreeWalk root: no process group; identity teardown.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
                     return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
@@ -420,6 +487,18 @@ pub(crate) fn attach(
                 // Nested member: it joined the ancestor's process group (or the root's
                 // tree-walk) rather than creating its own, so it owns no teardown — the
                 // outermost root tears the whole tree down.
+                #[cfg(target_os = "macos")]
+                if prepared.marker.is_some() {
+                    log::warn!(
+                        "fd marker: a nested spawn's prepare() unexpectedly produced a marker; \
+                         a nested member must inherit the root's marker, never create its own \
+                         — discarding it"
+                    );
+                    debug_assert!(
+                        false,
+                        "a nested member inherits the root's marker and must never create one"
+                    );
+                }
                 return Ok((Containment::Delegated, Attached::Delegated));
             }
         }
