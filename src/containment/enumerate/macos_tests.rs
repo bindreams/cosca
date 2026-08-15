@@ -339,6 +339,50 @@ fn snapshot_count_agrees_with_the_kernels_sizing_answer() {
     );
 }
 
+/// The end-to-end grow loop against the REAL kernel and REAL allocator - not a synthetic
+/// stand-in for either. Every other grow-loop test above drives `collect_pids` with an
+/// injected `fill`; the only test that calls the real `fill_from_kernel`
+/// (`fill_from_kernel_reports_written_equal_to_the_buffers_own_length`) does exactly one
+/// saturating fill and stops, never feeding the result back through the doubling loop. So the
+/// composition `collect_pids` + `fill_from_kernel` + `allocate_pids` actually runs in
+/// production is otherwise never exercised - a regression at that seam (e.g. `fill_from_kernel`
+/// sizing from a stale length, or `collect_pids` reusing the previous buffer instead of the
+/// newly allocated one) would pass every other test in this file.
+///
+/// A starting capacity of 2 cannot hold any real host's process table, forcing at least one
+/// real saturate-and-retry round - the live kernel CAN be made to under-report on demand this
+/// way, by simply starting deliberately small; that does not require a kernel that reports a
+/// specific total, an error, or a bogus over-report on command, which is why `fill` stays
+/// injected for those cases (see `collect_pids`'s doc).
+///
+/// Pinned with the same proportional tolerance as
+/// `snapshot_count_agrees_with_the_kernels_sizing_answer`, not a fixed round or pid count:
+/// both are host-load-dependent - see that test's doc for why.
+#[test]
+fn collect_pids_grows_against_the_live_kernel() {
+    let before = sizing_answer();
+    let filled = collect_pids(2, fill_from_kernel, allocate_pids).expect("fill succeeds");
+    let after = sizing_answer();
+    let expected = before.min(after);
+    assert!(
+        expected > 64,
+        "sizing answer of {expected} is below the range where this test's tolerance can \
+         discriminate a regression from a healthy snapshot - this pin is not meaningful on a \
+         host this small"
+    );
+    assert!(
+        filled.rounds > 1,
+        "a starting capacity of 2 took only 1 round against a sizing answer of {expected} - \
+         either the buffer somehow held the whole table, or growth silently isn't happening"
+    );
+    assert!(
+        filled.pids.len() * 2 >= expected,
+        "the live grow loop delivered {} pids against a sizing answer of {expected} - lost \
+         more than half, consistent with a units or growth regression",
+        filled.pids.len()
+    );
+}
+
 // Failure fallback branches ============================================================
 
 /// `all_pids`'s `Err` arm - unreachable from a live syscall in a test, same reasoning as

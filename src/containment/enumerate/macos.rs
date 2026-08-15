@@ -15,12 +15,17 @@
 //!   logged at `warn` naming that consequence.
 //! - `proc_listallpids`' fill path caps its walk at `min(nprocs + 20, our buffer capacity)`,
 //!   using an UNLOCKED read of `nprocs` taken before the process list locks (confirmed
-//!   against XNU's `bsd/kern/proc_info.c`). Once our buffer exceeds `nprocs + 20` — which it
-//!   always does after headroom — growing it further cannot raise this cap. `written < cap`
-//!   is therefore not an airtight completeness proof: it closes truncation at the buffer's
-//!   own edge, but a narrow, kernel-internal, userspace-invisible race remains (≥20 net new
-//!   processes inside that unlocked-read-to-locked-walk window). Nothing in this module can
-//!   close it without changing the underlying syscall.
+//!   against XNU's `bsd/kern/proc_info.c`). Our buffer capacity is the sizing call's answer
+//!   (itself `nprocs + 20`, at sizing time) plus `HEADROOM`; the `+ 20` term is on both sides
+//!   of the comparison and cancels, so our buffer exceeds the kernel's fill-time cap only
+//!   while fewer than `HEADROOM` net new processes are created between the sizing call and
+//!   the fill call. Above that threshold OUR buffer is the binding limit instead, the fill
+//!   saturates, and `collect_pids`'s grow loop doubles and retries — exactly the case it
+//!   exists for. `written < cap` is therefore not an airtight completeness proof: even once
+//!   the buffer has grown past being the limit, a narrow, kernel-internal, userspace-invisible
+//!   race remains on every fill — ≥20 net new processes inside THAT fill's own
+//!   unlocked-read-to-locked-walk window. Nothing in this module can close it without
+//!   changing the underlying syscall.
 
 use crate::identity::RawPid;
 
@@ -31,8 +36,7 @@ const HEADROOM: usize = 16;
 /// Read the parent pid of `pid` via `proc_bsdinfo`, or `None` if not resolvable (EPERM
 /// cross-user, ESRCH mid-snapshot exit). Silent per-call: a dropped edge drops the pid's
 /// whole subtree in `treewalk::descendants_with`, so the drop matters, but the caller
-/// (`process_parents`, via `join_ppids`) reports it aggregated, not one log record per pid -
-/// see the module docs for why per-pid logging here specifically is a problem worth naming.
+/// (`process_parents`, via `join_ppids`) reports it aggregated, not one log record per pid.
 fn ppid_of(pid: libc::c_int) -> Option<RawPid> {
     // SAFETY: proc_bsdinfo is repr(C) and every field is an integer type, for which an
     // all-zeros bit pattern is a valid value.
@@ -56,8 +60,7 @@ fn ppid_of(pid: libc::c_int) -> Option<RawPid> {
 /// `proc_listallpids` is one of the libproc wrappers that CONVERTS before returning: it
 /// calls `proc_listpids` — which answers in bytes — and divides by `sizeof(int)`. Both its
 /// sizing answer and its fill answer are therefore PID COUNTS, unlike `proc_listpids` and
-/// `proc_listpidspath`, which answer in bytes. Dividing this answer again asks for a
-/// quarter of the room the kernel said it needed.
+/// `proc_listpidspath`, which answer in bytes.
 ///
 /// `saturating_add`, not `+`: `needed` ultimately comes from `interpret_written`'s
 /// `libc::c_int`-derived bound today, but `capacity_for` is a private seam a future caller
@@ -130,9 +133,7 @@ fn interpret_written(written: libc::c_int) -> std::io::Result<usize> {
 /// (`collect_pids` already validates the identical `cap` immediately before constructing
 /// `pids` from it, so `pids.len()` here can never be a size `collect_pids` didn't already
 /// accept) - kept anyway as a defensive contract (same reasoning as `capacity_for`'s
-/// `saturating_add`, above). Its refusal branch is not unit-tested directly: proving it
-/// deterministically would need a slice long enough to overflow the `int` size argument
-/// (~536M elements, ~2GB), too heavy to allocate for a test.
+/// `saturating_add`, above).
 fn fill_from_kernel(pids: &mut [libc::c_int]) -> std::io::Result<usize> {
     let buf_bytes = size_argument_for(pids.len())?;
     // SAFETY: `pids` owns exactly `buf_bytes` writable bytes (`size_argument_for` derives
@@ -159,11 +160,15 @@ fn fill_from_kernel(pids: &mut [libc::c_int]) -> std::io::Result<usize> {
 /// would have rejected, and doubling cannot overflow because `size_argument_for` refuses
 /// every capacity above `i32::MAX / 4` first.
 ///
-/// `fill` and `allocate` are both injected: `fill` so the growth logic is testable without a
-/// kernel that can be made to under-report on demand, `allocate` so both the doubling-then-
-/// refusal path and an allocation failure can be driven deterministically without a real run
-/// to the true ~536M-pid boundary or genuine memory pressure. Production passes
-/// [`fill_from_kernel`] and [`allocate_pids`].
+/// `fill` and `allocate` are both injected: `fill` so the doubling logic can be pinned against
+/// an exact, host-independent total and its error / over-report branches driven
+/// deterministically - a live kernel CAN be forced to saturate on demand by starting from a
+/// deliberately small `cap` (see `collect_pids_grows_against_the_live_kernel`), but not to
+/// report a specific total, an error, or a bogus over-report; `allocate` so both the
+/// doubling-then-refusal path and an allocation failure can be driven deterministically
+/// without a real run to the true ~536M-pid boundary or genuine memory pressure. Production
+/// passes [`fill_from_kernel`] and [`allocate_pids`]; that exact composition is pinned live in
+/// `collect_pids_grows_against_the_live_kernel`.
 ///
 /// `cap == 0` is refused up front as a real `Err`, in every build profile: a zero capacity
 /// can never grow (`written < n` is `0 < 0` = false, so the "saturated, retry" branch would
