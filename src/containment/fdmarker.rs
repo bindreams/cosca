@@ -683,6 +683,548 @@ pub(crate) mod fault {
     }
 }
 
+// The attached mechanism =====
+
+use std::io;
+
+use crate::identity::{ProcessId, Resolved};
+
+/// The live marker for one contained tree.
+pub(crate) struct Marker {
+    /// Held for the mechanism's whole life. See the module docs: this is what stops `handle`
+    /// from being re-issued to an unrelated pipe once the tree drains.
+    read: OwnedFd,
+    handle: u64,
+    /// `read`'s OWN handle, captured at `install()` time — see `PreparedMarker::read_handle`'s
+    /// doc comment. What `sweep`'s entry contract re-checks against `read` at signal time.
+    read_handle: u64,
+    /// The root's identity, for the ppid-walk channel. `None` when it could not be read at
+    /// attach — the marker channel still runs.
+    root: Option<ProcessId>,
+    /// The root's process group, when the requested mode created one. `None` for TreeWalk.
+    pgid: Option<i32>,
+}
+
+impl std::fmt::Debug for Marker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Marker")
+            .field("handle", &format_args!("{:#x}", self.handle))
+            .field("pgid", &self.pgid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether a swept pid may be signalled at all. The supervisor is excluded because signalling
+/// itself would tear down the caller; pid 0 and pid 1 because neither is ever a tree member
+/// and `kill(0, …)` signals the caller's whole process group.
+pub(crate) fn is_signalable(pid: RawPid) -> bool {
+    pid > 1 && pid != std::process::id()
+}
+
+impl Marker {
+    pub(crate) fn new(prepared: PreparedMarker, root: Option<ProcessId>, pgid: Option<i32>) -> Marker {
+        Marker {
+            read: prepared.read,
+            handle: prepared.handle,
+            read_handle: prepared.read_handle,
+            root,
+            pgid,
+        }
+    }
+
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// The supervisor's read end. `read()` on it returns EOF exactly when the last holder of
+    /// the write end is gone.
+    #[allow(dead_code)]
+    pub(crate) fn read_end(&self) -> BorrowedFd<'_> {
+        self.read.as_fd()
+    }
+
+    pub(crate) fn hard_kill(&self) -> io::Result<()> {
+        self.sweep(nix::sys::signal::Signal::SIGKILL)
+    }
+
+    pub(crate) fn terminate(&self) -> io::Result<()> {
+        self.sweep(nix::sys::signal::Signal::SIGTERM)
+    }
+
+    /// Snapshot, compute, signal. Three membership channels, deduplicated across the whole
+    /// sweep by IDENTITY, not raw pid.
+    ///
+    /// **A single snapshot-compute-signal pass has a check-then-act gap a real tree can hit.**
+    /// Between the snapshot and the signal, any live member can `fork` a child that inherits the
+    /// marker; that child is in no channel of THIS pass (its ppid edge postdates `parents`, it
+    /// isn't in `pids`, and if its parent already left the group it isn't reachable by `killpg`
+    /// either). If the parent is then killed, the child reparents to launchd and is lost for
+    /// good — precisely the escapee class this mechanism exists to close.
+    ///
+    /// **The re-snapshot loop is SIGKILL-only.** `hard_kill` re-snapshots and re-computes after
+    /// signalling, repeating while a fresh pass BOTH finds identities this sweep has not
+    /// already signalled AND actually resolves at least one of them (`progressed`, below) — no
+    /// numeric cap (forbidden by this crate's no-arbitrary-loop-limit rule).
+    ///
+    /// **The termination argument has two distinct hazards, and needs a guard for each.**
+    ///
+    /// First: `kill(2)` only POSTS SIGKILL; the target dies at its next AST check (its next
+    /// return to userspace), not synchronously with the call. A target already inside `fork()`
+    /// when the signal is posted completes that fork — the pending SIGKILL does not reach the
+    /// new child — so a signalled member CAN produce one more marker-holding child before it
+    /// actually dies. That child is itself brand new and unsignalled, so it is exactly the kind
+    /// of "identity this sweep has not already signalled" the NEXT pass's fresh snapshot exists
+    /// to catch — "finds something new" alone handles this hazard.
+    ///
+    /// Second, and NOT covered by "finds something new" alone: this design deliberately leaves
+    /// some discovered identities unsignalled — `KillOutcome::NotAttempted` and
+    /// `MarkerQuery::Denied` (the OS refused the query or the signal, e.g. an EPERM-unkillable
+    /// member) are never retried. If such a member keeps forking, each child is a genuinely
+    /// NEW, never-before-seen identity, so "finds something new" would stay true on every pass
+    /// forever even though NOTHING is actually being resolved — an unbounded spin with no
+    /// numeric cap to stop it. `progressed` closes this: a pass continues the loop only if it
+    /// actually resolved at least one newly-discovered identity to something other than "OS
+    /// refused" (killed, already gone, or confirmed not a member all count; `NotAttempted`/
+    /// `Denied` do not). A pass where every new discovery is stuck makes no progress, and
+    /// exits, not spins — the same reasoning that makes `holders()`'s aggregate denial logging
+    /// (a bulk, mostly-irrelevant fact) different from an individual `Denied`/`NotAttempted`
+    /// outcome (a specific, actionable one) shows up here too: bulk "OS refused" facts must not
+    /// be allowed to drive unbounded looping.
+    ///
+    /// Termination overall follows from the tree being finite and non-adversarial: this
+    /// mechanism does not promise to catch a member that keeps forking new, INDIVIDUALLY
+    /// KILLABLE children forever (no unprivileged mechanism can, and `hard_kill` is reached
+    /// from `Child::drop`, so a genuinely non-terminating tree hangs the destructor regardless
+    /// of loop design) — it promises to reach every member of a tree whose own forking
+    /// eventually stops or whose forked children are themselves reachable, which is what
+    /// "cooperative"/"non-adversarial" means throughout this crate's other mechanisms too. In
+    /// the common case (nothing forks during the sweep's own brief duration) the second pass
+    /// finds nothing new and the loop exits after two snapshots.
+    ///
+    /// `terminate` (SIGTERM) takes exactly ONE pass and never loops. SIGTERM is catchable and
+    /// ignorable: a member that traps it and keeps forking on every delivery would make a
+    /// re-snapshot loop never converge, hanging `terminate_tree()` — a blocking API with no
+    /// timeout — forever. This matches `term_group`'s existing behavior: cooperative,
+    /// best-effort, does not chase forks. `hard_kill` (`kill_tree`) is the guaranteed sweep.
+    ///
+    /// **The group signal fires on pass 1 unconditionally, and on a LATER pass only if the
+    /// root's identity still resolves alive — see the group-signal block itself for the full
+    /// reuse-risk argument.** Every firing happens after THAT pass's other channels are
+    /// computed. Signalling the process group before a pass's own channels are computed would
+    /// destroy the channel that pass reads: an intermediate in the group whose child lost the
+    /// marker below a scrubbing spawn path but still chains by ppid would be killed, reparenting
+    /// that child to launchd before the snapshot sees it — reachable by no channel at all. So
+    /// `killpg`/`term_group` fires after each pass's walk/holders/root channels are computed
+    /// (in whatever combination that pass could actually compute — see below) and before that
+    /// pass signals individuals.
+    ///
+    /// Firing only once, on pass 1, was tried and is wrong: a process that JOINS the group
+    /// after pass 1 (e.g. a child forked by a member that had not yet `setpgid`'d away from the
+    /// root's group) is invisible to pass 1's `killpg` — it did not exist yet — and if that
+    /// child has also already lost the marker and reparented to launchd, no other channel
+    /// reaches it either. Only a group signal on a LATER pass, once the process is actually a
+    /// group member, closes this — the same "take another snapshot, the world moved" reasoning
+    /// that justifies re-snapshotting for the walk and holder channels applies here too; the
+    /// group channel is not special.
+    ///
+    /// Firing UNCONDITIONALLY on every pass was ALSO tried and is ALSO wrong: `self.pgid` is
+    /// the root's own pid, and a later pass's `killpg` fires strictly after that pass's OWN
+    /// SIGKILLs, i.e. exactly when the group is most likely to have just emptied and the OS
+    /// most likely to have already recycled the pgid onto an unrelated process — turning the
+    /// group channel's one pre-existing, accepted `killpg` reuse window (identical to today's
+    /// `ProcessGroup` mechanism) into `N` independent ones. The fix keeps the closed gap above
+    /// while not compounding this one: re-verify the root's identity resolves alive immediately
+    /// before a LATER pass's signal (never pass 1's, which carries exactly today's baseline
+    /// risk). `SIGTERM`'s single pass still signals the group exactly once, matching its single
+    /// overall pass — this gate is moot there.
+    ///
+    /// **Dedup is by identity (pid + start token), not bare pid.** A pid signalled and reaped on
+    /// pass 1 can be recycled by the OS onto a genuinely new fork of a still-live tree member
+    /// before pass 2's snapshot; deduping on the raw pid would then skip that new, never-
+    /// signalled process, reintroducing the exact pid-reuse ambiguity `kill_by_identity` exists
+    /// to close, one layer up. Resolving identity for a marker-channel candidate happens HERE,
+    /// at discovery, not deferred to `kill_holder` — `kill_holder` still re-verifies at signal
+    /// time (the window between discovery and signal, not between passes).
+    ///
+    /// **A blind pass, an unresolvable holder, and a refused signal are all real teardown
+    /// gaps — none of them is convergence, and NONE of them may be reported as `Ok(())`.**
+    /// `enumerate::snapshot()` returns an empty pid list on its own internal failure (logged
+    /// there) — never on a genuinely converged pass (there is always at least launchd and this
+    /// process on a real host). The root (`self.root`, already a resolved `ProcessId`) and the
+    /// process group (`self.pgid`, a plain integer) need no snapshot at all, so a blind pass
+    /// still attempts both; only the ppid-walk descendants and the marker-holder scan are
+    /// skipped, since both need the process table this pass could not read. A marker-holder pid
+    /// that resolves `Resolved::Unknown` (access denied), a `MarkerQuery::Denied` re-check, and
+    /// a `kill_by_identity`/`kill_holder` outcome of `KillOutcome::NotAttempted` (the OS refused
+    /// to query or signal an identity that WAS resolved), are each a known member this sweep
+    /// could not verify or reach. `sweep` tracks these under one `incomplete` flag and checks it
+    /// at the loop's single exit, regardless of which of the two `break`s was taken — `Ok(())`
+    /// is returned only when nothing was ever left unverified.
+    ///
+    /// **What is deliberately NOT in `incomplete`: `snapshot()`'s bulk denied-ppid-read
+    /// count.** `PROC_PIDTBSDINFO` denies for every process this caller does not own — measured
+    /// on this host, 327 of 1022 live pids, from an ordinary unprivileged shell, right now.
+    /// Escalating that bulk count would make `Ok(())` unreachable on any real multi-user host;
+    /// `snapshot()` logs it in aggregate for visibility (matching `holders()`'s own aggregate
+    /// `debug!` for the identical class of mostly-irrelevant host-wide denials), and this
+    /// function escalates a ppid-read denial only insofar as it prevents a SPECIFIC candidate
+    /// from being resolved — which the `Resolved::Unknown`/`Denied`/`NotAttempted` arms already
+    /// cover at the granularity where a denial is actually diagnostic.
+    ///
+    /// A `NotAttempted` identity is NOT retried on a later pass — retrying would hit the same
+    /// OS refusal again — but it IS already in `seen`, so it does not re-enter `new_walk`/
+    /// `new_holders` either; it is simply left running, logged, and folded into `incomplete`,
+    /// the same disposition `treewalk::hard_kill`'s single pass already gives it.
+    ///
+    /// Each channel covers a gap the others have: a member that lost the marker but kept its
+    /// ppid chain is caught by the walk; a member that left the group and was reparented is
+    /// caught only by the marker; a member that lost the marker AND was reparented but stayed
+    /// in the group is caught only by `killpg`.
+    ///
+    /// Best-effort: already-gone is success. The process-group channel's error, when present,
+    /// is combined into the returned message rather than silently discarded by `Result::and`
+    /// (which would otherwise mask an `incomplete` teardown behind an unrelated group-signal
+    /// failure, or vice versa, whichever happened to be checked first).
+    fn sweep(&self, signal: nix::sys::signal::Signal) -> io::Result<()> {
+        // CONTRACT, re-checked on every sweep, not just at `Marker::new` time: `self.read`
+        // must STILL be a pipe descriptor naming its OWN recorded handle. Rust ownership
+        // already makes "a sweep cannot run after `self.read` is dropped" a compile error
+        // (`sweep` borrows `&self`), but that only proves the FD IS STILL OPEN, not that it
+        // still names the SAME kernel object.
+        //
+        // This checks `read`'s OWN handle (`self.read_handle`), NOT its peer's — a peer check
+        // is wrong here and was measured to be wrong: once the LAST write end anywhere closes
+        // (the ordinary, ROUTINE case — the tree drained before `Child::drop` swept it, which
+        // is exactly what `hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_
+        // sweep` exercises), the read end's PEER handle reports `0` while the read end's OWN
+        // handle stays valid for as long as `read` itself stays open. A peer check here would
+        // fire on that ordinary path; `install()`'s peer check (both ends provably open then)
+        // is where that check belongs, not here.
+        //
+        // **This is not an ordinary internal-consistency assertion, so it is not `debug_assert!`
+        // -only.** Its documented failure mode is the worst outcome this whole design exists to
+        // prevent: a stale `read_handle` means `self.handle`/`self.read_handle` could now name
+        // ANY unrelated live pipe the OS has reissued the identity onto, and `holders()`
+        // matching by raw handle equality would then confirm-and-SIGKILL a stranger with no
+        // indication anything was wrong. A single debug-only line is not enough defense for that
+        // severity; it is checked in EVERY build, and a violation refuses to sweep at all rather
+        // than proceeding on a handle that may no longer mean what `self` claims.
+        let read_still_valid = matches!(
+            fd_pipe_info(std::process::id(), self.read.as_raw_fd()),
+            FdPipeInfoQuery::Found(info) if info.pipe_handle == self.read_handle
+        );
+        debug_assert!(
+            read_still_valid,
+            "fd marker {:#x}: the read end must still be the same pipe object at sweep time",
+            self.handle
+        );
+        if !read_still_valid {
+            let msg = format!(
+                "fd marker {:#x}: the read end no longer names its recorded pipe object at \
+                 sweep entry — refusing to sweep rather than signal against a handle that may \
+                 now name an unrelated live pipe",
+                self.handle
+            );
+            log::error!("{msg}");
+            return Err(io::Error::other(msg));
+        }
+
+        let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
+        // Folds together across every pass — see the group-signal block below for why an
+        // earlier pass's failure must not be erased by a later pass's success or vice versa.
+        let mut group_result: io::Result<()> = Ok(());
+        // True if ANY pass was blind, ANY marker holder could not be resolved, or ANY signal
+        // attempt was refused by the OS — checked exactly once, after the loop, regardless of
+        // which exit path was taken.
+        let mut incomplete = false;
+        // Group-signal reuse gate (see the group-signal block below): pass 1 always fires,
+        // matching today's one-shot `ProcessGroup::hard_kill` risk exactly. Pass 2+ only fires
+        // if `self.root`'s OWN identity still resolves alive — see there for why that is the
+        // right proxy for "this pgid has not been recycled onto an unrelated process."
+        let mut first_pass = true;
+
+        loop {
+            // Snapshot FIRST, always — the group-signal-ordering invariant below depends on
+            // this pass's snapshot (when one is obtained) predating any signal sent this pass.
+            // `_ppid_denied` is intentionally NOT folded into `incomplete`. Measured directly:
+            // on a real macOS host, `PROC_PIDTBSDINFO` denies for every process this caller
+            // does not own — 327 of 1022 live pids on this host, right now, from an ordinary
+            // unprivileged shell. Escalating that count would make every `hard_kill`/
+            // `terminate` return `Err` on every host, always — the same "bulk denials are
+            // mostly unrelated host noise" reasoning `holders()` already applies (aggregated
+            // into one `debug!`, never escalated). `snapshot()` still logs the aggregate count
+            // (Task 1) for visibility; escalating a SPECIFIC denial that matters — a pid
+            // already accepted into the walk, or already confirmed holding the marker — is
+            // what the `Resolved::Unknown`/`KillOutcome::NotAttempted`/`MarkerQuery::Denied`
+            // arms below already do, at the granularity where it is actually diagnostic.
+            let (pids, parents, _ppid_denied) = crate::containment::enumerate::snapshot();
+            let blind = pids.is_empty();
+            if blind {
+                incomplete = true;
+                log::warn!(
+                    "fd marker {:#x}: the host process table could not be read this pass; the \
+                     ppid-walk and marker channels are blind this pass (the group signal and \
+                     root kill below still run, since neither needs the process table)",
+                    self.handle
+                );
+            }
+
+            // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus
+            // its ppid-walk descendants NOT already signalled this sweep (need THIS pass's
+            // snapshot; skipped when blind, since there is nothing to walk). `descendants`
+            // applies the crate's own token guard against the root.
+            let mut new_walk: Vec<ProcessId> = Vec::new();
+            if let Some(root) = self.root {
+                if seen.insert(root) {
+                    new_walk.push(root);
+                }
+                if !blind {
+                    for id in crate::containment::treewalk::descendants(root, &parents) {
+                        if seen.insert(id) {
+                            new_walk.push(id);
+                        }
+                    }
+                }
+            }
+
+            // Channel 3: marker holders NOT already signalled this sweep (needs THIS pass's
+            // snapshot; empty when blind). Identity is resolved HERE (for the dedup) and
+            // re-verified again in `kill_holder` (for the discovery-to-signal window within
+            // this one pass).
+            let mut new_holders: Vec<ProcessId> = Vec::new();
+            if !blind {
+                for h in holders(self.handle, &pids) {
+                    if !is_signalable(h.pid) {
+                        // Reaching this branch at all means `h.pid` is the supervisor, pid 0,
+                        // or pid 1 — every one of which is a defect in this process's own
+                        // marker plumbing (the write end must never reach any of them), not a
+                        // routine miss. Both the log and the debug-build contract check cover
+                        // all three, not just the supervisor case.
+                        log::warn!(
+                            "fd marker {:#x}: self-exclusion guard fired for pid {} found in \
+                             the holder set (the supervisor or pid 0/1 must never hold its own \
+                             marker)",
+                            self.handle,
+                            h.pid
+                        );
+                        debug_assert!(
+                            false,
+                            "fd marker sweep found pid {} in its own holder set (supervisor, \
+                             pid 0, or pid 1) — the write-end hand-off must never reach any of \
+                             them",
+                            h.pid
+                        );
+                        continue;
+                    }
+                    let id = match ProcessId::of(h.pid) {
+                        Resolved::Found(id) => id,
+                        Resolved::Gone => continue,
+                        Resolved::Unknown => {
+                            log::warn!(
+                                "fd marker {:#x}: holder pid {} could not be queried (access \
+                                 denied?) - not signaled, left running",
+                                self.handle,
+                                h.pid
+                            );
+                            incomplete = true;
+                            continue;
+                        }
+                    };
+                    if seen.insert(id) {
+                        new_holders.push(id);
+                    }
+                }
+            }
+
+            // Group signal: pass 1 unconditionally; pass 2+ ONLY if `self.root`'s identity
+            // still resolves alive. Always after THIS pass's other channels are computed (see
+            // docs above) — still after them on a blind pass, where the walk/marker channels
+            // simply contributed nothing (no process table to read), but ordering relative to
+            // whatever they DID contribute (the root) is preserved either way.
+            //
+            // Re-firing on a LATER pass, not just the first, is required for the same reason a
+            // second snapshot pass is: a process that JOINS the group between pass 1's signal
+            // and a later pass (e.g. a child forked by a member that had not yet called
+            // `setpgid` away from the root's group) is invisible to pass 1's `killpg` — it did
+            // not exist yet — and is reachable by no OTHER channel if it has also already lost
+            // the marker and reparented. Only a group signal on a LATER pass, once that process
+            // is a group member, can close this.
+            //
+            // **But firing blindly on EVERY pass amplifies `killpg`'s pre-existing pgid-reuse
+            // caveat (`src/containment/unix.rs`), not merely repeats it.** `self.pgid` is the
+            // ROOT's own original pid (this crate's process-group convention); pass 1's
+            // `killpg` carries exactly today's ONE-SHOT `ProcessGroup::hard_kill` risk (a
+            // pre-existing, accepted, unavoidable window between resolving `pgid` and signalling
+            // it) — this design changes nothing about pass 1. A NAIVE later pass would fire
+            // again strictly AFTER pass 1 has already SIGKILLed every member THAT pass found,
+            // i.e. precisely when the group is most likely to have emptied and the OS most
+            // likely to have already recycled `self.pgid` onto an unrelated process — turning
+            // one accepted risk window into `N` independent ones, compounding with every pass.
+            //
+            // The gate: re-verify `self.root`'s OWN identity resolves alive (`is_alive`, which
+            // — per `identity/macos.rs`'s `is_running` — reports `Dead` on a token mismatch,
+            // i.e. exactly a reused pid) immediately before a LATER pass's `killpg`. Since
+            // `self.pgid` is `self.root`'s own pid, `self.root` still resolving alive under its
+            // ORIGINAL start token is a direct, positive proof that `self.pgid` cannot yet have
+            // been freed and recycled onto a stranger — the OS cannot reuse a pid that is still
+            // live. This is not a narrowing of the risk to "usually fine" — it is a real check
+            // that either proves the group identity intact or skips the signal, never a blind
+            // fire. If `self.root` is `None` (no identity to re-verify against — not the shape
+            // production wiring produces, since `root`/`pgid` are always threaded together from
+            // the same spawned child, but defensively handled), a later pass does not fire
+            // either: falling back to pass-1-only, the same, already-accepted risk profile as
+            // today's `ProcessGroup`, rather than firing blind.
+            //
+            // `group_result` folds together across passes (a later pass's success does not
+            // erase an earlier failure, and vice versa) so a transient failure on one pass is
+            // not silently dropped by the next pass's success.
+            {
+                let root_confirmed_alive = self
+                    .root
+                    .is_some_and(|root| root.is_alive() == crate::identity::Liveness::Alive);
+                let should_fire = first_pass || root_confirmed_alive;
+                if should_fire {
+                    let this_pass_group_result = match (self.pgid, signal) {
+                        (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid),
+                        (Some(pgid), _) => crate::containment::unix::term_group(pgid),
+                        (None, _) => Ok(()),
+                    };
+                    group_result = match (group_result, this_pass_group_result) {
+                        (Ok(()), r) => r,
+                        (e @ Err(_), Ok(())) => e,
+                        (Err(first), Err(latest)) => Err(io::Error::other(format!("{first}; {latest}"))),
+                    };
+                } else if self.pgid.is_some() {
+                    log::debug!(
+                        "fd marker {:#x}: skipping this pass's group signal — the root's \
+                         identity no longer resolves alive, so its pgid may have been recycled",
+                        self.handle
+                    );
+                }
+                first_pass = false;
+            }
+
+            if new_walk.is_empty() && new_holders.is_empty() {
+                break; // converged this pass — `incomplete` (from THIS or an earlier pass) is
+                       // still checked once, uniformly, after the loop below.
+            }
+            // `progressed`: did THIS pass actually resolve at least one newly-discovered
+            // identity to something other than "OS refused"? See the doc comment above for
+            // why the loop must stop, not continue, when the answer is no.
+            let mut progressed = false;
+            for id in new_walk {
+                // `KillOutcome::NotAttempted` means the OS refused to query or signal an
+                // identity that WAS resolved — a known member left running, not a gap in
+                // discovery. Not retried (see the doc comment above); folded into `incomplete`.
+                // Anything else (`Terminated`, `AlreadyGone`) is a real resolution: progress.
+                if crate::containment::treewalk::kill_by_identity(id, signal)
+                    == crate::containment::treewalk::KillOutcome::NotAttempted
+                {
+                    incomplete = true;
+                } else {
+                    progressed = true;
+                }
+            }
+            for id in new_holders {
+                if self.kill_holder(id, signal) {
+                    incomplete = true; // NotAttempted or Denied
+                } else {
+                    progressed = true; // NotHeld (resolved) or a signal actually attempted
+                }
+            }
+
+            if !progressed {
+                // Every newly-discovered identity this pass was left unsignalled. Looping
+                // again would spin forever against a member this design has chosen never to
+                // touch (e.g. EPERM-unkillable) that keeps forking new, individually-fresh
+                // children — no numeric cap could distinguish that from real convergence
+                // without this check. No progress this pass means no reason to expect
+                // progress on the next one either.
+                break;
+            }
+
+            // SIGKILL only: see the doc comment above for the liveness argument. SIGTERM takes
+            // exactly one pass.
+            if signal != nix::sys::signal::Signal::SIGKILL {
+                break;
+            }
+        }
+
+        if incomplete {
+            let msg = format!(
+                "fd marker {:#x}: teardown may be incomplete — the host process table was \
+                 unreadable on at least one pass, or at least one known/suspected member could \
+                 not be assessed or signalled",
+                self.handle
+            );
+            return match group_result {
+                Ok(()) => Err(io::Error::other(msg)),
+                Err(group_err) => Err(io::Error::other(format!(
+                    "{msg}; additionally, the group signal failed: {group_err}"
+                ))),
+            };
+        }
+        group_result
+    }
+
+    /// Kill one marker holder (already identity-resolved by the caller for dedup), closing the
+    /// discovery-to-signal window this one pass opens.
+    ///
+    /// `id` was resolved at discovery time; between then and now it could have exited (its pid
+    /// recycled onto a stranger) or genuinely stopped holding the marker (the `close(fd)`
+    /// escape). `holds_marker` re-verifies membership against the SAME pid; `kill_by_identity`
+    /// then re-verifies the identity once more immediately before signalling, closing the
+    /// remaining window exactly as the tree walk does.
+    ///
+    /// No separate start-token order guard: unlike the ppid-walk channel (where a stale ppid can
+    /// point at a recycled root pid, which is what `treewalk`'s token guard defends against),
+    /// membership re-checked HERE, at signal time, is already a complete proof — `Marker.handle`
+    /// names a kernel object that cannot be reissued while `self.read` is held (the module's
+    /// central invariant), so a pid that currently holds an fd naming it can only be a real
+    /// inheritor of this marker's write end.
+    ///
+    /// Uses `holds_marker_query` (the tri-state), not the plain-`bool` `holds_marker`: a
+    /// confirmed non-holder and a DENIED re-check are different facts here specifically. The
+    /// pid reaching this function was found by `holders()` moments earlier, this same pass —
+    /// so a `Denied` result now means a KNOWN member became unqueryable between discovery and
+    /// signal (almost always the credential-changing `exec` the module docs name), not the
+    /// documented `close(fd)` escape. `holders()`'s own aggregate-only denial logging does not
+    /// apply here for exactly that reason: this pid is not an arbitrary host process, it is a
+    /// confirmed candidate, so a denial here is worth a `warn!` on its own.
+    ///
+    /// Returns `true` iff this identity was left unsignalled for a reason that means teardown
+    /// may be incomplete — `KillOutcome::NotAttempted` OR a `Denied` re-check — which the
+    /// caller folds into `incomplete`. `false` covers every other outcome: a confirmed
+    /// non-holder (not incomplete, just resolved), or a signal that was actually attempted
+    /// (delivered, or already gone, which `kill_by_identity` treats as success).
+    fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal) -> bool {
+        match holds_marker_query(id.pid(), self.handle) {
+            MarkerQuery::NotHeld => {
+                log::debug!(
+                    "fd marker {:#x}: pid {} no longer holds the marker - not signaled",
+                    self.handle,
+                    id.pid()
+                );
+                false
+            }
+            MarkerQuery::Denied => {
+                log::warn!(
+                    "fd marker {:#x}: pid {} (a confirmed holder this pass) could not be \
+                     re-queried before signalling (access denied?) - not signaled, left \
+                     running",
+                    self.handle,
+                    id.pid()
+                );
+                true
+            }
+            MarkerQuery::Held => {
+                crate::containment::treewalk::kill_by_identity(id, signal)
+                    == crate::containment::treewalk::KillOutcome::NotAttempted
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "fdmarker_tests.rs"]
 mod fdmarker_tests;

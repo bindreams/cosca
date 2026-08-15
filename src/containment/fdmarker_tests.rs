@@ -583,3 +583,209 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
         assert!(super::fault::take_fault().is_none(), "the seam must be consumed by install");
     }
 }
+
+// Teardown: one snapshot, three channels =====
+
+/// The sweep must never signal the supervisor or pid 1. Asserted on the filter directly, not
+/// inferred from "the test process is still alive" — which would pass by luck if the filter
+/// were wrong and the signal merely failed.
+#[test]
+fn the_kill_filter_excludes_this_process_and_pid_one() {
+    assert!(!super::is_signalable(std::process::id()), "the supervisor is never a sweep target");
+    assert!(!super::is_signalable(1), "pid 1 is never a sweep target");
+    assert!(!super::is_signalable(0), "pid 0 is never a sweep target");
+    assert!(super::is_signalable(std::process::id() + 1), "an ordinary pid is signalable");
+}
+
+/// The shape the ppid walk structurally cannot reach: a descendant that calls `setsid`,
+/// double-forks so its parent exits, is reparented to launchd, and execs — its ppid is 1, but
+/// the marker sweep still finds it, and `hard_kill` kills it.
+///
+/// Deterministic with no timer: `sh` prints the orphan's pid, then exits; `wait()` returning
+/// proves `sh` is gone, which is exactly the event that reparents the orphan. Death is proven
+/// by EOF on the orphan's OWN inherited stdout, not by re-resolving its identity right after
+/// `kill()` returns: `kill(2)` only posts the signal and returns immediately, so checking
+/// `ProcessId::of` in the very next line races the kernel's own delivery-and-reap timing — a
+/// zombie orphan (signalled, not yet reaped by launchd) still resolves via `proc_pidinfo` with
+/// the SAME start token, so that check alone can pass before the kill has actually landed. `sh`
+/// backgrounds `sleep` without redirecting it, so `sleep` inherits `sh`'s piped stdout; once
+/// `sh` exits (`child.wait()`, above), the orphaned `sleep` is the pipe's ONLY remaining write
+/// end, so a blocking read on it returns EOF exactly when `sleep` dies — a real event, not a
+/// timer.
+#[test]
+fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    // `sleep` inherits the marker across sh's fork and its own exec; `echo $!` publishes it.
+    cmd.arg("-c").arg("sleep 600 & echo $!").stdout(std::process::Stdio::piped());
+    // setsid: the orphan leaves this process's session AND process group, so killpg misses it.
+    // SAFETY: pre_exec runs post-fork, pre-exec; `libc::setsid` is async-signal-safe.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let mut child = cmd.spawn().expect("spawn sh");
+    drop(cmd);
+
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read orphan pid");
+    let orphan: crate::identity::RawPid = line.trim().parse().expect("orphan pid");
+    child.wait().expect("reap sh"); // sh's exit is what reparents the orphan
+
+    let (_, parents, _) = crate::containment::enumerate::snapshot();
+    let ppid = parents.iter().find(|(p, _)| *p == orphan).map(|(_, pp)| *pp);
+    assert_eq!(ppid, Some(1), "precondition: the orphan must be reparented to launchd");
+
+    // No root identity: sh is reaped, so ONLY the marker channel can reach the orphan.
+    let marker = super::Marker::new(prepared, None, None);
+    marker.hard_kill().expect("hard_kill");
+
+    // The proof: `sleep` is the pipe's sole remaining writer, so EOF fires exactly on its
+    // death — a real event, not a timer. This DOES block until then, unlike `Member::assert_dead`
+    // in Task 7: there is no alive/dead round trip available on a plain, un-echoing `sleep`, so
+    // there is no way to fail non-blockingly on the "still alive" branch here. Accepted
+    // deliberately for this one unit test (the integration tests in Task 7 use control sockets
+    // precisely to avoid this tradeoff at the suite's more expensive layer).
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut out, &mut rest).expect("read to EOF on the orphan's stdout");
+    assert!(rest.is_empty(), "unexpected trailing output from the orphan: {rest:?}");
+
+    // Redundant secondary check, not the proof: `is_alive` is zombie-EXCLUSIVE (unlike
+    // `ProcessId::of`/`exists`, which stay `Found`/`Present` for an unreaped zombie), so it
+    // reports `Dead` synchronously at the kill, matching what the EOF above already showed.
+    if let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(orphan) {
+        assert_eq!(
+            id.is_alive(),
+            crate::identity::Liveness::Dead,
+            "pid {orphan} must not report alive after the EOF proof above"
+        );
+    }
+}
+
+/// A pid that stopped holding the marker before the sweep must survive a REAL `hard_kill()`,
+/// not merely fail the underlying `holds_marker` primitive in isolation (`a_dead_handle_finds_
+/// no_holders`, Task 2, already covers that narrower claim) — proving `kill_holder`'s live
+/// re-check inside a genuine sweep. The escapee is Task 3's documented `close(fd)` limit: it
+/// closes the marker, confirms the close over the SAME pipe (ordering the sweep strictly
+/// after, not racing it), then proves it is still alive by echoing back what the
+/// test writes to it AFTER `hard_kill()` returns.
+#[test]
+fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let (handle, marker_fd) = (prepared.handle, prepared.fd);
+    cmd.arg("-c")
+        .arg(format!(r#"echo $$; exec {marker_fd}>&-; echo closed; while read x; do echo "$x"; done"#));
+    let mut child = cmd.spawn().expect("spawn sh");
+    drop(cmd);
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read child pid");
+    let kid: crate::identity::RawPid = line.trim().parse().expect("child pid");
+    line.clear();
+    out.read_line(&mut line).expect("read closed confirmation");
+    assert_eq!(line.trim(), "closed", "the child must confirm the close before the sweep runs");
+    assert!(!holds_marker(kid, handle), "precondition: the escapee no longer holds the marker");
+
+    let marker = super::Marker::new(prepared, None, None);
+    marker.hard_kill().expect("hard_kill");
+
+    // Alive, proven positively: a line in, the same line back — the sweep must not have
+    // touched a pid that was never in its holder set to begin with.
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    std::io::Write::write_all(&mut stdin, b"still-here\n").expect("write probe line");
+    line.clear();
+    out.read_line(&mut line).expect("read probe echo");
+    assert_eq!(
+        line.trim(),
+        "still-here",
+        "the escapee closed the marker before hard_kill ran and must survive it"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+// NOTE: no test proves pass 2 of the convergence loop catches a holder that appears strictly
+// between pass 1's signal and pass 2's snapshot (an earlier draft tried, via a test-only
+// `converge_hook` checkpoint, now removed). The reason is structural, not a construction gap:
+// creating that "late" holder needs a live source descriptor to dup the marker's write end
+// from, and by the time a hook could run (after pass 1 has already signalled every CURRENT
+// holder), the only remaining owner of the original descriptor is the process pass 1 just
+// killed. Retaining a supervisor-side dup from before `hard_kill()` starts, so a hook has
+// something to dup, means the supervisor holds a live copy of `self.handle` DURING pass 1's own
+// `holders()` scan — not a benign test artifact, but a violation of the real invariant that the
+// write end is owned only by the spawned child once `Marker` exists to be swept (Task 5's
+// `drop(std_cmd)`, inside the spawn lock, is what makes that true) — and `sweep`'s
+// self-exclusion `debug_assert!` correctly panics on it. The loop's correctness rests on the
+// termination argument in `sweep`'s doc comment, reviewable but not test-pinned.
+
+/// `kill_holder`'s `MarkerQuery::Denied` arm, end to end: a KNOWN holder that becomes
+/// unqueryable at re-check time must be left unsignalled AND reported as incomplete (`true`),
+/// never silently treated as resolved. `id` names pid 1 (launchd) — the same real,
+/// unprivileged-EPERM oracle used throughout this file — fed directly to the private method
+/// rather than through a real sweep, since pid 1 can never naturally appear in a real sweep's
+/// holder set (it does not hold this marker) or its ppid-walk (the pid 1 launchd walk read
+/// would itself be catastrophic — see the `Marker::sweep`-level test below for why root=pid 1
+/// is never used there either).
+///
+/// `ProcessId::of(1)` is asserted to resolve (not skipped if it doesn't): `identity/macos.rs`
+/// falls back to the `sysctl(KERN_PROC_PID)` reader specifically because `proc_pidinfo` denies
+/// pid 1 to an unprivileged caller, and that fallback is documented to succeed for exactly this
+/// case — a `Resolved::Unknown` here would mean that documented fallback regressed, which this
+/// test must fail loudly on, not quietly skip past.
+#[test]
+fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let marker = super::Marker::new(prepared, None, None);
+
+    let id = match crate::identity::ProcessId::of(1) {
+        crate::identity::Resolved::Found(id) => id,
+        other => panic!(
+            "pid 1 must resolve via the documented sysctl fallback for this test's oracle to \
+             hold; got {other:?}"
+        ),
+    };
+
+    assert!(
+        marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL),
+        "a Denied re-check on a supposedly-known holder must report incomplete (true), not \
+         silently succeed"
+    );
+}
+
+/// `Marker::sweep`'s top-level `incomplete`/`Err` return, end to end through the REAL public
+/// `hard_kill()` — not a synthetic check of the `incomplete` bool in isolation. Forces a
+/// genuinely blind pass via the enumerate backend's test-only fault seam (module docs at the
+/// top of `enumerate/macos.rs`), NOT by naming an unkillable real pid as `root`: an unprivileged
+/// but real identity like pid 1 cannot be used as `root` here, because `treewalk::descendants`
+/// would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
+/// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
+/// `root: None, pgid: None` keeps every channel this test does not need inert, so the blind
+/// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.
+#[test]
+fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = super::install(&mut cmd, &[]).expect("install");
+    let marker = super::Marker::new(prepared, None, None);
+
+    crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+    let result = marker.hard_kill();
+
+    assert!(
+        result.is_err(),
+        "a sweep whose only pass was blind must report Err, not silently converge as Ok(())"
+    );
+}
