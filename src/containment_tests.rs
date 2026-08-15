@@ -6,6 +6,7 @@ fn containment_display_names_the_mechanism() {
     assert_eq!(Containment::CgroupV2.to_string(), "cgroup v2");
     assert_eq!(Containment::ProcessGroup.to_string(), "process group");
     assert_eq!(Containment::Session.to_string(), "session");
+    assert_eq!(Containment::FdMarker.to_string(), "inherited-fd marker");
     assert_eq!(Containment::TreeWalk.to_string(), "process-tree walk");
     assert_eq!(Containment::Delegated.to_string(), "delegated");
     assert_eq!(Containment::None.to_string(), "none");
@@ -20,6 +21,7 @@ fn containment_can_teardown() {
         Containment::JobObject,
         Containment::ProcessGroup,
         Containment::Session,
+        Containment::FdMarker,
         Containment::TreeWalk,
     ] {
         assert!(c.can_teardown(), "{c:?} must be teardown-capable");

@@ -612,7 +612,12 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
 #[test]
 fn unix_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), cosca::Containment::ProcessGroup);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::ProcessGroup
+    };
+    assert_eq!(child.containment(), expected);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -629,7 +634,12 @@ fn unix_kill_tree_reaps_the_grandchild() {
 #[test]
 fn unix_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    assert_eq!(child.containment(), cosca::Containment::ProcessGroup);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::ProcessGroup
+    };
+    assert_eq!(child.containment(), expected);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
@@ -780,7 +790,12 @@ fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
 #[test]
 fn unix_session_containment_reports_session() {
     let (child, mut gc_stream) = spawn_session_tree();
-    assert_eq!(child.containment(), cosca::Containment::Session);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::Session
+    };
+    assert_eq!(child.containment(), expected);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait();
@@ -807,7 +822,12 @@ fn unix_session_child_is_own_session_leader() {
         .expect("stdout pipe")
         .contain_with(cosca::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn sid-report");
-    assert_eq!(child.containment(), cosca::Containment::Session);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::Session
+    };
+    assert_eq!(child.containment(), expected);
 
     let mut reader = child.stdout().expect("stdout reader");
     let mut out = String::new();
@@ -875,7 +895,12 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
     // Hold `_root_stream` for the whole test: it keeps the root alive so TreeWalk
     // enumerates the grandchild as a live descendant (not a reparented orphan).
     let (child, mut gc_stream, _root_stream) = spawn_treewalk_tree();
-    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::TreeWalk
+    };
+    assert_eq!(child.containment(), expected);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -905,7 +930,12 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
     // Hold `_root_stream` so the root stays alive through teardown (see
     // spawn_treewalk_tree): TreeWalk must enumerate a live root's descendants.
     let (child, mut gc_stream, _root_stream) = spawn_treewalk_tree();
-    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::TreeWalk
+    };
+    assert_eq!(child.containment(), expected);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
@@ -936,7 +966,12 @@ fn treewalk_kills_process_group_escapee() {
         .args(["cosca_testbin", "spawn-grandchild-escapee", &addr]);
     cmd.contain_with(cosca::ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn tree-walk escapee tree");
-    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
+    let expected = if cfg!(target_os = "macos") {
+        cosca::Containment::FdMarker
+    } else {
+        cosca::Containment::TreeWalk
+    };
+    assert_eq!(child.containment(), expected);
 
     let mut gc = None;
     let mut root = None;
@@ -997,9 +1032,9 @@ fn drop_kills_contained_tree() {
     assert!(
         matches!(
             child.containment(),
-            cosca::Containment::ProcessGroup | cosca::Containment::Session
+            cosca::Containment::ProcessGroup | cosca::Containment::Session | cosca::Containment::FdMarker
         ),
-        "macOS/BSD must use ProcessGroup or Session, got {:?}",
+        "macOS/BSD must use ProcessGroup, Session or FdMarker, got {:?}",
         child.containment()
     );
 

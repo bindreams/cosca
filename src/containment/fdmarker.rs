@@ -756,9 +756,7 @@ impl Marker {
         }
     }
 
-    // Task 6 wires a test-only consumer (`Child::test_marker_handle`); until then this is
-    // dead under a non-test build, matching `read_end` below.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by Child::test_marker_handle (test-only)
     pub(crate) fn handle(&self) -> u64 {
         self.handle
     }

@@ -63,8 +63,11 @@ fn containment_smoke() {
     );
     #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
     assert!(
-        matches!(child.containment(), Containment::ProcessGroup | Containment::Session),
-        "macOS/BSD must use ProcessGroup or Session, got {:?}",
+        matches!(
+            child.containment(),
+            Containment::ProcessGroup | Containment::Session | Containment::FdMarker
+        ),
+        "macOS/BSD must use ProcessGroup, Session or FdMarker, got {:?}",
         child.containment()
     );
 

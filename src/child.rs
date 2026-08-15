@@ -133,6 +133,15 @@ impl Child {
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use `kill()` for a lone process).
+    ///
+    /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
+    /// means at least one known or suspected tree member could not be assessed or signalled
+    /// this call — not merely "some descendant's identity transiently failed to resolve and
+    /// was left running," which the rest of this doc comment calls acceptable. The tree may
+    /// still be partially alive after such an `Err`. This is a real, expected outcome on a
+    /// real host (e.g. a member that `exec`s a setuid binary becomes unqueryable), not a bug
+    /// to route around by ignoring the `Result`.
+    ///
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
@@ -167,8 +176,17 @@ impl Child {
     /// spawned detached cannot deliver it. The failure is classified best-effort: usually
     /// [`Error::NoConsole`](crate::error::Error::NoConsole), but a raw `Error::Io` when the
     /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
-    /// tree is still running" rather than keying a fallback on the variant alone. Attach a
-    /// console before spawning the tree, or use `kill_tree`, which needs none.
+    /// tree is still running" rather than keying a fallback on the variant alone.
+    ///
+    /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
+    /// means at least one known or suspected tree member could not be assessed or signalled
+    /// this call — not merely "some descendant's identity transiently failed to resolve and
+    /// was left running," which the rest of this doc comment calls acceptable. The tree may
+    /// still be partially alive after such an `Err`. This is a real, expected outcome on a
+    /// real host (e.g. a member that `exec`s a setuid binary becomes unqueryable), not a bug
+    /// to route around by ignoring the `Result`.
+    ///
+    /// Attach a console before spawning the tree, or use `kill_tree`, which needs none.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         self.attached.terminate(self.proc.id())
@@ -240,6 +258,16 @@ impl Child {
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
         crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())
+    }
+
+    /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
+    #[cfg(all(test, target_os = "macos"))]
+    #[allow(dead_code)] // awaits a unit-test consumer; not visible to integration tests (pub(crate))
+    pub(crate) fn test_marker_handle(&self) -> Option<u64> {
+        match &self.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.handle()),
+            _ => None,
+        }
     }
 }
 
