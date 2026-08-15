@@ -86,14 +86,29 @@ impl ProcessId {
         backend::start_token(pid).map(|start| ProcessId { pid, start })
     }
 
-    /// Test-only constructor from raw parts, so sibling modules can build
-    /// synthetic identities (with chosen pid/token) without a live process.
-    #[cfg(test)]
-    pub(crate) fn from_parts_for_test(pid: RawPid, token: u64) -> ProcessId {
+    /// Build a `ProcessId` from an already-known `(pid, raw start token)` pair, without a
+    /// live read. Used where the pair was already read as part of a larger record — the
+    /// containment group listing reads a member's start token in the very sysctl/proc record
+    /// it reads the pid from, and a second, separate read to re-derive it would itself race
+    /// against the pid-reuse hazard this type exists to catch.
+    ///
+    /// `cfg(any(unix, test))`: the only non-test caller (`containment::unix::group`) is
+    /// Unix-only, so a Windows *release* build has no caller for this at all — gated to avoid
+    /// a `dead_code` warning there (`cargo build --target *-pc-windows-msvc` is a real CI job,
+    /// `ci.yaml:82`, and this crate is otherwise warning-clean). Still available under
+    /// `cfg(test)` on every platform, because `from_parts_for_test` below calls it everywhere.
+    #[cfg(any(unix, test))]
+    pub(crate) fn from_parts(pid: RawPid, token: u64) -> ProcessId {
         ProcessId {
             pid,
             start: StartToken::from_raw(token),
         }
+    }
+
+    /// Test-only alias, kept so the many existing test call sites need no rename.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(pid: RawPid, token: u64) -> ProcessId {
+        Self::from_parts(pid, token)
     }
 
     /// This process's own identity. Windows reads the current-process pseudo-handle, which

@@ -104,6 +104,9 @@ fn term_direct(pid: i32) -> io::Result<()> {
     }
 }
 
+#[path = "unix/group.rs"]
+mod group;
+
 #[cfg(test)]
 #[path = "unix_tests.rs"]
 mod unix_tests;
