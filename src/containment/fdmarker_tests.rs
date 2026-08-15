@@ -20,23 +20,17 @@
 //! crate) already takes `spawn_lock()` internally, so reusing it here gets those tests'
 //! serialization for free.
 //!
-//! **This reuse does NOT make every fork in the `--lib` test binary safe — stated plainly,
-//! not implied.** `crate::test_child::spawn_a_process_that_exits` (used by unrelated tests,
-//! e.g. `identity/persist_tests.rs`) is wrapped in this same lock now. But grepping the tree
-//! for other unlocked `std::process::Command::spawn()`/`.output()` calls in the SAME `--lib`
-//! binary finds several more this task does not touch: `src/process/graceful_tests.rs`,
+//! This reuse is what makes the guard effective crate-wide, not just within this module:
+//! `crate::test_child::spawn_a_process_that_exits` (used by unrelated tests, e.g.
+//! `identity/persist_tests.rs`) and every other `--lib`-binary fork site that could race a
+//! marker-holding test here — `src/process/graceful_tests.rs`,
 //! `src/tokio/process/graceful_tests.rs`, `src/containment/unix_tests.rs`,
-//! `src/wait/macos_tests.rs`, `src/containment/dispatch_tests.rs`, `src/tokio/wait_tests.rs`.
-//! Each is a real, if narrow, fork-bystander exposure for exactly the reason the paragraph
-//! above states: any of those forking while THIS module's tests hold a marker write end open
-//! can transiently inherit it, and a concurrently-running `hard_kill()`/`holders()` scan in
-//! THIS module could then find and SIGKILL that bystander. Those files are outside this
-//! task's scope (owned by other in-flight work on this same crate) — this plan cannot silently
-//! claim they are covered when they are not. **Open, unresolved as of this task:** either every
-//! one of those call sites needs `spawn_lock()` too (a cross-cutting test-infra change spanning
-//! files this task does not own), or `cargo test` for this crate needs to run with reduced
-//! parallelism for the affected tests, or the risk is accepted and documented as a known,
-//! narrow test-suite flake source. Surfaced as a real question, not resolved here.
+//! `src/wait/macos_tests.rs`, `src/containment/dispatch_tests.rs`, `src/tokio/wait_tests.rs` —
+//! also take `spawn_lock()` around their own `std::process::Command::spawn()`/`.output()`
+//! calls, for exactly the reason the paragraph above states: any of those forking while THIS
+//! module's tests hold a marker write end open could otherwise transiently inherit it, and a
+//! concurrently-running `hard_kill()`/`holders()` scan in THIS module could then find and
+//! SIGKILL that bystander.
 
 use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd};
@@ -750,19 +744,158 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let _ = child.wait();
 }
 
-// NOTE: no test proves pass 2 of the convergence loop catches a holder that appears strictly
-// between pass 1's signal and pass 2's snapshot (an earlier draft tried, via a test-only
-// `converge_hook` checkpoint, now removed). The reason is structural, not a construction gap:
-// creating that "late" holder needs a live source descriptor to dup the marker's write end
-// from, and by the time a hook could run (after pass 1 has already signalled every CURRENT
-// holder), the only remaining owner of the original descriptor is the process pass 1 just
-// killed. Retaining a supervisor-side dup from before `hard_kill()` starts, so a hook has
-// something to dup, means the supervisor holds a live copy of `self.handle` DURING pass 1's own
-// `holders()` scan — not a benign test artifact, but a violation of the real invariant that the
-// write end is owned only by the spawned child once `Marker` exists to be swept (Task 5's
-// `drop(std_cmd)`, inside the spawn lock, is what makes that true) — and `sweep`'s
-// self-exclusion `debug_assert!` correctly panics on it. The loop's correctness rests on the
-// termination argument in `sweep`'s doc comment, reviewable but not test-pinned.
+/// `pid_is_live_group_member` — the group-signal re-fire gate's anchor — confirms a real,
+/// currently-live member of its own group, and rejects both a mismatched pgid and a pid that
+/// has already exited (the `getpgid` call itself fails `ESRCH` for a gone pid, which is the
+/// whole reason no separate liveness check is needed — see the function's doc).
+#[test]
+fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() {
+    use std::os::unix::process::CommandExt;
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("600").process_group(0); // pgid == the child's own pid — `process_group` is safe.
+    let mut child = cmd.spawn().expect("spawn sleep");
+    let pid = child.id() as crate::identity::RawPid;
+    let pgid = child.id() as i32;
+
+    assert!(
+        super::pid_is_live_group_member(pid, pgid),
+        "a live child must be confirmed a member of its own pgid"
+    );
+    assert!(
+        !super::pid_is_live_group_member(pid, pgid.wrapping_add(1)),
+        "a mismatched pgid must not be confirmed, even for a live pid"
+    );
+
+    child.kill().expect("kill");
+    child.wait().expect("reap");
+    assert!(
+        !super::pid_is_live_group_member(pid, pgid),
+        "a reaped pid must not be confirmed a member of anything — getpgid must fail ESRCH"
+    );
+}
+
+/// Item 1's central regression test: `sweep_pass`'s group-signal gate must re-fire on a LATER
+/// pass when THAT pass's own holder scan just confirmed a fresh, live, `getpgid`-verified member
+/// of `self.pgid` — closing the "a process joins the group strictly between passes" gap
+/// `sweep_pass`'s own doc names — and the "skipping this pass's group signal" log line, the
+/// probe an earlier review round used to catch this gap missing entirely, must NOT appear on
+/// that pass.
+///
+/// `sweep_pass` is called directly, twice, bypassing `hard_kill`'s automatic loop — the only way
+/// to get a deterministic injection point *between* two passes with no sleep and no race:
+/// `hard_kill`'s own loop offers no such hook.
+///
+/// Four roles, three real target processes:
+/// - **P** mints a real, currently-valid pgid (`process_group(0)`: P's pgid == P's own pid), AND
+///   carries a THROWAWAY marker (`scratch`, installed on P's own command) that exists only to
+///   give pass 1 a valid `Marker` to call `sweep_pass` on — pass 1's own holder scan finding P
+///   holding it is incidental (P dies from the group signal either way) and is not asserted on.
+///   Reusing P's command this way, rather than leaving a SEPARATE unspawned command's write end
+///   sitting open in this test process across pass 1, is what keeps this test itself clear of
+///   the self-exclusion guard `sweep_pass` enforces on its caller (see below).
+/// - **T** ("witness") carries the REAL marker (`marker`, installed on T's own command) `hard_
+///   kill`/`terminate` would actually track. Not spawned until strictly between the two passes,
+///   for two independent reasons that happen to coincide: (a) `pid_is_live_group_member` must
+///   confirm T as a FRESH `pgid` member on pass 2, so T cannot have been a member during pass
+///   1's unconditional `killpg`; (b) `install()`'s write end sits open in the CALLER (this test)
+///   until the command is actually spawned, and `sweep_pass`'s own self-exclusion guard
+///   `debug_assert!`-panics if a holder scan ever finds ITS OWN caller holding the marker it is
+///   sweeping — so `marker`'s `install()` must not be called until immediately before spawning
+///   T, with no `sweep_pass` call in between.
+/// - **Q** ("protected target") holds no marker and is never named as `root`, so `killpg` on
+///   `self.pgid` is the ONLY channel that can reach it. Q's death is therefore unambiguous proof
+///   that pass 2's group signal actually fired, not a side effect of the marker or ppid-walk
+///   channels. Also not spawned until between the two passes, for reason (a) above.
+///
+/// T and Q join `pgid` directly at their own spawn (`.process_group(pgid)`, a `setpgid(0, pgid)`
+/// on THEMSELVES before their own `exec`, always POSIX-legal) rather than via a `setpgid` issued
+/// BY this test after the fact: POSIX reserves that second form for a still-pre-`exec` child of
+/// the caller, so a parent-issued `setpgid` on an already-`exec`'d child fails `EPERM`/`EACCES`
+/// on every POSIX platform — measured here as `EPERM`, a real, unconditional OS restriction an
+/// earlier draft of this test hit and had to route around, not a flake. `pgid` stays valid for T
+/// and Q to join because P is left an unreaped zombie throughout (never `.wait()`ed) — the same
+/// "the kernel still lists a zombie in its process group" fact `group_tests.rs`'s `await_zombie`
+/// already relies on, applied here to keep `pgid` allocated across the gap instead of to query
+/// it.
+#[test]
+fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member() {
+    use std::os::unix::process::CommandExt;
+    let _serialize = test_spawn_lock();
+    crate::log_capture::install();
+
+    let mut p_cmd = std::process::Command::new("/bin/sleep");
+    p_cmd.arg("600").process_group(0); // pgid == P's own pid.
+    let scratch = super::install(&mut p_cmd, &[]).expect("install scratch marker on P");
+    // P is deliberately left unreaped for the rest of the test — see the doc above ("P is left
+    // an unreaped zombie throughout"). That's what keeps `pgid` allocated across the gap, so
+    // clippy's zombie-processes lint is a false positive here, not a real leak.
+    #[allow(clippy::zombie_processes)]
+    let p_child = p_cmd.spawn().expect("spawn P");
+    drop(p_cmd);
+    let pgid = p_child.id() as i32;
+
+    let pass1_marker = super::Marker::new(scratch, None, Some(pgid));
+    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::new();
+    let mut group_result: Result<(), crate::error::Error> = Ok(());
+    let mut incomplete = false;
+
+    // Pass 1: fires unconditionally (first_pass=true), killing P via killpg(pgid). Neither T
+    // nor Q exists yet, so pass 1 cannot reach either regardless.
+    pass1_marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut seen,
+        &mut group_result,
+        &mut incomplete,
+        true,
+    );
+    drop(pass1_marker); // its scratch handle has no further use.
+
+    // Between passes: T's real marker is installed and T is spawned in the same breath (no
+    // sweep_pass call in between — see the self-exclusion note above), born directly into
+    // `pgid`. Q is born into `pgid` too, holding no marker.
+    let mut t_cmd = std::process::Command::new("/bin/sleep");
+    t_cmd.arg("600").process_group(pgid);
+    let prepared = super::install(&mut t_cmd, &[]).expect("install marker on T");
+    let mut t_child = t_cmd.spawn().expect("spawn T");
+    drop(t_cmd);
+
+    let mut q_cmd = std::process::Command::new("/bin/sleep");
+    q_cmd.arg("600").process_group(pgid);
+    let mut q_child = q_cmd.spawn().expect("spawn Q");
+
+    let marker = super::Marker::new(prepared, None, Some(pgid));
+    let mark = crate::log_capture::mark();
+
+    // Pass 2: T's own holder scan on THIS pass confirms a live member of `pgid` (T itself), so
+    // the gate must open and the group signal must re-fire, reaching Q via killpg.
+    marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut seen,
+        &mut group_result,
+        &mut incomplete,
+        false,
+    );
+
+    assert!(
+        !crate::log_capture::contains_since(mark, "skipping this pass's group signal"),
+        "pass 2 must not skip the group signal: a live, getpgid-confirmed member (T) was just \
+         found in this pass's own holder scan"
+    );
+
+    // The proof: Q holds no marker and was never named `root`, so only a `killpg` on `pgid`
+    // could have killed it.
+    let status = q_child.wait().expect("reap Q");
+    assert!(
+        !status.success(),
+        "Q must have been killed by the pass-2 group signal (killpg), not left running; got {status:?}"
+    );
+
+    // T is reachable by the marker channel too (this same pass 2 call's own holder-kill loop),
+    // so it should already be gone or going; reap it rather than leave it running either way.
+    let _ = t_child.kill();
+    let _ = t_child.wait();
+}
 
 /// `kill_holder`'s `MarkerQuery::Denied` arm, end to end: a KNOWN holder that becomes
 /// unqueryable at re-check time must be left unsignalled AND reported as incomplete (`true`),

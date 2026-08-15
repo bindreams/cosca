@@ -4,6 +4,8 @@ use crate::identity::ProcessId;
 
 #[test]
 fn drain_reports_none_when_no_event_pending() {
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sleep")
         .arg("30")
         .spawn()

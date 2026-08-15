@@ -184,8 +184,9 @@ impl Child {
     /// tree is still running and this process cannot bring it down.
     ///
     /// **This guarantee, and its converse — that `Ok` is positive proof the group cleared —
-    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: `TreeWalk`
-    /// does not yet propagate a live refuser's outcome into this call's result (#63).
+    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: a separate,
+    /// unfixed gap means `TreeWalk` does not yet propagate a live refuser's outcome into this
+    /// call's result.
     ///
     /// **A `hidepid`-restricted Linux host can still return `Ok` with a live refuser left
     /// running.** `/proc` is this mechanism's only way to confirm the group cleared, and
@@ -196,35 +197,39 @@ impl Child {
     /// value is not trustworthy evidence either.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // Precondition (sibling #54's territory — asserted, not fixed, here): if the pgid-based
-        // mechanism's (Attached::ProcessGroup — covers both Containment::ProcessGroup and
-        // Containment::Session, which also lands in this variant at spawn time) leader pid has
-        // been reaped AND RECYCLED onto a DIFFERENT, LIVE process group, `killpg` would signal
-        // that unrelated group instead. Reaping alone is harmless — `killpg` on an absent pgid
-        // returns `ESRCH`, which `containment::unix::signal_group`/`verify` already treat as
-        // `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle (see
-        // `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
+        // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
+        // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
+        // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
+        // (`containment/dispatch.rs`) names exactly the mechanisms this applies to:
+        // `Attached::ProcessGroup` (covers both `Containment::ProcessGroup` and
+        // `Containment::Session`) and macOS `Attached::FdMarker` when its mode created a pgid
+        // (it fires `killpg` on pass 1 of every sweep unconditionally, so the hazard is
+        // identical there, not merely similar). Reaping alone is harmless — `killpg` on an
+        // absent pgid returns `ESRCH`, which `containment::unix::signal_group`/`verify` already
+        // treat as `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle
+        // (see `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
         // reachable on the ORDINARY spawn-then-teardown path for any fast-exiting child, not
         // only via an explicit `wait()` before `kill_tree()`/`terminate_tree()`: `std`'s
         // `SharedChild::new` (inside `Command::spawn`, see `child/spawn.rs`'s own comment on
         // this) can reap a fast-exiting leader itself, before the caller ever gets a `Child`
         // handle back — this assert can therefore fire on the very first call the caller makes,
-        // whatever ordering they use. Gated to this ONE mechanism: a recycled pgid is
-        // meaningless for Cgroup (keyed by an fd), JobObject (no pgid), Delegated (no
-        // mechanism), or TreeWalk (re-resolves identity per member, immune to this by
-        // construction) — asserting it there would be a false alarm unrelated to what this
-        // precondition is about. An OS refusal to answer either resolve (`Resolved::Unknown` /
-        // `Liveness::Unknown`) is permitted through: this asserts against POSITIVE evidence of a
-        // violation, not against every case we merely couldn't rule out.
+        // whatever ordering they use. Gated to mechanisms that carry a recyclable pgid: a
+        // recycled pgid is meaningless for Cgroup (keyed by an fd), JobObject (no pgid),
+        // Delegated (no mechanism), TreeWalk (re-resolves identity per member, immune to this
+        // by construction), or a macOS FdMarker whose mode created no pgid — asserting it there
+        // would be a false alarm unrelated to what this precondition is about. An OS refusal to
+        // answer either resolve (`Resolved::Unknown` / `Liveness::Unknown`) is permitted
+        // through: this asserts against POSITIVE evidence of a violation, not against every
+        // case we merely couldn't rule out.
         //
-        // `#[cfg(unix)]`: `Attached::ProcessGroup` is itself a Unix-only variant (see
+        // `#[cfg(unix)]`: `Attached::carries_recyclable_pgid` is itself Unix-only (see
         // `containment/dispatch.rs`) — referencing it unconditionally does not compile on
         // Windows (`cargo check --target x86_64-pc-windows-msvc` confirmed E0599 without this
         // gate). Windows has no pgid to recycle, so there is nothing for this precondition to
         // assert there.
         #[cfg(unix)]
         debug_assert!(
-            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+            !self.attached.carries_recyclable_pgid() || {
                 let now = ProcessId::of(self.id.pid());
                 let now_liveness = match now {
                     crate::identity::Resolved::Found(id) => id.is_alive(),
@@ -236,7 +241,7 @@ impl Child {
             },
             "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
              recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group (see #54)",
+             unrelated process group",
             self.id.pid()
         );
         let group_result = self.attached.hard_kill();
@@ -288,15 +293,15 @@ impl Child {
     /// tree is still running and this process cannot bring it down.
     ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
-    /// `ProcessGroup`/`Session`-only scope of this guarantee (`TreeWalk` is #63's territory),
-    /// and the residual `hidepid` gap on Linux.
+    /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
+    /// `TreeWalk`), and the residual `hidepid` gap on Linux.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // See kill_tree's identical precondition assert for the full rationale, including the
-        // `#[cfg(unix)]` gate (Attached::ProcessGroup does not exist on Windows).
+        // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
         debug_assert!(
-            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+            !self.attached.carries_recyclable_pgid() || {
                 let now = ProcessId::of(self.id.pid());
                 let now_liveness = match now {
                     crate::identity::Resolved::Found(id) => id.is_alive(),
@@ -308,7 +313,7 @@ impl Child {
             },
             "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
              recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group (see #54)",
+             unrelated process group",
             self.id.pid()
         );
         self.attached.terminate(self.proc.id())

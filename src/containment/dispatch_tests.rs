@@ -78,6 +78,53 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
+/// `Child::kill_tree`/`terminate_tree`'s pgid-recycle precondition assert gates on this
+/// predicate, not on `Attached::ProcessGroup` alone (`src/child.rs`, `src/tokio/child.rs`) —
+/// a macOS `FdMarker` that carries a pgid must be covered too, since it fires `killpg`
+/// unconditionally on pass 1 of every sweep, exactly the hazard this precondition guards.
+#[cfg(unix)]
+#[test]
+fn attached_carries_recyclable_pgid() {
+    use super::Attached;
+    assert!(!Attached::None.carries_recyclable_pgid());
+    assert!(!Attached::Delegated.carries_recyclable_pgid());
+    assert!(!Attached::TreeWalk(crate::identity::ProcessId::current()).carries_recyclable_pgid());
+    assert!(Attached::ProcessGroup(0).carries_recyclable_pgid());
+    #[cfg(target_os = "linux")]
+    assert!(
+        !Attached::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test()).carries_recyclable_pgid()
+    );
+}
+
+/// The macOS-specific half of `attached_carries_recyclable_pgid`: an `FdMarker` must track
+/// its OWN `pgid`, not the mechanism's mere presence — `TreeWalk` mode creates no pgid at
+/// all (`Marker::pgid: None`), so a marker built for it must read `false` here exactly like
+/// `Attached::TreeWalk` itself, while a marker built for any grouped mode (`pgid: Some(_)`)
+/// must read `true`, matching `Attached::ProcessGroup`.
+#[cfg(target_os = "macos")]
+#[test]
+fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use super::Attached;
+
+    fn marker_with_pgid(pgid: Option<i32>) -> crate::containment::fdmarker::Marker {
+        let (read, write) = std::io::pipe().expect("pipe");
+        let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
+        let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
+        let prepared = crate::containment::fdmarker::PreparedMarker {
+            read: std::os::fd::OwnedFd::from(read),
+            handle,
+            read_handle,
+            fd: write.as_fd().as_raw_fd(),
+        };
+        crate::containment::fdmarker::Marker::new(prepared, None, pgid)
+    }
+
+    assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).carries_recyclable_pgid());
+    assert!(!Attached::FdMarker(marker_with_pgid(None)).carries_recyclable_pgid());
+}
+
 /// Drives the real `attach()` nested arms (not a hand-built variant): a nested
 /// (`!is_root`) contained spawn must yield BOTH halves of the delegated pair —
 /// `Containment::Delegated` and `Attached::Delegated` — for a kernel mechanism
@@ -88,7 +135,11 @@ fn nested_attach_is_delegated() {
     use crate::containment::{ContainMode, Containment};
 
     fn spawn_trivial() -> std::process::Child {
-        // attach()'s nested arms don't touch the child, so an exited child is fine.
+        // attach()'s nested arms don't touch the child, so an exited child is fine. Held for
+        // the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write end
+        // is transiently open would inherit it into this not-yet-`exec`'d process, and a
+        // concurrent sweep could then find and SIGKILL it.
+        let _guard = crate::child::spawn::spawn_lock();
         #[cfg(unix)]
         return std::process::Command::new("true").spawn().expect("spawn true");
         #[cfg(windows)]

@@ -40,11 +40,13 @@ pub enum Containment {
     /// `kill_tree` (SIGKILL) re-snapshots the host and repeats until nothing new appears AND
     /// each pass makes actual progress (no fixed pass count); a LATER pass re-signals the group
     /// too (closing a gap the single-shot `ProcessGroup` mechanism does not need to close: a
-    /// process joining the group strictly between passes), but ONLY when the root's own
-    /// identity still resolves alive — proof its pgid cannot yet have been recycled — so a
-    /// later pass never adds a NEW instance of the reuse risk beyond pass 1's existing one.
-    /// `terminate_tree` (SIGTERM, catchable and ignorable) takes exactly one pass and does not
-    /// chase forks.
+    /// process joining the group strictly between passes), but ONLY when that pass's own
+    /// marker-holder scan just confirmed a live, `getpgid`-verified member of the group — proof
+    /// the pgid had not yet been recycled at that instant — so a later pass never adds a NEW,
+    /// unconditional instance of the reuse risk beyond pass 1's existing one (see
+    /// `Marker::sweep_pass`, `src/containment/fdmarker.rs`, for the full argument and its
+    /// stated limits). `terminate_tree` (SIGTERM, catchable and ignorable) takes exactly one
+    /// pass and does not chase forks.
     ///
     /// Naive-child containment, not a sandbox. A member leaves the set by closing the
     /// descriptor, by being spawned through a path that scrubs inherited descriptors (Python's
@@ -53,8 +55,9 @@ pub enum Containment {
     /// otherwise unqueryable — a holder whose identity or fd table the OS refuses to report is
     /// left running rather than signalled blind. The marker descriptor is inherited-only, not
     /// an IPC channel: a member that writes to it blocks (nothing drains it), and after
-    /// `detach()` a write raises `SIGPIPE` instead. An elevated spawn never reports this
-    /// variant: its `sudo` wrapper closes every descriptor >= 3.
+    /// `detach()` a write raises `SIGPIPE` instead. A spawn elevated THROUGH a `sudo`/`doas`/
+    /// `pkexec` wrapper never reports this variant, since that wrapper closes every descriptor
+    /// >= 3 before exec; an already-elevated caller's spawn has no such wrapper and can.
     FdMarker,
     /// Identity-aware descendant enumeration at teardown. Misses reparented orphans.
     TreeWalk,

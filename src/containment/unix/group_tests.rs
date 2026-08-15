@@ -36,6 +36,8 @@ fn await_zombie(pid: u32) {
 #[test]
 fn members_lists_a_live_owned_group() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .process_group(0)
@@ -60,6 +62,8 @@ fn members_lists_a_live_owned_group() {
 #[test]
 fn members_marks_an_unreaped_leader_as_dead() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let child = std::process::Command::new("true")
         .process_group(0)
         .spawn()
@@ -106,6 +110,8 @@ fn members_of_an_absent_group_is_empty() {
 #[test]
 fn members_token_matches_a_live_read_of_the_same_pid() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .process_group(0)
@@ -131,6 +137,8 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
 #[test]
 fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .process_group(0)
@@ -153,6 +161,8 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
 #[test]
 fn state_of_an_all_zombie_group_is_cleared() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let child = std::process::Command::new("true")
         .process_group(0)
         .spawn()

@@ -68,6 +68,10 @@ fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::CommandExt;
     // Spawn a child in its own private group (pgid == child pid) so we can
     // SIGKILL it without disturbing the test runner's own group.
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs: a fork landing while
+    // that module's marker write end is transiently open would inherit it into this
+    // not-yet-`exec`'d process, and a concurrent sweep could then find and SIGKILL it.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .process_group(0)
@@ -99,6 +103,8 @@ fn term_group_on_owned_group_succeeds() {
     use std::os::unix::process::CommandExt;
     // `sleep` has no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
     // distinguishing "exited because of the signal" from "merely stayed reachable".
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .process_group(0)
@@ -123,6 +129,8 @@ fn term_group_on_owned_group_succeeds() {
 #[test]
 fn kill_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let child = std::process::Command::new("true")
         .process_group(0)
         .spawn()
@@ -153,6 +161,8 @@ fn kill_group_on_an_all_zombie_group_is_ok() {
 #[test]
 fn term_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let child = std::process::Command::new("true")
         .process_group(0)
         .spawn()

@@ -278,9 +278,11 @@ impl Command {
         self.contain = req;
     }
 
-    /// Suppress the macOS fd marker for this spawn. Set on an elevation-derived command,
-    /// whose `sudo`/`doas`/`pkexec` wrapper closes every descriptor >= 3 before exec, so a
-    /// marker installed here could never reach the tree.
+    /// Suppress the macOS fd marker for this spawn. Set on a REAL wrapper-spawn command
+    /// (`ElevatePosix`'s derived `sudo`/`doas`/`pkexec …`), whose wrapper closes every
+    /// descriptor >= 3 before exec, so a marker installed here could never reach the tree.
+    /// Not set on `RunAsIs`'s derived command (already elevated): that one spawns the
+    /// original program directly, with no wrapper to destroy anything.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn suppress_fd_marker(&mut self) {
         self.fd_marker_suppressed = true;

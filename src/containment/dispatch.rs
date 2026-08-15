@@ -129,6 +129,25 @@ impl Attached {
         }
     }
 
+    /// Whether this mechanism fires `killpg` against a pgid subject to the reap-then-recycle
+    /// hazard `Child::kill_tree`/`terminate_tree`'s precondition assert guards against: the OS
+    /// reaping the leader and recycling its pid/pgid onto a different, live process group
+    /// before the signal is sent. `ProcessGroup` always carries one; a macOS `FdMarker` does
+    /// too, when its mode created one (`Marker::has_pgid` — `None` for `TreeWalk`, which needs
+    /// no pgid and stays exempt, matching `Attached::TreeWalk` below). `FdMarker` fires
+    /// `killpg` on `self.pgid` unconditionally on pass 1 of every sweep, so the hazard is
+    /// identical, not merely analogous — routing every contained macOS root through
+    /// `FdMarker` instead of `ProcessGroup` must not silently drop this precondition's coverage.
+    #[cfg(unix)]
+    pub(crate) fn carries_recyclable_pgid(&self) -> bool {
+        match self {
+            Attached::ProcessGroup(_) => true,
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.has_pgid(),
+            _ => false,
+        }
+    }
+
     /// Whether this child holds an actionable tree-teardown mechanism.
     pub(crate) fn is_actionable(&self) -> bool {
         match self {
@@ -459,7 +478,13 @@ pub(crate) fn attach(
                     };
                     let pgid = match prepared.mode {
                         Some(ContainMode::TreeWalk) => None,
-                        _ => Some(pid as i32),
+                        _ => {
+                            debug_assert!(
+                                pid <= i32::MAX as u32,
+                                "pid {pid} exceeds i32::MAX; pgid cast would truncate"
+                            );
+                            Some(pid as i32)
+                        }
                     };
                     return Ok((
                         Containment::FdMarker,

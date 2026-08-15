@@ -874,4 +874,24 @@ mod rewrite_tests {
              fd marker specifically is suppressed, not containment as a whole"
         );
     }
+
+    /// `RunAsIs`'s derived command spawns the ORIGINAL program directly — no `sudo`/`doas`/
+    /// `pkexec` wrapper, hence no `closefrom` to destroy the marker. Suppressing it there
+    /// would falsely claim a guarantee that already holds; a root process spawning a
+    /// contained child on this path must still get the marker.
+    #[test]
+    fn already_elevated_requested_does_not_suppress_the_fd_marker() {
+        let mut c = Command::new();
+        c.args(["id", "-u"])
+            .contain_with(crate::ContainMode::Strongest)
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        let rw = rewrite_with_host(&mut c, &elevated_sudo_host()).expect("rewrite");
+        let derived = rw.derived.as_ref().expect("derived");
+        assert!(
+            !derived.fd_marker_suppressed(),
+            "RunAsIs spawns the original program with no wrapper; suppressing the marker here \
+             is a false justification and loses setsid-proof containment for no reason"
+        );
+    }
 }
