@@ -48,10 +48,19 @@ pub(crate) struct JobHandle {
     raw: AtomicPtr<c_void>,
     /// The I/O completion port associated with this job at creation time, before
     /// `AssignProcessToJobObject` — always, never opt-in (see `assign_to_kill_on_close_job`).
-    /// `wait_drained` deliberately does not read from it (see that method's doc for why); it is
-    /// kept here solely so the association persists for the job's lifetime and the port handle
-    /// is closed exactly once, honestly, on `Drop` rather than leaked.
-    port: HANDLE,
+    ///
+    /// `wait_drained` never reads from this port — it is NOT what the drain waits on. The drain
+    /// instead re-enumerates the job's live members with `QueryInformationJobObject` and blocks
+    /// on real `WaitForMultipleObjects` process-handle waits (see that method's doc for the full
+    /// mechanism and why: ordinary job lifecycle messages are documented by Microsoft as not
+    /// guaranteed to be delivered, so trusting them here could hang forever on one dropped
+    /// packet). The association still matters for a narrower reason: `assign_to_kill_on_close_job`
+    /// creates and associates the port *before* assigning the process, so the job never has a
+    /// live member without one — a self-imposed ordering invariant, not a functional dependency
+    /// of any watch. Kept as an atomic pointer purely so `JobHandle` stays `Sync` (a bare Windows
+    /// handle is otherwise `!Sync`, matching `raw`); never null, never taken — it is only ever
+    /// read once, in `Drop`, to close it exactly once rather than leak it.
+    port: AtomicPtr<c_void>,
 }
 
 // A Windows job-object HANDLE is a process-wide kernel handle; using it
@@ -71,9 +80,10 @@ impl std::fmt::Debug for JobHandle {
 impl JobHandle {
     fn new(handle: HANDLE, port: HANDLE) -> Self {
         debug_assert!(!handle.0.is_null(), "job handle must not be null");
+        debug_assert!(!port.0.is_null(), "job completion port handle must not be null");
         JobHandle {
             raw: AtomicPtr::new(handle.0),
-            port,
+            port: AtomicPtr::new(port.0),
         }
     }
 
@@ -166,7 +176,7 @@ impl Drop for JobHandle {
         // closed anywhere else. Closing it here, unconditionally, whether or not the tree was
         // torn down, releases the last resource this type holds.
         unsafe {
-            let _ = CloseHandle(self.port);
+            let _ = CloseHandle(HANDLE(self.port.load(Ordering::Relaxed)));
         }
     }
 }

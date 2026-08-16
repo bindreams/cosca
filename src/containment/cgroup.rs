@@ -130,8 +130,9 @@ impl CgroupLeaf {
         self.procs_fd
     }
 
-    /// The leaf's `cgroup.events` path — the async death-watch's own edge to poll, since
-    /// `wait_drained`'s `poll(2)` loop is not reusable from a reactor-native async context.
+    /// The leaf's `cgroup.events` path — the drain edge. Both watches open it for themselves:
+    /// the sync one polls it directly, while the reactor-native async one cannot reuse that
+    /// `poll(2)` loop and registers the descriptor instead.
     pub(crate) fn events_path(&self) -> PathBuf {
         self.leaf_path.join("cgroup.events")
     }
@@ -177,7 +178,7 @@ impl CgroupLeaf {
         use crate::containment::TreeDrain;
         use crate::error::Error;
 
-        let mut file = File::open(self.leaf_path.join("cgroup.events")).map_err(Error::Io)?;
+        let mut file = File::open(self.events_path()).map_err(Error::Io)?;
         let mut buf = String::new();
         loop {
             buf.clear();

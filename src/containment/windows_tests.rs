@@ -3,14 +3,15 @@
 
 #[test]
 fn job_handle_debug_does_not_panic() {
-    // Verify the Debug impl compiles and runs cleanly for a consumed handle.
+    // Verify the Debug impl compiles and runs cleanly for a consumed (raw == null) handle.
+    // `port` is never a legal null, so there is no struct-literal shortcut to that state: go
+    // through the real constructor (`create_empty_for_test`) and a real consuming path
+    // (`hard_kill`, which both nulls `raw` and closes the underlying job handle — unlike a bare
+    // `take`, it doesn't leak the real handle this constructor opened) instead of hand-building
+    // a `JobHandle`.
     use super::JobHandle;
-    use std::sync::atomic::AtomicPtr;
-    // Construct a consumed (null) JobHandle to verify the Debug impl path.
-    // SAFETY: this is test-only; we do NOT pass this to any Win32 call.
-    let h = JobHandle {
-        raw: AtomicPtr::new(std::ptr::null_mut()),
-    };
+    let h = JobHandle::create_empty_for_test();
+    h.hard_kill();
     let s = format!("{h:?}");
     assert!(s.contains("JobHandle"), "debug output: {s}");
 }
