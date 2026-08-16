@@ -229,6 +229,67 @@ where
     }
 }
 
+/// Resolve when every holder of the containment marker's write end has exited — UNBOUNDED IN
+/// BOTH TIME AND CPU, poll-free below `NOTE_LOWAT`'s clamp, reactor-native.
+///
+/// **Unlike `block_until_drained`, this future has no deadline parameter and no internal
+/// bound at all.** Below the clamp it genuinely never wakes except on `EV_EOF` (poll-free,
+/// same as the sync form). At or past the clamp (a member sustaining writes ≥ the pipe's
+/// buffer capacity), `watch_readable`'s drain-then-re-await loop has no deadline to check
+/// against, so it keeps draining and re-awaiting for as long as the writer keeps writing —
+/// CPU-proportional to the writer's throughput, for as long as the future is polled, with
+/// nothing here to end it. A caller that wants a bound MUST supply one externally (e.g.
+/// `tokio::time::timeout`, the same pattern `grace_wait` already uses over `wait_exit` in
+/// this file) — that is a caller obligation this doc states explicitly, not a property this
+/// function has.
+///
+/// Exited is not reaped: this says nothing about statuses. A caller wanting a status waits on
+/// the root as well.
+///
+/// The marker's own kqueue is what gets registered with the reactor, not the marker
+/// descriptor: a knote is keyed on `(kqueue, fd, filter)`, so a second waiter registering the
+/// same descriptor directly would take over the first's registration and park it forever —
+/// each call arms its OWN private kqueue (`marker_eof::arm`).
+///
+/// No production caller exists yet — Task 6 (`Attached::wait_drained`) wires the SYNC form
+/// only; wiring this async form into `graceful_shutdown_tree` is #62's job. `#[allow(dead_code)]`
+/// reflects that honestly, mirroring `marker_eof::probe`.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
+    wait_tree_drained_inner(read_end, None).await
+}
+
+/// Test-only entry point that reports the instant its kqueue is armed, on a channel the
+/// CALLER owns — no shared/global observer state, so concurrently-running tests (this file
+/// has four) cannot steal each other's notification.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) async fn wait_tree_drained_for_test(
+    read_end: std::os::fd::BorrowedFd<'_>,
+    armed: std::sync::mpsc::Sender<()>,
+) -> Result<(), Error> {
+    wait_tree_drained_inner(read_end, Some(armed)).await
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_tree_drained_inner(
+    read_end: std::os::fd::BorrowedFd<'_>,
+    armed: Option<std::sync::mpsc::Sender<()>>,
+) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+    // Unbounded: this future has no deadline parameter at all (see the doc comment above).
+    let kq = crate::containment::marker_eof::arm(read_end, true)?;
+    if let Some(tx) = armed {
+        let _ = tx.send(());
+    }
+    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
+    watch_readable(&afd, move |kq| {
+        crate::containment::marker_eof::drain_kqueue(kq, read_end).map(|d| d.map(|_| ()))
+    })
+    .await
+}
+
 #[cfg(test)]
 #[path = "wait_tests.rs"]
 mod wait_tests;

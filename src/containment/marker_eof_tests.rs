@@ -535,3 +535,113 @@ fn self_thread_cpu_time() -> Duration {
     );
     Duration::from_secs(ts.tv_sec.max(0) as u64) + Duration::from_nanos(ts.tv_nsec.max(0) as u64)
 }
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_wait_resolves_when_the_last_member_exits() {
+    // `join!` polling `watch` before `end` is an implementation detail, not a contract — so
+    // ordering is enforced with a real, per-call channel, not assumed from poll order.
+    // `armed_rx.recv()` (blocking, moved to a blocking-pool thread) only returns once
+    // `wait_tree_drained_for_test` has actually armed its kqueue; `drop(stdin)` happens
+    // strictly after that.
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let fd = marker.as_fd();
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let watch = crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx);
+    let end = async move {
+        ::tokio::task::spawn_blocking(move || armed_rx.recv().expect("watch armed"))
+            .await
+            .unwrap();
+        drop(stdin);
+    };
+    let (watched, ()) = ::tokio::join!(watch, end);
+    watched.expect("async drain watch");
+    child.wait().expect("reap");
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn two_concurrent_async_waiters_both_observe_the_drain() {
+    // Each waiter owns a private kqueue, so their knotes cannot displace each other.
+    // Registering the same raw descriptor twice on the reactor instead would park one waiter
+    // forever — but that only manifests across a LIVE-to-DRAINED transition (stickiness means
+    // an already-drained descriptor resolves both registrations on the spot even with the
+    // collision bug present, silently duplicating
+    // `async_wait_resolves_immediately_for_an_already_drained_tree` instead of catching
+    // anything). So both waiters get their own armed handshake, and `drop(stdin)` is provably
+    // AFTER both have armed — not left to `tokio::join!`'s poll order, the same reasoning the
+    // sibling test above this one already applies.
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let fd = marker.as_fd();
+    let (a_armed_tx, a_armed_rx) = std::sync::mpsc::channel();
+    let (b_armed_tx, b_armed_rx) = std::sync::mpsc::channel();
+    let a = crate::tokio::wait::wait_tree_drained_for_test(fd, a_armed_tx);
+    let b = crate::tokio::wait::wait_tree_drained_for_test(fd, b_armed_tx);
+    let end = async move {
+        ::tokio::task::spawn_blocking(move || {
+            a_armed_rx.recv().expect("waiter a armed");
+            b_armed_rx.recv().expect("waiter b armed");
+        })
+        .await
+        .unwrap();
+        drop(stdin);
+    };
+    let (ra, rb, ()) = ::tokio::join!(a, b, end);
+    ra.expect("waiter a");
+    rb.expect("waiter b");
+    child.wait().expect("reap");
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_wait_resolves_immediately_for_an_already_drained_tree() {
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
+    drop(stdin);
+    child.wait().expect("reap");
+    crate::tokio::wait::wait_tree_drained(marker.as_fd())
+        .await
+        .expect("already-drained watch");
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_wait_discards_small_bytes_written_by_a_member() {
+    // The async counterpart to the sync `small_bytes_from_a_member_are_not_a_drain`: the
+    // integration between `drain_kqueue` and `watch_readable`'s clear_ready discipline is new
+    // code. (A few bytes stay below the NOTE_LOWAT clamp, so this resolves via the real EOF
+    // from `drop(stdin)`, not via the discard branch — that branch's async coverage would
+    // need a >64 KiB write, which is deliberately left to the sync suite (Task 3), since
+    // proving the SAME bounded-drain mechanics twice adds little once the sync path already
+    // pins it directly.)
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh")
+        .args(["sh", "-c", "echo noise >&3; echo ready >&4; exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
+    cmd.fd(4, crate::Stdio::pipe_out()).expect("report pipe");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let report = child.fd_read_end(4.into()).expect("report read end");
+    let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
+
+    let fd = marker.as_fd();
+    let watch = crate::tokio::wait::wait_tree_drained(fd);
+    let end = async move {
+        // Blocking read on the report pipe: real synchronization for "the bytes are on the
+        // marker now", off the async executor thread so it can't stall the reactor.
+        ::tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut byte = [0u8; 1];
+            let mut report = report;
+            report
+                .read_exact(&mut byte)
+                .expect("child wrote to fd 3 before this returns");
+        })
+        .await
+        .unwrap();
+        drop(stdin);
+    };
+    let (watched, ()) = ::tokio::join!(watch, end);
+    watched.expect("async drain watch after discarding bytes");
+    child.wait().expect("reap");
+}
