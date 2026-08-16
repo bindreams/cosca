@@ -284,11 +284,11 @@ pub(crate) async fn wait_tree_deadline(
     match crate::wait::remaining(deadline) {
         None => {
             wait_tree_drained(read_end).await?;
-            Ok(TreeDrain::AllMembersExited)
+            Ok(TreeDrain::AllMarkersClosed)
         }
         Some(d) if d.is_zero() => crate::containment::marker_eof::probe(read_end),
         Some(d) => match ::tokio::time::timeout(d, wait_tree_drained(read_end)).await {
-            Ok(res) => res.map(|()| TreeDrain::AllMembersExited),
+            Ok(res) => res.map(|()| TreeDrain::AllMarkersClosed),
             Err(_elapsed) => Ok(TreeDrain::MembersRemain),
         },
     }
@@ -338,14 +338,12 @@ async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
-    use std::io::{Read, Seek, SeekFrom};
-
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
 
     use crate::containment::TreeDrain;
 
-    use crate::containment::cgroup::removed_after_drain;
+    use crate::containment::cgroup::{read_populated, removed_after_drain};
 
     let file = match std::fs::File::open(leaf.events_path()) {
         Ok(f) => f,
@@ -355,37 +353,14 @@ async fn cgroup_wait_tree_drained(
     let mut afd = AsyncFd::with_interest(file, Interest::PRIORITY).map_err(Error::Io)?;
     let mut buf = String::new();
     loop {
-        buf.clear();
         // Mirrors `CgroupLeaf::wait_drained`'s own leaf-removal race handling exactly (see its
-        // doc): `rmdir` on this leaf — `Drop`'s own retry, or an external cgroup manager's
-        // cleanup of an already-empty leaf — can land between this loop's own `ready()` wakeup
-        // and its next read, and observing that removal is itself proof every member had
-        // already exited (rmdir cannot precede full drain), not a failure.
-        {
-            let f = afd.get_mut();
-            if let Err(e) = f.seek(SeekFrom::Start(0)) {
-                return if removed_after_drain(&e) {
-                    Ok(TreeDrain::AllMembersExited)
-                } else {
-                    Err(Error::Io(e))
-                };
-            }
-            if let Err(e) = f.read_to_string(&mut buf) {
-                return if removed_after_drain(&e) {
-                    Ok(TreeDrain::AllMembersExited)
-                } else {
-                    Err(Error::Io(e))
-                };
-            }
-        }
-        match crate::containment::cgroup::parse_populated(&buf) {
-            Some(false) => return Ok(TreeDrain::AllMembersExited),
-            Some(true) => {}
-            None => {
-                return Err(Error::Io(std::io::Error::other(
-                    "cgroup.events has no 'populated' field — unexpected kernel format",
-                )))
-            }
+        // doc, and `read_populated`'s own): `rmdir` on this leaf — `Drop`'s own retry, or an
+        // external cgroup manager's cleanup of an already-empty leaf — can land between this
+        // loop's own `ready()` wakeup and its next read, and observing that removal is itself
+        // proof every member had already exited (rmdir cannot precede full drain), not a
+        // failure.
+        if !read_populated(afd.get_mut(), &mut buf)? {
+            return Ok(TreeDrain::AllMembersExited);
         }
         let remaining = crate::wait::remaining(deadline);
         if remaining == Some(std::time::Duration::ZERO) {
@@ -409,18 +384,29 @@ async fn cgroup_wait_tree_drained(
 /// Job objects expose no pollable handle, so — unlike the Linux/macOS arms in this file — this
 /// is NOT reactor-native: it hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
 /// releasing the blocking thread promptly on drop via the same cancel-event idiom
-/// `blocking_watch` uses for `grace_wait`. Only the raw `HANDLE` value (`Copy`, `Send`) crosses
-/// into the blocking closure — `JobHandle` itself is never moved there — because the closure
-/// must be `'static` while `JobHandle` is only borrowed. This is sound because the caller
-/// (`wait_tree_drained`, transitively `tokio::Child::wait_tree`/`wait_tree_timeout`) holds
-/// `&Child` — and so `&JobHandle` — across this entire `.await`, so the job handle cannot be
-/// closed while the blocking task runs.
+/// `blocking_watch` uses for `grace_wait`.
+///
+/// **Handle ownership across cancellation.** `blocking_watch` gets away with borrowing nothing
+/// at all — it re-derives a process handle from a `ProcessId` inside the closure. A job object
+/// has no such re-openable identity, so this function instead duplicates the live job `HANDLE`
+/// into one the spawned task owns outright (`DuplicateHandle`, closed by the closure itself on
+/// every exit path, panic included) before ever spawning. This matters because dropping THIS
+/// future only cancels the `.await` — it does not join the blocking task, which keeps running
+/// detached. A caller cancelling the `wait_tree`/`wait_tree_timeout` future (via `select!`, an
+/// outer `timeout()`, or simply not polling it again) can therefore race `JobHandle::hard_kill`/
+/// `Drop` closing the ORIGINAL handle while the detached task is still mid-syscall on it. A
+/// borrowed raw `HANDLE` would then alias a handle value the kernel is free to recycle onto an
+/// unrelated object the moment it is closed; the duplicate has its own independent lifetime,
+/// closed only by the task that owns it, and is never touched by `JobHandle` at all — so no
+/// such aliasing is possible regardless of what the caller does with the `Child` after
+/// cancelling.
 #[cfg(windows)]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
 
     // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
     // call that cannot block (mirrors grace_wait's identical delegation).
@@ -430,19 +416,43 @@ async fn job_wait_tree_drained(
     let Some(raw_job) = job.as_handle() else {
         // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
         // reaches here once that method's Duration::ZERO delegation above has already been
-        // ruled out): the job handle was already consumed, so there is no live handle left to
-        // re-enumerate or open member handles from, and `TerminateJobObject`/`CloseHandle` are
-        // not documented as synchronous with member process teardown. Reporting
-        // `AllMembersExited` here would be a guess, not a live-checked verdict — see that
-        // method's doc and inline comment for the full justification.
-        return Err(Error::Unassessable {
-            detail: "the job handle was already closed (kill_tree()/hard_kill(), or the Child \
-                     was dropped) before this drain check ran; whether every member has \
-                     actually finished exiting can no longer be observed"
-                .into(),
-            source: None,
-        });
+        // ruled out) — see `consumed_job_handle_error`'s own doc for the full justification.
+        return Err(crate::containment::windows::consumed_job_handle_error());
     };
+
+    /// An independently-owned duplicate of the job handle, held only by the spawned blocking
+    /// task and closed by it on every exit path, panic included — see this function's own doc
+    /// for why a borrowed handle is not safe to hand across the cancellation boundary here.
+    /// Closing a job handle only fires `KILL_ON_JOB_CLOSE` if it is the LAST open handle to
+    /// that job (Win32 semantics); `JobHandle`'s own, separate handle is unaffected either way.
+    struct OwnedJobDup(HANDLE);
+    impl Drop for OwnedJobDup {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is this struct's own `DuplicateHandle`-created handle, never
+            // shared or aliased anywhere else.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let mut dup = HANDLE::default();
+    // SAFETY: `raw_job` was just confirmed live via `job.as_handle()` above. Duplicating
+    // within our own process with `DUPLICATE_SAME_ACCESS` produces an independent handle to
+    // the same job object, valid for the spawned task's full lifetime regardless of what
+    // happens to `job`/`JobHandle` afterward.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            raw_job,
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .map_err(|e| Error::Io(std::io::Error::from(e)))?;
+    let job_dup = OwnedJobDup(dup);
 
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
     /// releases promptly instead of parking out the deadline, and `Runtime::drop` — which
@@ -460,24 +470,27 @@ async fn job_wait_tree_drained(
     let cancel_raw = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&*cancel));
     let cancel_for_blocking = cancel.clone();
 
-    /// `HANDLE`'s raw pointer is `!Send` by default; a job or event handle is sound to use
-    /// from another thread (the kernel serialises handle operations) — the same justification
-    /// as `JobHandle`'s own `unsafe impl Send`.
+    /// `HANDLE`'s raw pointer is `!Send` by default; a job or event handle (owned or borrowed
+    /// for the task's own full lifetime) is sound to use and close from another thread — the
+    /// kernel serialises handle operations — the same justification as `JobHandle`'s own
+    /// `unsafe impl Send`.
     struct SendHandles {
-        job: HANDLE,
+        job: OwnedJobDup,
         cancel: HANDLE,
     }
     unsafe impl Send for SendHandles {}
     let handles = SendHandles {
-        job: raw_job,
+        job: job_dup,
         cancel: cancel_raw,
     };
 
     let joined = ::tokio::task::spawn_blocking(move || {
         let handles = handles;
-        let result = crate::containment::windows::wait_drained_raw(handles.job, deadline, Some(handles.cancel));
+        let result = crate::containment::windows::wait_drained_raw(handles.job.0, deadline, Some(handles.cancel));
         drop(cancel_for_blocking); // keep the handle alive for the full blocking call, explicitly
         result
+        // `handles.job` (`OwnedJobDup`) drops here on every path, including an early return
+        // from `wait_drained_raw` above, closing our duplicate independently of `JobHandle`.
     })
     .await;
     match joined {
@@ -510,7 +523,19 @@ pub(crate) async fn wait_tree_drained_dispatch(
         #[cfg(windows)]
         crate::containment::Attached::JobObject(job) => job_wait_tree_drained(job, deadline).await,
         #[cfg(target_os = "macos")]
-        crate::containment::Attached::FdMarker(m) => wait_tree_deadline(m.read_end(), deadline).await,
+        crate::containment::Attached::FdMarker(m) => {
+            // Mirrors `Marker::wait_drained`'s own preamble exactly: a reissued read-end fd
+            // would falsely deliver `EV_EOF` instantly here just as readily as it would there,
+            // so this path must not skip the check just because it reads the raw fd directly
+            // instead of going through `Marker::wait_drained`.
+            m.check_read_end_still_valid()?;
+            debug_assert_ne!(
+                crate::containment::marker_eof::write_end_check(m.read_end()),
+                crate::containment::marker_eof::WriteEndCheck::HeldByUs,
+                "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
+            );
+            wait_tree_deadline(m.read_end(), deadline).await
+        }
         other => other.wait_drained(deadline),
     }
 }

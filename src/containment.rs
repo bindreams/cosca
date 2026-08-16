@@ -102,12 +102,44 @@ impl Containment {
 
 /// Whether every member of the contained tree has exited (not reaped — a descriptor/kernel-state
 /// change, never a collected zombie; a caller wanting a status still waits on the root).
+///
+/// `AllMembersExited` and `AllMarkersClosed` are NOT interchangeable evidence, despite both
+/// meaning "nothing more to wait for from this channel". [`Containment::CgroupV2`]'s
+/// `cgroup.events` `populated` field and [`Containment::JobObject`]'s job membership count are
+/// KERNEL-OWNED: a live process cannot leave either set without exiting, so `AllMembersExited`
+/// from either is positive, sufficient proof the whole tree is gone — safe to skip a hard sweep
+/// on. [`Containment::FdMarker`]'s pipe EOF is ADVISORY, not membership-owning: a live process
+/// can leave the marker's holder set early by closing its own copy of the inherited descriptor
+/// (deliberately, or as a side effect of something else it does) while remaining alive —
+/// undetectable by this edge alone. Treat `AllMarkersClosed` as "no more evidence of survivors
+/// from this channel", never as proof no survivor exists; in particular, never use it alone to
+/// skip a hard sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeDrain {
-    /// Every member of the tree has exited. Statuses have NOT been collected.
+    /// Every member of the tree has exited, confirmed by a kernel-owned membership count a live
+    /// process cannot leave without exiting. Statuses have NOT been collected.
     AllMembersExited,
+    /// The macOS fd marker's last held copy of the marker descriptor closed. Advisory, not
+    /// authoritative — see this type's own doc.
+    AllMarkersClosed,
     /// At least one member was still running at the deadline.
     MembersRemain,
+}
+
+impl TreeDrain {
+    /// Whether this verdict is, on its own with no corroboration, positive kernel-confirmed
+    /// proof the whole tree exited — strong enough that a hard sweep afterward would be pure
+    /// overhead and can be skipped. Only `AllMembersExited` qualifies; see this type's own doc
+    /// for why `AllMarkersClosed` does not. Named for the decision, not the mechanism, and
+    /// matched exhaustively (no wildcard) so adding a future variant is a compile error HERE —
+    /// the one place this decision is made — rather than a silent default at every call site
+    /// that would otherwise need its own copy of this match.
+    pub(crate) fn permits_skipping_sweep(&self) -> bool {
+        match self {
+            TreeDrain::AllMembersExited => true,
+            TreeDrain::AllMarkersClosed | TreeDrain::MembersRemain => false,
+        }
+    }
 }
 
 /// Guard for the `_tree` operations, shared by the sync and async `Child`: they act on the

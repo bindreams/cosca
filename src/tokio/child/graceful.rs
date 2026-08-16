@@ -170,18 +170,21 @@ impl Child {
 
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
         //
-        // `drained`: whether the sweep below is skippable. On a drain-observable mechanism
-        // this is positive kernel-confirmed proof the WHOLE tree exited, so the sweep would be
-        // pure overhead — skip it. On every other mechanism there is no such edge, so `drained`
-        // stays `false` unconditionally and the sweep always runs, exactly as before this
-        // distinction existed. `root_exited`: whether the root specifically was observed to
-        // have exited. A drained tree implies it. On the root-only-watch mechanism (the `else`
-        // arm below) it is that watch's own result. On a drain-observable mechanism whose tree
-        // did NOT fully drain (`MembersRemain`) it comes from a fresh, non-blocking,
-        // zero-duration probe of the root alone, immediately below — a tree-wide `MembersRemain`
-        // verdict says nothing about the root specifically (only some OTHER member may still be
-        // alive), and the probe costs nothing extra since `grace` was already fully spent by
-        // the tree-drain watch that just returned it. Used only below, to decide whether a
+        // `drained`: whether the sweep below is skippable. Only `TreeDrain::AllMembersExited`
+        // (`permits_skipping_sweep`) makes it true — positive kernel-confirmed proof the WHOLE
+        // tree exited, from a mechanism a live process cannot leave without exiting, so the
+        // sweep would be pure overhead. `AllMarkersClosed` (the macOS marker's advisory pipe
+        // EOF — see `TreeDrain`'s own doc) is NOT that proof: a live process can close its own
+        // copy of the marker descriptor and remain alive, undetectable by this edge alone, so
+        // it falls into the same "always sweep" bucket as `MembersRemain` and every mechanism
+        // with no drain edge at all. `root_exited`: whether the root specifically was observed
+        // to have exited. A skipped-sweep tree implies it. On the root-only-watch mechanism
+        // (the `else` arm below) it is that watch's own result. Everywhere else it comes from a
+        // fresh, non-blocking, zero-duration probe of the root alone, immediately below — a
+        // tree-wide verdict that isn't sufficient to skip the sweep says nothing about the root
+        // specifically (only some OTHER member may still be alive), and the probe costs nothing
+        // extra since `grace` was already fully spent by the tree-drain watch that just
+        // returned it. Used only below, to decide whether a
         // best-effort reap is safe after a sweep failure.
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
@@ -189,13 +192,13 @@ impl Child {
             match crate::tokio::wait::wait_tree_drained_dispatch(&self.attached, crate::wait::deadline_from(grace))
                 .await
             {
-                Ok(crate::containment::TreeDrain::AllMembersExited) => (true, true, None),
-                Ok(crate::containment::TreeDrain::MembersRemain) => {
-                    match crate::tokio::wait::grace_wait(self.id(), Duration::ZERO).await {
-                        Ok(exited) => (false, exited, None),
-                        Err(e) => (false, false, Some(e)),
-                    }
-                }
+                Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
+                // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
+                // to the fresh, non-blocking, zero-duration root probe described there.
+                Ok(_) => match crate::tokio::wait::grace_wait(self.id(), Duration::ZERO).await {
+                    Ok(exited) => (false, exited, None),
+                    Err(e) => (false, false, Some(e)),
+                },
                 Err(e) => (false, false, Some(e)),
             }
         } else {
@@ -316,6 +319,23 @@ pub(crate) mod fault {
     }
     pub(crate) fn forced_kill_tree_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
+    }
+
+    /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
+    /// full rationale (a test harness thread is reused across test functions, so a seam armed
+    /// but never consumed must still be cleared even if this test's own assertions panic first).
+    #[must_use]
+    pub(crate) struct ArmedKillTreeError;
+    impl ArmedKillTreeError {
+        pub(crate) fn arm() -> Self {
+            set_force_kill_tree_error(true);
+            Self
+        }
+    }
+    impl Drop for ArmedKillTreeError {
+        fn drop(&mut self) {
+            set_force_kill_tree_error(false);
+        }
     }
     // No `armed()` here — see the sync twin's identical note.
     pub(crate) fn forced_terminate_error(kind: Forced) -> crate::error::Error {

@@ -411,7 +411,7 @@ fn wait_drained_is_unsupported_without_a_marker() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn wait_drained_reports_members_remain_then_all_members_exited() {
+fn wait_drained_reports_members_remain_then_all_markers_closed() {
     use super::Attached;
     use crate::containment::fdmarker::{pipe_handle_of, Marker, PreparedMarker};
     use crate::containment::TreeDrain;
@@ -455,6 +455,6 @@ fn wait_drained_reports_members_remain_then_all_members_exited() {
         attached
             .wait_drained(None)
             .expect("unbounded wait after the holder exits"),
-        TreeDrain::AllMembersExited
+        TreeDrain::AllMarkersClosed
     );
 }

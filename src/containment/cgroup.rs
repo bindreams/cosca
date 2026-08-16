@@ -114,6 +114,40 @@ pub(crate) fn removed_after_drain(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENODEV) | Some(libc::ENOENT))
 }
 
+/// Seek to the start of `file` (a `cgroup.events` handle) and read its current `populated`
+/// value. Shared verbatim by `CgroupLeaf::wait_drained`'s sync loop and its tokio twin,
+/// `cgroup_wait_tree_drained` — the only difference between the two callers is how each awaits
+/// the next readiness edge, not how either reads or classifies the file.
+///
+/// A leaf removed after every member has exited (see [`removed_after_drain`]) is reported as
+/// `Ok(false)`: the leaf's own removal is itself proof of a full drain, indistinguishable in
+/// meaning from an explicit `populated 0`.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, crate::error::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    buf.clear();
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        return if removed_after_drain(&e) {
+            Ok(false)
+        } else {
+            Err(crate::error::Error::Io(e))
+        };
+    }
+    if let Err(e) = file.read_to_string(buf) {
+        return if removed_after_drain(&e) {
+            Ok(false)
+        } else {
+            Err(crate::error::Error::Io(e))
+        };
+    }
+    parse_populated(buf).ok_or_else(|| {
+        crate::error::Error::Io(io::Error::other(
+            "cgroup.events has no 'populated' field — unexpected kernel format",
+        ))
+    })
+}
+
 /// A live leaf sub-cgroup created for a single spawned process tree.
 ///
 /// The `pre_exec` closure writes `"0"` to `procs_fd` to place the forked
@@ -196,8 +230,6 @@ impl CgroupLeaf {
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        use std::io::{Read, Seek, SeekFrom};
-
         use rustix::event::{poll, PollFd, PollFlags};
 
         use crate::containment::TreeDrain;
@@ -210,29 +242,8 @@ impl CgroupLeaf {
         };
         let mut buf = String::new();
         loop {
-            buf.clear();
-            if let Err(e) = file.seek(SeekFrom::Start(0)) {
-                return if removed_after_drain(&e) {
-                    Ok(TreeDrain::AllMembersExited)
-                } else {
-                    Err(Error::Io(e))
-                };
-            }
-            if let Err(e) = file.read_to_string(&mut buf) {
-                return if removed_after_drain(&e) {
-                    Ok(TreeDrain::AllMembersExited)
-                } else {
-                    Err(Error::Io(e))
-                };
-            }
-            match parse_populated(&buf) {
-                Some(false) => return Ok(TreeDrain::AllMembersExited),
-                Some(true) => {}
-                None => {
-                    return Err(Error::Io(io::Error::other(
-                        "cgroup.events has no 'populated' field — unexpected kernel format",
-                    )))
-                }
+            if !read_populated(&mut file, &mut buf)? {
+                return Ok(TreeDrain::AllMembersExited);
             }
             let remaining = crate::wait::remaining(deadline);
             if remaining == Some(std::time::Duration::ZERO) {

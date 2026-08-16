@@ -214,10 +214,10 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     let _ = child.wait().await;
 }
 
-// Async twin of `graceful_tree_drained_skips_sweep_when_mechanism_allows` — see there for the
-// full rationale.
+// Async twin of `graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative` —
+// see there for the full rationale.
 #[tokio::test]
-async fn async_graceful_tree_drained_skips_sweep_when_mechanism_allows() {
+async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
     cmd.args(["sleep", "30"]);
@@ -225,15 +225,19 @@ async fn async_graceful_tree_drained_skips_sweep_when_mechanism_allows() {
     cmd.args(["ping", "-n", "30", "127.0.0.1"]);
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
-    let drainable = child.containment().can_observe_drain();
-    term_fault::set_force_kill_tree_error(true);
+    let authoritative = matches!(
+        child.containment(),
+        crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
+    );
+    let armed = term_fault::ArmedKillTreeError::arm();
     let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
-    if drainable {
-        let status = result.expect("a fully-drained tree must not invoke the sweep at all");
+    if authoritative {
+        let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
         assert!(
             term_fault::kill_tree_armed(),
             "the forced kill_tree failure must still be armed — the sweep was never entered"
         );
+        drop(armed); // disarm now that this branch's own assertion above has run
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
@@ -246,11 +250,12 @@ async fn async_graceful_tree_drained_skips_sweep_when_mechanism_allows() {
         #[cfg(windows)]
         let _ = status;
     } else {
-        let err = result.expect_err("a non-drainable mechanism must always run the sweep");
+        let err = result.expect_err("a non-authoritative mechanism must always run the sweep");
         assert!(
             !term_fault::kill_tree_armed(),
             "the sweep must have consumed the forced-failure seam"
         );
+        drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
         assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
         let _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
         let _ = child.wait().await;
@@ -258,14 +263,25 @@ async fn async_graceful_tree_drained_skips_sweep_when_mechanism_allows() {
 }
 
 // Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` — see there
-// for the full rationale.
+// for the full rationale, including the readiness handshake that closes the root's own
+// trap-installation race.
 #[cfg(unix)]
 #[tokio::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+    use tokio::io::AsyncReadExt;
+
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & exit 0"]);
+    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & echo r; exit 0"]);
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
+    let mut readiness = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut readiness)
+        .await
+        .expect("readiness byte");
     let id = child.id();
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
@@ -283,12 +299,61 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
         crate::identity::Existence::Gone,
         "an already-exited root must be best-effort reaped even when the sweep fails ({})",
         if drainable {
-            "MembersRemain branch — the #62 round-2 fix"
+            "MembersRemain branch"
         } else {
             "non-drain-observable fallback branch — pre-existing, unaffected behavior"
         }
     );
     // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
+    // still alive — a real sweep now (the seam is already consumed) actually kills it.
+    let _ = child.kill_tree();
+}
+
+// Async twin of `windows_graceful_tree_members_remain_still_reaps_an_already_exited_root` — see
+// there for the full rationale, including the `test_child::fixture_survives_group_signal`
+// fixture that plays the Unix root shell's role.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
+    cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ENV, "1");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let mut readiness = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut readiness)
+        .await
+        .expect("readiness byte");
+    let id = child.id();
+    let drainable = child.containment().can_observe_drain();
+    term_fault::set_force_kill_tree_error(true);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_secs(2))
+        .await
+        .expect_err("the forced sweep failure must surface");
+    assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+    assert!(
+        !term_fault::kill_tree_armed(),
+        "the sweep must have consumed the forced-failure seam"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
+        if drainable {
+            "MembersRemain branch"
+        } else {
+            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
+        }
+    );
+    // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.
     let _ = child.kill_tree();
 }

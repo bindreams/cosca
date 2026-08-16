@@ -1021,7 +1021,11 @@ impl Marker {
     /// indication anything was wrong. A single debug-only line is not enough defense for that
     /// severity; it is checked in EVERY build, and a violation refuses to sweep at all rather
     /// than proceeding on a handle that may no longer mean what `self` claims.
-    fn check_read_end_still_valid(&self) -> Result<(), Error> {
+    ///
+    /// `pub(crate)`: also called from the async dispatch path (`crate::tokio::wait`) before it
+    /// reads `self.read`'s raw fd directly, for the same reason — a reissued fd there would
+    /// falsely report `EV_EOF` just as readily as it would here.
+    pub(crate) fn check_read_end_still_valid(&self) -> Result<(), Error> {
         let read_still_valid = matches!(
             fd_pipe_info(std::process::id(), self.read.as_raw_fd()),
             FdPipeInfoQuery::Found(info) if info.pipe_handle == self.read_handle

@@ -505,26 +505,28 @@ impl JobHandle {
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         let Some(job) = self.as_handle() else {
             // The job was already consumed — `hard_kill()` or `Drop` already ran, nulling `raw`
-            // and closing the underlying handle. `TerminateJobObject`/`CloseHandle` are NOT
-            // documented as synchronous with member process teardown (pending I/O, for one, can
-            // outlive both calls), so "we already told it to die" is not live evidence that
-            // every member has actually finished exiting. Once the handle is gone there is also
-            // no longer any way to ask — `QueryInformationJobObject` needs a live job handle,
-            // and none of `JobHandle`'s fields keep the individual member pids around to fall
-            // back on. Reporting `AllMembersExited` here would be exactly the guess this
-            // function's own doc promises never to make; `Unassessable` says plainly that the
-            // answer can no longer be observed, rather than asserting one nothing here
-            // re-checked. No `source`: nothing was asked of the OS on this path at all — the
-            // handle was already gone before any call could be made.
-            return Err(crate::error::Error::Unassessable {
-                detail: "the job handle was already closed (kill_tree()/hard_kill(), or the \
-                         Child was dropped) before this drain check ran; whether every member \
-                         has actually finished exiting can no longer be observed"
-                    .into(),
-                source: None,
-            });
+            // and closing the underlying handle. See `consumed_job_handle_error`'s own doc for
+            // why that is reported as `Unassessable` rather than a guessed `AllMembersExited`.
+            return Err(consumed_job_handle_error());
         };
         wait_drained_raw(job, deadline, cancel)
+    }
+}
+
+/// The [`Error::Unassessable`](crate::error::Error::Unassessable) reported when a drain check
+/// finds the job handle already closed (`kill_tree()`/`hard_kill()`, or the `Child` was
+/// dropped): `TerminateJobObject`/`CloseHandle` are not documented as synchronous with member
+/// process teardown, so once the handle is gone there is no way left to ask whether every member
+/// has actually finished exiting — reporting `AllMembersExited` here would be a guess, not a
+/// live-checked verdict. Shared verbatim by `JobHandle::wait_drained`'s own early return and its
+/// tokio twin, `job_wait_tree_drained`.
+pub(crate) fn consumed_job_handle_error() -> crate::error::Error {
+    crate::error::Error::Unassessable {
+        detail: "the job handle was already closed (kill_tree()/hard_kill(), or the Child was \
+                 dropped) before this drain check ran; whether every member has actually \
+                 finished exiting can no longer be observed"
+            .into(),
+        source: None,
     }
 }
 
@@ -628,6 +630,16 @@ pub(crate) fn wait_drained_raw(
             idx < wait_set.len(),
             "unexpected WaitForMultipleObjects verdict: {waited:?}"
         );
+        if idx >= wait_set.len() {
+            // Same anomaly the debug_assert above catches in debug builds — surfaced here too
+            // so a release build does not silently fall through to "treat as a member exit and
+            // re-enumerate" without any trace of the OS having returned an unexpected verdict.
+            log::warn!(
+                "wait_tree: unexpected WaitForMultipleObjects verdict {waited:?} (index {idx} \
+                 outside the {} handles waited on) - re-enumerating regardless",
+                wait_set.len()
+            );
+        }
         if cancel.is_some() && idx == handles.len() {
             // The cancel handle was signaled — the caller's future was dropped. The
             // tree's drain state is genuinely unknown at this instant; report it exactly
@@ -701,8 +713,20 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
         let _ = CloseHandle(snap);
     }
 
+    // The doc above promises this unconditionally ("If ResumeThread fails the child is killed
+    // immediately and an error returned") — that must hold even when SOME threads resumed
+    // successfully before another one failed, not only when every one did: a thread left
+    // suspended is exactly the "frozen process" this function exists to rule out, regardless of
+    // how many of its siblings got moving first.
+    if let Some(e) = last_err {
+        log::warn!(
+            "wait_tree: failed to resume one or more of this child's initial threads \
+             ({resumed} resumed successfully before the failure): {e}"
+        );
+        return Err(e);
+    }
     if resumed == 0 {
-        return Err(last_err.unwrap_or_else(|| io::Error::other("no suspended threads resumed")));
+        return Err(io::Error::other("no suspended threads resumed"));
     }
     Ok(())
 }
