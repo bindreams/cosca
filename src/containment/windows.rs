@@ -479,11 +479,14 @@ impl JobHandle {
     /// pids and block on `WaitForMultipleObjects(bWaitAll = FALSE)`. A process handle becoming
     /// signaled on exit is an unconditional, always-honored OS guarantee — unlike a job message
     /// — so as long as this round's tree is non-empty, at least one tracked handle WILL
-    /// eventually signal, forcing a fresh re-enumeration next round. This can never falsely
-    /// report `AllMembersExited` (that verdict is only ever reached via a live re-count of
-    /// zero); it can only be slow to *notice* full drain when concurrently-live membership
-    /// exceeds `MAXIMUM_WAIT_OBJECTS - 1` in a single round (this round's un-tracked excess is
-    /// picked up on the NEXT re-enumeration, once a tracked handle signals).
+    /// eventually signal, forcing a fresh re-enumeration next round. While the job handle is
+    /// still open, this can never falsely report `AllMembersExited` (that verdict is only ever
+    /// reached via a live re-count of zero); it can only be slow to *notice* full drain when
+    /// concurrently-live membership exceeds `MAXIMUM_WAIT_OBJECTS - 1` in a single round (this
+    /// round's un-tracked excess is picked up on the NEXT re-enumeration, once a tracked handle
+    /// signals). If the job handle has ALREADY been consumed by the time this call runs, there
+    /// is nothing left to re-enumerate at all — see the early return below, which reports
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) rather than guess.
     ///
     /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
     /// interval is chosen anywhere in this path: every round blocks in one
@@ -501,9 +504,25 @@ impl JobHandle {
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         let Some(job) = self.as_handle() else {
-            // The job was already consumed (killed/dropped) by the time this call runs — the
-            // tree it owned is gone.
-            return Ok(crate::containment::TreeDrain::AllMembersExited);
+            // The job was already consumed — `hard_kill()` or `Drop` already ran, nulling `raw`
+            // and closing the underlying handle. `TerminateJobObject`/`CloseHandle` are NOT
+            // documented as synchronous with member process teardown (pending I/O, for one, can
+            // outlive both calls), so "we already told it to die" is not live evidence that
+            // every member has actually finished exiting. Once the handle is gone there is also
+            // no longer any way to ask — `QueryInformationJobObject` needs a live job handle,
+            // and none of `JobHandle`'s fields keep the individual member pids around to fall
+            // back on. Reporting `AllMembersExited` here would be exactly the guess this
+            // function's own doc promises never to make; `Unassessable` says plainly that the
+            // answer can no longer be observed, rather than asserting one nothing here
+            // re-checked. No `source`: nothing was asked of the OS on this path at all — the
+            // handle was already gone before any call could be made.
+            return Err(crate::error::Error::Unassessable {
+                detail: "the job handle was already closed (kill_tree()/hard_kill(), or the \
+                         Child was dropped) before this drain check ran; whether every member \
+                         has actually finished exiting can no longer be observed"
+                    .into(),
+                source: None,
+            });
         };
         wait_drained_raw(job, deadline, cancel)
     }

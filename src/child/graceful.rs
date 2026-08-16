@@ -165,15 +165,25 @@ impl Child {
         // pure overhead — skip it. On every other mechanism there is no such edge, so `drained`
         // stays `false` unconditionally and the sweep always runs, exactly as before this
         // distinction existed. `root_exited`: whether the root specifically was observed to
-        // have exited (a drained tree implies it; otherwise it is the root-only watch's own
-        // result) — used only below, to decide whether a best-effort reap is safe after a
-        // sweep failure.
+        // have exited. A drained tree implies it. On the root-only-watch mechanism (the `else`
+        // arm below) it is that watch's own result. On a drain-observable mechanism whose tree
+        // did NOT fully drain (`MembersRemain`) it comes from a fresh, non-blocking,
+        // zero-duration probe of the root alone, immediately below — a tree-wide `MembersRemain`
+        // verdict says nothing about the root specifically (only some OTHER member may still be
+        // alive), and the probe costs nothing extra since `grace` was already fully spent by
+        // the tree-drain watch that just returned it. Used only below, to decide whether a
+        // best-effort reap is safe after a sweep failure.
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
         } else if self.containment().can_observe_drain() {
             match self.attached.wait_drained(crate::wait::deadline_from(grace)) {
                 Ok(crate::containment::TreeDrain::AllMembersExited) => (true, true, None),
-                Ok(crate::containment::TreeDrain::MembersRemain) => (false, false, None),
+                Ok(crate::containment::TreeDrain::MembersRemain) => {
+                    match crate::wait::block_until_exit(self.id, Some(Duration::ZERO)) {
+                        Ok(exited) => (false, exited, None),
+                        Err(e) => (false, false, Some(e)),
+                    }
+                }
                 Err(e) => (false, false, Some(e)),
             }
         } else {

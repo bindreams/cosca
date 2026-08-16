@@ -257,6 +257,42 @@ async fn async_graceful_tree_drained_skips_sweep_when_mechanism_allows() {
     }
 }
 
+// Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` — see there
+// for the full rationale.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & exit 0"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    let drainable = child.containment().can_observe_drain();
+    term_fault::set_force_kill_tree_error(true);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_secs(2))
+        .await
+        .expect_err("the forced sweep failure must surface");
+    assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+    assert!(
+        !term_fault::kill_tree_armed(),
+        "the sweep must have consumed the forced-failure seam"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
+        if drainable {
+            "MembersRemain branch — the #62 round-2 fix"
+        } else {
+            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
+        }
+    );
+    // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
+    // still alive — a real sweep now (the seam is already consumed) actually kills it.
+    let _ = child.kill_tree();
+}
+
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.
 #[tokio::test]
 async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {

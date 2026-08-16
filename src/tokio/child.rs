@@ -519,6 +519,10 @@ impl Child {
 #[path = "child_drop_tests.rs"]
 mod child_drop_tests;
 
+#[cfg(test)]
+#[path = "child_wait_tree_tests.rs"]
+mod child_wait_tree_tests;
+
 #[cfg(all(test, windows))]
 impl Child {
     /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's

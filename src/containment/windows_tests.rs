@@ -16,6 +16,99 @@ fn job_handle_debug_does_not_panic() {
     assert!(s.contains("JobHandle"), "debug output: {s}");
 }
 
+/// A `wait_drained` call against an already-consumed job handle must report `Unassessable`,
+/// never a guessed `AllMembersExited` — the handle is gone, so nothing here re-checked whether
+/// every member actually finished exiting (`TerminateJobObject`/`CloseHandle` are not
+/// documented as synchronous with member process teardown).
+#[test]
+fn wait_drained_on_a_consumed_handle_is_unassessable() {
+    use super::JobHandle;
+    let h = JobHandle::create_empty_for_test();
+    h.hard_kill();
+    let err = h
+        .wait_drained(Some(None), None)
+        .expect_err("a consumed job handle must not report a live drain verdict");
+    let crate::error::Error::Unassessable { source, .. } = err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    assert!(
+        source.is_none(),
+        "nothing was asked of the OS on this path — no source is expected"
+    );
+}
+
+/// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
+/// path `wait_drained_raw` relies on to return `AllMembersExited` without ever opening a
+/// process handle.
+#[test]
+fn query_job_pid_list_is_empty_for_an_unpopulated_job() {
+    use super::JobHandle;
+    let job = JobHandle::create_empty_for_test();
+    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let pids = super::query_job_pid_list(job_handle).expect("query pid list");
+    assert!(pids.is_empty(), "an empty job must report no members: {pids:?}");
+}
+
+/// `wait_drained_raw`'s empty-job fast path: no member was ever assigned, so the very first
+/// re-enumeration already reports `AllMembersExited`, with no wait and no deadline needed.
+#[test]
+fn wait_drained_raw_reports_drained_for_an_empty_job() {
+    use super::JobHandle;
+    let job = JobHandle::create_empty_for_test();
+    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let verdict = super::wait_drained_raw(job_handle, Some(None), None).expect("wait_drained_raw");
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+}
+
+/// A real, still-running job member reports `MembersRemain` at an already-elapsed deadline —
+/// not a race: the child is blocked reading its own piped stdin, which this test still holds
+/// open at the point of the check, so the member's liveness there is a fact this test itself
+/// holds, not a guess about timing. Also exercises `query_job_pid_list`'s non-empty branch (the
+/// pid must be visible in the job before `wait_drained_raw` can find it to wait on at all), and
+/// — once the child is let go and reaped — the live re-enumeration that turns a real exit into
+/// `AllMembersExited`, synchronized on `Child::wait()` rather than on any elapsed time.
+#[test]
+fn wait_drained_raw_tracks_a_real_member_through_exit() {
+    use std::os::windows::io::AsRawHandle;
+
+    // `cmd /C more`: a binary present on every Windows host, which blocks reading its stdin
+    // until EOF, then exits. No new external dependency — this is the OS shell.
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "more"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn cmd /C more");
+    let raw = child.as_raw_handle();
+
+    let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
+    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+
+    let pids = super::query_job_pid_list(job_handle).expect("query pid list");
+    assert_eq!(
+        pids,
+        vec![child.id()],
+        "the job must report exactly the member just assigned"
+    );
+
+    // An already-elapsed deadline: `crate::wait::remaining` reads it as Duration::ZERO without
+    // blocking at all, so this assertion is instantaneous — the point under test is that a
+    // non-empty live member set reports MembersRemain rather than a guessed drain verdict.
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let verdict = super::wait_drained_raw(job_handle, Some(Some(past)), None).expect("wait_drained_raw");
+    assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
+
+    // Let the child exit on its own terms (EOF on stdin), then confirm the job reports drained
+    // once it genuinely has. `Child::wait()` only returns once the OS reports the process gone
+    // — a real synchronization point, not a timing guess.
+    drop(child.stdin.take());
+    child.wait().expect("wait for cmd /C more to exit");
+
+    let verdict = super::wait_drained_raw(job_handle, Some(None), None).expect("wait_drained_raw");
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+}
+
 /// Live coverage of the `Ok(true)` arm against a real console. `Ok(false)` needs the DETACHED
 /// helper in the integration suite (a different process); `Err` is not provokable live, hence
 /// the fault seam exercised below. This test does NOT guard the integration test against

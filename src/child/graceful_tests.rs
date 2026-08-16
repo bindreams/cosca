@@ -286,6 +286,58 @@ fn graceful_tree_drained_skips_sweep_when_mechanism_allows() {
     }
 }
 
+// Regression test (#62 round-2 review): on the `MembersRemain` branch — a drain-observable
+// mechanism whose tree does NOT fully drain within `grace` — `root_exited` must be freshly
+// computed by its own zero-duration probe of the root, not hardcoded `false`. Otherwise an
+// already-exited-but-unreaped root is stranded as a zombie when the subsequent hard sweep
+// also fails, because the best-effort reap below is gated on `root_exited`.
+//
+// Fixture: the root shell first ignores `SIGTERM` for itself (`trap '' TERM`), THEN
+// backgrounds `sleep 30` (which vastly outlives `grace`) and exits on its own immediately
+// after — a deterministic ordering, not a race against `grace` OR against the terminate
+// signal: `sleep 30` is forked (inheriting the already-installed ignore disposition
+// atomically, no window where it could still be killed) only after the trap is in effect, and
+// an ignored disposition survives `sleep`'s own exec (POSIX). A version of this fixture where
+// the descendant installs its OWN trap after being forked/exec'd instead would race the
+// terminate signal against that installation and was rejected during development. The
+// descendant keeps a drain-observable tree from fully draining within `grace`, forcing
+// `MembersRemain` specifically — the branch this fix touches. On a mechanism with no kernel
+// drain edge, this same fixture still exercises the pre-existing (unaffected-by-this-bug)
+// root-only watch, which already computed `root_exited` correctly — asserted separately below
+// rather than skipped, per this crate's "never silently skip" testing convention.
+#[cfg(unix)]
+#[test]
+fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & exit 0"]);
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    let drainable = child.containment().can_observe_drain();
+    term_fault::set_force_kill_tree_error(true);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_secs(2))
+        .expect_err("the forced sweep failure must surface");
+    assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+    assert!(
+        !term_fault::kill_tree_armed(),
+        "the sweep must have consumed the forced-failure seam"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
+        if drainable {
+            "MembersRemain branch — the #62 round-2 fix"
+        } else {
+            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
+        }
+    );
+    // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
+    // still alive — a real sweep now (the seam is already consumed) actually kills it.
+    let _ = child.kill_tree();
+}
+
 // A NON-containment terminate_tree error (modelling NoConsole/Unsupported) must NOT be held
 // -- this is the pre-existing, still-documented "no signal sent, no grace waited, tree left
 // running" contract from #46, unrelated to #61, and this task's scoping must not silently

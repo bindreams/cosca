@@ -99,6 +99,21 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::unistd::Pid;
 
+/// Whether `e` is the kernel's proof that this leaf's `cgroup.events` node is already gone —
+/// either because the whole path was already removed (`ENOENT`, on a fresh `open` through the
+/// now-unlinked leaf directory) or because THIS fd was opened before removal and the
+/// underlying kernfs node has since been deactivated (`ENODEV`, on `seek`/`read` through an
+/// already-open fd). `rmdir` on a cgroup v2 leaf — whether `Drop`'s own retry or an external
+/// cgroup manager's cleanup of an empty leaf — succeeds ONLY once `populated` has already read
+/// 0 (see `CgroupLeaf::wait_drained`'s doc); observing the leaf's removal is therefore always
+/// proof every member had already exited, never proof of anything else, so no other errno is
+/// folded in here (a genuine mechanism failure — `EACCES`, `EIO`, ...— must still surface as
+/// `Error::Io`, not be silently reinterpreted as a drain).
+#[cfg(target_os = "linux")]
+pub(crate) fn removed_after_drain(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENODEV) | Some(libc::ENOENT))
+}
+
 /// A live leaf sub-cgroup created for a single spawned process tree.
 ///
 /// The `pre_exec` closure writes `"0"` to `procs_fd` to place the forked
@@ -167,6 +182,16 @@ impl CgroupLeaf {
     /// interval is chosen anywhere in this path: every round blocks in one `poll(2)` call for
     /// exactly the caller's own remaining time, and returns as soon as either the kernel
     /// reports a transition or the deadline is reached.
+    ///
+    /// Leaf-removal race: `rmdir` on this leaf (`Drop`'s own retry, or an external cgroup
+    /// manager cleaning up an empty leaf — either succeeds only once `populated` has already
+    /// read 0) can land at any point after the last member exits, including between this
+    /// call's own `poll` waking on the 1→0 transition and its very next read. Once that
+    /// happens, `open`/`seek`/`read` on this leaf's `cgroup.events` fail (`ENOENT` for a fresh
+    /// `open` through the now-unlinked directory; `ENODEV` for a syscall through an fd that was
+    /// opened before removal, once the kernel deactivates the underlying kernfs node) — proof
+    /// the leaf is gone, which is itself proof every member had already exited (removal can
+    /// never precede full drain), not a failure. See [`removed_after_drain`].
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -178,12 +203,28 @@ impl CgroupLeaf {
         use crate::containment::TreeDrain;
         use crate::error::Error;
 
-        let mut file = File::open(self.events_path()).map_err(Error::Io)?;
+        let mut file = match File::open(self.events_path()) {
+            Ok(f) => f,
+            Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
+            Err(e) => return Err(Error::Io(e)),
+        };
         let mut buf = String::new();
         loop {
             buf.clear();
-            file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
-            file.read_to_string(&mut buf).map_err(Error::Io)?;
+            if let Err(e) = file.seek(SeekFrom::Start(0)) {
+                return if removed_after_drain(&e) {
+                    Ok(TreeDrain::AllMembersExited)
+                } else {
+                    Err(Error::Io(e))
+                };
+            }
+            if let Err(e) = file.read_to_string(&mut buf) {
+                return if removed_after_drain(&e) {
+                    Ok(TreeDrain::AllMembersExited)
+                } else {
+                    Err(Error::Io(e))
+                };
+            }
             match parse_populated(&buf) {
                 Some(false) => return Ok(TreeDrain::AllMembersExited),
                 Some(true) => {}

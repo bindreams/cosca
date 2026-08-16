@@ -169,3 +169,39 @@ fn populated_garbage_value_returns_none() {
 fn populated_no_trailing_newline() {
     assert_eq!(parse_populated("frozen 0\npopulated 0"), Some(false));
 }
+
+// removed_after_drain tests -----
+// Linux-only: the function itself is `#[cfg(target_os = "linux")]` (it interprets raw kernel
+// errno values that only mean anything against a real cgroupfs).
+
+/// `ENODEV` — a syscall through an fd opened before the leaf was removed, once the kernel
+/// deactivates the underlying kernfs node — is proof of drain.
+#[cfg(target_os = "linux")]
+#[test]
+fn enodev_is_removed_after_drain() {
+    let e = std::io::Error::from_raw_os_error(libc::ENODEV);
+    assert!(super::removed_after_drain(&e));
+}
+
+/// `ENOENT` — a fresh `open` through the now-unlinked leaf directory — is proof of drain too.
+#[cfg(target_os = "linux")]
+#[test]
+fn enoent_is_removed_after_drain() {
+    let e = std::io::Error::from_raw_os_error(libc::ENOENT);
+    assert!(super::removed_after_drain(&e));
+}
+
+/// Every other errno is a genuine failure, not proof of anything — must NOT be folded into a
+/// guessed drain verdict. `EACCES` (permission denied) and `EIO` (real device/backing-store
+/// failure) are both plausible `cgroup.events` failures unrelated to removal.
+#[cfg(target_os = "linux")]
+#[test]
+fn unrelated_errnos_are_not_removed_after_drain() {
+    for errno in [libc::EACCES, libc::EIO, libc::EBUSY, libc::EPERM] {
+        let e = std::io::Error::from_raw_os_error(errno);
+        assert!(
+            !super::removed_after_drain(&e),
+            "errno {errno} must not be classified as proof of drain"
+        );
+    }
+}

@@ -56,3 +56,7 @@ impl Child {
         self.attached.wait_drained(crate::wait::deadline_from(timeout))
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

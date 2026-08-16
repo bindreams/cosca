@@ -345,15 +345,38 @@ async fn cgroup_wait_tree_drained(
 
     use crate::containment::TreeDrain;
 
-    let file = std::fs::File::open(leaf.events_path()).map_err(Error::Io)?;
+    use crate::containment::cgroup::removed_after_drain;
+
+    let file = match std::fs::File::open(leaf.events_path()) {
+        Ok(f) => f,
+        Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
+        Err(e) => return Err(Error::Io(e)),
+    };
     let mut afd = AsyncFd::with_interest(file, Interest::PRIORITY).map_err(Error::Io)?;
     let mut buf = String::new();
     loop {
         buf.clear();
+        // Mirrors `CgroupLeaf::wait_drained`'s own leaf-removal race handling exactly (see its
+        // doc): `rmdir` on this leaf — `Drop`'s own retry, or an external cgroup manager's
+        // cleanup of an already-empty leaf — can land between this loop's own `ready()` wakeup
+        // and its next read, and observing that removal is itself proof every member had
+        // already exited (rmdir cannot precede full drain), not a failure.
         {
             let f = afd.get_mut();
-            f.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
-            f.read_to_string(&mut buf).map_err(Error::Io)?;
+            if let Err(e) = f.seek(SeekFrom::Start(0)) {
+                return if removed_after_drain(&e) {
+                    Ok(TreeDrain::AllMembersExited)
+                } else {
+                    Err(Error::Io(e))
+                };
+            }
+            if let Err(e) = f.read_to_string(&mut buf) {
+                return if removed_after_drain(&e) {
+                    Ok(TreeDrain::AllMembersExited)
+                } else {
+                    Err(Error::Io(e))
+                };
+            }
         }
         match crate::containment::cgroup::parse_populated(&buf) {
             Some(false) => return Ok(TreeDrain::AllMembersExited),
@@ -399,15 +422,26 @@ async fn job_wait_tree_drained(
 ) -> Result<crate::containment::TreeDrain, Error> {
     use windows::Win32::Foundation::HANDLE;
 
-    use crate::containment::TreeDrain;
-
     // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
     // call that cannot block (mirrors grace_wait's identical delegation).
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
         return job.wait_drained(deadline, None);
     }
     let Some(raw_job) = job.as_handle() else {
-        return Ok(TreeDrain::AllMembersExited);
+        // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
+        // reaches here once that method's Duration::ZERO delegation above has already been
+        // ruled out): the job handle was already consumed, so there is no live handle left to
+        // re-enumerate or open member handles from, and `TerminateJobObject`/`CloseHandle` are
+        // not documented as synchronous with member process teardown. Reporting
+        // `AllMembersExited` here would be a guess, not a live-checked verdict — see that
+        // method's doc and inline comment for the full justification.
+        return Err(Error::Unassessable {
+            detail: "the job handle was already closed (kill_tree()/hard_kill(), or the Child \
+                     was dropped) before this drain check ran; whether every member has \
+                     actually finished exiting can no longer be observed"
+                .into(),
+            source: None,
+        });
     };
 
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
