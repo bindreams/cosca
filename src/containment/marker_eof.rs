@@ -162,7 +162,14 @@ fn interpret_read_event(event: &KEvent, read_end: BorrowedFd<'_>) -> Result<Opti
 /// `interpret_read_event`.
 pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>) -> Result<Option<TreeDrain>, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let mut events = [KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0)];
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
     loop {
         match kq.kevent(&[], &mut events, Some(zero)) {
             Ok(0) => return Ok(None), // nothing pending
@@ -198,9 +205,12 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 ///
 /// `deadline` follows the crate's watch convention: `None` = block indefinitely, `Some(None)`
 /// = a duration that overflowed `Instant` (also indefinite), `Some(Some(at))` = an absolute
-/// deadline; a deadline already in the past makes this behave exactly like `probe` (there is a
-/// dedicated test pinning that equivalence). Uses one kernel syscall per wait round — no
-/// interval is chosen anywhere in this path.
+/// deadline; a deadline already in the past still performs exactly one non-blocking check
+/// before concluding — the sticky, level-triggered `EV_EOF` a genuinely-already-drained tree
+/// left pending must be observed, not assumed away by the elapsed deadline alone (there is a
+/// dedicated test pinning this: an already-drained tree checked past a stale deadline still
+/// reports `AllMembersExited`, not a verdict inferred from "no time is left"). Uses one kernel
+/// syscall per wait round — no interval is chosen anywhere in this path.
 ///
 /// **The deadline is checked explicitly at the top of every round, not inferred from `kevent`
 /// returning 0.** A member sustaining writes past the `NOTE_LOWAT` clamp keeps the descriptor
@@ -208,22 +218,30 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// zero/expired timeout — so it never actually returns "0 events, timed out" while the pipe
 /// stays full; relying on that alone lets the wait overrun the deadline by an unbounded number
 /// of rounds. Checking `remaining(deadline)` before each `kevent` call bounds the overrun to at
-/// most one in-flight round's drain instead.
+/// most one in-flight round's drain: once a round starts with the deadline already elapsed, a
+/// non-EOF event in THAT round (bytes drained, holders remain) returns immediately rather than
+/// looping back for another round — otherwise a sustained writer whose deadline has already
+/// elapsed would spin forever, since "elapsed" never becomes "more elapsed."
 pub(crate) fn block_until_drained(
     read_end: BorrowedFd<'_>,
     deadline: Option<Option<Instant>>,
 ) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
-    let mut events = [KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0)];
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
     loop {
         // Recompute from the absolute deadline so an EINTR retry cannot extend the total wait,
         // AND so a continuously-ready descriptor (a sustained writer) cannot make `kevent`
         // return real events forever without this loop ever noticing the deadline passed.
         let remaining = crate::wait::remaining(deadline);
-        if remaining == Some(std::time::Duration::ZERO) {
-            return Ok(TreeDrain::MembersRemain); // deadline elapsed, a holder is alive
-        }
+        let already_elapsed = remaining == Some(std::time::Duration::ZERO);
         let timeout = remaining.map(|d| libc::timespec {
             tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
             tv_nsec: d.subsec_nanos() as libc::c_long,
@@ -234,8 +252,14 @@ pub(crate) fn block_until_drained(
                 if let Some(verdict) = interpret_read_event(&events[0], read_end)? {
                     return Ok(verdict);
                 }
-                // bytes discarded (only past the low-water clamp), holders remain — loop back,
-                // where the deadline is re-checked BEFORE the next kevent call
+                // Bytes discarded (only past the low-water clamp), holders remain. A round that
+                // started with the deadline already elapsed stops here rather than looping back:
+                // see the doc comment above for why (a sustained writer past an elapsed deadline
+                // must not spin).
+                if already_elapsed {
+                    return Ok(TreeDrain::MembersRemain);
+                }
+                // otherwise loop back, where the deadline is re-checked BEFORE the next kevent call
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::Io(e.into())),
