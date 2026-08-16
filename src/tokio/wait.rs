@@ -218,14 +218,19 @@ impl std::os::fd::AsRawFd for KqueueFd {
 ///
 /// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
 /// to verify that itself, since the closure's return type carries no more than "done" or "not
-/// done". The invariant holds for both current callers because NEITHER `Ok(None)` case ever
-/// consumes bytes: `drain_proc_exit`'s only non-`None` outcome is `NOTE_EXIT`, with no draining
-/// concept at all, and `marker_eof::drain_kqueue`'s caller here (`wait_tree_drained_inner`)
-/// always arms with `unbounded_wait: true`, under which `interpret_read_event` itself never
-/// drains (see `marker_eof`'s module doc — an unbounded wait cannot drain on a sustained
-/// writer's behalf without spinning). A future `drain` closure that DOES consume bytes on a
-/// non-`None`-but-also-non-terminal path would violate this silently; `watch_readable` cannot
-/// detect that on its own, so any such closure owns re-verifying this invariant itself.
+/// done". The invariant holds for both current callers: `drain_proc_exit`'s only non-`None`
+/// outcome is `NOTE_EXIT`, with no draining concept at all, and `marker_eof::drain_kqueue`'s
+/// caller here (`wait_tree_drained_inner`) passes through the SAME `unbounded_wait` its own
+/// caller computed from the real deadline (`crate::wait::remaining(deadline).is_none()`,
+/// matching the sync backend's `block_until_drained` exactly) — when `true`,
+/// `interpret_read_event` never drains at all (see `marker_eof`'s module doc — an unbounded wait
+/// cannot drain on a sustained writer's behalf without spinning); when `false`, a non-`None`
+/// non-terminal event DOES drain bytes, but only inside `interpret_read_event`'s own
+/// already-verified `Ok(None)` return, so the invariant this loop relies on — no closure
+/// silently drains behind an `Ok(None)` it can't see — still holds. A future `drain` closure
+/// that consumed bytes on a DIFFERENT non-`None`-but-non-terminal path would violate that
+/// silently; `watch_readable` cannot detect that on its own, so any such closure owns
+/// re-verifying this invariant itself.
 #[cfg(target_os = "macos")]
 async fn watch_readable<F>(afd: &::tokio::io::unix::AsyncFd<KqueueFd>, mut drain: F) -> Result<(), Error>
 where
@@ -267,14 +272,26 @@ where
 ///
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, None).await
+    wait_tree_drained_inner(read_end, true, None).await
 }
 
 /// Deadline-bounded, [`TreeDrain`](crate::containment::TreeDrain)-returning wrapper over
-/// [`wait_tree_drained`] — the macOS arm of `tokio::Child::wait_tree`/`wait_tree_timeout`.
+/// [`wait_tree_drained_inner`] — the macOS arm of `tokio::Child::wait_tree`/`wait_tree_timeout`.
 /// `Duration::ZERO` delegates to the sync backend's one-shot, non-blocking probe (safe to call
 /// directly from async code), matching `grace_wait`'s identical `Duration::ZERO` delegation to
 /// `block_until_exit`.
+///
+/// The bounded arm (`Some(d)`) arms with `unbounded_wait: false` — computed the same way the
+/// sync backend's `block_until_drained` does (`crate::wait::remaining(deadline).is_none()`,
+/// `false` whenever a real deadline governs this call) — NOT via [`wait_tree_drained`], which is
+/// always unbounded by construction (see its own doc). Arming unbounded here would be a real,
+/// observable divergence from the sync twin: `refuse_if_write_end_held` would refuse an
+/// `Unassessable` write-end scan that a bounded caller should tolerate (its own deadline caps
+/// the risk), and `interpret_read_event` would stop draining a sustained writer at the low-water
+/// clamp, so a bounded wait could only ever expire into `MembersRemain` where the sync call
+/// drains through to the real edge. `tokio::time::timeout` still supplies the actual bound —
+/// the same pattern `grace_wait` uses over `wait_exit` — this only fixes what the ARMED kqueue
+/// itself is told.
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_deadline(
     read_end: std::os::fd::BorrowedFd<'_>,
@@ -287,7 +304,7 @@ pub(crate) async fn wait_tree_deadline(
             Ok(TreeDrain::AllMarkersClosed)
         }
         Some(d) if d.is_zero() => crate::containment::marker_eof::probe(read_end),
-        Some(d) => match ::tokio::time::timeout(d, wait_tree_drained(read_end)).await {
+        Some(d) => match ::tokio::time::timeout(d, wait_tree_drained_inner(read_end, false, None)).await {
             Ok(res) => res.map(|()| TreeDrain::AllMarkersClosed),
             Err(_elapsed) => Ok(TreeDrain::MembersRemain),
         },
@@ -296,30 +313,35 @@ pub(crate) async fn wait_tree_deadline(
 
 /// Test-only entry point that reports the instant its kqueue is armed, on a channel the
 /// CALLER owns — no shared/global observer state, so concurrently-running tests (this file
-/// has four) cannot steal each other's notification.
+/// has four) cannot steal each other's notification. Always the unbounded arm, matching
+/// [`wait_tree_drained`] (its own real caller): these tests exercise the no-deadline API.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) async fn wait_tree_drained_for_test(
     read_end: std::os::fd::BorrowedFd<'_>,
     armed: std::sync::mpsc::Sender<()>,
 ) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, Some(armed)).await
+    wait_tree_drained_inner(read_end, true, Some(armed)).await
 }
 
+/// `unbounded_wait` must be the SAME expression the sync backend's `block_until_drained` uses
+/// (`crate::wait::remaining(deadline).is_none()`) for whichever deadline the caller is honoring
+/// — threaded through to both `arm` and `drain_kqueue` (see [`wait_tree_deadline`]'s own doc for
+/// why arming this wrong is a real, observable divergence, not a cosmetic one).
 #[cfg(target_os = "macos")]
 async fn wait_tree_drained_inner(
     read_end: std::os::fd::BorrowedFd<'_>,
+    unbounded_wait: bool,
     armed: Option<std::sync::mpsc::Sender<()>>,
 ) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
-    // Unbounded: this future has no deadline parameter at all (see the doc comment above).
-    let kq = crate::containment::marker_eof::arm(read_end, true)?;
+    let kq = crate::containment::marker_eof::arm(read_end, unbounded_wait)?;
     if let Some(tx) = armed {
         let _ = tx.send(());
     }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, move |kq| {
-        crate::containment::marker_eof::drain_kqueue(kq, read_end, true).map(|d| d.map(|_| ()))
+        crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait).map(|d| d.map(|_| ()))
     })
     .await
 }
