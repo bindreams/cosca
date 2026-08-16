@@ -451,14 +451,23 @@ impl JobHandle {
     ///
     /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
     /// interval is chosen anywhere in this path: every round blocks in one
-    /// `WaitForMultipleObjects` call for exactly the caller's own remaining time.
+    /// `WaitForMultipleObjects` call for exactly the caller's own remaining time. An
+    /// already-elapsed (or `Duration::ZERO`) deadline still gets one real re-enumeration and, if
+    /// any member is still live, one real non-blocking `WaitForMultipleObjects` poll before a
+    /// deadline-based verdict is returned — a stale bound only ever forecloses looping back for
+    /// ANOTHER round, never the current one's own observation. A drained tree is reported
+    /// `AllMembersExited` regardless of how late the caller arrived to look.
     ///
     /// `cancel`, when given, is appended to every round's wait set (one fewer live member
     /// tracked per round) so a live `WaitForMultipleObjects` releases the instant it is
     /// signaled rather than only at the next re-enumeration boundary — the async wrapper's
     /// drop-cancellation primitive (mirrors `block_until_exit_or_cancel`'s cancel event). A
     /// cancellation reports `MembersRemain` (the tree's drain state is simply unknown at that
-    /// point, same as a timeout), never an error.
+    /// point, same as a timeout), never an error. Unlike the deadline, cancellation IS checked
+    /// before that first re-enumeration too: it is a genuine "stop looking" instruction, not a
+    /// stale bound on how long to keep looking, so a caller who cancels before this call ever
+    /// enumerates the job once still gets a prompt `MembersRemain` rather than being forced
+    /// through one more round first.
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -506,35 +515,29 @@ pub(crate) fn wait_drained_raw(
 
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
-        // Check the deadline and cancellation BEFORE doing any work this round — not after,
-        // and never skipped by an early `continue`. A round in which every candidate pid has
-        // already exited by the time we try to open it (see the all-exited case below) is
-        // real progress and must re-enumerate, but that re-enumeration is still one loop
-        // iteration, and every iteration owes its caller a bounded-wait probe and a
-        // cancellation check: otherwise `wait_tree_timeout(Duration::ZERO)` — documented and
-        // used as a non-blocking probe — can loop on a churning tree, and a dropped future's
-        // cancel signal (see `SignalOnDrop`) is never observed by a thread that keeps cycling
-        // straight back to `query_job_pid_list` without ever consulting it.
+        // Cancellation is checked BEFORE any work this round, including the very first — a
+        // deliberate asymmetry with the deadline check below. Cancellation is a genuine "stop
+        // looking" instruction (the caller's future was dropped; the tree's drain state is no
+        // longer anyone's to observe), so it is honored even before we have ever enumerated the
+        // job once. A deadline, in contrast, is a stale BOUND on how long to keep looking, not
+        // an instruction to skip looking — see below.
         if let Some(c) = cancel {
             // SAFETY: `cancel` is a valid handle for the duration of this call (caller-owned).
             let cancel_state = unsafe { WaitForSingleObject(c, 0) };
             if cancel_state == WAIT_OBJECT_0 {
-                // The cancel handle was signaled — the caller's future was dropped. The
-                // tree's drain state is genuinely unknown at this instant; report it exactly
-                // like a timeout rather than inventing a verdict.
                 return Ok(TreeDrain::MembersRemain);
             }
         }
-        let ms: u32 = match crate::wait::remaining(deadline) {
-            None => INFINITE,
-            Some(d) => {
-                if d.is_zero() {
-                    return Ok(TreeDrain::MembersRemain);
-                }
-                d.as_millis().min((INFINITE - 1) as u128) as u32
-            }
-        };
 
+        // Re-enumerate BEFORE consulting the deadline for a return. A `Duration::ZERO` (or
+        // already-elapsed) deadline must still observe the tree's ACTUAL current state on the
+        // one round it gets, not conclude `MembersRemain` purely because it arrived too late to
+        // look — a ZERO probe on an already-drained tree must report `AllMembersExited`, the
+        // same verdict an unbounded wait would find. This mirrors `block_on_kqueue`'s
+        // `already_elapsed` handling on the macOS side: the real observation always happens
+        // first; an elapsed deadline only forecloses looping back for ANOTHER round afterward
+        // (see the `handles.is_empty()` branch below, and the `ms` computation for the bounded
+        // wait itself).
         let pids = query_job_pid_list(job).map_err(Error::Io)?;
         if pids.is_empty() {
             return Ok(TreeDrain::AllMembersExited);
@@ -555,6 +558,10 @@ pub(crate) fn wait_drained_raw(
             }
         }
 
+        // Computed once per round and reused below for both the empty-handles decision and the
+        // bounded-wait timeout, so the two agree on what "the deadline" means for this round.
+        let remaining = crate::wait::remaining(deadline);
+
         if handles.is_empty() {
             if let Some(e) = denied {
                 // A persistent, actionable open failure (not a benign exit-race): looping
@@ -568,8 +575,15 @@ pub(crate) fn wait_drained_raw(
                 });
             }
             // Every candidate in this round's batch had already exited by the time we tried
-            // to open it — real progress. Re-enumerate immediately (the deadline and
-            // cancellation checks above already covered this iteration).
+            // to open it — real progress, but this round's `pids` was non-empty (so
+            // `AllMembersExited` isn't supported by what was actually observed) and looping
+            // straight back to `query_job_pid_list` is itself another round, which a bounded
+            // wait must not be allowed to take once its deadline has already elapsed (the
+            // busy-spin/cancellation-starvation hazard this whole restructuring exists to
+            // close). An elapsed deadline concludes `MembersRemain` here instead of continuing.
+            if remaining == Some(std::time::Duration::ZERO) {
+                return Ok(TreeDrain::MembersRemain);
+            }
             continue;
         }
         if let Some(e) = &denied {
@@ -592,6 +606,16 @@ pub(crate) fn wait_drained_raw(
         if let Some(c) = cancel {
             wait_set.push(c);
         }
+
+        // A ZERO (or already-elapsed) deadline yields `ms == 0` here, which
+        // `WaitForMultipleObjects` treats as a genuine non-blocking poll of the handles just
+        // opened above — the ZERO-probe semantics fall out of the real API rather than a
+        // pre-emptive return, so this round's `handles` (real, live members) still get one
+        // real look before `WAIT_TIMEOUT` reports `MembersRemain` below.
+        let ms: u32 = match remaining {
+            None => INFINITE,
+            Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
+        };
 
         // SAFETY: every handle in `handles` was just opened above and stays open for the
         // duration of this call; `cancel`, if present, is kept alive by its caller for the
