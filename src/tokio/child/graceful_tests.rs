@@ -120,7 +120,7 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
         crate::log_capture::contains_since(
             mark,
             &format!(
-                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
             )
         ),
@@ -168,7 +168,7 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
         crate::log_capture::contains_since(
             mark,
             &format!(
-                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
             )
         ),
@@ -212,6 +212,49 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     // Clean up: the child is still running by design (no sweep happened above).
     let _ = child.kill_tree();
     let _ = child.wait().await;
+}
+
+// Async twin of `graceful_tree_drained_skips_sweep_when_mechanism_allows` — see there for the
+// full rationale.
+#[tokio::test]
+async fn async_graceful_tree_drained_skips_sweep_when_mechanism_allows() {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let drainable = child.containment().can_observe_drain();
+    term_fault::set_force_kill_tree_error(true);
+    let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
+    if drainable {
+        let status = result.expect("a fully-drained tree must not invoke the sweep at all");
+        assert!(
+            term_fault::kill_tree_armed(),
+            "the forced kill_tree failure must still be armed — the sweep was never entered"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "graceful root exit, got {status:?}"
+            );
+        }
+        #[cfg(windows)]
+        let _ = status;
+    } else {
+        let err = result.expect_err("a non-drainable mechanism must always run the sweep");
+        assert!(
+            !term_fault::kill_tree_armed(),
+            "the sweep must have consumed the forced-failure seam"
+        );
+        assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+        let _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
+        let _ = child.wait().await;
+    }
 }
 
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.

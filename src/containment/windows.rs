@@ -15,15 +15,22 @@ use std::io;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+use windows::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectAssociateCompletionPortInformation,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject, JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    GetProcessId, OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
+    GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, CREATE_NEW_PROCESS_GROUP,
+    CREATE_SUSPENDED, INFINITE, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
 };
+use windows::Win32::System::IO::CreateIoCompletionPort;
 
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
 fn null_ptr() -> *mut c_void {
@@ -39,6 +46,12 @@ pub(crate) struct JobHandle {
     /// The raw HANDLE value stored as an atomic `*mut c_void`.
     /// Null means the handle has been consumed (taken/killed).
     raw: AtomicPtr<c_void>,
+    /// The I/O completion port associated with this job at creation time, before
+    /// `AssignProcessToJobObject` — always, never opt-in (see `assign_to_kill_on_close_job`).
+    /// `wait_drained` deliberately does not read from it (see that method's doc for why); it is
+    /// kept here solely so the association persists for the job's lifetime and the port handle
+    /// is closed exactly once, honestly, on `Drop` rather than leaked.
+    port: HANDLE,
 }
 
 // A Windows job-object HANDLE is a process-wide kernel handle; using it
@@ -56,10 +69,11 @@ impl std::fmt::Debug for JobHandle {
 }
 
 impl JobHandle {
-    fn new(handle: HANDLE) -> Self {
+    fn new(handle: HANDLE, port: HANDLE) -> Self {
         debug_assert!(!handle.0.is_null(), "job handle must not be null");
         JobHandle {
             raw: AtomicPtr::new(handle.0),
+            port,
         }
     }
 
@@ -129,7 +143,10 @@ impl JobHandle {
         // Safety: CreateJobObjectW with null name/attrs returns an owned job handle.
         let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
             .expect("CreateJobObjectW for test placeholder");
-        JobHandle::new(handle)
+        // SAFETY: creating a fresh, unassociated completion port has no preconditions.
+        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 0) }
+            .expect("CreateIoCompletionPort for test placeholder");
+        JobHandle::new(handle, port)
     }
 }
 
@@ -143,6 +160,13 @@ impl Drop for JobHandle {
             unsafe {
                 let _ = CloseHandle(job);
             }
+        }
+        // SAFETY: `port` was created once in `assign_to_kill_on_close_job` (or the test
+        // placeholder) and is owned exclusively by this `JobHandle` — never shared, never
+        // closed anywhere else. Closing it here, unconditionally, whether or not the tree was
+        // torn down, releases the last resource this type holds.
+        unsafe {
+            let _ = CloseHandle(self.port);
         }
     }
 }
@@ -316,11 +340,15 @@ pub(crate) mod fault {
     }
 }
 
-/// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
+/// Create a `KILL_ON_JOB_CLOSE` job, associate a fresh I/O completion port with it — ALWAYS,
+/// before `AssignProcessToJobObject`, never opt-in — and assign the process at `proc_handle` to
+/// it. Associating before assignment (rather than after) means no window exists in which the
+/// job could be assigned but unassociated: nothing racing the assignment can observe a job that
+/// briefly had a member with no completion port at all.
 fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
-    // SAFETY: all calls are standard Win32; owned handles are closed on error.
+    // SAFETY: all calls are standard Win32; owned handles are closed on every error path.
     unsafe {
         let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).map_err(io::Error::from)?;
 
@@ -336,12 +364,248 @@ fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> 
             return Err(io::Error::from(e));
         }
 
-        if let Err(e) = AssignProcessToJobObject(job, raw_handle) {
+        let port = match CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = CloseHandle(job);
+                return Err(io::Error::from(e));
+            }
+        };
+        // The completion key only needs to be unique per port; the job handle's own bit
+        // pattern is a convenient, already-unique value with no bookkeeping of its own.
+        let assoc = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: job.0,
+            CompletionPort: port,
+        };
+        if let Err(e) = SetInformationJobObject(
+            job,
+            JobObjectAssociateCompletionPortInformation,
+            std::ptr::addr_of!(assoc).cast(),
+            size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+        ) {
+            let _ = CloseHandle(port);
             let _ = CloseHandle(job);
             return Err(io::Error::from(e));
         }
 
-        Ok(JobHandle::new(job))
+        if let Err(e) = AssignProcessToJobObject(job, raw_handle) {
+            let _ = CloseHandle(port);
+            let _ = CloseHandle(job);
+            return Err(io::Error::from(e));
+        }
+
+        Ok(JobHandle::new(job, port))
+    }
+}
+
+/// Read the job's LIVE member pids via `QueryInformationJobObject(JobObjectBasicProcessIdList)`
+/// — the authoritative, always-fresh source `wait_drained` re-consults every round, independent
+/// of any completion-port message. Grows the buffer and retries (no bound on retries: a job
+/// that keeps growing needs an ever-larger buffer, but capping this would silently under-report
+/// live membership rather than fail loudly).
+fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
+    let mut capacity: usize = 64;
+    loop {
+        let buf_len = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() + capacity.saturating_sub(1) * size_of::<usize>();
+        let mut buf = vec![0u8; buf_len];
+        let mut returned = 0u32;
+        // SAFETY: `buf` is exactly `buf_len` bytes, zero-initialized, matching the trailing
+        // `ProcessIdList` array's declared capacity; the call writes at most that many bytes.
+        let result = unsafe {
+            QueryInformationJobObject(
+                Some(job),
+                JobObjectBasicProcessIdList,
+                buf.as_mut_ptr().cast(),
+                buf_len as u32,
+                Some(&mut returned),
+            )
+        };
+        // SAFETY: the fixed header (`NumberOfAssignedProcesses`/`NumberOfProcessIdsInList`) is
+        // always written even when the call fails with a too-small buffer.
+        let header = unsafe { &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+        if result.is_err() {
+            let assigned = header.NumberOfAssignedProcesses as usize;
+            if assigned > capacity {
+                capacity = assigned;
+                continue;
+            }
+            return Err(io::Error::last_os_error());
+        }
+        let n = header.NumberOfProcessIdsInList as usize;
+        debug_assert!(
+            n <= capacity,
+            "kernel reported more pids than the queried buffer could hold"
+        );
+        let list_ptr = header.ProcessIdList.as_ptr();
+        let mut pids = Vec::with_capacity(n.min(capacity));
+        for i in 0..n.min(capacity) {
+            // SAFETY: `list_ptr` points at the start of `buf`'s trailing `usize` array, which
+            // has room for `capacity` entries; `i < n.min(capacity) <= capacity`.
+            let raw = unsafe { *list_ptr.add(i) };
+            pids.push(raw as u32);
+        }
+        return Ok(pids);
+    }
+}
+
+/// The largest handle count a single `WaitForMultipleObjects` call accepts (`MAXIMUM_WAIT_OBJECTS`).
+const MAXIMUM_WAIT_OBJECTS: usize = 64;
+
+impl JobHandle {
+    /// Block until every process in this job has EXITED (not reaped), or until `deadline`.
+    ///
+    /// Deliberately does NOT read the completion port associated at job-creation time: every
+    /// ordinary job-lifecycle completion-port message (`JOB_OBJECT_MSG_EXIT_PROCESS`,
+    /// `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO`, ...) is documented by Microsoft as **not guaranteed
+    /// to be delivered** — only `JobObjectNotificationLimitInformation`-class resource-limit
+    /// messages carry a delivery guarantee, a class unrelated to process lifecycle. Trusting the
+    /// port for this call's own correctness would make an unbounded `wait_tree()` capable of a
+    /// caller-invisible infinite hang on a single dropped packet.
+    ///
+    /// Instead, each round: (1) re-enumerate the job's LIVE members via
+    /// `QueryInformationJobObject(JobObjectBasicProcessIdList)` — the authoritative, always-fresh
+    /// source of truth, independent of any notification; (2) if empty, the tree has drained; (3)
+    /// otherwise open real `SYNCHRONIZE` handles to up to `MAXIMUM_WAIT_OBJECTS - 1` of those
+    /// pids and block on `WaitForMultipleObjects(bWaitAll = FALSE)`. A process handle becoming
+    /// signaled on exit is an unconditional, always-honored OS guarantee — unlike a job message
+    /// — so as long as this round's tree is non-empty, at least one tracked handle WILL
+    /// eventually signal, forcing a fresh re-enumeration next round. This can never falsely
+    /// report `AllMembersExited` (that verdict is only ever reached via a live re-count of
+    /// zero); it can only be slow to *notice* full drain when concurrently-live membership
+    /// exceeds `MAXIMUM_WAIT_OBJECTS - 1` in a single round (this round's un-tracked excess is
+    /// picked up on the NEXT re-enumeration, once a tracked handle signals).
+    ///
+    /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
+    /// interval is chosen anywhere in this path: every round blocks in one
+    /// `WaitForMultipleObjects` call for exactly the caller's own remaining time.
+    ///
+    /// `cancel`, when given, is appended to every round's wait set (one fewer live member
+    /// tracked per round) so a live `WaitForMultipleObjects` releases the instant it is
+    /// signaled rather than only at the next re-enumeration boundary — the async wrapper's
+    /// drop-cancellation primitive (mirrors `block_until_exit_or_cancel`'s cancel event). A
+    /// cancellation reports `MembersRemain` (the tree's drain state is simply unknown at that
+    /// point, same as a timeout), never an error.
+    pub(crate) fn wait_drained(
+        &self,
+        deadline: Option<Option<std::time::Instant>>,
+        cancel: Option<HANDLE>,
+    ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        let Some(job) = self.as_handle() else {
+            // The job was already consumed (killed/dropped) by the time this call runs — the
+            // tree it owned is gone.
+            return Ok(crate::containment::TreeDrain::AllMembersExited);
+        };
+        wait_drained_raw(job, deadline, cancel)
+    }
+}
+
+/// The loop body of [`JobHandle::wait_drained`], taking the already-resolved raw handle rather
+/// than borrowing `&JobHandle` — the async wrapper (`tokio::wait`) copies the handle value out
+/// before handing it to `spawn_blocking`, since a `'static` blocking closure cannot capture a
+/// borrow. Sound because the async caller holds `&JobHandle` (transitively, `&Child`) across the
+/// whole `spawn_blocking` `.await`, so the job handle cannot be closed while this runs.
+pub(crate) fn wait_drained_raw(
+    job: HANDLE,
+    deadline: Option<Option<std::time::Instant>>,
+    cancel: Option<HANDLE>,
+) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+    use crate::containment::TreeDrain;
+    use crate::error::Error;
+
+    let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
+    loop {
+        let pids = query_job_pid_list(job).map_err(Error::Io)?;
+        if pids.is_empty() {
+            return Ok(TreeDrain::AllMembersExited);
+        }
+
+        let mut handles: Vec<HANDLE> = Vec::new();
+        let mut denied: Option<io::Error> = None;
+        for pid in pids.iter().take(budget) {
+            // SAFETY: standard Win32 call; the handle is closed below on every path.
+            match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, *pid) } {
+                Ok(h) => handles.push(h),
+                // ERROR_INVALID_PARAMETER: the pid no longer names a process — it exited in
+                // the race between the enumeration above and this open. That is real
+                // progress (this round's tree is shrinking), not a failure: loop back to
+                // re-enumerate rather than treating it as denied.
+                Err(e) if e.code() == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => {}
+                Err(e) => denied = Some(io::Error::from(e)),
+            }
+        }
+
+        if handles.is_empty() {
+            if let Some(e) = denied {
+                // A persistent, actionable open failure (not a benign exit-race): looping
+                // back here without ever holding a real handle to block on would busy-spin.
+                log::warn!("wait_tree: could not open any live job member to watch for its exit ({e})");
+                return Err(Error::Unassessable {
+                    detail: "could not open a handle to any live member of the contained tree \
+                                 to observe its exit"
+                        .into(),
+                    source: Some(e),
+                });
+            }
+            // Every candidate in this round's batch had already exited by the time we tried
+            // to open it — real progress. Re-enumerate immediately.
+            continue;
+        }
+
+        let ms: u32 = match crate::wait::remaining(deadline) {
+            None => INFINITE,
+            Some(d) => {
+                if d.is_zero() {
+                    for h in &handles {
+                        // SAFETY: each handle was freshly opened above and not yet closed.
+                        unsafe {
+                            let _ = CloseHandle(*h);
+                        }
+                    }
+                    return Ok(TreeDrain::MembersRemain);
+                }
+                d.as_millis().min((INFINITE - 1) as u128) as u32
+            }
+        };
+
+        // The cancel handle (if any) is appended AFTER the real member handles, never
+        // closed here (caller-owned) — only `handles` (the freshly opened member handles)
+        // are closed below.
+        let mut wait_set = handles.clone();
+        if let Some(c) = cancel {
+            wait_set.push(c);
+        }
+
+        // SAFETY: every handle in `handles` was just opened above and stays open for the
+        // duration of this call; `cancel`, if present, is kept alive by its caller for the
+        // same duration.
+        let waited = unsafe { WaitForMultipleObjects(&wait_set, false, ms) };
+        let wait_failed = (waited == WAIT_FAILED).then(io::Error::last_os_error);
+        for h in &handles {
+            // SAFETY: each handle was opened above; closing after the wait releases it
+            // regardless of which handle (if any) was signaled.
+            unsafe {
+                let _ = CloseHandle(*h);
+            }
+        }
+
+        if waited == WAIT_TIMEOUT {
+            return Ok(TreeDrain::MembersRemain);
+        }
+        if let Some(e) = wait_failed {
+            return Err(Error::Io(e));
+        }
+        let idx = waited.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+        debug_assert!(
+            idx < wait_set.len(),
+            "unexpected WaitForMultipleObjects verdict: {waited:?}"
+        );
+        if cancel.is_some() && idx == handles.len() {
+            // The cancel handle was signaled — the caller's future was dropped. The
+            // tree's drain state is genuinely unknown at this instant; report it exactly
+            // like a timeout rather than inventing a verdict.
+            return Ok(TreeDrain::MembersRemain);
+        }
+        // A tracked member exited — loop back and re-enumerate the authoritative live set.
     }
 }
 

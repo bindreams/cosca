@@ -58,6 +58,24 @@ pub(crate) fn cgroup_procs_contains(contents: &str, pid: u32) -> bool {
     false
 }
 
+/// Parse the `populated` field out of the contents of a cgroup v2 `cgroup.events` file
+/// (`populated 0`/`populated 1`, one `key value` pair per line, order not guaranteed).
+/// `None` means the file had no `populated` line, or an unrecognized value — the caller
+/// must treat this as "could not be assessed", never silently default to either state.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("populated ") {
+            return match rest.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 // Everything below is Linux-only. =====
 
 #[cfg(target_os = "linux")]
@@ -112,6 +130,12 @@ impl CgroupLeaf {
         self.procs_fd
     }
 
+    /// The leaf's `cgroup.events` path — the async death-watch's own edge to poll, since
+    /// `wait_drained`'s `poll(2)` loop is not reusable from a reactor-native async context.
+    pub(crate) fn events_path(&self) -> PathBuf {
+        self.leaf_path.join("cgroup.events")
+    }
+
     /// Returns `true` when `pid` is listed in `cgroup.procs` of this leaf.
     /// Used post-spawn (parent side) to confirm placement succeeded.
     pub(crate) fn contains_pid(&self, pid: u32) -> bool {
@@ -125,6 +149,65 @@ impl CgroupLeaf {
     /// Best-effort: already-empty leaves are silently fine.
     pub(crate) fn hard_kill(&self) {
         let _ = fs::write(self.leaf_path.join("cgroup.kill"), b"1");
+    }
+
+    /// Block until every process in the leaf has EXITED (not reaped), observed via
+    /// `cgroup.events`'s `populated` key — the kernel flips it 1→0 exactly when the leaf's
+    /// last task exits, fork-proof (no cooperation from the tree, no re-enumeration race).
+    ///
+    /// Read-before-arm: `populated` is checked BEFORE every `poll`, not only after — a
+    /// transition that already happened (leaf drained between a caller's previous check and
+    /// this call) must be observed on the read, not require a fresh kernel edge that will
+    /// never fire again. `POLLPRI` fires on every transition (both 1→0 and 0→1), so an
+    /// intervening 0→1 (a leaf that reused-then-repopulated between reads) is also picked up
+    /// by looping back to re-read rather than trusting readiness to imply the value dropped.
+    ///
+    /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
+    /// interval is chosen anywhere in this path: every round blocks in one `poll(2)` call for
+    /// exactly the caller's own remaining time, and returns as soon as either the kernel
+    /// reports a transition or the deadline is reached.
+    pub(crate) fn wait_drained(
+        &self,
+        deadline: Option<Option<std::time::Instant>>,
+    ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        use rustix::event::{poll, PollFd, PollFlags};
+
+        use crate::containment::TreeDrain;
+        use crate::error::Error;
+
+        let mut file = File::open(self.leaf_path.join("cgroup.events")).map_err(Error::Io)?;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+            file.read_to_string(&mut buf).map_err(Error::Io)?;
+            match parse_populated(&buf) {
+                Some(false) => return Ok(TreeDrain::AllMembersExited),
+                Some(true) => {}
+                None => {
+                    return Err(Error::Io(io::Error::other(
+                        "cgroup.events has no 'populated' field — unexpected kernel format",
+                    )))
+                }
+            }
+            let remaining = crate::wait::remaining(deadline);
+            if remaining == Some(std::time::Duration::ZERO) {
+                return Ok(TreeDrain::MembersRemain);
+            }
+            let ts = remaining.map(|d| rustix::event::Timespec {
+                tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
+                tv_nsec: d.subsec_nanos() as _,
+            });
+            let mut fds = [PollFd::new(&file, PollFlags::PRI)];
+            match poll(&mut fds, ts.as_ref()) {
+                Ok(0) => return Ok(TreeDrain::MembersRemain), // genuinely timed out
+                Ok(_) => continue,                            // a transition fired — re-read
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(Error::Io(io::Error::from(e))),
+            }
+        }
     }
 
     /// SIGTERM every pid currently listed in `cgroup.procs`.

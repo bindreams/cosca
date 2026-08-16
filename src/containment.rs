@@ -83,6 +83,31 @@ impl Containment {
             Containment::None | Containment::Delegated => false,
         }
     }
+
+    /// Whether this handle can observe the whole tree's exit via a real kernel edge
+    /// (`wait_tree`/`wait_tree_timeout` act rather than returning `Unsupported`).
+    ///
+    /// A strict subset of [`can_teardown`](Self::can_teardown): `ProcessGroup`/`Session`
+    /// (`killpg`-based) and `TreeWalk` (identity re-enumeration) can tear a tree down but
+    /// expose no single kernel object whose state says "every member has exited" — only
+    /// `CgroupV2` (`cgroup.events`'s `populated` key), `JobObject` (the job's completion-port
+    /// process-count edge) and `FdMarker` (the marker pipe's EOF) do.
+    pub fn can_observe_drain(&self) -> bool {
+        matches!(
+            self,
+            Containment::CgroupV2 | Containment::JobObject | Containment::FdMarker
+        )
+    }
+}
+
+/// Whether every member of the contained tree has exited (not reaped — a descriptor/kernel-state
+/// change, never a collected zombie; a caller wanting a status still waits on the root).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeDrain {
+    /// Every member of the tree has exited. Statuses have NOT been collected.
+    AllMembersExited,
+    /// At least one member was still running at the deadline.
+    MembersRemain,
 }
 
 /// Guard for the `_tree` operations, shared by the sync and async `Child`: they act on the
@@ -102,6 +127,31 @@ pub(crate) fn require_contained(containment: Containment, attached: &Attached) -
                      or a nested member of an ancestor's containment group). Use kill() for a \
                      lone process, or tear down the tree via the outermost .contain()ed handle."
                 .into(),
+        });
+    }
+    Ok(())
+}
+
+/// Guard for `wait_tree`/`wait_tree_timeout`, shared by the sync and async `Child`: only a
+/// mechanism with a real kernel drain edge ([`Containment::can_observe_drain`]) can answer
+/// "has the whole tree exited" without polling — everything else (an uncontained child, a
+/// nested `Delegated` member, or a teardown-only mechanism like `ProcessGroup`/`TreeWalk`)
+/// returns `Unsupported`.
+pub(crate) fn require_drainable(containment: Containment, attached: &Attached) -> Result<(), crate::error::Error> {
+    debug_assert_eq!(
+        containment.can_observe_drain(),
+        attached.can_observe_drain(),
+        "Containment/Attached drain-observability diverged"
+    );
+    if !attached.can_observe_drain() {
+        return Err(crate::error::Error::Unsupported {
+            op: "wait for the contained tree to drain (wait_tree / wait_tree_timeout)".into(),
+            platform: std::env::consts::OS,
+            detail: format!(
+                "this child's containment mechanism ({containment}) exposes no kernel edge for \
+                 tree drain — only cgroup v2, a Windows job object, and the macOS fd marker do. \
+                 Use kill_tree()/terminate_tree() for teardown, or wait() to watch the root alone."
+            ),
         });
     }
     Ok(())

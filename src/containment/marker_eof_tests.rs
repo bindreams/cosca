@@ -16,7 +16,8 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use super::{block_until_drained, probe, TreeDrain};
+use super::{block_until_drained, probe};
+use crate::containment::TreeDrain;
 
 fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     crate::child::spawn::spawn_lock()

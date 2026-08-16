@@ -36,4 +36,23 @@ impl Child {
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.proc.wait_deadline(deadline).map_err(Error::Io)
     }
+
+    /// Block until every member of the contained tree has EXITED — not reaped; a status is
+    /// never collected by this call, only the root's own `wait`/`wait_timeout` does that.
+    /// Requires a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2,
+    /// a Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/
+    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). Event-driven: no
+    /// interval is chosen internally anywhere in this call's path.
+    pub fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
+        self.require_drainable()?;
+        self.attached.wait_drained(None)
+    }
+
+    /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`. `TreeDrain::MembersRemain`
+    /// at expiry is not an error. A `timeout` so large it would overflow `Instant` is treated as
+    /// unbounded, matching [`wait_timeout`](Child::wait_timeout).
+    pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<crate::containment::TreeDrain, Error> {
+        self.require_drainable()?;
+        self.attached.wait_drained(crate::wait::deadline_from(timeout))
+    }
 }

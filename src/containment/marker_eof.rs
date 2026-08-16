@@ -56,24 +56,12 @@ use std::time::Instant;
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
+use crate::containment::TreeDrain;
 use crate::error::Error;
 
 #[cfg(test)]
 #[path = "marker_eof_tests.rs"]
 mod marker_eof_tests;
-
-/// Whether every holder of the marker's write end has **exited**.
-///
-/// Exited is not reaped: descriptors close before the zombie is collected, so
-/// `AllMembersExited` never implies a status is available. It also means every holder of the
-/// *marker*, which a member that closed the descriptor has stopped being.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TreeDrain {
-    /// Every marker holder has exited. Statuses have NOT been collected.
-    AllMembersExited,
-    /// At least one marker holder was still running at the deadline.
-    MembersRemain,
-}
 
 /// The `NOTE_LOWAT` low-water mark every knote in this module is armed with. Clamped by the
 /// kernel to the pipe's actual buffer capacity — see the module doc for what this does and

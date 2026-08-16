@@ -917,11 +917,10 @@ impl Marker {
     /// reissued fd (an unrelated pipe with no open write end) deliver `EV_EOF` immediately and
     /// report `AllMembersExited` for a fully live tree — the same false-edge risk `hard_kill`
     /// refuses on, not merely a discrepancy between two code paths.
-    #[allow(dead_code)] // no non-test caller yet; mirrors marker_eof::probe / Attached::wait_drained
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<Instant>>,
-    ) -> Result<crate::containment::marker_eof::TreeDrain, Error> {
+    ) -> Result<crate::containment::TreeDrain, Error> {
         self.check_read_end_still_valid()?;
         // This process is the supervisor: it must have closed its own copy of the write end at
         // spawn time (`install`'s contract), or the edge could never fire. A deliberately

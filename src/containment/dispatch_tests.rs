@@ -414,7 +414,7 @@ fn wait_drained_is_unsupported_without_a_marker() {
 fn wait_drained_reports_members_remain_then_all_members_exited() {
     use super::Attached;
     use crate::containment::fdmarker::{pipe_handle_of, Marker, PreparedMarker};
-    use crate::containment::marker_eof::TreeDrain;
+    use crate::containment::TreeDrain;
     use std::os::fd::{AsFd, OwnedFd};
 
     // A real holder in a separate process, mirroring marker_eof_tests.rs's

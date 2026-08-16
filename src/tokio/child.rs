@@ -475,6 +475,36 @@ impl Child {
     fn require_contained(&self) -> Result<(), Error> {
         crate::containment::require_contained(self.containment, &self.attached)
     }
+
+    /// Guard for `wait_tree`/`wait_tree_timeout` (single-sourced with the sync `Child`).
+    fn require_drainable(&self) -> Result<(), Error> {
+        crate::containment::require_drainable(self.containment, &self.attached)
+    }
+
+    /// Block until every member of the contained tree has EXITED — not reaped; a status is
+    /// never collected by this call, only the root's own `wait`/`try_wait` does that. Requires
+    /// a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2, a
+    /// Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/
+    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). Reactor-native on
+    /// Linux and macOS (no polling interval); Windows hands the wait to `spawn_blocking` (job
+    /// objects have no pollable handle) with a cancel event so a dropped future releases the
+    /// blocking watcher promptly instead of parking out the wait.
+    pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
+        self.require_drainable()?;
+        super::wait::wait_tree_drained_dispatch(&self.attached, None).await
+    }
+
+    /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`.
+    /// `TreeDrain::MembersRemain` at expiry is not an error. A `timeout` so large it would
+    /// overflow `Instant` is treated as unbounded, matching [`wait_tree`](Child::wait_tree).
+    pub async fn wait_tree_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<crate::containment::TreeDrain, Error> {
+        self.require_drainable()?;
+        let deadline = crate::wait::deadline_from(timeout);
+        super::wait::wait_tree_drained_dispatch(&self.attached, deadline).await
+    }
 }
 
 impl Child {

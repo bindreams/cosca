@@ -123,6 +123,11 @@ impl Child {
         crate::containment::require_contained(self.containment, &self.attached)
     }
 
+    /// Guard for `wait_tree`/`wait_tree_timeout` (single-sourced with the async `Child`).
+    fn require_drainable(&self) -> Result<(), Error> {
+        crate::containment::require_drainable(self.containment, &self.attached)
+    }
+
     /// This child's stable identity (see [`crate::identity::ProcessId`]).
     pub fn id(&self) -> ProcessId {
         self.id

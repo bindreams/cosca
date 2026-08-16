@@ -1,7 +1,7 @@
 // Pure-parser tests for cgroup v2 path detection and cgroup.procs membership.
 // These run on any host (including Windows) with synthetic inputs — no filesystem access.
 
-use super::{cgroup_procs_contains, parse_v2_relative_path};
+use super::{cgroup_procs_contains, parse_populated, parse_v2_relative_path};
 
 // parse_v2_relative_path tests =====
 
@@ -124,4 +124,48 @@ fn procs_trailing_newline() {
 #[test]
 fn procs_whitespace_trimmed() {
     assert!(cgroup_procs_contains("  99  \n", 99));
+}
+
+// parse_populated tests =====
+
+/// The real kernel format: `populated 0\nfrozen 0\n`.
+#[test]
+fn populated_zero_means_drained() {
+    assert_eq!(parse_populated("populated 0\nfrozen 0\n"), Some(false));
+}
+
+/// `populated 1` means at least one process remains.
+#[test]
+fn populated_one_means_members_remain() {
+    assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Some(true));
+}
+
+/// Field order is not guaranteed by the kernel doc — `populated` may not be first.
+#[test]
+fn populated_field_not_first_line() {
+    assert_eq!(parse_populated("frozen 0\npopulated 1\n"), Some(true));
+}
+
+/// No `populated` line at all (wrong file / malformed) — must not silently default.
+#[test]
+fn populated_missing_returns_none() {
+    assert_eq!(parse_populated("frozen 0\n"), None);
+}
+
+/// Empty file — must not silently default.
+#[test]
+fn populated_empty_returns_none() {
+    assert_eq!(parse_populated(""), None);
+}
+
+/// An unrecognized value after `populated ` — must not silently default to either state.
+#[test]
+fn populated_garbage_value_returns_none() {
+    assert_eq!(parse_populated("populated 2\n"), None);
+}
+
+/// No trailing newline on the last line — must still parse.
+#[test]
+fn populated_no_trailing_newline() {
+    assert_eq!(parse_populated("frozen 0\npopulated 0"), Some(false));
 }

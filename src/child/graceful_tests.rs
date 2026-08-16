@@ -132,7 +132,7 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
         crate::log_capture::contains_since(
             mark,
             &format!(
-                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
             )
         ),
@@ -183,7 +183,7 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
         crate::log_capture::contains_since(
             mark,
             &format!(
-                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
             )
         ),
@@ -233,6 +233,57 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
     // Clean up: the child is still running by design (no sweep happened above).
     let _ = child.kill_tree();
     let _ = child.wait();
+}
+
+// The core #62 property: on a drain-observable mechanism, a tree that drains on its own within
+// `grace` must skip the hard sweep entirely — not merely run a sweep that no-ops on an empty
+// group. Proven by forcing `kill_tree` to fail: the call only comes back `Ok` if that branch
+// was never entered. On a mechanism with no kernel drain edge (no `ProcessGroup`/`Session`
+// fallback host in CI, but asserted either way rather than assumed), the sweep stays
+// unconditional by design, so the forced failure must surface instead — both arms are real,
+// exercised assertions, not a skip.
+#[test]
+fn graceful_tree_drained_skips_sweep_when_mechanism_allows() {
+    let mut cmd = crate::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]); // dies to the default-disposition SIGTERM well within grace
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn");
+    let drainable = child.containment().can_observe_drain();
+    term_fault::set_force_kill_tree_error(true);
+    let result = child.graceful_shutdown_tree(Duration::from_secs(30));
+    if drainable {
+        let status = result.expect("a fully-drained tree must not invoke the sweep at all");
+        assert!(
+            term_fault::kill_tree_armed(),
+            "the forced kill_tree failure must still be armed — the sweep was never entered"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "graceful root exit, got {status:?}"
+            );
+        }
+        #[cfg(windows)]
+        let _ = status;
+    } else {
+        // No kernel drain edge on this mechanism: the sweep is unconditional by design (see
+        // graceful_shutdown_tree's own doc), so the forced failure must surface — proving the
+        // sweep WAS entered, the opposite of the branch above.
+        let err = result.expect_err("a non-drainable mechanism must always run the sweep");
+        assert!(
+            !term_fault::kill_tree_armed(),
+            "the sweep must have consumed the forced-failure seam"
+        );
+        assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+        let _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
+        let _ = child.wait();
+    }
 }
 
 // A NON-containment terminate_tree error (modelling NoConsole/Unsupported) must NOT be held
