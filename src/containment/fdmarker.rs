@@ -782,6 +782,13 @@ pub(crate) struct Marker {
     root_denied: bool,
     /// The root's process group, when the requested mode created one. `None` for TreeWalk.
     pgid: Option<i32>,
+    /// The descriptor number the marker occupies in the child, copied from
+    /// `PreparedMarker::fd`. Exposed to this crate's OWN integration tests (`tests/*.rs`) via
+    /// `Child::test_fdmarker_fd`, so a test can be TOLD the exact fd rather than inferring it
+    /// from ambient process state (see `tests/macos_fdmarker.rs`'s
+    /// `holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy`, and the CI failure that
+    /// motivated it, #59).
+    own_fd: RawFd,
 }
 
 impl std::fmt::Debug for Marker {
@@ -856,12 +863,20 @@ impl Marker {
             root,
             root_denied,
             pgid,
+            own_fd: prepared.fd,
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // consumed by Child::test_marker_handle (test-only)
     pub(crate) fn handle(&self) -> u64 {
         self.handle
+    }
+
+    /// The descriptor number the marker occupies in the child. Consumed by
+    /// `Child::test_fdmarker_fd`, this crate's own `#[doc(hidden)]` test-only accessor for
+    /// `tests/*.rs` (see `own_fd`'s doc comment for why this exists).
+    pub(crate) fn own_fd(&self) -> RawFd {
+        self.own_fd
     }
 
     /// Whether this marker carries a pgid to `killpg`/`term_group` on sweep — `true` for

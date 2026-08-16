@@ -296,15 +296,36 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
 
 /// `holders()` reports a holder as CLOEXEC only when EVERY matching descriptor is (#59): a
 /// regression to first-fd-wins would misreport a holder that also keeps a non-CLOEXEC copy. The
-/// testbin dups a second, CLOEXEC copy of its inherited marker fd at a lower fd number, which
-/// `PROC_PIDLISTFDS` (measured to enumerate ascending) scans before the marker's own high fd, so
-/// first-fd-wins would see the CLOEXEC copy first and warn that this holder will lose the marker.
-/// The correct AND-fold sees the still-open, non-CLOEXEC original too and must not warn.
+/// testbin dups a second, CLOEXEC copy of its inherited marker fd, which the correct AND-fold
+/// must not let outvote the still-open, non-CLOEXEC original.
+///
+/// The testbin is TOLD the marker's fd number over the control socket (`Child::test_fdmarker_fd`
+/// — this crate's own bookkeeping from installing the marker), not left to infer it from ambient
+/// process state. An earlier version had the testbin scan its own open fds for "the one nobody
+/// else explains"; that passed locally but was flaky on a GitHub-hosted macOS runner, which
+/// hands the process extra inherited descriptors the scan could not tell apart from the marker.
 #[test]
 fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
     common::install_log_capture();
     let mark = common::log_mark();
-    let (child, _sock) = common::spawn_control("control-block-mixed-cloexec-marker", &["R"], true);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let child = cosca::Command::new()
+        .executable(testbin())
+        .args(["cosca_testbin", "control-block-mixed-cloexec-marker", &addr, "R"])
+        .contain()
+        .spawn()
+        .expect("spawn the mixed-cloexec holder");
+    let marker_fd = child
+        .test_fdmarker_fd()
+        .expect("Strongest containment on macOS must install an fd marker");
+
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read tag");
+    writeln!(sock, "{marker_fd}").expect("send the marker fd to the testbin child");
+
     child.kill_tree().expect("kill_tree");
     assert!(
         !common::contains_since(mark, WOULD_LOSE_MARKER_LOG_NEEDLE),

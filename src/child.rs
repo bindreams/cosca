@@ -397,6 +397,23 @@ impl Child {
         }
     }
 
+    /// Test-only: the fd-marker descriptor's number in the child, so this crate's OWN
+    /// integration tests (`tests/*.rs`, which cannot name a `pub(crate)` item) can be TOLD the
+    /// exact number rather than inferring it from ambient process state. A prior version of
+    /// `tests/macos_fdmarker.rs` had a testbin mode scan its own open fds for "the one nobody
+    /// explains" — passing locally but flaky on CI, where the runner hands the process extra
+    /// inherited descriptors the scan could not tell apart from the marker (#59). This is the
+    /// crate's own bookkeeping, not a guess: `None` if `self` is not `Attached::FdMarker`.
+    /// `#[doc(hidden)]`: not public API, present only for this crate's own `tests/` binaries.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn test_fdmarker_fd(&self) -> Option<i32> {
+        match &self.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.own_fd()),
+            _ => None,
+        }
+    }
+
     /// Test-only: force the FdMarker mechanism's process-group id, so a test can drive
     /// `containment::unix::signal_group`'s real `pgid <= 0` guard — a real,
     /// privilege-free `Error::Unassessable { source: None, .. }` outcome, not a synthetic

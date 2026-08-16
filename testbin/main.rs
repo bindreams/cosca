@@ -2,6 +2,8 @@
 //! one exception: the `report-nested-kill-tree` mode uses the `cosca` crate
 //! to exercise the real nested-member `kill_tree` path. Behavior is selected by argv[1].
 
+#[cfg(target_os = "macos")]
+use std::io::BufRead;
 use std::io::{Read, Write};
 use std::process::exit;
 
@@ -70,31 +72,6 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
             Err(e) => panic!("control socket read failed: {e}"),
         }
     }
-}
-
-/// The one open fd beyond `known` — used by `control-block-mixed-cloexec-marker` to find the
-/// inherited fd-marker descriptor, which this process never opened itself and so cannot
-/// otherwise name by number. Panics loudly if there is not EXACTLY one such fd, rather than
-/// silently guessing among several.
-#[cfg(target_os = "macos")]
-fn find_one_unexplained_open_fd(known: &[i32]) -> i32 {
-    let mut found = None;
-    for fd in 0..1024 {
-        if known.contains(&fd) {
-            continue;
-        }
-        // SAFETY: F_GETFD has no preconditions beyond a valid fd number; -1 means closed.
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-            continue;
-        }
-        assert!(
-            found.is_none(),
-            "multiple unexplained open fds found ({found:?} and {fd}); cannot identify the \
-             marker descriptor unambiguously"
-        );
-        found = Some(fd);
-    }
-    found.expect("no inherited marker fd found beyond the known descriptors")
 }
 
 fn main() {
@@ -240,24 +217,34 @@ fn main() {
         "control-block-mixed-cloexec-marker" => {
             // Like control-block, but first `F_DUPFD_CLOEXEC`s a second copy of the inherited
             // fd-marker descriptor, so this pid holds BOTH a CLOEXEC copy and the original
-            // non-CLOEXEC one — exercising `holders()`'s AND-fold coverage gap (#59). The dup
-            // lands at the lowest free fd (well below the marker's own high, reserved number —
-            // see `HIGH_FLOOR` in `fdmarker.rs`), and `PROC_PIDLISTFDS` enumerates a process's
-            // fd table in ascending order (measured on this host), so the CLOEXEC dup is
-            // scanned FIRST. A regression to first-fd-wins would therefore misreport
-            // `clexec: true`; the correct AND-fold reports `false`, since the original,
-            // still-open copy is not CLOEXEC.
+            // non-CLOEXEC one — exercising `holders()`'s AND-fold coverage gap (#59).
+            //
+            // The marker's fd number is NOT discovered here: an earlier version scanned this
+            // process's own open fds for "the one nobody else explains", which passed locally
+            // but was flaky on CI, where the runner hands the process extra inherited
+            // descriptors indistinguishable from the marker by that scan alone. The test
+            // process already knows the real number (`Child::test_fdmarker_fd`, its own
+            // bookkeeping from installing the marker) and sends it over the control socket
+            // after the tag handshake below — this mode is simply told, never guesses.
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
             let mut sock = std::net::TcpStream::connect(addr).unwrap();
-            let control_fd = {
-                use std::os::fd::AsRawFd;
-                sock.as_raw_fd()
-            };
-            let marker_fd = find_one_unexplained_open_fd(&[0, 1, 2, control_fd]);
-            // SAFETY: `marker_fd` was just confirmed open by the scan above; F_DUPFD_CLOEXEC
-            // duplicates it, setting FD_CLOEXEC on the NEW copy only — the original descriptor
-            // is untouched (still open, still non-CLOEXEC).
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+
+            let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read marker fd from the test");
+            let marker_fd: i32 = line.trim().parse().expect("marker fd must be a plain decimal number");
+            // SAFETY: F_GETFD has no preconditions beyond a valid fd number; -1 means closed.
+            assert!(
+                unsafe { libc::fcntl(marker_fd, libc::F_GETFD) } != -1,
+                "the test told us fd {marker_fd} carries the marker, but it is not open here"
+            );
+
+            // SAFETY: `marker_fd` was just confirmed open above; F_DUPFD_CLOEXEC duplicates it,
+            // setting FD_CLOEXEC on the NEW copy only — the original descriptor is untouched
+            // (still open, still non-CLOEXEC).
             let dup = unsafe { libc::fcntl(marker_fd, libc::F_DUPFD_CLOEXEC, 0) };
             assert!(
                 dup >= 0,
@@ -269,8 +256,7 @@ fn main() {
                 "the CLOEXEC dup (fd {dup}) must land below the marker's own high fd \
                  ({marker_fd}) for this test to exercise the ordering its coverage depends on"
             );
-            sock.write_all(tag.as_bytes()).unwrap();
-            sock.flush().unwrap();
+
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
         }
