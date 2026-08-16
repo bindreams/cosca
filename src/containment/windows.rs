@@ -16,21 +16,19 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows::Win32::Foundation::{
-    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectAssociateCompletionPortInformation,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, CREATE_NEW_PROCESS_GROUP,
-    CREATE_SUSPENDED, INFINITE, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
+    GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, INFINITE, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
 };
-use windows::Win32::System::IO::CreateIoCompletionPort;
 
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
 fn null_ptr() -> *mut c_void {
@@ -46,21 +44,6 @@ pub(crate) struct JobHandle {
     /// The raw HANDLE value stored as an atomic `*mut c_void`.
     /// Null means the handle has been consumed (taken/killed).
     raw: AtomicPtr<c_void>,
-    /// The I/O completion port associated with this job at creation time, before
-    /// `AssignProcessToJobObject` — always, never opt-in (see `assign_to_kill_on_close_job`).
-    ///
-    /// `wait_drained` never reads from this port — it is NOT what the drain waits on. The drain
-    /// instead re-enumerates the job's live members with `QueryInformationJobObject` and blocks
-    /// on real `WaitForMultipleObjects` process-handle waits (see that method's doc for the full
-    /// mechanism and why: ordinary job lifecycle messages are documented by Microsoft as not
-    /// guaranteed to be delivered, so trusting them here could hang forever on one dropped
-    /// packet). The association still matters for a narrower reason: `assign_to_kill_on_close_job`
-    /// creates and associates the port *before* assigning the process, so the job never has a
-    /// live member without one — a self-imposed ordering invariant, not a functional dependency
-    /// of any watch. Kept as an atomic pointer purely so `JobHandle` stays `Sync` (a bare Windows
-    /// handle is otherwise `!Sync`, matching `raw`); never null, never taken — it is only ever
-    /// read once, in `Drop`, to close it exactly once rather than leak it.
-    port: AtomicPtr<c_void>,
 }
 
 // A Windows job-object HANDLE is a process-wide kernel handle; using it
@@ -78,12 +61,10 @@ impl std::fmt::Debug for JobHandle {
 }
 
 impl JobHandle {
-    fn new(handle: HANDLE, port: HANDLE) -> Self {
+    fn new(handle: HANDLE) -> Self {
         debug_assert!(!handle.0.is_null(), "job handle must not be null");
-        debug_assert!(!port.0.is_null(), "job completion port handle must not be null");
         JobHandle {
             raw: AtomicPtr::new(handle.0),
-            port: AtomicPtr::new(port.0),
         }
     }
 
@@ -153,10 +134,7 @@ impl JobHandle {
         // Safety: CreateJobObjectW with null name/attrs returns an owned job handle.
         let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
             .expect("CreateJobObjectW for test placeholder");
-        // SAFETY: creating a fresh, unassociated completion port has no preconditions.
-        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 0) }
-            .expect("CreateIoCompletionPort for test placeholder");
-        JobHandle::new(handle, port)
+        JobHandle::new(handle)
     }
 }
 
@@ -170,13 +148,6 @@ impl Drop for JobHandle {
             unsafe {
                 let _ = CloseHandle(job);
             }
-        }
-        // SAFETY: `port` was created once in `assign_to_kill_on_close_job` (or the test
-        // placeholder) and is owned exclusively by this `JobHandle` — never shared, never
-        // closed anywhere else. Closing it here, unconditionally, whether or not the tree was
-        // torn down, releases the last resource this type holds.
-        unsafe {
-            let _ = CloseHandle(HANDLE(self.port.load(Ordering::Relaxed)));
         }
     }
 }
@@ -350,11 +321,7 @@ pub(crate) mod fault {
     }
 }
 
-/// Create a `KILL_ON_JOB_CLOSE` job, associate a fresh I/O completion port with it — ALWAYS,
-/// before `AssignProcessToJobObject`, never opt-in — and assign the process at `proc_handle` to
-/// it. Associating before assignment (rather than after) means no window exists in which the
-/// job could be assigned but unassociated: nothing racing the assignment can observe a job that
-/// briefly had a member with no completion port at all.
+/// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
 fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
@@ -374,37 +341,12 @@ fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> 
             return Err(io::Error::from(e));
         }
 
-        let port = match CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 0) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = CloseHandle(job);
-                return Err(io::Error::from(e));
-            }
-        };
-        // The completion key only needs to be unique per port; the job handle's own bit
-        // pattern is a convenient, already-unique value with no bookkeeping of its own.
-        let assoc = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
-            CompletionKey: job.0,
-            CompletionPort: port,
-        };
-        if let Err(e) = SetInformationJobObject(
-            job,
-            JobObjectAssociateCompletionPortInformation,
-            std::ptr::addr_of!(assoc).cast(),
-            size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
-        ) {
-            let _ = CloseHandle(port);
-            let _ = CloseHandle(job);
-            return Err(io::Error::from(e));
-        }
-
         if let Err(e) = AssignProcessToJobObject(job, raw_handle) {
-            let _ = CloseHandle(port);
             let _ = CloseHandle(job);
             return Err(io::Error::from(e));
         }
 
-        Ok(JobHandle::new(job, port))
+        Ok(JobHandle::new(job))
     }
 }
 
@@ -417,41 +359,58 @@ fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
     let mut capacity: usize = 64;
     loop {
         let buf_len = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() + capacity.saturating_sub(1) * size_of::<usize>();
-        let mut buf = vec![0u8; buf_len];
+        // Backed by `Vec<usize>`, not `Vec<u8>`: `JOBOBJECT_BASIC_PROCESS_ID_LIST` is 8-aligned
+        // (it holds `usize` fields), but a `Vec<u8>`'s allocation is only ever requested at
+        // alignment 1. Forming a `&JOBOBJECT_BASIC_PROCESS_ID_LIST` from a `Vec<u8>` buffer is
+        // undefined behaviour regardless of what the allocator happens to return in practice —
+        // the compiler is entitled to assume the reference's target is properly aligned. A
+        // `Vec<usize>` buffer is naturally aligned for this header, and is read through raw
+        // pointers below rather than a reference, so no alignment assumption is ever load-bearing.
+        let mut buf: Vec<usize> = vec![0usize; buf_len.div_ceil(size_of::<usize>())];
         let mut returned = 0u32;
-        // SAFETY: `buf` is exactly `buf_len` bytes, zero-initialized, matching the trailing
-        // `ProcessIdList` array's declared capacity; the call writes at most that many bytes.
+        let header_ptr = buf.as_mut_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+        // SAFETY: `buf` is at least `buf_len` bytes (rounded up to whole `usize`s),
+        // zero-initialized, matching the trailing `ProcessIdList` array's declared capacity; the
+        // call writes at most `buf_len` bytes.
         let result = unsafe {
             QueryInformationJobObject(
                 Some(job),
                 JobObjectBasicProcessIdList,
-                buf.as_mut_ptr().cast(),
+                header_ptr.cast(),
                 buf_len as u32,
                 Some(&mut returned),
             )
         };
-        // SAFETY: the fixed header (`NumberOfAssignedProcesses`/`NumberOfProcessIdsInList`) is
-        // always written even when the call fails with a too-small buffer.
-        let header = unsafe { &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+        // The fixed header (`NumberOfAssignedProcesses`/`NumberOfProcessIdsInList`) is always
+        // written even when the call fails with a too-small buffer. Read both fields via
+        // `addr_of!`/`read_unaligned` on the raw pointer rather than materialising a
+        // `&JOBOBJECT_BASIC_PROCESS_ID_LIST` reference, so this call never depends on forming a
+        // reference into a buffer the kernel writes out-of-band.
+        // SAFETY: `header_ptr` is valid for reads of `size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()`
+        // bytes (`buf_len` is at least that size by construction) and initialized (zeroed above,
+        // then possibly partially overwritten by the call).
+        let assigned = unsafe { std::ptr::addr_of!((*header_ptr).NumberOfAssignedProcesses).read_unaligned() } as usize;
         if result.is_err() {
-            let assigned = header.NumberOfAssignedProcesses as usize;
             if assigned > capacity {
                 capacity = assigned;
                 continue;
             }
             return Err(io::Error::last_os_error());
         }
-        let n = header.NumberOfProcessIdsInList as usize;
+        // SAFETY: same as above.
+        let n = unsafe { std::ptr::addr_of!((*header_ptr).NumberOfProcessIdsInList).read_unaligned() } as usize;
         debug_assert!(
             n <= capacity,
             "kernel reported more pids than the queried buffer could hold"
         );
-        let list_ptr = header.ProcessIdList.as_ptr();
+        // SAFETY: `ProcessIdList` is the header's trailing flexible-array member; `buf` was sized
+        // for `capacity` entries starting right after the two `u32` counters, and
+        // `n.min(capacity) <= capacity`, so every read below is in-bounds and initialized.
+        let list_ptr = unsafe { std::ptr::addr_of!((*header_ptr).ProcessIdList).cast::<usize>() };
         let mut pids = Vec::with_capacity(n.min(capacity));
         for i in 0..n.min(capacity) {
-            // SAFETY: `list_ptr` points at the start of `buf`'s trailing `usize` array, which
-            // has room for `capacity` entries; `i < n.min(capacity) <= capacity`.
-            let raw = unsafe { *list_ptr.add(i) };
+            // SAFETY: see above.
+            let raw = unsafe { list_ptr.add(i).read_unaligned() };
             pids.push(raw as u32);
         }
         return Ok(pids);
@@ -464,13 +423,15 @@ const MAXIMUM_WAIT_OBJECTS: usize = 64;
 impl JobHandle {
     /// Block until every process in this job has EXITED (not reaped), or until `deadline`.
     ///
-    /// Deliberately does NOT read the completion port associated at job-creation time: every
+    /// Deliberately does not associate an I/O completion port with the job at all: every
     /// ordinary job-lifecycle completion-port message (`JOB_OBJECT_MSG_EXIT_PROCESS`,
     /// `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO`, ...) is documented by Microsoft as **not guaranteed
     /// to be delivered** — only `JobObjectNotificationLimitInformation`-class resource-limit
-    /// messages carry a delivery guarantee, a class unrelated to process lifecycle. Trusting the
+    /// messages carry a delivery guarantee, a class unrelated to process lifecycle. Trusting a
     /// port for this call's own correctness would make an unbounded `wait_tree()` capable of a
-    /// caller-invisible infinite hang on a single dropped packet.
+    /// caller-invisible infinite hang on a single dropped packet — and with the port never read,
+    /// associating one anyway would only cost unbounded kernel nonpaged-pool growth (one queued
+    /// packet per job lifecycle event, for the job handle's whole lifetime) for nothing.
     ///
     /// Instead, each round: (1) re-enumerate the job's LIVE members via
     /// `QueryInformationJobObject(JobObjectBasicProcessIdList)` — the authoritative, always-fresh
@@ -545,6 +506,35 @@ pub(crate) fn wait_drained_raw(
 
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
+        // Check the deadline and cancellation BEFORE doing any work this round — not after,
+        // and never skipped by an early `continue`. A round in which every candidate pid has
+        // already exited by the time we try to open it (see the all-exited case below) is
+        // real progress and must re-enumerate, but that re-enumeration is still one loop
+        // iteration, and every iteration owes its caller a bounded-wait probe and a
+        // cancellation check: otherwise `wait_tree_timeout(Duration::ZERO)` — documented and
+        // used as a non-blocking probe — can loop on a churning tree, and a dropped future's
+        // cancel signal (see `SignalOnDrop`) is never observed by a thread that keeps cycling
+        // straight back to `query_job_pid_list` without ever consulting it.
+        if let Some(c) = cancel {
+            // SAFETY: `cancel` is a valid handle for the duration of this call (caller-owned).
+            let cancel_state = unsafe { WaitForSingleObject(c, 0) };
+            if cancel_state == WAIT_OBJECT_0 {
+                // The cancel handle was signaled — the caller's future was dropped. The
+                // tree's drain state is genuinely unknown at this instant; report it exactly
+                // like a timeout rather than inventing a verdict.
+                return Ok(TreeDrain::MembersRemain);
+            }
+        }
+        let ms: u32 = match crate::wait::remaining(deadline) {
+            None => INFINITE,
+            Some(d) => {
+                if d.is_zero() {
+                    return Ok(TreeDrain::MembersRemain);
+                }
+                d.as_millis().min((INFINITE - 1) as u128) as u32
+            }
+        };
+
         let pids = query_job_pid_list(job).map_err(Error::Io)?;
         if pids.is_empty() {
             return Ok(TreeDrain::AllMembersExited);
@@ -578,25 +568,22 @@ pub(crate) fn wait_drained_raw(
                 });
             }
             // Every candidate in this round's batch had already exited by the time we tried
-            // to open it — real progress. Re-enumerate immediately.
+            // to open it — real progress. Re-enumerate immediately (the deadline and
+            // cancellation checks above already covered this iteration).
             continue;
         }
-
-        let ms: u32 = match crate::wait::remaining(deadline) {
-            None => INFINITE,
-            Some(d) => {
-                if d.is_zero() {
-                    for h in &handles {
-                        // SAFETY: each handle was freshly opened above and not yet closed.
-                        unsafe {
-                            let _ = CloseHandle(*h);
-                        }
-                    }
-                    return Ok(TreeDrain::MembersRemain);
-                }
-                d.as_millis().min((INFINITE - 1) as u128) as u32
-            }
-        };
+        if let Some(e) = &denied {
+            // Some sibling in this round was still openable, so the round proceeds — but an
+            // actionable `OpenProcess` failure on a live member (as opposed to the benign
+            // exit-race above) is otherwise invisible for every round in which that holds,
+            // which can be every round for the tree's whole lifetime. Every other known
+            // failure in this function gets a visible disposition; this one should too, even
+            // though it isn't (yet) fatal to this round's wait.
+            log::debug!(
+                "wait_tree: could not open one live job member to watch for its exit, but \
+                 other members are still trackable this round: {e}"
+            );
+        }
 
         // The cancel handle (if any) is appended AFTER the real member handles, never
         // closed here (caller-owned) — only `handles` (the freshly opened member handles)
@@ -713,14 +700,12 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
         let _ = CloseHandle(snap);
     }
 
-    // The doc above promises this unconditionally ("If ResumeThread fails the child is killed
-    // immediately and an error returned") — that must hold even when SOME threads resumed
-    // successfully before another one failed, not only when every one did: a thread left
-    // suspended is exactly the "frozen process" this function exists to rule out, regardless of
-    // how many of its siblings got moving first.
+    // That must hold even when SOME threads resumed successfully before another one failed, not
+    // only when every one did: a thread left suspended is exactly the "frozen process" this
+    // function exists to rule out, regardless of how many of its siblings got moving first.
     if let Some(e) = last_err {
         log::warn!(
-            "wait_tree: failed to resume one or more of this child's initial threads \
+            "resume_initial_threads: failed to resume one or more of this child's initial threads \
              ({resumed} resumed successfully before the failure): {e}"
         );
         return Err(e);
