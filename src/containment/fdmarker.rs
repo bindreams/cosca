@@ -901,7 +901,6 @@ impl Marker {
 
     /// The supervisor's read end. `read()` on it returns EOF exactly when the last holder of
     /// the write end is gone.
-    #[allow(dead_code)]
     pub(crate) fn read_end(&self) -> BorrowedFd<'_> {
         self.read.as_fd()
     }

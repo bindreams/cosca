@@ -394,3 +394,17 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
     };
     assert!(detail.contains("vanished"), "absence must not read as denial: {detail}");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn wait_drained_is_unsupported_without_a_marker() {
+    // Mirrors `require_contained`: a mechanism that cannot answer says so, rather than
+    // implying a guarantee it has not got.
+    use super::Attached;
+    for attached in [Attached::None, Attached::Delegated] {
+        let err = attached
+            .wait_drained(Some(Some(std::time::Instant::now())))
+            .expect_err("a mechanism with no drain edge must be Unsupported");
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+    }
+}
