@@ -252,22 +252,42 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     }
     debug_assert!(preassigned.is_empty(), "the pre-pass only assigns std slots");
 
-    let prepared = crate::containment::prepare(tcmd.as_std_mut(), &cmd.contain_request());
-
-    // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
-    // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
+    // Every child fd number this spawn will occupy, including fd >= 3 merge sources (not yet
+    // folded into `child_ends` — see below), so the macOS fd-marker install places its own
+    // descriptor above all of them rather than colliding with a user mapping.
     #[cfg(unix)]
-    for (fd, end) in merge_fd_ends {
-        let prev = child_ends.insert(fd, end);
-        debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
-    }
+    let reserved: Vec<i32> = child_ends
+        .keys()
+        .map(|fd| fd.raw())
+        .chain(merge_fd_ends.iter().map(|(fd, _)| fd.raw()))
+        .collect();
+    #[cfg(not(unix))]
+    let reserved: Vec<i32> = Vec::new();
 
-    // On Unix, hand n>=3 child ends to command-fds — registered AFTER `prepare` so its dup2
-    // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
-    #[cfg(unix)]
-    {
+    // Phase 1 (before spawn): root detection + pre-spawn containment setup, registered before
+    // command-fds' dup2 pre_exec so the latter runs LAST in the child (see the ordering
+    // rationale in child/spawn.rs). On macOS the spawn lock is widened to enclose `prepare`
+    // through `drop(tcmd)` — see child/spawn.rs's matching comment for the race this closes
+    // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
+    // actually owns the marker write end's supervisor-side copy).
+    #[cfg(target_os = "macos")]
+    let (prepared, mut child) = {
+        let _guard = crate::child::spawn::spawn_lock();
+        let prepared = crate::containment::prepare(
+            tcmd.as_std_mut(),
+            &cmd.contain_request(),
+            &reserved,
+            cmd.fd_marker_suppressed(),
+        );
+
+        // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
+        // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
+        for (fd, end) in merge_fd_ends {
+            let prev = child_ends.insert(fd, end);
+            debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
+        }
+
         use command_fds::{CommandFdExt, FdMapping};
-
         let mappings: Vec<FdMapping> = child_ends
             .into_iter()
             .map(|(fd, owned)| FdMapping {
@@ -280,14 +300,56 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 .fd_mappings(mappings)
                 .expect("child fd numbers are unique (BTreeMap keys)");
         }
-    }
 
-    // Serialize the spawn against the raw backend's inheritable-handle window via the shared spawn
-    // lock: tokio's own handle-inheritance marking must not overlap a raw `CreateProcessW` spawn on
-    // another thread (mirrors the sync std path).
-    let mut child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        tcmd.spawn().map_err(Error::Io)?
+        let c = tcmd.spawn().map_err(Error::Io)?;
+        drop(tcmd);
+        (prepared, c)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (prepared, mut child) = {
+        let prepared = crate::containment::prepare(
+            tcmd.as_std_mut(),
+            &cmd.contain_request(),
+            &reserved,
+            cmd.fd_marker_suppressed(),
+        );
+
+        // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
+        // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
+        #[cfg(unix)]
+        for (fd, end) in merge_fd_ends {
+            let prev = child_ends.insert(fd, end);
+            debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
+        }
+
+        // On Unix, hand n>=3 child ends to command-fds — registered AFTER `prepare` so its dup2
+        // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
+        #[cfg(unix)]
+        {
+            use command_fds::{CommandFdExt, FdMapping};
+
+            let mappings: Vec<FdMapping> = child_ends
+                .into_iter()
+                .map(|(fd, owned)| FdMapping {
+                    parent_fd: owned,
+                    child_fd: fd.raw(),
+                })
+                .collect();
+            if !mappings.is_empty() {
+                tcmd.as_std_mut()
+                    .fd_mappings(mappings)
+                    .expect("child fd numbers are unique (BTreeMap keys)");
+            }
+        }
+
+        // Serialize the spawn against the raw backend's inheritable-handle window via the shared
+        // spawn lock: tokio's own handle-inheritance marking must not overlap a raw
+        // `CreateProcessW` spawn on another thread (mirrors the sync std path).
+        let c = {
+            let _guard = crate::child::spawn::spawn_lock();
+            tcmd.spawn().map_err(Error::Io)?
+        };
+        (prepared, c)
     };
 
     // Identity must be read before any await: spawn + attach are synchronous, so the runtime cannot

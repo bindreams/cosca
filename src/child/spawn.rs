@@ -147,6 +147,13 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
     }
 
+    // Every child fd number this spawn will occupy, so the macOS fd-marker install (below)
+    // places its own descriptor above all of them rather than colliding with a user mapping.
+    #[cfg(unix)]
+    let reserved: Vec<i32> = child_ends.keys().map(|fd| fd.raw()).collect();
+    #[cfg(not(unix))]
+    let reserved: Vec<i32> = Vec::new();
+
     // Phase 1 (before spawn): root detection + pre-spawn containment setup. This
     // MUST run before the command-fds block below so that command-fds installs
     // the LAST pre_exec hook. Why ordering matters: pre_exec hooks run in
@@ -160,19 +167,35 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // cgroup write+close happens while its fd is still valid; command-fds may then
     // freely reuse the now-closed slot. Net child order: std stdio (0/1/2) ->
     // containment pre_execs (cgroup placement / setsid) -> command-fds dup2 (last).
-    let prepared = crate::containment::prepare(&mut std_cmd, &cmd.contain_request());
+    //
+    // On macOS, `prepare` also clears FD_CLOEXEC on the marker write end for the forked
+    // child only (the supervisor's own copy stays CLOEXEC — see `fdmarker::install`'s doc
+    // comment). That leaves a real, bounded window — between the clear and this spawn's own
+    // `exec` — where a truly concurrent, unrelated `fork()` on another thread of THIS process
+    // could transiently inherit the marker fd and carry it past its own `exec`. The shared,
+    // process-wide `spawn_lock` (already used to serialize against the Windows raw backend)
+    // is widened on macOS to enclose `prepare` through `drop(std_cmd)`, closing that window
+    // against every other cosca-originated spawn; `install`'s doc comment names the residual
+    // (a spawn racing this one via a path outside cosca's own spawn functions) that no local
+    // code can close.
+    #[cfg(target_os = "macos")]
+    let (prepared, mut child) = {
+        let _guard = spawn_lock();
+        let prepared = crate::containment::prepare(
+            &mut std_cmd,
+            &cmd.contain_request(),
+            &reserved,
+            cmd.fd_marker_suppressed(),
+        );
 
-    // On Unix, hand n>=3 child ends to command-fds. This installs a pre_exec hook
-    // that dup2's each OwnedFd to its target number post-fork. It is registered
-    // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
-    // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
-    // disables posix_spawn when hooks are registered), so our n>=3 mappings never
-    // clobber the std stdio fds either. FdMappingCollision is unreachable:
-    // child_ends keys come from a BTreeMap, so each child fd number is unique.
-    #[cfg(unix)]
-    {
+        // On Unix, hand n>=3 child ends to command-fds. This installs a pre_exec hook
+        // that dup2's each OwnedFd to its target number post-fork. It is registered
+        // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
+        // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
+        // disables posix_spawn when hooks are registered), so our n>=3 mappings never
+        // clobber the std stdio fds either. FdMappingCollision is unreachable:
+        // child_ends keys come from a BTreeMap, so each child fd number is unique.
         use command_fds::{CommandFdExt, FdMapping};
-
         let mappings: Vec<FdMapping> = child_ends
             .into_iter()
             .map(|(fd, owned)| FdMapping {
@@ -185,14 +208,48 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 .fd_mappings(mappings)
                 .expect("child fd numbers are unique (BTreeMap keys)");
         }
-    }
 
-    // The std Child is owned here so containment can job-assign + resume it. Serialize the
-    // spawn against the raw backend's inheritable-handle window via the shared spawn lock: std's
-    // own handle-inheritance marking must not overlap a raw spawn on another thread.
-    let mut child = {
-        let _guard = spawn_lock();
-        std_cmd.spawn().map_err(Error::Io)?
+        let c = std_cmd.spawn().map_err(Error::Io)?;
+        drop(std_cmd);
+        (prepared, c)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (prepared, mut child) = {
+        let prepared = crate::containment::prepare(
+            &mut std_cmd,
+            &cmd.contain_request(),
+            &reserved,
+            cmd.fd_marker_suppressed(),
+        );
+
+        // On Unix, hand n>=3 child ends to command-fds. See the macOS branch above for why
+        // this is registered LAST (after `prepare`).
+        #[cfg(unix)]
+        {
+            use command_fds::{CommandFdExt, FdMapping};
+
+            let mappings: Vec<FdMapping> = child_ends
+                .into_iter()
+                .map(|(fd, owned)| FdMapping {
+                    parent_fd: owned,
+                    child_fd: fd.raw(),
+                })
+                .collect();
+            if !mappings.is_empty() {
+                std_cmd
+                    .fd_mappings(mappings)
+                    .expect("child fd numbers are unique (BTreeMap keys)");
+            }
+        }
+
+        // The std Child is owned here so containment can job-assign + resume it. Serialize the
+        // spawn against the raw backend's inheritable-handle window via the shared spawn lock: std's
+        // own handle-inheritance marking must not overlap a raw spawn on another thread.
+        let c = {
+            let _guard = spawn_lock();
+            std_cmd.spawn().map_err(Error::Io)?
+        };
+        (prepared, c)
     };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
     // `prepared` is consumed here: Linux cgroup leaf ownership moves to Attached::Cgroup.

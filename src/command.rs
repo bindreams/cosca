@@ -23,6 +23,7 @@ pub struct Command {
     kill_on_drop: bool,
     contain: ContainRequest,
     elevation: crate::elevation::ElevationRequest,
+    fd_marker_suppressed: bool,
 }
 
 /// An environment variable operation, recorded in order.
@@ -44,6 +45,7 @@ impl Default for Command {
             kill_on_drop: true,
             contain: ContainRequest::default(),
             elevation: crate::elevation::ElevationRequest::default(),
+            fd_marker_suppressed: false,
         }
     }
 }
@@ -274,6 +276,20 @@ impl Command {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_contain(&mut self, req: ContainRequest) {
         self.contain = req;
+    }
+
+    /// Suppress the macOS fd marker for this spawn. Set on a REAL wrapper-spawn command
+    /// (`ElevatePosix`'s derived `sudo`/`doas`/`pkexec …`), whose wrapper closes every
+    /// descriptor >= 3 before exec, so a marker installed here could never reach the tree.
+    /// Not set on `RunAsIs`'s derived command (already elevated): that one spawns the
+    /// original program directly, with no wrapper to destroy anything.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn suppress_fd_marker(&mut self) {
+        self.fd_marker_suppressed = true;
+    }
+
+    pub(crate) fn fd_marker_suppressed(&self) -> bool {
+        self.fd_marker_suppressed
     }
 
     // ---- crate-internal accessors for the spawn engine -------------

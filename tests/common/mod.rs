@@ -3,8 +3,9 @@
 //! are shared via `#[path = "common/mod.rs"] mod common;`).
 
 // Each test crate compiles the whole module but uses only the subset it needs (e.g.
-// `lifecycle` never calls `spawn_blocker`), so per-crate dead-code is expected here.
-#![allow(dead_code)]
+// `lifecycle` never calls `spawn_blocker`), so per-crate dead code and unused imports (e.g. the
+// log-capture re-exports, which only `macos_fdmarker.rs` uses) are expected here.
+#![allow(dead_code, unused_imports)]
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -12,6 +13,63 @@ use std::net::{TcpListener, TcpStream};
 pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
+
+/// Run `cmd` under `cosca::test_spawn_lock()` and return its captured output — the ONLY way
+/// this test surface should fork a RAW `std::process::Command` (one not going through
+/// `cosca::Command`, which already takes this same lock internally). Cargo runs `#[test]` fns
+/// in one binary concurrently, and every test in `tests/macos_fdmarker.rs` runs a real
+/// `FdMarker` sweep; an unguarded raw fork can transiently inherit a live marker pre-`exec`,
+/// and a concurrent sweep can then confirm and SIGKILL it before it gets there. A single
+/// wrapper, not a `let _guard = ...;` line the caller must remember, closes that gap for
+/// every call site at once — including any added later.
+pub fn output_locked(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    let _guard = cosca::test_spawn_lock();
+    cmd.output()
+}
+
+/// The `.status()` sibling of [`output_locked`] — see there for why raw spawns in this test
+/// surface must go through one of these two, not a bare `std::process::Command` call.
+pub fn status_locked(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    let _guard = cosca::test_spawn_lock();
+    cmd.status()
+}
+
+/// A capturing `log::Log` for asserting on log output from an integration-test process — a fresh
+/// copy of `src/log_capture.rs`'s `pub(crate)`-private original, which a separate compilation unit
+/// like this one cannot name.
+mod log_capture {
+    use std::sync::{Mutex, OnceLock};
+
+    struct CaptureLog;
+    static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    impl log::Log for CaptureLog {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            RECORDS.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    pub fn install() {
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&CaptureLog).expect("first logger in this test process");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    pub fn mark() -> usize {
+        RECORDS.lock().unwrap().len()
+    }
+
+    pub fn contains_since(mark: usize, needle: &str) -> bool {
+        RECORDS.lock().unwrap()[mark..].iter().any(|m| m.contains(needle))
+    }
+}
+pub use log_capture::{contains_since, install as install_log_capture, mark as log_mark};
 
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it

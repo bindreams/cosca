@@ -167,6 +167,15 @@ impl Child {
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use `kill()` for a lone process).
+    ///
+    /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
+    /// means at least one known or suspected tree member could not be assessed or signalled
+    /// this call — not merely "some descendant's identity transiently failed to resolve and
+    /// was left running," which the rest of this doc comment calls acceptable. The tree may
+    /// still be partially alive after such an `Err`. This is a real, expected outcome on a
+    /// real host (e.g. a member that `exec`s a setuid binary becomes unqueryable), not a bug
+    /// to route around by ignoring the `Result`.
+    ///
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
     /// On the Unix process-group and session mechanisms this returns
@@ -175,8 +184,9 @@ impl Child {
     /// tree is still running and this process cannot bring it down.
     ///
     /// **This guarantee, and its converse — that `Ok` is positive proof the group cleared —
-    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: `TreeWalk`
-    /// does not yet propagate a live refuser's outcome into this call's result (#63).
+    /// hold only for the `ProcessGroup`/`Session` mechanisms**, not `TreeWalk`: a separate,
+    /// unfixed gap means `TreeWalk` does not yet propagate a live refuser's outcome into this
+    /// call's result.
     ///
     /// **A `hidepid`-restricted Linux host can still return `Ok` with a live refuser left
     /// running.** `/proc` is this mechanism's only way to confirm the group cleared, and
@@ -187,35 +197,39 @@ impl Child {
     /// value is not trustworthy evidence either.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // Precondition (sibling #54's territory — asserted, not fixed, here): if the pgid-based
-        // mechanism's (Attached::ProcessGroup — covers both Containment::ProcessGroup and
-        // Containment::Session, which also lands in this variant at spawn time) leader pid has
-        // been reaped AND RECYCLED onto a DIFFERENT, LIVE process group, `killpg` would signal
-        // that unrelated group instead. Reaping alone is harmless — `killpg` on an absent pgid
-        // returns `ESRCH`, which `containment::unix::signal_group`/`verify` already treat as
-        // `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle (see
-        // `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
+        // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
+        // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
+        // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
+        // (`containment/dispatch.rs`) names exactly the mechanisms this applies to:
+        // `Attached::ProcessGroup` (covers both `Containment::ProcessGroup` and
+        // `Containment::Session`) and macOS `Attached::FdMarker` when its mode created a pgid
+        // (it fires `killpg` on pass 1 of every sweep unconditionally, so the hazard is
+        // identical there, not merely similar). Reaping alone is harmless — `killpg` on an
+        // absent pgid returns `ESRCH`, which `containment::unix::signal_group`/`verify` already
+        // treat as `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle
+        // (see `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
         // reachable on the ORDINARY spawn-then-teardown path for any fast-exiting child, not
         // only via an explicit `wait()` before `kill_tree()`/`terminate_tree()`: `std`'s
         // `SharedChild::new` (inside `Command::spawn`, see `child/spawn.rs`'s own comment on
         // this) can reap a fast-exiting leader itself, before the caller ever gets a `Child`
         // handle back — this assert can therefore fire on the very first call the caller makes,
-        // whatever ordering they use. Gated to this ONE mechanism: a recycled pgid is
-        // meaningless for Cgroup (keyed by an fd), JobObject (no pgid), Delegated (no
-        // mechanism), or TreeWalk (re-resolves identity per member, immune to this by
-        // construction) — asserting it there would be a false alarm unrelated to what this
-        // precondition is about. An OS refusal to answer either resolve (`Resolved::Unknown` /
-        // `Liveness::Unknown`) is permitted through: this asserts against POSITIVE evidence of a
-        // violation, not against every case we merely couldn't rule out.
+        // whatever ordering they use. Gated to mechanisms that carry a recyclable pgid: a
+        // recycled pgid is meaningless for Cgroup (keyed by an fd), JobObject (no pgid),
+        // Delegated (no mechanism), TreeWalk (re-resolves identity per member, immune to this
+        // by construction), or a macOS FdMarker whose mode created no pgid — asserting it there
+        // would be a false alarm unrelated to what this precondition is about. An OS refusal to
+        // answer either resolve (`Resolved::Unknown` / `Liveness::Unknown`) is permitted
+        // through: this asserts against POSITIVE evidence of a violation, not against every
+        // case we merely couldn't rule out.
         //
-        // `#[cfg(unix)]`: `Attached::ProcessGroup` is itself a Unix-only variant (see
+        // `#[cfg(unix)]`: `Attached::carries_recyclable_pgid` is itself Unix-only (see
         // `containment/dispatch.rs`) — referencing it unconditionally does not compile on
         // Windows (`cargo check --target x86_64-pc-windows-msvc` confirmed E0599 without this
         // gate). Windows has no pgid to recycle, so there is nothing for this precondition to
         // assert there.
         #[cfg(unix)]
         debug_assert!(
-            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+            !self.attached.carries_recyclable_pgid() || {
                 let now = ProcessId::of(self.id.pid());
                 let now_liveness = match now {
                     crate::identity::Resolved::Found(id) => id.is_alive(),
@@ -227,7 +241,7 @@ impl Child {
             },
             "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
              recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group (see #54)",
+             unrelated process group",
             self.id.pid()
         );
         let group_result = self.attached.hard_kill();
@@ -261,8 +275,17 @@ impl Child {
     /// spawned detached cannot deliver it. The failure is classified best-effort: usually
     /// [`Error::NoConsole`](crate::error::Error::NoConsole), but a raw `Error::Io` when the
     /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
-    /// tree is still running" rather than keying a fallback on the variant alone. Attach a
-    /// console before spawning the tree, or use `kill_tree`, which needs none.
+    /// tree is still running" rather than keying a fallback on the variant alone.
+    ///
+    /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
+    /// means at least one known or suspected tree member could not be assessed or signalled
+    /// this call — not merely "some descendant's identity transiently failed to resolve and
+    /// was left running," which the rest of this doc comment calls acceptable. The tree may
+    /// still be partially alive after such an `Err`. This is a real, expected outcome on a
+    /// real host (e.g. a member that `exec`s a setuid binary becomes unqueryable), not a bug
+    /// to route around by ignoring the `Result`.
+    ///
+    /// Attach a console before spawning the tree, or use `kill_tree`, which needs none.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -270,15 +293,15 @@ impl Child {
     /// tree is still running and this process cannot bring it down.
     ///
     /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
-    /// `ProcessGroup`/`Session`-only scope of this guarantee (`TreeWalk` is #63's territory),
-    /// and the residual `hidepid` gap on Linux.
+    /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
+    /// `TreeWalk`), and the residual `hidepid` gap on Linux.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // See kill_tree's identical precondition assert for the full rationale, including the
-        // `#[cfg(unix)]` gate (Attached::ProcessGroup does not exist on Windows).
+        // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
         debug_assert!(
-            !matches!(self.attached, crate::containment::Attached::ProcessGroup(_)) || {
+            !self.attached.carries_recyclable_pgid() || {
                 let now = ProcessId::of(self.id.pid());
                 let now_liveness = match now {
                     crate::identity::Resolved::Found(id) => id.is_alive(),
@@ -290,7 +313,7 @@ impl Child {
             },
             "kill_tree/terminate_tree called after the contained root's pid ({}) was reaped and \
              recycled onto a different, live process; a pgid-based mechanism would now signal an \
-             unrelated process group (see #54)",
+             unrelated process group",
             self.id.pid()
         );
         self.attached.terminate(self.proc.id())
@@ -362,6 +385,55 @@ impl Child {
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
         crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())
+    }
+
+    /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
+    #[cfg(all(test, target_os = "macos"))]
+    #[allow(dead_code)] // awaits a unit-test consumer; not visible to integration tests (pub(crate))
+    pub(crate) fn test_marker_handle(&self) -> Option<u64> {
+        match &self.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.handle()),
+            _ => None,
+        }
+    }
+
+    /// Test-only: the fd-marker descriptor's number in the child, so this crate's OWN
+    /// integration tests (`tests/*.rs`, which cannot name a `pub(crate)` item) can be TOLD the
+    /// exact number rather than inferring it from ambient process state. A prior version of
+    /// `tests/macos_fdmarker.rs` had a testbin mode scan its own open fds for "the one nobody
+    /// explains" — passing locally but flaky on CI, where the runner hands the process extra
+    /// inherited descriptors the scan could not tell apart from the marker (#59). This is the
+    /// crate's own bookkeeping, not a guess: `None` if `self` is not `Attached::FdMarker`.
+    /// `#[doc(hidden)]`: not public API, present only for this crate's own `tests/` binaries.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn test_fdmarker_fd(&self) -> Option<i32> {
+        match &self.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.own_fd()),
+            _ => None,
+        }
+    }
+
+    /// Test-only: force the FdMarker mechanism's process-group id, so a test can drive
+    /// `containment::unix::signal_group`'s real `pgid <= 0` guard — a real,
+    /// privilege-free `Error::Unassessable { source: None, .. }` outcome, not a synthetic
+    /// `Error` value — through this crate's own public `kill_tree`/`terminate_tree`/`Drop`
+    /// path and `is_teardown_mechanism_failure` below. Exists because a live cross-uid
+    /// refuser (the `Error::Containment` scenario) needs real root to construct at all — see
+    /// `tests/group_teardown_setuid.rs`'s own module docs for why that is not reliably
+    /// provisionable on macOS (SIP) — and because calling `Marker::hard_kill`/`terminate`
+    /// directly, the way `fdmarker_tests.rs` otherwise does, bypasses `dispatch.rs`'s
+    /// `Attached::FdMarker` arm entirely: exactly where an earlier version of this fix
+    /// laundered `Error::Containment` into `Error::Io` without any test noticing.
+    ///
+    /// Panics if `self` is not `Attached::FdMarker` — a misuse of this seam by the caller,
+    /// not a case to silently no-op past.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_force_fdmarker_pgid(&mut self, pgid: i32) {
+        match &mut self.attached {
+            crate::containment::Attached::FdMarker(m) => m.force_pgid_for_test(pgid),
+            other => panic!("test_force_fdmarker_pgid called on a non-FdMarker child: {other:?}"),
+        }
     }
 }
 

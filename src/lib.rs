@@ -18,6 +18,18 @@ pub use stdio::{Fd, Stdio};
 mod child;
 pub use child::Child;
 
+/// Test-only: the same process-wide lock production spawns take internally
+/// (`child::spawn::spawn_lock`), exposed so this crate's OWN integration tests
+/// (`tests/*.rs`, a separate compilation unit that cannot name a `pub(crate)` item) can
+/// serialize a raw `std::process::Command` spawn against it too — closing the same
+/// fork-bystander-inherits-a-live-marker window `containment::fdmarker`'s module docs
+/// describe, for a raw spawn that bypasses `cosca::Command` entirely. `#[doc(hidden)]`: not
+/// public API, present only for this crate's own `tests/` binaries to link against.
+#[doc(hidden)]
+pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    child::spawn::spawn_lock()
+}
+
 mod command;
 pub use command::Command;
 

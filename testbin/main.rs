@@ -2,6 +2,8 @@
 //! one exception: the `report-nested-kill-tree` mode uses the `cosca` crate
 //! to exercise the real nested-member `kill_tree` path. Behavior is selected by argv[1].
 
+#[cfg(target_os = "macos")]
+use std::io::BufRead;
 use std::io::{Read, Write};
 use std::process::exit;
 
@@ -52,6 +54,24 @@ fn install_ignore_break() {
     }
     // SAFETY: installing a console ctrl handler has no preconditions.
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
+}
+
+/// Shared body of `control-echo-pid` and the grandchild arm of `spawn-orphan-escapee`'s
+/// relay: publish `<tag><pid>\n`, then echo each byte received. `Ok(0)`/`Interrupted` are the
+/// only expected outcomes besides a live echo; anything else is a genuine test-harness bug.
+fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
+    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    writeln!(sock, "{tag}{}", std::process::id()).unwrap();
+    sock.flush().unwrap();
+    let mut b = [0u8; 1];
+    loop {
+        match sock.read(&mut b) {
+            Ok(0) => std::process::exit(0), // the test dropped the socket
+            Ok(_) => sock.write_all(&b).unwrap(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("control socket read failed: {e}"),
+        }
+    }
 }
 
 fn main() {
@@ -193,6 +213,61 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
         }
+        #[cfg(target_os = "macos")]
+        "control-block-mixed-cloexec-marker" => {
+            // Like control-block, but first `F_DUPFD_CLOEXEC`s a second copy of the inherited
+            // fd-marker descriptor, so this pid holds BOTH a CLOEXEC copy and the original
+            // non-CLOEXEC one — exercising `holders()`'s AND-fold coverage gap (#59).
+            //
+            // The marker's fd number is NOT discovered here: an earlier version scanned this
+            // process's own open fds for "the one nobody else explains", which passed locally
+            // but was flaky on CI, where the runner hands the process extra inherited
+            // descriptors indistinguishable from the marker by that scan alone. The test
+            // process already knows the real number (`Child::test_fdmarker_fd`, its own
+            // bookkeeping from installing the marker) and sends it over the control socket
+            // after the tag handshake below — this mode is simply told, never guesses.
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+
+            let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read marker fd from the test");
+            let marker_fd: i32 = line.trim().parse().expect("marker fd must be a plain decimal number");
+            // SAFETY: F_GETFD has no preconditions beyond a valid fd number; -1 means closed.
+            assert!(
+                unsafe { libc::fcntl(marker_fd, libc::F_GETFD) } != -1,
+                "the test told us fd {marker_fd} carries the marker, but it is not open here"
+            );
+
+            // SAFETY: `marker_fd` was just confirmed open above; F_DUPFD_CLOEXEC duplicates it,
+            // setting FD_CLOEXEC on the NEW copy only — the original descriptor is untouched
+            // (still open, still non-CLOEXEC).
+            let dup = unsafe { libc::fcntl(marker_fd, libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                dup >= 0,
+                "F_DUPFD_CLOEXEC({marker_fd}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(
+                dup < marker_fd,
+                "the CLOEXEC dup (fd {dup}) must land below the marker's own high fd \
+                 ({marker_fd}) for this test to exercise the ordering its coverage depends on"
+            );
+
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
+        }
+        "control-echo-pid" => {
+            // Like control-block, but publishes its own pid on the wire: `<tag><pid>\n`. Then
+            // echoes each byte it receives, so a test can prove a member is ALIVE (a real
+            // 1-byte round trip) as well as dead (EOF) — without a timer in either direction.
+            let addr = args[2].clone();
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            run_control_echo_pid(&addr, tag);
+        }
         "spawn-grandchild" => {
             // Spawn a grandchild that holds its own control connection (tag "G"),
             // then hold ours (tag "R"). Both die together iff containment works.
@@ -321,6 +396,39 @@ fn main() {
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
+        }
+        // The shape both current macOS mechanisms lose: a grandchild that leaves the session,
+        // is reparented to launchd when its parent exits, and execs. The relay does the setsid
+        // and exits at once; the grandchild it spawned reparents to pid 1 with its own pgid.
+        #[cfg(unix)]
+        "spawn-orphan-escapee" => {
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            let mut relay = std::process::Command::new(&exe);
+            relay.args(["orphan-relay", &addr]);
+            // SAFETY: pre_exec runs post-fork, pre-exec; libc::setsid is async-signal-safe.
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                relay.pre_exec(|| {
+                    libc::setsid(); // best-effort: EPERM only if already a leader
+                    Ok(())
+                });
+            }
+            let mut relay = relay.spawn().unwrap();
+            relay.wait().unwrap(); // its exit is the reparenting event
+                                   // Same wire format as the grandchild, so the test parses one shape.
+            run_control_echo_pid(&addr, "R");
+        }
+        #[cfg(unix)]
+        "orphan-relay" => {
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us
+            let _ = std::process::Command::new(&exe)
+                .args(["control-echo-pid", &addr, "G"])
+                .spawn()
+                .unwrap();
+            std::process::exit(0);
         }
         #[cfg(unix)]
         "spawn-grandchild-ignore-term" => {

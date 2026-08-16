@@ -525,6 +525,10 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
 }
 
 /// Transfer the caller's cwd / containment / kill-on-drop onto the derived command.
+/// Does NOT suppress the fd marker — that is only correct for a real wrapper spawn
+/// (`ElevatePosix`), whose `closefrom` destroys it; `RunAsIs`'s derived command spawns the
+/// original program directly, with no wrapper to destroy anything, so its caller must
+/// suppress explicitly if that arm ever needs to.
 fn transfer_process_attrs(derived: &mut Command, cmd: &Command) {
     if let Some(d) = cmd.cwd() {
         derived.current_dir(d);
@@ -635,6 +639,11 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             derived.set_input_argv(argv);
             derived.set_env_ops(new_ops);
             transfer_process_attrs(&mut derived, cmd);
+            // Only THIS arm's derived command is a real wrapper spawn (`sudo`/`doas`/`pkexec`
+            // …): its `closefrom` destroys an installed marker, so the marker must not be
+            // installed on it at all. `RunAsIs` spawns the original program with no wrapper —
+            // suppressing there would claim a false justification (see `transfer_process_attrs`).
+            derived.suppress_fd_marker();
 
             // Auth::Stdin: wire the derived fd0 to a fresh pipe's read end; the password is
             // written after spawn (the fd0 conflict was rejected in the structural gate).

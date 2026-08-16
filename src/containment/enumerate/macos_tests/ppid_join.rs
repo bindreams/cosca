@@ -1,6 +1,8 @@
-//! The ppid join: `join_ppids`, `process_parents`, and `ppid_of`'s failure branches.
+//! The ppid join: `join_edges`, `process_parents`, and `ppid_of`'s failure branches.
 
-use super::super::{join_ppids, ppid_of, process_parents, DROP_SAMPLE_CAP};
+use crate::identity::Resolved;
+
+use super::super::{join_edges, ppid_of, process_parents, push_denied_sample, DENIED_SAMPLE_CAP};
 
 /// The `pid <= 0` filter, pinned deterministically with a synthetic pid list rather than a
 /// live one: depending on a live run to happen to contain pid 0 (a kernel-internal fact
@@ -9,17 +11,17 @@ use super::super::{join_ppids, ppid_of, process_parents, DROP_SAMPLE_CAP};
 /// to resolve (`proc_pidinfo` on SELF is always permitted), so it proves the non-positive
 /// entries are what's filtered, not that every entry is.
 #[test]
-fn join_ppids_filters_non_positive_pids() {
+fn join_edges_filters_non_positive_pids() {
     let me = std::process::id() as libc::c_int;
     // Read before and after, same reasoning as `parents_contains_this_process_edge`:
     // nothing holds this process's real parent fixed across the call.
     let parent_before = std::os::unix::process::parent_id();
-    let (out, dropped, sample) = join_ppids(&[0, -1, me]);
+    let (out, denied, sample) = join_edges(&[0, -1, me]);
     let parent_after = std::os::unix::process::parent_id();
-    assert_eq!(dropped, 0, "0 and -1 must not be counted as failed ppid lookups");
+    assert_eq!(denied, 0, "0 and -1 must not be counted as denied ppid lookups");
     assert!(
         sample.is_empty(),
-        "nothing was attempted-and-failed, so nothing should be sampled"
+        "nothing was attempted-and-denied, so nothing should be sampled"
     );
     assert_eq!(out.len(), 1, "only the real pid should produce an edge");
     let (pid, ppid) = out[0];
@@ -30,24 +32,42 @@ fn join_ppids_filters_non_positive_pids() {
     );
 }
 
-/// The drop sample truncates at `DROP_SAMPLE_CAP`, not off-by-one and not unbounded: more
-/// than `DROP_SAMPLE_CAP` copies of a pid that can never resolve (see
-/// `ppid_of_returns_none_for_an_unallocatable_pid`) must still count every one as dropped
-/// while the sample itself stays capped.
+/// A `Gone` pid (one that can never resolve because it's beyond `PID_MAX`) is a legitimate
+/// exclusion, not a denial: it must produce no edge and must NOT be counted in `denied`, no
+/// matter how many are batched together.
 #[test]
-fn join_ppids_caps_the_drop_sample() {
-    let unresolvable = vec![libc::c_int::MAX; DROP_SAMPLE_CAP + 2];
-    let (out, dropped, sample) = join_ppids(&unresolvable);
+fn join_edges_does_not_count_gone_pids_as_denied() {
+    let unresolvable = vec![libc::c_int::MAX; 8];
+    let (out, denied, sample) = join_edges(&unresolvable);
     assert!(out.is_empty(), "none of these pids can resolve to an edge");
-    assert_eq!(
-        dropped,
-        DROP_SAMPLE_CAP + 2,
-        "every attempted lookup must be counted as dropped"
+    assert_eq!(denied, 0, "a pid that is simply gone must not be counted as denied");
+    assert!(
+        sample.is_empty(),
+        "a Gone pid must not be sampled either — only Unknown is"
     );
+}
+
+/// The denied-sample cap, pinned directly against [`push_denied_sample`] rather than through
+/// a live `join_edges` call: there is no deterministic way to force `Resolved::Unknown` from
+/// a real `ppid_of` call (see `snapshot`'s doc), so this is the only way to exercise the cap
+/// at all. Pushing `DENIED_SAMPLE_CAP + 2` entries must still keep exactly the first
+/// `DENIED_SAMPLE_CAP` of them — capped, not merely bounded by coincidence, and not silently
+/// replacing earlier entries with later ones.
+#[test]
+fn push_denied_sample_caps_at_the_limit() {
+    let mut sample = Vec::new();
+    for pid in 0..(DENIED_SAMPLE_CAP as libc::c_int + 2) {
+        push_denied_sample(&mut sample, pid);
+    }
     assert_eq!(
         sample.len(),
-        DROP_SAMPLE_CAP,
-        "the sample must be capped, not grow with the drop count"
+        DENIED_SAMPLE_CAP,
+        "the sample must be capped, not grow with every push"
+    );
+    assert_eq!(
+        sample,
+        (0..DENIED_SAMPLE_CAP as libc::c_int).collect::<Vec<_>>(),
+        "a capped sample must keep the FIRST N pushes, not the last"
     );
 }
 
@@ -87,7 +107,7 @@ fn parents_contains_this_process_edge() {
 /// The precondition assertion is load-bearing, not decoration: the whole point of this test
 /// is that the FALLBACK resolves pid 1, but whether the fallback is even reached depends
 /// entirely on the runner's privilege - root's `proc_pidinfo(1, ..)` succeeds outright, so a
-/// privileged run (`sudo cargo test`, a root CI container) would satisfy `Some(0)` via the
+/// privileged run (`sudo cargo test`, a root CI container) would satisfy `Found(0)` via the
 /// PRIMARY path alone and never exercise the fallback at all, leaving this test green while
 /// silently testing nothing. Asserting non-root up front makes that case fail loudly instead.
 #[test]
@@ -101,18 +121,19 @@ fn ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback() {
     );
     assert_eq!(
         ppid_of(1),
-        Some(0),
+        Resolved::Found(0),
         "pid 1 (launchd)'s parent is the kernel (ppid 0), resolvable via the sysctl fallback"
     );
 }
 
-/// The OTHER cause of `ppid_of`'s `None` branch: ESRCH, a pid that does not exist. Triggered
-/// deterministically: XNU caps real pids at `PID_MAX` (99999), so `libc::c_int::MAX` can
-/// never be live.
+/// The OTHER cause of `ppid_of`'s non-`Found` branch: `Gone`, a pid that does not exist.
+/// Triggered deterministically: XNU caps real pids at `PID_MAX` (99999), so `libc::c_int::MAX`
+/// can never be live.
 #[test]
-fn ppid_of_returns_none_for_an_unallocatable_pid() {
-    assert!(
-        ppid_of(libc::c_int::MAX).is_none(),
-        "a pid beyond PID_MAX can never resolve to a ppid"
+fn ppid_of_reports_gone_for_an_unallocatable_pid() {
+    assert_eq!(
+        ppid_of(libc::c_int::MAX),
+        Resolved::Gone,
+        "a pid beyond PID_MAX can never resolve to a ppid, and is not a denial"
     );
 }

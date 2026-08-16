@@ -11,6 +11,8 @@ use crate::identity::ProcessId;
 
 // A long-lived std child (leak-proof: killed + reaped by each test).
 fn std_blocker() -> std::process::Child {
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let _guard = crate::child::spawn::spawn_lock();
     let mut cmd = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" });
     #[cfg(windows)]
     cmd.args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null());

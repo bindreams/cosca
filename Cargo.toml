@@ -63,7 +63,7 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["signal", "process", "event", "term"] }
+nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
 command-fds = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]

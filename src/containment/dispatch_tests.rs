@@ -78,6 +78,53 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
+/// `Child::kill_tree`/`terminate_tree`'s pgid-recycle precondition assert gates on this
+/// predicate, not on `Attached::ProcessGroup` alone (`src/child.rs`, `src/tokio/child.rs`) —
+/// a macOS `FdMarker` that carries a pgid must be covered too, since it fires `killpg`
+/// unconditionally on pass 1 of every sweep, exactly the hazard this precondition guards.
+#[cfg(unix)]
+#[test]
+fn attached_carries_recyclable_pgid() {
+    use super::Attached;
+    assert!(!Attached::None.carries_recyclable_pgid());
+    assert!(!Attached::Delegated.carries_recyclable_pgid());
+    assert!(!Attached::TreeWalk(crate::identity::ProcessId::current()).carries_recyclable_pgid());
+    assert!(Attached::ProcessGroup(0).carries_recyclable_pgid());
+    #[cfg(target_os = "linux")]
+    assert!(
+        !Attached::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test()).carries_recyclable_pgid()
+    );
+}
+
+/// The macOS-specific half of `attached_carries_recyclable_pgid`: an `FdMarker` must track
+/// its OWN `pgid`, not the mechanism's mere presence — `TreeWalk` mode creates no pgid at
+/// all (`Marker::pgid: None`), so a marker built for it must read `false` here exactly like
+/// `Attached::TreeWalk` itself, while a marker built for any grouped mode (`pgid: Some(_)`)
+/// must read `true`, matching `Attached::ProcessGroup`.
+#[cfg(target_os = "macos")]
+#[test]
+fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use super::Attached;
+
+    fn marker_with_pgid(pgid: Option<i32>) -> crate::containment::fdmarker::Marker {
+        let (read, write) = std::io::pipe().expect("pipe");
+        let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
+        let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
+        let prepared = crate::containment::fdmarker::PreparedMarker {
+            read: std::os::fd::OwnedFd::from(read),
+            handle,
+            read_handle,
+            fd: write.as_fd().as_raw_fd(),
+        };
+        crate::containment::fdmarker::Marker::new(prepared, None, pgid, false)
+    }
+
+    assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).carries_recyclable_pgid());
+    assert!(!Attached::FdMarker(marker_with_pgid(None)).carries_recyclable_pgid());
+}
+
 /// Drives the real `attach()` nested arms (not a hand-built variant): a nested
 /// (`!is_root`) contained spawn must yield BOTH halves of the delegated pair —
 /// `Containment::Delegated` and `Attached::Delegated` — for a kernel mechanism
@@ -88,7 +135,11 @@ fn nested_attach_is_delegated() {
     use crate::containment::{ContainMode, Containment};
 
     fn spawn_trivial() -> std::process::Child {
-        // attach()'s nested arms don't touch the child, so an exited child is fine.
+        // attach()'s nested arms don't touch the child, so an exited child is fine. Held for
+        // the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write end
+        // is transiently open would inherit it into this not-yet-`exec`'d process, and a
+        // concurrent sweep could then find and SIGKILL it.
+        let _guard = crate::child::spawn::spawn_lock();
         #[cfg(unix)]
         return std::process::Command::new("true").spawn().expect("spawn true");
         #[cfg(windows)]
@@ -105,6 +156,8 @@ fn nested_attach_is_delegated() {
             is_root: false, // nested member
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
+            #[cfg(target_os = "macos")]
+            marker: None,
         };
         #[cfg(windows)]
         let proc_handle = {
@@ -134,14 +187,22 @@ fn nested_attach_is_delegated() {
     }
 }
 
-// kill_tree handle-backstop (treewalk fault seam) =====
+// kill_tree handle-backstop (treewalk / macOS fd-marker fault seam) =====
 
 // A long-lived TreeWalk-contained child; no descendants, so with the root identity-kill
 // seam-disabled the ONLY killer is kill_tree's handle backstop. Armed AFTER the fallible
 // spawn so a spawn panic cannot leak the flag.
+//
+// On macOS, `ContainMode::TreeWalk` still attaches `Containment::FdMarker` (decision 2: the
+// marker installs for every contained root regardless of requested mode) — its `sweep` calls
+// `treewalk::kill_by_identity` directly, never `treewalk::hard_kill`, so `treewalk::fault`'s
+// seam is never consumed there; `fdmarker::fault` provides the matching seam instead.
 #[test]
 fn sync_kill_tree_backstop_is_load_bearing() {
+    #[cfg(not(target_os = "macos"))]
     use super::super::treewalk::fault;
+    #[cfg(target_os = "macos")]
+    use crate::containment::fdmarker::fault;
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
     cmd.args(["sleep", "30"]);
@@ -166,7 +227,10 @@ fn sync_kill_tree_backstop_is_load_bearing() {
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn async_kill_tree_backstop_is_load_bearing() {
+    #[cfg(not(target_os = "macos"))]
     use super::super::treewalk::fault;
+    #[cfg(target_os = "macos")]
+    use crate::containment::fdmarker::fault;
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
     cmd.args(["sleep", "30"]);
@@ -185,6 +249,127 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     assert!(
         !status.success(),
         "the handle backstop must be what killed the root, got {status:?}"
+    );
+}
+
+// fd marker install policy (macOS) =====
+
+/// The install policy, exhaustively: every mode installs a marker for a ROOT spawn, no
+/// nested spawn ever does (it inherits the root's), no uncontained spawn does, and an
+/// elevation-derived spawn does not (its `sudo` wrapper closes every descriptor >= 3).
+#[cfg(target_os = "macos")]
+#[test]
+fn marker_wanted_installs_for_every_contained_root_and_nothing_else() {
+    use crate::containment::fdmarker::marker_wanted;
+    use crate::containment::ContainMode;
+    for mode in [ContainMode::Strongest, ContainMode::Session, ContainMode::TreeWalk] {
+        assert!(
+            marker_wanted(Some(mode), true, false),
+            "{mode:?} root installs a marker"
+        );
+        assert!(
+            !marker_wanted(Some(mode), false, false),
+            "{mode:?} nested inherits, never installs"
+        );
+        assert!(
+            !marker_wanted(Some(mode), true, true),
+            "{mode:?} elevated root must not install"
+        );
+    }
+    assert!(
+        !marker_wanted(None, true, false),
+        "an uncontained spawn installs no marker"
+    );
+}
+
+/// The marker mechanism is actionable: `kill_tree`/`terminate_tree` act on it.
+#[cfg(target_os = "macos")]
+#[test]
+fn attached_fd_marker_is_actionable() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use super::Attached;
+    let (read, write) = std::io::pipe().expect("pipe");
+    let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
+    let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
+    let prepared = crate::containment::fdmarker::PreparedMarker {
+        read: std::os::fd::OwnedFd::from(read),
+        handle,
+        read_handle,
+        fd: write.as_fd().as_raw_fd(),
+    };
+    let marker = crate::containment::fdmarker::Marker::new(prepared, None, None, false);
+    assert!(Attached::FdMarker(marker).is_actionable());
+}
+
+/// `prepare` must thread the caller's reserved child fds through to the placement, or a user
+/// fd mapping would dup2 over the marker in the child.
+#[cfg(target_os = "macos")]
+#[test]
+fn prepare_places_the_marker_above_the_callers_reserved_fds() {
+    use crate::containment::{ContainMode, ContainRequest, Nesting};
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = super::prepare(
+        &mut cmd,
+        &ContainRequest {
+            mode: Some(ContainMode::Strongest),
+            nesting: Nesting::Mark,
+        },
+        &[3, 4, 5, 6, 7, 8, 9, 10],
+        false,
+    );
+    let marker = prepared.marker.as_ref().expect("a contained macOS root gets a marker");
+    assert!(
+        marker.fd > 10,
+        "prepare placed the marker on fd {}, which a user mapping would dup2 over",
+        marker.fd
+    );
+}
+
+/// A failed install degrades to the pre-existing mechanism rather than failing the spawn.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_marker_install_leaves_prepare_without_one() {
+    use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
+    use crate::containment::{ContainMode, ContainRequest, Nesting};
+    // This test doesn't assert on log content itself, but triggering `Fault::Pipe` DOES emit
+    // "fd marker: pipe() failed" into the shared `log_capture` buffer once any test has called
+    // `log_capture::install()` — held for the whole body so it cannot land inside
+    // `fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`'s
+    // scanned window on another thread.
+    let _serialize = lock_for_log_assertion();
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    set_fault(Some(Fault::Pipe));
+    let prepared = super::prepare(
+        &mut cmd,
+        &ContainRequest {
+            mode: Some(ContainMode::Strongest),
+            nesting: Nesting::Mark,
+        },
+        &[],
+        false,
+    );
+    assert!(prepared.marker.is_none(), "the forced failure must yield no marker");
+}
+
+/// An elevation-derived spawn must not install a marker: `sudo` closes every descriptor >= 3.
+#[cfg(target_os = "macos")]
+#[test]
+fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
+    use crate::containment::{ContainMode, ContainRequest, Nesting};
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = super::prepare(
+        &mut cmd,
+        &ContainRequest {
+            mode: Some(ContainMode::Strongest),
+            nesting: Nesting::Mark,
+        },
+        &[],
+        true,
+    );
+    assert!(
+        prepared.marker.is_none(),
+        "an elevated spawn must not claim marker containment"
     );
 }
 
