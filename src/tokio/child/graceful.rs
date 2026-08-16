@@ -7,6 +7,22 @@ use std::time::Duration;
 use super::Child;
 use crate::error::Error;
 
+/// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
+/// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
+/// performs — root-only ([`crate::tokio::wait::grace_wait`]) or whole-tree
+/// ([`crate::tokio::wait::wait_tree_drained_dispatch`]). Outside test builds the seam module
+/// does not exist at all, so this compiles to a constant `None`. Duplicated (not shared) with
+/// the sync `crate::child::graceful` twin — see this module's own fault-seam doc comment for
+/// why a shared seam is not nameable across the sync/async trees.
+#[cfg(test)]
+fn take_forced_watch_error() -> Option<Error> {
+    crate::wait::fault::take_force_watch_error().then(crate::wait::fault::forced_watch_error)
+}
+#[cfg(not(test))]
+fn take_forced_watch_error() -> Option<Error> {
+    None
+}
+
 impl Child {
     /// Send `SIGTERM` to the (lone) child — a cooperative request to exit. Signal-only: does
     /// not wait or reap. Identity-bound, so it cannot race a concurrent reap onto a recycled
@@ -60,18 +76,28 @@ impl Child {
 
     /// Cooperative-then-forced shutdown of the contained tree: send the group its graceful
     /// signal (`SIGTERM` via `killpg`/cgroup, or `CTRL_BREAK` to the job/console group), wait
-    /// up to `grace` for the **root** to exit, then hard-sweep any survivors and reap the root.
-    /// Returns the root's `ExitStatus`. Requires an actionable containment mechanism (errors
-    /// `Unsupported` otherwise — use [`graceful_shutdown`](Child::graceful_shutdown) for a lone
-    /// child). Works on all platforms.
+    /// up to `grace`, then hard-sweep any survivors and reap the root. Returns the root's
+    /// `ExitStatus`. Requires an actionable containment mechanism (errors `Unsupported`
+    /// otherwise — use [`graceful_shutdown`](Child::graceful_shutdown) for a lone child).
+    /// Works on all platforms.
+    ///
+    /// **What the grace-wait watches depends on the mechanism.** On one with a real kernel
+    /// drain edge ([`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain)
+    /// — cgroup v2, a Windows job object, the macOS fd marker), the whole `grace` is spent
+    /// watching the *entire tree* drain, and the hard sweep below runs only if `grace` elapses
+    /// before the tree does — never on a tree that already cleared on its own. On every other
+    /// mechanism (`ProcessGroup`, `Session`, `TreeWalk`) there is no kernel edge to observe
+    /// descendants draining, so the wait watches the **root only** and the sweep always runs
+    /// afterward regardless of what it saw, exactly as before this distinction existed.
     ///
     /// **Windows: what this actually signals, and what the grace costs.** `CTRL_BREAK` goes
     /// to the root's **process group** only. A nested contained descendant leads its own
     /// group and never receives it — so it does not exit during the grace, idles through the
-    /// whole window, and is then killed by the sweep. The call reports no error either way:
-    /// on Windows the grace is spent regardless of how much of the tree the signal reached.
-    /// Size it accordingly, and treat [`kill_tree`](Child::kill_tree) as the only op that
-    /// reaches every member.
+    /// whole window, and is then killed by the sweep (a job object *is* drain-observable, so
+    /// this shows up as `grace` fully elapsing rather than draining early, not as a skipped
+    /// wait). The call reports no error either way: on Windows the grace is spent regardless
+    /// of how much of the tree the signal reached. Size it accordingly, and treat
+    /// [`kill_tree`](Child::kill_tree) as the only op that reaches every member.
     ///
     /// **The caller must also have a console.** The event is deliverable only within the
     /// *calling* process's console, so a GUI-subsystem binary, a service, or anything spawned
@@ -81,11 +107,10 @@ impl Child {
     /// but a raw `Error::Io` when the crate cannot confirm it — so treat **any** error here
     /// as "not delivered, tree still running".
     ///
-    /// The grace-wait is **non-reaping** (watches the root's exit without collecting it), so the
-    /// subsequent hard sweep runs while the root's pid — and thus the `killpg` group id — is
-    /// still valid; reaping first could let `killpg` hit a recycled group. The sweep is
-    /// unconditional but a no-op once the tree has drained, so a graceful exit's status is
-    /// preserved (the lone backstop no-ops on the already-dead root).
+    /// The grace-wait is **non-reaping** (watches exit without collecting it), so a subsequent
+    /// hard sweep runs while the root's pid — and thus the `killpg` group id — is still valid;
+    /// reaping first could let `killpg` hit a recycled group. A skipped or no-op sweep alike
+    /// preserve a graceful exit's status (the lone backstop no-ops on an already-dead root).
     ///
     /// Dropping this future mid-grace cancels the exit watch (on all platforms — the Windows
     /// watcher is released via its cancel event) and performs no further signalling — the
@@ -144,40 +169,95 @@ impl Child {
         };
 
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
-        let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
-        // The sweep is unconditional — a gracefully-exited root does NOT mean the descendants
-        // drained (the survivor-sweep scenario). A sweep Err subsumes any watch or terminate Err;
-        // it must propagate before the reap on a LIVE root (waiting unswept would hang), but once
-        // the root's exit was observed, the reap runs first so no zombie is stranded.
-        if let Err(e) = &watch {
+        //
+        // `drained`: whether the sweep below is skippable. Only `TreeDrain::AllMembersExited`
+        // (`permits_skipping_sweep`) makes it true — positive kernel-confirmed proof the WHOLE
+        // tree exited, from a mechanism a live process cannot leave without exiting, so the
+        // sweep would be pure overhead. `AllMarkersClosed` (the macOS marker's advisory pipe
+        // EOF — see `TreeDrain`'s own doc) is NOT that proof: a live process can close its own
+        // copy of the marker descriptor and remain alive, undetectable by this edge alone, so
+        // it falls into the same "always sweep" bucket as `MembersRemain` and every mechanism
+        // with no drain edge at all. `root_exited`: whether the root specifically was observed
+        // to have exited. A skipped-sweep tree implies it. On the root-only-watch mechanism
+        // (the `else` arm below) it is that watch's own result. Everywhere else it comes from a
+        // fresh, non-blocking, zero-duration probe of the root alone, immediately below — a
+        // tree-wide verdict that isn't sufficient to skip the sweep says nothing about the root
+        // specifically (only some OTHER member may still be alive), and the probe costs nothing
+        // extra since `grace` was already fully spent by the tree-drain watch that just
+        // returned it. Used only below, to decide whether a
+        // best-effort reap is safe after a sweep failure.
+        let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
+            (false, false, Some(e))
+        } else if self.containment().can_observe_drain() {
+            match crate::tokio::wait::wait_tree_drained_dispatch(&self.attached, crate::wait::deadline_from(grace))
+                .await
+            {
+                Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
+                // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
+                // to the fresh, non-blocking, zero-duration root probe described there.
+                Ok(_) => match crate::tokio::wait::grace_wait(self.id(), Duration::ZERO).await {
+                    Ok(exited) => (false, exited, None),
+                    Err(e) => (false, false, Some(e)),
+                },
+                Err(e) => (false, false, Some(e)),
+            }
+        } else {
+            // NON-reaping grace-wait on the root only.
+            match crate::tokio::wait::grace_wait(self.id(), grace).await {
+                Ok(exited) => (false, exited, None),
+                Err(e) => (false, false, Some(e)),
+            }
+        };
+        if let Some(e) = &watch_err {
             log::debug!(
                 "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
                 id = self.id().pid()
             );
         }
-        if let Err(sweep) = self.kill_tree() {
-            if matches!(watch, Ok(true)) {
-                // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
-                // (below) is already the error this call reports, so a failure here is
-                // secondary — but every other discarded error in this module is still logged,
-                // and a silent one here would obscure a second, independent failure mode.
-                if let Err(e) = self.wait().await {
-                    log::debug!(
-                        "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {e}",
-                        id = self.id().pid()
-                    );
+        // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
+        // a LIVE root (waiting unswept would hang), but once the root's exit was observed, the
+        // reap runs first so no zombie is stranded.
+        if !drained {
+            // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
+            // not merely that it would have no-op'd: forcing this call to fail and then
+            // observing `Ok` from the whole function is only possible if this branch was
+            // never entered at all.
+            #[cfg(test)]
+            let sweep_result = if fault::take_force_kill_tree_error() {
+                Err(fault::forced_kill_tree_error())
+            } else {
+                self.kill_tree()
+            };
+            #[cfg(not(test))]
+            let sweep_result = self.kill_tree();
+            if let Err(sweep) = sweep_result {
+                if root_exited {
+                    // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
+                    // (below) is already the error this call reports, so a failure here is
+                    // secondary — but every other discarded error in this module is still logged,
+                    // and a silent one here would obscure a second, independent failure mode.
+                    if let Err(e) = self.wait().await {
+                        log::debug!(
+                            "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {e}",
+                            id = self.id().pid()
+                        );
+                    }
                 }
+                return Err(sweep);
             }
-            return Err(sweep);
         }
         let status = self.wait().await?;
-        watch?;
-        // The sweep just returned `Ok`: positive, freshly-measured proof the group cleared,
-        // superseding whatever `term` held. Discard it here rather than returning it — an
-        // already-disproved refusal must never outrank the evidence that disproved it.
+        if let Some(e) = watch_err {
+            return Err(e);
+        }
+        // The tree is confirmed clear here — either the drain watch observed the whole tree
+        // directly (`drained`), or the sweep just returned `Ok`: either way, positive,
+        // freshly-measured proof superseding whatever `term` held. Discard it here rather than
+        // returning it — an already-disproved refusal must never outrank the evidence that
+        // disproved it.
         if let Err(e) = &term {
             log::debug!(
-                "graceful_shutdown_tree({id}): sweep succeeded; discarding the superseded terminate_tree refusal: {e}",
+                "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {e}",
                 id = self.id().pid()
             );
         }
@@ -216,12 +296,46 @@ pub(crate) mod fault {
     }
     thread_local! {
         static FORCE_TERMINATE: Cell<Forced> = const { Cell::new(Forced::None) };
+        static FORCE_KILL_TREE_ERROR: Cell<bool> = const { Cell::new(false) };
     }
     pub(crate) fn set_force_terminate(kind: Forced) {
         FORCE_TERMINATE.with(|f| f.set(kind));
     }
     pub(crate) fn take_force_terminate() -> Forced {
         FORCE_TERMINATE.with(|f| f.replace(Forced::None))
+    }
+
+    /// Force the next `kill_tree` call inside `graceful_shutdown_tree` on THIS thread — the
+    /// sweep, not `terminate_tree` — to fail, so a test can prove it was skipped (`drained`)
+    /// rather than merely no-op'd on an already-empty group.
+    pub(crate) fn set_force_kill_tree_error(on: bool) {
+        FORCE_KILL_TREE_ERROR.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_kill_tree_error() -> bool {
+        FORCE_KILL_TREE_ERROR.with(|f| f.replace(false))
+    }
+    pub(crate) fn kill_tree_armed() -> bool {
+        FORCE_KILL_TREE_ERROR.with(|f| f.get())
+    }
+    pub(crate) fn forced_kill_tree_error() -> crate::error::Error {
+        crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
+    }
+
+    /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
+    /// full rationale (a test harness thread is reused across test functions, so a seam armed
+    /// but never consumed must still be cleared even if this test's own assertions panic first).
+    #[must_use]
+    pub(crate) struct ArmedKillTreeError;
+    impl ArmedKillTreeError {
+        pub(crate) fn arm() -> Self {
+            set_force_kill_tree_error(true);
+            Self
+        }
+    }
+    impl Drop for ArmedKillTreeError {
+        fn drop(&mut self) {
+            set_force_kill_tree_error(false);
+        }
     }
     // No `armed()` here — see the sync twin's identical note.
     pub(crate) fn forced_terminate_error(kind: Forced) -> crate::error::Error {

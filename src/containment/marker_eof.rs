@@ -56,24 +56,12 @@ use std::time::Instant;
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
+use crate::containment::TreeDrain;
 use crate::error::Error;
 
 #[cfg(test)]
 #[path = "marker_eof_tests.rs"]
 mod marker_eof_tests;
-
-/// Whether every holder of the marker's write end has **exited**.
-///
-/// Exited is not reaped: descriptors close before the zombie is collected, so
-/// `AllMembersExited` never implies a status is available. It also means every holder of the
-/// *marker*, which a member that closed the descriptor has stopped being.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TreeDrain {
-    /// Every marker holder has exited. Statuses have NOT been collected.
-    AllMembersExited,
-    /// At least one marker holder was still running at the deadline.
-    MembersRemain,
-}
 
 /// The `NOTE_LOWAT` low-water mark every knote in this module is armed with. Clamped by the
 /// kernel to the pipe's actual buffer capacity — see the module doc for what this does and
@@ -184,7 +172,7 @@ fn interpret_read_event(
         return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
     }
     if event.flags().contains(EvFlags::EV_EOF) {
-        return Ok(Some(TreeDrain::AllMembersExited));
+        return Ok(Some(TreeDrain::AllMarkersClosed));
     }
     // `data` is a byte count for a readable, non-EOF, non-error EVFILT_READ event — never
     // negative per the kqueue contract this module relies on everywhere else. A violation here
@@ -241,18 +229,19 @@ pub(crate) fn drain_kqueue(
 }
 
 /// One-shot drain check: exact, not heuristic — arms a private kqueue and reads its
-/// zero-timeout verdict off `EV_EOF`, the same authoritative signal `block_until_drained`
-/// uses. `Ok(None)` from `drain_kqueue` (nothing pending yet) means a write end is open with
-/// nothing queued: `MembersRemain`, correctly, since `AllMembersExited` is only ever reported
-/// when the kernel itself said `EV_EOF`.
+/// zero-timeout verdict off `EV_EOF`, the same signal `block_until_drained` uses (advisory, per
+/// this module's `TreeDrain::AllMarkersClosed` — see that type's own doc). `Ok(None)` from
+/// `drain_kqueue` (nothing pending yet) means a write end is open with nothing queued:
+/// `MembersRemain`, correctly, since `AllMarkersClosed` is only ever reported when the kernel
+/// itself said `EV_EOF`.
 ///
-/// No production caller exists yet — kept as crate-internal primitive surface for a future
-/// consumer, exercised directly by the unit tests below. `#[allow(dead_code)]` reflects that
-/// honestly instead of leaving the lib target to fail `cargo clippy --all-targets -D
-/// warnings`, which sees no test-cfg code and would otherwise flag this as unused. A one-shot
-/// check never blocks, so it never risks a caller-invisible hang: it always passes `false` for
-/// `arm`'s `unbounded_wait`.
-#[allow(dead_code)]
+/// Called from `wait_tree_deadline`'s zero-duration case (`crate::tokio::wait`) — a one-shot
+/// check never blocks, so it never risks a caller-invisible hang there: it always passes
+/// `false` for `arm`'s `unbounded_wait`. That caller lives behind the crate's `tokio` feature,
+/// so this (and its own callee `drain_kqueue`) really is unreachable without it —
+/// `#[allow(dead_code)]` reflects that honestly for a `tokio`-disabled build instead of leaving
+/// the lib target to fail `cargo clippy --all-targets -D warnings` there.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
     let kq = arm(read_end, false)?;
     match drain_kqueue(&kq, read_end, false)? {

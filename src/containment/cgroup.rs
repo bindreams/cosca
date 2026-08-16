@@ -58,6 +58,24 @@ pub(crate) fn cgroup_procs_contains(contents: &str, pid: u32) -> bool {
     false
 }
 
+/// Parse the `populated` field out of the contents of a cgroup v2 `cgroup.events` file
+/// (`populated 0`/`populated 1`, one `key value` pair per line, order not guaranteed).
+/// `None` means the file had no `populated` line, or an unrecognized value — the caller
+/// must treat this as "could not be assessed", never silently default to either state.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("populated ") {
+            return match rest.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 // Everything below is Linux-only. =====
 
 #[cfg(target_os = "linux")]
@@ -80,6 +98,55 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::unistd::Pid;
+
+/// Whether `e` is the kernel's proof that this leaf's `cgroup.events` node is already gone —
+/// either because the whole path was already removed (`ENOENT`, on a fresh `open` through the
+/// now-unlinked leaf directory) or because THIS fd was opened before removal and the
+/// underlying kernfs node has since been deactivated (`ENODEV`, on `seek`/`read` through an
+/// already-open fd). `rmdir` on a cgroup v2 leaf — whether `Drop`'s own retry or an external
+/// cgroup manager's cleanup of an empty leaf — succeeds ONLY once `populated` has already read
+/// 0 (see `CgroupLeaf::wait_drained`'s doc); observing the leaf's removal is therefore always
+/// proof every member had already exited, never proof of anything else, so no other errno is
+/// folded in here (a genuine mechanism failure — `EACCES`, `EIO`, ...— must still surface as
+/// `Error::Io`, not be silently reinterpreted as a drain).
+#[cfg(target_os = "linux")]
+pub(crate) fn removed_after_drain(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENODEV) | Some(libc::ENOENT))
+}
+
+/// Seek to the start of `file` (a `cgroup.events` handle) and read its current `populated`
+/// value. Shared verbatim by `CgroupLeaf::wait_drained`'s sync loop and its tokio twin,
+/// `cgroup_wait_tree_drained` — the only difference between the two callers is how each awaits
+/// the next readiness edge, not how either reads or classifies the file.
+///
+/// A leaf removed after every member has exited (see [`removed_after_drain`]) is reported as
+/// `Ok(false)`: the leaf's own removal is itself proof of a full drain, indistinguishable in
+/// meaning from an explicit `populated 0`.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, crate::error::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    buf.clear();
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        return if removed_after_drain(&e) {
+            Ok(false)
+        } else {
+            Err(crate::error::Error::Io(e))
+        };
+    }
+    if let Err(e) = file.read_to_string(buf) {
+        return if removed_after_drain(&e) {
+            Ok(false)
+        } else {
+            Err(crate::error::Error::Io(e))
+        };
+    }
+    parse_populated(buf).ok_or_else(|| {
+        crate::error::Error::Io(io::Error::other(
+            "cgroup.events has no 'populated' field — unexpected kernel format",
+        ))
+    })
+}
 
 /// A live leaf sub-cgroup created for a single spawned process tree.
 ///
@@ -112,6 +179,13 @@ impl CgroupLeaf {
         self.procs_fd
     }
 
+    /// The leaf's `cgroup.events` path — the drain edge. Both watches open it for themselves:
+    /// the sync one polls it directly, while the reactor-native async one cannot reuse that
+    /// `poll(2)` loop and registers the descriptor instead.
+    pub(crate) fn events_path(&self) -> PathBuf {
+        self.leaf_path.join("cgroup.events")
+    }
+
     /// Returns `true` when `pid` is listed in `cgroup.procs` of this leaf.
     /// Used post-spawn (parent side) to confirm placement succeeded.
     pub(crate) fn contains_pid(&self, pid: u32) -> bool {
@@ -125,6 +199,68 @@ impl CgroupLeaf {
     /// Best-effort: already-empty leaves are silently fine.
     pub(crate) fn hard_kill(&self) {
         let _ = fs::write(self.leaf_path.join("cgroup.kill"), b"1");
+    }
+
+    /// Block until every process in the leaf has EXITED (not reaped), observed via
+    /// `cgroup.events`'s `populated` key — the kernel flips it 1→0 exactly when the leaf's
+    /// last task exits, fork-proof (no cooperation from the tree, no re-enumeration race).
+    ///
+    /// Read-before-arm: `populated` is checked BEFORE every `poll`, not only after — a
+    /// transition that already happened (leaf drained between a caller's previous check and
+    /// this call) must be observed on the read, not require a fresh kernel edge that will
+    /// never fire again. `POLLPRI` fires on every transition (both 1→0 and 0→1), so an
+    /// intervening 0→1 (a leaf that reused-then-repopulated between reads) is also picked up
+    /// by looping back to re-read rather than trusting readiness to imply the value dropped.
+    ///
+    /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
+    /// interval is chosen anywhere in this path: every round blocks in one `poll(2)` call for
+    /// exactly the caller's own remaining time, and returns as soon as either the kernel
+    /// reports a transition or the deadline is reached.
+    ///
+    /// Leaf-removal race: `rmdir` on this leaf (`Drop`'s own retry, or an external cgroup
+    /// manager cleaning up an empty leaf — either succeeds only once `populated` has already
+    /// read 0) can land at any point after the last member exits, including between this
+    /// call's own `poll` waking on the 1→0 transition and its very next read. Once that
+    /// happens, `open`/`seek`/`read` on this leaf's `cgroup.events` fail (`ENOENT` for a fresh
+    /// `open` through the now-unlinked directory; `ENODEV` for a syscall through an fd that was
+    /// opened before removal, once the kernel deactivates the underlying kernfs node) — proof
+    /// the leaf is gone, which is itself proof every member had already exited (removal can
+    /// never precede full drain), not a failure. See [`removed_after_drain`].
+    pub(crate) fn wait_drained(
+        &self,
+        deadline: Option<Option<std::time::Instant>>,
+    ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        use rustix::event::{poll, PollFd, PollFlags};
+
+        use crate::containment::TreeDrain;
+        use crate::error::Error;
+
+        let mut file = match File::open(self.events_path()) {
+            Ok(f) => f,
+            Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let mut buf = String::new();
+        loop {
+            if !read_populated(&mut file, &mut buf)? {
+                return Ok(TreeDrain::AllMembersExited);
+            }
+            let remaining = crate::wait::remaining(deadline);
+            if remaining == Some(std::time::Duration::ZERO) {
+                return Ok(TreeDrain::MembersRemain);
+            }
+            let ts = remaining.map(|d| rustix::event::Timespec {
+                tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
+                tv_nsec: d.subsec_nanos() as _,
+            });
+            let mut fds = [PollFd::new(&file, PollFlags::PRI)];
+            match poll(&mut fds, ts.as_ref()) {
+                Ok(0) => return Ok(TreeDrain::MembersRemain), // genuinely timed out
+                Ok(_) => continue,                            // a transition fired — re-read
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(Error::Io(io::Error::from(e))),
+            }
+        }
     }
 
     /// SIGTERM every pid currently listed in `cgroup.procs`.

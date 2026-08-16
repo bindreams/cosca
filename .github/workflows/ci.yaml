@@ -144,25 +144,35 @@ jobs:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
       # rule does not apply and a cgroup may hold BOTH the test process and a child
       # leaf. We move our shell into it and run only the cgroup-named tests there
-      # (as root, single-threaded). With the marker set the tests assert CgroupV2
-      # and FAIL LOUDLY if the leaf is unusable — never a silent skip.
+      # (as root, single-threaded) — both the `spawn_io` integration binary and the
+      # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
+      # coverage in src/containment/cgroup_tests.rs). With the marker set the tests
+      # assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a
+      # silent skip.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
           cargo test --locked --features pty --target ${{ matrix.target }} --no-run
-          BIN=$(cargo test --locked --features pty --target ${{ matrix.target }} --no-run --message-format=json \
+          JSON=$(cargo test --locked --features pty --target ${{ matrix.target }} --no-run --message-format=json)
+          BIN=$(echo "$JSON" \
             | jq -r 'select(.profile.test == true and .target.name == "spawn_io") | .executable' \
             | grep -v '^null$' | grep . | head -n1)
           test -n "$BIN"
           echo "cgroup test binary: $BIN"
+          LIB_BIN=$(echo "$JSON" \
+            | jq -r 'select(.profile.test == true and .target.name == "cosca" and (.target.kind | contains(["lib"]))) | .executable' \
+            | grep -v '^null$' | grep . | head -n1)
+          test -n "$LIB_BIN"
+          echo "cgroup lib unit test binary: $LIB_BIN"
           sudo bash -euxc '
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
-            exec "$0" cgroup --nocapture --test-threads=1
-          ' "$BIN"
+            "$0" cgroup --nocapture --test-threads=1
+            exec "$1" cgroup --nocapture --test-threads=1
+          ' "$BIN" "$LIB_BIN"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
       # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo test`

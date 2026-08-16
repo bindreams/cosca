@@ -164,25 +164,37 @@ impl Attached {
         }
     }
 
+    /// Whether this handle owns a mechanism with a kernel drain edge — mirrors
+    /// [`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain),
+    /// checked against the concrete resource rather than the reported enum so the two can
+    /// never drift silently (`require_drainable` asserts them equal in debug).
+    pub(crate) fn can_observe_drain(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(_) => true,
+            #[cfg(windows)]
+            Attached::JobObject(_) => true,
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(_) => true,
+            _ => false,
+        }
+    }
+
     /// Block until every member of the contained tree has EXITED (not reaped), or until
-    /// `deadline`. `Unsupported` on every mechanism without a kernel drain edge — presently all
-    /// of them except the macOS fd marker.
-    ///
-    /// No non-test caller exists yet: wiring `graceful_shutdown_tree`'s conditional escalation
-    /// to consult this is a later change's deliverable, not this one's. `#[allow(dead_code)]`
-    /// reflects that honestly, mirroring `marker_eof::probe`.
-    ///
-    /// Delegates to [`Marker::wait_drained`](crate::containment::fdmarker::Marker::wait_drained)
-    /// rather than handing out a bare `BorrowedFd` (as an earlier `marker_read_end` accessor
-    /// did): that method re-checks the read end's identity first, the same way
-    /// `hard_kill`/`terminate` do, before trusting the descriptor at all.
-    #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
+    /// `deadline`. `Unsupported` on every mechanism without a kernel drain edge (checked by the
+    /// caller via `require_drainable`/`can_observe_drain` before this is reached in the public
+    /// API, but this still refuses honestly if ever called directly against a non-drainable
+    /// mechanism).
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<std::time::Instant>>,
-    ) -> Result<crate::containment::marker_eof::TreeDrain, Error> {
+    ) -> Result<crate::containment::TreeDrain, Error> {
         match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(leaf) => leaf.wait_drained(deadline),
+            #[cfg(windows)]
+            Attached::JobObject(job) => job.wait_drained(deadline, None),
+            #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.wait_drained(deadline),
             _ => Err(Error::Unsupported {
                 op: "wait for the contained tree to drain".into(),

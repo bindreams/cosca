@@ -917,11 +917,10 @@ impl Marker {
     /// reissued fd (an unrelated pipe with no open write end) deliver `EV_EOF` immediately and
     /// report `AllMembersExited` for a fully live tree — the same false-edge risk `hard_kill`
     /// refuses on, not merely a discrepancy between two code paths.
-    #[allow(dead_code)] // no non-test caller yet; mirrors marker_eof::probe / Attached::wait_drained
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<Instant>>,
-    ) -> Result<crate::containment::marker_eof::TreeDrain, Error> {
+    ) -> Result<crate::containment::TreeDrain, Error> {
         self.check_read_end_still_valid()?;
         // This process is the supervisor: it must have closed its own copy of the write end at
         // spawn time (`install`'s contract), or the edge could never fire. A deliberately
@@ -1022,7 +1021,11 @@ impl Marker {
     /// indication anything was wrong. A single debug-only line is not enough defense for that
     /// severity; it is checked in EVERY build, and a violation refuses to sweep at all rather
     /// than proceeding on a handle that may no longer mean what `self` claims.
-    fn check_read_end_still_valid(&self) -> Result<(), Error> {
+    ///
+    /// `pub(crate)`: also called from the async dispatch path (`crate::tokio::wait`) before it
+    /// reads `self.read`'s raw fd directly, for the same reason — a reissued fd there would
+    /// falsely report `EV_EOF` just as readily as it would here.
+    pub(crate) fn check_read_end_still_valid(&self) -> Result<(), Error> {
         let read_still_valid = matches!(
             fd_pipe_info(std::process::id(), self.read.as_raw_fd()),
             FdPipeInfoQuery::Found(info) if info.pipe_handle == self.read_handle

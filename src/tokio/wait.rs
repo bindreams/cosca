@@ -218,14 +218,19 @@ impl std::os::fd::AsRawFd for KqueueFd {
 ///
 /// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
 /// to verify that itself, since the closure's return type carries no more than "done" or "not
-/// done". The invariant holds for both current callers because NEITHER `Ok(None)` case ever
-/// consumes bytes: `drain_proc_exit`'s only non-`None` outcome is `NOTE_EXIT`, with no draining
-/// concept at all, and `marker_eof::drain_kqueue`'s caller here (`wait_tree_drained_inner`)
-/// always arms with `unbounded_wait: true`, under which `interpret_read_event` itself never
-/// drains (see `marker_eof`'s module doc — an unbounded wait cannot drain on a sustained
-/// writer's behalf without spinning). A future `drain` closure that DOES consume bytes on a
-/// non-`None`-but-also-non-terminal path would violate this silently; `watch_readable` cannot
-/// detect that on its own, so any such closure owns re-verifying this invariant itself.
+/// done". The invariant holds for both current callers: `drain_proc_exit`'s only non-`None`
+/// outcome is `NOTE_EXIT`, with no draining concept at all, and `marker_eof::drain_kqueue`'s
+/// caller here (`wait_tree_drained_inner`) passes through the SAME `unbounded_wait` its own
+/// caller computed from the real deadline (`crate::wait::remaining(deadline).is_none()`,
+/// matching the sync backend's `block_until_drained` exactly) — when `true`,
+/// `interpret_read_event` never drains at all (see `marker_eof`'s module doc — an unbounded wait
+/// cannot drain on a sustained writer's behalf without spinning); when `false`, a non-`None`
+/// non-terminal event DOES drain bytes, but only inside `interpret_read_event`'s own
+/// already-verified `Ok(None)` return, so the invariant this loop relies on — no closure
+/// silently drains behind an `Ok(None)` it can't see — still holds. A future `drain` closure
+/// that consumed bytes on a DIFFERENT non-`None`-but-non-terminal path would violate that
+/// silently; `watch_readable` cannot detect that on its own, so any such closure owns
+/// re-verifying this invariant itself.
 #[cfg(target_os = "macos")]
 async fn watch_readable<F>(afd: &::tokio::io::unix::AsyncFd<KqueueFd>, mut drain: F) -> Result<(), Error>
 where
@@ -265,43 +270,296 @@ where
 /// same descriptor directly would take over the first's registration and park it forever —
 /// each call arms its OWN private kqueue (`marker_eof::arm`).
 ///
-/// No production caller exists yet — `Attached::wait_drained` wires the SYNC form only;
-/// wiring this async form into `graceful_shutdown_tree` is a later change's job.
-/// `#[allow(dead_code)]` reflects that honestly, mirroring `marker_eof::probe`.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, None).await
+    wait_tree_drained_inner(read_end, true, None).await
+}
+
+/// Deadline-bounded, [`TreeDrain`](crate::containment::TreeDrain)-returning wrapper over
+/// [`wait_tree_drained_inner`] — the macOS arm of `tokio::Child::wait_tree`/`wait_tree_timeout`.
+/// `Duration::ZERO` delegates to the sync backend's one-shot, non-blocking probe (safe to call
+/// directly from async code), matching `grace_wait`'s identical `Duration::ZERO` delegation to
+/// `block_until_exit`.
+///
+/// The bounded arm (`Some(d)`) arms with `unbounded_wait: false` — computed the same way the
+/// sync backend's `block_until_drained` does (`crate::wait::remaining(deadline).is_none()`,
+/// `false` whenever a real deadline governs this call) — NOT via [`wait_tree_drained`], which is
+/// always unbounded by construction (see its own doc). Arming unbounded here would be a real,
+/// observable divergence from the sync twin: `refuse_if_write_end_held` would refuse an
+/// `Unassessable` write-end scan that a bounded caller should tolerate (its own deadline caps
+/// the risk), and `interpret_read_event` would stop draining a sustained writer at the low-water
+/// clamp, so a bounded wait could only ever expire into `MembersRemain` where the sync call
+/// drains through to the real edge. `tokio::time::timeout` still supplies the actual bound —
+/// the same pattern `grace_wait` uses over `wait_exit` — this only fixes what the ARMED kqueue
+/// itself is told.
+#[cfg(target_os = "macos")]
+pub(crate) async fn wait_tree_deadline(
+    read_end: std::os::fd::BorrowedFd<'_>,
+    deadline: Option<Option<std::time::Instant>>,
+) -> Result<crate::containment::TreeDrain, Error> {
+    use crate::containment::TreeDrain;
+    match crate::wait::remaining(deadline) {
+        None => {
+            wait_tree_drained(read_end).await?;
+            Ok(TreeDrain::AllMarkersClosed)
+        }
+        Some(d) if d.is_zero() => crate::containment::marker_eof::probe(read_end),
+        Some(d) => match ::tokio::time::timeout(d, wait_tree_drained_inner(read_end, false, None)).await {
+            Ok(res) => res.map(|()| TreeDrain::AllMarkersClosed),
+            Err(_elapsed) => Ok(TreeDrain::MembersRemain),
+        },
+    }
 }
 
 /// Test-only entry point that reports the instant its kqueue is armed, on a channel the
 /// CALLER owns — no shared/global observer state, so concurrently-running tests (this file
-/// has four) cannot steal each other's notification.
+/// has four) cannot steal each other's notification. Always the unbounded arm, matching
+/// [`wait_tree_drained`] (its own real caller): these tests exercise the no-deadline API.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) async fn wait_tree_drained_for_test(
     read_end: std::os::fd::BorrowedFd<'_>,
     armed: std::sync::mpsc::Sender<()>,
 ) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, Some(armed)).await
+    wait_tree_drained_inner(read_end, true, Some(armed)).await
 }
 
+/// `unbounded_wait` must be the SAME expression the sync backend's `block_until_drained` uses
+/// (`crate::wait::remaining(deadline).is_none()`) for whichever deadline the caller is honoring
+/// — threaded through to both `arm` and `drain_kqueue` (see [`wait_tree_deadline`]'s own doc for
+/// why arming this wrong is a real, observable divergence, not a cosmetic one).
 #[cfg(target_os = "macos")]
 async fn wait_tree_drained_inner(
     read_end: std::os::fd::BorrowedFd<'_>,
+    unbounded_wait: bool,
     armed: Option<std::sync::mpsc::Sender<()>>,
 ) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
-    // Unbounded: this future has no deadline parameter at all (see the doc comment above).
-    let kq = crate::containment::marker_eof::arm(read_end, true)?;
+    let kq = crate::containment::marker_eof::arm(read_end, unbounded_wait)?;
     if let Some(tx) = armed {
         let _ = tx.send(());
     }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, move |kq| {
-        crate::containment::marker_eof::drain_kqueue(kq, read_end, true).map(|d| d.map(|_| ()))
+        crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait).map(|d| d.map(|_| ()))
     })
     .await
+}
+
+/// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), observed via
+/// `cgroup.events`'s `populated` key over a reactor-registered `AsyncFd` (`EPOLLPRI`, tokio's
+/// `Interest::PRIORITY`) — genuinely reactor-native, no polling interval anywhere, and
+/// cancellable (dropping the future deregisters the fd, same as every other Unix watch in this
+/// file). Mirrors `CgroupLeaf::wait_drained`'s sync loop exactly, including read-before-arm: the
+/// file is read BEFORE every `ready()` await, not only after, so a transition that already
+/// happened is observed on the read rather than requiring a fresh edge that may never fire
+/// again. `deadline` follows the crate's watch convention; each round awaits readiness for
+/// exactly the caller's own remaining time (`tokio::time::timeout`), never an invented interval.
+#[cfg(target_os = "linux")]
+async fn cgroup_wait_tree_drained(
+    leaf: &crate::containment::cgroup::CgroupLeaf,
+    deadline: Option<Option<std::time::Instant>>,
+) -> Result<crate::containment::TreeDrain, Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+
+    use crate::containment::TreeDrain;
+
+    use crate::containment::cgroup::{read_populated, removed_after_drain};
+
+    let file = match std::fs::File::open(leaf.events_path()) {
+        Ok(f) => f,
+        Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let mut afd = AsyncFd::with_interest(file, Interest::PRIORITY).map_err(Error::Io)?;
+    let mut buf = String::new();
+    loop {
+        // Mirrors `CgroupLeaf::wait_drained`'s own leaf-removal race handling exactly (see its
+        // doc, and `read_populated`'s own): `rmdir` on this leaf — `Drop`'s own retry, or an
+        // external cgroup manager's cleanup of an already-empty leaf — can land between this
+        // loop's own `ready()` wakeup and its next read, and observing that removal is itself
+        // proof every member had already exited (rmdir cannot precede full drain), not a
+        // failure.
+        if !read_populated(afd.get_mut(), &mut buf)? {
+            return Ok(TreeDrain::AllMembersExited);
+        }
+        let remaining = crate::wait::remaining(deadline);
+        if remaining == Some(std::time::Duration::ZERO) {
+            return Ok(TreeDrain::MembersRemain);
+        }
+        let mut ready = match remaining {
+            None => afd.ready(Interest::PRIORITY).await.map_err(Error::Io)?,
+            Some(d) => match ::tokio::time::timeout(d, afd.ready(Interest::PRIORITY)).await {
+                Ok(r) => r.map_err(Error::Io)?,
+                Err(_elapsed) => return Ok(TreeDrain::MembersRemain),
+            },
+        };
+        // A regular file has no "would block" concept to drain — any readiness means a
+        // transition fired (possibly stale by the time we re-read, which the loop's own
+        // re-read handles); clear and re-await.
+        ready.clear_ready();
+    }
+}
+
+/// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
+/// Job objects expose no pollable handle, so — unlike the Linux/macOS arms in this file — this
+/// is NOT reactor-native: it hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
+/// releasing the blocking thread promptly on drop via the same cancel-event idiom
+/// `blocking_watch` uses for `grace_wait`.
+///
+/// **Handle ownership across cancellation.** `blocking_watch` gets away with borrowing nothing
+/// at all — it re-derives a process handle from a `ProcessId` inside the closure. A job object
+/// has no such re-openable identity, so this function instead duplicates the live job `HANDLE`
+/// into one the spawned task owns outright (`DuplicateHandle`, closed by the closure itself on
+/// every exit path, panic included) before ever spawning. This matters because dropping THIS
+/// future only cancels the `.await` — it does not join the blocking task, which keeps running
+/// detached. A caller cancelling the `wait_tree`/`wait_tree_timeout` future (via `select!`, an
+/// outer `timeout()`, or simply not polling it again) can therefore race `JobHandle::hard_kill`/
+/// `Drop` closing the ORIGINAL handle while the detached task is still mid-syscall on it. A
+/// borrowed raw `HANDLE` would then alias a handle value the kernel is free to recycle onto an
+/// unrelated object the moment it is closed; the duplicate has its own independent lifetime,
+/// closed only by the task that owns it, and is never touched by `JobHandle` at all — so no
+/// such aliasing is possible regardless of what the caller does with the `Child` after
+/// cancelling.
+#[cfg(windows)]
+async fn job_wait_tree_drained(
+    job: &crate::containment::windows::JobHandle,
+    deadline: Option<Option<std::time::Instant>>,
+) -> Result<crate::containment::TreeDrain, Error> {
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
+    // call that cannot block (mirrors grace_wait's identical delegation).
+    if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+        return job.wait_drained(deadline, None);
+    }
+    let Some(raw_job) = job.as_handle() else {
+        // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
+        // reaches here once that method's Duration::ZERO delegation above has already been
+        // ruled out) — see `consumed_job_handle_error`'s own doc for the full justification.
+        return Err(crate::containment::windows::consumed_job_handle_error());
+    };
+
+    /// An independently-owned duplicate of the job handle, held only by the spawned blocking
+    /// task and closed by it on every exit path, panic included — see this function's own doc
+    /// for why a borrowed handle is not safe to hand across the cancellation boundary here.
+    /// Closing a job handle only fires `KILL_ON_JOB_CLOSE` if it is the LAST open handle to
+    /// that job (Win32 semantics); `JobHandle`'s own, separate handle is unaffected either way.
+    struct OwnedJobDup(HANDLE);
+    impl Drop for OwnedJobDup {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is this struct's own `DuplicateHandle`-created handle, never
+            // shared or aliased anywhere else.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let mut dup = HANDLE::default();
+    // SAFETY: `raw_job` was just confirmed live via `job.as_handle()` above. Duplicating
+    // within our own process with `DUPLICATE_SAME_ACCESS` produces an independent handle to
+    // the same job object, valid for the spawned task's full lifetime regardless of what
+    // happens to `job`/`JobHandle` afterward.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            raw_job,
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .map_err(|e| Error::Io(std::io::Error::from(e)))?;
+    let job_dup = OwnedJobDup(dup);
+
+    /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
+    /// releases promptly instead of parking out the deadline, and `Runtime::drop` — which
+    /// joins blocking tasks — does not stall. Identical idiom to `blocking_watch`'s guard.
+    struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            crate::wait::backend::signal_cancel(&self.0);
+        }
+    }
+    let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
+    let _guard = SignalOnDrop(cancel.clone());
+    // SAFETY: `cancel`'s OwnedHandle is kept alive by the Arc clone captured in the
+    // spawn_blocking closure below (and by `_guard`/`cancel` here) for the whole wait.
+    let cancel_raw = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&*cancel));
+    let cancel_for_blocking = cancel.clone();
+
+    /// `HANDLE`'s raw pointer is `!Send` by default; a job or event handle (owned or borrowed
+    /// for the task's own full lifetime) is sound to use and close from another thread — the
+    /// kernel serialises handle operations — the same justification as `JobHandle`'s own
+    /// `unsafe impl Send`.
+    struct SendHandles {
+        job: OwnedJobDup,
+        cancel: HANDLE,
+    }
+    unsafe impl Send for SendHandles {}
+    let handles = SendHandles {
+        job: job_dup,
+        cancel: cancel_raw,
+    };
+
+    let joined = ::tokio::task::spawn_blocking(move || {
+        let handles = handles;
+        let result = crate::containment::windows::wait_drained_raw(handles.job.0, deadline, Some(handles.cancel));
+        drop(cancel_for_blocking); // keep the handle alive for the full blocking call, explicitly
+        result
+        // `handles.job` (`OwnedJobDup`) drops here on every path, including an early return
+        // from `wait_drained_raw` above, closing our duplicate independently of `JobHandle`.
+    })
+    .await;
+    match joined {
+        Ok(result) => result,
+        // wait_drained_raw does not panic — a panic here is a bug, not an I/O condition;
+        // propagate it instead of masking it as an error.
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) if e.is_cancelled() => Err(Error::Io(std::io::Error::other(
+            "tree-drain watcher cancelled (runtime shutting down)",
+        ))),
+        Err(e) => {
+            debug_assert!(false, "unknown JoinError variant: {e:?}");
+            Err(Error::Io(std::io::Error::other(e)))
+        }
+    }
+}
+
+/// Async equivalent of `Attached::wait_drained`, dispatched by mechanism. Linux and macOS are
+/// genuinely reactor-native (`AsyncFd`); Windows hands its sync loop to `spawn_blocking` with a
+/// cancel event (job objects have no pollable handle). Every other mechanism delegates to the
+/// sync `Attached::wait_drained`, whose non-drainable arm returns `Unsupported` immediately —
+/// never blocking — so calling it directly here (no `spawn_blocking`) is safe.
+pub(crate) async fn wait_tree_drained_dispatch(
+    attached: &crate::containment::Attached,
+    deadline: Option<Option<std::time::Instant>>,
+) -> Result<crate::containment::TreeDrain, Error> {
+    match attached {
+        #[cfg(target_os = "linux")]
+        crate::containment::Attached::Cgroup(leaf) => cgroup_wait_tree_drained(leaf, deadline).await,
+        #[cfg(windows)]
+        crate::containment::Attached::JobObject(job) => job_wait_tree_drained(job, deadline).await,
+        #[cfg(target_os = "macos")]
+        crate::containment::Attached::FdMarker(m) => {
+            // Mirrors `Marker::wait_drained`'s own preamble exactly: a reissued read-end fd
+            // would falsely deliver `EV_EOF` instantly here just as readily as it would there,
+            // so this path must not skip the check just because it reads the raw fd directly
+            // instead of going through `Marker::wait_drained`.
+            m.check_read_end_still_valid()?;
+            debug_assert_ne!(
+                crate::containment::marker_eof::write_end_check(m.read_end()),
+                crate::containment::marker_eof::WriteEndCheck::HeldByUs,
+                "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
+            );
+            wait_tree_deadline(m.read_end(), deadline).await
+        }
+        other => other.wait_drained(deadline),
+    }
 }
 
 #[cfg(test)]

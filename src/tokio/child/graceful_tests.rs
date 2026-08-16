@@ -120,7 +120,7 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
         crate::log_capture::contains_since(
             mark,
             &format!(
-                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
             )
         ),
@@ -168,7 +168,7 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
         crate::log_capture::contains_since(
             mark,
             &format!(
-                "graceful_shutdown_tree({pid}): sweep succeeded; discarding the superseded terminate_tree refusal",
+                "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
             )
         ),
@@ -212,6 +212,142 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     // Clean up: the child is still running by design (no sweep happened above).
     let _ = child.kill_tree();
     let _ = child.wait().await;
+}
+
+// Async twin of `graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative` —
+// see there for the full rationale.
+#[tokio::test]
+async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["sleep", "30"]);
+    #[cfg(windows)]
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let authoritative = matches!(
+        child.containment(),
+        crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
+    );
+    let armed = term_fault::ArmedKillTreeError::arm();
+    let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
+    if authoritative {
+        let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
+        assert!(
+            term_fault::kill_tree_armed(),
+            "the forced kill_tree failure must still be armed — the sweep was never entered"
+        );
+        drop(armed); // disarm now that this branch's own assertion above has run
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "graceful root exit, got {status:?}"
+            );
+        }
+        #[cfg(windows)]
+        let _ = status;
+    } else {
+        let err = result.expect_err("a non-authoritative mechanism must always run the sweep");
+        assert!(
+            !term_fault::kill_tree_armed(),
+            "the sweep must have consumed the forced-failure seam"
+        );
+        drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
+        assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+        let _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
+        let _ = child.wait().await;
+    }
+}
+
+// Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` — see there
+// for the full rationale, including the readiness handshake that closes the root's own
+// trap-installation race.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & echo r; exit 0"]);
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let mut readiness = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut readiness)
+        .await
+        .expect("readiness byte");
+    let id = child.id();
+    let drainable = child.containment().can_observe_drain();
+    term_fault::set_force_kill_tree_error(true);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_secs(2))
+        .await
+        .expect_err("the forced sweep failure must surface");
+    assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+    assert!(
+        !term_fault::kill_tree_armed(),
+        "the sweep must have consumed the forced-failure seam"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
+        if drainable {
+            "MembersRemain branch"
+        } else {
+            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
+        }
+    );
+    // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
+    // still alive — a real sweep now (the seam is already consumed) actually kills it.
+    let _ = child.kill_tree();
+}
+
+// Async twin of `windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure` — see
+// there for the full rationale, including why the Unix twin's reap postcondition does not
+// translate to Windows (no Windows-observable difference between the fixed code and the bug it
+// was meant to catch, so none is asserted here), the `test_child::fixture_survives_group_signal`
+// fixture that plays the Unix root shell's role, and why the readiness tag travels over a raw
+// TCP socket rather than stdout. Blocking `std::net::TcpListener` (not an async socket), exactly
+// like `tests/common::spawn_tree_async`'s own synchronous accept — a short, bounded wait for a
+// real connection, not a poll loop, and the same shape already accepted for an async test.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
+    cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let (mut sock, _) = listener.accept().expect("accept readiness connection");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("readiness tag");
+    term_fault::set_force_kill_tree_error(true);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_secs(2))
+        .await
+        .expect_err("the forced sweep failure must surface");
+    assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+    assert!(
+        !term_fault::kill_tree_armed(),
+        "the sweep must have consumed the forced-failure seam"
+    );
+    // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
+    // still alive — a real sweep now (the seam is already consumed) actually kills it.
+    let _ = child.kill_tree();
 }
 
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.

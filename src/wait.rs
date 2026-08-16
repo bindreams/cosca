@@ -80,6 +80,15 @@ pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
     }
 }
 
+/// Convert a relative `duration` into the crate's `deadline` convention
+/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): `Instant::now() + duration`,
+/// saturating to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on
+/// overflow rather than panicking. Shared by every `_timeout`/`grace`-style call that starts
+/// a fresh relative wait from "now".
+pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
+    Some(Instant::now().checked_add(duration))
+}
+
 #[cfg(test)]
 #[path = "wait_tests.rs"]
 mod wait_tests;

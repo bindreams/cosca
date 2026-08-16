@@ -16,7 +16,8 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use super::{block_until_drained, probe, TreeDrain};
+use super::{block_until_drained, probe};
+use crate::containment::TreeDrain;
 
 fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     crate::child::spawn::spawn_lock()
@@ -70,7 +71,7 @@ fn probe_reports_drained_when_the_last_write_end_is_gone() {
     let _serialize = test_spawn_lock();
     let (r, w) = marker_pipe();
     drop(w); // the last holder's descriptor closed
-    assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMembersExited);
+    assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
 
 #[test]
@@ -84,7 +85,7 @@ fn probe_reports_drained_even_with_bytes_still_buffered() {
     let (r, w) = marker_pipe();
     nix::unistd::write(&w, b"noise from a member").expect("write");
     drop(w);
-    assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMembersExited);
+    assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
 
 #[test]
@@ -114,7 +115,7 @@ fn block_until_drained_with_a_past_deadline_behaves_like_a_one_shot_probe() {
     drop(stdin);
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
-        TreeDrain::AllMembersExited
+        TreeDrain::AllMarkersClosed
     );
     child.wait().expect("reap");
 }
@@ -133,7 +134,7 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
     drop(w); // drained before the deadline below is even evaluated
     assert_eq!(
         block_until_drained(r.as_fd(), Some(Some(already_past))).expect("probe"),
-        TreeDrain::AllMembersExited,
+        TreeDrain::AllMarkersClosed,
         "an already-drained tree must be reported as drained even past a stale deadline"
     );
 }
@@ -170,7 +171,7 @@ fn a_retained_supervisor_write_end_is_refused_not_waited_on() {
     // table is being churned by every other test running at the same moment. The property
     // under test is that a CLEARED write end is never mistaken for a still-held one.
     assert_ne!(super::write_end_check(r.as_fd()), super::WriteEndCheck::HeldByUs);
-    assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMembersExited);
+    assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
 
 #[test]
@@ -231,7 +232,7 @@ fn a_live_member_holds_the_edge_shut_and_releases_it_on_exit() {
     drop(stdin); // cat sees EOF on stdin and exits
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
-        TreeDrain::AllMembersExited
+        TreeDrain::AllMarkersClosed
     );
     child.wait().expect("reap");
 }
@@ -245,7 +246,7 @@ fn the_edge_is_sticky_for_a_waiter_that_arrives_late() {
     child.wait().expect("reap");
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("late wait"),
-        TreeDrain::AllMembersExited
+        TreeDrain::AllMarkersClosed
     );
 }
 
@@ -256,7 +257,7 @@ fn a_member_that_closes_the_marker_leaves_the_set_early() {
     let (child, marker, stdin) = spawn_marker_holder("exec 3>&-; exec cat >/dev/null");
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("wait"),
-        TreeDrain::AllMembersExited,
+        TreeDrain::AllMarkersClosed,
         "a member that closed the marker must leave the membership set"
     );
     assert_eq!(
@@ -317,15 +318,15 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     drop(stdin); // the orphan's only exit path — no signal, no timer
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
-        TreeDrain::AllMembersExited,
+        TreeDrain::AllMarkersClosed,
         "the edge must fire when the orphan exits"
     );
 }
 
 #[test]
-fn all_members_exited_requires_every_simultaneous_holder_to_exit() {
+fn all_markers_closed_requires_every_simultaneous_holder_to_exit() {
     // Every test above this one has exactly ONE write-end holder at a time, so none of them can
-    // tell "some closed" from "all closed" apart — a bug that reported `AllMembersExited` the
+    // tell "some closed" from "all closed" apart — a bug that reported `AllMarkersClosed` the
     // moment ANY single holder's copy closed, ignoring the rest, would still pass every one of
     // them. This test needs two INDEPENDENTLY closable holders alive at once: a single root
     // `/bin/sh` backgrounds two separate `cat` processes, each with its OWN stdin pipe (fd 0
@@ -363,7 +364,7 @@ fn all_members_exited_requires_every_simultaneous_holder_to_exit() {
     drop(stdin_b); // holder B sees EOF and exits; no holder remains
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
-        TreeDrain::AllMembersExited,
+        TreeDrain::AllMarkersClosed,
         "the edge must fire only once the LAST simultaneous holder is gone"
     );
     child
@@ -407,7 +408,7 @@ fn small_bytes_from_a_member_are_not_a_drain() {
     drop(stdin);
     assert_eq!(
         block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
-        TreeDrain::AllMembersExited
+        TreeDrain::AllMarkersClosed
     );
     child.wait().expect("reap");
 }
@@ -475,7 +476,7 @@ fn bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict() {
             Some(Instant::now().checked_add(Duration::from_secs(10)))
         )
         .expect("wait past the low-water clamp"),
-        TreeDrain::AllMembersExited,
+        TreeDrain::AllMarkersClosed,
         "closing the marker after writing past the clamp must still report drained, not hang or misfire"
     );
     assert_eq!(
@@ -598,7 +599,7 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
 
     assert_eq!(
         verdict,
-        TreeDrain::AllMembersExited,
+        TreeDrain::AllMarkersClosed,
         "killing the writer closes the marker descriptor, which must still be observed"
     );
     // Generous (5%), matching the quiet-holder test's own margin: proving "genuinely blocked,
