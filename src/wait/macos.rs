@@ -13,21 +13,13 @@ fn placeholder() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
-/// Arm an `EVFILT_PROC | NOTE_EXIT` filter for `pid` on an EXISTING kqueue (`EV_RECEIPT`:
-/// synchronous, receipt-checked). `Ok(None)` => the pid is already gone. The single
-/// definition of the receipt dance — `arm_proc_exit` consumes it, and the decoy composition
-/// test arms its second filter through it (no hand-rolled twin to drift).
-pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
-    let change = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
+/// Apply one change to an EXISTING kqueue with `EV_RECEIPT` (synchronous, receipt-checked)
+/// and return the add result: 0 = armed, otherwise an errno. The single definition of the
+/// receipt dance, shared by every filter this crate arms via `EV_ADD | EV_RECEIPT` — no
+/// hand-rolled twin to drift.
+pub(crate) fn add_with_receipt(kq: &Kqueue, change: KEvent) -> Result<i64, Error> {
     // EV_RECEIPT makes EV_ADD synchronous: kevent returns exactly one receipt event
-    // whose `data` is the add result (0 = armed, ESRCH = pid gone, other = errno).
+    // whose `data` is the add result (0 = armed, an errno otherwise).
     let mut receipt = [placeholder()];
     let n = kq
         .kevent(&[change], &mut receipt, None)
@@ -37,7 +29,21 @@ pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Erro
             "kqueue EV_RECEIPT returned no receipt event",
         )));
     }
-    let add_result = receipt[0].data() as i64;
+    Ok(receipt[0].data() as i64)
+}
+
+/// Arm an `EVFILT_PROC | NOTE_EXIT` filter for `pid` on an EXISTING kqueue. `Ok(None)` => the
+/// pid is already gone.
+pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
+    let change = KEvent::new(
+        pid as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let add_result = add_with_receipt(kq, change)?;
     if add_result == libc::ESRCH as i64 {
         return Ok(None); // pid already gone
     }

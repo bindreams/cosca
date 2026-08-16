@@ -213,6 +213,10 @@ pub(crate) mod dispatch;
 #[allow(unused_imports)]
 pub(crate) use dispatch::{attach, prepare, Attached, Prepared};
 
+#[cfg(target_os = "macos")]
+#[path = "containment/marker_eof.rs"]
+pub(crate) mod marker_eof;
+
 #[cfg(test)]
 #[path = "containment_tests.rs"]
 mod containment_tests;
