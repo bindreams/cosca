@@ -57,6 +57,7 @@
 //! principle, stumble onto by number.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::time::Instant;
 
 use crate::identity::RawPid;
 
@@ -90,8 +91,8 @@ pub(crate) struct ProcFileInfo {
 pub(crate) struct PipeFdInfo {
     pfi: ProcFileInfo,
     pipe_stat: libc::vinfo_stat,
-    pipe_handle: u64,
-    pipe_peerhandle: u64,
+    pub(crate) pipe_handle: u64,
+    pub(crate) pipe_peerhandle: u64,
     pipe_status: i32,
     rfu_1: i32,
 }
@@ -117,7 +118,7 @@ pub(crate) fn pipe_handle_of(fd: BorrowedFd<'_>) -> Option<u64> {
 /// reported as a pipe, so a denial here is not the routine "not a pipe" case; it means the
 /// query was refused between the two calls (matching the module docs' credential-changing-exec
 /// scenario), and each caller needs to react to that specifically — see each call site.
-enum FdPipeInfoQuery {
+pub(crate) enum FdPipeInfoQuery {
     Found(PipeFdInfo),
     /// Not a pipe, the fd closed, or the pid is gone — indistinguishable at this layer, and
     /// (unlike `PipeQuery`) not worth separating: nothing calls this hoping to count denials
@@ -127,7 +128,7 @@ enum FdPipeInfoQuery {
     Denied,
 }
 
-fn fd_pipe_info(pid: RawPid, fd: libc::c_int) -> FdPipeInfoQuery {
+pub(crate) fn fd_pipe_info(pid: RawPid, fd: libc::c_int) -> FdPipeInfoQuery {
     let mut info: PipeFdInfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<PipeFdInfo>() as libc::c_int;
     // SAFETY: proc_pidfdinfo writes up to `size` bytes into `info`; pointer and size match.
@@ -170,7 +171,7 @@ pub(crate) struct Holder {
 /// because `holders()` (scanning the WHOLE host) and `holds_marker_query()` (re-checking a
 /// KNOWN candidate) need to react to a denial completely differently. See the module docs and
 /// each caller for why.
-enum PipeQuery {
+pub(crate) enum PipeQuery {
     /// The fd table was read; these are its pipe descriptors (possibly none).
     Found(Vec<libc::c_int>),
     /// The pid is gone (`ESRCH`) — expected, never worth logging.
@@ -364,7 +365,7 @@ fn fd_list_buf_bytes(cap: usize, entry: usize) -> std::io::Result<libc::c_int> {
         })
 }
 
-fn pipe_fds_of(pid: RawPid) -> PipeQuery {
+pub(crate) fn pipe_fds_of(pid: RawPid) -> PipeQuery {
     let entry = std::mem::size_of::<libc::proc_fdinfo>();
     let needed = clear_errno_and_call(|| unsafe {
         libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
@@ -901,9 +902,40 @@ impl Marker {
 
     /// The supervisor's read end. `read()` on it returns EOF exactly when the last holder of
     /// the write end is gone.
-    #[allow(dead_code)]
     pub(crate) fn read_end(&self) -> BorrowedFd<'_> {
         self.read.as_fd()
+    }
+
+    /// Block until every holder of the marker's write end has EXITED (not reaped), or until
+    /// `deadline` — see `marker_eof::block_until_drained`'s own doc for what `deadline` means
+    /// and what it guarantees.
+    ///
+    /// Calls [`check_read_end_still_valid`](Self::check_read_end_still_valid) FIRST, exactly
+    /// like `hard_kill`/`terminate` do: `marker_eof::block_until_drained` takes a bare
+    /// `BorrowedFd` and has no way to know it is still the SAME kernel object `self` was built
+    /// around, only that the number is still open. Skipping this check here would let a
+    /// reissued fd (an unrelated pipe with no open write end) deliver `EV_EOF` immediately and
+    /// report `AllMembersExited` for a fully live tree — the same false-edge risk `hard_kill`
+    /// refuses on, not merely a discrepancy between two code paths.
+    #[allow(dead_code)] // no non-test caller yet; mirrors marker_eof::probe / Attached::wait_drained
+    pub(crate) fn wait_drained(
+        &self,
+        deadline: Option<Option<Instant>>,
+    ) -> Result<crate::containment::marker_eof::TreeDrain, Error> {
+        self.check_read_end_still_valid()?;
+        // This process is the supervisor: it must have closed its own copy of the write end at
+        // spawn time (`install`'s contract), or the edge could never fire. A deliberately
+        // constructed `HeldByUs` condition still needs a real `Err`, not a panic, so the
+        // enforcement lives in `refuse_if_write_end_held`'s `Err` return, not here; this assert
+        // instead catches a violation of that contract reaching THIS, the crate's own call
+        // site, in debug builds — the crate's own code path, not a test deliberately
+        // constructing the condition.
+        debug_assert_ne!(
+            crate::containment::marker_eof::write_end_check(self.read_end()),
+            crate::containment::marker_eof::WriteEndCheck::HeldByUs,
+            "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
+        );
+        crate::containment::marker_eof::block_until_drained(self.read_end(), deadline)
     }
 
     /// `Err` distinguishes a genuine teardown-mechanism failure (`Error::Io`/`Unsupported`,

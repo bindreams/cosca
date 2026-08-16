@@ -2,7 +2,7 @@
 //! reaps) and identity-verified `kill(2)` (no pidfd on Darwin, so a residual pid-reuse
 //! window between re-verify and signal is irreducible — documented at the call site).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
@@ -13,21 +13,13 @@ fn placeholder() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
-/// Arm an `EVFILT_PROC | NOTE_EXIT` filter for `pid` on an EXISTING kqueue (`EV_RECEIPT`:
-/// synchronous, receipt-checked). `Ok(None)` => the pid is already gone. The single
-/// definition of the receipt dance — `arm_proc_exit` consumes it, and the decoy composition
-/// test arms its second filter through it (no hand-rolled twin to drift).
-pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
-    let change = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
+/// Apply one change to an EXISTING kqueue with `EV_RECEIPT` (synchronous, receipt-checked)
+/// and return the add result: 0 = armed, otherwise an errno. The single definition of the
+/// receipt dance, shared by every filter this crate arms via `EV_ADD | EV_RECEIPT` — no
+/// hand-rolled twin to drift.
+pub(crate) fn add_with_receipt(kq: &Kqueue, change: KEvent) -> Result<i64, Error> {
     // EV_RECEIPT makes EV_ADD synchronous: kevent returns exactly one receipt event
-    // whose `data` is the add result (0 = armed, ESRCH = pid gone, other = errno).
+    // whose `data` is the add result (0 = armed, an errno otherwise).
     let mut receipt = [placeholder()];
     let n = kq
         .kevent(&[change], &mut receipt, None)
@@ -37,7 +29,21 @@ pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Erro
             "kqueue EV_RECEIPT returned no receipt event",
         )));
     }
-    let add_result = receipt[0].data() as i64;
+    Ok(receipt[0].data() as i64)
+}
+
+/// Arm an `EVFILT_PROC | NOTE_EXIT` filter for `pid` on an EXISTING kqueue. `Ok(None)` => the
+/// pid is already gone.
+pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Error> {
+    let change = KEvent::new(
+        pid as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let add_result = add_with_receipt(kq, change)?;
     if add_result == libc::ESRCH as i64 {
         return Ok(None); // pid already gone
     }
@@ -102,20 +108,54 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     let Some(kq) = arm_proc_exit(id)? else {
         return Ok(true);
     };
+    block_on_kqueue(&kq, deadline, false, |event| {
+        if event.flags().contains(EvFlags::EV_ERROR) {
+            return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
+        }
+        Ok(Some(true)) // NOTE_EXIT
+    })
+}
+
+/// Block on an armed kqueue until `interpret` concludes, or until `deadline`. `interpret` maps
+/// ONE pending `KEvent` to `Ok(Some(verdict))` (conclusive — stop) or `Ok(None)` (nothing
+/// conclusive yet, e.g. bytes drained below a filter's own terminal condition — keep waiting).
+/// `on_timeout` is the verdict for a genuine timeout.
+///
+/// The deadline is checked explicitly at the top of every round, not inferred from `kevent`
+/// returning 0: a continuously-ready descriptor (e.g. a sustained pipe writer) keeps `kevent`
+/// returning real events even with an already-expired timeout, so relying on "0 events, timed
+/// out" alone would let the wait overrun the deadline by an unbounded number of rounds.
+/// Checking `remaining(deadline)` before each `kevent` call bounds the overrun to at most one
+/// in-flight round: once a round starts with the deadline already elapsed, an inconclusive
+/// event in THAT round returns `on_timeout` immediately rather than looping back.
+///
+/// Shared by every blocking kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in
+/// `containment::marker_eof` — so a hazard found against one filter (an already-past deadline
+/// against a sticky, already-satisfied event) is fixed once, not rediscovered per filter.
+pub(crate) fn block_on_kqueue<T: Copy>(
+    kq: &Kqueue,
+    deadline: Option<Option<Instant>>,
+    on_timeout: T,
+    mut interpret: impl FnMut(&KEvent) -> Result<Option<T>, Error>,
+) -> Result<T, Error> {
     let mut events = [placeholder()];
     loop {
+        let remaining = crate::wait::remaining(deadline);
+        let already_elapsed = remaining == Some(Duration::ZERO);
         // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
-        let timeout = crate::wait::remaining(deadline).map(|d| libc::timespec {
+        let timeout = remaining.map(|d| libc::timespec {
             tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
             tv_nsec: d.subsec_nanos() as libc::c_long,
         });
         match kq.kevent(&[], &mut events, timeout) {
-            Ok(0) => return Ok(false), // timed out, still alive
+            Ok(0) => return Ok(on_timeout), // genuinely timed out, no events
             Ok(_) => {
-                if events[0].flags().contains(EvFlags::EV_ERROR) {
-                    return Err(Error::Io(std::io::Error::from_raw_os_error(events[0].data() as i32)));
+                if let Some(verdict) = interpret(&events[0])? {
+                    return Ok(verdict);
                 }
-                return Ok(true); // NOTE_EXIT
+                if already_elapsed {
+                    return Ok(on_timeout);
+                }
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::Io(e.into())),

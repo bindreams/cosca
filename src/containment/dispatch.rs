@@ -163,6 +163,34 @@ impl Attached {
             Attached::TreeWalk(_) => true,
         }
     }
+
+    /// Block until every member of the contained tree has EXITED (not reaped), or until
+    /// `deadline`. `Unsupported` on every mechanism without a kernel drain edge — presently all
+    /// of them except the macOS fd marker.
+    ///
+    /// No non-test caller exists yet: wiring `graceful_shutdown_tree`'s conditional escalation
+    /// to consult this is a later change's deliverable, not this one's. `#[allow(dead_code)]`
+    /// reflects that honestly, mirroring `marker_eof::probe`.
+    ///
+    /// Delegates to [`Marker::wait_drained`](crate::containment::fdmarker::Marker::wait_drained)
+    /// rather than handing out a bare `BorrowedFd` (as an earlier `marker_read_end` accessor
+    /// did): that method re-checks the read end's identity first, the same way
+    /// `hard_kill`/`terminate` do, before trusting the descriptor at all.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    pub(crate) fn wait_drained(
+        &self,
+        deadline: Option<Option<std::time::Instant>>,
+    ) -> Result<crate::containment::marker_eof::TreeDrain, Error> {
+        match self {
+            Attached::FdMarker(m) => m.wait_drained(deadline),
+            _ => Err(Error::Unsupported {
+                op: "wait for the contained tree to drain".into(),
+                platform: std::env::consts::OS,
+                detail: "this child's containment mechanism exposes no kernel edge for tree drain".into(),
+            }),
+        }
+    }
 }
 
 /// Returns `true` when the current process is the outermost contained root

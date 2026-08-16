@@ -334,9 +334,9 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
     use crate::containment::{ContainMode, ContainRequest, Nesting};
     // This test doesn't assert on log content itself, but triggering `Fault::Pipe` DOES emit
     // "fd marker: pipe() failed" into the shared `log_capture` buffer once any test has called
-    // `log_capture::install()` — held for the whole body so it cannot land inside
-    // `fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`'s
-    // scanned window on another thread.
+    // `log_capture::install()` — held for the whole body so it cannot land inside the sibling
+    // fd-marker test module's fault-injection log-scanning test's scanned window on another
+    // thread.
     let _serialize = lock_for_log_assertion();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     set_fault(Some(Fault::Pipe));
@@ -393,4 +393,68 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
         panic!("a nonexistent pid must not resolve");
     };
     assert!(detail.contains("vanished"), "absence must not read as denial: {detail}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn wait_drained_is_unsupported_without_a_marker() {
+    // Mirrors `require_contained`: a mechanism that cannot answer says so, rather than
+    // implying a guarantee it has not got.
+    use super::Attached;
+    for attached in [Attached::None, Attached::Delegated] {
+        let err = attached
+            .wait_drained(Some(Some(std::time::Instant::now())))
+            .expect_err("a mechanism with no drain edge must be Unsupported");
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn wait_drained_reports_members_remain_then_all_members_exited() {
+    use super::Attached;
+    use crate::containment::fdmarker::{pipe_handle_of, Marker, PreparedMarker};
+    use crate::containment::marker_eof::TreeDrain;
+    use std::os::fd::{AsFd, OwnedFd};
+
+    // A real holder in a separate process, mirroring marker_eof_tests.rs's
+    // spawn_marker_holder: the marker's write end lives in the child, not in-process, so
+    // wait_drained observes a genuinely open, then genuinely closed, write end.
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
+
+    // wait_drained now consults read_handle too (Marker::wait_drained calls
+    // check_read_end_still_valid first, same as hard_kill/terminate) — so this uses the read
+    // end's REAL current handle for both fields, standing in for install()'s full write-end
+    // capture sequence without replicating it.
+    let handle = pipe_handle_of(marker.as_fd()).expect("handle");
+    let prepared = PreparedMarker {
+        read: OwnedFd::from(marker),
+        handle,
+        read_handle: handle,
+        fd: 3,
+    };
+    let attached = Attached::FdMarker(Marker::new(prepared, None, None, false));
+
+    assert_eq!(
+        attached
+            .wait_drained(Some(Some(std::time::Instant::now())))
+            .expect("bounded wait while the holder is alive"),
+        TreeDrain::MembersRemain
+    );
+
+    drop(stdin); // cat's stdin EOFs, so cat exits, closing its inherited marker write end
+    child.wait().expect("reap");
+
+    assert_eq!(
+        attached
+            .wait_drained(None)
+            .expect("unbounded wait after the holder exits"),
+        TreeDrain::AllMembersExited
+    );
 }

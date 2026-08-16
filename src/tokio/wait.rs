@@ -215,6 +215,17 @@ impl std::os::fd::AsRawFd for KqueueFd {
 /// against the REAL `AsyncFd` (see `wait_tests`). Exit is concluded only on a drained event;
 /// `clear_ready` only after an EMPTY drain — mio's edge-triggered (`EV_CLEAR`) would-block
 /// contract.
+///
+/// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
+/// to verify that itself, since the closure's return type carries no more than "done" or "not
+/// done". The invariant holds for both current callers because NEITHER `Ok(None)` case ever
+/// consumes bytes: `drain_proc_exit`'s only non-`None` outcome is `NOTE_EXIT`, with no draining
+/// concept at all, and `marker_eof::drain_kqueue`'s caller here (`wait_tree_drained_inner`)
+/// always arms with `unbounded_wait: true`, under which `interpret_read_event` itself never
+/// drains (see `marker_eof`'s module doc — an unbounded wait cannot drain on a sustained
+/// writer's behalf without spinning). A future `drain` closure that DOES consume bytes on a
+/// non-`None`-but-also-non-terminal path would violate this silently; `watch_readable` cannot
+/// detect that on its own, so any such closure owns re-verifying this invariant itself.
 #[cfg(target_os = "macos")]
 async fn watch_readable<F>(afd: &::tokio::io::unix::AsyncFd<KqueueFd>, mut drain: F) -> Result<(), Error>
 where
@@ -227,6 +238,70 @@ where
             None => guard.clear_ready(), // no exit drained — re-await
         }
     }
+}
+
+/// Resolve when every holder of the containment marker's write end has exited — genuinely
+/// poll-free, reactor-native, and with no internal deadline at all.
+///
+/// **Unlike `block_until_drained`, this future has no deadline parameter.** Below `NOTE_LOWAT`'s
+/// clamp it never wakes except on `EV_EOF`. At or past the clamp (a member sustaining writes ≥
+/// the pipe's buffer capacity) this primitive does NOT drain on the writer's behalf, unlike the
+/// sync form's bounded case — see `marker_eof`'s module doc for why an unbounded wait cannot
+/// honestly offer both zero CPU and forward progress for a sustained writer, and why this
+/// primitive, having no deadline to bound the alternative, chooses zero CPU: the writer's own
+/// `write()` call blocks against the full pipe (the marker fd's documented misuse contract —
+/// `fdmarker`'s module doc), and this future stays genuinely asleep until that descriptor
+/// closes. A caller that wants such a writer to make forward progress toward closing the
+/// descriptor cannot get that from this primitive; a caller that merely wants a time bound on
+/// the wait itself can still layer one externally (e.g. `tokio::time::timeout`, the same
+/// pattern `grace_wait` already uses over `wait_exit` in this file) — that bounds the CALLER's
+/// patience, not the writer's blocked state.
+///
+/// Exited is not reaped: this says nothing about statuses. A caller wanting a status waits on
+/// the root as well.
+///
+/// The marker's own kqueue is what gets registered with the reactor, not the marker
+/// descriptor: a knote is keyed on `(kqueue, fd, filter)`, so a second waiter registering the
+/// same descriptor directly would take over the first's registration and park it forever —
+/// each call arms its OWN private kqueue (`marker_eof::arm`).
+///
+/// No production caller exists yet — `Attached::wait_drained` wires the SYNC form only;
+/// wiring this async form into `graceful_shutdown_tree` is a later change's job.
+/// `#[allow(dead_code)]` reflects that honestly, mirroring `marker_eof::probe`.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
+    wait_tree_drained_inner(read_end, None).await
+}
+
+/// Test-only entry point that reports the instant its kqueue is armed, on a channel the
+/// CALLER owns — no shared/global observer state, so concurrently-running tests (this file
+/// has four) cannot steal each other's notification.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) async fn wait_tree_drained_for_test(
+    read_end: std::os::fd::BorrowedFd<'_>,
+    armed: std::sync::mpsc::Sender<()>,
+) -> Result<(), Error> {
+    wait_tree_drained_inner(read_end, Some(armed)).await
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_tree_drained_inner(
+    read_end: std::os::fd::BorrowedFd<'_>,
+    armed: Option<std::sync::mpsc::Sender<()>>,
+) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+    // Unbounded: this future has no deadline parameter at all (see the doc comment above).
+    let kq = crate::containment::marker_eof::arm(read_end, true)?;
+    if let Some(tx) = armed {
+        let _ = tx.send(());
+    }
+    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
+    watch_readable(&afd, move |kq| {
+        crate::containment::marker_eof::drain_kqueue(kq, read_end, true).map(|d| d.map(|_| ()))
+    })
+    .await
 }
 
 #[cfg(test)]
