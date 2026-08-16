@@ -309,15 +309,17 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     let _ = child.kill_tree();
 }
 
-// Async twin of `windows_graceful_tree_members_remain_still_reaps_an_already_exited_root` — see
-// there for the full rationale, including the `test_child::fixture_survives_group_signal`
-// fixture that plays the Unix root shell's role and why the readiness tag travels over a raw
+// Async twin of `windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure` — see
+// there for the full rationale, including why the Unix twin's reap postcondition does not
+// translate to Windows (no Windows-observable difference between the fixed code and the bug it
+// was meant to catch, so none is asserted here), the `test_child::fixture_survives_group_signal`
+// fixture that plays the Unix root shell's role, and why the readiness tag travels over a raw
 // TCP socket rather than stdout. Blocking `std::net::TcpListener` (not an async socket), exactly
 // like `tests/common::spawn_tree_async`'s own synchronous accept — a short, bounded wait for a
 // real connection, not a poll loop, and the same shape already accepted for an async test.
 #[cfg(windows)]
 #[tokio::test]
-async fn windows_async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     use std::io::Read;
     use std::net::TcpListener;
 
@@ -333,8 +335,6 @@ async fn windows_async_graceful_tree_members_remain_still_reaps_an_already_exite
     let (mut sock, _) = listener.accept().expect("accept readiness connection");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("readiness tag");
-    let id = child.id();
-    let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(2))
@@ -344,16 +344,6 @@ async fn windows_async_graceful_tree_members_remain_still_reaps_an_already_exite
     assert!(
         !term_fault::kill_tree_armed(),
         "the sweep must have consumed the forced-failure seam"
-    );
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
-        if drainable {
-            "MembersRemain branch"
-        } else {
-            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
-        }
     );
     // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.

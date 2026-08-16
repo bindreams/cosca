@@ -351,22 +351,37 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     let _ = child.kill_tree();
 }
 
-// Windows twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` above — see
-// its doc for the invariant under test; identical here, just reached via a job object instead
-// of cgroup/process-group. Fixture: `test_child::fixture_survives_group_signal` (see its own
-// doc) plays the Unix root shell's role — it spawns a `CREATE_NEW_PROCESS_GROUP` grandchild the
-// group `CTRL_BREAK` can never reach (forcing `MembersRemain` on the drain-observable job
-// object, exactly like the Unix fixture's backgrounded, TERM-immune `sleep`), THEN connects back
-// and tags over the TCP listener below, proving the grandchild already exists in its own group
-// before this test proceeds — the same happens-before edge the Unix fixture's readiness-byte
-// read supplies, over the same control-channel shape `tests/common::spawn_tree` uses (a stdout
-// byte would not work here: libtest captures a passing test's own `print!` output and discards
-// it, so it would never reach a piped reader — see the fixture's own doc). The fixture then
-// exits immediately on its own, leaving an unreaped root by the time `graceful_shutdown_tree`
-// runs, exactly like the Unix twin's own `exit 0`.
+// Windows twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` above,
+// reached via a job object instead of cgroup/process-group — but NOT a check on the same
+// postcondition, because that postcondition does not translate. The Unix test proves an
+// already-exited root is best-effort REAPED (`waitpid`-collected) even when the sweep also
+// fails, so it never strands a zombie. Windows has no reap concept to strand: per the
+// `shared_child` crate's own comment on its Windows backend, "there's no such thing as reaping
+// child processes on Windows — instead, you close the child handle when you're done with it,
+// like a file", and `Child::wait()` never closes that handle on any Windows backend (raw or
+// std) — only `Child`'s own `Drop` does. A Windows process object stays resolvable exactly as
+// long as ANY handle referencing it is open, including this very `Child`'s own handle, held for
+// this whole test — so `id.exists()` reports `Present` here whether or not the best-effort
+// `self.wait()` call inside `graceful_shutdown_tree` ran, on both the fixed code and the bug it
+// was meant to catch. There is no Windows-observable difference to assert here; asserting `Gone`
+// would be tautologically false regardless of correctness (as CI's `left: Present, right: Gone`
+// failure demonstrated) rather than evidence of anything. What IS Windows-observable, and
+// exercised below, is that a drain-observable-but-not-fully-drained mechanism (`MembersRemain`)
+// still runs the hard sweep and surfaces its failure — the same control flow this branch is
+// otherwise built to protect.
+//
+// Fixture: `test_child::fixture_survives_group_signal` (see its own doc) plays the Unix root
+// shell's role — it spawns a `CREATE_NEW_PROCESS_GROUP` grandchild the group `CTRL_BREAK` can
+// never reach (forcing `MembersRemain` on the drain-observable job object, exactly like the Unix
+// fixture's backgrounded, TERM-immune `sleep`), THEN connects back and tags over the TCP
+// listener below, proving the grandchild already exists in its own group before this test
+// proceeds — the same happens-before edge the Unix fixture's readiness-byte read supplies, over
+// the same control-channel shape `tests/common::spawn_tree` uses (a stdout byte would not work
+// here: libtest captures a passing test's own `print!` output and discards it, so it would never
+// reach a piped reader — see the fixture's own doc).
 #[cfg(windows)]
 #[test]
-fn windows_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     use std::io::Read;
     use std::net::TcpListener;
 
@@ -384,8 +399,6 @@ fn windows_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     let (mut sock, _) = listener.accept().expect("accept readiness connection");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("readiness tag");
-    let id = child.id();
-    let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(2))
@@ -394,16 +407,6 @@ fn windows_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     assert!(
         !term_fault::kill_tree_armed(),
         "the sweep must have consumed the forced-failure seam"
-    );
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
-        if drainable {
-            "MembersRemain branch"
-        } else {
-            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
-        }
     );
     // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.
