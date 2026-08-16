@@ -311,26 +311,28 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
 
 // Async twin of `windows_graceful_tree_members_remain_still_reaps_an_already_exited_root` — see
 // there for the full rationale, including the `test_child::fixture_survives_group_signal`
-// fixture that plays the Unix root shell's role.
+// fixture that plays the Unix root shell's role and why the readiness tag travels over a raw
+// TCP socket rather than stdout. Blocking `std::net::TcpListener` (not an async socket), exactly
+// like `tests/common::spawn_tree_async`'s own synchronous accept — a short, bounded wait for a
+// real connection, not a poll loop, and the same shape already accepted for an async test.
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
-    use tokio::io::AsyncReadExt;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
 
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
-    cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ENV, "1");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
-    let mut readiness = [0u8; 1];
-    child
-        .stdout()
-        .expect("piped stdout")
-        .read_exact(&mut readiness)
-        .await
-        .expect("readiness byte");
+    let (mut sock, _) = listener.accept().expect("accept readiness connection");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("readiness tag");
     let id = child.id();
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);

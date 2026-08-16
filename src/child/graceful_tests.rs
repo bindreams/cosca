@@ -356,27 +356,34 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
 // of cgroup/process-group. Fixture: `test_child::fixture_survives_group_signal` (see its own
 // doc) plays the Unix root shell's role — it spawns a `CREATE_NEW_PROCESS_GROUP` grandchild the
 // group `CTRL_BREAK` can never reach (forcing `MembersRemain` on the drain-observable job
-// object, exactly like the Unix fixture's backgrounded, TERM-immune `sleep`), writes a
-// readiness byte to its own stdout, and exits immediately on its own — leaving an unreaped root
-// by the time `graceful_shutdown_tree` runs, exactly like the Unix twin's own `exit 0`.
+// object, exactly like the Unix fixture's backgrounded, TERM-immune `sleep`), THEN connects back
+// and tags over the TCP listener below, proving the grandchild already exists in its own group
+// before this test proceeds — the same happens-before edge the Unix fixture's readiness-byte
+// read supplies, over the same control-channel shape `tests/common::spawn_tree` uses (a stdout
+// byte would not work here: libtest captures a passing test's own `print!` output and discards
+// it, so it would never reach a piped reader — see the fixture's own doc). The fixture then
+// exits immediately on its own, leaving an unreaped root by the time `graceful_shutdown_tree`
+// runs, exactly like the Unix twin's own `exit 0`.
 #[cfg(windows)]
 #[test]
 fn windows_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use std::io::Read;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
 
     let mut cmd = crate::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
-    cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ENV, "1");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
-    let mut readiness = [0u8; 1];
-    child
-        .stdout()
-        .expect("piped stdout")
-        .read_exact(&mut readiness)
-        .expect("readiness byte");
+    let child = cmd.spawn().expect("spawn");
+    // Blocks until the fixture has connected — which it does only after the grandchild survivor
+    // already exists in its own process group (see the fixture's own doc).
+    let (mut sock, _) = listener.accept().expect("accept readiness connection");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("readiness tag");
     let id = child.id();
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);

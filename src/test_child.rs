@@ -27,29 +27,38 @@ pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
 #[cfg(windows)]
 pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_TEST: &str = "test_child::fixture_survives_group_signal";
 
-/// The env var whose mere presence tells [`fixture_survives_group_signal`] it was re-exec'd as
-/// a fixture rather than picked up by an ordinary, unfiltered suite run.
+/// The env var carrying the `127.0.0.1:<port>` address [`fixture_survives_group_signal`] connects
+/// back to and tags once the grandchild survivor exists in its own process group. Its mere
+/// presence also tells the fixture it was re-exec'd deliberately rather than picked up by an
+/// ordinary, unfiltered suite run — one var serves both roles, since the fixture needs the
+/// address either way.
 #[cfg(windows)]
-pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ENV: &str = "COSCA_FIXTURE_SURVIVES_GROUP_SIGNAL";
+pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR";
 
 /// Windows-only fixture for the `root_exited`-on-`MembersRemain` regression (sync and async
-/// twins): a no-op when picked up by an ordinary, unfiltered suite run — [`FIXTURE_SURVIVES_GROUP_SIGNAL_ENV`]
-/// is unset there. Re-executed via `current_exe() --exact` [`FIXTURE_SURVIVES_GROUP_SIGNAL_TEST`]
-/// with that var set, it instead spawns a grandchild a group `CTRL_BREAK` can never reach —
-/// `CREATE_NEW_PROCESS_GROUP` puts it in its own process group, the same isolation
-/// `graceful_shutdown_tree`'s own doc describes for a nested contained descendant — then writes
-/// a single readiness byte to its own stdout and exits immediately, regardless of the group
-/// signal. The job object still tracks the grandchild as a tree member despite its own process
-/// group (job membership and process group are independent Win32 concepts), so it shows up as a
-/// `MembersRemain` survivor even though the signal itself never reaches it. Mirrors
-/// [`spawn_a_process_that_exits`]'s filtered-re-exec idiom (see its own doc for why the filter
-/// is mandatory) put to a second use.
+/// twins): a no-op when picked up by an ordinary, unfiltered suite run —
+/// [`FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV`] is unset there. Re-executed via `current_exe()
+/// --exact` [`FIXTURE_SURVIVES_GROUP_SIGNAL_TEST`] with that var set, it instead spawns a
+/// grandchild a group `CTRL_BREAK` can never reach — `CREATE_NEW_PROCESS_GROUP` puts it in its
+/// own process group, the same isolation `graceful_shutdown_tree`'s own doc describes for a
+/// nested contained descendant — then connects to the caller's listener at that address and
+/// writes a single tag byte, proving the grandchild already exists (and is already in its own
+/// group) before the caller proceeds to call `graceful_shutdown_tree`. The tag goes out over a
+/// real TCP socket, not `print!`/`io::stdout()`: libtest captures the latter per-test and
+/// discards it for a passing test, so a stdout-based readiness byte never reaches the caller's
+/// piped reader at all — this is the same control-channel shape `tests/common`'s
+/// `spawn_tree`/`spawn_tree_async` tag handshake already uses for exactly this reason, not a
+/// Windows-specific mechanism. The job object still tracks the grandchild as a tree member
+/// despite its own process group (job membership and process group are independent Win32
+/// concepts), so it shows up as a `MembersRemain` survivor even though the signal itself never
+/// reaches it. Mirrors [`spawn_a_process_that_exits`]'s filtered-re-exec idiom (see its own doc
+/// for why the filter is mandatory) put to a second use.
 #[cfg(windows)]
 #[test]
 fn fixture_survives_group_signal() {
-    if std::env::var_os(FIXTURE_SURVIVES_GROUP_SIGNAL_ENV).is_none() {
+    let Some(addr) = std::env::var_os(FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
-    }
+    };
     use std::io::Write;
     use std::os::windows::process::CommandExt;
 
@@ -64,6 +73,6 @@ fn fixture_survives_group_signal() {
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn a grandchild the group signal cannot reach");
-    print!("r");
-    std::io::stdout().flush().expect("flush readiness byte");
+    let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect readiness socket");
+    sock.write_all(b"R").expect("write readiness tag");
 }
