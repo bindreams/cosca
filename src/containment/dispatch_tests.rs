@@ -408,3 +408,52 @@ fn wait_drained_is_unsupported_without_a_marker() {
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn wait_drained_reports_members_remain_then_all_members_exited() {
+    use super::Attached;
+    use crate::containment::fdmarker::{pipe_handle_of, Marker, PreparedMarker};
+    use crate::containment::marker_eof::TreeDrain;
+    use std::os::fd::{AsFd, OwnedFd};
+
+    // A real holder in a separate process, mirroring marker_eof_tests.rs's
+    // spawn_marker_holder: the marker's write end lives in the child, not in-process, so
+    // wait_drained observes a genuinely open, then genuinely closed, write end.
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
+
+    // wait_drained/marker_read_end never consult handle/read_handle/fd — only
+    // hard_kill/terminate do — so a real value for the read end's own handle stands in for
+    // both fields here without replicating install()'s full write-end capture sequence.
+    let handle = pipe_handle_of(marker.as_fd()).expect("handle");
+    let prepared = PreparedMarker {
+        read: OwnedFd::from(marker),
+        handle,
+        read_handle: handle,
+        fd: 3,
+    };
+    let attached = Attached::FdMarker(Marker::new(prepared, None, None, false));
+
+    assert_eq!(
+        attached
+            .wait_drained(Some(Some(std::time::Instant::now())))
+            .expect("bounded wait while the holder is alive"),
+        TreeDrain::MembersRemain
+    );
+
+    drop(stdin); // cat's stdin EOFs, so cat exits, closing its inherited marker write end
+    child.wait().expect("reap");
+
+    assert_eq!(
+        attached
+            .wait_drained(None)
+            .expect("unbounded wait after the holder exits"),
+        TreeDrain::AllMembersExited
+    );
+}

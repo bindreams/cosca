@@ -33,7 +33,7 @@ fn marker_pipe() -> (OwnedFd, OwnedFd) {
     (OwnedFd::from(r), OwnedFd::from(w))
 }
 
-/// A fd number NEVER allocated in this process (M14/M16): using it instead of a real,
+/// A fd number NEVER allocated in this process: using it instead of a real,
 /// just-closed fd means these tests cannot race a concurrently-running test that reuses a
 /// freed number, and its errno (EBADF) was independently reproduced multiple times, unlike a
 /// freshly-closed-then-reused fd's (EINVAL — a different, not-useful-here path).
@@ -51,7 +51,7 @@ fn never_allocated_fd() -> BorrowedFd<'static> {
 /// Deliberately used even by tests below that just want "the write end is open, held by
 /// SOMETHING that isn't me": once `refuse_if_write_end_held` is added to `arm`, a bare second
 /// in-process fd (as plain `marker_pipe()` would give) is indistinguishable from the exact
-/// supervisor bug (M3) the guard exists to catch, and would make `arm`/`probe` refuse rather
+/// supervisor bug the guard exists to catch, and would make `arm`/`probe` refuse rather
 /// than report `MembersRemain`. A real holder in ANOTHER process is what "the write end is
 /// open" is supposed to mean here.
 fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std::io::PipeWriter) {
@@ -95,8 +95,8 @@ fn probe_reports_members_remain_while_the_write_end_is_open() {
 
 #[test]
 fn probe_on_an_invalid_descriptor_reports_an_io_error() {
-    // A borrowed fd the caller passed after it was already invalid (e.g. a #59 lifecycle
-    // bug) must fail loudly, never silently report a verdict.
+    // A borrowed fd the caller passed after it was already invalid must fail loudly, never
+    // silently report a verdict.
     let err = probe(never_allocated_fd()).expect_err("an invalid descriptor must error");
     assert!(
         matches!(err, crate::error::Error::Io(_)),
@@ -141,7 +141,7 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
 #[test]
 fn arm_on_an_invalid_descriptor_reports_an_io_error() {
     // Exercises `ensure_nonblocking`'s guard inside `arm` — the actual reachable failure mode
-    // for a bad descriptor (M14). `add_with_receipt`'s own EV_ERROR branch (for EVFILT_READ,
+    // for a bad descriptor. `add_with_receipt`'s own EV_ERROR branch (for EVFILT_READ,
     // via `arm`) has no test anywhere in this module: a descriptor that passes
     // `ensure_nonblocking`'s fcntl check yet still fails kqueue's EV_ADD is not something this
     // module found a reliable, portable way to construct.
@@ -195,7 +195,7 @@ fn write_end_check_is_unassessable_for_a_descriptor_that_is_not_a_pipe() {
 
 #[test]
 fn an_unassessable_write_end_check_refuses_only_an_unbounded_wait() {
-    // Q7's settled behavior: `Unassessable` is not evidence of a bug (an ordinary transient
+    // `Unassessable` is not evidence of a bug (an ordinary transient
     // scan gap under concurrent spawning), so a BOUNDED wait proceeds — its own deadline
     // already caps the exposure. Only an UNBOUNDED wait is refused, because that combination
     // is exactly the condition under which the primitive could otherwise hang forever with no
@@ -605,14 +605,11 @@ async fn async_wait_resolves_immediately_for_an_already_drained_tree() {
 
 #[cfg(feature = "tokio")]
 #[tokio::test]
-async fn async_wait_discards_small_bytes_written_by_a_member() {
-    // The async counterpart to the sync `small_bytes_from_a_member_are_not_a_drain`: the
-    // integration between `drain_kqueue` and `watch_readable`'s clear_ready discipline is new
-    // code. (A few bytes stay below the NOTE_LOWAT clamp, so this resolves via the real EOF
-    // from `drop(stdin)`, not via the discard branch — that branch's async coverage would
-    // need a >64 KiB write, which is deliberately left to the sync suite (Task 3), since
-    // proving the SAME bounded-drain mechanics twice adds little once the sync path already
-    // pins it directly.)
+async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
+    // The async counterpart to the sync `small_bytes_from_a_member_are_not_a_drain`: a few
+    // bytes stay below the NOTE_LOWAT clamp, so this resolves via the real EOF from
+    // `drop(stdin)`, not via `drain_kqueue`'s discard branch — the test below this one is what
+    // exercises that branch, through a write that forces genuine backpressure.
     let mut cmd = crate::Command::new();
     cmd.executable("/bin/sh")
         .args(["sh", "-c", "echo noise >&3; echo ready >&4; exec cat >/dev/null"]);
@@ -643,5 +640,27 @@ async fn async_wait_discards_small_bytes_written_by_a_member() {
     };
     let (watched, ()) = ::tokio::join!(watch, end);
     watched.expect("async drain watch after discarding bytes");
+    child.wait().expect("reap");
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_wait_drains_bytes_past_the_low_water_clamp_through_the_real_reactor() {
+    // The async counterpart to the sync `bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict`:
+    // >64 KiB exceeds the pipe's own buffer capacity, so the writer BLOCKS mid-write until the
+    // reactor's drain loop empties it below capacity — forcing at least one genuine
+    // discard-then-`clear_ready`-then-reawait round through `watch_readable`'s real `AsyncFd`
+    // registration, strictly before the writer can even reach its own `exec 3>&-`. The 10s
+    // bound is a failure bound (a regression here should fail fast), not the mechanism the
+    // assertion depends on.
+    let (child, marker, stdin) = spawn_marker_holder("yes | head -c 200000 >&3; exec 3>&-; exec cat >/dev/null");
+    ::tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::tokio::wait::wait_tree_drained(marker.as_fd()),
+    )
+    .await
+    .expect("the discard-then-reawait loop must not hang")
+    .expect("async drain watch past the low-water clamp");
+    drop(stdin);
     child.wait().expect("reap");
 }

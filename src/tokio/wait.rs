@@ -251,9 +251,9 @@ where
 /// same descriptor directly would take over the first's registration and park it forever —
 /// each call arms its OWN private kqueue (`marker_eof::arm`).
 ///
-/// No production caller exists yet — Task 6 (`Attached::wait_drained`) wires the SYNC form
-/// only; wiring this async form into `graceful_shutdown_tree` is #62's job. `#[allow(dead_code)]`
-/// reflects that honestly, mirroring `marker_eof::probe`.
+/// No production caller exists yet — `Attached::wait_drained` wires the SYNC form only;
+/// wiring this async form into `graceful_shutdown_tree` is a later change's job.
+/// `#[allow(dead_code)]` reflects that honestly, mirroring `marker_eof::probe`.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {

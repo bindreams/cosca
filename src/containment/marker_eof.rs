@@ -102,10 +102,8 @@ fn drain_pending(read_end: BorrowedFd<'_>, mut n: usize) -> Result<(), Error> {
 /// kqueues compose (two waiters both see the edge) where two registrations of the same
 /// descriptor on one shared queue would take each other's place.
 ///
-/// `unbounded_wait` says whether the caller intends to wait with no deadline: an `Unassessable`
-/// write-end check combined with an unbounded wait is exactly the condition under which this
-/// primitive could hang forever with no elevated runtime signal — see
-/// `refuse_if_write_end_held`.
+/// `unbounded_wait` says whether the caller intends to wait with no deadline — see
+/// `refuse_if_write_end_held` for why that matters.
 pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kqueue, Error> {
     ensure_nonblocking(read_end)?;
     refuse_if_write_end_held(read_end, unbounded_wait)?;
@@ -207,64 +205,21 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// = a duration that overflowed `Instant` (also indefinite), `Some(Some(at))` = an absolute
 /// deadline; a deadline already in the past still performs exactly one non-blocking check
 /// before concluding — the sticky, level-triggered `EV_EOF` a genuinely-already-drained tree
-/// left pending must be observed, not assumed away by the elapsed deadline alone (there is a
-/// dedicated test pinning this: an already-drained tree checked past a stale deadline still
-/// reports `AllMembersExited`, not a verdict inferred from "no time is left"). Uses one kernel
-/// syscall per wait round — no interval is chosen anywhere in this path.
+/// left pending must be observed, not assumed away by the elapsed deadline alone. Uses one
+/// kernel syscall per wait round — no interval is chosen anywhere in this path.
 ///
-/// **The deadline is checked explicitly at the top of every round, not inferred from `kevent`
-/// returning 0.** A member sustaining writes past the `NOTE_LOWAT` clamp keeps the descriptor
-/// continuously ready, and `kevent` returns as soon as ANY event is ready — including with a
-/// zero/expired timeout — so it never actually returns "0 events, timed out" while the pipe
-/// stays full; relying on that alone lets the wait overrun the deadline by an unbounded number
-/// of rounds. Checking `remaining(deadline)` before each `kevent` call bounds the overrun to at
-/// most one in-flight round's drain: once a round starts with the deadline already elapsed, a
-/// non-EOF event in THAT round (bytes drained, holders remain) returns immediately rather than
-/// looping back for another round — otherwise a sustained writer whose deadline has already
-/// elapsed would spin forever, since "elapsed" never becomes "more elapsed."
+/// The per-round deadline-checking and `kevent` mechanics live in `wait::backend::block_on_kqueue`
+/// (shared with the proc-exit watch); this function supplies only the marker's own arm and
+/// per-event interpretation (`interpret_read_event`).
 pub(crate) fn block_until_drained(
     read_end: BorrowedFd<'_>,
     deadline: Option<Option<Instant>>,
 ) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
-    let mut events = [KEvent::new(
-        0,
-        EventFilter::EVFILT_READ,
-        EvFlags::empty(),
-        FilterFlag::empty(),
-        0,
-        0,
-    )];
-    loop {
-        // Recompute from the absolute deadline so an EINTR retry cannot extend the total wait,
-        // AND so a continuously-ready descriptor (a sustained writer) cannot make `kevent`
-        // return real events forever without this loop ever noticing the deadline passed.
-        let remaining = crate::wait::remaining(deadline);
-        let already_elapsed = remaining == Some(std::time::Duration::ZERO);
-        let timeout = remaining.map(|d| libc::timespec {
-            tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-            tv_nsec: d.subsec_nanos() as libc::c_long,
-        });
-        match kq.kevent(&[], &mut events, timeout) {
-            Ok(0) => return Ok(TreeDrain::MembersRemain), // genuinely timed out, no events
-            Ok(_) => {
-                if let Some(verdict) = interpret_read_event(&events[0], read_end)? {
-                    return Ok(verdict);
-                }
-                // Bytes discarded (only past the low-water clamp), holders remain. A round that
-                // started with the deadline already elapsed stops here rather than looping back:
-                // see the doc comment above for why (a sustained writer past an elapsed deadline
-                // must not spin).
-                if already_elapsed {
-                    return Ok(TreeDrain::MembersRemain);
-                }
-                // otherwise loop back, where the deadline is re-checked BEFORE the next kevent call
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return Err(Error::Io(e.into())),
-        }
-    }
+    crate::wait::backend::block_on_kqueue(&kq, deadline, TreeDrain::MembersRemain, |event| {
+        interpret_read_event(event, read_end)
+    })
 }
 
 // Detecting a supervisor-retained write-end copy =====

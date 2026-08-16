@@ -168,8 +168,8 @@ impl Attached {
     /// marker. `None` for every other mechanism (nothing else exposes a kernel drain edge).
     ///
     /// No non-test caller exists yet outside `wait_drained` below — wiring an actual consumer
-    /// (`graceful_shutdown_tree`'s conditional escalation) is #62's job, not this accessor's.
-    /// `#[allow(dead_code)]` reflects that honestly, mirroring `marker_eof::probe`.
+    /// (`graceful_shutdown_tree`'s conditional escalation) is a later change's job, not this
+    /// accessor's. `#[allow(dead_code)]` reflects that honestly, mirroring `marker_eof::probe`.
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     pub(crate) fn marker_read_end(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
@@ -181,11 +181,11 @@ impl Attached {
 
     /// Block until every member of the contained tree has EXITED (not reaped), or until
     /// `deadline`. `Unsupported` on every mechanism without a kernel drain edge — presently all
-    /// of them except the macOS fd marker. The cross-platform surface over this is #62.
+    /// of them except the macOS fd marker.
     ///
     /// No non-test caller exists yet: wiring `graceful_shutdown_tree`'s conditional escalation
-    /// to consult this is #62's deliverable, not #60's. `#[allow(dead_code)]` reflects that
-    /// honestly, mirroring `marker_eof::probe`.
+    /// to consult this is a later change's deliverable, not this one's. `#[allow(dead_code)]`
+    /// reflects that honestly, mirroring `marker_eof::probe`.
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     pub(crate) fn wait_drained(
@@ -195,8 +195,8 @@ impl Attached {
         if let Some(read_end) = self.marker_read_end() {
             // This process is the supervisor: it must have closed its own copy of the write
             // end at spawn time (fdmarker::install's contract), or the edge could never fire.
-            // A deliberately-constructed HeldByUs condition (Task 2's own unit tests) still
-            // needs a real Err, not a panic, so the enforcement lives in
+            // A deliberately-constructed HeldByUs condition still needs a real Err, not a
+            // panic, so the enforcement lives in
             // `refuse_if_write_end_held`'s Err return, not here; this assert instead catches
             // a violation of that contract reaching THIS, the crate's own call site, in debug
             // builds — the crate's own code path, not a test deliberately constructing the
