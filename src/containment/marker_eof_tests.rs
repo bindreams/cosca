@@ -323,14 +323,63 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
 }
 
 #[test]
+fn all_members_exited_requires_every_simultaneous_holder_to_exit() {
+    // Every test above this one has exactly ONE write-end holder at a time, so none of them can
+    // tell "some closed" from "all closed" apart — a bug that reported `AllMembersExited` the
+    // moment ANY single holder's copy closed, ignoring the rest, would still pass every one of
+    // them. This test needs two INDEPENDENTLY closable holders alive at once: a single root
+    // `/bin/sh` backgrounds two separate `cat` processes, each with its OWN stdin pipe (fd 0
+    // and fd 5) so each can be closed on its own, both inheriting the same fd 3 from the one
+    // spawn. The root closes its own fd 3 copy right after backgrounding (`exec 3>&-`) so it is
+    // never itself a third holder, then `wait`s for both children instead of exiting — nothing
+    // here depends on reparenting, unlike the orphan test above.
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args([
+        "sh",
+        "-c",
+        "cat 0<&0 >/dev/null & cat 0<&5 >/dev/null & exec 3>&-; wait",
+    ]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe for holder A");
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
+    cmd.fd(5, crate::Stdio::pipe_in()).expect("stdin pipe for holder B");
+    let mut child = cmd.spawn().expect("spawn /bin/sh");
+    let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let stdin_a = child.fd_write_end(crate::Fd::STDIN).expect("holder A stdin write end");
+    let stdin_b = child.fd_write_end(5.into()).expect("holder B stdin write end");
+
+    assert_eq!(
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        TreeDrain::MembersRemain,
+        "two live holders must hold the edge shut"
+    );
+
+    drop(stdin_a); // holder A sees EOF on its own stdin and exits; holder B is untouched
+    assert_eq!(
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        TreeDrain::MembersRemain,
+        "one holder exiting while a second remains must not be mistaken for a full drain"
+    );
+
+    drop(stdin_b); // holder B sees EOF and exits; no holder remains
+    assert_eq!(
+        block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
+        TreeDrain::AllMembersExited,
+        "the edge must fire only once the LAST simultaneous holder is gone"
+    );
+    child
+        .wait()
+        .expect("reap the root sh, which itself waited for both background cats");
+}
+
+#[test]
 fn small_bytes_from_a_member_are_not_a_drain() {
     // The verdict-level half of the NOTE_LOWAT claim: a handful of buffered bytes must never
     // read as a drain, gated or not (`interpret_read_event`'s non-EOF branch reports
     // `MembersRemain` either way). The ZERO-deadline check is the exact, correct tool here
     // (matching this file's own header promise), not a multi-second real wait. Whether the
-    // wakeup itself is actually suppressed is a SEPARATE, lower-level claim, pinned by
-    // `note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp` below (a verdict-only
-    // assertion cannot distinguish "suppressed" from "delivered but harmless"). The child
+    // wakeup itself is actually suppressed is a SEPARATE, lower-level claim, pinned by the
+    // low-water suppression test below (a verdict-only assertion cannot distinguish
+    // "suppressed" from "delivered but harmless"). The child
     // signals readiness on a SEPARATE report pipe right after writing to fd 3, so the ordering
     // ("the write already happened") is real synchronization, not assumed.
     let mut cmd = crate::Command::new();
@@ -518,6 +567,51 @@ fn a_sustained_writer_never_exceeds_the_deadline() {
     child.wait().expect("reap");
 }
 
+#[test]
+fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
+    // The unbounded counterpart to the quiet-holder CPU test above, and the
+    // case the sync death-watch's CPU-proportional accounting explicitly does NOT cover: with
+    // `deadline: None` there is no caller-supplied bound to pay a per-round drain against, so
+    // (per the module doc) this wait must not drain past the low-water clamp at all — the
+    // writer's own `write()` blocks against the full pipe instead, and the wait genuinely
+    // blocks in the kernel rather than busy-looping `kevent`-drain-repeat forever. A background
+    // thread kills the writer after the measurement window so the unbounded wait has a way to
+    // conclude at all; the measurement itself covers only the window BEFORE that kill, on THIS
+    // thread, same idiom and same reasoning as the quiet-holder test above.
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec yes >&3"]);
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
+    let mut child = cmd.spawn().expect("spawn yes");
+    let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let window = Duration::from_millis(300);
+    let cpu_before = self_thread_cpu_time();
+    let wall_before = Instant::now();
+    let verdict = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(window);
+            child.kill().expect("kill the sustained writer");
+        });
+        block_until_drained(marker.as_fd(), None).expect("unbounded wait against a sustained writer")
+    });
+    let wall_elapsed = wall_before.elapsed();
+    let cpu_elapsed = self_thread_cpu_time() - cpu_before;
+
+    assert_eq!(
+        verdict,
+        TreeDrain::AllMembersExited,
+        "killing the writer closes the marker descriptor, which must still be observed"
+    );
+    // Generous (5%), matching the quiet-holder test's own margin: proving "genuinely blocked,
+    // not spinning," not chasing a tight bound sensitive to scheduling noise.
+    assert!(
+        cpu_elapsed < wall_elapsed / 20,
+        "CPU time ({cpu_elapsed:?}) too high relative to wall time ({wall_elapsed:?}) for an \
+         unbounded wait against a sustained writer — looks like a busy-poll, not a genuine kernel block"
+    );
+
+    child.wait().expect("reap");
+}
+
 /// This CALLING THREAD's own CPU time, via `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` — NOT
 /// `getrusage(RUSAGE_SELF)`, which is process-wide and would be contaminated by whatever other
 /// tests `cargo test`'s concurrent thread pool happens to be running during the same
@@ -566,9 +660,9 @@ async fn two_concurrent_async_waiters_both_observe_the_drain() {
     // Registering the same raw descriptor twice on the reactor instead would park one waiter
     // forever — but that only manifests across a LIVE-to-DRAINED transition (stickiness means
     // an already-drained descriptor resolves both registrations on the spot even with the
-    // collision bug present, silently duplicating
-    // `async_wait_resolves_immediately_for_an_already_drained_tree` instead of catching
-    // anything). So both waiters get their own armed handshake, and `drop(stdin)` is provably
+    // collision bug present, silently duplicating the already-drained-resolves-immediately test
+    // below instead of catching anything). So both waiters get their own armed handshake, and
+    // `drop(stdin)` is provably
     // AFTER both have armed — not left to `tokio::join!`'s poll order, the same reasoning the
     // sibling test above this one already applies.
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
@@ -606,10 +700,10 @@ async fn async_wait_resolves_immediately_for_an_already_drained_tree() {
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
-    // The async counterpart to the sync `small_bytes_from_a_member_are_not_a_drain`: a few
-    // bytes stay below the NOTE_LOWAT clamp, so this resolves via the real EOF from
-    // `drop(stdin)`, not via `drain_kqueue`'s discard branch — the test below this one is what
-    // exercises that branch, through a write that forces genuine backpressure.
+    // The async counterpart to the sync small-bytes-are-not-a-drain test above: a few bytes
+    // stay below the NOTE_LOWAT clamp, so this resolves via the real EOF from `drop(stdin)`,
+    // not via `drain_kqueue`'s discard branch — the test below this one is what exercises that
+    // branch, through a write that forces genuine backpressure.
     let mut cmd = crate::Command::new();
     cmd.executable("/bin/sh")
         .args(["sh", "-c", "echo noise >&3; echo ready >&4; exec cat >/dev/null"]);
@@ -645,22 +739,34 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
 
 #[cfg(feature = "tokio")]
 #[tokio::test]
-async fn async_wait_drains_bytes_past_the_low_water_clamp_through_the_real_reactor() {
-    // The async counterpart to the sync `bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict`:
-    // >64 KiB exceeds the pipe's own buffer capacity, so the writer BLOCKS mid-write until the
-    // reactor's drain loop empties it below capacity — forcing at least one genuine
-    // discard-then-`clear_ready`-then-reawait round through `watch_readable`'s real `AsyncFd`
-    // registration, strictly before the writer can even reach its own `exec 3>&-`. The 10s
-    // bound is a failure bound (a regression here should fail fast), not the mechanism the
-    // assertion depends on.
+async fn async_wait_never_drains_past_the_low_water_clamp() {
+    // The async counterpart to the sync past-the-clamp test above — but with the OPPOSITE
+    // expectation, because `wait_tree_drained` has no deadline at all
+    // (see its doc): draining on a stuck writer's behalf forever is exactly the unbounded CPU
+    // spin this primitive must not have, so past the clamp it does not drain and the writer's
+    // own `write()` blocks instead (the marker fd's documented misuse contract). >64 KiB exceeds
+    // the pipe's own buffer capacity, so the writer never reaches its own `exec 3>&-` and the
+    // future never resolves; the external `tokio::time::timeout` here bounds the TEST's
+    // patience, not the primitive's — it is the caller-supplied bound the primitive's doc says a
+    // caller wanting one must supply itself.
     let (child, marker, stdin) = spawn_marker_holder("yes | head -c 200000 >&3; exec 3>&-; exec cat >/dev/null");
-    ::tokio::time::timeout(
-        Duration::from_secs(10),
+    let outcome = ::tokio::time::timeout(
+        Duration::from_millis(300),
         crate::tokio::wait::wait_tree_drained(marker.as_fd()),
     )
-    .await
-    .expect("the discard-then-reawait loop must not hang")
-    .expect("async drain watch past the low-water clamp");
+    .await;
+    assert!(
+        outcome.is_err(),
+        "a writer stuck past the low-water clamp must not resolve the wait — it should never be drained"
+    );
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the writer must still be blocked in its own write(), not exited"
+    );
     drop(stdin);
+    child
+        .kill()
+        .expect("kill the writer, which can never finish its write() on its own");
     child.wait().expect("reap");
 }

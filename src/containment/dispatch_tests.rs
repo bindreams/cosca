@@ -334,9 +334,9 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
     use crate::containment::{ContainMode, ContainRequest, Nesting};
     // This test doesn't assert on log content itself, but triggering `Fault::Pipe` DOES emit
     // "fd marker: pipe() failed" into the shared `log_capture` buffer once any test has called
-    // `log_capture::install()` — held for the whole body so it cannot land inside
-    // `fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`'s
-    // scanned window on another thread.
+    // `log_capture::install()` — held for the whole body so it cannot land inside the sibling
+    // fd-marker test module's fault-injection log-scanning test's scanned window on another
+    // thread.
     let _serialize = lock_for_log_assertion();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     set_fault(Some(Fault::Pipe));
@@ -428,9 +428,10 @@ fn wait_drained_reports_members_remain_then_all_members_exited() {
     let marker = child.fd_read_end(3.into()).expect("marker read end");
     let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
 
-    // wait_drained/marker_read_end never consult handle/read_handle/fd — only
-    // hard_kill/terminate do — so a real value for the read end's own handle stands in for
-    // both fields here without replicating install()'s full write-end capture sequence.
+    // wait_drained now consults read_handle too (Marker::wait_drained calls
+    // check_read_end_still_valid first, same as hard_kill/terminate) — so this uses the read
+    // end's REAL current handle for both fields, standing in for install()'s full write-end
+    // capture sequence without replicating it.
     let handle = pipe_handle_of(marker.as_fd()).expect("handle");
     let prepared = PreparedMarker {
         read: OwnedFd::from(marker),

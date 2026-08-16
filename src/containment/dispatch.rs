@@ -164,21 +164,6 @@ impl Attached {
         }
     }
 
-    /// The supervisor's read end of the marker pipe, when this mechanism is the macOS fd
-    /// marker. `None` for every other mechanism (nothing else exposes a kernel drain edge).
-    ///
-    /// No non-test caller exists yet outside `wait_drained` below — wiring an actual consumer
-    /// (`graceful_shutdown_tree`'s conditional escalation) is a later change's job, not this
-    /// accessor's. `#[allow(dead_code)]` reflects that honestly, mirroring `marker_eof::probe`.
-    #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
-    pub(crate) fn marker_read_end(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        match self {
-            Attached::FdMarker(m) => Some(m.read_end()),
-            _ => None,
-        }
-    }
-
     /// Block until every member of the contained tree has EXITED (not reaped), or until
     /// `deadline`. `Unsupported` on every mechanism without a kernel drain edge — presently all
     /// of them except the macOS fd marker.
@@ -186,33 +171,25 @@ impl Attached {
     /// No non-test caller exists yet: wiring `graceful_shutdown_tree`'s conditional escalation
     /// to consult this is a later change's deliverable, not this one's. `#[allow(dead_code)]`
     /// reflects that honestly, mirroring `marker_eof::probe`.
+    ///
+    /// Delegates to [`Marker::wait_drained`](crate::containment::fdmarker::Marker::wait_drained)
+    /// rather than handing out a bare `BorrowedFd` (as an earlier `marker_read_end` accessor
+    /// did): that method re-checks the read end's identity first, the same way
+    /// `hard_kill`/`terminate` do, before trusting the descriptor at all.
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::marker_eof::TreeDrain, Error> {
-        if let Some(read_end) = self.marker_read_end() {
-            // This process is the supervisor: it must have closed its own copy of the write
-            // end at spawn time (fdmarker::install's contract), or the edge could never fire.
-            // A deliberately-constructed HeldByUs condition still needs a real Err, not a
-            // panic, so the enforcement lives in
-            // `refuse_if_write_end_held`'s Err return, not here; this assert instead catches
-            // a violation of that contract reaching THIS, the crate's own call site, in debug
-            // builds — the crate's own code path, not a test deliberately constructing the
-            // condition.
-            debug_assert_ne!(
-                crate::containment::marker_eof::write_end_check(read_end),
-                crate::containment::marker_eof::WriteEndCheck::HeldByUs,
-                "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
-            );
-            return crate::containment::marker_eof::block_until_drained(read_end, deadline);
+        match self {
+            Attached::FdMarker(m) => m.wait_drained(deadline),
+            _ => Err(Error::Unsupported {
+                op: "wait for the contained tree to drain".into(),
+                platform: std::env::consts::OS,
+                detail: "this child's containment mechanism exposes no kernel edge for tree drain".into(),
+            }),
         }
-        Err(Error::Unsupported {
-            op: "wait for the contained tree to drain".into(),
-            platform: std::env::consts::OS,
-            detail: "this child's containment mechanism exposes no kernel edge for tree drain".into(),
-        })
     }
 }
 

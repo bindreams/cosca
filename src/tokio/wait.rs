@@ -215,6 +215,17 @@ impl std::os::fd::AsRawFd for KqueueFd {
 /// against the REAL `AsyncFd` (see `wait_tests`). Exit is concluded only on a drained event;
 /// `clear_ready` only after an EMPTY drain — mio's edge-triggered (`EV_CLEAR`) would-block
 /// contract.
+///
+/// `drain` returning `Ok(None)` is what `clear_ready` treats as "empty" — this loop has no way
+/// to verify that itself, since the closure's return type carries no more than "done" or "not
+/// done". The invariant holds for both current callers because NEITHER `Ok(None)` case ever
+/// consumes bytes: `drain_proc_exit`'s only non-`None` outcome is `NOTE_EXIT`, with no draining
+/// concept at all, and `marker_eof::drain_kqueue`'s caller here (`wait_tree_drained_inner`)
+/// always arms with `unbounded_wait: true`, under which `interpret_read_event` itself never
+/// drains (see `marker_eof`'s module doc — an unbounded wait cannot drain on a sustained
+/// writer's behalf without spinning). A future `drain` closure that DOES consume bytes on a
+/// non-`None`-but-also-non-terminal path would violate this silently; `watch_readable` cannot
+/// detect that on its own, so any such closure owns re-verifying this invariant itself.
 #[cfg(target_os = "macos")]
 async fn watch_readable<F>(afd: &::tokio::io::unix::AsyncFd<KqueueFd>, mut drain: F) -> Result<(), Error>
 where
@@ -229,19 +240,22 @@ where
     }
 }
 
-/// Resolve when every holder of the containment marker's write end has exited — UNBOUNDED IN
-/// BOTH TIME AND CPU, poll-free below `NOTE_LOWAT`'s clamp, reactor-native.
+/// Resolve when every holder of the containment marker's write end has exited — genuinely
+/// poll-free, reactor-native, and with no internal deadline at all.
 ///
-/// **Unlike `block_until_drained`, this future has no deadline parameter and no internal
-/// bound at all.** Below the clamp it genuinely never wakes except on `EV_EOF` (poll-free,
-/// same as the sync form). At or past the clamp (a member sustaining writes ≥ the pipe's
-/// buffer capacity), `watch_readable`'s drain-then-re-await loop has no deadline to check
-/// against, so it keeps draining and re-awaiting for as long as the writer keeps writing —
-/// CPU-proportional to the writer's throughput, for as long as the future is polled, with
-/// nothing here to end it. A caller that wants a bound MUST supply one externally (e.g.
-/// `tokio::time::timeout`, the same pattern `grace_wait` already uses over `wait_exit` in
-/// this file) — that is a caller obligation this doc states explicitly, not a property this
-/// function has.
+/// **Unlike `block_until_drained`, this future has no deadline parameter.** Below `NOTE_LOWAT`'s
+/// clamp it never wakes except on `EV_EOF`. At or past the clamp (a member sustaining writes ≥
+/// the pipe's buffer capacity) this primitive does NOT drain on the writer's behalf, unlike the
+/// sync form's bounded case — see `marker_eof`'s module doc for why an unbounded wait cannot
+/// honestly offer both zero CPU and forward progress for a sustained writer, and why this
+/// primitive, having no deadline to bound the alternative, chooses zero CPU: the writer's own
+/// `write()` call blocks against the full pipe (the marker fd's documented misuse contract —
+/// `fdmarker`'s module doc), and this future stays genuinely asleep until that descriptor
+/// closes. A caller that wants such a writer to make forward progress toward closing the
+/// descriptor cannot get that from this primitive; a caller that merely wants a time bound on
+/// the wait itself can still layer one externally (e.g. `tokio::time::timeout`, the same
+/// pattern `grace_wait` already uses over `wait_exit` in this file) — that bounds the CALLER's
+/// patience, not the writer's blocked state.
 ///
 /// Exited is not reaped: this says nothing about statuses. A caller wanting a status waits on
 /// the root as well.
@@ -285,7 +299,7 @@ async fn wait_tree_drained_inner(
     }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, move |kq| {
-        crate::containment::marker_eof::drain_kqueue(kq, read_end).map(|d| d.map(|_| ()))
+        crate::containment::marker_eof::drain_kqueue(kq, read_end, true).map(|d| d.map(|_| ()))
     })
     .await
 }

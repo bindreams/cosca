@@ -15,14 +15,34 @@
 //!   trustworthy as the marker's membership: it can fire while such a member still runs.
 //!   That is the same trust model as the marker itself — naive-child containment.
 //!
-//! Every knote here is armed with `NOTE_LOWAT` and a high low-water mark. `EV_EOF` is always
-//! the sole verdict, unconditional of buffered bytes — but the low-water mark itself is
-//! clamped by the kernel to the pipe's actual buffer capacity (measured ~64 KiB on this host),
-//! so it suppresses wakeups for ordinary writes (which is all the crate should ever produce —
-//! nothing in the crate writes to the marker) without being an absolute guarantee against a
-//! member that sustains output at or above that ceiling. That residual case degrades to a
-//! bounded, deadline-respecting, CPU-proportional drain rather than a genuine kernel block —
-//! documented and tested, not assumed away.
+//! Every knote here is armed with `NOTE_LOWAT`, a high low-water mark, and `EV_CLEAR` (arm once
+//! per genuinely new edge, not once per `kevent` call while the condition merely holds).
+//! `EV_EOF` is always the sole verdict, unconditional of buffered bytes — but the low-water
+//! mark itself is clamped by the kernel to the pipe's actual buffer capacity (measured ~64 KiB
+//! on this host), so it suppresses wakeups for ordinary writes (which is all the crate should
+//! ever produce — nothing in the crate writes to the marker) without being an absolute
+//! guarantee against a member that sustains output at or above that ceiling.
+//!
+//! That residual case is handled differently depending on whether the wait is bounded:
+//!
+//! - **Bounded** (a caller-supplied deadline): the excess is drained in bounded rounds, an
+//!   accommodation for a misbehaving-but-eventually-cooperative writer, paid for by the
+//!   caller's own deadline — CPU-proportional to the writer's throughput for the wait's
+//!   duration, same as the drain itself, but never longer than the deadline allows.
+//! - **Unbounded** (no deadline at all): nothing is drained. The effective low-water clamp
+//!   equals the pipe's full capacity, so the very edge that makes the knote ready is also the
+//!   instant the writer's own `write()` call blocks in the kernel — the original design
+//!   assumption this module's misuse contract already documents (see `fdmarker`'s module doc:
+//!   a member that writes to its inherited marker descriptor "blocks once the kernel pipe
+//!   buffer fills"). Not draining lets that self-limiting behavior stand: with `EV_CLEAR` set
+//!   and no new bytes possible while the writer stays blocked, the wait genuinely blocks in the
+//!   kernel — poll-free, not CPU-proportional — until the writer's descriptor closes (forcibly
+//!   or otherwise) or, for the bounded callers layered on top of this primitive, a deadline is
+//!   reached. An unbounded wait cannot honestly offer both zero CPU AND forward progress for a
+//!   sustained writer at the same time (continuing to drain IS continuing to do work
+//!   proportional to what the writer produces, for as long as the writer keeps producing it) —
+//!   this module chooses zero CPU for the unbounded case, since that is also the case with no
+//!   deadline to bound the alternative.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::Instant;
@@ -76,9 +96,10 @@ fn ensure_nonblocking(read_end: BorrowedFd<'_>) -> Result<(), Error> {
 
 /// Read and discard up to `n` bytes, tolerating short reads. Bounded by `n` — a count the
 /// KERNEL just reported via the triggering kevent's own `data` field, never "keep reading
-/// until it stops." Below the low-water clamp this branch never runs at all; at or above it,
-/// this is what keeps a single round bounded — the OUTER loop (`block_until_drained`) is what
-/// keeps the total wait bounded by the caller's deadline despite repeated rounds.
+/// until it stops." Below the low-water clamp this branch never runs at all; at or above it —
+/// and only for a caller with an actual deadline, see `interpret_read_event` — this is what
+/// keeps a single round bounded — the OUTER loop (`block_until_drained`) is what keeps the
+/// total wait bounded by the caller's deadline despite repeated rounds.
 fn drain_pending(read_end: BorrowedFd<'_>, mut n: usize) -> Result<(), Error> {
     let mut buf = [0u8; 4096];
     while n > 0 {
@@ -111,7 +132,7 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
     let change = KEvent::new(
         read_end.as_raw_fd() as usize,
         EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
         FilterFlag::NOTE_LOWAT,
         LOW_WATER_MARK,
         0,
@@ -129,10 +150,29 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 ///
 /// `Ok(Some(AllMembersExited))` = `EV_EOF` was set — final, regardless of buffered bytes, so no
 /// read happens in this branch. `Ok(None)` = readable without `EV_EOF`, which with
-/// `NOTE_LOWAT` armed only happens once buffered bytes reach the clamp: `event.data()` is
-/// exactly how many are queued, discarded in one bounded round via `drain_pending`. `Err` =
-/// `EV_ERROR` or a `kevent`/read failure.
-fn interpret_read_event(event: &KEvent, read_end: BorrowedFd<'_>) -> Result<Option<TreeDrain>, Error> {
+/// `NOTE_LOWAT` armed only happens once buffered bytes reach the clamp — i.e. the pipe is at
+/// capacity, so a writer that keeps writing is, at that exact instant, already blocked in its
+/// own `write()`. `unbounded_wait` decides what happens next:
+///
+/// - **Bounded** (a real deadline bounds the caller's wait): `event.data()` bytes are discarded
+///   via `drain_pending`, in one round bounded by the count the kernel itself reported — the
+///   crate's accommodation for a misbehaving-but-eventually-cooperative writer, paid for by the
+///   caller's own deadline.
+/// - **Unbounded**: nothing is read. The armed knote carries `EV_CLEAR` (see `arm`), so with no
+///   bytes drained there is no new edge to refire on until the writer's OWN blocked `write()`
+///   unblocks (impossible while the pipe stays full) or the descriptor closes (`EV_EOF`,
+///   unconditional of buffered bytes). The wait genuinely blocks in the kernel rather than
+///   draining on the writer's behalf forever — see the module doc for why an indefinite wait
+///   cannot honestly offer both zero CPU and forward progress for a sustained writer, and why
+///   this crate chooses zero CPU plus the writer's own original self-limiting contract
+///   (`fdmarker`'s module doc) for that case.
+///
+/// `Err` = `EV_ERROR` or a `kevent`/read failure.
+fn interpret_read_event(
+    event: &KEvent,
+    read_end: BorrowedFd<'_>,
+    unbounded_wait: bool,
+) -> Result<Option<TreeDrain>, Error> {
     if event.flags().contains(EvFlags::EV_ERROR) {
         return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
     }
@@ -140,25 +180,40 @@ fn interpret_read_event(event: &KEvent, read_end: BorrowedFd<'_>) -> Result<Opti
         return Ok(Some(TreeDrain::AllMembersExited));
     }
     // `data` is a byte count for a readable, non-EOF, non-error EVFILT_READ event — never
-    // negative per the kqueue contract this module relies on everywhere else. `.max(0)` is a
-    // release-build fallback only; a violation here is a kqueue/ABI surprise or a bug in this
-    // module's own event handling, not an ordinary runtime condition, so it gets a loud
-    // debug_assert rather than being silently absorbed into the routine "nothing to drain yet"
-    // code path.
+    // negative per the kqueue contract this module relies on everywhere else. A violation here
+    // is a kqueue/ABI surprise or a bug in this module's own event handling, not an ordinary
+    // runtime condition: `debug_assert!` catches it loudly in debug builds, and `log::warn!`
+    // leaves a trace in release ones too — clamping to `0` and returning the routine "nothing to
+    // drain yet" verdict must not happen in total silence, unlike an ordinary empty drain.
+    if event.data() < 0 {
+        log::warn!(
+            "marker EOF: EVFILT_READ reported a negative data field ({}) on a non-EOF event — a \
+             kqueue ABI surprise or a bug in this module's own event handling",
+            event.data()
+        );
+    }
     debug_assert!(
         event.data() >= 0,
         "EVFILT_READ data must be non-negative per kernel contract, got {}",
         event.data()
     );
-    drain_pending(read_end, event.data().max(0) as usize)?;
-    Ok(None) // bytes discarded; holders remain (EV_EOF was clear)
+    if !unbounded_wait {
+        drain_pending(read_end, event.data().max(0) as usize)?;
+    }
+    Ok(None) // holders remain (EV_EOF was clear)
 }
 
 /// Take one pending event from an armed kqueue without blocking. `Ok(Some(_))` = the drain was
 /// observed; `Ok(None)` = nothing conclusive yet (nothing pending, or — only once the
-/// low-water clamp is reached — a member's bytes, discarded) — re-wait; `Err` = see
-/// `interpret_read_event`.
-pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>) -> Result<Option<TreeDrain>, Error> {
+/// low-water clamp is reached, and only for a bounded wait — a member's bytes, discarded) —
+/// re-wait; `Err` = see `interpret_read_event`. `unbounded_wait` must match what the kqueue was
+/// armed with (`arm`'s own parameter of the same name) — see `interpret_read_event` for why it
+/// changes what a non-EOF event does.
+pub(crate) fn drain_kqueue(
+    kq: &Kqueue,
+    read_end: BorrowedFd<'_>,
+    unbounded_wait: bool,
+) -> Result<Option<TreeDrain>, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [KEvent::new(
         0,
@@ -171,7 +226,7 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>) -> Result<Opti
     loop {
         match kq.kevent(&[], &mut events, Some(zero)) {
             Ok(0) => return Ok(None), // nothing pending
-            Ok(_) => return interpret_read_event(&events[0], read_end),
+            Ok(_) => return interpret_read_event(&events[0], read_end, unbounded_wait),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::Io(e.into())),
         }
@@ -193,7 +248,7 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>) -> Result<Opti
 #[allow(dead_code)]
 pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
     let kq = arm(read_end, false)?;
-    match drain_kqueue(&kq, read_end)? {
+    match drain_kqueue(&kq, read_end, false)? {
         Some(verdict) => Ok(verdict),
         None => Ok(TreeDrain::MembersRemain),
     }
@@ -211,6 +266,11 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// The per-round deadline-checking and `kevent` mechanics live in `wait::backend::block_on_kqueue`
 /// (shared with the proc-exit watch); this function supplies only the marker's own arm and
 /// per-event interpretation (`interpret_read_event`).
+///
+/// A genuinely unbounded wait (`None`, or `Some(None)`) never drains bytes past the low-water
+/// clamp on a sustained writer — see the module doc for why, and `interpret_read_event` for
+/// where that decision is made. A bounded wait (`Some(Some(_))`, including one already past)
+/// keeps draining as before.
 pub(crate) fn block_until_drained(
     read_end: BorrowedFd<'_>,
     deadline: Option<Option<Instant>>,
@@ -218,7 +278,7 @@ pub(crate) fn block_until_drained(
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
     crate::wait::backend::block_on_kqueue(&kq, deadline, TreeDrain::MembersRemain, |event| {
-        interpret_read_event(event, read_end)
+        interpret_read_event(event, read_end, unbounded_wait)
     })
 }
 
