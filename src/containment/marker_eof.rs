@@ -43,6 +43,13 @@
 //!   proportional to what the writer produces, for as long as the writer keeps producing it) —
 //!   this module chooses zero CPU for the unbounded case, since that is also the case with no
 //!   deadline to bound the alternative.
+//!
+//!   The verdict stays TRUE while that writer is blocked, which is why this is a cost and not a
+//!   wrong answer: a member parked in `write()` is still alive and still holds a write end, so
+//!   the tree really does still have a member and `MembersRemain` is what an honest observer
+//!   reports. The blocked member is visible in the process table; the alternative trades that
+//!   visibility for a supervisor quietly spending a third of a core (measured 23-37% against a
+//!   writer sustaining ~1 GB/s) to carry a member that is already outside the marker's contract.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::Instant;
