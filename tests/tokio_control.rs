@@ -500,12 +500,9 @@ async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 ///
 /// Unix-only, unlike its sync counterpart. The sync `Child` pins its pid for its whole life
 /// through `SharedChild`, which is what makes the already-exited answer `Ok`. The async `Child`
-/// does not: `wait()` drops the guard holding the Windows process handle, so by the time this
-/// asserts, the pid is no longer addressable and the call reports an OS error instead.
-///
-/// That unpinning is a live correctness hazard on the shipped async tree-terminate, not a
-/// property of this test — see cosca#100, which un-gates this once the handle is held for the
-/// child's lifetime.
+/// does not: `wait()` drops the guard holding the Windows process handle, so there the same call
+/// is refused rather than answered `Ok` — a pid this handle no longer pins is not one a console
+/// control event may be addressed to.
 #[cfg(unix)]
 #[tokio::test]
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {

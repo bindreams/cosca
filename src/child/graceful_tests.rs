@@ -265,7 +265,9 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     #[cfg(windows)]
     {
         cmd.executable(std::env::current_exe().expect("current_exe"))
-            .args(["--exact", crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST]);
+            .args(crate::test_child::fixture_argv(
+                crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
+            ));
         cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
     }
     cmd.contain();
@@ -429,7 +431,9 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
 
     let mut cmd = crate::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
+        .args(crate::test_child::fixture_argv(
+            crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,
+        ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     cmd.contain();
     let child = cmd.spawn().expect("spawn");

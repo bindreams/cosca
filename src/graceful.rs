@@ -15,6 +15,9 @@
 //! `FreeConsole`/`AllocConsole`/`AttachConsole` after it starts. So the mechanism says which
 //! signal would be sent and whether this process has a route to send it — never that a given
 //! call will arrive.
+//!
+//! One child has no such word at all: a UAC-elevated one, created on cosca's behalf by a system
+//! service. It reports [`GracefulMechanism::Unknown`], and [`signal`] refuses it.
 
 /// Which cooperative signal [`Child::terminate`](crate::Child::terminate) sends to a child, how
 /// far that signal reaches when it is delivered, and whether this process has a route to deliver
@@ -36,6 +39,11 @@ pub enum GracefulMechanism {
     /// here. Not "unreachable": a process attached to the child's own console can deliver an
     /// event.
     OtherConsoleGroup,
+    /// Windows: **cosca did not create this child.** A system service creates the UAC-elevated
+    /// child, with creation flags this process never sees, so whether it leads a console process
+    /// group of its own is unknowable from here — and a pid that leads none addresses its
+    /// leader's whole group instead. Refused, not attempted.
+    Unknown,
     /// Windows: the child leads no process group of its own, and group leadership is fixed at
     /// creation — so no per-child console control event can be addressed to it by any process,
     /// ever.
@@ -48,6 +56,7 @@ impl std::fmt::Display for GracefulMechanism {
             GracefulMechanism::Process => "process",
             GracefulMechanism::ConsoleGroup => "own console group",
             GracefulMechanism::OtherConsoleGroup => "own console group in another console",
+            GracefulMechanism::Unknown => "unknown",
             GracefulMechanism::None => "none",
         };
         f.write_str(s)
@@ -63,10 +72,10 @@ impl std::fmt::Display for GracefulMechanism {
 pub(crate) fn signal(mechanism: GracefulMechanism, id: crate::identity::ProcessId) -> Result<(), crate::error::Error> {
     match mechanism {
         GracefulMechanism::Process => crate::wait::terminate(id),
-        // One arm for both, because nothing in this process can tell them apart at signal time:
-        // a console control event aimed at a group in another console reports success and
-        // delivers nothing, and refusing `OtherConsoleGroup` would refuse a child that
-        // re-attached itself to our console after it started.
+        // One arm for both. This process's console list is readable, but absence from it does
+        // not imply undeliverable (see `containment::windows::terminate`), and refusing
+        // `OtherConsoleGroup` would refuse a child that re-attached itself to our console after
+        // it started.
         #[cfg(windows)]
         GracefulMechanism::ConsoleGroup | GracefulMechanism::OtherConsoleGroup => {
             crate::containment::windows::terminate(id.pid())
@@ -80,6 +89,15 @@ pub(crate) fn signal(mechanism: GracefulMechanism, id: crate::identity::ProcessI
                 detail: "internal invariant: a console-group mechanism reached signal off Windows".into(),
             })
         }
+        GracefulMechanism::Unknown => Err(crate::error::Error::Unsupported {
+            op: "graceful terminate".into(),
+            platform: std::env::consts::OS,
+            detail: "cosca did not create this child — a system elevation service did — so \
+                     whether it leads a console process group of its own is unknown, and an \
+                     event addressed to its pid would reach its leader's whole group instead. \
+                     Use kill() for a hard teardown."
+                .into(),
+        }),
         GracefulMechanism::None => Err(crate::error::Error::Unsupported {
             op: "graceful terminate".into(),
             platform: std::env::consts::OS,

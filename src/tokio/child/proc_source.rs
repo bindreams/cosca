@@ -66,6 +66,18 @@ impl ProcSource {
         }
     }
 
+    /// Whether the backend still holds something that pins the child's pid against reuse.
+    /// tokio's `Child` replaces its inner state the moment `wait`/`try_wait` observes the exit,
+    /// dropping the guard that holds the process handle (`id()` goes `None` with it); the raw
+    /// backend owns its handle for the child's whole life and never unpins.
+    #[cfg(windows)]
+    pub(crate) fn pins_pid(&self) -> bool {
+        match self {
+            ProcSource::Tokio(c) => c.id().is_some(),
+            ProcSource::Raw(_) => true,
+        }
+    }
+
     /// Signal a hard kill (does not reap). Already-exited ⇒ `Ok`.
     pub(crate) fn start_kill(&mut self) -> Result<(), Error> {
         match self {

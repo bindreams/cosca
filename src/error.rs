@@ -146,7 +146,8 @@ pub enum Error {
     /// Typically an unprivileged caller querying a service, or a parent that cannot open
     /// its own elevated child. Also covers the crate's own refusal to act on a target it
     /// cannot address safely — a pid that names a process *group* rather than a single
-    /// process — where nothing was asked of the OS at all; those carry no `source`.
+    /// process, or one the handle no longer pins against reuse — where nothing was asked of
+    /// the OS at all; those carry no `source`.
     #[error("could not determine the target process's state: {detail}")]
     Unassessable {
         detail: String,

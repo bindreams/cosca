@@ -498,8 +498,10 @@ fn windows_contain_setup_records_the_mechanism_of_the_flags_it_chose() {
 }
 
 /// The UAC-elevated attachment bypasses `mechanism_from_flags` entirely — nothing in the flag
-/// matrix covers it — so its three fields are pinned here. `OtherConsoleGroup`, not the `None` a
-/// flagless spawn yields: a copy-paste of the wrong constant must fail.
+/// matrix covers it — so its three fields are pinned here. `Unknown`, not the `None` a flagless
+/// spawn yields nor the `OtherConsoleGroup` a suppressed one does: a copy-paste of either must
+/// fail. What the dispatcher then does with the value is
+/// `signal_refuses_a_child_cosca_did_not_create`, in `src/graceful_tests.rs`.
 #[cfg(windows)]
 #[test]
 fn uac_elevated_attachment_has_no_in_process_route() {
@@ -510,5 +512,5 @@ fn uac_elevated_attachment_has_no_in_process_route() {
     let a = Attachment::uac_elevated();
     assert_eq!(a.containment, Containment::None);
     assert!(matches!(a.attached, Attached::None), "got {:?}", a.attached);
-    assert_eq!(a.graceful, GracefulMechanism::OtherConsoleGroup);
+    assert_eq!(a.graceful, GracefulMechanism::Unknown);
 }

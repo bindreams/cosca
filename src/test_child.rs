@@ -21,6 +21,16 @@ pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
         .expect("spawn")
 }
 
+/// The argv for re-executing this test binary against one fixture through `cosca::Command`,
+/// whose `args` is the **full** argv — libtest drops slot 0 as the binary name, so a filter or
+/// option placed there is silently eaten and `--exact` degrades to substring matching.
+/// `--test-threads=1` keeps a future filter that matches more than one test from running them
+/// concurrently inside a process the caller is about to signal.
+#[cfg(windows)]
+pub(crate) fn fixture_argv(test: &str) -> [&str; 4] {
+    ["cosca_unit_tests", "--test-threads=1", "--exact", test]
+}
+
 /// The fully-qualified libtest path of [`fixture_survives_group_signal`], for callers that
 /// re-exec this binary against it directly (`current_exe() --exact <this>`) rather than through
 /// [`spawn_a_process_that_exits`]'s own filter.

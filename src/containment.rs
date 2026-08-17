@@ -14,12 +14,8 @@
 //! (broker-spawned helpers, privilege, `setsid` out of a process group). It
 //! reliably tears down *cooperative* trees and reports the achieved guarantee.
 //!
-//! **Tree ownership and cooperative-signal mechanism are independent axes.**
-//! [`Containment`] answers "who tears this tree down";
-//! [`GracefulMechanism`](crate::GracefulMechanism) answers "what cooperative signal
-//! `terminate()` sends to this child, and how far it goes". On Windows the two are correlated
-//! only because containment is currently the only thing that sets `CREATE_NEW_PROCESS_GROUP` —
-//! a coincidence deliberately encoded nowhere.
+//! [`Containment`] answers "who tears this tree down". What cooperative signal `terminate()`
+//! sends the child is an independent axis — see [`crate::graceful`].
 
 use std::fmt;
 

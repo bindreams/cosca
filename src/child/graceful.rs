@@ -45,9 +45,9 @@ impl Child {
     /// process's reach.
     ///
     /// **Success does not prove delivery on Windows.** Windows reports success for an event
-    /// aimed at a group in another console and delivers nothing, and nothing inside this process
-    /// can tell that case from a healthy one. Each such call also leaves a dead entry in the
-    /// caller's console process list.
+    /// aimed at a group in another console and delivers nothing, and this process cannot rule
+    /// that case out: absence from its console list is equally the answer for a healthy child.
+    /// Each such call also leaves a dead entry in the caller's console process list.
     ///
     /// **Every error means nothing was sent and nothing was killed.**
     ///

@@ -56,17 +56,17 @@ impl Attachment {
     /// The attachment for a UAC-elevated spawn, which `ShellExecuteEx("runas")` creates through
     /// a system service with creation flags this process never sees and never chose.
     ///
-    /// The mechanism is `OtherConsoleGroup`, not `None`: what is observable is that the elevated
-    /// child runs in a console that is not ours, so there is no in-process route. `None` would
-    /// be the stronger claim that no cooperative signal exists from any process ever, and cosca
-    /// cannot make it about a child it did not create.
+    /// The mechanism is `Unknown`, so [`crate::graceful::signal`] refuses this child rather than
+    /// addressing a console control event to its pid. `OtherConsoleGroup` would claim a route to
+    /// a group known to exist, and `None` that no cooperative signal exists from any process
+    /// ever; cosca can make neither claim about a child it did not create.
     ///
     /// Named for its single use so nothing else adopts it.
     pub(crate) fn uac_elevated() -> Attachment {
         Attachment {
             containment: Containment::None,
             attached: Attached::None,
-            graceful: crate::graceful::GracefulMechanism::OtherConsoleGroup,
+            graceful: crate::graceful::GracefulMechanism::Unknown,
         }
     }
 }

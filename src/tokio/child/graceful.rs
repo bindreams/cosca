@@ -47,9 +47,9 @@ impl Child {
     /// process's reach.
     ///
     /// **Success does not prove delivery on Windows.** Windows reports success for an event
-    /// aimed at a group in another console and delivers nothing, and nothing inside this process
-    /// can tell that case from a healthy one. Each such call also leaves a dead entry in the
-    /// caller's console process list.
+    /// aimed at a group in another console and delivers nothing, and this process cannot rule
+    /// that case out: absence from its console list is equally the answer for a healthy child.
+    /// Each such call also leaves a dead entry in the caller's console process list.
     ///
     /// **Every error means nothing was sent and nothing was killed.**
     ///
@@ -61,7 +61,27 @@ impl Child {
     /// is past the window and gets a real cooperative signal; a caller that wants the child gone
     /// before it has run at all should use [`kill`](Child::kill), which is honest about being
     /// forced.
+    ///
+    /// **Windows, after the exit has been observed.** A console control event is addressed by
+    /// pid alone, and this handle stops pinning the child's pid the moment `wait`/`try_wait`
+    /// reports the exit — the async backend releases the process handle there, so the OS may
+    /// reissue the pid to an unrelated group leader. From that point the call is refused
+    /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
+    /// pid. The sync [`Child`](crate::Child) pins for its whole life and answers `Ok`.
     pub fn terminate(&self) -> Result<(), Error> {
+        #[cfg(windows)]
+        if !self.proc.pins_pid() {
+            return Err(Error::Unassessable {
+                detail: format!(
+                    "this handle no longer pins pid {pid}: the async backend released the \
+                     child's process handle when its exit was observed, so the pid may since \
+                     name an unrelated process. A console control event is addressed by pid \
+                     alone, so nothing was sent — and the child is already gone.",
+                    pid = self.id().pid()
+                ),
+                source: None,
+            });
+        }
         crate::graceful::signal(self.graceful_mechanism(), self.id())
     }
 

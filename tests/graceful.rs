@@ -532,7 +532,7 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
 /// tree, leads a console process group of its own, and had no cooperative shutdown at all.
 /// `break=1` is reachable only if that child's own handler acknowledged an event no tree op on
 /// any handle in the system could have delivered to it; `tree=Unsupported` fails if the
-/// containment gate was loosened, which this change must not do.
+/// containment gate was loosened.
 #[cfg(windows)]
 #[test]
 fn nested_delegated_child_can_be_gracefully_terminated() {

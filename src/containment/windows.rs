@@ -346,6 +346,17 @@ pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io:
 /// can deliver an event to it, and `kill`/`kill_tree` need no console at all. And every call —
 /// including one to an ordinary group that has already drained — leaves a dead entry in the
 /// caller's console process list, which persists after the target exits.
+///
+/// **Absence from the caller's console list is not grounds to refuse.** Membership is readable
+/// (`GetConsoleProcessList`), so the first gap's condition is decidable here; the inference is
+/// what is missing. Absence is consistent with three states and only one of them is a
+/// non-delivery. A contained child is absent at the instant `spawn()` returns — measured 0/10,
+/// and 0/10 again for the suspend-then-resume shape a contained root uses — while a signal in
+/// that window is delivered and kills it, so refusing would turn a working teardown into an
+/// error. An already-exited child is absent too, because a real member's entry is removed on
+/// exit, where this function's contract is "already-dead ⇒ `Ok`". The genuinely-elsewhere target
+/// is the third, and separating it needs the TARGET's console rather than ours — a broker, not
+/// a probe.
 pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
     debug_assert!(
