@@ -158,19 +158,22 @@ fn nested_attach_is_delegated() {
             cgroup_leaf: None,
             #[cfg(target_os = "macos")]
             marker: None,
+            #[cfg(windows)]
+            graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
         };
         #[cfg(windows)]
         let proc_handle = {
             use std::os::windows::io::AsRawHandle;
             child.as_raw_handle()
         };
-        let (containment, attached) = attach(
+        let attachment = attach(
             child.id(),
             #[cfg(windows)]
             proc_handle,
             prepared,
         )
         .expect("attach nested");
+        let (containment, attached) = (attachment.containment, attachment.attached);
         // Reap before asserting: `attached` is owned and independent of `child`, so a
         // failing assertion must not leak the helper (the nested arms don't touch it).
         let _ = child.kill();
@@ -457,4 +460,55 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
             .expect("unbounded wait after the holder exits"),
         TreeDrain::AllMarkersClosed
     );
+}
+
+/// The three shapes `windows_contain_setup` can produce must not all agree: an uncontained
+/// spawn leads no group, while both contained shapes do. Lives here rather than in
+/// `windows_tests.rs` because `windows_contain_setup` is defined in this module.
+#[cfg(windows)]
+#[test]
+fn windows_contain_setup_records_the_mechanism_of_the_flags_it_chose() {
+    use super::windows_contain_setup;
+    use crate::containment::{ContainMode, ContainRequest, Nesting};
+    use crate::graceful::GracefulMechanism;
+
+    let uncontained = ContainRequest {
+        mode: None,
+        nesting: Nesting::Mark,
+    };
+    let contained = ContainRequest {
+        mode: Some(ContainMode::Strongest),
+        nesting: Nesting::Mark,
+    };
+    assert_eq!(
+        windows_contain_setup(&uncontained, true).graceful,
+        GracefulMechanism::None,
+        "an uncontained spawn passes no flags, so it leads no group"
+    );
+    assert_eq!(
+        windows_contain_setup(&contained, true).graceful,
+        GracefulMechanism::ConsoleGroup,
+        "a Strongest root spawns suspended into its own group"
+    );
+    assert_eq!(
+        windows_contain_setup(&contained, false).graceful,
+        GracefulMechanism::ConsoleGroup,
+        "a nested spawn leads its own group too"
+    );
+}
+
+/// The UAC-elevated attachment bypasses `mechanism_from_flags` entirely — nothing in the flag
+/// matrix covers it — so its three fields are pinned here. `OtherConsoleGroup`, not the `None` a
+/// flagless spawn yields: a copy-paste of the wrong constant must fail.
+#[cfg(windows)]
+#[test]
+fn uac_elevated_attachment_has_no_in_process_route() {
+    use super::{Attached, Attachment};
+    use crate::containment::Containment;
+    use crate::graceful::GracefulMechanism;
+
+    let a = Attachment::uac_elevated();
+    assert_eq!(a.containment, Containment::None);
+    assert!(matches!(a.attached, Attached::None), "got {:?}", a.attached);
+    assert_eq!(a.graceful, GracefulMechanism::OtherConsoleGroup);
 }

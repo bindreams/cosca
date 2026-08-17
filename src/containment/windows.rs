@@ -157,14 +157,54 @@ impl Drop for JobHandle {
 /// `CREATE_NEW_PROCESS_GROUP`: child leads its own console group so
 /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can target it.
 /// Shared by the std path and the raw `CreateProcessW` backend via `windows_contain_setup`.
+/// What this word implies about cooperative shutdown is derived by [`mechanism_from_flags`].
 pub(crate) fn root_flags() -> u32 {
     CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0
 }
 
 /// Pre-spawn creation flags for a nested (non-root) spawn.
 /// Only `CREATE_NEW_PROCESS_GROUP` — no suspension needed for nested spawns.
+/// What this word implies about cooperative shutdown is derived by [`mechanism_from_flags`].
 pub(crate) fn group_flags() -> u32 {
     CREATE_NEW_PROCESS_GROUP.0
+}
+
+/// Which cooperative signal a child spawned with `creation_flags` can be sent, derived from the
+/// flag word the spawn actually passed to `CreateProcessW`.
+///
+/// Three rows:
+///
+/// - `CREATE_NEW_PROCESS_GROUP` absent → [`GracefulMechanism::None`]. The child sits in the
+///   spawner's group, so no console control event can ever be addressed to it individually by
+///   any process, and group leadership cannot be changed after creation. This is the one flat
+///   negative the flag word settles absolutely.
+/// - the group flag set, and none of `DETACHED_PROCESS` / `CREATE_NEW_CONSOLE` /
+///   `CREATE_NO_WINDOW` → [`GracefulMechanism::ConsoleGroup`].
+/// - the group flag set together with any of those three → [`GracefulMechanism::OtherConsoleGroup`].
+///
+/// What the results do **not** mean. `ConsoleGroup` says the flags do not *exclude* in-process
+/// delivery — it is not a claim the child is reachable. Console membership is not a function of
+/// the flag word at all: a GUI-subsystem image never attaches to the spawner's console whatever
+/// the flags say, and any child may `FreeConsole`/`AllocConsole`/`AttachConsole` after it starts.
+/// An out-of-console group makes `GenerateConsoleCtrlEvent` report success while delivering
+/// nothing, which is why the split exists. And `OtherConsoleGroup` is not "unreachable": a child
+/// spawned with window suppression owns a *private* console a helper process can attach to, so
+/// the claim is about the route from here, never a verdict on the child.
+///
+/// Any future creation-flag surface must extend this one function rather than deriving a
+/// mechanism of its own.
+pub(crate) fn mechanism_from_flags(creation_flags: u32) -> crate::graceful::GracefulMechanism {
+    use crate::graceful::GracefulMechanism;
+    use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
+
+    if creation_flags & CREATE_NEW_PROCESS_GROUP.0 == 0 {
+        return GracefulMechanism::None;
+    }
+    let out_of_console = DETACHED_PROCESS.0 | CREATE_NEW_CONSOLE.0 | CREATE_NO_WINDOW.0;
+    if creation_flags & out_of_console != 0 {
+        return GracefulMechanism::OtherConsoleGroup;
+    }
+    GracefulMechanism::ConsoleGroup
 }
 
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents

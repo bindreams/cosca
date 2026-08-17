@@ -312,3 +312,41 @@ fn process_soft_tree_unsupported_on_windows() {
     child.kill().expect("cleanup");
     let _ = child.wait();
 }
+
+// GracefulMechanism =====
+
+/// Unix is uniformly `Process`: every child cosca owns there can be sent an identity-bound
+/// `SIGTERM`, whatever its containment. A `cfg`-confused implementation that reported the
+/// contained child's group instead fails here.
+#[cfg(unix)]
+#[test]
+fn graceful_mechanism_is_process_on_unix() {
+    use cosca::GracefulMechanism;
+
+    let (uncontained, _s1) = common::spawn_blocker();
+    let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
+    assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
+    assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
+    for child in [uncontained, contained] {
+        child.kill().expect("cleanup");
+        let _ = child.wait();
+    }
+}
+
+/// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
+/// uncontained child leads no group while a contained one does. A hardcoded return value fails
+/// one of the two.
+#[cfg(windows)]
+#[test]
+fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
+    use cosca::GracefulMechanism;
+
+    let (uncontained, _s1) = common::spawn_blocker();
+    let (contained, _s2) = common::spawn_control("control-block", &["R"], true);
+    assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::None);
+    assert_eq!(contained.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    for child in [uncontained, contained] {
+        child.kill().expect("cleanup");
+        let _ = child.wait();
+    }
+}

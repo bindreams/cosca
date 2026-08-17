@@ -368,9 +368,12 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let prepared = crate::containment::Prepared {
         mode: req.mode,
         is_root,
+        // From the FINAL flag word this backend passed to CreateProcessW, not from
+        // `contain_flags` alone: the derivation must read what the OS was actually given.
+        graceful: crate::containment::windows::mechanism_from_flags(flags),
     };
     let raw_handle = proc.as_raw_handle();
-    let (containment, attached) = match attach_or_fault(pid, raw_handle, prepared) {
+    let attachment = match attach_or_fault(pid, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
             sync_raw::raw_spawn_teardown(proc, pid);
@@ -388,9 +391,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     Ok(Child::from_parts(
         ProcSource::Raw(RawAsyncChild::new(proc, pid)),
         id,
-        attached,
         kill_on_drop,
-        containment,
+        attachment,
         fd_pipes,
         owned_std,
     ))

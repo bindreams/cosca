@@ -41,9 +41,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                     let mut child = Child::from_parts(
                         ProcSource::Raw(raw),
                         id,
-                        crate::containment::Attached::None,
                         kill_on_drop,
-                        crate::containment::Containment::None,
+                        crate::containment::Attachment::uac_elevated(),
                         super::child::FdPipes::new(),
                         std::collections::BTreeMap::new(),
                     );
@@ -376,7 +375,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         proc_handle,
         prepared,
     );
-    let (containment, attached) = match attach {
+    let attachment = match attach {
         Ok(v) => v,
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
         // attach never leaks a live/suspended process.
@@ -401,15 +400,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         super::child::FdPipes::new()
     };
 
-    let mut child = Child::from_parts(
-        ProcSource::Tokio(child),
-        id,
-        attached,
-        kill_on_drop,
-        containment,
-        pipes,
-        owned_std,
-    );
+    let mut child = Child::from_parts(ProcSource::Tokio(child), id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
     Ok(child)
 }

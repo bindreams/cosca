@@ -76,6 +76,7 @@ pub struct Child {
     kill_on_drop: bool,
     containment: Containment,
     attached: crate::containment::Attached,
+    graceful: crate::graceful::GracefulMechanism,
     elevation: Option<crate::elevation::ElevationReport>,
 }
 
@@ -85,16 +86,16 @@ impl Child {
         id: ProcessId,
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
-        containment: Containment,
-        attached: crate::containment::Attached,
+        attachment: crate::containment::Attachment,
     ) -> Child {
         Child {
             proc,
             id,
             pipes,
             kill_on_drop,
-            containment,
-            attached,
+            containment: attachment.containment,
+            attached: attachment.attached,
+            graceful: attachment.graceful,
             elevation: None,
         }
     }
@@ -116,6 +117,22 @@ impl Child {
     /// act or return `Unsupported`.
     pub fn containment(&self) -> Containment {
         self.containment
+    }
+
+    /// Which cooperative signal [`terminate`](Child::terminate) sends this child, how far it
+    /// reaches, and whether this process has a route to deliver it. A spawn-time fact, so it is
+    /// stable for the child's whole life and costs no syscall.
+    ///
+    /// Independent of [`containment`](Child::containment): that answers who tears this child's
+    /// *tree* down, this answers what a polite signal to the child itself is.
+    ///
+    /// **Not a delivery guarantee.** [`GracefulMechanism::ConsoleGroup`] means only that the
+    /// creation flags do not exclude delivery from this process — Windows reports success for a
+    /// console control event aimed at a group in another console and delivers nothing, and no
+    /// spawn-time fact can predict a child that leaves or joins a console after it starts.
+    /// Each such call also leaves a dead entry in the caller's console process list.
+    pub fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
+        self.graceful
     }
 
     /// Guard for the `_tree` operations (single-sourced with the async `Child`).

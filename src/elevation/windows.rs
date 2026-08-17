@@ -171,7 +171,7 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::RawChild;
 use crate::command::CommandInput;
-use crate::containment::{Attached, Containment};
+use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ElevationErrorKind;
@@ -380,8 +380,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
                 id,
                 BTreeMap::new(),
                 kill_on_drop,
-                Containment::None,
-                Attached::None,
+                Attachment::uac_elevated(),
             );
             child.set_elevation(Some(report));
             Ok(child)

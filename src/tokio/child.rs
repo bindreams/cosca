@@ -35,6 +35,7 @@ pub struct Child {
     attached: Attached,
     kill_on_drop: bool,
     containment: Containment,
+    graceful: crate::graceful::GracefulMechanism,
     /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
     /// [`fd_write_end`](Child::fd_write_end). Unix: `command-fds`-wired reactor pipes; Windows: the
     /// raw backend's overlapped async ends (empty on the std path, which routes fd >= 3 to the raw
@@ -53,18 +54,18 @@ impl Child {
     pub(super) fn from_parts(
         proc: ProcSource,
         id: ProcessId,
-        attached: Attached,
         kill_on_drop: bool,
-        containment: Containment,
+        attachment: crate::containment::Attachment,
         pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
             proc,
             id,
-            attached,
+            attached: attachment.attached,
             kill_on_drop,
-            containment,
+            containment: attachment.containment,
+            graceful: attachment.graceful,
             pipes,
             owned_std,
             elevation: None,
@@ -106,6 +107,11 @@ impl Child {
     }
     pub fn containment(&self) -> Containment {
         self.containment
+    }
+    /// Async mirror of [`Child::graceful_mechanism`](crate::Child::graceful_mechanism) — see
+    /// there for what the value claims, and what it deliberately does not.
+    pub fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
+        self.graceful
     }
 
     pub fn stdin(&mut self) -> Option<super::stdio::ChildStdin> {
