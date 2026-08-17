@@ -17,7 +17,8 @@
 //! call will arrive.
 //!
 //! One child has no such word at all: a UAC-elevated one, created on cosca's behalf by a system
-//! service. It reports [`GracefulMechanism::Unknown`], and [`signal`] refuses it.
+//! service. It reports [`GracefulMechanism::Unknown`], which
+//! [`Child::terminate`](crate::Child::terminate) refuses.
 
 /// Which cooperative signal [`Child::terminate`](crate::Child::terminate) sends to a child, how
 /// far that signal reaches when it is delivered, and whether this process has a route to deliver
