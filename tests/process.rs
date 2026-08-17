@@ -234,10 +234,14 @@ fn foreign_kill_surfaces_permission_denied() {
 #[cfg(unix)]
 #[test]
 fn is_alive_is_false_for_a_real_zombie() {
-    // The deferred Plan-2 test. Spawn a RAW std child (std does NOT reap on drop), take it
-    // foreign, death-watch it to its exit, then — before reaping — assert is_alive()==false
-    // (zombie) while the identity still resolves (exists). The kernel exit edge is the sync
-    // point; no sleep. Finally reap to avoid a leak.
+    // Spawn a RAW std child (std does NOT reap on drop), take it foreign, drive it to a
+    // zombie, then — before reaping — assert is_alive()==Dead while the identity still
+    // resolves (exists). Finally reap to avoid a leak.
+    //
+    // The foreign death-watch below is exercised but is NOT the sync point: `Process::wait`
+    // returns on the OS exit edge, which on macOS precedes the zombie transition that
+    // `is_alive` reads (see `common::block_until_zombie`). Only that helper's
+    // `waitid(WEXITED | WNOWAIT)` establishes this test's premise.
     use std::io::Read;
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -254,7 +258,8 @@ fn is_alive_is_false_for_a_real_zombie() {
 
     let p = cosca::Process::from_pid(raw.id()).found().expect("raw child resolves");
     sock.write_all(b"x").expect("trigger exit");
-    p.wait().expect("death-watch"); // returns at the zombie instant (no reap yet)
+    p.wait().expect("death-watch"); // the OS exit edge — non-reaping, but not yet the zombie edge
+    common::block_until_zombie(raw.id()); // the zombie edge, still unreaped
 
     assert_eq!(
         p.is_alive(),

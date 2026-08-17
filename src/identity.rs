@@ -146,11 +146,18 @@ impl ProcessId {
         }
     }
 
-    /// Whether the process is currently *running* (has not exited). Authoritative and
-    /// synchronously correct the instant the process exits — on Windows via the handle's
-    /// signaled state, on Unix via process state / `/proc` presence. A reused PID (different
-    /// start token) is never alive. [`Liveness::Unknown`] when the OS refuses the query, or
-    /// answers ambiguously — never `Dead` on a process we could not assess.
+    /// Whether the process is currently *running* (has not exited). Answers out of the OS's own
+    /// exit bookkeeping — on Windows the handle's signaled state, on Unix process state /
+    /// `/proc` presence. A reused PID (different start token) is never alive.
+    /// [`Liveness::Unknown`] when the OS refuses the query, or answers ambiguously — never
+    /// `Dead` on a process we could not assess.
+    ///
+    /// **The OS exit *edge* can precede that bookkeeping.** macOS posts the `NOTE_EXIT` a
+    /// death-watch ([`Process::wait`](crate::Process::wait)) returns on from inside `proc_exit`,
+    /// before the same function sets the `p_stat = SZOMB` this reads — so `Alive` is briefly
+    /// reachable for a process that has already exited. Linux (`pidfd`) and Windows signal only
+    /// after their equivalent transition. Confirm a process is finished by reaping it or by a
+    /// real exit event, not by asking this immediately after a wait returns.
     pub fn is_alive(&self) -> Liveness {
         backend::is_running(self.pid, self.start)
     }

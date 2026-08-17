@@ -34,6 +34,37 @@ pub fn status_locked(cmd: &mut std::process::Command) -> std::io::Result<std::pr
     cmd.status()
 }
 
+/// Block until `pid` — which MUST be an unreaped child of this process — has exited AND become
+/// a zombie, leaving it unreaped for the caller to assert on and then reap. The canonical
+/// zombie edge for this suite: the ONLY sync point that a liveness assertion about a zombie may
+/// be taken at.
+///
+/// A death-watch is NOT a substitute. `Process::wait` returns on the OS exit edge, and on macOS
+/// that edge is `proc_exit`'s `proc_knote(p, NOTE_EXIT)`, which XNU posts well before the same
+/// function assigns `p->p_stat = SZOMB` — so a liveness check taken there can still read the
+/// process as running. `waitid` reports `WEXITED` only out of the kernel's `SZOMB` case, so its
+/// return IS the zombie transition, and `WNOWAIT` leaves the zombie collectable. Blocking,
+/// kernel-synchronised, and never a poll or a timeout.
+#[cfg(unix)]
+pub fn block_until_zombie(pid: cosca::identity::RawPid) {
+    loop {
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `si` is a valid, correctly-sized out-param; `pid` is our own unreaped child.
+        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut si, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 {
+            return;
+        }
+        // EINTR is a restart, not a failure — the codebase's convention for every blocking
+        // syscall (see `wait/macos.rs`, `identity/macos/kinfo.rs`).
+        let e = std::io::Error::last_os_error();
+        assert_eq!(
+            e.raw_os_error(),
+            Some(libc::EINTR),
+            "waitid(P_PID, {pid}, WEXITED | WNOWAIT): {e}"
+        );
+    }
+}
+
 /// A capturing `log::Log` for asserting on log output from an integration-test process — a fresh
 /// copy of `src/log_capture.rs`'s `pub(crate)`-private original, which a separate compilation unit
 /// like this one cannot name.
