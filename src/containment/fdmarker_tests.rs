@@ -834,7 +834,8 @@ fn await_member_ready(child: &mut std::process::Child) {
 /// to get a deterministic injection point *between* two passes with no sleep and no race:
 /// `hard_kill`'s own loop offers no such hook.
 ///
-/// Four roles, three real target processes:
+/// Four roles, three real target processes — all [`member_command`] members, none scanned until
+/// [`await_member_ready`] has read its announcement:
 /// - **P** mints a real, currently-valid pgid (`process_group(0)`: P's pgid == P's own pid), AND
 ///   carries a THROWAWAY marker (`scratch`, installed on P's own command) that exists only to
 ///   give pass 1 a valid `Marker` to call `sweep_pass` on — pass 1's own holder scan finding P
@@ -866,10 +867,6 @@ fn await_member_ready(child: &mut std::process::Child) {
 /// "the kernel still lists a zombie in its process group" fact `group_tests.rs`'s `await_zombie`
 /// already relies on, applied here to keep `pgid` allocated across the gap instead of to query
 /// it.
-///
-/// All three are [`member_command`] members, and none of them is passed to a sweep until
-/// [`await_member_ready`] has read its announcement — see there for what `spawn()` alone does
-/// and does not establish.
 #[test]
 fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member() {
     let _serialize = test_spawn_lock();
@@ -915,8 +912,10 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
 
     let mut q_cmd = member_command(pgid);
     let mut q_child = q_cmd.spawn().expect("spawn Q");
-    // Q's announcement proves it is a live member of `pgid` and blocked on its stdin before the
-    // signal fires, so its non-success exit below can only be that signal.
+    // Q's announcement proves it is a live member of `pgid`, blocked on its stdin, before the
+    // signal fires. It does NOT make a non-success exit proof of the signal: `wait()` closes Q's
+    // piped stdin before waiting, and `read` at EOF exits `sh` 1 on its own — which is why the
+    // assertion below is on the termination signal, not on `!success()`.
     await_member_ready(&mut q_child);
 
     let marker = super::Marker::new(prepared, None, Some(pgid), false);
@@ -938,12 +937,17 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
          found in this pass's own holder scan"
     );
 
-    // The proof: Q holds no marker and was never named `root`, so only a `killpg` on `pgid`
-    // could have killed it.
+    // The proof: Q holds no marker and was never named `root`, so a SIGKILL on Q can only have
+    // come from `killpg(pgid)`. It must be the signal that ended Q, not `wait()`'s own stdin
+    // close: a gate that stopped re-firing would leave Q alive to read that EOF and exit 1,
+    // which `signal()` reports as `None`.
+    use std::os::unix::process::ExitStatusExt;
     let status = q_child.wait().expect("reap Q");
-    assert!(
-        !status.success(),
-        "Q must have been killed by the pass-2 group signal (killpg), not left running; got {status:?}"
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "Q must have died from the pass-2 group signal (killpg on pgid), the only channel that \
+         reaches it; got {status:?}"
     );
 
     // T is reachable by the marker channel too (this same pass 2 call's own holder-kill loop),
