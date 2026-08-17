@@ -128,11 +128,16 @@ async fn async_terminate_sends_sigterm() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn async_terminate_unsupported_on_windows() {
+async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let (mut child, mut sock) = common::spawn_blocker_async();
+    assert_eq!(
+        child.graceful_mechanism(),
+        cosca::GracefulMechanism::None,
+        "the refusal follows from the recorded fact, not from the platform"
+    );
     let err = child
         .terminate()
-        .expect_err("lone graceful terminate has no Windows primitive");
+        .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
@@ -311,13 +316,18 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn async_graceful_shutdown_unsupported_on_windows() {
+async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
     let (mut child, mut sock) = common::spawn_blocker_async();
+    assert_eq!(
+        child.graceful_mechanism(),
+        cosca::GracefulMechanism::None,
+        "the refusal follows from the recorded fact, not from the platform"
+    );
     let err = child
         .graceful_shutdown(Duration::from_secs(1))
         .await
-        .expect_err("no Windows lone graceful");
+        .expect_err("a child that leads no group cannot be addressed");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
@@ -425,4 +435,138 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
     child.kill().expect("cleanup");
     expect_eof("blocker", &mut sock);
     let _ = child.wait().await;
+}
+
+// The lone graceful ops on a console-group child — async twins of tests/graceful.rs's =====
+
+/// Async twin of `child_terminate_delivers_ctrl_break_to_a_contained_root`.
+#[cfg(windows)]
+#[tokio::test]
+async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
+    use cosca::GracefulMechanism;
+
+    let (mut child, mut sock) = common::spawn_control_async("control-block-ack-break", &["R"], true);
+    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert_eq!(
+        common::in_our_console(child.id().pid()),
+        Some(true),
+        "the root must share our console for the event to be deliverable"
+    );
+    child.terminate().expect("terminate a console-group child");
+    let mut ack = [0u8; 1];
+    sock.read_exact(&mut ack).expect("the child must acknowledge the break");
+    assert_eq!(&ack, b"B", "wrong ack byte");
+    child.kill_tree().expect("cleanup");
+    let _ = child.wait().await;
+}
+
+/// Async twin of `child_graceful_shutdown_exits_via_ctrl_break_on_windows`.
+#[cfg(windows)]
+#[tokio::test]
+async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
+    use std::time::Duration;
+
+    let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true);
+    let status = child
+        .graceful_shutdown(Duration::from_secs(30))
+        .await
+        .expect("graceful_shutdown on a console-group child");
+    assert_eq!(
+        status.code(),
+        Some(0xC000013A_u32 as i32),
+        "the child must die to the console event, got {status:?}"
+    );
+}
+
+/// Async twin of `child_graceful_shutdown_escalates_when_the_break_is_ignored`.
+#[cfg(windows)]
+#[tokio::test]
+async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
+    use std::time::Duration;
+
+    let (mut child, _sock) = common::spawn_control_async("control-block-ignore-break", &["R"], true);
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect("graceful_shutdown escalates");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a break-ignoring child must be force-killed, got {status:?}"
+    );
+}
+
+/// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`, deliberately not
+/// `cfg`-gated for the same reason: the parity claim is one test, not two.
+#[tokio::test]
+async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
+    let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true);
+    child.kill().expect("kill");
+    let _status = child.wait().await.expect("reap");
+    child.terminate().expect("already-dead must be Ok");
+}
+
+/// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console` — the
+/// same known limitation, pinned on the async surface too.
+#[cfg(windows)]
+#[tokio::test]
+async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
+    use std::time::Duration;
+
+    use cosca::GracefulMechanism;
+
+    let (mut child, mut sock) = common::spawn_gui_control_async(true);
+    assert_eq!(
+        child.graceful_mechanism(),
+        GracefulMechanism::ConsoleGroup,
+        "the flags do not exclude delivery — that is exactly what makes this a gap"
+    );
+    assert_eq!(
+        common::in_our_console(child.id().pid()),
+        Some(false),
+        "a GUI-subsystem child is not in our console"
+    );
+    child.terminate().expect("the documented false success");
+    assert_eq!(
+        child.is_alive(),
+        cosca::identity::Liveness::Alive,
+        "nothing was delivered, so the child must still be running"
+    );
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect("the forced half needs no console");
+    assert_eq!(status.code(), Some(1), "escalation's kill, got {status:?}");
+    let mut buf = [0u8; 1];
+    let _ = sock.read(&mut buf);
+    let _ = child.wait().await;
+}
+
+/// The one assertion that catches a future divergence between the two hand-mirrored surfaces:
+/// the async query must report exactly what the sync side pins, for both an uncontained and a
+/// contained child.
+#[tokio::test]
+async fn async_graceful_mechanism_matches_the_sync_surface() {
+    let (mut uncontained, _s1) = common::spawn_blocker_async();
+    let (mut contained, _s2) = common::spawn_control_async("control-block", &["R"], true);
+    let (sync_uncontained, _s3) = common::spawn_blocker();
+    let (sync_contained, _s4) = common::spawn_control("control-block", &["R"], true);
+    assert_eq!(
+        uncontained.graceful_mechanism(),
+        sync_uncontained.graceful_mechanism(),
+        "uncontained: the two mirrors disagree"
+    );
+    assert_eq!(
+        contained.graceful_mechanism(),
+        sync_contained.graceful_mechanism(),
+        "contained: the two mirrors disagree"
+    );
+    uncontained.kill().expect("cleanup");
+    let _ = uncontained.wait().await;
+    contained.kill().expect("cleanup");
+    let _ = contained.wait().await;
+    for child in [sync_uncontained, sync_contained] {
+        child.kill().expect("cleanup");
+        let _ = child.wait();
+    }
 }

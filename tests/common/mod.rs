@@ -173,6 +173,27 @@ pub fn spawn_gui_control(contain: bool) -> (cosca::Child, TcpStream) {
     (child, sock)
 }
 
+/// Async sibling of [`spawn_gui_control`] — see there for why the GUI-subsystem image is the
+/// only way to construct a child whose flags say nothing excludes delivery while the OS puts it
+/// out of reach.
+#[cfg(all(windows, feature = "tokio"))]
+pub fn spawn_gui_control_async(contain: bool) -> (cosca::tokio::Child, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.args([exe, addr.as_str()]);
+    if contain {
+        cmd.contain();
+    }
+    let child = cmd.spawn().expect("spawn async gui control child");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read tag");
+    assert_eq!(&tag, b"G", "wrong gui tag");
+    (child, sock)
+}
+
 /// Convenience alias for the common `control-block` blocker (no `.contain()`). A one-line
 /// shortcut over `spawn_control`, NOT a second copy of the body.
 pub fn spawn_blocker() -> (cosca::Child, TcpStream) {

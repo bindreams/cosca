@@ -24,21 +24,76 @@ fn take_forced_watch_error() -> Option<Error> {
 }
 
 impl Child {
-    /// Send `SIGTERM` to the (lone) child — a cooperative request to exit. Signal-only: does
-    /// not wait or reap. Identity-bound, so it cannot race a concurrent reap onto a recycled
-    /// pid. Unix only — Windows has no per-process graceful signal and returns `Unsupported`
-    /// (use [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) for a contained child).
+    /// Send the child its cooperative shutdown signal — a request to exit, not an order.
+    /// Signal-only: does not wait or reap.
+    ///
+    /// Which signal, and how far it goes, is per child: read it from
+    /// [`graceful_mechanism`](Child::graceful_mechanism). On Unix it is an identity-bound
+    /// `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a recycled pid.
+    /// On Windows it is `CTRL_BREAK` to the child's own **console process group** — every child
+    /// spawned with [`contain`](crate::tokio::Command::contain), including a nested
+    /// [`Delegated`](crate::Containment::Delegated) one. A child that leads no group of its own
+    /// (an uncontained Windows spawn) is refused with `Unsupported`; `kill` is the
+    /// always-available alternative.
+    ///
+    /// **Windows blast radius.** The event reaches the child's whole console group, so an
+    /// ordinary descendant that stayed in that group is signalled too, while a nested
+    /// *contained* descendant — which leads a group of its own — is not.
+    ///
+    /// **The caller must hold a console** ([`Error::NoConsole`](crate::error::Error::NoConsole)
+    /// otherwise: a GUI-subsystem binary, a service, or a detached spawn cannot deliver console
+    /// control events). A child that owns its own console instead needs a process attached to
+    /// *that* console to signal it — it is not beyond a polite shutdown, just beyond this
+    /// process's reach.
+    ///
+    /// **Success does not prove delivery on Windows.** Windows reports success for an event
+    /// aimed at a group in another console and delivers nothing, and nothing inside this process
+    /// can tell that case from a healthy one. Each such call also leaves a dead entry in the
+    /// caller's console process list.
+    ///
+    /// **Every error means nothing was sent and nothing was killed.**
+    ///
+    /// **Windows, before the child has run.** Between the spawn returning and the child
+    /// executing its first instructions it has not yet registered with any console; an event
+    /// delivered in that window ends it during loader init rather than through its own handler.
+    /// That is an abrupt end, not a failed one, and it is reported `Ok`. A caller that has
+    /// observed anything from the child — a byte of output, a handshake, an exit-status check —
+    /// is past the window and gets a real cooperative signal; a caller that wants the child gone
+    /// before it has run at all should use [`kill`](Child::kill), which is honest about being
+    /// forced.
     pub fn terminate(&self) -> Result<(), Error> {
-        crate::wait::terminate(self.id())
+        crate::graceful::signal(self.graceful_mechanism(), self.id())
     }
 
-    /// Cooperative-then-forced lone shutdown: `SIGTERM`, wait up to `grace` for the child to
-    /// exit, then `SIGKILL` if it has not — reaping either way and returning its `ExitStatus`.
-    /// The status's terminating signal distinguishes a graceful exit from a forced one —
+    /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
+    /// `grace` for the child to exit, then hard-kill it if it has not — reaping either way and
+    /// returning its `ExitStatus`. The status distinguishes a graceful exit from a forced one —
     /// best-effort at the boundary: a child that exits of its own accord between the grace
-    /// elapsing and the `SIGKILL` landing reports its own status.
-    /// Escalation proceeds even if the child ignores `SIGTERM`. Unix only; Windows returns
-    /// `Unsupported`. `grace` is relative; `Duration::ZERO` signals, polls once, then escalates.
+    /// elapsing and the kill landing reports its own status. Escalation proceeds even if the
+    /// child ignores the cooperative signal. `grace` is relative; `Duration::ZERO` signals,
+    /// polls once, then escalates.
+    ///
+    /// Every caveat on [`terminate`](Child::terminate) applies to the cooperative half, and a
+    /// cooperative-signal error propagates immediately: no grace is waited, nothing is killed,
+    /// and the child is left running for the caller to `kill`.
+    ///
+    /// **Windows: the two halves have different radii.** The cooperative half reaches the
+    /// child's whole console group; the forced half reaches only the child. So a descendant
+    /// that stayed in the child's group can be left told-to-exit but not killed: if the child
+    /// itself exits within `grace`, this returns `Ok` while that descendant — possibly hung
+    /// mid-shutdown — keeps running, with no hard backstop and no error. For a leaf child, the
+    /// common case, the two radii are identical. Two routes give matched radii: the tree
+    /// variants on a contained root ([`graceful_shutdown_tree`](Child::graceful_shutdown_tree)
+    /// plus [`kill_tree`](Child::kill_tree)), or each level shutting down its own children,
+    /// which works because a child that owns a console can politely signal its own
+    /// group-leading children.
+    ///
+    /// **Neither route is available to the holder of a nested contained child.** Its `_tree`
+    /// ops are `Unsupported` by design, and the root that owns its teardown lives in the
+    /// intermediate process that spawned it. What that holder can do is exactly this call: the
+    /// cooperative half reaches the nested child's own group and the forced half reaches the
+    /// child. Anything below it that left that group is the intermediate's business — and if the
+    /// intermediate is itself contained by *its* holder, `kill_tree` there is the backstop.
     ///
     /// Dropping this future mid-grace cancels the exit watch (the `AsyncFd` deregisters and
     /// the fd closes) and performs no further signalling — the child stays owned, and
@@ -54,11 +109,11 @@ impl Child {
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        crate::wait::terminate(self.id())?;
-        // A watch failure must not strand the child between the soft signal and the
-        // escalation — kill and reap still run (grace unobservable => escalate now); the
-        // watch error surfaces only after they succeed (a kill/reap error wins — deliberate
-        // subsumption, mirroring kill_tree's both-fail disposition).
+        self.terminate()?; // an error here returns before any grace wait or kill
+                           // A watch failure must not strand the child between the soft signal and the
+                           // escalation — kill and reap still run (grace unobservable => escalate now); the
+                           // watch error surfaces only after they succeed (a kill/reap error wins — deliberate
+                           // subsumption, mirroring kill_tree's both-fail disposition).
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         if !matches!(watch, Ok(true)) {
             if let Err(e) = &watch {
@@ -97,7 +152,15 @@ impl Child {
     /// this shows up as `grace` fully elapsing rather than draining early, not as a skipped
     /// wait). The call reports no error either way: on Windows the grace is spent regardless
     /// of how much of the tree the signal reached. Size it accordingly, and treat
-    /// [`kill_tree`](Child::kill_tree) as the only op that reaches every member.
+    /// [`kill_tree`](Child::kill_tree) as the only op that reaches every member FROM THIS
+    /// HANDLE. The layers the group signal skips are not beyond a polite shutdown: the holder
+    /// of a nested descendant's own `Child` can drain it with
+    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
+    /// chain in which each level shuts down its own children drains completely, because a
+    /// child that owns a console can politely signal its own group-leading children.
+    ///
+    /// **And success here does not prove the event was delivered.** A root that shares no
+    /// console with the caller is reported as success and reaches nobody.
     ///
     /// **The caller must also have a console.** The event is deliverable only within the
     /// *calling* process's console, so a GUI-subsystem binary, a service, or anything spawned
