@@ -76,6 +76,12 @@ path = "testbin/main.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "cosca_testbin_gui"
+path = "testbin/gui.rs"
+test = false
+doc = false
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
