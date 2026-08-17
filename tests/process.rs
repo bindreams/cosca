@@ -1,6 +1,9 @@
-//! Foreign `Process` integration tests. A child we spawn (and own) is treated as
-//! a foreign process via its `ProcessId`; death/liveness is proven only by a real
-//! exit event (control-socket EOF or the kernel exit edge), never by sleep/poll.
+//! Foreign `Process` integration tests. A child we spawn (and own) is treated as a foreign
+//! process via its `ProcessId`; nothing here is proven by sleep/poll. A real exit event
+//! (control-socket EOF, or the kernel exit edge a death-watch returns on) proves the EXIT.
+//! Only a reap or `common::block_until_zombie` proves NOT-ALIVE: on macOS both of those events
+//! fire while the kernel is still tearing the process down, before it is marked a zombie —
+//! the state `is_alive` reads.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -86,9 +89,9 @@ fn current_and_from_id_round_trip() {
 #[test]
 fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // from_pid resolves a live foreign child to its true identity; after the child is
-    // killed+reaped, that resolved Process reports !is_alive (the synchronously-correct
-    // liveness check, distinct from the zombie-inclusive exists()). Death is proven by the
-    // reap, never by sleep.
+    // killed+reaped, that resolved Process reports !is_alive (the zombie-EXCLUSIVE liveness
+    // check, distinct from the zombie-inclusive exists()). The reap is what makes the liveness
+    // assertion sound — an exit event alone would not (see the module doc).
     let (child, _sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid())
         .found()
@@ -237,11 +240,6 @@ fn is_alive_is_false_for_a_real_zombie() {
     // Spawn a RAW std child (std does NOT reap on drop), take it foreign, drive it to a
     // zombie, then — before reaping — assert is_alive()==Dead while the identity still
     // resolves (exists). Finally reap to avoid a leak.
-    //
-    // The foreign death-watch below is exercised but is NOT the sync point: `Process::wait`
-    // returns on the OS exit edge, which on macOS precedes the zombie transition that
-    // `is_alive` reads (see `common::block_until_zombie`). Only that helper's
-    // `waitid(WEXITED | WNOWAIT)` establishes this test's premise.
     use std::io::Read;
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

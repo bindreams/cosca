@@ -665,16 +665,11 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     std::io::Read::read_to_end(&mut out, &mut rest).expect("read to EOF on the orphan's stdout");
     assert!(rest.is_empty(), "unexpected trailing output from the orphan: {rest:?}");
 
-    // Redundant secondary check, not the proof: `is_alive` is zombie-EXCLUSIVE (unlike
-    // `ProcessId::of`/`exists`, which stay `Found`/`Present` for an unreaped zombie), so it
-    // reports `Dead` synchronously at the kill, matching what the EOF above already showed.
-    if let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(orphan) {
-        assert_eq!(
-            id.is_alive(),
-            crate::identity::Liveness::Dead,
-            "pid {orphan} must not report alive after the EOF proof above"
-        );
-    }
+    // No liveness assertion follows the EOF, deliberately: `proc_exit` invalidates the fd table
+    // (what the EOF above observes) long before it marks the process a zombie, the state
+    // `is_alive` reads — so `Alive` is reachable here for an orphan that has already died. Nor is
+    // there a sound edge to wait for instead: this orphan belongs to launchd, so `waitid` returns
+    // `ECHILD`. The EOF is the proof, and it is the only one available.
 }
 
 /// A pid that stopped holding the marker before the sweep must survive a REAL `hard_kill()`,

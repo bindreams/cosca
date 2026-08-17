@@ -152,12 +152,13 @@ impl ProcessId {
     /// [`Liveness::Unknown`] when the OS refuses the query, or answers ambiguously — never
     /// `Dead` on a process we could not assess.
     ///
-    /// **The OS exit *edge* can precede that bookkeeping.** macOS posts the `NOTE_EXIT` a
-    /// death-watch ([`Process::wait`](crate::Process::wait)) returns on from inside `proc_exit`,
-    /// before the same function sets the `p_stat = SZOMB` this reads — so `Alive` is briefly
-    /// reachable for a process that has already exited. Linux (`pidfd`) and Windows signal only
-    /// after their equivalent transition. Confirm a process is finished by reaping it or by a
-    /// real exit event, not by asking this immediately after a wait returns.
+    /// **On macOS the exit *edge* precedes that bookkeeping.** A death-watch
+    /// ([`Process::wait`](crate::Process::wait)) returning, and a pipe or socket EOF on the dying
+    /// process's own descriptors, both fire while the kernel is still tearing the process down —
+    /// before it is marked a zombie, which is the state this reads. So `Alive` is briefly
+    /// reachable for a process that has already exited; Linux and Windows signal only after their
+    /// equivalent transition. Confirm a process is finished by reaping it, or by
+    /// `waitid(WEXITED | WNOWAIT)` — never by asking this after an exit event.
     pub fn is_alive(&self) -> Liveness {
         backend::is_running(self.pid, self.start)
     }

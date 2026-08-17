@@ -42,9 +42,10 @@ pub fn status_locked(cmd: &mut std::process::Command) -> std::io::Result<std::pr
 /// A death-watch is NOT a substitute. `Process::wait` returns on the OS exit edge, and on macOS
 /// that edge is `proc_exit`'s `proc_knote(p, NOTE_EXIT)`, which XNU posts well before the same
 /// function assigns `p->p_stat = SZOMB` — so a liveness check taken there can still read the
-/// process as running. `waitid` reports `WEXITED` only out of the kernel's `SZOMB` case, so its
-/// return IS the zombie transition, and `WNOWAIT` leaves the zombie collectable. Blocking,
-/// kernel-synchronised, and never a poll or a timeout.
+/// process as running. Neither is a pipe or socket EOF on the dying process's own descriptors:
+/// `proc_exit` invalidates the fd table earlier still. `waitid` reports `WEXITED` only out of
+/// the kernel's `SZOMB` case, so its return IS the zombie transition, and `WNOWAIT` leaves the
+/// zombie collectable.
 #[cfg(unix)]
 pub fn block_until_zombie(pid: cosca::identity::RawPid) {
     loop {
