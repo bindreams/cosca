@@ -13,6 +13,13 @@
 //! This is NOT a security sandbox: a determined child escapes every mechanism
 //! (broker-spawned helpers, privilege, `setsid` out of a process group). It
 //! reliably tears down *cooperative* trees and reports the achieved guarantee.
+//!
+//! **Tree ownership and cooperative-signal mechanism are independent axes.**
+//! [`Containment`] answers "who tears this tree down";
+//! [`GracefulMechanism`](crate::GracefulMechanism) answers "what cooperative signal
+//! `terminate()` sends to this child, and how far it goes". On Windows the two are correlated
+//! only because containment is currently the only thing that sets `CREATE_NEW_PROCESS_GROUP` —
+//! a coincidence deliberately encoded nowhere.
 
 use std::fmt;
 
@@ -64,6 +71,10 @@ pub enum Containment {
     /// A nested member of an ancestor's containment group/job: this child joined the
     /// tree the outermost root owns, so it drives no teardown itself (`can_teardown()`
     /// is `false`) and its `_tree` ops return `Unsupported`. The root tears the tree down.
+    ///
+    /// It is still independently signallable through its own handle wherever
+    /// [`Child::graceful_mechanism`](crate::Child::graceful_mechanism) says so — owning no tree
+    /// is not the same as having no cooperative shutdown.
     Delegated,
     /// No containment — `kill`/drop act on the lone process.
     None,

@@ -138,7 +138,15 @@ impl Child {
     /// this shows up as `grace` fully elapsing rather than draining early, not as a skipped
     /// wait). The call reports no error either way: on Windows the grace is spent regardless
     /// of how much of the tree the signal reached. Size it accordingly, and treat
-    /// [`kill_tree`](Child::kill_tree) as the only op that reaches every member.
+    /// [`kill_tree`](Child::kill_tree) as the only op that reaches every member FROM THIS
+    /// HANDLE. The layers the group signal skips are not beyond a polite shutdown: the holder
+    /// of a nested descendant's own `Child` can drain it with
+    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
+    /// chain in which each level shuts down its own children drains completely, because a
+    /// child that owns a console can politely signal its own group-leading children.
+    ///
+    /// **And success here does not prove the event was delivered.** A root that shares no
+    /// console with the caller is reported as success and reaches nobody.
     ///
     /// **The caller must also have a console.** The event is deliverable only within the
     /// *calling* process's console, so a GUI-subsystem binary, a service, or anything spawned

@@ -434,8 +434,16 @@ impl Child {
     ///
     /// **Windows: what this actually signals.** `CTRL_BREAK` is delivered to the root's
     /// **process group**, not to the tree. A nested contained descendant leads its own
-    /// group and never receives it; only [`kill_tree`](Child::kill_tree) reaches every
-    /// member.
+    /// group and never receives it, so from THIS handle only
+    /// [`kill_tree`](Child::kill_tree) reaches every member. The layers this skips are not
+    /// beyond a polite shutdown, though: the holder of a nested descendant's own `Child` can
+    /// drain it with [`terminate`](Child::terminate) or
+    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
+    /// chain in which each level shuts down its own children drains completely, because a
+    /// child that owns a console can politely signal its own group-leading children.
+    ///
+    /// **And success here does not prove the event was delivered.** A root that shares no
+    /// console with the caller is reported as success and reaches nobody.
     ///
     /// **And it needs the caller to have a console.** The event is deliverable only within
     /// the *calling* process's console, so a GUI-subsystem binary, a service, or anything

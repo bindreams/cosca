@@ -132,8 +132,9 @@ pub enum Error {
     Containment { detail: String },
     /// The calling process has no attached console, so Windows' console-group graceful
     /// signal (`CTRL_BREAK`) cannot be delivered — the caller is a GUI-subsystem binary,
-    /// a service, or was spawned detached. Only the *graceful* tree ops are affected;
-    /// `kill_tree` needs no console.
+    /// a service, or was spawned detached. Every graceful op that reaches a console group is
+    /// affected, lone and tree alike; `kill` and `kill_tree` need no console, and a lone or
+    /// nested child that has no `kill_tree` still has `kill`.
     #[error("no attached console for the graceful console-group signal: {detail}")]
     NoConsole { detail: String },
     /// Privilege elevation could not be completed at runtime.

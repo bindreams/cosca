@@ -10,7 +10,16 @@ use crate::error::Error;
 impl Process {
     /// Send `SIGTERM` to the foreign process — a cooperative request to exit. Signal-only.
     /// Identity-bound (Linux `pidfd_send_signal`; macOS reverify-then-`kill`). Already-dead ⇒
-    /// `Ok`; a real failure (`EPERM`) ⇒ `Err`. Unix only; Windows returns `Unsupported`.
+    /// `Ok`; a real failure (`EPERM`) ⇒ `Err`.
+    ///
+    /// **Windows: `Unsupported`, for two concrete absences.** A `Process` holds only a pid,
+    /// nothing that pins it, and `GenerateConsoleCtrlEvent` takes a raw pid with no
+    /// verify-then-signal form — so a foreign console-group signal cannot be made
+    /// identity-bound, unlike every other op on this type. And Win32 exposes no way to learn
+    /// whether a foreign pid leads a console process group, so a non-leader would silently
+    /// signal *its* leader's whole group instead. An owned [`Child`](crate::Child) has neither
+    /// problem: its held process handle keeps the pid allocated, so the pid can only ever name
+    /// that child's own group.
     pub fn terminate(&self) -> Result<(), Error> {
         crate::wait::terminate(self.id)
     }
@@ -49,9 +58,10 @@ impl Process {
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
-    /// then descendants). Signal-only. Unix only: Windows has no per-process graceful signal and
-    /// a foreign process shares no addressable group with the caller, so this returns `Unsupported`
-    /// there (use [`kill_tree`](Process::kill_tree) for a hard sweep).
+    /// then descendants). Signal-only. Unix only: on Windows this rests on
+    /// [`terminate`](Process::terminate), whose two absences — no pinned pid, and no way to
+    /// learn whether a foreign pid leads a group — apply here too, so it returns `Unsupported`
+    /// (use [`kill_tree`](Process::kill_tree) for a hard sweep).
     pub fn terminate_tree(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {

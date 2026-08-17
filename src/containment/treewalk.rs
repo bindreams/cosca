@@ -377,10 +377,11 @@ pub(crate) mod fault {
 /// spawned with `CREATE_NEW_PROCESS_GROUP`). This is cooperative only and reaches
 /// only processes that share the root's console group; a nested *contained*
 /// descendant is spawned into its OWN process group (`CREATE_NEW_PROCESS_GROUP`)
-/// and therefore does NOT receive this CTRL_BREAK. There is no per-process
-/// graceful signal on Windows, so graceful `terminate` cannot reach those nested
-/// groups — the identity `hard_kill` (`kill_tree`) is the guaranteed sweep that
-/// does. Best-effort by design.
+/// and therefore does NOT receive this CTRL_BREAK. THIS WALK cannot reach those
+/// nested groups — but their own holder can, through the nested child's own handle
+/// (see [`Child::terminate`](crate::Child::terminate)). From a single handle, the
+/// identity `hard_kill` (`kill_tree`) remains the only op that reaches every member.
+/// Best-effort by design.
 pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
     #[cfg(unix)]
     {
