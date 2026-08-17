@@ -76,3 +76,52 @@ fn fixture_survives_group_signal() {
     let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect readiness socket");
     sock.write_all(b"R").expect("write readiness tag");
 }
+
+/// The fully-qualified libtest path of [`fixture_registers_then_blocks`], for callers that
+/// re-exec this binary against it directly (`current_exe() --exact <this>`).
+#[cfg(windows)]
+pub(crate) const FIXTURE_REGISTERS_THEN_BLOCKS_TEST: &str = "test_child::fixture_registers_then_blocks";
+
+/// The env var carrying the `127.0.0.1:<port>` address [`fixture_registers_then_blocks`] tags.
+/// Its mere presence also tells the fixture it was re-exec'd deliberately rather than picked up
+/// by an ordinary, unfiltered suite run.
+#[cfg(windows)]
+pub(crate) const FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV: &str = "COSCA_FIXTURE_REGISTERS_THEN_BLOCKS_ADDR";
+
+/// Bind a rendezvous listener for [`fixture_registers_then_blocks`]; returns it and its
+/// `127.0.0.1:<port>` address.
+#[cfg(windows)]
+pub(crate) fn registration_rendezvous() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    (listener, addr)
+}
+
+/// Windows-only fixture supplying the happens-before edge a cooperative console signal needs: a
+/// no-op when picked up by an ordinary, unfiltered suite run
+/// ([`FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV`] is unset there). Re-executed via `current_exe()
+/// --exact` [`FIXTURE_REGISTERS_THEN_BLOCKS_TEST`] with that var set, it connects to the
+/// caller's listener, writes one tag byte, then blocks on a 1-byte read of that same socket.
+///
+/// The tag is the edge: the fixture cannot write it until it is executing its own code, which is
+/// after the console has registered it. A child signalled before that point dies during loader
+/// init instead of to the console event, which is a different exit code and a different thing
+/// under test.
+///
+/// It installs no console-control handler, so `CTRL_BREAK`'s default disposition terminates it.
+/// Blocking on the socket rather than parking means a panicking or aborted caller closes the
+/// socket and the fixture exits on EOF instead of orphaning.
+#[cfg(windows)]
+#[test]
+fn fixture_registers_then_blocks() {
+    let Some(addr) = std::env::var_os(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    use std::io::{Read, Write};
+
+    let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect rendezvous socket");
+    sock.write_all(b"R").expect("write registration tag");
+    sock.flush().expect("flush registration tag");
+    let mut sink = [0u8; 1];
+    let _ = sock.read(&mut sink);
+}

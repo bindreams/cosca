@@ -220,11 +220,41 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
 async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    {
+        cmd.args(["sh", "-c", "echo r; exec sleep 30"]);
+        cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    }
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    #[cfg(windows)]
+    {
+        cmd.executable(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST]);
+        cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
+    }
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncReadExt;
+        let mut readiness = [0u8; 1];
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_exact(&mut readiness)
+            .await
+            .expect("readiness byte");
+    }
+    // Blocking `std::net::TcpListener`, exactly like the sibling Windows test above: a bounded
+    // wait for a real connection, not a poll loop.
+    #[cfg(windows)]
+    let _sock = {
+        use std::io::Read;
+        let (mut sock, _) = listener.accept().expect("accept rendezvous connection");
+        let mut tag = [0u8; 1];
+        sock.read_exact(&mut tag).expect("registration tag");
+        sock
+    };
     let authoritative = matches!(
         child.containment(),
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
@@ -248,7 +278,11 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
             );
         }
         #[cfg(windows)]
-        let _ = status;
+        assert_eq!(
+            status.code(),
+            Some(0xC000013A_u32 as i32),
+            "the root must die to the console event, not to a loader-init kill or the sweep, got {status:?}"
+        );
     } else {
         let err = result.expect_err("a non-authoritative mechanism must always run the sweep");
         assert!(
