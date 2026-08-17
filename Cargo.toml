@@ -1,6 +1,6 @@
 [package]
 name = "cosca"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Anna Zhukova"]
 description = "Unified cross-platform subprocess management: spawning, stdio, process trees, stable identity, and elevation."
