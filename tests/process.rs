@@ -1,6 +1,9 @@
-//! Foreign `Process` integration tests. A child we spawn (and own) is treated as
-//! a foreign process via its `ProcessId`; death/liveness is proven only by a real
-//! exit event (control-socket EOF or the kernel exit edge), never by sleep/poll.
+//! Foreign `Process` integration tests. A child we spawn (and own) is treated as a foreign
+//! process via its `ProcessId`; nothing here is proven by sleep/poll. A real exit event
+//! (control-socket EOF, or the kernel exit edge a death-watch returns on) proves the EXIT.
+//! Only a reap or `common::block_until_zombie` proves NOT-ALIVE: on macOS both of those events
+//! fire while the kernel is still tearing the process down, before it is marked a zombie —
+//! the state `is_alive` reads.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -86,9 +89,9 @@ fn current_and_from_id_round_trip() {
 #[test]
 fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // from_pid resolves a live foreign child to its true identity; after the child is
-    // killed+reaped, that resolved Process reports !is_alive (the synchronously-correct
-    // liveness check, distinct from the zombie-inclusive exists()). Death is proven by the
-    // reap, never by sleep.
+    // killed+reaped, that resolved Process reports !is_alive (the zombie-EXCLUSIVE liveness
+    // check, distinct from the zombie-inclusive exists()). The reap is what makes the liveness
+    // assertion sound — an exit event alone would not (see the module doc).
     let (child, _sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid())
         .found()
@@ -234,10 +237,9 @@ fn foreign_kill_surfaces_permission_denied() {
 #[cfg(unix)]
 #[test]
 fn is_alive_is_false_for_a_real_zombie() {
-    // The deferred Plan-2 test. Spawn a RAW std child (std does NOT reap on drop), take it
-    // foreign, death-watch it to its exit, then — before reaping — assert is_alive()==false
-    // (zombie) while the identity still resolves (exists). The kernel exit edge is the sync
-    // point; no sleep. Finally reap to avoid a leak.
+    // Spawn a RAW std child (std does NOT reap on drop), take it foreign, drive it to a
+    // zombie, then — before reaping — assert is_alive()==Dead while the identity still
+    // resolves (exists). Finally reap to avoid a leak.
     use std::io::Read;
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -254,7 +256,8 @@ fn is_alive_is_false_for_a_real_zombie() {
 
     let p = cosca::Process::from_pid(raw.id()).found().expect("raw child resolves");
     sock.write_all(b"x").expect("trigger exit");
-    p.wait().expect("death-watch"); // returns at the zombie instant (no reap yet)
+    p.wait().expect("death-watch"); // the OS exit edge — non-reaping, but not yet the zombie edge
+    common::block_until_zombie(raw.id()); // the zombie edge, still unreaped
 
     assert_eq!(
         p.is_alive(),

@@ -120,8 +120,8 @@ fn identity_resolves_an_exited_unreaped_child() {
 }
 
 /// The start token must be STABLE across the alive -> zombie transition — the property
-/// `is_running`'s reused-PID guard depends on. `waitid(WEXITED | WNOWAIT)` pins the
-/// zombie: it returns only once the child IS a zombie and leaves it unreaped.
+/// `is_running`'s reused-PID guard depends on. `common::block_until_zombie` pins the zombie:
+/// it returns only once the child IS a zombie and leaves it unreaped.
 #[cfg(unix)]
 #[test]
 fn identity_survives_the_alive_to_zombie_transition() {
@@ -131,18 +131,7 @@ fn identity_survives_the_alive_to_zombie_transition() {
     assert_eq!(id.exists(), cosca::identity::Existence::Present, "live child exists");
     assert_eq!(id.is_alive(), cosca::identity::Liveness::Alive, "live child is alive");
     child.kill().expect("kill");
-    // WNOWAIT: leaves the zombie unreaped.
-    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `si` is a valid out-param; the child is ours and unreaped.
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id().pid() as libc::id_t,
-            &mut si,
-            libc::WEXITED | libc::WNOWAIT,
-        )
-    };
-    assert_eq!(rc, 0, "waitid(WNOWAIT): {}", std::io::Error::last_os_error());
+    common::block_until_zombie(child.id().pid());
     assert_eq!(
         id.exists(),
         cosca::identity::Existence::Present,
