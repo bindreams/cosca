@@ -321,15 +321,37 @@ pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io:
 /// targeting its `pid` reaches the whole group without affecting the parent's console.
 /// `CTRL_C` cannot be group-targeted; `CTRL_BREAK` is the only option here.
 ///
+/// **Precondition: the caller holds something that pins `pid`** — the owning `Child`'s process
+/// handle, or an identity-verified `ProcessId`. This function takes a raw pid because Win32
+/// offers no verify-then-signal primitive, so an unpinned pid could name a recycled process.
+///
 /// **Requires the CALLER to have a console.** That is the failure this classifies; Windows
 /// can also report `ERROR_INVALID_PARAMETER` for a pid that names no process at all, which
-/// stays a raw `Error::Io`. A group that merely *drained* is not a failure — measured, a dead
-/// group leader still returns success. The failure code is authoritative; the console probe that follows only *confirms* it, so a
-/// console state change in the gap degrades the result to a raw `Error::Io` rather than to a
-/// false `NoConsole`. Targeting a group that is in a *different* console is NOT reported by
-/// Windows at all — it returns success and delivers nothing.
+/// stays a raw `Error::Io`. The failure code is authoritative; the console probe that follows
+/// only *confirms* it, so a console state change in the gap degrades the result to a raw
+/// `Error::Io` rather than to a false `NoConsole`.
+///
+/// **The Win32 return value is evidence in neither direction.** Measured: a target in another
+/// console returns success having delivered nothing, and the same class of target returns
+/// `ERROR_INVALID_PARAMETER` in another configuration. So the classification above must never
+/// be replaced with a return-code check, and success must never be read as delivery.
+///
+/// **An already-exited target is `Ok`**, because the pinned pid stays allocated and the call
+/// succeeds — matching the crate's "already-dead ⇒ `Ok`" contract for the lone signal. A dead
+/// group leader is not proof of an empty group either: a signal addressed to one still reaches
+/// live members of that group.
+///
+/// **Two known gaps a caller must plan around.** A target that shares no console with the caller
+/// is reported as success and receives nothing; a process attached to the child's *own* console
+/// can deliver an event to it, and `kill`/`kill_tree` need no console at all. And every call —
+/// including one to an ordinary group that has already drained — leaves a dead entry in the
+/// caller's console process list, which persists after the target exits.
 pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    debug_assert!(
+        pid != 0,
+        "pid 0 addresses every process attached to the caller's console, including the caller"
+    );
     // SAFETY: standard Win32 call targeting the child's own console group.
     match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
         Ok(()) => Ok(()),

@@ -581,6 +581,168 @@ fn main() {
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death)
         }
         #[cfg(windows)]
+        "spawn-grandchild-ack-break" => {
+            // A 2-level tree for the lone graceful op's radius: the ROOT ignores CTRL_BREAK (so
+            // only the escalation can end it), while its grandchild ACKS the break and stays
+            // alive. The grandchild is an ordinary std spawn with creation flags 0, so it joins
+            // the root's console group AND console — exactly the descendant the cooperative half
+            // reaches and the forced half does not.
+            install_ignore_break();
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            let _gc = std::process::Command::new(exe)
+                .args(["control-block-ack-break", &addr, "G"])
+                .spawn()
+                .unwrap();
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        #[cfg(windows)]
+        "report-console-lone" => {
+            use std::fmt::Write as _;
+            use std::time::Duration;
+
+            // Connect FIRST — the test blocks on accept(), so a panic below must reach it as
+            // socket EOF instead of hanging the suite. Sibling of `report-console-terminate`;
+            // see there for why each token is whitespace-free.
+            let mut report_sock = std::net::TcpStream::connect(&args[2]).unwrap();
+
+            let mut list = [0u32; 1];
+            // SAFETY: both calls are standard Win32; `list` is a valid writable slice.
+            let n = unsafe {
+                windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
+                windows::Win32::System::Console::GetConsoleProcessList(&mut list)
+            };
+            let console = if n != 0 {
+                "1"
+            } else if std::io::Error::last_os_error().raw_os_error()
+                == Some(windows::Win32::Foundation::ERROR_INVALID_HANDLE.0 as i32)
+            {
+                "0" // genuinely no console
+            } else {
+                "?" // the probe itself failed
+            };
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let ack_addr = listener.local_addr().unwrap().to_string();
+            let exe = std::env::current_exe().unwrap();
+
+            let mut cmd = cosca::Command::new();
+            cmd.executable(&exe)
+                .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "R"])
+                .contain();
+            let child = cmd.spawn().expect("spawn contained root");
+            let (mut ack, _) = listener.accept().expect("accept ack socket");
+            let mut t = [0u8; 1];
+            ack.read_exact(&mut t).expect("read ack tag");
+            assert_eq!(&t, b"R", "wrong ack tag");
+
+            let in_our_console = |pid: u32| {
+                // Grow to whatever count the API reports rather than capping.
+                let mut buf = vec![0u32; 16];
+                loop {
+                    // SAFETY: standard Win32; `buf` is a valid writable slice.
+                    let n = unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut buf) } as usize;
+                    if n == 0 {
+                        return None; // no console at all
+                    }
+                    if n <= buf.len() {
+                        return Some(buf[..n].contains(&pid));
+                    }
+                    buf.resize(n, 0);
+                }
+            };
+            let three_way = |b: Option<bool>| match b {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "?",
+            };
+            let saw_break = |sock: &mut std::net::TcpStream| -> &'static str {
+                let mut b = [0u8; 1];
+                match sock.read(&mut b) {
+                    Ok(1) if &b == b"B" => "1",
+                    Ok(1) => "?",
+                    Ok(_) => "0",
+                    Err(_) => "E",
+                }
+            };
+            let describe = |e: &cosca::error::Error| match e {
+                cosca::error::Error::NoConsole { .. } => "NoConsole".to_string(),
+                cosca::error::Error::Unsupported { .. } => "Unsupported".to_string(),
+                cosca::error::Error::Containment { .. } => "Containment".to_string(),
+                other => format!("Other({})", other.to_string().replace(char::is_whitespace, "_")),
+            };
+            let liveness = |l: cosca::identity::Liveness| match l {
+                cosca::identity::Liveness::Alive => "alive",
+                cosca::identity::Liveness::Dead => "dead",
+                cosca::identity::Liveness::Unknown => "unknown",
+            };
+            // Two of GracefulMechanism's Display strings contain spaces, and the report is parsed
+            // by splitting on whitespace — so this mode emits its own tokens.
+            let mechanism = match child.graceful_mechanism() {
+                cosca::GracefulMechanism::ConsoleGroup => "console-group",
+                cosca::GracefulMechanism::OtherConsoleGroup => "other-console-group",
+                cosca::GracefulMechanism::Process => "process",
+                _ => "none",
+            };
+
+            let c_in_console = in_our_console(child.id().pid());
+            let terminate = match child.terminate() {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => describe(&e),
+            };
+            let alive_after_terminate = liveness(child.is_alive());
+            // The blocking read happens ONLY where delivery is guaranteed: the child was MEASURED
+            // to be in our console, its mechanism says the flags do not exclude delivery, and the
+            // call reported success. Every other combination defers the read until after the
+            // cleanup kill below, so it collects EOF or a reset and this mode always reports.
+            let delivered = c_in_console == Some(true) && mechanism == "console-group" && terminate == "Ok";
+            let early_break = delivered.then(|| saw_break(&mut ack));
+
+            // ZERO grace: the acker survives its break by design, so the escalation is
+            // deterministic and its exit code is what proves the forced half ran.
+            let (graceful, graceful_code) = match child.graceful_shutdown(Duration::ZERO) {
+                Ok(status) => (
+                    "Ok".to_string(),
+                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                ),
+                Err(e) => (describe(&e), "none".to_string()),
+            };
+            let alive_after_graceful = liveness(child.is_alive());
+
+            let cleanup = match child.kill() {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => describe(&e),
+            };
+            if cleanup == "Ok" {
+                child.wait().expect("reap the acker");
+            }
+            // `K`: the teardown that should have ended the child failed, so delivery was never
+            // observable — distinct from an observed non-delivery.
+            let seen = match early_break {
+                Some(seen) => seen,
+                None if cleanup == "Ok" => saw_break(&mut ack),
+                None => "K",
+            };
+
+            let mut line = String::new();
+            write!(
+                line,
+                "console={console} c_in_console={} mechanism={mechanism} terminate={terminate} \
+                 alive_after_terminate={alive_after_terminate} break={seen} graceful={graceful} \
+                 graceful_code={graceful_code} alive_after_graceful={alive_after_graceful} \
+                 cleanup={cleanup}",
+                three_way(c_in_console),
+            )
+            .unwrap();
+            report_sock.write_all(line.as_bytes()).unwrap();
+            report_sock.flush().unwrap();
+        }
+        #[cfg(windows)]
         "report-console-terminate" => {
             use std::fmt::Write as _;
             use std::time::Duration;

@@ -24,3 +24,15 @@ fn graceful_mechanism_display_is_stable_and_distinct() {
         }
     }
 }
+
+// `None` is the one mechanism the crate refuses up front, and it refuses with the remedy: a
+// wildcard arm that fell through to the console call would return something else entirely.
+#[test]
+fn signal_refuses_a_child_with_no_mechanism() {
+    let id = crate::identity::ProcessId::current();
+    let err = super::signal(GracefulMechanism::None, id).expect_err("no group to address");
+    let crate::error::Error::Unsupported { detail, .. } = &err else {
+        panic!("expected Unsupported, got {err:?}");
+    };
+    assert!(detail.contains("contain"), "the refusal must name the remedy: {detail}");
+}

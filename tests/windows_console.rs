@@ -224,3 +224,87 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
         "a successful graceful_shutdown_tree must leave nothing alive: {r}"
     );
 }
+
+/// Sibling of [`run_probe`] driving the `report-console-lone` mode — the LONE graceful ops
+/// (`terminate` / `graceful_shutdown`) against a contained root, instead of the tree ops. Same
+/// direct-launch discipline and same connect-before-work EOF guarantee; see [`run_probe`].
+fn run_lone_probe(detached: bool) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
+    cmd.args(["report-console-lone", &addr]);
+    if detached {
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+    let mut helper = cmd.spawn().expect("spawn lone probe helper");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut report = String::new();
+    sock.read_to_string(&mut report).expect("read report");
+    let status = helper.wait().expect("reap lone probe helper");
+    assert!(
+        status.success(),
+        "lone probe helper failed: {status:?} — report so far: {report:?}"
+    );
+    report
+}
+
+#[test]
+fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
+    let r = run_lone_probe(true);
+    // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
+    // cannot be satisfied by a broken probe.
+    assert_eq!(
+        field(&r, "console"),
+        "0",
+        "helper must have NO console, else vacuous: {r}"
+    );
+    assert_eq!(
+        field(&r, "mechanism"),
+        "console-group",
+        "the child's own flags do not exclude delivery; it is the CALLER that cannot send: {r}"
+    );
+    assert_eq!(field(&r, "terminate"), "NoConsole", "{r}");
+    assert_eq!(
+        field(&r, "alive_after_terminate"),
+        "alive",
+        "a fail-fast terminate must leave the child untouched: {r}"
+    );
+    // Killed rather than signalled, and a killed peer resets its socket about as often as it
+    // closes it. `?` and `K` stay distinct and neither may pass here.
+    let seen = field(&r, "break");
+    assert!(
+        matches!(seen, "0" | "E"),
+        "no signal can have been delivered, got {seen}: {r}"
+    );
+    assert_eq!(field(&r, "graceful"), "NoConsole", "{r}");
+    assert_eq!(field(&r, "graceful_code"), "none", "{r}");
+    assert_eq!(
+        field(&r, "alive_after_graceful"),
+        "alive",
+        "graceful_shutdown must fail before signalling, never after hard-killing: {r}"
+    );
+    assert_eq!(field(&r, "cleanup"), "Ok", "hard teardown needs no console: {r}");
+}
+
+#[test]
+fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
+    // Positive control. `break=1` is load-bearing: the child acknowledges the CTRL_BREAK over
+    // its own socket, so this cannot pass on a return code alone. `graceful_code=1` names the
+    // escalation's exit code — the acker survives its break, so ZERO grace escalates — and a
+    // build that escalated nothing would report a different code and `alive_after_graceful=alive`.
+    let r = run_lone_probe(false);
+    assert_eq!(field(&r, "console"), "1", "{r}");
+    assert_eq!(field(&r, "c_in_console"), "1", "the child must share our console: {r}");
+    assert_eq!(field(&r, "mechanism"), "console-group", "{r}");
+    assert_eq!(field(&r, "terminate"), "Ok", "{r}");
+    assert_eq!(
+        field(&r, "alive_after_terminate"),
+        "alive",
+        "the acker handles the break and keeps running: {r}"
+    );
+    assert_eq!(field(&r, "break"), "1", "the child must receive CTRL_BREAK: {r}");
+    assert_eq!(field(&r, "graceful"), "Ok", "{r}");
+    assert_eq!(field(&r, "graceful_code"), "1", "the escalation's kill: {r}");
+    assert_eq!(field(&r, "alive_after_graceful"), "dead", "{r}");
+    assert_eq!(field(&r, "cleanup"), "Ok", "{r}");
+}
