@@ -527,3 +527,54 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     }
     let _ = child.wait();
 }
+
+/// The case this capability exists for, end to end: a nested contained Windows child owns no
+/// tree, leads a console process group of its own, and had no cooperative shutdown at all.
+/// `break=1` is reachable only if that child's own handler acknowledged an event no tree op on
+/// any handle in the system could have delivered to it; `tree=Unsupported` fails if the
+/// containment gate was loosened, which this change must not do.
+#[cfg(windows)]
+#[test]
+fn nested_delegated_child_can_be_gracefully_terminated() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    // Exact `key=value` matching, never `contains`: `mechanism=none` is a substring of
+    // neighbouring text.
+    fn field<'a>(report: &'a str, key: &str) -> &'a str {
+        report
+            .split_ascii_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no field {key} in report: {report}"))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    // Contained, so the reporter's own crate spawn is a real nested member.
+    let mut cmd = cosca::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "report-nested-terminate", &addr])
+        .contain();
+    let child = cmd.spawn().expect("spawn reporter");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut r = String::new();
+    sock.read_to_string(&mut r).expect("read report");
+
+    assert_eq!(field(&r, "containment"), "delegated", "{r}");
+    assert_eq!(field(&r, "mechanism"), "console-group", "{r}");
+    assert_eq!(field(&r, "in_console"), "1", "{r}");
+    assert_eq!(field(&r, "terminate"), "Ok", "{r}");
+    assert_eq!(
+        field(&r, "break"),
+        "1",
+        "the nested child's own handler must have acknowledged the event: {r}"
+    );
+    assert_eq!(
+        field(&r, "tree"),
+        "Unsupported",
+        "a nested member still owns no tree teardown: {r}"
+    );
+    assert_eq!(field(&r, "cleanup"), "Ok", "{r}");
+    let status = child.wait().expect("reap reporter");
+    assert!(status.success(), "reporter failed: {status:?} — report: {r}");
+}
