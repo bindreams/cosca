@@ -87,13 +87,23 @@ impl ProcSource {
         }
     }
 
-    /// Guaranteed synchronous teardown for `Drop`: kill, then block until the child has exited.
-    /// **Invariant:** no `wait()` future for this child is in flight when this runs.
-    pub(crate) fn reap_now_on_drop(&mut self, pid: u32) {
+    /// `true` once the backend has collected the child's status, so no reap remains.
+    pub(crate) fn is_reaped(&self) -> bool {
         match self {
-            ProcSource::Tokio(c) => super::reap_now(c, pid, true),
+            ProcSource::Tokio(c) => c.id().is_none(),
             #[cfg(windows)]
-            ProcSource::Raw(r) => r.reap_blocking(),
+            ProcSource::Raw(r) => r.is_reaped(),
+        }
+    }
+
+    /// Wait for exit, then let the backend reap. **Never kills** — the signal is issued by the
+    /// caller, on the dropping thread.
+    /// **Invariant:** no `wait()` future for this child is in flight when this runs.
+    pub(crate) fn wait_and_reap(&mut self, pid: u32) {
+        match self {
+            ProcSource::Tokio(c) => super::reaper::wait_and_reap(c, pid, true),
+            #[cfg(windows)]
+            ProcSource::Raw(r) => r.wait_and_reap(),
         }
     }
 

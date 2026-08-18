@@ -188,39 +188,23 @@ impl RawAsyncChild {
         }
     }
 
-    /// Synchronous kill-then-reap for `Drop` (no reactor, no `wait()` future in flight). A plain
-    /// child is `TerminateProcess`d so the wait returns at once. A runas child a lower-integrity
-    /// parent cannot terminate is torn down best-effort WITHOUT blocking (universal teardown).
-    pub(crate) fn reap_blocking(&mut self) {
+    /// `true` once this backend has collected the child's exit status, so no wait remains.
+    pub(crate) fn is_reaped(&self) -> bool {
+        self.exited.is_some()
+    }
+
+    /// Wait for the child's exit; the caller has already signalled it. **Never kills:** a second
+    /// `TerminateProcess` on an already-exiting child returns ACCESS_DENIED, and the classified
+    /// kill decision was already made on the dropping thread.
+    pub(crate) fn wait_and_reap(&mut self) {
         if self.exited.is_some() {
             return;
         }
-        if self.runas {
-            // SAFETY: our live, owned process handle.
-            match unsafe { TerminateProcess(self.handle(), 1) } {
-                Ok(()) => {
-                    // It will exit; the wait is bounded by a real termination event.
-                    // SAFETY: our live, owned process handle.
-                    let _ = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
-                }
-                Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                    if !matches!(self.try_wait(), Ok(Some(_))) {
-                        log::warn!(
-                            "elevated async child {} could not be terminated on drop; leaving it running",
-                            self.pid
-                        );
-                    }
-                }
-                Err(e) => log::warn!("terminating elevated async child {} on drop failed: {e:?}", self.pid),
-            }
-            return;
-        }
-        let _ = self.start_kill();
-        // SAFETY: our live, owned process handle; INFINITE is bounded by the kill above.
+        // SAFETY: our live, owned process handle; INFINITE is bounded by the caller's kill.
         let waited = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
         debug_assert!(
             waited == WAIT_OBJECT_0,
-            "raw async Drop did not observe child {} exit: {waited:?}",
+            "raw async teardown did not observe child {} exit: {waited:?}",
             self.pid
         );
         let _ = waited;
