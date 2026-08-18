@@ -18,8 +18,9 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
 
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut child = {
-        // Every cosca-originated spawn takes this lock; a raw tokio spawn here must too, so a
-        // macOS fork cannot transiently inherit another test's fd-marker write end.
+        // Raw tokio bypasses cosca's spawn path, so its internal `spawn_lock()` is taken here by
+        // hand: a macOS fork must not transiently inherit another test's fd-marker write end.
+        // Wrapping a *cosca* spawn this way would self-deadlock — the mutex is not reentrant.
         let _guard = crate::child::spawn::spawn_lock();
         ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
             .args([
@@ -63,6 +64,8 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
 /// libtest filter that matches nothing. See `test_child::spawn_a_process_that_exits` for why the
 /// filter is mandatory (an unfiltered re-exec runs the whole suite, including this test).
 fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
+    // Raw tokio, so it bypasses cosca's spawn path and its internal `spawn_lock()` — taken here
+    // by hand instead. A cosca spawn must NOT be wrapped this way (the mutex is not reentrant).
     let _guard = crate::child::spawn::spawn_lock();
     ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args(["--exact", "__cosca_no_such_test__"])
@@ -119,10 +122,10 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
         .args(["cosca_unit_tests", "--exact", "__cosca_no_such_test__"]);
     cmd.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     cmd.stderr(crate::stdio::Stdio::null()).expect("stderr null");
-    let mut child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn")
-    };
+    // NO `spawn_lock()` here: this is a cosca spawn, which takes it internally, and it is a plain
+    // non-reentrant mutex. The raw `::tokio::process::Command` spawns elsewhere in this file take
+    // it by hand precisely because they bypass that path — do not copy the guard across.
+    let mut child = cmd.spawn().expect("spawn");
     child.wait().await.expect("wait");
     child.wait_and_reap_blocking();
     // Only reachable in release (debug panicked above, as expected):
