@@ -232,15 +232,10 @@ async fn async_drop_tears_down_a_contained_tree() {
         cosca::Containment::None,
         "contained spawn must engage a mechanism"
     );
-    let root_id = child.id();
     drop(child);
-    // The root is deterministically dead — reap_now blocked until its exit before Drop returned.
-    assert_eq!(
-        root_id.is_alive(),
-        cosca::identity::Liveness::Dead,
-        "the contained root must be torn down by Drop"
-    );
-    // The grandchild's death is proven by its control-socket EOF: a survivor blocks the read (a CI failure).
+    // No post-drop liveness assertion: `Drop` signals and does not wait, and `start_kill` is
+    // asynchronous. Each process's death is proven by its own control-socket EOF: a survivor
+    // blocks the read (a CI failure).
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {
@@ -253,15 +248,15 @@ async fn async_drop_tears_down_a_contained_tree() {
 
 #[tokio::test]
 async fn async_drop_after_wait_still_tears_down_the_tree() {
-    // After awaiting the root's exit it is already reaped (reap_now is then a no-op), so the tree
-    // teardown must come from attached.hard_kill() on Drop — proven by the grandchild's EOF.
+    // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
+    // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
     use std::io::{Read as _, Write as _};
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
-    drop(child); // root already reaped → reap_now no-op; attached.hard_kill must still kill the grandchild
+    drop(child); // root already reaped → nothing submitted; attached.hard_kill must still kill the grandchild
     let mut buf = [0u8; 1];
     match grand.read(&mut buf) {
         Ok(0) => {}
@@ -297,7 +292,7 @@ async fn async_detach_leaves_the_tree_running() {
 #[tokio::test]
 async fn async_kill_on_drop_false_leaves_the_root_running() {
     // `kill_on_drop(false)` hits the async Drop early-return with `attached` STILL ARMED (unlike
-    // detach(), which also disarms). Drop must NOT run the teardown (hard_kill + reap_now), so the
+    // detach(), which also disarms). Drop must NOT run the teardown (hard_kill + the root's kill), so the
     // root stays alive. Proven by positive liveness on the never-signaled root (race-free, mirroring
     // async_detach_leaves_the_tree_running). UNCONTAINED on purpose: a Windows JobObject's
     // KILL_ON_JOB_CLOSE fires when the job handle field drops (only `disarm()` clears it, and
@@ -322,23 +317,9 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn async_drop_leaves_no_zombie() {
-    // The guaranteed-reap contract: after Drop the child is FULLY reaped (reap_now waited for exit,
-    // then tokio's field-drop collected the zombie). Reuse-immune proof: the child's original
-    // identity (pid + start token) is gone. A zombie would still resolve to `Some(id)` (Linux /proc
-    // persists); a reaped pid resolves to `None` or, if recycled, a different identity — so a
-    // recycled pid never false-fails (no pid-reuse race, which a bare-pid `waitpid` would risk).
-    let (child, _sock) = common::spawn_blocker_async();
-    let id = child.id();
-    drop(child);
-    assert_ne!(
-        cosca::identity::ProcessId::of(id.pid()),
-        cosca::identity::Resolved::Found(id),
-        "Drop must fully reap the child (no lingering process/zombie at its identity)"
-    );
-}
+// `async_drop_leaves_no_zombie` moved to `drop_reaps_on_a_worker_thread` in
+// `src/tokio/child/reaper_tests.rs`: once `Drop` returns before the reap, only the
+// `#[cfg(test)]` probe offers an edge to sequence the no-zombie check after.
 
 // Arbitrary fd (n>=3) — Unix only, wired via command-fds (async mirror of spawn_io.rs) =====
 
@@ -687,13 +668,9 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
         cosca::Containment::JobObject,
         "Windows Strongest => JobObject"
     );
-    let root_id = child.id();
     drop(child);
-    assert_eq!(
-        root_id.is_alive(),
-        cosca::identity::Liveness::Dead,
-        "the contained root must be torn down by Drop"
-    );
+    // As in `async_drop_tears_down_a_contained_tree`: `Drop` does not wait, so the control-socket
+    // EOFs are the real edges.
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
         let mut buf = [0u8; 1];
         match s.read(&mut buf) {

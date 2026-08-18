@@ -8,6 +8,9 @@ mod graceful;
 mod proc_source;
 pub(crate) use proc_source::ProcSource;
 
+#[path = "child/reaper.rs"]
+mod reaper;
+
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
@@ -27,27 +30,49 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 #[cfg(windows)]
 pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 
-/// The `expect` behind the two backend accessors: nothing takes `proc`, so both are infallible.
-const PROC_TAKEN: &str = "the async child's process backend is never taken";
+/// The `expect` behind the two backend accessors: only `Drop` takes `proc`, and nothing runs on
+/// the handle after that, so both are infallible.
+const PROC_TAKEN: &str = "the async child's process backend is taken only by Drop";
 
-#[derive(Debug)]
-pub struct Child {
-    /// `Option` only so the backend can be moved out of a `&mut self` receiver; nothing does.
-    /// Read it through `proc_mut()` / `proc()`, never directly.
-    proc: Option<ProcSource>,
-    id: ProcessId,
-    attached: Attached,
-    kill_on_drop: bool,
-    containment: Containment,
-    graceful: crate::graceful::GracefulMechanism,
+/// Every field of a [`Child`] that owns an OS resource, **declared in the order they must be
+/// released**: the backend first, so the pid stays pinned for the whole wait and each other
+/// release is ordered after the reap.
+///
+/// This grouping is the parity contract with [`reaper::ReapJob`], which carries one of these
+/// verbatim: `Drop` hands the whole group over, so a resource-owning field added here travels to
+/// the reaper — and is released in the right order — with no other edit. Adding one directly to
+/// `Child` instead would silently keep its release on the dropping thread.
+#[derive(Debug, Default)]
+pub(crate) struct OsResources {
+    /// `Option` so `Drop` can move the backend into the reaper job; nothing else takes it.
+    /// Read it through [`proc_mut`](OsResources::proc_mut), never directly.
+    pub(crate) proc: Option<ProcSource>,
+    pub(crate) attached: Attached,
     /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
     /// [`fd_write_end`](Child::fd_write_end). Unix: `command-fds`-wired reactor pipes; Windows: the
     /// raw backend's overlapped async ends (empty on the std path, which routes fd >= 3 to the raw
     /// backend).
-    pipes: FdPipes,
+    pub(crate) pipes: FdPipes,
     /// Our-owned parent ends of piped std-slot MERGE TARGETS (the spawn pre-pass owns those
     /// pipes; tokio's internal ones cannot be shared), keyed by the target slot.
-    owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
+    pub(crate) owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
+}
+
+impl OsResources {
+    /// The process backend. The single `expect` site: `Drop` is the only thing that empties this,
+    /// and it is the last reader.
+    pub(crate) fn proc_mut(&mut self) -> &mut ProcSource {
+        self.proc.as_mut().expect(PROC_TAKEN)
+    }
+}
+
+#[derive(Debug)]
+pub struct Child {
+    os: OsResources,
+    id: ProcessId,
+    kill_on_drop: bool,
+    containment: Containment,
+    graceful: crate::graceful::GracefulMechanism,
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
     /// `Child`). Drives the universal-teardown kill mapping.
     elevation: Option<crate::elevation::ElevationReport>,
@@ -64,14 +89,16 @@ impl Child {
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
-            proc: Some(proc),
+            os: OsResources {
+                proc: Some(proc),
+                attached: attachment.attached,
+                pipes,
+                owned_std,
+            },
             id,
-            attached: attachment.attached,
             kill_on_drop,
             containment: attachment.containment,
             graceful: attachment.graceful,
-            pipes,
-            owned_std,
             elevation: None,
         }
     }
@@ -79,12 +106,12 @@ impl Child {
     /// The process backend. `pub(super)`: the sibling `pump` module borrows it for
     /// `communicate`'s `wait` future, and `child::graceful` for its pid-pinning guard.
     pub(super) fn proc_mut(&mut self) -> &mut ProcSource {
-        self.proc.as_mut().expect(PROC_TAKEN)
+        self.os.proc_mut()
     }
     /// Shared read-only accessor for the two `pins_pid` guards, which hold `&self`.
     #[cfg(windows)]
     pub(super) fn proc(&self) -> &ProcSource {
-        self.proc.as_ref().expect(PROC_TAKEN)
+        self.os.proc.as_ref().expect(PROC_TAKEN)
     }
 
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
@@ -171,7 +198,7 @@ impl Child {
     #[cfg(unix)]
     fn take_owned_out(&mut self, fd: Fd) -> Option<super::stdio::OutInner> {
         use std::os::fd::OwnedFd;
-        match self.owned_std.remove(&fd)? {
+        match self.os.owned_std.remove(&fd)? {
             ParentEnd::Reader(r) => match ::tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(r)) {
                 Ok(recv) => Some(super::stdio::OutInner::Owned(recv)),
                 Err(e) => {
@@ -183,7 +210,7 @@ impl Child {
                 }
             },
             end => {
-                self.owned_std.insert(fd, end); // wrong direction — put it back (fd_read_end mirror)
+                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_read_end mirror)
                 None
             }
         }
@@ -194,10 +221,10 @@ impl Child {
     /// (and no `from_raw_handle`, which would double-register the IOCP handle) exists here.
     #[cfg(windows)]
     fn take_owned_out(&mut self, fd: Fd) -> Option<super::stdio::OutInner> {
-        match self.owned_std.remove(&fd)? {
+        match self.os.owned_std.remove(&fd)? {
             super::stdio::OwnedStd::Read(r) => Some(super::stdio::OutInner::Owned(r)),
             end => {
-                self.owned_std.insert(fd, end); // wrong direction — put it back (fd_read_end mirror)
+                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_read_end mirror)
                 None
             }
         }
@@ -209,7 +236,7 @@ impl Child {
     #[cfg(unix)]
     fn take_owned_in(&mut self, fd: Fd) -> Option<super::stdio::InInner> {
         use std::os::fd::OwnedFd;
-        match self.owned_std.remove(&fd)? {
+        match self.os.owned_std.remove(&fd)? {
             ParentEnd::Writer(w) => match ::tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(w)) {
                 Ok(send) => Some(super::stdio::InInner::Owned(send)),
                 Err(e) => {
@@ -221,7 +248,7 @@ impl Child {
                 }
             },
             end => {
-                self.owned_std.insert(fd, end); // wrong direction — put it back (fd_write_end mirror)
+                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_write_end mirror)
                 None
             }
         }
@@ -231,10 +258,10 @@ impl Child {
     /// (see [`take_owned_out`](Child::take_owned_out)).
     #[cfg(windows)]
     fn take_owned_in(&mut self, fd: Fd) -> Option<super::stdio::InInner> {
-        match self.owned_std.remove(&fd)? {
+        match self.os.owned_std.remove(&fd)? {
             super::stdio::OwnedStd::Write(w) => Some(super::stdio::InInner::Owned(w)),
             end => {
-                self.owned_std.insert(fd, end); // wrong direction — put it back (fd_write_end mirror)
+                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_write_end mirror)
                 None
             }
         }
@@ -258,7 +285,7 @@ impl Child {
     pub fn fd_read_end(&mut self, fd: impl Into<crate::stdio::Fd>) -> Option<::tokio::net::unix::pipe::Receiver> {
         use std::os::fd::OwnedFd;
         let fd = fd.into();
-        match self.pipes.remove(&fd)? {
+        match self.os.pipes.remove(&fd)? {
             crate::child::ParentEnd::Reader(r) => {
                 match ::tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(r)) {
                     Ok(recv) => Some(recv),
@@ -272,7 +299,7 @@ impl Child {
                 }
             }
             end => {
-                self.pipes.insert(fd, end); // wrong direction — put it back (sync mirror)
+                self.os.pipes.insert(fd, end); // wrong direction — put it back (sync mirror)
                 None
             }
         }
@@ -296,7 +323,7 @@ impl Child {
     pub fn fd_write_end(&mut self, fd: impl Into<crate::stdio::Fd>) -> Option<::tokio::net::unix::pipe::Sender> {
         use std::os::fd::OwnedFd;
         let fd = fd.into();
-        match self.pipes.remove(&fd)? {
+        match self.os.pipes.remove(&fd)? {
             crate::child::ParentEnd::Writer(w) => {
                 match ::tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(w)) {
                     Ok(send) => Some(send),
@@ -310,7 +337,7 @@ impl Child {
                 }
             }
             end => {
-                self.pipes.insert(fd, end);
+                self.os.pipes.insert(fd, end);
                 None
             }
         }
@@ -329,12 +356,12 @@ impl Child {
     #[cfg(windows)]
     pub fn fd_read_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdout> {
         let fd = fd.into();
-        match self.pipes.remove(&fd)? {
+        match self.os.pipes.remove(&fd)? {
             super::stdio::OwnedStd::Read(r) => Some(super::stdio::ChildStdout {
                 inner: super::stdio::OutInner::Owned(r),
             }),
             end => {
-                self.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
+                self.os.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
                 None
             }
         }
@@ -352,12 +379,12 @@ impl Child {
     #[cfg(windows)]
     pub fn fd_write_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdin> {
         let fd = fd.into();
-        match self.pipes.remove(&fd)? {
+        match self.os.pipes.remove(&fd)? {
             super::stdio::OwnedStd::Write(w) => Some(super::stdio::ChildStdin {
                 inner: super::stdio::InInner::Owned(w),
             }),
             end => {
-                self.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
+                self.os.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
                 None
             }
         }
@@ -367,7 +394,7 @@ impl Child {
     /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        crate::containment::windows::job_contains_pid(&self.attached, self.id.pid())
+        crate::containment::windows::job_contains_pid(&self.os.attached, self.id.pid())
     }
 
     /// Block until the child exits, returning its status. For a bounded wait use
@@ -421,7 +448,7 @@ impl Child {
         // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).
         #[cfg(unix)]
         debug_assert!(
-            !self.attached.carries_recyclable_pgid() || {
+            !self.os.attached.carries_recyclable_pgid() || {
                 let now = ProcessId::of(self.id.pid());
                 let now_liveness = match now {
                     crate::identity::Resolved::Found(id) => id.is_alive(),
@@ -436,7 +463,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        let group_result = self.attached.hard_kill();
+        let group_result = self.os.attached.hard_kill();
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
         // covers that, so its failure is contract-relevant.
@@ -514,7 +541,7 @@ impl Child {
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
         debug_assert!(
-            !self.attached.carries_recyclable_pgid() || {
+            !self.os.attached.carries_recyclable_pgid() || {
                 let now = ProcessId::of(self.id.pid());
                 let now_liveness = match now {
                     crate::identity::Resolved::Found(id) => id.is_alive(),
@@ -529,7 +556,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        self.attached.terminate(self.id.pid())
+        self.os.attached.terminate(self.id.pid())
     }
 
     /// The refusal both cooperative ops answer with once this handle has stopped pinning the
@@ -553,12 +580,12 @@ impl Child {
 
     /// Guard for the `_tree` operations (single-sourced with the sync `Child`).
     fn require_contained(&self) -> Result<(), Error> {
-        crate::containment::require_contained(self.containment, &self.attached)
+        crate::containment::require_contained(self.containment, &self.os.attached)
     }
 
     /// Guard for `wait_tree`/`wait_tree_timeout` (single-sourced with the sync `Child`).
     fn require_drainable(&self) -> Result<(), Error> {
-        crate::containment::require_drainable(self.containment, &self.attached)
+        crate::containment::require_drainable(self.containment, &self.os.attached)
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
@@ -571,7 +598,7 @@ impl Child {
     /// blocking watcher promptly instead of parking out the wait.
     pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
         self.require_drainable()?;
-        super::wait::wait_tree_drained_dispatch(&self.attached, None).await
+        super::wait::wait_tree_drained_dispatch(&self.os.attached, None).await
     }
 
     /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`.
@@ -583,7 +610,7 @@ impl Child {
     ) -> Result<crate::containment::TreeDrain, Error> {
         self.require_drainable()?;
         let deadline = crate::wait::deadline_from(timeout);
-        super::wait::wait_tree_drained_dispatch(&self.attached, deadline).await
+        super::wait::wait_tree_drained_dispatch(&self.os.attached, deadline).await
     }
 }
 
@@ -591,7 +618,7 @@ impl Child {
     /// Leave the child (and its contained tree) running after this handle drops.
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
-        self.attached.disarm();
+        self.os.attached.disarm();
     }
 }
 
@@ -620,31 +647,55 @@ impl Child {
     }
 }
 
-/// Hard-kills the contained tree, then blocks until the root has exited — the same shape as the
-/// sync [`Child`](crate::Child)'s `Drop`. What differs, deliberately, is who collects the status:
-/// see the reap below.
+/// Signals the tree and the root and does NOT wait: the child is not necessarily gone when
+/// `drop` returns, and neither is it necessarily reaped. A caller that must observe the teardown
+/// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
+/// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
+///
+/// The reap is handed to a small fixed pool of reaper threads (currently four) that starts on
+/// the first kill-on-drop drop and persists for the process's life. It is guaranteed except on
+/// the two paths below, both of which are loud. Under thread exhaustion the pool cannot start,
+/// and the child goes to the runtime's orphan handling instead — an `error` per child, and each
+/// drop then costs at most that many failing spawn syscalls.
+///
+/// # Known limitation: `fork()` without `exec`
+///
+/// **A process that forks after this pool has started, and then keeps running Rust code in the
+/// child, loses the reap silently in that child.** `fork` duplicates only the calling thread, so
+/// the child inherits the pool's job queue with none of its workers; sends into it still succeed
+/// (the receiver handles exist in the copied address space), so nothing errors and nothing is
+/// logged, and every child handle dropped there queues forever, pinning its process handle,
+/// containment resource and stdio for the life of that process. It affects daemonizing and
+/// pre-fork worker models. It does **not** affect ordinary subprocess spawning — `fork`+`exec`
+/// and `posix_spawn` replace the child image immediately — nor Windows, which has no `fork`.
+///
+/// Until it is fixed, a forking consumer should either fork before its first kill-on-drop drop,
+/// or `kill` and `await` [`wait`](Child::wait) explicitly in the forked child rather than relying
+/// on `Drop`. The sync [`Child`](crate::Child) is unaffected: it reaps on the dropping thread.
+///
+/// That divergence from the sync `Child`, which still blocks, is otherwise deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
+        // The opt-out/`detach()` contract: nothing is signalled and nothing is logged.
         if !self.kill_on_drop {
             return;
         }
-        // Tree teardown — the SOLE coverage for descendants (reap_now only guarantees the root),
-        // so surface a real mechanism failure in debug. A no-op for an uncontained child.
+        #[cfg(test)]
+        let probe = reaper::test_probe::take();
+        #[cfg(test)]
+        if let Some(p) = probe.as_ref() {
+            let _ = p.entered.send(std::thread::current().id());
+        }
+        // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
+        // only the root), so surface a real mechanism failure in debug. A no-op for an
+        // uncontained child.
         //
-        // MUST stay on the dropping thread, and the reason is mechanism-specific — deferring it
-        // to a background thread or an awaitable teardown would take the guarantee away.
-        //
-        // Windows job object: a nested contained descendant is spawned into its OWN process group
-        // (`windows::group_flags`), so a consumer's `terminate_tree` — `CTRL_BREAK` to the ROOT's
-        // group — never reaches it, and `TerminateJobObject` here is the only thing that does.
-        //
-        // Unix: reach is identical either way. A nested contained descendant is `Delegated` and
-        // creates no group of its own, so `killpg` reaches it; a descendant that escaped by
-        // calling `setsid` itself is out of `hard_kill`'s reach too, since that is the same
-        // `killpg`. (The cgroup and fd-marker mechanisms sweep the same membership for both
-        // signals.) What this adds there is force, not reach: `SIGTERM` is catchable, `SIGKILL`
-        // is not.
-        let tree = self.attached.hard_kill();
+        // MUST stay on the dropping thread, before the handle is dismembered: on Windows a job
+        // object's kill is the only signal reaching a nested descendant that leads its own console
+        // group (console control events stop at that boundary). On Unix this and `terminate_tree`
+        // have the same radius. The contract either way: the tree is signalled before `drop`
+        // returns.
+        let tree = self.os.attached.hard_kill();
         if let Err(e) = &tree {
             debug_assert!(
                 !crate::child::is_teardown_mechanism_failure(e),
@@ -653,16 +704,51 @@ impl Drop for Child {
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         let _ = tree;
-        // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
-        // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend
-        // (tokio field-drop reap vs the raw handle's kill-then-wait).
-        //
-        // The sync twin (`crate::Child`'s `Drop`) collects the status itself; this one must not —
-        // tokio owns the child and its own reaping, so the wait is non-reaping (`WNOWAIT`) and the
-        // collection is left to tokio's field-drop. `src/tokio/` mirrors the sync surface by hand
-        // with nothing enforcing parity, so that difference is deliberate, not drift.
+
         let pid = self.id.pid();
-        self.proc_mut().reap_now_on_drop(pid);
+        // The WHOLE resource group moves, so a field added to `OsResources` is carried here
+        // without touching this function. On every early return below it drops in group order,
+        // on this thread — exactly where it dropped before the reap moved off it.
+        let mut os = std::mem::take(&mut self.os);
+        // Already reaped: no signal to issue and no exit to wait for.
+        if os.proc_mut().is_reaped() {
+            return;
+        }
+        // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
+        // higher-integrity elevated child), and asserting would panic inside a destructor.
+        //
+        // The test seam REPLACES the kill rather than masking its result — a masked kill would
+        // still have signalled the child, and the branch below is about one that was not.
+        #[cfg(test)]
+        let killed = if reaper::fault::take_force_kill_failure() {
+            Err(Error::Io(std::io::Error::other("forced kill failure (test seam)")))
+        } else {
+            os.proc_mut().start_kill()
+        };
+        #[cfg(not(test))]
+        let killed = os.proc_mut().start_kill();
+        if killed.is_err() {
+            if !matches!(os.proc_mut().try_wait(), Ok(Some(_))) {
+                log::warn!("async child {pid} could not be terminated on drop; leaving it running");
+            }
+            // An unsignalled child is never submitted: its wait is unbounded, and a worker parked
+            // on it would never come back. Its resources release with this handle instead.
+            return;
+        }
+        reaper::submit(reaper::ReapJob {
+            os,
+            pid,
+            #[cfg(test)]
+            origin: std::thread::current().id(),
+            #[cfg(test)]
+            probe,
+            #[cfg(test)]
+            force_panic: false,
+            #[cfg(test)]
+            force_release_panic: false,
+            #[cfg(test)]
+            force_glue_panic: false,
+        });
     }
 }
 

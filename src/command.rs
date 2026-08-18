@@ -207,13 +207,25 @@ impl Command {
     /// after the fact.
     ///
     /// What "tear down" means, on both handles: hard-kill the contained tree (a no-op for an
-    /// uncontained child — see [`contain`](Command::contain)), then block until the ROOT has
-    /// exited. There is no cooperative signal first; use
+    /// uncontained child — see [`contain`](Command::contain)), then kill the ROOT. There is no
+    /// cooperative signal first; use
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
     /// child needs one. Descendants are killed, not waited for.
     ///
-    /// An elevated child this process cannot signal is the one case that does not block: the
-    /// teardown gives up rather than wait forever, and the child is left running.
+    /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
+    /// until the root has exited, so after `drop` returns the child is gone. The async
+    /// [`Child`](crate::tokio::Child) signals and returns — parking a runtime worker in a
+    /// destructor is not something the caller can await or cancel — and hands the wait to reaper
+    /// threads of its own, so the reap happens later and off this thread.
+    ///
+    /// The async reap is **not** unconditional: a host too thread-starved to start the pool falls
+    /// back to the runtime's orphan handling, and a process that forks without `exec` loses it
+    /// entirely in the forked child. Code that must know the child is gone should `kill` and
+    /// `await` [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
+    /// rustdoc for both paths.
+    ///
+    /// An elevated child this process cannot signal is the one case the sync handle does not
+    /// block on: the teardown gives up rather than wait forever, and the child is left running.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self
