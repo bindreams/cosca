@@ -202,6 +202,18 @@ impl Command {
         self
     }
 
+    /// Tear the child down when its handle drops. **On by default**; pass `false` to opt out for
+    /// every child of this command, or [`Child::detach`](crate::Child::detach) to opt one out
+    /// after the fact.
+    ///
+    /// What "tear down" means, on both handles: hard-kill the contained tree (a no-op for an
+    /// uncontained child — see [`contain`](Command::contain)), then block until the ROOT has
+    /// exited. There is no cooperative signal first; use
+    /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
+    /// child needs one. Descendants are killed, not waited for.
+    ///
+    /// An elevated child this process cannot signal is the one case that does not block: the
+    /// teardown gives up rather than wait forever, and the child is left running.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self

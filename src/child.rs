@@ -525,6 +525,12 @@ impl Drop for Child {
             );
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
+        // Kill, block until the child has exited, and collect its status here — this handle owns
+        // the child outright. The async twin (`cosca::tokio::Child`'s `Drop`) blocks the same way
+        // but must NOT collect: tokio owns that child and its own reaping, so it waits without
+        // reaping and leaves the collection to tokio's field-drop. `src/tokio/` mirrors this
+        // surface by hand with nothing enforcing parity, so that difference is deliberate, not
+        // drift.
         self.proc.teardown_on_drop();
     }
 }

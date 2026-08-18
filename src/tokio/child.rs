@@ -604,6 +604,9 @@ impl Child {
     }
 }
 
+/// Hard-kills the contained tree, then blocks until the root has exited — the same shape as the
+/// sync [`Child`](crate::Child)'s `Drop`. What differs, deliberately, is who collects the status:
+/// see the reap below.
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -611,6 +614,20 @@ impl Drop for Child {
         }
         // Tree teardown — the SOLE coverage for descendants (reap_now only guarantees the root),
         // so surface a real mechanism failure in debug. A no-op for an uncontained child.
+        //
+        // MUST stay on the dropping thread, and the reason is mechanism-specific — deferring it
+        // to a background thread or an awaitable teardown would take the guarantee away.
+        //
+        // Windows job object: a nested contained descendant is spawned into its OWN process group
+        // (`windows::group_flags`), so a consumer's `terminate_tree` — `CTRL_BREAK` to the ROOT's
+        // group — never reaches it, and `TerminateJobObject` here is the only thing that does.
+        //
+        // Unix: reach is identical either way. A nested contained descendant is `Delegated` and
+        // creates no group of its own, so `killpg` reaches it; a descendant that escaped by
+        // calling `setsid` itself is out of `hard_kill`'s reach too, since that is the same
+        // `killpg`. (The cgroup and fd-marker mechanisms sweep the same membership for both
+        // signals.) What this adds there is force, not reach: `SIGTERM` is catchable, `SIGKILL`
+        // is not.
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             debug_assert!(
@@ -623,6 +640,11 @@ impl Drop for Child {
         // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
         // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend
         // (tokio field-drop reap vs the raw handle's kill-then-wait).
+        //
+        // The sync twin (`crate::Child`'s `Drop`) collects the status itself; this one must not —
+        // tokio owns the child and its own reaping, so the wait is non-reaping (`WNOWAIT`) and the
+        // collection is left to tokio's field-drop. `src/tokio/` mirrors the sync surface by hand
+        // with nothing enforcing parity, so that difference is deliberate, not drift.
         let pid = self.id.pid();
         self.proc.reap_now_on_drop(pid);
     }
