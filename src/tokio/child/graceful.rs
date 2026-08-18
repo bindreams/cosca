@@ -67,22 +67,17 @@ impl Child {
     /// reports the exit — the async backend releases the process handle there, so the OS may
     /// reissue the pid to an unrelated group leader. From that point the call is refused
     /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
-    /// pid. The sync [`Child`](crate::Child) pins for its whole life and answers `Ok`.
+    /// pid. The sync [`Child`](crate::Child) pins for its whole life and answers `Ok`. A
+    /// mechanism that addresses no pid keeps its own answer: an uncontained Windows child is
+    /// `Unsupported` before and after the reap alike, because nothing was ever going to be sent
+    /// to a pid in the first place.
     pub fn terminate(&self) -> Result<(), Error> {
+        let mechanism = self.graceful_mechanism();
         #[cfg(windows)]
-        if !self.proc.pins_pid() {
-            return Err(Error::Unassessable {
-                detail: format!(
-                    "this handle no longer pins pid {pid}: the async backend released the \
-                     child's process handle when its exit was observed, so the pid may since \
-                     name an unrelated process. A console control event is addressed by pid \
-                     alone, so nothing was sent — and the child is already gone.",
-                    pid = self.id().pid()
-                ),
-                source: None,
-            });
+        if mechanism.addresses_a_bare_pid() && !self.proc.pins_pid() {
+            return Err(self.unpinned_pid_refusal("terminate"));
         }
-        crate::graceful::signal(self.graceful_mechanism(), self.id())
+        crate::graceful::signal(mechanism, self.id())
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -129,11 +124,11 @@ impl Child {
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        self.terminate()?; // an error here returns before any grace wait or kill
-                           // A watch failure must not strand the child between the soft signal and the
-                           // escalation — kill and reap still run (grace unobservable => escalate now); the
-                           // watch error surfaces only after they succeed (a kill/reap error wins — deliberate
-                           // subsumption, mirroring kill_tree's both-fail disposition).
+        self.terminate()?;
+        // A watch failure must not strand the child between the soft signal and the escalation —
+        // kill and reap still run (grace unobservable => escalate now); the watch error surfaces
+        // only after they succeed (a kill/reap error wins — deliberate subsumption, mirroring
+        // kill_tree's both-fail disposition).
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         if !matches!(watch, Ok(true)) {
             if let Err(e) = &watch {

@@ -46,9 +46,30 @@ pub enum GracefulMechanism {
     /// leader's whole group instead. Refused, not attempted.
     Unknown,
     /// Windows: the child leads no process group of its own, and group leadership is fixed at
-    /// creation — so no per-child console control event can be addressed to it by any process,
-    /// ever.
+    /// creation — so no console control event can be addressed to it ALONE by any process,
+    /// ever; one aimed at its pid reaches its leader's whole group instead.
     None,
+}
+
+// Gated on `tokio` as well as Windows: the async `Child` is the only handle that can stop
+// pinning its child's pid, so it is the only caller this distinction exists for.
+#[cfg(all(windows, feature = "tokio"))]
+impl GracefulMechanism {
+    /// Whether the signal this mechanism names is addressed to a **bare pid** — no handle, no
+    /// identity check — so a caller whose handle has stopped pinning that pid must refuse rather
+    /// than fire it at whatever the OS has since reissued it to. The mechanisms that send
+    /// nothing at all are false: their refusal is permanent and pid-independent, and reporting
+    /// it as a pinning problem would name the wrong cause and the wrong error variant.
+    ///
+    /// Matched exhaustively, like [`signal`], so a future variant must decide this too.
+    pub(crate) fn addresses_a_bare_pid(self) -> bool {
+        match self {
+            GracefulMechanism::ConsoleGroup | GracefulMechanism::OtherConsoleGroup => true,
+            // Identity-bound (`crate::wait::terminate`), and unconstructible on Windows anyway.
+            GracefulMechanism::Process => false,
+            GracefulMechanism::Unknown | GracefulMechanism::None => false,
+        }
+    }
 }
 
 impl std::fmt::Display for GracefulMechanism {

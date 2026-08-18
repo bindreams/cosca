@@ -425,6 +425,68 @@ async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
     );
 }
 
+// The TREE graceful ops must refuse on the same terms: both Windows arms of `terminate_tree`
+// (job object and tree walk) address the root's bare pid exactly like the lone `terminate`, and
+// a root that exits while its descendants are still alive is the ordinary reason to reach for a
+// tree signal at all. The refusal is `Unassessable` — not `Ok`, which is what an unguarded call
+// returns after firing at whatever now holds the pid — and `graceful_shutdown_tree` inherits it:
+// the trace asserted below fires only if `terminate_tree` refused.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    child.kill().expect("kill");
+    child.wait().await.expect("reap"); // tokio unpins the pid here
+    let err = child
+        .terminate_tree()
+        .expect_err("an unpinned pid must not be signalled");
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
+        "got {err:?}"
+    );
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    // Held, then superseded by the drained tree — the refusal reaching `graceful_shutdown_tree`
+    // at all is what this proves, not the disposition it already documents for that shape.
+    child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("a drained tree supersedes the held refusal");
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
+        ),
+        "graceful_shutdown_tree must inherit the refusal from its cooperative half"
+    );
+}
+
+// The pid guard must not swallow the refusals that never address a pid. An uncontained Windows
+// child records `GracefulMechanism::None` — permanent and pid-independent — so it must keep
+// answering `Unsupported` (what its own doc promises, and what the sync mirror returns for the
+// identical child) after the backend has unpinned the pid, not `Unassessable`, which is
+// documented as a transient could-not-determine condition a caller may retry.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]); // uncontained: leads no group of its own
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        child.graceful_mechanism(),
+        crate::graceful::GracefulMechanism::None,
+        "the subject must be a child whose refusal is permanent, not pid-dependent"
+    );
+    child.kill().expect("kill");
+    child.wait().await.expect("reap"); // tokio unpins the pid here
+    let err = child.terminate().expect_err("a child that leads no group is refused");
+    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+}
+
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.
 #[tokio::test]
 async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {

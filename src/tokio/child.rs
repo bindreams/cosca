@@ -461,8 +461,23 @@ impl Child {
     /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), and the residual `hidepid` gap on Linux.
+    ///
+    /// **Windows, after the root's exit has been observed.** The event is addressed by the
+    /// ROOT's pid — on the job-object mechanism and the tree walk alike — and this handle stops
+    /// pinning that pid the moment `wait`/`try_wait` reports the exit, so the OS may reissue it
+    /// to an unrelated group leader. A root exiting while its descendants are still alive is an
+    /// ordinary flow, so this is refused from that point
+    /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
+    /// pid; [`kill_tree`](Child::kill_tree) addresses no pid and still reaches the survivors.
+    /// The sync [`Child`](crate::Child) pins for its whole life and is unaffected.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // After the mechanism guard, which is permanent and pid-independent: an uncontained
+        // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
+        #[cfg(windows)]
+        if !self.proc.pins_pid() {
+            return Err(self.unpinned_pid_refusal("terminate_tree"));
+        }
         // See kill_tree's identical precondition assert for the full rationale, including the
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
@@ -483,6 +498,25 @@ impl Child {
             self.id.pid()
         );
         self.attached.terminate(self.id.pid())
+    }
+
+    /// The refusal both cooperative ops answer with once this handle has stopped pinning the
+    /// child's pid — the async backend releases the Windows process handle when `wait`/`try_wait`
+    /// observes the exit. Shared so the lone and the tree op cannot drift on what is, for both,
+    /// the same hazard: a console control event carries a bare pid and nothing else.
+    #[cfg(windows)]
+    fn unpinned_pid_refusal(&self, op: &str) -> Error {
+        Error::Unassessable {
+            detail: format!(
+                "this handle no longer pins pid {pid}: the async backend released the child's \
+                 process handle when its exit was observed, so the pid may since name an \
+                 unrelated process. A console control event is addressed by pid alone, so {op}() \
+                 sent nothing. The child itself is already gone; kill_tree() addresses no pid and \
+                 still tears down any survivors.",
+                pid = self.id.pid()
+            ),
+            source: None,
+        }
     }
 
     /// Guard for the `_tree` operations (single-sourced with the sync `Child`).

@@ -567,6 +567,40 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         sync_contained.graceful_mechanism(),
         "contained: the two mirrors disagree"
     );
+    // The mechanism is only half of it: the two mirrors must also refuse for the same REASON.
+    // Reaped first — the async backend releases the Windows process handle there, which is
+    // exactly where a pid-scoped refusal that also swallowed the pid-INDEPENDENT ones would
+    // start answering something the sync side never answers. Uncontained on purpose: a contained
+    // child's two surfaces legitimately diverge after a reap (the sync handle still pins the pid
+    // and answers `Ok`; the async one no longer does and refuses), which
+    // `windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped` pins. Spawned through
+    // `args` alone rather than the `executable()` helper above, which is load-bearing: an
+    // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
+    // its whole life, so no released pin could be observed through it at all.
+    #[cfg(windows)]
+    let argv = ["ping", "-n", "30", "127.0.0.1"];
+    #[cfg(unix)]
+    let argv = ["sleep", "30"];
+    let mut async_reaped = {
+        let mut cmd = cosca::tokio::Command::new();
+        cmd.args(argv);
+        cmd.spawn().expect("spawn async uncontained")
+    };
+    let sync_reaped = {
+        let mut cmd = cosca::Command::new();
+        cmd.args(argv);
+        cmd.spawn().expect("spawn sync uncontained")
+    };
+    async_reaped.kill().expect("kill");
+    async_reaped.wait().await.expect("reap");
+    sync_reaped.kill().expect("kill");
+    sync_reaped.wait().expect("reap");
+    assert_eq!(
+        refusal_shape(&async_reaped.terminate()),
+        refusal_shape(&sync_reaped.terminate()),
+        "uncontained, after a reap: the two mirrors answer with different error shapes"
+    );
+
     uncontained.kill().expect("cleanup");
     let _ = uncontained.wait().await;
     contained.kill().expect("cleanup");
@@ -574,5 +608,16 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     for child in [sync_uncontained, sync_contained] {
         child.kill().expect("cleanup");
         let _ = child.wait();
+    }
+}
+
+/// The comparable shape of a cooperative-signal outcome: `Error` is `#[non_exhaustive]` and not
+/// `PartialEq`, and the detail strings legitimately differ between the two surfaces.
+fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
+    match result {
+        Ok(()) => "ok",
+        Err(cosca::error::Error::Unsupported { .. }) => "unsupported",
+        Err(cosca::error::Error::Unassessable { .. }) => "unassessable",
+        Err(_) => "other",
     }
 }
