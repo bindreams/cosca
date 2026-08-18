@@ -6,6 +6,11 @@ use std::sync::mpsc;
 use super::fault;
 use super::test_probe::{arm, DropProbe, ReapOutcome};
 use super::{run_teardown, ReapJob};
+// Windows has no zombie, and a pid outlives its last handle by an asynchronous kernel rundown
+// that nothing in user mode signals (measured on an idle box: 0-14 `OpenProcess` probes of
+// slack). So identity-after-teardown is a Unix-only property, as the `#[cfg(unix)]`
+// `async_drop_leaves_no_zombie` this coverage came from already recorded.
+#[cfg(unix)]
 use crate::identity::{ProcessId, Resolved};
 use crate::test_child::spawn_async_blocker;
 
@@ -33,6 +38,7 @@ async fn drop_signals_the_root_and_returns_before_the_reap() {
     use std::io::Read as _;
     let ends = arm_probe();
     let (child, mut sock) = spawn_async_blocker();
+    #[cfg(unix)]
     let id = child.id();
     drop(child);
 
@@ -56,12 +62,21 @@ async fn drop_signals_the_root_and_returns_before_the_reap() {
         other => panic!("root not signalled on the dropping thread: {other:?}"),
     }
 
-    // Exited but NOT reaped — the identity still resolves — so `Drop` returned before the reap.
-    // Reuse-immune: the comparison is pid + start token, so a recycled pid cannot false-pass.
+    // `Drop` returned before the teardown. Race-free rather than merely not-yet-observed: we
+    // still hold the gate SENDER, so a teardown on a worker CANNOT have reported, while an
+    // inlined one provably reported before `drop` returned. This is the whole discriminator on
+    // Windows, where the identity comparison below cannot tell the two worlds apart.
+    assert!(
+        matches!(ends.outcome.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "Drop must return before the teardown runs"
+    );
+    // Unix sharpens it: the child has exited but is still an unreaped zombie, so its identity
+    // resolves. Reuse-immune — the comparison is pid + start token.
+    #[cfg(unix)]
     assert_eq!(
         ProcessId::of(id.pid()),
         Resolved::Found(id),
-        "Drop must return before the reap: the exited child's identity must still resolve"
+        "the exited child must still be an unreaped zombie while the teardown is gated"
     );
 
     drop(ends.gate);
@@ -69,6 +84,7 @@ async fn drop_signals_the_root_and_returns_before_the_reap() {
         matches!(ends.outcome.recv(), Ok(ReapOutcome::Reaped(_))),
         "the released teardown must reap"
     );
+    #[cfg(unix)]
     assert_ne!(
         ProcessId::of(id.pid()),
         Resolved::Found(id),
@@ -80,6 +96,7 @@ async fn drop_signals_the_root_and_returns_before_the_reap() {
 async fn drop_reaps_on_a_worker_thread() {
     let ends = arm_probe();
     let (child, _sock) = spawn_async_blocker();
+    #[cfg(unix)]
     let id = child.id();
     drop(child);
 
@@ -98,6 +115,10 @@ async fn drop_reaps_on_a_worker_thread() {
     // The no-zombie property, sequenced after a real edge rather than after a blocking `Drop`.
     // A zombie still resolves to `Found(id)` (Linux `/proc` persists); a reaped pid resolves to
     // `Gone` or, if recycled, a DIFFERENT identity — so a recycled pid never false-passes.
+    // Unix-only, keeping the gate its source test carried: Windows has no zombie, and the
+    // outcome above already implies the backend was released, because it is sent only after the
+    // job's four resources are dropped.
+    #[cfg(unix)]
     assert_ne!(
         ProcessId::of(id.pid()),
         Resolved::Found(id),
