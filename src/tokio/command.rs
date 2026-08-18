@@ -87,6 +87,9 @@ impl Command {
         self.inner.current_dir(dir);
         self
     }
+    /// Async mirror of [`Command::kill_on_drop`](crate::Command::kill_on_drop) — see there for
+    /// what the teardown does. The per-child opt-out is
+    /// [`Child::detach`](crate::tokio::Child::detach).
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.inner.kill_on_drop(yes);
         self
