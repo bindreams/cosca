@@ -60,8 +60,6 @@ impl Attachment {
     /// addressing a console control event to its pid. `OtherConsoleGroup` would claim a route to
     /// a group known to exist, and `None` that no cooperative signal exists from any process
     /// ever; cosca can make neither claim about a child it did not create.
-    ///
-    /// Named for its single use so nothing else adopts it.
     pub(crate) fn uac_elevated() -> Attachment {
         Attachment {
             containment: Containment::None,

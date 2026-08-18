@@ -97,7 +97,7 @@ impl Child {
     /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
     /// applies).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        self.terminate()?; // an error here returns before any grace wait or kill
+        self.terminate()?;
 
         let watch = self.wait_timeout(grace);
         if let Ok(Some(status)) = &watch {
