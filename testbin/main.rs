@@ -7,6 +7,11 @@ use std::io::BufRead;
 use std::io::{Read, Write};
 use std::process::exit;
 
+/// The `report-console-identity` mode, shared verbatim with the GUI-subsystem fixture.
+#[cfg(windows)]
+#[path = "console_identity.rs"]
+mod console_identity;
+
 /// Borrow a std stream's raw descriptor as an UNBUFFERED `File`. `ManuallyDrop` keeps the
 /// real descriptor open (a plain `File` drop would close it — double-close on exit).
 /// Callers must pass one of this process's std descriptors, which live for the whole run.
@@ -861,6 +866,11 @@ fn main() {
             .unwrap();
             report_sock.write_all(line.as_bytes()).unwrap();
             report_sock.flush().unwrap();
+        }
+        #[cfg(windows)]
+        "report-console-identity" => {
+            let caller_pid: u32 = args[3].parse().expect("argv[3]: the spawning process's pid");
+            console_identity::run(&args[2], caller_pid);
         }
         #[cfg(windows)]
         "report-console-terminate" => {
