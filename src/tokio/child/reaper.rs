@@ -213,6 +213,10 @@ pub(crate) fn run_teardown(job: ReapJob) {
     // `proc` is BORROWED into this region, never moved: an unwind must not destroy a resource
     // whose release the region below owns and orders.
     let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if let Some(p) = probe.as_ref() {
+            let _ = p.started.send(std::thread::current().id());
+        }
         // Executing elsewhere ⇒ a test may hold the teardown until it has observed the
         // not-yet-reaped state. On the dropping thread the teardown was inlined, so skipping the
         // gate lets that broken world fail an assertion instead of deadlocking.
@@ -273,6 +277,9 @@ pub(crate) mod test_probe {
     pub(crate) struct DropProbe {
         /// The dropping thread's id, sent from `Drop` before the handoff.
         pub(crate) entered: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        /// The executing thread's id, sent by the teardown before it gates: "a worker took this
+        /// job". A released job never sends it, so the receiver's `Err` is the negative edge.
+        pub(crate) started: std::sync::mpsc::Sender<std::thread::ThreadId>,
         /// Held teardowns wait here; a dropped sender releases them.
         pub(crate) gate: std::sync::mpsc::Receiver<()>,
         pub(crate) outcome: std::sync::mpsc::Sender<ReapOutcome>,
