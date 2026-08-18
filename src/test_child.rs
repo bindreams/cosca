@@ -193,6 +193,12 @@ pub(crate) fn spawn_async_blocker() -> (crate::tokio::Child, std::net::TcpStream
     cmd.executable(&exe)
         .args(fixture_argv(FIXTURE_CONTROL_BLOCK_TEST))
         .env(FIXTURE_CONTROL_BLOCK_ADDR_ENV, &addr);
+    // The child runs a full libtest harness, which writes its `running 1 test` / `test result:`
+    // banner to fd 1 directly — libtest's capture wraps the Rust print machinery, not the
+    // descriptor, so an inherited fd 1 lands that banner raw (and mid-line) in THIS binary's
+    // output. Both are nulled; stdin stays inherited, per this helper's contract.
+    cmd.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    cmd.stderr(crate::stdio::Stdio::null()).expect("stderr null");
     let child = cmd.spawn().expect("spawn the control-block fixture");
     let (mut sock, _) = listener.accept().expect("accept the control socket");
     let mut tag = [0u8; 1];
