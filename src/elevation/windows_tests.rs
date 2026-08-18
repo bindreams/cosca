@@ -38,6 +38,14 @@ fn is_unsupported<T>(r: Result<T, Error>) -> bool {
     matches!(r, Err(Error::Unsupported { .. }))
 }
 
+/// The refusal's `detail`, for the tests that assert on the message and not only the variant.
+fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+    match r {
+        Err(Error::Unsupported { detail, .. }) => detail,
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
 #[test]
 fn piped_stdio_is_unsupported() {
     let mut c = Command::new();
@@ -165,7 +173,8 @@ fn runas_shows_the_window_by_default() {
 fn elevation_rejects_raw_creation_flags() {
     let mut c = Command::new();
     c.args(["whoami"]).elevate().creation_flags(0x0000_0040);
-    assert!(is_unsupported(super::reject_unsupported_config(&c)));
+    let detail = unsupported_detail(super::reject_unsupported_config(&c));
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
 #[test]
@@ -179,14 +188,16 @@ fn elevation_accepts_a_zero_creation_flags_word() {
 fn elevation_rejects_detached() {
     let mut c = Command::new();
     c.args(["whoami"]).elevate().detached();
-    assert!(is_unsupported(super::reject_unsupported_config(&c)));
+    let detail = unsupported_detail(super::reject_unsupported_config(&c));
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
 #[test]
 fn elevation_rejects_breakaway() {
     let mut c = Command::new();
     c.args(["whoami"]).elevate().breakaway_from_job();
-    assert!(is_unsupported(super::reject_unsupported_config(&c)));
+    let detail = unsupported_detail(super::reject_unsupported_config(&c));
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
 /// The one flag intent that survives the gate — which is the whole of the elevated half of the

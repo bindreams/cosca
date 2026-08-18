@@ -257,7 +257,6 @@ impl Command {
     ///
     /// A child that would not have had a console anyway — a windows-subsystem image, for
     /// instance — needs no suppression and is not an error; the request is already satisfied.
-    /// Nothing is logged either.
     ///
     /// # Consequence for cooperative shutdown
     ///
@@ -344,7 +343,7 @@ impl Command {
     ///
     /// | Flag | Why reserved | Instead |
     /// | --- | --- | --- |
-    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none yet |
+    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none; a suspended-spawn window is being designed in [cosca#49](https://github.com/bindreams/cosca/issues/49) |
     /// | `CREATE_NEW_PROCESS_GROUP` | load-bearing for `CTRL_BREAK` delivery to the contained root | [`contain`](Self::contain) |
     /// | `CREATE_NEW_CONSOLE` | measured: the child gets its own *visible* console window, overriding a requested window suppression | none |
     /// | `CREATE_UNICODE_ENVIRONMENT` | both backends supply it structurally, so a caller can neither set nor clear it meaningfully | none |

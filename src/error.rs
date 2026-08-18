@@ -166,6 +166,19 @@ pub enum Error {
     },
 }
 
+/// Test-only: assert a user-facing `detail` carries no run of two or more spaces.
+///
+/// A hard-wrapped string literal that loses its `\` line-continuation bakes the source
+/// indentation into the value, and both a variant match and a substring check read right past
+/// it. This is the one assertion that sees it.
+#[cfg(test)]
+pub(crate) fn assert_detail_is_not_hard_wrapped(detail: &str) {
+    assert!(
+        !detail.contains("  "),
+        "a run of two or more spaces means a hard-wrapped literal lost its `\\` continuation: {detail:?}"
+    );
+}
+
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;

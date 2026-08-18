@@ -129,7 +129,8 @@ fn assert_false_success(expected_containment: Containment, configure: impl Fn(&m
     assert_eq!(
         child.graceful_mechanism(),
         GracefulMechanism::OtherConsoleGroup,
-        "cosca's honest report of the route; a derivation reading only the containment half of          the creation-flag word says ConsoleGroup here"
+        "cosca's honest report of the route; a derivation reading only the containment half of \
+         the creation-flag word says ConsoleGroup here"
     );
 
     child
@@ -140,7 +141,8 @@ fn assert_false_success(expected_containment: Containment, configure: impl Fn(&m
     assert_eq!(
         status.code(),
         Some(0),
-        "the child exited on OUR release byte, so the cooperative op delivered nothing; a          delivered break would have ended it with STATUS_CONTROL_C_EXIT ({STATUS_CONTROL_C_EXIT})"
+        "the child exited on OUR release byte, so the cooperative op delivered nothing; a \
+         delivered break would have ended it with STATUS_CONTROL_C_EXIT ({STATUS_CONTROL_C_EXIT})"
     );
     drop(sock);
 

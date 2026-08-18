@@ -350,9 +350,9 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// Windows can honour.
 ///
 /// Fallible only on Windows, where the composed creation-flag word may name a reserved bit. The
-/// composition runs at the very top, before anything is mutated, so a refusal leaves nothing to
-/// unwind — and above the uncontained early return, which is what used to drop a caller's flags
-/// on an uncontained spawn.
+/// composition runs at the very top — before anything is mutated, so a refusal leaves nothing to
+/// unwind, and above the uncontained early return, so an uncontained spawn carries the caller's
+/// flags too.
 pub(crate) fn prepare(
     std_cmd: &mut std::process::Command,
     req: &ContainRequest,
@@ -483,10 +483,9 @@ pub(crate) fn prepare(
         None
     };
 
-    // Windows: stop the child inheriting this process's std handles. Gated on containment
-    // exactly as before, and below the composition above so a refused spawn has mutated nothing.
-    // The creation-flag word itself is applied at the top, since an uncontained spawn never
-    // reaches this point.
+    // Windows: stop the child inheriting this process's std handles. Contained spawns only, and
+    // below the composition above so a refused spawn has mutated nothing. The creation-flag word
+    // itself is applied at the top, since an uncontained spawn never reaches this point.
     #[cfg(windows)]
     crate::containment::windows::clear_std_handle_inheritance();
 

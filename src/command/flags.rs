@@ -102,9 +102,10 @@ fn reserved_table() -> [Reserved; 10] {
         Reserved {
             bit: CREATE_SUSPENDED.0,
             name: "CREATE_SUSPENDED",
-            remedy: "no replacement yet: cosca suspends and resumes a contained root itself, so a \
-                     caller's suspend would be resumed silently on a contained spawn and never \
-                     resumed at all on an uncontained one",
+            remedy: "no replacement today, a suspended-spawn window is being designed in cosca#49: \
+                     cosca suspends and resumes a contained root itself, so a caller's suspend \
+                     would be resumed silently on a contained spawn and never resumed at all on \
+                     an uncontained one",
         },
         Reserved {
             bit: DETACHED_PROCESS.0,
@@ -193,7 +194,9 @@ pub(crate) fn windows_spawn(
         return Err(Error::Unsupported {
             op: "breakaway_from_job() with contain()".into(),
             platform: "windows",
-            detail: "cosca's containment is a job object the child must be inside for the tree                      teardown it reports to be true, and a nested contained spawn's containment IS                      inheriting the ancestor's job. Drop one of the two."
+            detail: "cosca's containment is a job object the child must be inside for the tree \
+                     teardown it reports to be true, and a nested contained spawn's containment IS \
+                     inheriting the ancestor's job. Drop one of the two."
                 .into(),
         });
     }
@@ -268,7 +271,15 @@ pub(crate) fn classify_spawn_denial(
         return err;
     }
     Error::Containment {
-        detail: "the spawn was refused with ACCESS_DENIED, and this process's job object sets                  neither JOB_OBJECT_LIMIT_BREAKAWAY_OK nor JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,                  so it forbids the breakaway_from_job() this spawn requested. Windows evaluates                  that check before it resolves the image, so this is the FIRST thing refused and                  not necessarily the only problem: dropping the request may reveal a different                  failure rather than making the spawn work. Only whoever created that job can                  permit breakaway — and if this process was itself spawned by cosca with                  contain(), the job is cosca's own, which sets neither limit and whose limits a                  member process cannot relax."
+        detail: "the spawn was refused with ACCESS_DENIED, and this process's job object sets \
+                 neither JOB_OBJECT_LIMIT_BREAKAWAY_OK nor JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, \
+                 so it forbids the breakaway_from_job() this spawn requested. Windows evaluates \
+                 that check before it resolves the image, so this is the FIRST thing refused and \
+                 not necessarily the only problem: dropping the request may reveal a different \
+                 failure rather than making the spawn work. Only whoever created that job can \
+                 permit breakaway — and if this process was itself spawned by cosca with \
+                 contain(), the job is cosca's own, which sets neither limit and whose limits a \
+                 member process cannot relax."
             .into(),
     }
 }

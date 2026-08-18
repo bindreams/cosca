@@ -74,8 +74,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let is_root = !crate::containment::dispatch::is_nested(marker_present);
     // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
     // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
-    // must not have mutated the parent. The gate itself is unchanged — the call stays inside the
-    // containment condition, only below the refusal.
+    // must not have mutated the parent.
     let plan = crate::command::flags::windows_spawn(
         &req,
         *cmd.flags_request(),

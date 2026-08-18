@@ -41,8 +41,8 @@ fn refusal(flags: FlagsRequest) -> String {
     }
 }
 
-/// A caller's raw word reaches an uncontained spawn untouched. This is also the shape
-/// `prepare`'s `mode.is_none()` early return used to drop entirely.
+/// A caller's raw word reaches an uncontained spawn untouched — the shape `prepare` composes
+/// the word for above its `mode.is_none()` early return.
 #[test]
 fn an_uncontained_std_request_carries_only_the_callers_flags() {
     let flags = FlagsRequest {
@@ -146,7 +146,8 @@ fn an_uncontained_word_ignores_is_root() {
 /// passed `0x0800_0000` should not have to look up which flag that was.
 ///
 /// The list is written out here rather than read from the production table, so dropping a row
-/// from that table fails this test instead of silently un-reserving a bit.
+/// from that table fails this test instead of silently un-reserving a bit. The length equality
+/// closes the other direction: a row ADDED to that table cannot land uncovered.
 #[test]
 fn each_reserved_bit_is_refused_by_name() {
     let reserved = [
@@ -159,7 +160,13 @@ fn each_reserved_bit_is_refused_by_name() {
         (CREATE_UNICODE_ENVIRONMENT.0, "CREATE_UNICODE_ENVIRONMENT"),
         (EXTENDED_STARTUPINFO_PRESENT.0, "EXTENDED_STARTUPINFO_PRESENT"),
         (CREATE_BREAKAWAY_FROM_JOB.0, "CREATE_BREAKAWAY_FROM_JOB"),
+        (CREATE_NO_WINDOW.0, "CREATE_NO_WINDOW"),
     ];
+    assert_eq!(
+        reserved.len(),
+        super::reserved_table().len(),
+        "mirror every production reserved row here, or the new one ships untested"
+    );
     for (bit, name) in reserved {
         let detail = refusal(FlagsRequest {
             raw: bit,
@@ -268,10 +275,10 @@ fn breakaway_with_containment_is_refused() {
     for is_root in [true, false] {
         let err = windows_spawn(&contained(), breakaway(), is_root, SpawnBackend::Std)
             .expect_err("breakaway plus containment is refused");
-        assert!(
-            matches!(err, Error::Unsupported { .. }),
-            "is_root={is_root}: got {err:?}"
-        );
+        let Error::Unsupported { detail, .. } = &err else {
+            panic!("is_root={is_root}: got {err:?}");
+        };
+        crate::error::assert_detail_is_not_hard_wrapped(detail);
     }
 }
 
@@ -291,6 +298,7 @@ fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
         assert!(detail.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"), "{detail}");
         assert!(detail.contains("breakaway_from_job()"), "{detail}");
         assert!(detail.contains("FIRST"), "{detail}");
+        crate::error::assert_detail_is_not_hard_wrapped(&detail);
     }
 }
 
@@ -332,6 +340,29 @@ fn an_unrelated_failure_code_is_never_reclassified() {
         let out = super::classify_spawn_denial(io_err(not_found), breakaway(), job);
         assert!(matches!(out, Error::Io(_)), "{job:?}: got {out:?}");
     }
+}
+
+/// The classifier's opening `let-else` returns every non-`Io` error unchanged, in the one
+/// configuration that would otherwise rewrite it — a breakaway request plus a forbidding job. A
+/// broadening of that pattern would reclassify one error kind as another in silence.
+#[test]
+fn a_non_io_error_is_returned_unchanged() {
+    let out = super::classify_spawn_denial(
+        Error::Unsupported {
+            op: "some op".into(),
+            platform: "windows",
+            detail: "some detail".into(),
+        },
+        breakaway(),
+        JobBreakaway::Forbidden,
+    );
+    let Error::Unsupported { op, platform, detail } = &out else {
+        panic!("a non-Io error must pass through unchanged, got {out:?}");
+    };
+    assert_eq!(
+        (op.as_str(), *platform, detail.as_str()),
+        ("some op", "windows", "some detail")
+    );
 }
 
 /// The other half: an access-denied spawn with NO breakaway request is never blamed on a job.

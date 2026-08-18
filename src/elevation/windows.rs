@@ -158,19 +158,24 @@ pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
     if flags.detached {
         return unsupported(
             "detached() + elevate on Windows",
-            "the runas launch takes a show-command and no creation flags, so DETACHED_PROCESS              cannot be expressed. Elevate without it, or spawn unelevated.",
+            "the runas launch takes a show-command and no creation flags, so DETACHED_PROCESS \
+             cannot be expressed. Elevate without it, or spawn unelevated.",
         );
     }
     if flags.breakaway_from_job {
         return unsupported(
             "breakaway_from_job() + elevate on Windows",
-            "the runas launch takes a show-command and no creation flags, so              CREATE_BREAKAWAY_FROM_JOB cannot be expressed — and the runas child is created by a              system service, not by this process's job.",
+            "the runas launch takes a show-command and no creation flags, so \
+             CREATE_BREAKAWAY_FROM_JOB cannot be expressed — and the runas child is created by a \
+             system service, not by this process's job.",
         );
     }
     if flags.raw != 0 {
         return unsupported(
             "creation_flags() + elevate on Windows",
-            "the runas launch takes a show-command and no creation flags, so an arbitrary              dwCreationFlags word cannot be expressed. no_window() is the one flag intent that              survives here, lowered to the launch's show-command.",
+            "the runas launch takes a show-command and no creation flags, so an arbitrary \
+             dwCreationFlags word cannot be expressed. no_window() is the one flag intent that \
+             survives here, lowered to the launch's show-command.",
         );
     }
     Ok(())
