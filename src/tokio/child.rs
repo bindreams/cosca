@@ -90,12 +90,19 @@ impl Child {
             Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
         )
     }
-    /// Blocking kill-then-reap used by the POSIX spawn-error cleanup path (a sync context — no
-    /// reactor `await` available), delegating to the same per-backend primitive `Drop` uses.
+    /// Blocking reap used by the POSIX spawn-error cleanup path (a sync context — no reactor
+    /// `await` available).
+    ///
+    /// **Wait-only, and the caller must already have killed successfully** — that kill is the
+    /// precondition that bounds this wait. Killing again here would gate the wait on the second
+    /// kill's result, and a second kill of an elevated child can be refused (it drops to root
+    /// mid-teardown, and a zombie keeps the credentials it died with), so the reap would be
+    /// skipped on the ordinary success path.
+    ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
-    pub(super) fn reap_blocking(&mut self) {
-        self.proc.reap_now_on_drop(self.id.pid());
+    pub(super) fn wait_and_reap_blocking(&mut self) {
+        self.proc.wait_and_reap(self.id.pid());
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -577,6 +584,10 @@ impl Child {
 mod child_drop_tests;
 
 #[cfg(test)]
+#[path = "child_reap_tests.rs"]
+mod child_reap_tests;
+
+#[cfg(test)]
 #[path = "child_wait_tree_tests.rs"]
 mod child_wait_tree_tests;
 
@@ -617,14 +628,10 @@ impl Drop for Child {
     }
 }
 
-/// Guaranteed synchronous teardown, shared by `Drop` and the spawn error path: kill the child,
-/// then block until it has exited. On Unix we wait with `WNOWAIT` (NOT reaping), so tokio's own
-/// `Child` field-drop reaps the zombie synchronously in its drop (its `try_wait` returns
-/// `Ok(Some)`, not a park-dependent orphan enqueue) — a guaranteed reap before `Drop` returns.
-/// We only wait while tokio still owns the child (`id().is_some()`), which pins the pid; once
-/// tokio is `Done` (a prior `wait()` reaped it), the pid may be recycled and we must not wait on
-/// it. `done_ok` says whether an already-`Done` child is legal here: `true` for `Drop` (the user
-/// may have `wait()`ed), `false` for the spawn-error path (the child was never awaited).
+/// Guaranteed synchronous teardown for `Drop`: kill the child, then block until it has exited.
+/// The kill here is what bounds the wait, so a caller that has ALREADY killed must use
+/// [`wait_and_reap`] instead — re-killing would make its reap conditional on a second kill that
+/// can be refused.
 /// **Invariant:** no `wait()` future for this child is in flight when this runs.
 pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
     // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
@@ -637,12 +644,27 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
     if killed.is_err() {
         return;
     }
+    wait_and_reap(child, pid, done_ok);
+}
+
+/// The wait-then-reap half of [`reap_now`], with **no kill of its own**: the caller's own
+/// successful kill is the precondition that bounds this wait.
+///
+/// On Unix we wait with `WNOWAIT` (NOT reaping), so tokio's own `Child` field-drop reaps the
+/// zombie synchronously in its drop (its `try_wait` returns `Ok(Some)`, not a park-dependent
+/// orphan enqueue) — a guaranteed reap before the handle is gone. We only wait while tokio still
+/// owns the child (`id().is_some()`), which pins the pid; once tokio is `Done` (a prior `wait()`
+/// reaped it), the pid may be recycled and we must not wait on it. `done_ok` says whether an
+/// already-`Done` child is legal here: `true` for `Drop` (the user may have `wait()`ed), `false`
+/// for a caller whose child was never awaited.
+/// **Invariant:** no `wait()` future for this child is in flight when this runs.
+pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
     // tokio `Done` ⇒ already reaped, pid possibly recycled ⇒ nothing to do (the recycled-pid wait
     // hazard the sync side avoids by holding a handle).
     if child.id().is_none() {
         debug_assert!(
             done_ok,
-            "reap_now found an already-reaped child where one was impossible"
+            "wait_and_reap found an already-reaped child where one was impossible"
         );
         return;
     }
@@ -666,7 +688,7 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
             }
             // id() was Some above (tokio un-reaped ⇒ pid pinned), so no ECHILD / other errno should
             // occur — a debug tripwire, with a safe release `break`.
-            debug_assert!(false, "waitid in reap_now failed unexpectedly: {err}");
+            debug_assert!(false, "waitid in wait_and_reap failed unexpectedly: {err}");
             break;
         }
     }
@@ -677,11 +699,11 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
         let _ = pid;
         let h = child.raw_handle().expect("tokio owns the handle while id() is Some");
         // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
-        // INFINITE is bounded by `start_kill` above.
+        // INFINITE is bounded by the kill the caller already issued.
         let waited = unsafe { WaitForSingleObject(HANDLE(h), INFINITE) };
         debug_assert!(
             waited == WAIT_OBJECT_0,
-            "reap_now did not observe the child's exit: {waited:?}"
+            "wait_and_reap did not observe the child's exit: {waited:?}"
         );
     }
 }

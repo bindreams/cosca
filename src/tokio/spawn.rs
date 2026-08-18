@@ -79,12 +79,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                         // Do NOT orphan the running elevated child on a genuine write failure:
                         // kill + reap, folding the teardown outcome into the error detail. A
                         // successful kill() (SIGKILL, uncatchable) is followed by a BLOCKING reap
-                        // (try_wait cannot reap a just-killed child, so it would leak a zombie); an
-                        // Err kill() (e.g. Unkillable) can't be reaped, so fall back to a
-                        // non-blocking try_wait() and note the child may still be running.
+                        // (try_wait cannot reap a just-killed child, so it would leak a zombie),
+                        // which waits only — this kill is what bounds it; an Err kill() (e.g.
+                        // Unkillable) can't be reaped, so fall back to a non-blocking try_wait()
+                        // and note the child may still be running.
                         let kill_note = match child.kill() {
                             Ok(()) => {
-                                child.reap_blocking();
+                                child.wait_and_reap_blocking();
                                 "the elevated child was terminated".to_string()
                             }
                             Err(e) => {

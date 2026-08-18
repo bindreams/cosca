@@ -97,6 +97,22 @@ impl ProcSource {
         }
     }
 
+    /// Block until the child has exited, then let the backend reap it. **Never kills** — the
+    /// caller's own successful kill is what bounds the wait.
+    /// **Invariant:** no `wait()` future for this child is in flight when this runs.
+    ///
+    /// Unix-only, so it needs no `Raw` arm: that backend exists only on Windows, and the sole
+    /// caller ([`Child::wait_and_reap_blocking`](super::Child::wait_and_reap_blocking)) is the
+    /// POSIX elevated-spawn cleanup path. That child was never awaited, so `done_ok` is `false`
+    /// (matching the other never-awaited callers): an already-reaped one is a broken precondition,
+    /// not a case to return quietly from — which is the shape this entry exists to remove.
+    #[cfg(unix)]
+    pub(crate) fn wait_and_reap(&mut self, pid: u32) {
+        match self {
+            ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false),
+        }
+    }
+
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —
     /// the observer seam exists solely for the raw async wait path.
     #[cfg(all(test, windows))]
