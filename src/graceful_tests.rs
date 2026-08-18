@@ -38,6 +38,35 @@ fn signal_refuses_a_child_with_no_mechanism() {
     assert!(detail.contains("contain"), "the refusal must name the remedy: {detail}");
 }
 
+// `OtherConsoleGroup` shares `ConsoleGroup`'s arm — the flag word says the child's group lives
+// in another console, but a child may re-attach to ours after it starts, so the signal is
+// attempted rather than refused. No spawn through the public containment API can carry this
+// mechanism (the flag words emitted never produce it), so the dispatcher is the only place the
+// routing can be pinned at all. `Ok` is what separates the two worlds: the `Unsupported` arms
+// refuse, and `wait::terminate` — the only other path out of `signal` — is itself `Unsupported`
+// on Windows.
+#[cfg(windows)]
+#[test]
+fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
+    let mut cmd = crate::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn");
+    let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.id());
+    let group = super::signal(GracefulMechanism::ConsoleGroup, child.id());
+    assert!(
+        other.is_ok(),
+        "OtherConsoleGroup must be attempted, not refused: {other:?}"
+    );
+    assert_eq!(
+        other.is_ok(),
+        group.is_ok(),
+        "the two console mechanisms must take one path: {other:?} vs {group:?}"
+    );
+    let _ = child.kill_tree();
+    let _ = child.wait();
+}
+
 // The dispatcher's half of `uac_elevated_attachment_has_no_in_process_route`, which pins only
 // the recorded constant. The subject is a live contained child of OUR own, whose group a
 // wrongly-routed event really would reach: a dispatcher that fired at it returns `Ok` (or the
