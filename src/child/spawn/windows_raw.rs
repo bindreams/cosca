@@ -149,6 +149,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
             &env_block,
             &cwd_w,
             flags,
+            *cmd.flags_request(),
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
         drop(attr); // DeleteProcThreadAttributeList before the guard releases
@@ -226,6 +227,9 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 /// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
 /// can close the child ends + attribute list before releasing the spawn lock on either arm.
 /// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
+// `CreateProcessW`'s own parameter list, plus the request its failure is classified against.
+// Bundling them would only rename the same values one call site deep.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_step(
     handles: &[HANDLE],
     app: Option<&[u16]>,
@@ -234,11 +238,15 @@ pub(crate) fn spawn_step(
     env: &Option<Vec<u16>>,
     cwd: &Option<Vec<u16>>,
     flags: u32,
+    request: crate::command::flags::FlagsRequest,
 ) -> Result<(OwnedHandle, u32), Error> {
     for &h in handles {
         set_inherit(h)?;
     }
+    // Only the syscall's own Result is classified — the inherit loop above stays outside, since
+    // an access-denied from `SetHandleInformation` is not a breakaway denial.
     proc::create_process(app, cmdline, si, env, cwd, flags)
+        .map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, request))
 }
 
 /// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn

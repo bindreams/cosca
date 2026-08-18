@@ -361,6 +361,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
             &env_block,
             &cwd_w,
             flags,
+            *cmd.flags_request(),
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
         drop(attr); // DeleteProcThreadAttributeList before the guard releases

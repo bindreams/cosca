@@ -288,6 +288,38 @@ impl Command {
         self
     }
 
+    /// Spawn the child with `CREATE_BREAKAWAY_FROM_JOB`, so it starts outside whatever job object
+    /// this process belongs to.
+    ///
+    /// The bit is emitted from the request alone — cosca never reads the ambient job first. A
+    /// pre-spawn reading could go stale in the gap, and omitting the bit on a "not in a job"
+    /// reading would silently leave the child in a job the caller asked it to escape. Where the
+    /// ambient job forbids breakaway the OS refuses the spawn, and that refusal is classified
+    /// afterwards as [`Error::Containment`](crate::error::Error::Containment).
+    ///
+    /// # What it does not promise
+    ///
+    /// - Breakaway leaves the immediate job and each job up the parent chain **until one forbids
+    ///   it**, so under nesting the child can still end up inside an ancestor job. cosca does not
+    ///   promise the child ends up in no job at all.
+    /// - **It cannot succeed from inside a cosca-contained tree.** cosca's own containment job
+    ///   sets neither breakaway limit, and a member process cannot relax the limits of the job
+    ///   that holds it — so for a child that was itself spawned by cosca with
+    ///   [`contain`](Self::contain), this request can only fail.
+    /// - The resulting error names the **first** thing the OS refused. The breakaway denial is
+    ///   evaluated before the image is resolved, so removing the request may reveal a different
+    ///   failure rather than making the spawn work.
+    ///
+    /// Combining it with any `contain*()` is [`Error::Unsupported`](crate::error::Error::Unsupported):
+    /// a nested contained spawn's containment IS "the child inherits the ancestor's job", and
+    /// breaking away from it would leave cosca reporting a teardown owner that no longer owns
+    /// anything.
+    #[cfg(windows)]
+    pub fn breakaway_from_job(&mut self) -> &mut Command {
+        self.flags.breakaway_from_job = true;
+        self
+    }
+
     /// Add arbitrary bits to this spawn's `dwCreationFlags`, for flags cosca does not name.
     ///
     /// **Replaces, it does not accumulate** — matching

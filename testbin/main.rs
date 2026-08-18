@@ -12,6 +12,11 @@ use std::process::exit;
 #[path = "console_identity.rs"]
 mod console_identity;
 
+/// The `report-breakaway` mode: job-object shapes and the three spawn vehicles.
+#[cfg(windows)]
+#[path = "breakaway.rs"]
+mod breakaway;
+
 /// Borrow a std stream's raw descriptor as an UNBUFFERED `File`. `ManuallyDrop` keeps the
 /// real descriptor open (a plain `File` drop would close it — double-close on exit).
 /// Callers must pass one of this process's std descriptors, which live for the whole run.
@@ -866,6 +871,10 @@ fn main() {
             .unwrap();
             report_sock.write_all(line.as_bytes()).unwrap();
             report_sock.flush().unwrap();
+        }
+        #[cfg(windows)]
+        "report-breakaway" => {
+            breakaway::run(&args[2], &args[3], &args[4]);
         }
         #[cfg(windows)]
         "report-console-identity" => {

@@ -125,6 +125,15 @@ impl Command {
         self
     }
 
+    /// Spawn outside this process's job object — mirrors
+    /// [`breakaway_from_job`](crate::Command::breakaway_from_job), including everything it does
+    /// not promise.
+    #[cfg(windows)]
+    pub fn breakaway_from_job(&mut self) -> &mut Command {
+        self.inner.breakaway_from_job();
+        self
+    }
+
     /// Add arbitrary `dwCreationFlags` bits — mirrors
     /// [`creation_flags`](crate::Command::creation_flags), including its reserved-bit table and
     /// its replace-not-accumulate semantics.

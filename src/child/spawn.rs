@@ -267,7 +267,13 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // own handle-inheritance marking must not overlap a raw spawn on another thread.
         let c = {
             let _guard = spawn_lock();
-            std_cmd.spawn().map_err(Error::Io)?
+            // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
+            // resolution or the post-spawn attach has nothing to do with a breakaway request.
+            let spawned = std_cmd.spawn().map_err(Error::Io);
+            #[cfg(windows)]
+            let spawned =
+                spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+            spawned?
         };
         (prepared, c)
     };

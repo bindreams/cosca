@@ -65,6 +65,7 @@ pub(crate) enum SpawnBackend {
 
 /// Everything cosca decided about a Windows spawn before it happens.
 #[cfg(windows)]
+#[derive(Debug)]
 pub(crate) struct WindowsSpawn {
     /// The complete word cosca supplies to the backend — see the module doc for why that is not
     /// the word the OS receives.
@@ -183,6 +184,21 @@ pub(crate) fn windows_spawn(
         });
     }
 
+    // Pure, so there is no staleness to race: both operands are recorded on the builder. For a
+    // NESTED contained spawn cosca's containment IS "the child inherits the ancestor's job", and
+    // breaking away leaves it while `Containment::Delegated` still claims the root will tear it
+    // down — a report that is simply false. A root contained spawn is arguably safe, but making
+    // the verdict depend on root-ness would mean the identical `Command` succeeds in one process
+    // and fails in a nested one.
+    if flags.breakaway_from_job && contain.mode.is_some() {
+        return Err(Error::Unsupported {
+            op: "breakaway_from_job() with contain()".into(),
+            platform: "windows",
+            detail: "cosca's containment is a job object the child must be inside for the tree                      teardown it reports to be true, and a nested contained spawn's containment IS                      inheriting the ancestor's job. Drop one of the two."
+                .into(),
+        });
+    }
+
     let setup = crate::containment::dispatch::windows_contain_setup(contain, is_root);
     let mut creation_flags = setup.creation_flags | flags.raw;
     if flags.no_window {
@@ -204,6 +220,69 @@ pub(crate) fn windows_spawn(
         creation_flags,
         marker_env: setup.marker_env,
     })
+}
+
+/// Classify a Windows spawn-syscall failure. Pure — the OS's error and the ambient job's verdict
+/// are both parameters — so every arm is unit-testable without the OS producing the configuration.
+///
+/// It runs on the error path of a spawn SYSCALL and nowhere else. Everything above a syscall
+/// (stdio resolution, executable resolution, handle-inherit calls, the attribute list, the
+/// post-spawn attach) can fail access-denied for reasons that have nothing to do with a breakaway
+/// request, and the soundness argument below holds only for the error the spawn call itself
+/// returned.
+///
+/// **Why naming the request is sound.** With a forbidding ambient job, an emitted
+/// `CREATE_BREAKAWAY_FROM_JOB` *guarantees* an access-denied failure, so the request is a
+/// sufficient cause of the failure the caller just got — honest even if the image's own ACL would
+/// also have denied the spawn, since fixing the named cause is necessary either way.
+///
+/// **Why the message claims only FIRST.** Measured: the breakaway denial is evaluated before the
+/// image is resolved — a spawn of a path that does not exist, inside a forbidding job, fails
+/// access-denied rather than file-not-found. So a genuine "no such program" is masked, and the
+/// detail says what was measured and stops there.
+///
+/// Two error encodings reach here and both are accepted: the std path returns the bare Win32
+/// code, while the raw backends convert a `windows::core::Error` whose `raw_os_error` is the
+/// HRESULT.
+#[cfg(windows)]
+pub(crate) fn classify_spawn_denial(
+    err: Error,
+    flags: FlagsRequest,
+    job: crate::containment::windows::JobBreakaway,
+) -> Error {
+    use crate::containment::windows::JobBreakaway;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    if !flags.breakaway_from_job {
+        return err;
+    }
+    let Error::Io(io) = &err else {
+        return err;
+    };
+    let win32 = ERROR_ACCESS_DENIED.0 as i32;
+    let hresult = windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0).0;
+    if !matches!(io.raw_os_error(), Some(c) if c == win32 || c == hresult) {
+        return err;
+    }
+    // Never assert a cause the process just measured to be false, or could not measure at all.
+    if job != JobBreakaway::Forbidden {
+        return err;
+    }
+    Error::Containment {
+        detail: "the spawn was refused with ACCESS_DENIED, and this process's job object sets                  neither JOB_OBJECT_LIMIT_BREAKAWAY_OK nor JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,                  so it forbids the breakaway_from_job() this spawn requested. Windows evaluates                  that check before it resolves the image, so this is the FIRST thing refused and                  not necessarily the only problem: dropping the request may reveal a different                  failure rather than making the spawn work. Only whoever created that job can                  permit breakaway — and if this process was itself spawned by cosca with                  contain(), the job is cosca's own, which sets neither limit and whose limits a                  member process cannot relax."
+            .into(),
+    }
+}
+
+/// The one impure adapter, called at the Windows spawn syscalls and nowhere else, so no spawn
+/// path grows a probe call of its own.
+///
+/// The probe therefore runs on every failed Windows spawn syscall, not only breakaway ones. That
+/// is deliberate: two syscalls on an already-failing spawn are irrelevant, and gating the probe
+/// would move part of the decision out of the pure function above and into untested glue.
+#[cfg(windows)]
+pub(crate) fn classify_spawn_syscall_error(err: Error, flags: FlagsRequest) -> Error {
+    classify_spawn_denial(err, flags, crate::containment::windows::probe_job_breakaway())
 }
 
 #[cfg(all(test, windows))]

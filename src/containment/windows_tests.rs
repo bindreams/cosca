@@ -259,3 +259,55 @@ mod mechanism_from_flags_tests {
         assert_eq!(mechanism_from_flags(CREATE_NO_WINDOW.0), GracefulMechanism::None);
     }
 }
+
+// ===== job breakaway probe =====
+
+/// The `Unknown` arm exists so cosca never asserts a cause it could not measure. Neither Win32
+/// call in the probe can be made to fail on a live system, so the seam is the only route to that
+/// arm's production — and without the seam the probe reports a real verdict, which is what makes
+/// this assertion about the arm rather than about the constant.
+#[test]
+fn probe_reports_unknown_when_the_query_fails() {
+    use crate::containment::windows::{fault, probe_job_breakaway, JobBreakaway};
+    assert_ne!(
+        probe_job_breakaway(),
+        JobBreakaway::Unknown,
+        "unarmed, the probe must reach a real verdict"
+    );
+    fault::set_force_job_probe_error(true);
+    assert_eq!(probe_job_breakaway(), JobBreakaway::Unknown);
+    assert_ne!(
+        probe_job_breakaway(),
+        JobBreakaway::Unknown,
+        "take semantics: the fault applies to exactly one call"
+    );
+}
+
+/// A RELATIONSHIP, never an absolute: whether CI runs test processes inside a job object is not
+/// ours to control. It fails if the probe's first branch is inverted, which is the bug that would
+/// make every ambient job read as "no job" and silently disable the typed containment error.
+#[test]
+fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
+    use crate::containment::windows::{probe_job_breakaway, JobBreakaway};
+    use windows::Win32::System::JobObjects::IsProcessInJob;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut in_job = windows::core::BOOL(0);
+    // SAFETY: standard Win32; `in_job` is a valid out-param and `None` asks "in ANY job".
+    unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut in_job) }.expect("IsProcessInJob");
+
+    let verdict = probe_job_breakaway();
+    if in_job.as_bool() {
+        assert_ne!(
+            verdict,
+            JobBreakaway::NotInJob,
+            "this process IS in a job, so the probe must not report otherwise"
+        );
+    } else {
+        assert_eq!(
+            verdict,
+            JobBreakaway::NotInJob,
+            "this process is in no job, so the probe must say so"
+        );
+    }
+}

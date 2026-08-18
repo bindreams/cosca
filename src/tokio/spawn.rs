@@ -353,7 +353,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         // `CreateProcessW` spawn on another thread (mirrors the sync std path).
         let c = {
             let _guard = crate::child::spawn::spawn_lock();
-            tcmd.spawn().map_err(Error::Io)?
+            // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
+            // the wrong domain for this attribution.
+            let spawned = tcmd.spawn().map_err(Error::Io);
+            #[cfg(windows)]
+            let spawned =
+                spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+            spawned?
         };
         (prepared, c)
     };

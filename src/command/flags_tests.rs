@@ -235,3 +235,120 @@ fn the_composed_word_reports_a_different_mechanism_for_each_containment_shape() 
         "window suppression puts the child's group in a console of its own"
     );
 }
+
+// ===== breakaway: the pre-spawn rule and the post-failure classifier =====
+
+use crate::containment::windows::JobBreakaway;
+
+fn breakaway() -> FlagsRequest {
+    FlagsRequest {
+        breakaway_from_job: true,
+        ..Default::default()
+    }
+}
+
+/// `ERROR_ACCESS_DENIED` in the two encodings that reach the classifier: the std path returns the
+/// bare Win32 code, the raw backends convert a `windows::core::Error` whose `raw_os_error` is the
+/// HRESULT. Derived from the documented `HRESULT_FROM_WIN32` mapping, not from this crate's own
+/// output, so a bug in that conversion cannot make the test agree with itself.
+fn access_denied_encodings() -> [i32; 2] {
+    let win32 = windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32;
+    [win32, windows::core::HRESULT::from_win32(win32 as u32).0]
+}
+
+fn io_err(code: i32) -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(code))
+}
+
+/// Breaking away while contained is refused for a ROOT and a NESTED request alike, so the verdict
+/// is order- and root-independent: making it depend on root-ness would mean the identical
+/// `Command` succeeds in one process and fails in a nested one.
+#[test]
+fn breakaway_with_containment_is_refused() {
+    for is_root in [true, false] {
+        let err = windows_spawn(&contained(), breakaway(), is_root, SpawnBackend::Std)
+            .expect_err("breakaway plus containment is refused");
+        assert!(
+            matches!(err, Error::Unsupported { .. }),
+            "is_root={is_root}: got {err:?}"
+        );
+    }
+}
+
+/// F1: with a forbidding ambient job, an emitted breakaway bit GUARANTEES an access-denied
+/// failure, so the request is a sufficient cause of the failure the caller just got.
+///
+/// The detail names the measured limit, the request, and the first-refusal qualifier. It must not
+/// claim the request was the spawn's only problem: the breakaway check runs before the image is
+/// resolved, so a genuine "no such program" is masked by it.
+#[test]
+fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
+    for code in access_denied_encodings() {
+        let out = super::classify_spawn_denial(io_err(code), breakaway(), JobBreakaway::Forbidden);
+        let Error::Containment { detail } = out else {
+            panic!("encoding {code:#x}: expected Containment, got {out:?}");
+        };
+        assert!(detail.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"), "{detail}");
+        assert!(detail.contains("breakaway_from_job()"), "{detail}");
+        assert!(detail.contains("FIRST"), "{detail}");
+    }
+}
+
+/// F2. Measured (Windows 11 26100, 2026-08-18): a silent-breakaway job ACCEPTS the flag, so no
+/// breakaway request can reach the classifier from such a job at all. The verdict exists solely
+/// to stop that job being misread as `Forbidden`, whose message would be wrong about the world —
+/// a silent-breakaway job does not forbid children from leaving, it removes them itself.
+#[test]
+fn the_silent_breakaway_verdict_keeps_the_raw_io_error() {
+    for code in access_denied_encodings() {
+        let out = super::classify_spawn_denial(io_err(code), breakaway(), JobBreakaway::SilentBreakaway);
+        assert!(matches!(out, Error::Io(_)), "encoding {code:#x}: got {out:?}");
+    }
+}
+
+/// F3: the typed variant must never assert a cause the process just measured to be false — nor
+/// one it could not measure at all.
+#[test]
+fn a_contradicted_or_unmeasurable_probe_keeps_the_raw_io_error() {
+    for job in [JobBreakaway::Permitted, JobBreakaway::NotInJob, JobBreakaway::Unknown] {
+        for code in access_denied_encodings() {
+            let out = super::classify_spawn_denial(io_err(code), breakaway(), job);
+            assert!(matches!(out, Error::Io(_)), "{job:?}/{code:#x}: got {out:?}");
+        }
+    }
+}
+
+/// F4: an unrelated failure code stays itself whatever the ambient job looks like.
+#[test]
+fn an_unrelated_failure_code_is_never_reclassified() {
+    let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0 as i32;
+    for job in [
+        JobBreakaway::Forbidden,
+        JobBreakaway::Permitted,
+        JobBreakaway::SilentBreakaway,
+        JobBreakaway::NotInJob,
+        JobBreakaway::Unknown,
+    ] {
+        let out = super::classify_spawn_denial(io_err(not_found), breakaway(), job);
+        assert!(matches!(out, Error::Io(_)), "{job:?}: got {out:?}");
+    }
+}
+
+/// F4, the other half: an access-denied spawn with NO breakaway request is never blamed on a job.
+/// Without this, an unrelated denial would be rewritten into a containment error naming a flag
+/// that was never submitted to anything.
+#[test]
+fn a_spawn_denial_without_a_breakaway_request_is_never_reclassified() {
+    for job in [
+        JobBreakaway::Forbidden,
+        JobBreakaway::Permitted,
+        JobBreakaway::SilentBreakaway,
+        JobBreakaway::NotInJob,
+        JobBreakaway::Unknown,
+    ] {
+        for code in access_denied_encodings() {
+            let out = super::classify_spawn_denial(io_err(code), FlagsRequest::default(), job);
+            assert!(matches!(out, Error::Io(_)), "{job:?}/{code:#x}: got {out:?}");
+        }
+    }
+}
