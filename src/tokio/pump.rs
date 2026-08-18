@@ -62,7 +62,7 @@ impl Child {
         };
         // `wait` is the sole borrow of `self` here (already mapped to `Error`); the stream futures
         // own their taken locals, so the four-future join has no aliasing conflict.
-        let wait = async { self.proc.wait().await };
+        let wait = async { self.proc.as_mut().expect(super::child::PROC_TAKEN).wait().await };
 
         let ((), out, err, status) = ::tokio::try_join!(write, read_out, read_err, wait)?;
         Ok(Output {

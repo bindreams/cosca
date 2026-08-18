@@ -27,10 +27,16 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 #[cfg(windows)]
 pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 
+/// `proc` is `Some` for the handle's whole life: only [`Drop`] takes it, and nothing else runs
+/// on the handle after that.
+pub(super) const PROC_TAKEN: &str = "the async child's process backend is taken only by Drop";
+
 #[derive(Debug)]
 pub struct Child {
     // `pub(super)`: the sibling `pump` module borrows the backend for `communicate`'s `wait` future.
-    pub(super) proc: ProcSource,
+    // `Option` because `Drop` takes `&mut self` and cannot move the backend out otherwise; the
+    // taken state is in the type system rather than in a `ManuallyDrop` the compiler cannot check.
+    pub(super) proc: Option<ProcSource>,
     id: ProcessId,
     attached: Attached,
     kill_on_drop: bool,
@@ -60,7 +66,7 @@ impl Child {
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
-            proc,
+            proc: Some(proc),
             id,
             attached: attachment.attached,
             kill_on_drop,
@@ -95,7 +101,7 @@ impl Child {
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
     pub(super) fn reap_blocking(&mut self) {
-        self.proc.reap_now_on_drop(self.id.pid());
+        self.proc.as_mut().expect(PROC_TAKEN).reap_now_on_drop(self.id.pid());
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -118,25 +124,37 @@ impl Child {
         if let Some(owned) = self.take_owned_in(crate::stdio::Fd::STDIN) {
             return Some(super::stdio::ChildStdin { inner: owned });
         }
-        self.proc.take_stdin().map(|s| super::stdio::ChildStdin {
-            inner: super::stdio::InInner::Tokio(s),
-        })
+        self.proc
+            .as_mut()
+            .expect(PROC_TAKEN)
+            .take_stdin()
+            .map(|s| super::stdio::ChildStdin {
+                inner: super::stdio::InInner::Tokio(s),
+            })
     }
     pub fn stdout(&mut self) -> Option<super::stdio::ChildStdout> {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDOUT) {
             return Some(super::stdio::ChildStdout { inner: owned });
         }
-        self.proc.take_stdout().map(|s| super::stdio::ChildStdout {
-            inner: super::stdio::OutInner::Stdout(s),
-        })
+        self.proc
+            .as_mut()
+            .expect(PROC_TAKEN)
+            .take_stdout()
+            .map(|s| super::stdio::ChildStdout {
+                inner: super::stdio::OutInner::Stdout(s),
+            })
     }
     pub fn stderr(&mut self) -> Option<super::stdio::ChildStderr> {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDERR) {
             return Some(super::stdio::ChildStderr { inner: owned });
         }
-        self.proc.take_stderr().map(|s| super::stdio::ChildStderr {
-            inner: super::stdio::OutInner::Stderr(s),
-        })
+        self.proc
+            .as_mut()
+            .expect(PROC_TAKEN)
+            .take_stderr()
+            .map(|s| super::stdio::ChildStderr {
+                inner: super::stdio::OutInner::Stderr(s),
+            })
     }
 
     /// Take the stashed our-owned read end of an Out-direction merge target (plain
@@ -350,11 +368,11 @@ impl Child {
     /// Block until the child exits, returning its status. For a bounded wait use
     /// `tokio::time::timeout(d, child.wait())`.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
-        self.proc.wait().await
+        self.proc.as_mut().expect(PROC_TAKEN).wait().await
     }
     /// Exit status if the child has already exited (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
-        self.proc.try_wait()
+        self.proc.as_mut().expect(PROC_TAKEN).try_wait()
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
@@ -364,7 +382,7 @@ impl Child {
     pub fn kill(&mut self) -> Result<(), Error> {
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc.start_kill() {
+        match self.proc.as_mut().expect(PROC_TAKEN).start_kill() {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             other => other,
         }
@@ -484,7 +502,7 @@ impl Child {
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]
-        if !self.proc.pins_pid() {
+        if !self.proc.as_ref().expect(PROC_TAKEN).pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate_tree"));
         }
         // See kill_tree's identical precondition assert for the full rationale, including the
@@ -589,7 +607,10 @@ impl Child {
         started: ::tokio::sync::oneshot::Sender<()>,
         outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
     ) {
-        self.proc.install_wait_observer(started, outcome);
+        self.proc
+            .as_mut()
+            .expect(PROC_TAKEN)
+            .install_wait_observer(started, outcome);
     }
 }
 
@@ -613,7 +634,7 @@ impl Drop for Child {
         // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend
         // (tokio field-drop reap vs the raw handle's kill-then-wait).
         let pid = self.id.pid();
-        self.proc.reap_now_on_drop(pid);
+        self.proc.as_mut().expect(PROC_TAKEN).reap_now_on_drop(pid);
     }
 }
 

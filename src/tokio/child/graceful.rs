@@ -74,7 +74,7 @@ impl Child {
     pub fn terminate(&self) -> Result<(), Error> {
         let mechanism = self.graceful_mechanism();
         #[cfg(windows)]
-        if mechanism.addresses_a_bare_pid() && !self.proc.pins_pid() {
+        if mechanism.addresses_a_bare_pid() && !self.proc.as_ref().expect(super::PROC_TAKEN).pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate"));
         }
         crate::graceful::signal(mechanism, self.id())
