@@ -268,6 +268,13 @@ impl Command {
     /// route is reported per child by
     /// [`Child::graceful_mechanism`](crate::Child::graceful_mechanism); it is a statement about
     /// the route, never an authority on whether a signal will arrive.
+    ///
+    /// This is not "such a child cannot be shut down politely" — a process attached to the child's
+    /// own console can deliver the event. Nor does cosca report an error for one: the cooperative
+    /// ops ([`terminate`](crate::Child::terminate),
+    /// [`terminate_tree`](crate::Child::terminate_tree)) return `Ok` and deliver nothing, which is
+    /// the gap this crate documents rather than the behaviour it wants. The forced ops
+    /// ([`kill`](crate::Child::kill) / [`kill_tree`](crate::Child::kill_tree)) are unaffected.
     pub fn no_window(&mut self) -> &mut Command {
         self.flags.no_window = true;
         self
@@ -281,7 +288,8 @@ impl Command {
     ///
     /// Same one-directional console consequence as [`no_window`](Self::no_window): a
     /// console-group signal sent from this process cannot reach such a child, while *not*
-    /// detaching establishes nothing about the reverse.
+    /// detaching establishes nothing about the reverse — and the cooperative ops return `Ok` and
+    /// deliver nothing rather than reporting an error.
     #[cfg(windows)]
     pub fn detached(&mut self) -> &mut Command {
         self.flags.detached = true;

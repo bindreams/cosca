@@ -275,7 +275,7 @@ fn breakaway_with_containment_is_refused() {
     }
 }
 
-/// F1: with a forbidding ambient job, an emitted breakaway bit GUARANTEES an access-denied
+/// With a forbidding ambient job, an emitted breakaway bit GUARANTEES an access-denied
 /// failure, so the request is a sufficient cause of the failure the caller just got.
 ///
 /// The detail names the measured limit, the request, and the first-refusal qualifier. It must not
@@ -294,7 +294,7 @@ fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
     }
 }
 
-/// F2. Measured (Windows 11 26100, 2026-08-18): a silent-breakaway job ACCEPTS the flag, so no
+/// Measured (Windows 11 26100, 2026-08-18): a silent-breakaway job ACCEPTS the flag, so no
 /// breakaway request can reach the classifier from such a job at all. The verdict exists solely
 /// to stop that job being misread as `Forbidden`, whose message would be wrong about the world —
 /// a silent-breakaway job does not forbid children from leaving, it removes them itself.
@@ -306,7 +306,7 @@ fn the_silent_breakaway_verdict_keeps_the_raw_io_error() {
     }
 }
 
-/// F3: the typed variant must never assert a cause the process just measured to be false — nor
+/// The typed variant must never assert a cause the process just measured to be false — nor
 /// one it could not measure at all.
 #[test]
 fn a_contradicted_or_unmeasurable_probe_keeps_the_raw_io_error() {
@@ -318,7 +318,7 @@ fn a_contradicted_or_unmeasurable_probe_keeps_the_raw_io_error() {
     }
 }
 
-/// F4: an unrelated failure code stays itself whatever the ambient job looks like.
+/// An unrelated failure code stays itself whatever the ambient job looks like.
 #[test]
 fn an_unrelated_failure_code_is_never_reclassified() {
     let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0 as i32;
@@ -334,7 +334,7 @@ fn an_unrelated_failure_code_is_never_reclassified() {
     }
 }
 
-/// F4, the other half: an access-denied spawn with NO breakaway request is never blamed on a job.
+/// The other half: an access-denied spawn with NO breakaway request is never blamed on a job.
 /// Without this, an unrelated denial would be rewritten into a containment error naming a flag
 /// that was never submitted to anything.
 #[test]
