@@ -323,3 +323,96 @@ async fn pool_width_follows_its_bound() {
         release_and_reap(e);
     }
 }
+
+/// Submit one UNGATED job to `pool` and keep its outcome — the shape the degraded-mode tests use.
+/// A dropped gate sender is a release, so a job that does reach a worker never blocks.
+fn submit_ungated(pool: &'static super::LazyPool) -> mpsc::Receiver<ReapOutcome> {
+    let (probe, ends) = probe_pair();
+    drop(ends.gate);
+    super::submit_to(pool, bare_job(std::thread::current().id(), Some(probe)));
+    ends.outcome
+}
+
+#[tokio::test]
+async fn any_spawn_failure_abandons_the_pool_and_the_next_dispatch_retries() {
+    let pool = private_pool(super::REAPER_POOL_THREADS);
+
+    super::fault::set_force_spawn_failures(1);
+    let outcome = submit_ungated(pool);
+    // `release` runs synchronously before `submit_to` returns, so this needs no edge to wait on.
+    assert_eq!(
+        outcome.try_recv(),
+        Ok(ReapOutcome::Released),
+        "a pool that could not start every worker must abandon and release the job in hand"
+    );
+
+    let outcome = submit_ungated(pool);
+    assert!(
+        matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+        "the abandoned pool leaves its cell empty, so the next dispatch must retry the init"
+    );
+    // Last, so it cannot shadow the retry assertion above: a seam nothing read would still be
+    // armed here, and neither init consumed it.
+    assert_eq!(
+        super::fault::take_force_spawn_failures(),
+        0,
+        "the seam must have been consumed — a flag nothing read cannot fail this test"
+    );
+}
+
+#[tokio::test]
+async fn total_spawn_failure_releases_the_job_in_hand() {
+    // Its OWN pool: a second pool in one test would shadow an init mutation. This one exercises
+    // the join-of-zero-started path, where the test above joins three.
+    let pool = private_pool(super::REAPER_POOL_THREADS);
+
+    super::fault::set_force_spawn_failures(super::REAPER_POOL_THREADS);
+    let outcome = submit_ungated(pool);
+    assert_eq!(
+        outcome.try_recv(),
+        Ok(ReapOutcome::Released),
+        "with no worker started at all the job must be released in hand"
+    );
+    assert_eq!(
+        super::fault::take_force_spawn_failures(),
+        0,
+        "the seam must have been consumed"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_first_submits_share_one_init() {
+    let pool = private_pool(super::REAPER_POOL_THREADS);
+    let submitters = super::REAPER_POOL_THREADS + 2;
+    let origin = std::thread::current().id();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(submitters));
+
+    let mut outcomes = Vec::new();
+    let mut handles = Vec::new();
+    for _ in 0..submitters {
+        let (probe, ends) = probe_pair();
+        drop(ends.gate);
+        outcomes.push(ends.outcome);
+        // Built on the test thread: tokio's process spawn needs a runtime, the submitters do not.
+        let job = bare_job(origin, Some(probe));
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            super::submit_to(pool, job);
+        }));
+    }
+    for h in handles {
+        h.join().expect("a submitting thread must not panic");
+    }
+    for outcome in outcomes {
+        assert!(
+            matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+            "a submitter that spuriously saw no pool would have released its job instead"
+        );
+    }
+    assert_eq!(
+        pool.inits.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the in-lock re-check must admit exactly one init"
+    );
+}

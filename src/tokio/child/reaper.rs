@@ -58,6 +58,9 @@ struct LazyPool {
     bound: usize,
     cell: OnceLock<Pool>,
     init: Mutex<()>,
+    /// Init attempts that reached their spawn loop. Observability only — no decision reads it.
+    #[cfg(test)]
+    inits: std::sync::atomic::AtomicUsize,
 }
 
 impl LazyPool {
@@ -66,6 +69,8 @@ impl LazyPool {
             bound,
             cell: OnceLock::new(),
             init: Mutex::new(()),
+            #[cfg(test)]
+            inits: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -96,9 +101,20 @@ impl LazyPool {
                 }
             };
             if self.cell.get().is_none() {
+                #[cfg(test)]
+                self.inits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Consumed here, on the submitting thread this init runs on.
+                #[cfg(test)]
+                let mut forced = fault::take_force_spawn_failures();
                 let (tx, rx) = crossbeam_channel::unbounded::<ReapJob>();
                 let mut started = 0usize;
                 for _ in 0..self.bound {
+                    #[cfg(test)]
+                    if forced > 0 {
+                        forced -= 1;
+                        failures.push(std::io::Error::other("forced reaper spawn failure (test seam)"));
+                        continue;
+                    }
                     let rx = rx.clone();
                     match std::thread::Builder::new()
                         .name("cosca-reaper".to_owned())
@@ -254,6 +270,25 @@ pub(crate) fn run_teardown(job: ReapJob) {
         let _ = std::panic::catch_unwind(|| {
             log::error!("releasing child {pid}'s resources panicked; its wait had already completed");
         });
+    }
+}
+
+/// Fault seams for the off-nominal paths. Take-semantics, matching `crate::wait::fault`.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_SPAWN_FAILURES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Fail the first `n` `Builder::spawn` attempts of the NEXT init entered from THIS thread.
+    /// Init runs on the submitting thread, so the thread-local is visible where it is read.
+    pub(crate) fn set_force_spawn_failures(n: usize) {
+        FORCE_SPAWN_FAILURES.with(|f| f.set(n));
+    }
+    pub(crate) fn take_force_spawn_failures() -> usize {
+        FORCE_SPAWN_FAILURES.with(|f| f.replace(0))
     }
 }
 
