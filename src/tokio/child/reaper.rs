@@ -66,6 +66,11 @@ pub(crate) struct ReapJob {
     /// thread-local of its own.
     #[cfg(test)]
     pub(crate) force_release_panic: bool,
+    /// Seeded panic in the GLUE between the two regions — the one place a panic escapes
+    /// [`run_teardown`]. It models a future edit breaking the two-region structure, which is the
+    /// only input [`work`]'s recovery guard has.
+    #[cfg(test)]
+    pub(crate) force_glue_panic: bool,
 }
 
 /// A wedged child occupies one worker and no other; the rest keep draining the shared queue. Not
@@ -206,11 +211,14 @@ impl LazyPool {
 fn work(rx: crossbeam_channel::Receiver<ReapJob>) {
     while let Ok(job) = rx.recv() {
         // Defense in depth against a future edit breaking `run_teardown`'s no-unwind contract:
-        // loud, never a silent absorb.
+        // loud, never a silent absorb — and never fatal to this worker. The whole recovery,
+        // ASSERT INCLUDED, sits inside a catch: a worker that died here would shrink a published
+        // pool permanently, since nothing replenishes one. The assert still reaches the default
+        // panic hook, so it stays as loud as any other.
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_teardown(job))).is_err() {
-            debug_assert!(false, "run_teardown unwound despite its no-unwind contract");
             let _ = std::panic::catch_unwind(|| {
                 log::error!("a reaper teardown unwound despite its no-unwind contract");
+                debug_assert!(false, "run_teardown unwound despite its no-unwind contract");
             });
         }
     }
@@ -275,6 +283,8 @@ pub(crate) fn run_teardown(job: ReapJob) {
     let force_panic = job.force_panic;
     #[cfg(test)]
     let force_release_panic = job.force_release_panic;
+    #[cfg(test)]
+    let force_glue_panic = job.force_glue_panic;
     let mut proc = job.proc;
     let attached = job.attached;
     let pipes = job.pipes;
@@ -303,6 +313,13 @@ pub(crate) fn run_teardown(job: ReapJob) {
         }
         proc.wait_and_reap(pid);
     }));
+
+    // The glue. Only a seeded fault reaches this, and only to give `work`'s recovery guard the
+    // one input it can ever have.
+    #[cfg(test)]
+    if force_glue_panic {
+        panic!("forced glue panic (test seam)");
+    }
 
     let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if waited.is_err() {

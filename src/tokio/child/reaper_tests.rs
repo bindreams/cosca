@@ -88,6 +88,7 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
         probe,
         force_panic: false,
         force_release_panic: false,
+        force_glue_panic: false,
     }
 }
 
@@ -502,5 +503,45 @@ async fn unkillable_root_is_not_submitted() {
     assert!(
         ends.outcome.recv().is_err(),
         "a child whose kill failed must not be submitted"
+    );
+}
+
+/// `work`'s recovery guard exists for exactly one input: a `run_teardown` that unwound. Its whole
+/// value is that the worker survives it — a dead worker shrinks a published pool permanently,
+/// silently, and nothing replenishes it. Run on a channel and thread this test OWNS, so the
+/// global pool is never perturbed and `join` is available as the edge.
+#[tokio::test]
+async fn a_worker_survives_a_teardown_that_unwinds() {
+    let origin = std::thread::current().id();
+    let (tx, rx) = crossbeam_channel::unbounded::<super::ReapJob>();
+    let worker = std::thread::spawn(move || super::work(rx));
+
+    // A teardown that unwinds out of both regions, through the glue.
+    let (probe, ends) = probe_pair();
+    drop(ends.gate);
+    let mut job = bare_job(origin, Some(probe));
+    job.force_glue_panic = true;
+    tx.send(job).expect("the worker's receiver is live");
+    assert!(
+        ends.outcome.recv().is_err(),
+        "a teardown that unwinds past the release region reports no outcome"
+    );
+
+    // A second job the SAME worker must still take.
+    let (probe, ends) = probe_pair();
+    drop(ends.gate);
+    tx.send(bare_job(origin, Some(probe)))
+        .expect("the worker's receiver must have outlived the unwinding teardown");
+
+    // Dropping the sender is the edge in BOTH worlds: a live worker drains the queue and then
+    // returns on the disconnect; a worker the guard killed has already returned, panicking. So
+    // `join` always terminates, and its `Err` IS the dead-worker signal.
+    drop(tx);
+    worker
+        .join()
+        .expect("the recovery guard must not unwind out of `work` and kill the worker");
+    assert!(
+        matches!(ends.outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+        "the surviving worker must keep draining the queue"
     );
 }

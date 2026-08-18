@@ -711,6 +711,8 @@ impl Drop for Child {
             force_panic: false,
             #[cfg(test)]
             force_release_panic: false,
+            #[cfg(test)]
+            force_glue_panic: false,
         });
     }
 }
