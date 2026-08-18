@@ -73,7 +73,6 @@ pub(crate) struct WindowsSpawn {
     /// Whether this spawn must set the inherited root marker so descendants join THIS group.
     /// Read by the raw backends, which build their own environment block; the std path applies
     /// the marker through the portable path `prepare` shares with Unix.
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub marker_env: bool,
 }
 
