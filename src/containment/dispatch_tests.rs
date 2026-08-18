@@ -318,9 +318,11 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
             mode: Some(ContainMode::Strongest),
             nesting: Nesting::Mark,
         },
+        &crate::command::flags::FlagsRequest::default(),
         &[3, 4, 5, 6, 7, 8, 9, 10],
         false,
-    );
+    )
+    .expect("prepare is infallible off Windows");
     let marker = prepared.marker.as_ref().expect("a contained macOS root gets a marker");
     assert!(
         marker.fd > 10,
@@ -349,9 +351,11 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
             mode: Some(ContainMode::Strongest),
             nesting: Nesting::Mark,
         },
+        &crate::command::flags::FlagsRequest::default(),
         &[],
         false,
-    );
+    )
+    .expect("prepare is infallible off Windows");
     assert!(prepared.marker.is_none(), "the forced failure must yield no marker");
 }
 
@@ -367,9 +371,11 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
             mode: Some(ContainMode::Strongest),
             nesting: Nesting::Mark,
         },
+        &crate::command::flags::FlagsRequest::default(),
         &[],
         true,
-    );
+    )
+    .expect("prepare is infallible off Windows");
     assert!(
         prepared.marker.is_none(),
         "an elevated spawn must not claim marker containment"
@@ -459,41 +465,6 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
             .wait_drained(None)
             .expect("unbounded wait after the holder exits"),
         TreeDrain::AllMarkersClosed
-    );
-}
-
-/// The three shapes `windows_contain_setup` can produce must not all agree: an uncontained
-/// spawn leads no group, while both contained shapes do. Lives here rather than in
-/// `windows_tests.rs` because `windows_contain_setup` is defined in this module.
-#[cfg(windows)]
-#[test]
-fn windows_contain_setup_records_the_mechanism_of_the_flags_it_chose() {
-    use super::windows_contain_setup;
-    use crate::containment::{ContainMode, ContainRequest, Nesting};
-    use crate::graceful::GracefulMechanism;
-
-    let uncontained = ContainRequest {
-        mode: None,
-        nesting: Nesting::Mark,
-    };
-    let contained = ContainRequest {
-        mode: Some(ContainMode::Strongest),
-        nesting: Nesting::Mark,
-    };
-    assert_eq!(
-        windows_contain_setup(&uncontained, true).graceful,
-        GracefulMechanism::None,
-        "an uncontained spawn passes no flags, so it leads no group"
-    );
-    assert_eq!(
-        windows_contain_setup(&contained, true).graceful,
-        GracefulMechanism::ConsoleGroup,
-        "a Strongest root spawns suspended into its own group"
-    );
-    assert_eq!(
-        windows_contain_setup(&contained, false).graceful,
-        GracefulMechanism::ConsoleGroup,
-        "a nested spawn leads its own group too"
     );
 }
 

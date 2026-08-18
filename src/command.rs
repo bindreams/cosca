@@ -8,9 +8,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::command::flags::FlagsRequest;
 use crate::containment::{ContainMode, ContainRequest, Nesting};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio, Stdio};
+
+pub(crate) mod flags;
 
 /// A process to be configured and (later) spawned.
 #[derive(Debug)]
@@ -24,6 +27,7 @@ pub struct Command {
     contain: ContainRequest,
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
+    flags: FlagsRequest,
 }
 
 /// An environment variable operation, recorded in order.
@@ -46,6 +50,7 @@ impl Default for Command {
             contain: ContainRequest::default(),
             elevation: crate::elevation::ElevationRequest::default(),
             fd_marker_suppressed: false,
+            flags: FlagsRequest::default(),
         }
     }
 }
@@ -223,6 +228,100 @@ impl Command {
 
     pub(crate) fn contain_request(&self) -> ContainRequest {
         self.contain
+    }
+
+    // ---- creation-flag intents ---------------------------------------
+
+    /// Do not put a console window on the user's screen for this child.
+    ///
+    /// # The intent sits above the mechanisms
+    ///
+    /// Windows offers two unrelated launch mechanisms and this request is lowered onto whichever
+    /// one a given spawn uses, because a flags-shaped API would honour it on one path and
+    /// silently ignore it on the other:
+    ///
+    /// | Platform / path | Lowered to |
+    /// | --- | --- |
+    /// | Windows, no [`elevate`](Self::elevate) | `CREATE_NO_WINDOW` in `dwCreationFlags` |
+    /// | Windows, `elevate()` from an **already-elevated** caller | `CREATE_NO_WINDOW` — the ordinary backends, unchanged |
+    /// | Windows, `elevate()` where a **consent prompt is used** | the launch's show-command becomes `SW_HIDE` |
+    /// | Unix | nothing; a documented no-op |
+    ///
+    /// The request means the same thing everywhere; only how far the closest available mechanism
+    /// carries it differs. Where the creation flag carries it, it concerns the child's
+    /// **console** and nothing else. Where a consent prompt is used there is no console-only
+    /// knob, so the show-command is the shell's initial show state for the whole launched
+    /// application — a graphical child's own main window is affected too, and may override it.
+    /// Note the condition: an already-elevated caller gets the ordinary creation flag, so
+    /// "elevation was requested" is not what selects the wider reach.
+    ///
+    /// A child that would not have had a console anyway — a windows-subsystem image, for
+    /// instance — needs no suppression and is not an error; the request is already satisfied.
+    /// Nothing is logged either.
+    ///
+    /// # Consequence for cooperative shutdown
+    ///
+    /// The child gets a console of its own rather than joining this process's, so a console-group
+    /// signal sent from this process cannot reach it. Not requesting this does not establish the
+    /// reverse — whether a child shares this process's console also depends on the child image's
+    /// subsystem and on what the child does with its own console. What cosca recorded about the
+    /// route is reported per child by
+    /// [`Child::graceful_mechanism`](crate::Child::graceful_mechanism); it is a statement about
+    /// the route, never an authority on whether a signal will arrive.
+    pub fn no_window(&mut self) -> &mut Command {
+        self.flags.no_window = true;
+        self
+    }
+
+    /// Spawn the child with `DETACHED_PROCESS`: it gets no console at all.
+    ///
+    /// This removes the child's **console**, not its stdio — with [`Stdio::inherit`] a detached
+    /// child still writes to the handles it inherited. It also does not leave a job; that is
+    /// [`breakaway_from_job`](Self::breakaway_from_job).
+    ///
+    /// Same one-directional console consequence as [`no_window`](Self::no_window): a
+    /// console-group signal sent from this process cannot reach such a child, while *not*
+    /// detaching establishes nothing about the reverse.
+    #[cfg(windows)]
+    pub fn detached(&mut self) -> &mut Command {
+        self.flags.detached = true;
+        self
+    }
+
+    /// Add arbitrary bits to this spawn's `dwCreationFlags`, for flags cosca does not name.
+    ///
+    /// **Replaces, it does not accumulate** — matching
+    /// [`std::os::windows::process::CommandExt::creation_flags`]. Calling it twice leaves the
+    /// second word, and `creation_flags(0)` is how a word set earlier is cleared. Or-in would
+    /// make a bit unclearable, which is the one thing a raw hatch must never do.
+    ///
+    /// # Reserved bits
+    ///
+    /// Bits whose consequences cosca must manage are refused at spawn with
+    /// [`Error::Unsupported`], naming every offending flag and its replacement. Validation is at
+    /// spawn rather than here because a pairwise rule enforced in a setter would give a verdict
+    /// that depends on builder call order.
+    ///
+    /// | Flag | Why reserved | Instead |
+    /// | --- | --- | --- |
+    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none yet |
+    /// | `CREATE_NEW_PROCESS_GROUP` | load-bearing for `CTRL_BREAK` delivery to the contained root | [`contain`](Self::contain) |
+    /// | `CREATE_NEW_CONSOLE` | measured: the child gets its own *visible* console window, overriding a requested window suppression | none |
+    /// | `CREATE_UNICODE_ENVIRONMENT` | both backends supply it structurally, so a caller can neither set nor clear it meaningfully | none |
+    /// | `EXTENDED_STARTUPINFO_PRESENT` | it announces a structure only the spawn backend can supply | none |
+    /// | `DETACHED_PROCESS` | carries a console consequence cosca must record | [`detached`](Self::detached) |
+    /// | `CREATE_NO_WINDOW` | same | [`no_window`](Self::no_window) |
+    /// | `CREATE_BREAKAWAY_FROM_JOB` | same, plus the failure classification the raw bit would lose | [`breakaway_from_job`](Self::breakaway_from_job) |
+    /// | `DEBUG_PROCESS` | makes the spawner a debugger; the child stops on debug events nothing services, so `wait`/`wait_tree` would hang | none |
+    /// | `DEBUG_ONLY_THIS_PROCESS` | same | none |
+    #[cfg(windows)]
+    pub fn creation_flags(&mut self, flags: u32) -> &mut Command {
+        self.flags.raw = flags;
+        self
+    }
+
+    pub(crate) fn flags_request(&self) -> &FlagsRequest {
+        &self.flags
     }
 
     /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +

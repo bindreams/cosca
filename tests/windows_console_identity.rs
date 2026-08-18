@@ -268,3 +268,125 @@ fn the_report_escapes_argv0_so_a_spaced_path_cannot_split_the_record() {
     );
     p.end();
 }
+
+// ===== cosca's own spawn paths =====
+
+/// A running cosca-spawned `report-console-identity` child plus its report line. Argv-only, so
+/// it routes to the **std** backend: an `executable()` or any fd >= 3 would route to the raw
+/// `CreateProcessW` one instead, and the existing testbin idiom uses `executable()` — so a test
+/// written in the house style would silently leave the std path unproven.
+struct CoscaProbe {
+    child: cosca::Child,
+    sock: TcpStream,
+    report: String,
+}
+
+impl CoscaProbe {
+    fn field(&self, key: &str) -> &str {
+        field(&self.report, key)
+    }
+
+    fn end(self) {
+        drop(self.sock);
+        let _ = self.child.kill_tree();
+        self.child.wait().expect("reap cosca identity probe child");
+    }
+}
+
+/// Spawn the testbin through `cosca::Command` with the image path as `argv[0]`, apply
+/// `configure`, and read the one report line.
+fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let me = std::process::id().to_string();
+    let mut cmd = cosca::Command::new();
+    cmd.args([
+        env!("CARGO_BIN_EXE_cosca_testbin"),
+        "report-console-identity",
+        addr.as_str(),
+        me.as_str(),
+    ]);
+    configure(&mut cmd);
+    let child = cmd.spawn().expect("spawn cosca identity probe child");
+    let (sock, _) = listener.accept().expect("accept report socket");
+    let report = read_report(&sock);
+    CoscaProbe { child, sock, report }
+}
+
+/// `no_window()` reaches the child on the std backend — the path most spawns take.
+#[test]
+fn cosca_no_window_child_gets_its_own_console_on_the_std_path() {
+    let p = probe_cosca(|c| {
+        c.contain().no_window();
+    });
+    assert_eq!(p.field("console"), "1", "still a console, just not ours: {}", p.report);
+    assert_eq!(
+        p.field("sees_caller"),
+        "0",
+        "the suppressed child got a console of its own: {}",
+        p.report
+    );
+    p.end();
+}
+
+/// The same on an UNCONTAINED spawn, which is the branch `prepare` returns from before it ever
+/// reaches its Windows work — so a composition placed inside the containment branch drops the
+/// caller's word here and nowhere else.
+#[test]
+fn cosca_uncontained_raw_flags_reach_the_child() {
+    let p = probe_cosca(|c| {
+        c.no_window();
+    });
+    assert_eq!(
+        p.field("sees_caller"),
+        "0",
+        "an uncontained spawn must carry the caller's flags too: {}",
+        p.report
+    );
+    p.end();
+}
+
+/// The control for both of the above, through the identical `cosca::Command` path with no flag
+/// methods called. A red result here would mean the harness broke, not the feature.
+#[test]
+fn a_plain_cosca_child_still_joins_the_callers_console() {
+    let p = probe_cosca(|_| {});
+    assert_eq!(
+        p.field("sees_caller"),
+        "1",
+        "a plain cosca child shares OUR console: {}",
+        p.report
+    );
+    p.end();
+}
+
+/// `graceful_mechanism()` must be derived from the word cosca actually composed, not from the
+/// containment half of it: a hidden child has no in-process route, and reporting `ConsoleGroup`
+/// for it tells the caller the opposite.
+///
+/// The two children are what make this discriminate. A derivation reading only the containment
+/// half reports `ConsoleGroup` for both, so the second assertion fails; a hardcoded
+/// `OtherConsoleGroup` fails the first.
+#[test]
+fn a_no_window_contained_child_reports_no_in_process_route() {
+    use cosca::GracefulMechanism;
+
+    let plain = probe_cosca(|c| {
+        c.contain();
+    });
+    assert_eq!(
+        plain.child.graceful_mechanism(),
+        GracefulMechanism::ConsoleGroup,
+        "a contained child leads a group in OUR console"
+    );
+    let hidden = probe_cosca(|c| {
+        c.contain().no_window();
+    });
+    assert_eq!(
+        hidden.child.graceful_mechanism(),
+        GracefulMechanism::OtherConsoleGroup,
+        "a hidden child's group is in a console of its own"
+    );
+    plain.end();
+    hidden.end();
+}

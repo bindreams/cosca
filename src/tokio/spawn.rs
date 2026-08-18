@@ -275,9 +275,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         let prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
+            cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
-        );
+        )?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
@@ -309,9 +310,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         let prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
+            cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
-        );
+        )?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).

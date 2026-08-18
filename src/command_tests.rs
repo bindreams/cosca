@@ -257,3 +257,48 @@ fn suppress_fd_marker_sets_the_flag_a_fresh_command_does_not_have() {
     derived.suppress_fd_marker();
     assert!(derived.fd_marker_suppressed());
 }
+
+// ===== creation flags =====
+
+/// `no_window()` is the one portable flag intent: it records the same request on every platform,
+/// and only the lowering differs (a creation flag / a show-command / nothing at all).
+#[test]
+fn no_window_is_recorded_on_every_platform() {
+    let mut cmd = Command::new();
+    assert!(!cmd.flags_request().no_window, "the default requests nothing");
+    cmd.no_window();
+    assert!(cmd.flags_request().no_window);
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_and_raw_flags_are_recorded() {
+    let mut cmd = Command::new();
+    let before = *cmd.flags_request();
+    assert!(!before.detached);
+    assert_eq!(before.raw, 0);
+    cmd.detached().creation_flags(0x0000_0040);
+    let after = *cmd.flags_request();
+    assert!(after.detached);
+    assert_eq!(after.raw, 0x0000_0040);
+}
+
+/// `creation_flags` REPLACES, matching `std::os::windows::process::CommandExt::creation_flags`
+/// (`self.flags = flags;`). Or-in would make a bit unclearable, which is the one thing a raw
+/// hatch must never do — so `creation_flags(0)` is the documented way to clear a word set
+/// earlier, and this test would fail under an or-in implementation at both later calls.
+#[cfg(windows)]
+#[test]
+fn repeated_creation_flags_calls_replace_rather_than_accumulate() {
+    let mut cmd = Command::new();
+    cmd.creation_flags(0x0000_0040);
+    assert_eq!(cmd.flags_request().raw, 0x0000_0040);
+    cmd.creation_flags(0x0000_0080);
+    assert_eq!(
+        cmd.flags_request().raw,
+        0x0000_0080,
+        "the second call replaces the first"
+    );
+    cmd.creation_flags(0);
+    assert_eq!(cmd.flags_request().raw, 0, "zero clears a word set earlier");
+}

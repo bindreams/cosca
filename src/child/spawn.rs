@@ -184,9 +184,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
+            cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
-        );
+        )?;
 
         // On Unix, hand n>=3 child ends to command-fds. This installs a pre_exec hook
         // that dup2's each OwnedFd to its target number post-fork. It is registered
@@ -218,9 +219,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
+            cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
-        );
+        )?;
 
         // On Unix, hand n>=3 child ends to command-fds. See the macOS branch above for why
         // this is registered LAST (after `prepare`).
