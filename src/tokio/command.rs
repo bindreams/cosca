@@ -110,6 +110,39 @@ impl Command {
         self
     }
 
+    /// Do not put a console window on the user's screen — mirrors
+    /// [`no_window`](crate::Command::no_window), including the per-path lowering and the
+    /// one-directional console consequence documented there.
+    pub fn no_window(&mut self) -> &mut Command {
+        self.inner.no_window();
+        self
+    }
+
+    /// Spawn with `DETACHED_PROCESS` — mirrors [`detached`](crate::Command::detached).
+    #[cfg(windows)]
+    pub fn detached(&mut self) -> &mut Command {
+        self.inner.detached();
+        self
+    }
+
+    /// Spawn outside this process's job object — mirrors
+    /// [`breakaway_from_job`](crate::Command::breakaway_from_job), including everything it does
+    /// not promise.
+    #[cfg(windows)]
+    pub fn breakaway_from_job(&mut self) -> &mut Command {
+        self.inner.breakaway_from_job();
+        self
+    }
+
+    /// Add arbitrary `dwCreationFlags` bits — mirrors
+    /// [`creation_flags`](crate::Command::creation_flags), including its reserved-bit table and
+    /// its replace-not-accumulate semantics.
+    #[cfg(windows)]
+    pub fn creation_flags(&mut self, flags: u32) -> &mut Command {
+        self.inner.creation_flags(flags);
+        self
+    }
+
     /// Run the child elevated — mirrors [`cosca::Command::elevate`](crate::Command::elevate).
     pub fn elevate(&mut self) -> &mut Command {
         self.inner.elevate();

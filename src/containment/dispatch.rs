@@ -317,8 +317,6 @@ pub(crate) struct WindowsContain {
     pub creation_flags: u32,
     /// Whether this spawn must set the inherited root marker so descendants join THIS group.
     pub marker_env: bool,
-    /// The cooperative-signal mechanism `creation_flags` implies, derived from that same word.
-    pub graceful: crate::graceful::GracefulMechanism,
 }
 
 /// Decide the Windows pre-spawn containment flags + marker for `req`/`is_root`. Pure — directly
@@ -329,7 +327,6 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
         return WindowsContain {
             creation_flags: 0,
             marker_env: false,
-            graceful: crate::containment::windows::mechanism_from_flags(0),
         };
     };
     let creation_flags = if is_root && !matches!(mode, ContainMode::TreeWalk) {
@@ -343,36 +340,58 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     WindowsContain {
         creation_flags,
         marker_env: is_root && req.nesting == Nesting::Mark,
-        graceful: crate::containment::windows::mechanism_from_flags(creation_flags),
     }
 }
 
 /// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup.
 ///
 /// `reserved_fds` and `marker_suppressed` drive the macOS fd-marker install only; every
-/// other platform ignores them.
+/// other platform ignores them. `flags` is the caller's creation-flag request, which only
+/// Windows can honour.
+///
+/// Fallible only on Windows, where the composed creation-flag word may name a reserved bit. The
+/// composition runs at the very top — before anything is mutated, so a refusal leaves nothing to
+/// unwind, and above the uncontained early return, so an uncontained spawn carries the caller's
+/// flags too.
 pub(crate) fn prepare(
     std_cmd: &mut std::process::Command,
     req: &ContainRequest,
+    #[cfg_attr(not(windows), allow(unused_variables))] flags: &crate::command::flags::FlagsRequest,
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] reserved_fds: &[i32],
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] marker_suppressed: bool,
-) -> Prepared {
+) -> Result<Prepared, Error> {
     let mode = req.mode;
+    // Read once, above every branch, so the word is composed exactly once per spawn and no two
+    // compositions can disagree. This is this process's own environment variable — read-only and
+    // constant for the run — so reading it for an uncontained spawn too is unobservable.
+    let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
+    let is_root = !is_nested(marker_present);
+
+    #[cfg(windows)]
+    let graceful = {
+        use std::os::windows::process::CommandExt;
+        let spawn =
+            crate::command::flags::windows_spawn(req, *flags, is_root, crate::command::flags::SpawnBackend::Std)?;
+        std_cmd.creation_flags(spawn.creation_flags);
+        // Sound for THIS derivation and no other: `mechanism_from_flags` reads only
+        // CREATE_NEW_PROCESS_GROUP / DETACHED_PROCESS / CREATE_NEW_CONSOLE / CREATE_NO_WINDOW,
+        // and std adds and removes none of them. The word is what cosca supplies, never what
+        // `CreateProcessW` receives — see `crate::command::flags`.
+        crate::containment::windows::mechanism_from_flags(spawn.creation_flags)
+    };
+
     if mode.is_none() {
-        return Prepared {
+        return Ok(Prepared {
             mode: None,
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
             #[cfg(target_os = "macos")]
             marker: None,
-            // An uncontained spawn passes no creation flags, so it leads no group of its own.
             #[cfg(windows)]
-            graceful: crate::containment::windows::mechanism_from_flags(0),
-        };
+            graceful,
+        });
     }
-    let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
-    let is_root = !is_nested(marker_present);
     if is_root && req.nesting == Nesting::Mark {
         // Set AFTER any user env ops (env_clear) have been applied to std_cmd by
         // the spawn engine, so the marker survives env_clear. `env` appends.
@@ -389,20 +408,20 @@ pub(crate) fn prepare(
                 UnixSetup::Session => {
                     // Session: setsid only — no process_group(0) (would EPERM).
                     crate::containment::unix::set_session(std_cmd);
-                    return Prepared {
+                    return Ok(Prepared {
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
-                    };
+                    });
                 }
                 UnixSetup::None => {
                     // TreeWalk: NO process group / setsid / cgroup — teardown is
                     // by identity so we can catch process-group escapees.
-                    return Prepared {
+                    return Ok(Prepared {
                         mode,
                         is_root,
                         cgroup_leaf: None,
-                    };
+                    });
                 }
                 UnixSetup::ProcessGroup => {
                     // Strongest: set a new process group + try cgroup.
@@ -428,17 +447,17 @@ pub(crate) fn prepare(
                     });
                 }
             }
-            return Prepared {
+            return Ok(Prepared {
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
-            };
+            });
         }
-        return Prepared {
+        return Ok(Prepared {
             mode,
             is_root,
             cgroup_leaf: None,
-        };
+        });
     }
 
     // Non-Linux Unix: process group or session (mutually exclusive).
@@ -464,21 +483,14 @@ pub(crate) fn prepare(
         None
     };
 
-    // Windows: clear handle inheritance + apply creation_flags. The flag/marker decision
-    // lives in `windows_contain_setup` (shared with the raw `CreateProcessW` backend); the
-    // root marker itself is applied above (shared with the Unix path), so only the creation
-    // flags are applied here.
+    // Windows: stop the child inheriting this process's std handles. Contained spawns only, and
+    // below the composition above so a refused spawn has mutated nothing. The creation-flag word
+    // itself is applied at the top, since an uncontained spawn never reaches this point.
     #[cfg(windows)]
-    let graceful = {
-        use std::os::windows::process::CommandExt;
-        crate::containment::windows::clear_std_handle_inheritance();
-        let setup = windows_contain_setup(req, is_root);
-        std_cmd.creation_flags(setup.creation_flags);
-        setup.graceful
-    };
+    crate::containment::windows::clear_std_handle_inheritance();
 
     #[allow(unreachable_code)]
-    Prepared {
+    Ok(Prepared {
         mode,
         is_root,
         #[cfg(target_os = "linux")]
@@ -487,7 +499,7 @@ pub(crate) fn prepare(
         marker,
         #[cfg(windows)]
         graceful,
-    }
+    })
 }
 
 /// Phase 2 (after spawn, before SharedChild::new): attach the mechanism and bundle it with the

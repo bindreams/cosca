@@ -18,8 +18,7 @@ use std::sync::Arc;
 
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    TerminateProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, WaitForSingleObject, INFINITE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 use crate::child::spawn::windows_raw as sync_raw;
@@ -285,15 +284,21 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // (flags 0, `mode: None`/`is_root: false`); a Strongest root spawns CREATE_SUSPENDED and is
     // job-assigned + resumed in `attach_or_fault`.
     let req = cmd.contain_request();
-    let (contain_flags, is_root, marker_env) = if req.mode.is_some() {
-        let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
-        let is_root = !crate::containment::dispatch::is_nested(marker_present);
+    let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
+    let is_root = !crate::containment::dispatch::is_nested(marker_present);
+    // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
+    // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
+    // must not have mutated the parent.
+    let plan = crate::command::flags::windows_spawn(
+        &req,
+        *cmd.flags_request(),
+        is_root,
+        crate::command::flags::SpawnBackend::Raw,
+    )?;
+    let marker_env = plan.marker_env;
+    if req.mode.is_some() {
         crate::containment::windows::clear_std_handle_inheritance();
-        let setup = crate::containment::dispatch::windows_contain_setup(&req, is_root);
-        (setup.creation_flags, is_root, setup.marker_env)
-    } else {
-        (0u32, false, false)
-    };
+    }
 
     // Append the inherited root marker AFTER the user's env ops so it survives a user `env_clear()`
     // (mirrors the sync path).
@@ -337,7 +342,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let all_handles: &[HANDLE] = &table.handles;
     let attr = AttributeList::build(all_handles)?;
     si.lpAttributeList = attr.as_ptr();
-    let flags = CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0 | contain_flags;
+    // The complete word, composed above by the ONE function all three backends share — the two
+    // structural bits this backend cannot spawn without included. Nothing ORs into it here.
+    let flags = plan.creation_flags;
 
     // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
     // the attribute list BEFORE the guard releases on EVERY path (mirrors the sync raw backend —
@@ -353,6 +360,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
             &env_block,
             &cwd_w,
             flags,
+            *cmd.flags_request(),
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
         drop(attr); // DeleteProcThreadAttributeList before the guard releases
@@ -368,8 +376,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let prepared = crate::containment::Prepared {
         mode: req.mode,
         is_root,
-        // From the FINAL flag word this backend passed to CreateProcessW, not from
-        // `contain_flags` alone: the derivation must read what the OS was actually given.
+        // From the COMPOSED word, which carries the caller's flags as well as the containment
+        // decision: a derivation reading only the containment half would report an in-process
+        // route for a child this spawn deliberately put in another console.
         graceful: crate::containment::windows::mechanism_from_flags(flags),
     };
     let raw_handle = proc.as_raw_handle();

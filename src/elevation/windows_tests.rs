@@ -38,6 +38,14 @@ fn is_unsupported<T>(r: Result<T, Error>) -> bool {
     matches!(r, Err(Error::Unsupported { .. }))
 }
 
+/// The refusal's `detail`, for the tests that assert on the message and not only the variant.
+fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+    match r {
+        Err(Error::Unsupported { detail, .. }) => detail,
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
 #[test]
 fn piped_stdio_is_unsupported() {
     let mut c = Command::new();
@@ -133,4 +141,71 @@ fn already_elevated_inherit_only_is_run_as_is() {
         super::launch_runas_with_host(&mut c, &win_host(true)),
         Ok(super::RunasOutcome::AlreadyElevated)
     ));
+}
+
+// ===== creation-flag intents on the consent-prompt path =====
+
+/// `ShellExecuteEx` takes a show-command and no creation-flag word, so this is the only knob the
+/// consent launch has for the window-suppression intent. Two inputs, two values: a constant
+/// implementation fails one of the pair.
+#[test]
+fn runas_hides_the_window_when_no_window_is_requested() {
+    use crate::command::flags::FlagsRequest;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let flags = FlagsRequest {
+        no_window: true,
+        ..Default::default()
+    };
+    assert_eq!(super::runas_show_command(&flags), SW_HIDE);
+}
+
+#[test]
+fn runas_shows_the_window_by_default() {
+    use crate::command::flags::FlagsRequest;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    assert_eq!(super::runas_show_command(&FlagsRequest::default()), SW_SHOWNORMAL);
+}
+
+/// The consent launch accepts no creation flags at all, so a raw word is refused rather than
+/// silently dropped. Stated over the RECORDED state, not "a method was called": `creation_flags(0)`
+/// requests nothing, so there is nothing to refuse.
+#[test]
+fn elevation_rejects_raw_creation_flags() {
+    let mut c = Command::new();
+    c.args(["whoami"]).elevate().creation_flags(0x0000_0040);
+    let detail = unsupported_detail(super::reject_unsupported_config(&c));
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
+}
+
+#[test]
+fn elevation_accepts_a_zero_creation_flags_word() {
+    let mut c = Command::new();
+    c.args(["whoami"]).elevate().creation_flags(0);
+    assert!(super::reject_unsupported_config(&c).is_ok());
+}
+
+#[test]
+fn elevation_rejects_detached() {
+    let mut c = Command::new();
+    c.args(["whoami"]).elevate().detached();
+    let detail = unsupported_detail(super::reject_unsupported_config(&c));
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
+}
+
+#[test]
+fn elevation_rejects_breakaway() {
+    let mut c = Command::new();
+    c.args(["whoami"]).elevate().breakaway_from_job();
+    let detail = unsupported_detail(super::reject_unsupported_config(&c));
+    crate::error::assert_detail_is_not_hard_wrapped(&detail);
+}
+
+/// The one flag intent that survives the gate — which is the whole of the elevated half of the
+/// window-suppression feature. Without this leg, a future tightening could take it away again in
+/// silence, and the three rejections above would all still pass.
+#[test]
+fn elevation_accepts_no_window() {
+    let mut c = Command::new();
+    c.args(["whoami"]).elevate().no_window();
+    assert!(super::reject_unsupported_config(&c).is_ok());
 }

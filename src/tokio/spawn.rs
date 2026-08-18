@@ -106,6 +106,11 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     }
 
+    // Read the routing rule BEFORE the take, for the reason spelled out at
+    // `crate::child::spawn::routes_to_raw_backend`: after it, a high-descriptor-only command
+    // would take the std path and lose its descriptors in silence.
+    #[cfg(windows)]
+    let to_raw_backend = crate::child::spawn::routes_to_raw_backend(cmd);
     let mut fds = std::mem::take(cmd.fds_mut());
 
     // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend:
@@ -114,7 +119,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // contained and uncontained via its own async containment; everything else stays on
     // the std/tokio path, whose `prepare` applies containment for argv/commandline spawns.
     #[cfg(windows)]
-    if cmd.executable_path().is_some() || fds.keys().any(|f| f.raw() >= 3) {
+    if to_raw_backend {
         // Attach the report on the AlreadyElevated fall-through too — an already-elevated
         // `executable()` command routes here (fd >= 3 on an elevated child is already rejected by
         // the Windows gate), and dropping the raw child without the report would lose its elevation
@@ -275,9 +280,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         let prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
+            cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
-        );
+        )?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
@@ -309,9 +315,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         let prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
+            cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
-        );
+        )?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
@@ -346,7 +353,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         // `CreateProcessW` spawn on another thread (mirrors the sync std path).
         let c = {
             let _guard = crate::child::spawn::spawn_lock();
-            tcmd.spawn().map_err(Error::Io)?
+            // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
+            // the wrong domain for this attribution.
+            let spawned = tcmd.spawn().map_err(Error::Io);
+            #[cfg(windows)]
+            let spawned =
+                spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+            spawned?
         };
         (prepared, c)
     };

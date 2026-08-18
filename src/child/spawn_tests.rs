@@ -89,3 +89,128 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
         Err(crate::error::Error::Unsupported { .. })
     ));
 }
+
+// ===== Windows backend routing =====
+
+/// The rule both Windows routers read, in both directions and for all four shapes.
+///
+/// `tests/windows_creation_flags.rs` names a backend in every test name; its `executable()` legs
+/// carry their own behavioural proof (the child's `argv[0]`), but its argv legs have none — an
+/// argv-only command would report the same `argv[0]` whichever backend spawned it. Their
+/// std-path claim rests on this rule, which is now one function rather than two copies.
+///
+/// The **high-descriptor-only** shape is the branch with no coverage anywhere today: every
+/// shipped Windows high-descriptor test also sets an explicit `executable()`, which
+/// short-circuits the rule before the fd term is ever evaluated.
+#[cfg(windows)]
+#[test]
+fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
+    use crate::stdio::Stdio;
+
+    let mut argv_only = Command::new();
+    argv_only.args(["cmd", "/C", "exit 0"]);
+    assert!(
+        !super::routes_to_raw_backend(&argv_only),
+        "an argv-only command stays on the std path"
+    );
+
+    let mut exe_only = Command::new();
+    exe_only.executable("cmd").args(["cmd", "/C", "exit 0"]);
+    assert!(super::routes_to_raw_backend(&exe_only), "an executable() routes to raw");
+
+    let mut high_fd_only = Command::new();
+    high_fd_only.args(["cmd", "/C", "exit 0"]);
+    high_fd_only.fd(3, Stdio::pipe_out()).unwrap();
+    assert!(
+        super::routes_to_raw_backend(&high_fd_only),
+        "a descriptor >= 3 routes to raw even with no executable(): std cannot carry it, and the \
+         std path's fd >= 3 collection is unix-only, so it would be dropped in silence"
+    );
+
+    let mut both = Command::new();
+    both.executable("cmd").args(["cmd", "/C", "exit 0"]);
+    both.fd(3, Stdio::pipe_out()).unwrap();
+    assert!(super::routes_to_raw_backend(&both));
+}
+
+/// A refused spawn must not have mutated this process first. `clear_std_handle_inheritance` is a
+/// real, process-global, un-undone `SetHandleInformation` on our own std handles, so running it
+/// before the refusal would leave a disposition-less side effect behind.
+///
+/// The two legs differ by one bit and are one `#[test]` so their order is guaranteed; `cargo
+/// test` gives each test its own thread, so the thread-local seam starts clean. The positive leg
+/// is what stops the negative one passing on a seam that was never wired.
+///
+/// The real handle flags are deliberately NOT measured instead: the mutation is process-global
+/// and permanent, so any earlier contained spawn in this binary would already have made that
+/// observation meaningless.
+#[cfg(windows)]
+#[test]
+fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+
+    let mut refused = Command::new();
+    refused
+        .executable("cmd")
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+
+    let mut allowed = Command::new();
+    allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
+    let child = allowed
+        .spawn()
+        .expect("the same command without the reserved bit spawns");
+    assert!(
+        observe::take_inheritance_cleared(),
+        "the seam must record a real call, else the negative leg above proves nothing"
+    );
+    child.wait().expect("reap");
+}
+
+/// The std-path counterpart of the test above. The std backend reaches the same process-global
+/// mutation through `containment::prepare`, which composes and validates the creation-flag word
+/// at its top — a separate ordering the raw backends' tests cannot see.
+///
+/// Argv-only and no `executable()`, asserted through `routes_to_raw_backend` so a future routing
+/// change cannot quietly turn this into a third raw-backend test.
+#[cfg(windows)]
+#[test]
+fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+
+    let mut refused = Command::new();
+    refused
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
+    assert!(
+        !super::routes_to_raw_backend(&refused),
+        "this leg is only a std-path proof while the command stays off the raw backend"
+    );
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+
+    let mut allowed = Command::new();
+    allowed.args(["cmd", "/C", "exit 0"]).contain();
+    let child = allowed
+        .spawn()
+        .expect("the same command without the reserved bit spawns");
+    assert!(
+        observe::take_inheritance_cleared(),
+        "the seam must record a real call, else the negative leg above proves nothing"
+    );
+    child.wait().expect("reap");
+}

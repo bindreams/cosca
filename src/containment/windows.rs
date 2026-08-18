@@ -210,6 +210,8 @@ pub(crate) fn mechanism_from_flags(creation_flags: u32) -> crate::graceful::Grac
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents
 /// the child from inheriting the test runner's console handles. Best-effort.
 pub(crate) fn clear_std_handle_inheritance() {
+    #[cfg(test)]
+    observe::record_inheritance_cleared();
     for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: standard Win32 call; handle is not closed.
         unsafe {
@@ -316,6 +318,78 @@ pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io:
     crate::error::Error::Io(err)
 }
 
+/// What this process's ambient job object says about a child breaking away from it.
+///
+/// `Unknown` exists for the same reason `identity::Resolved::Unknown` does: cosca must not assert
+/// a cause it could not measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobBreakaway {
+    NotInJob,
+    Permitted,
+    /// The job removes new children itself, without them asking — so it does not FORBID
+    /// breakaway, and a message saying it does would be wrong about the world.
+    SilentBreakaway,
+    Forbidden,
+    Unknown,
+}
+
+/// Read this process's ambient job's breakaway limits.
+///
+/// Impure, and called only to CLASSIFY a spawn failure that already happened — never to gate one
+/// before it. Spawning does not disturb job membership, but membership changes on its own (a
+/// process can be assigned to a job at any moment), so a pre-spawn guard would decide the outcome
+/// from state that may already be stale, while a post-failure confirmation at worst withholds a
+/// typed error. Same impure-probe / pure-classifier split as `caller_has_console` /
+/// `classify_ctrl_event_failure`.
+///
+/// `Permitted` takes precedence over `SilentBreakaway`, because a job setting both does honour
+/// the flag.
+pub(crate) fn probe_job_breakaway() -> JobBreakaway {
+    use windows::Win32::System::JobObjects::{
+        IsProcessInJob, JobObjectBasicLimitInformation, QueryInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    #[cfg(test)]
+    if fault::take_force_job_probe_error() {
+        return JobBreakaway::Unknown;
+    }
+
+    let mut in_job = windows::core::BOOL(0);
+    // SAFETY: standard Win32; `in_job` is a valid out-param, and `None` asks "in ANY job".
+    if unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut in_job) }.is_err() {
+        return JobBreakaway::Unknown;
+    }
+    if !in_job.as_bool() {
+        return JobBreakaway::NotInJob;
+    }
+
+    let mut info = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
+    // SAFETY: standard Win32; `info` is a valid, correctly-sized out-param, and `None` asks about
+    // the calling process's own job. The query class returns the BASIC structure even though the
+    // matching setter needs the extended one — an asymmetry in the API, not a mistake here.
+    let queried = unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectBasicLimitInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+            None,
+        )
+    };
+    if queried.is_err() {
+        return JobBreakaway::Unknown;
+    }
+    if info.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != JOB_OBJECT_LIMIT(0) {
+        return JobBreakaway::Permitted;
+    }
+    if info.LimitFlags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != JOB_OBJECT_LIMIT(0) {
+        return JobBreakaway::SilentBreakaway;
+    }
+    JobBreakaway::Forbidden
+}
+
 /// Send `CTRL_BREAK_EVENT` to the process group rooted at `pid`.
 /// The child was spawned with `CREATE_NEW_PROCESS_GROUP`, making it the leader;
 /// targeting its `pid` reaches the whole group without affecting the parent's console.
@@ -374,6 +448,26 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     }
 }
 
+/// Test-only: record that `clear_std_handle_inheritance` ran on THIS thread, so a test can prove
+/// a refused spawn did not mutate this process first. Take semantics, mirroring `fault`.
+///
+/// The real handle flags cannot serve as the observation: the mutation is process-global and
+/// permanent, so any earlier contained spawn in the same test binary would already have made it
+/// meaningless.
+#[cfg(test)]
+pub(crate) mod observe {
+    use std::cell::Cell;
+    thread_local! {
+        static INHERITANCE_CLEARED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn record_inheritance_cleared() {
+        INHERITANCE_CLEARED.with(|f| f.set(true));
+    }
+    pub(crate) fn take_inheritance_cleared() -> bool {
+        INHERITANCE_CLEARED.with(|f| f.replace(false))
+    }
+}
+
 /// Test-only: force the NEXT `caller_has_console` on THIS thread to report a probe failure,
 /// so that arm's production is covered — a live `GetConsoleProcessList` cannot be made to
 /// fail. Take semantics, mirroring `treewalk::fault`.
@@ -385,6 +479,17 @@ pub(crate) mod fault {
     }
     pub(crate) fn set_force_console_probe_error(on: bool) {
         FORCE_CONSOLE_PROBE_ERROR.with(|f| f.set(on));
+    }
+    thread_local! {
+        static FORCE_JOB_PROBE_ERROR: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Force the NEXT `probe_job_breakaway` on THIS thread to report `Unknown`: neither Win32
+    /// call it makes can be made to fail on a live system.
+    pub(crate) fn set_force_job_probe_error(on: bool) {
+        FORCE_JOB_PROBE_ERROR.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_job_probe_error() -> bool {
+        FORCE_JOB_PROBE_ERROR.with(|f| f.replace(false))
     }
     pub(crate) fn take_force_console_probe_error() -> bool {
         FORCE_CONSOLE_PROBE_ERROR.with(|f| f.replace(false))

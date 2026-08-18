@@ -58,3 +58,40 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
         .await
         .expect("a fresh wait resolves after the cancelled one");
 }
+
+/// The async twin of `a_refused_raw_spawn_does_not_clear_our_handle_inheritance`. Not padding:
+/// the async raw backend has its own copy of the ordering, which the sync test cannot see.
+///
+/// `#[tokio::test]` is single-threaded, which matters — the seam is per *thread*, so a
+/// multi-thread runtime could move the spawn off this test's thread.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+    use crate::error::Error;
+
+    let mut refused = Command::new();
+    refused
+        .executable("cmd")
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+
+    let mut allowed = Command::new();
+    allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
+    let mut child = allowed
+        .spawn()
+        .expect("the same command without the reserved bit spawns");
+    assert!(
+        observe::take_inheritance_cleared(),
+        "the seam must record a real call, else the negative leg above proves nothing"
+    );
+    child.wait().await.expect("reap");
+}
