@@ -652,13 +652,28 @@ impl Child {
 /// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
 /// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
 ///
-/// The reap itself is still guaranteed: the wait is handed to a small fixed pool of reaper
-/// threads (currently four) that starts on the first kill-on-drop drop and persists for the
-/// process's life. Under thread exhaustion the pool cannot start and the child is left to the
-/// runtime's orphan handling instead, logged per child; each drop then costs at most that many
-/// failing spawn syscalls.
+/// The reap is handed to a small fixed pool of reaper threads (currently four) that starts on
+/// the first kill-on-drop drop and persists for the process's life. It is guaranteed except on
+/// the two paths below, both of which are loud. Under thread exhaustion the pool cannot start,
+/// and the child goes to the runtime's orphan handling instead — an `error` per child, and each
+/// drop then costs at most that many failing spawn syscalls.
 ///
-/// The sync [`Child`](crate::Child)'s `Drop` still blocks; that divergence is deliberate.
+/// # Known limitation: `fork()` without `exec`
+///
+/// **A process that forks after this pool has started, and then keeps running Rust code in the
+/// child, loses the reap silently in that child.** `fork` duplicates only the calling thread, so
+/// the child inherits the pool's job queue with none of its workers; sends into it still succeed
+/// (the receiver handles exist in the copied address space), so nothing errors and nothing is
+/// logged, and every child handle dropped there queues forever, pinning its process handle,
+/// containment resource and stdio for the life of that process. It affects daemonizing and
+/// pre-fork worker models. It does **not** affect ordinary subprocess spawning — `fork`+`exec`
+/// and `posix_spawn` replace the child image immediately — nor Windows, which has no `fork`.
+///
+/// Until it is fixed, a forking consumer should either fork before its first kill-on-drop drop,
+/// or `kill` and `await` [`wait`](Child::wait) explicitly in the forked child rather than relying
+/// on `Drop`. The sync [`Child`](crate::Child) is unaffected: it reaps on the dropping thread.
+///
+/// That divergence from the sync `Child`, which still blocks, is otherwise deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
         // The opt-out/`detach()` contract: nothing is signalled and nothing is logged.

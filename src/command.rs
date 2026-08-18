@@ -215,9 +215,14 @@ impl Command {
     /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
     /// until the root has exited, so after `drop` returns the child is gone. The async
     /// [`Child`](crate::tokio::Child) signals and returns — parking a runtime worker in a
-    /// destructor is not something the caller can await or cancel — and hands the wait to
-    /// reaper threads of its own; the reap is still guaranteed, just not by the time `drop`
-    /// returns. See its `Drop` for the full contract.
+    /// destructor is not something the caller can await or cancel — and hands the wait to reaper
+    /// threads of its own, so the reap happens later and off this thread.
+    ///
+    /// The async reap is **not** unconditional: a host too thread-starved to start the pool falls
+    /// back to the runtime's orphan handling, and a process that forks without `exec` loses it
+    /// entirely in the forked child. Code that must know the child is gone should `kill` and
+    /// `await` [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
+    /// rustdoc for both paths.
     ///
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.

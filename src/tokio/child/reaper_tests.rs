@@ -3,12 +3,15 @@
 //!
 //! **Gate-holding budget.** The pool behind `submit` is process-global and shared with every
 //! other test in this binary, so no test may reason about its worker count or its idleness. A
-//! worker of it is held *indefinitely* only behind a held probe gate, and probes are private to
-//! this module, so the budget is local: at most `REAPER_POOL_THREADS - 1` tests here may hold a
-//! gate on the global pool concurrently. Currently exactly one does
-//! (`drop_signals_the_root_and_returns_before_the_reap`); the pool-shape tests hold their gates
-//! on their own [`private_pool`]s instead. Every other drop in the binary occupies a global
-//! worker only for a killed child's prompt exit.
+//! worker of it is parked *indefinitely* only behind a held probe gate, so the budget is
+//! `REAPER_POOL_THREADS - 1` concurrent holders — at full width, a later drop's job would queue
+//! behind holders that are themselves waiting, and libtest runs these in parallel.
+//!
+//! The budget is spent by [`arm_probe`] and nothing else. Exactly one test calls it
+//! (`drop_signals_the_root_and_returns_before_the_reap`, which holds across a blocking socket
+//! read — the gate IS its discriminator), leaving two of the three slots free. Every other
+//! global-pool test takes [`arm_probe_ungated`], which hands back no gate to hold; the
+//! pool-shape tests gate their own [`private_pool`]s, which are nobody else's.
 
 use std::sync::mpsc;
 use std::thread::ThreadId;
@@ -114,11 +117,23 @@ fn release_and_reap(ends: ProbeEnds) {
     );
 }
 
-/// Arm a probe for the next `Child::drop` on this thread and keep its ends.
+/// Arm a probe for the next `Child::drop` on this thread and keep its ends, GATE HELD — so the
+/// teardown parks a worker of the process-global pool until this test releases it. Spends one of
+/// the gate-holding budget in the file header; prefer [`arm_probe_ungated`].
 fn arm_probe() -> ProbeEnds {
     let (probe, ends) = probe_pair();
     arm(probe);
     ends
+}
+
+/// As [`arm_probe`], but the gate is released before it can ever be held, so the teardown runs
+/// straight through and the global worker is occupied only for the killed child's prompt exit.
+/// The right choice for any test that observes nothing while the teardown is held — and it hands
+/// back no gate, so such a test cannot spend the budget by accident.
+fn arm_probe_ungated() -> (mpsc::Receiver<ThreadId>, mpsc::Receiver<ReapOutcome>) {
+    let ends = arm_probe();
+    drop(ends.gate);
+    (ends.entered, ends.outcome)
 }
 
 #[tokio::test]
@@ -182,15 +197,14 @@ async fn drop_signals_the_root_and_returns_before_the_reap() {
 
 #[tokio::test]
 async fn drop_reaps_on_a_worker_thread() {
-    let ends = arm_probe();
+    let (entered, outcome) = arm_probe_ungated();
     let (child, _sock) = spawn_async_blocker();
     #[cfg(unix)]
     let id = child.id();
     drop(child);
 
-    let dropping = ends.entered.recv().expect("Drop must reach the handoff");
-    drop(ends.gate);
-    let outcome = ends.outcome.recv().expect("the teardown must report an outcome");
+    let dropping = entered.recv().expect("Drop must reach the handoff");
+    let outcome = outcome.recv().expect("the teardown must report an outcome");
     // Thread ids FIRST: an inlined teardown is the failure under test, and asserting the
     // identity first would fail it for an incidental reason instead.
     match outcome {
@@ -422,15 +436,14 @@ async fn concurrent_first_submits_share_one_init() {
 
 #[tokio::test]
 async fn teardown_panic_is_caught_and_reported() {
-    let ends = arm_probe();
+    let (entered, outcome) = arm_probe_ungated();
     let (child, _sock) = spawn_async_blocker();
     super::fault::set_force_teardown_panic(true);
     drop(child);
 
-    ends.entered.recv().expect("Drop must reach the handoff");
-    drop(ends.gate);
+    entered.recv().expect("Drop must reach the handoff");
     assert_eq!(
-        ends.outcome
+        outcome
             .recv()
             .expect("without the wait region's catch the worker unwinds and no outcome arrives"),
         ReapOutcome::Panicked,
@@ -467,16 +480,15 @@ async fn release_region_panic_does_not_unwind_run_teardown() {
 #[tokio::test]
 async fn unkillable_root_is_not_submitted() {
     use std::io::{Read as _, Write as _};
-    let ends = arm_probe();
+    // Ungated: nothing is submitted here, and a broken world that DID submit must not wedge a
+    // worker instead of failing the assertion below.
+    let (entered, outcome) = arm_probe_ungated();
     let (child, mut sock) = spawn_async_blocker();
     let id = child.id();
     super::fault::set_force_kill_failure(true);
     drop(child);
 
-    ends.entered.recv().expect("Drop must reach the handoff");
-    // Nothing is submitted, so nothing gates; releasing anyway keeps a broken world that DID
-    // submit from wedging a worker instead of failing the assertion below.
-    drop(ends.gate);
+    entered.recv().expect("Drop must reach the handoff");
     // Race-free: the seam REPLACED the kill, so the child was never signalled.
     assert_eq!(
         id.is_alive(),
@@ -501,7 +513,7 @@ async fn unkillable_root_is_not_submitted() {
     // The probe's outcome sender dropped with the job that was never built. A submitted job would
     // by now have reaped the exited child and reported `Reaped`.
     assert!(
-        ends.outcome.recv().is_err(),
+        outcome.recv().is_err(),
         "a child whose kill failed must not be submitted"
     );
 }

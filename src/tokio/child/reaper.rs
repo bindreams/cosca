@@ -36,6 +36,17 @@
 //! the runtime's orphan handling would not have managed it either. Process exit with jobs still
 //! queued is benign, since the roots are already signalled and the OS reaps them.
 //!
+//! **Known limitation: this pool is not fork-safe.** `fork` duplicates only the calling thread,
+//! so a child forked after publication inherits the populated cell and none of the workers. The
+//! send still SUCCEEDS — the receiver handles exist in the copied address space, so the channel
+//! is not disconnected and the degraded release path never fires — and every job queued in that
+//! child is unreaped, unlogged, and holds its resources for the life of the process. Measured, on
+//! Linux, not inferred. It is a real regression against the synchronous reap this replaced, which
+//! was fork-safe by construction. Windows has no `fork`; `fork`+`exec` and `posix_spawn` are
+//! unaffected because the image is replaced at once. A `pthread_atfork` child handler is the
+//! shape of the fix, but neither the cell nor the init lock survives one as written — see
+//! issue #121. `Drop`'s rustdoc carries the consumer-facing statement.
+//!
 //! The backlog `debug` log fires on healthy bursts too — it reports depth, not a fault, and no
 //! decision reads it.
 
@@ -52,8 +63,7 @@ pub(crate) struct ReapJob {
     pub(crate) origin: std::thread::ThreadId,
     #[cfg(test)]
     pub(crate) probe: Option<test_probe::DropProbe>,
-    /// Seeded panic in the wait region. Sampled at submit time on the dropping thread — a
-    /// thread-local armed by the test is invisible on a worker.
+    /// Seeded panic in the wait region; see `submit_to` for why it is sampled, not read here.
     #[cfg(test)]
     pub(crate) force_panic: bool,
     /// Seeded panic in the release region. Set directly on a hand-built job, so it needs no
@@ -89,7 +99,6 @@ impl Pool {
             );
         }
         if let Err(e) = self.tx.send(job) {
-            // Unreachable: a published pool's sender lives in a `static` and never drops.
             debug_assert!(false, "a published reaper pool's channel cannot disconnect");
             release(e.into_inner());
         }
@@ -250,7 +259,7 @@ fn release(job: ReapJob) {
     );
     #[cfg(test)]
     let probe = job.probe;
-    drop(job.os); // group order, single-sourced by `OsResources`
+    drop(job.os);
     #[cfg(test)]
     if let Some(p) = probe {
         let _ = p.outcome.send(test_probe::ReapOutcome::Released);
@@ -317,9 +326,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
         if force_release_panic {
             panic!("forced release-region panic (test seam)");
         }
-        // One drop, ordered by `OsResources`' own declaration order — `proc` first, so the pid
-        // stays pinned for the whole wait and every other release lands after the reap.
-        drop(os);
+        drop(os); // one drop, ordered by `OsResources`' own declaration
         #[cfg(test)]
         if let Some(p) = probe {
             let _ = p.outcome.send(if waited.is_err() {
@@ -358,9 +365,8 @@ pub(crate) mod fault {
         FORCE_SPAWN_FAILURES.with(|f| f.replace(0))
     }
 
-    /// Force the NEXT teardown to panic in its wait region. Sampled at submit time into
-    /// [`ReapJob::force_panic`](super::ReapJob::force_panic), because the region it models runs
-    /// on a worker.
+    /// Force the NEXT teardown to panic in its wait region, via
+    /// [`ReapJob::force_panic`](super::ReapJob::force_panic).
     pub(crate) fn set_force_teardown_panic(on: bool) {
         FORCE_TEARDOWN_PANIC.with(|f| f.set(on));
     }
