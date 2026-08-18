@@ -26,7 +26,7 @@ pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
 /// option placed there is silently eaten and `--exact` degrades to substring matching.
 /// `--test-threads=1` keeps a future filter that matches more than one test from running them
 /// concurrently inside a process the caller is about to signal.
-#[cfg(windows)]
+#[cfg(any(windows, feature = "tokio"))]
 pub(crate) fn fixture_argv(test: &str) -> [&str; 4] {
     ["cosca_unit_tests", "--test-threads=1", "--exact", test]
 }
@@ -135,4 +135,68 @@ fn fixture_registers_then_blocks() {
     sock.flush().expect("flush registration tag");
     let mut sink = [0u8; 1];
     let _ = sock.read(&mut sink);
+}
+
+/// The fully-qualified libtest path of [`fixture_control_block`].
+#[cfg(feature = "tokio")]
+pub(crate) const FIXTURE_CONTROL_BLOCK_TEST: &str = "test_child::fixture_control_block";
+
+/// The env var carrying the `127.0.0.1:<port>` address [`fixture_control_block`] tags. Its mere
+/// presence also tells the fixture it was re-exec'd deliberately rather than picked up by an
+/// ordinary, unfiltered suite run.
+#[cfg(feature = "tokio")]
+pub(crate) const FIXTURE_CONTROL_BLOCK_ADDR_ENV: &str = "COSCA_FIXTURE_CONTROL_BLOCK_ADDR";
+
+/// A child that reports readiness and then blocks until the caller releases or kills it: a no-op
+/// when picked up by an ordinary, unfiltered suite run ([`FIXTURE_CONTROL_BLOCK_ADDR_ENV`] is
+/// unset there). Re-executed via `current_exe() --exact` [`FIXTURE_CONTROL_BLOCK_TEST`] with that
+/// var set, it connects to the caller's listener, writes one tag byte, then blocks on a 1-byte
+/// read of that same socket and RETURNS as soon as the read returns — so a caller that writes a
+/// byte gets a clean voluntary exit, and a caller that kills it gets the socket's EOF.
+///
+/// Mirrors [`fixture_registers_then_blocks`]'s filtered-re-exec idiom (see
+/// [`spawn_a_process_that_exits`] for why the filter is mandatory), and deliberately takes NO
+/// `spawn_lock()`: see [`spawn_async_blocker`].
+#[cfg(feature = "tokio")]
+#[test]
+fn fixture_control_block() {
+    let Some(addr) = std::env::var_os(FIXTURE_CONTROL_BLOCK_ADDR_ENV) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    use std::io::{Read, Write};
+
+    let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect control socket");
+    sock.write_all(b"R").expect("write readiness tag");
+    sock.flush().expect("flush readiness tag");
+    let mut sink = [0u8; 1];
+    let _ = sock.read(&mut sink);
+}
+
+/// Spawn [`fixture_control_block`] through `cosca::tokio` and return its handle plus the control
+/// socket, already past the readiness tag — so the child is provably executing its own code.
+///
+/// **Takes no `spawn_lock()`, deliberately.** That lock is a plain non-reentrant mutex and
+/// cosca's own async spawn takes it internally, so a helper holding it across a cosca spawn
+/// deadlocks on its own thread. Every existing helper that takes it spawns via
+/// `std::process::Command`; the cosca-spawning helpers do not.
+///
+/// Uncontained (so the tree teardown is a verified no-op) and stdin INHERITED (so closing the
+/// parent's stdio cannot make the child exit on its own). Spawned via `executable()`, which puts
+/// Windows on the raw `CreateProcessW` backend.
+#[cfg(feature = "tokio")]
+pub(crate) fn spawn_async_blocker() -> (crate::tokio::Child, std::net::TcpStream) {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(&exe)
+        .args(fixture_argv(FIXTURE_CONTROL_BLOCK_TEST))
+        .env(FIXTURE_CONTROL_BLOCK_ADDR_ENV, &addr);
+    let child = cmd.spawn().expect("spawn the control-block fixture");
+    let (mut sock, _) = listener.accept().expect("accept the control socket");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read the readiness tag");
+    assert_eq!(&tag, b"R", "unexpected control tag");
+    (child, sock)
 }

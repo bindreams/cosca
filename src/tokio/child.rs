@@ -8,6 +8,9 @@ mod graceful;
 mod proc_source;
 pub(crate) use proc_source::ProcSource;
 
+#[path = "child/reaper.rs"]
+mod reaper;
+
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
@@ -27,12 +30,13 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 #[cfg(windows)]
 pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 
-/// The `expect` behind the two backend accessors: nothing takes `proc`, so both are infallible.
-const PROC_TAKEN: &str = "the async child's process backend is never taken";
+/// The `expect` behind the two backend accessors: only `Drop` takes `proc`, and nothing runs on
+/// the handle after that, so both are infallible.
+const PROC_TAKEN: &str = "the async child's process backend is taken only by Drop";
 
 #[derive(Debug)]
 pub struct Child {
-    /// `Option` only so the backend can be moved out of a `&mut self` receiver; nothing does.
+    /// `Option` so `Drop` can move the backend into the reaper job; nothing else takes it.
     /// Read it through `proc_mut()` / `proc()`, never directly.
     proc: Option<ProcSource>,
     id: ProcessId,
@@ -620,31 +624,39 @@ impl Child {
     }
 }
 
-/// Hard-kills the contained tree, then blocks until the root has exited — the same shape as the
-/// sync [`Child`](crate::Child)'s `Drop`. What differs, deliberately, is who collects the status:
-/// see the reap below.
+/// Signals the tree and the root and does NOT wait: the child is not necessarily gone when
+/// `drop` returns, and neither is it necessarily reaped. A caller that must observe the teardown
+/// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
+/// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
+///
+/// The reap itself is still guaranteed: the wait is handed to a small fixed pool of reaper
+/// threads (currently four) that starts on the first kill-on-drop drop and persists for the
+/// process's life. Under thread exhaustion the pool cannot start and the child is left to the
+/// runtime's orphan handling instead, logged per child; each drop then costs at most that many
+/// failing spawn syscalls.
+///
+/// The sync [`Child`](crate::Child)'s `Drop` still blocks; that divergence is deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
+        // The opt-out/`detach()` contract: nothing is signalled and nothing is logged.
         if !self.kill_on_drop {
             return;
+        }
+        #[cfg(test)]
+        let probe = reaper::test_probe::take();
+        #[cfg(test)]
+        if let Some(p) = probe.as_ref() {
+            let _ = p.entered.send(std::thread::current().id());
         }
         // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
         // only the root), so surface a real mechanism failure in debug. A no-op for an
         // uncontained child.
         //
-        // MUST stay on the dropping thread, and the reason is mechanism-specific — deferring it
-        // to a background thread or an awaitable teardown would take the guarantee away.
-        //
-        // Windows job object: a nested contained descendant is spawned into its OWN process group
-        // (`windows::group_flags`), so a consumer's `terminate_tree` — `CTRL_BREAK` to the ROOT's
-        // group — never reaches it, and `TerminateJobObject` here is the only thing that does.
-        //
-        // Unix: reach is identical either way. A nested contained descendant is `Delegated` and
-        // creates no group of its own, so `killpg` reaches it; a descendant that escaped by
-        // calling `setsid` itself is out of `hard_kill`'s reach too, since that is the same
-        // `killpg`. (The cgroup and fd-marker mechanisms sweep the same membership for both
-        // signals.) What this adds there is force, not reach: `SIGTERM` is catchable, `SIGKILL`
-        // is not.
+        // MUST stay on the dropping thread, before the handle is dismembered: on Windows a job
+        // object's kill is the only signal reaching a nested descendant that leads its own console
+        // group (console control events stop at that boundary). On Unix this and `terminate_tree`
+        // have the same radius. The contract either way: the tree is signalled before `drop`
+        // returns.
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             debug_assert!(
@@ -654,16 +666,11 @@ impl Drop for Child {
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         let _ = tree;
-        // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
-        // the dropping thread; the child is SIGKILL'd so it exits at once.
-        //
-        // The sync twin (`crate::Child`'s `Drop`) collects the status itself; this one must not —
-        // tokio owns the child and its own reaping, so the wait is non-reaping (`WNOWAIT`) and the
-        // collection is left to tokio's field-drop. `src/tokio/` mirrors the sync surface by hand
-        // with nothing enforcing parity, so that difference is deliberate, not drift.
+
         let pid = self.id.pid();
-        let proc = self.proc_mut();
-        // Already reaped: no signal to issue and no exit to wait for.
+        let mut proc = self.proc.take().expect(PROC_TAKEN);
+        // Already reaped: no signal to issue and no exit to wait for. The remaining resources
+        // release on this thread, with this handle.
         if proc.is_reaped() {
             return;
         }
@@ -673,9 +680,23 @@ impl Drop for Child {
             if !matches!(proc.try_wait(), Ok(Some(_))) {
                 log::warn!("async child {pid} could not be terminated on drop; leaving it running");
             }
+            // An unsignalled child is never submitted: its wait is unbounded, and a worker parked
+            // on it would never come back. Its resources release with this handle instead.
             return;
         }
-        proc.wait_and_reap(pid);
+        // Every field holding an OS resource travels with the backend, so its release stays
+        // ordered after the reap, as it is on this handle today.
+        reaper::submit(reaper::ReapJob {
+            proc,
+            attached: std::mem::take(&mut self.attached),
+            pipes: std::mem::take(&mut self.pipes),
+            owned_std: std::mem::take(&mut self.owned_std),
+            pid,
+            #[cfg(test)]
+            origin: std::thread::current().id(),
+            #[cfg(test)]
+            probe,
+        });
     }
 }
 
