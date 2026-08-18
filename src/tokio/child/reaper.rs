@@ -99,8 +99,10 @@ impl Pool {
             );
         }
         if let Err(e) = self.tx.send(job) {
-            debug_assert!(false, "a published reaper pool's channel cannot disconnect");
+            // Recover FIRST: in a debug build the assert below panics, and ordered ahead of the
+            // release it would cost this job the very recovery the branch exists for.
             release(e.into_inner());
+            debug_assert!(false, "a published reaper pool's channel cannot disconnect");
         }
     }
 }
