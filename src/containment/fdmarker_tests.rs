@@ -918,8 +918,21 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // assertion below is on the termination signal, not on `!success()`.
     await_member_ready(&mut q_child);
 
+    let handle = prepared.handle;
     let marker = super::Marker::new(prepared, None, Some(pgid), false);
     let mark = crate::log_capture::mark();
+
+    // A stand-in for the sibling record this assertion must ignore, emitted inside the window
+    // it scans so the scoping below is proven on every run rather than argued: `log_capture` is
+    // one process-global buffer, and every `kill_tree()` on a contained macOS child logs this
+    // same sentence under ITS OWN handle on its second pass. Safe to inject because no other
+    // test in this crate asserts on this sentence at all — only this one does, and only for
+    // `handle`.
+    log::debug!(
+        "fd marker {:#x}: skipping this pass's group signal — no live member confirmed this \
+         pass's pgid, so it may have been recycled",
+        handle.wrapping_add(1)
+    );
 
     // Pass 2: T's own holder scan on THIS pass confirms a live member of `pgid` (T itself), so
     // the gate must open and the group signal must re-fire, reaching Q via killpg.
@@ -931,8 +944,15 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         false,
     );
 
+    // Keyed on THIS marker's handle, per the module docs' rule: the bare sentence is emitted by
+    // every other marker's sweep too, so an unscoped probe reads a concurrent sibling's teardown
+    // as this pass's own skip. `handle` names a pipe object that cannot be reissued while this
+    // test holds the read end, so no simultaneously-live marker can share it.
     assert!(
-        !crate::log_capture::contains_since(mark, "skipping this pass's group signal"),
+        !crate::log_capture::contains_since(
+            mark,
+            &format!("fd marker {handle:#x}: skipping this pass's group signal")
+        ),
         "pass 2 must not skip the group signal: a live, getpgid-confirmed member (T) was just \
          found in this pass's own holder scan"
     );
