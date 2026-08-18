@@ -20,6 +20,53 @@ pub(crate) struct Prepared {
     /// process group).
     #[cfg(target_os = "macos")]
     pub marker: Option<crate::containment::fdmarker::PreparedMarker>,
+    /// The cooperative-signal mechanism implied by the creation-flag word this spawn passed to
+    /// `CreateProcessW`. Set by whichever backend chose that word, so the derivation reads what
+    /// the OS was actually given.
+    #[cfg(windows)]
+    pub graceful: crate::graceful::GracefulMechanism,
+}
+
+impl Prepared {
+    /// The cooperative-signal mechanism for a child spawned from this decision. The `cfg` lives
+    /// here, once, so no spawn path carries one for it: every non-Windows child cosca owns can
+    /// be sent an identity-bound `SIGTERM`, whatever its containment.
+    pub(crate) fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
+        #[cfg(windows)]
+        return self.graceful;
+        #[cfg(not(windows))]
+        return crate::graceful::GracefulMechanism::Process;
+    }
+}
+
+/// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the
+/// cooperative-signal mechanism, which are independent axes (see [`crate::graceful`]).
+///
+/// Bundled rather than threaded as separate positional arguments so the spawn constructors do
+/// not grow an argument per spawn fact, and so a new fact is a compile error at every
+/// construction site rather than a silently diverging path.
+pub(crate) struct Attachment {
+    pub containment: Containment,
+    pub attached: Attached,
+    pub graceful: crate::graceful::GracefulMechanism,
+}
+
+#[cfg(windows)]
+impl Attachment {
+    /// The attachment for a UAC-elevated spawn, which `ShellExecuteEx("runas")` creates through
+    /// a system service with creation flags this process never sees and never chose.
+    ///
+    /// The mechanism is `Unknown`, so [`crate::graceful::signal`] refuses this child rather than
+    /// addressing a console control event to its pid. `OtherConsoleGroup` would claim a route to
+    /// a group known to exist, and `None` that no cooperative signal exists from any process
+    /// ever; cosca can make neither claim about a child it did not create.
+    pub(crate) fn uac_elevated() -> Attachment {
+        Attachment {
+            containment: Containment::None,
+            attached: Attached::None,
+            graceful: crate::graceful::GracefulMechanism::Unknown,
+        }
+    }
 }
 
 /// Owns the OS containment resource for a spawned child; `hard_kill`/`terminate`
@@ -270,6 +317,8 @@ pub(crate) struct WindowsContain {
     pub creation_flags: u32,
     /// Whether this spawn must set the inherited root marker so descendants join THIS group.
     pub marker_env: bool,
+    /// The cooperative-signal mechanism `creation_flags` implies, derived from that same word.
+    pub graceful: crate::graceful::GracefulMechanism,
 }
 
 /// Decide the Windows pre-spawn containment flags + marker for `req`/`is_root`. Pure — directly
@@ -280,6 +329,7 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
         return WindowsContain {
             creation_flags: 0,
             marker_env: false,
+            graceful: crate::containment::windows::mechanism_from_flags(0),
         };
     };
     let creation_flags = if is_root && !matches!(mode, ContainMode::TreeWalk) {
@@ -293,6 +343,7 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     WindowsContain {
         creation_flags,
         marker_env: is_root && req.nesting == Nesting::Mark,
+        graceful: crate::containment::windows::mechanism_from_flags(creation_flags),
     }
 }
 
@@ -315,6 +366,9 @@ pub(crate) fn prepare(
             cgroup_leaf: None,
             #[cfg(target_os = "macos")]
             marker: None,
+            // An uncontained spawn passes no creation flags, so it leads no group of its own.
+            #[cfg(windows)]
+            graceful: crate::containment::windows::mechanism_from_flags(0),
         };
     }
     let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
@@ -415,12 +469,13 @@ pub(crate) fn prepare(
     // root marker itself is applied above (shared with the Unix path), so only the creation
     // flags are applied here.
     #[cfg(windows)]
-    if mode.is_some() {
+    let graceful = {
         use std::os::windows::process::CommandExt;
         crate::containment::windows::clear_std_handle_inheritance();
         let setup = windows_contain_setup(req, is_root);
         std_cmd.creation_flags(setup.creation_flags);
-    }
+        setup.graceful
+    };
 
     #[allow(unreachable_code)]
     Prepared {
@@ -430,13 +485,36 @@ pub(crate) fn prepare(
         cgroup_leaf: None,
         #[cfg(target_os = "macos")]
         marker,
+        #[cfg(windows)]
+        graceful,
     }
 }
 
-/// Phase 2 (after spawn, before SharedChild::new): attach the mechanism.
-/// Consumes `prepared` so Linux cgroup leaf ownership transfers cleanly to
-/// `Attached::Cgroup` without requiring interior mutability.
+/// Phase 2 (after spawn, before SharedChild::new): attach the mechanism and bundle it with the
+/// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
+/// cleanly to `Attached::Cgroup` without requiring interior mutability — hence the
+/// cooperative-signal mechanism is read off it first.
 pub(crate) fn attach(
+    pid: u32,
+    #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
+    prepared: Prepared,
+) -> Result<Attachment, Error> {
+    let graceful = prepared.graceful_mechanism();
+    let (containment, attached) = attach_tree(
+        pid,
+        #[cfg(windows)]
+        proc_handle,
+        prepared,
+    )?;
+    Ok(Attachment {
+        containment,
+        attached,
+        graceful,
+    })
+}
+
+/// The tree-teardown half of [`attach`]: which mechanism owns this child's tree.
+fn attach_tree(
     pid: u32,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,

@@ -13,6 +13,9 @@
 //! This is NOT a security sandbox: a determined child escapes every mechanism
 //! (broker-spawned helpers, privilege, `setsid` out of a process group). It
 //! reliably tears down *cooperative* trees and reports the achieved guarantee.
+//!
+//! [`Containment`] answers "who tears this tree down". What cooperative signal `terminate()`
+//! sends the child is an independent axis — see [`crate::graceful`].
 
 use std::fmt;
 
@@ -64,6 +67,10 @@ pub enum Containment {
     /// A nested member of an ancestor's containment group/job: this child joined the
     /// tree the outermost root owns, so it drives no teardown itself (`can_teardown()`
     /// is `false`) and its `_tree` ops return `Unsupported`. The root tears the tree down.
+    ///
+    /// It is still independently signallable through its own handle wherever
+    /// [`Child::graceful_mechanism`](crate::Child::graceful_mechanism) says so — owning no tree
+    /// is not the same as having no cooperative shutdown.
     Delegated,
     /// No containment — `kill`/drop act on the lone process.
     None,
@@ -293,7 +300,7 @@ pub(crate) mod treewalk;
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
 #[allow(unused_imports)]
-pub(crate) use dispatch::{attach, prepare, Attached, Prepared};
+pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

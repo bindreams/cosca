@@ -243,15 +243,52 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
 // edge at all, not the "skip the sweep" bucket. Proven by forcing `kill_tree` to fail: the call
 // only comes back `Ok` if that branch was never entered. Both arms are real, exercised
 // assertions on every platform, not a skip.
+//
+// Both arms block on a readiness edge from the child's own code before signalling. Without it
+// the child has not registered with the console (Windows) or installed its disposition (Unix)
+// when the signal arrives, and what the test measures is an abrupt death during startup rather
+// than the cooperative path it is named for.
 #[test]
 fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
+    use std::io::Read;
+
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]); // dies to the default-disposition SIGTERM well within grace
+    {
+        // `exec` keeps the signalled root process `sleep` itself, so the SIGTERM assertion below
+        // still means what it means. It dies to the default disposition well within grace.
+        cmd.args(["sh", "-c", "echo r; exec sleep 30"]);
+        cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    }
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    #[cfg(windows)]
+    {
+        cmd.executable(std::env::current_exe().expect("current_exe"))
+            .args(crate::test_child::fixture_argv(
+                crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
+            ));
+        cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
+    }
     cmd.contain();
-    let child = cmd.spawn().expect("spawn");
+    #[allow(unused_mut)]
+    let mut child = cmd.spawn().expect("spawn");
+    #[cfg(unix)]
+    {
+        let mut readiness = [0u8; 1];
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_exact(&mut readiness)
+            .expect("readiness byte");
+    }
+    #[cfg(windows)]
+    let _sock = {
+        let (mut sock, _) = listener.accept().expect("accept rendezvous connection");
+        let mut tag = [0u8; 1];
+        sock.read_exact(&mut tag).expect("registration tag");
+        sock
+    };
     let authoritative = matches!(
         child.containment(),
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
@@ -275,7 +312,11 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
             );
         }
         #[cfg(windows)]
-        let _ = status;
+        assert_eq!(
+            status.code(),
+            Some(0xC000013A_u32 as i32),
+            "the root must die to the console event, not to a loader-init kill or the sweep, got {status:?}"
+        );
     } else {
         // Either the marker is advisory (macOS, drain-observable but not authoritative) or
         // there is no kernel drain edge at all: either way the sweep is unconditional by design
@@ -390,7 +431,9 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
 
     let mut cmd = crate::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
+        .args(crate::test_child::fixture_argv(
+            crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,
+        ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     cmd.contain();
     let child = cmd.spawn().expect("spawn");

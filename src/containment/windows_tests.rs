@@ -195,3 +195,67 @@ fn the_no_console_signature_matches_the_real_win32_mapping() {
         Some(E_INVALID_HANDLE)
     );
 }
+
+// The mechanism the creation-flag word settles, one test per row. Nine inputs, three distinct
+// outcomes: no constant implementation passes, and the last three rows pin that
+// `OtherConsoleGroup` is a statement about a route to a group that EXISTS, not a synonym for
+// "detached" — with no group flag there is nothing to address, whatever the console situation.
+mod mechanism_from_flags_tests {
+    use crate::containment::windows::{group_flags, mechanism_from_flags, root_flags};
+    use crate::graceful::GracefulMechanism;
+    use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
+
+    #[test]
+    fn mechanism_from_flags_reports_none_for_no_flags() {
+        assert_eq!(mechanism_from_flags(0), GracefulMechanism::None);
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_console_group_for_group_flags() {
+        assert_eq!(mechanism_from_flags(group_flags()), GracefulMechanism::ConsoleGroup);
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_console_group_for_root_flags() {
+        assert_eq!(mechanism_from_flags(root_flags()), GracefulMechanism::ConsoleGroup);
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_other_console_group_for_group_plus_detached() {
+        assert_eq!(
+            mechanism_from_flags(group_flags() | DETACHED_PROCESS.0),
+            GracefulMechanism::OtherConsoleGroup
+        );
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_other_console_group_for_group_plus_new_console() {
+        assert_eq!(
+            mechanism_from_flags(group_flags() | CREATE_NEW_CONSOLE.0),
+            GracefulMechanism::OtherConsoleGroup
+        );
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_other_console_group_for_group_plus_no_window() {
+        assert_eq!(
+            mechanism_from_flags(group_flags() | CREATE_NO_WINDOW.0),
+            GracefulMechanism::OtherConsoleGroup
+        );
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_none_for_detached_without_a_group() {
+        assert_eq!(mechanism_from_flags(DETACHED_PROCESS.0), GracefulMechanism::None);
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_none_for_a_new_console_without_a_group() {
+        assert_eq!(mechanism_from_flags(CREATE_NEW_CONSOLE.0), GracefulMechanism::None);
+    }
+
+    #[test]
+    fn mechanism_from_flags_reports_none_for_no_window_without_a_group() {
+        assert_eq!(mechanism_from_flags(CREATE_NO_WINDOW.0), GracefulMechanism::None);
+    }
+}

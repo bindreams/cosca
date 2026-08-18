@@ -35,6 +35,7 @@ pub struct Child {
     attached: Attached,
     kill_on_drop: bool,
     containment: Containment,
+    graceful: crate::graceful::GracefulMechanism,
     /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
     /// [`fd_write_end`](Child::fd_write_end). Unix: `command-fds`-wired reactor pipes; Windows: the
     /// raw backend's overlapped async ends (empty on the std path, which routes fd >= 3 to the raw
@@ -53,18 +54,18 @@ impl Child {
     pub(super) fn from_parts(
         proc: ProcSource,
         id: ProcessId,
-        attached: Attached,
         kill_on_drop: bool,
-        containment: Containment,
+        attachment: crate::containment::Attachment,
         pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
             proc,
             id,
-            attached,
+            attached: attachment.attached,
             kill_on_drop,
-            containment,
+            containment: attachment.containment,
+            graceful: attachment.graceful,
             pipes,
             owned_std,
             elevation: None,
@@ -106,6 +107,11 @@ impl Child {
     }
     pub fn containment(&self) -> Containment {
         self.containment
+    }
+    /// Async mirror of [`Child::graceful_mechanism`](crate::Child::graceful_mechanism) — see
+    /// there for what the value claims, and what it deliberately does not.
+    pub fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
+        self.graceful
     }
 
     pub fn stdin(&mut self) -> Option<super::stdio::ChildStdin> {
@@ -428,8 +434,16 @@ impl Child {
     ///
     /// **Windows: what this actually signals.** `CTRL_BREAK` is delivered to the root's
     /// **process group**, not to the tree. A nested contained descendant leads its own
-    /// group and never receives it; only [`kill_tree`](Child::kill_tree) reaches every
-    /// member.
+    /// group and never receives it, so from THIS handle only
+    /// [`kill_tree`](Child::kill_tree) reaches every member. The layers this skips are not
+    /// beyond a polite shutdown, though: the holder of a nested descendant's own `Child` can
+    /// drain it with [`terminate`](Child::terminate) or
+    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
+    /// chain in which each level shuts down its own children drains completely, because a
+    /// child that owns a console can politely signal its own group-leading children.
+    ///
+    /// **And success here does not prove the event was delivered.** A root that shares no
+    /// console with the caller is reported as success and reaches nobody.
     ///
     /// **And it needs the caller to have a console.** The event is deliverable only within
     /// the *calling* process's console, so a GUI-subsystem binary, a service, or anything
@@ -447,8 +461,23 @@ impl Child {
     /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), and the residual `hidepid` gap on Linux.
+    ///
+    /// **Windows, after the root's exit has been observed.** The event is addressed by the
+    /// ROOT's pid — on the job-object mechanism and the tree walk alike — and this handle stops
+    /// pinning that pid the moment `wait`/`try_wait` reports the exit, so the OS may reissue it
+    /// to an unrelated group leader. A root exiting while its descendants are still alive is an
+    /// ordinary flow, so this is refused from that point
+    /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
+    /// pid; [`kill_tree`](Child::kill_tree) addresses no pid and still reaches the survivors.
+    /// The sync [`Child`](crate::Child) pins for its whole life and is unaffected.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        // After the mechanism guard, which is permanent and pid-independent: an uncontained
+        // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
+        #[cfg(windows)]
+        if !self.proc.pins_pid() {
+            return Err(self.unpinned_pid_refusal("terminate_tree"));
+        }
         // See kill_tree's identical precondition assert for the full rationale, including the
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
@@ -469,6 +498,25 @@ impl Child {
             self.id.pid()
         );
         self.attached.terminate(self.id.pid())
+    }
+
+    /// The refusal both cooperative ops answer with once this handle has stopped pinning the
+    /// child's pid — the async backend releases the Windows process handle when `wait`/`try_wait`
+    /// observes the exit. Shared so the lone and the tree op cannot drift on what is, for both,
+    /// the same hazard: a console control event carries a bare pid and nothing else.
+    #[cfg(windows)]
+    fn unpinned_pid_refusal(&self, op: &str) -> Error {
+        Error::Unassessable {
+            detail: format!(
+                "this handle no longer pins pid {pid}: the async backend released the child's \
+                 process handle when its exit was observed, so the pid may since name an \
+                 unrelated process. A console control event is addressed by pid alone, so {op}() \
+                 sent nothing. The child itself is already gone; kill_tree() addresses no pid and \
+                 still tears down any survivors.",
+                pid = self.id.pid()
+            ),
+            source: None,
+        }
     }
 
     /// Guard for the `_tree` operations (single-sourced with the sync `Child`).

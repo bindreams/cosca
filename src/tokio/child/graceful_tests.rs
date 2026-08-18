@@ -220,11 +220,43 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
 async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    {
+        cmd.args(["sh", "-c", "echo r; exec sleep 30"]);
+        cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    }
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    #[cfg(windows)]
+    {
+        cmd.executable(std::env::current_exe().expect("current_exe"))
+            .args(crate::test_child::fixture_argv(
+                crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
+            ));
+        cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
+    }
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncReadExt;
+        let mut readiness = [0u8; 1];
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_exact(&mut readiness)
+            .await
+            .expect("readiness byte");
+    }
+    // Blocking `std::net::TcpListener`, exactly like the sibling Windows test above: a bounded
+    // wait for a real connection, not a poll loop.
+    #[cfg(windows)]
+    let _sock = {
+        use std::io::Read;
+        let (mut sock, _) = listener.accept().expect("accept rendezvous connection");
+        let mut tag = [0u8; 1];
+        sock.read_exact(&mut tag).expect("registration tag");
+        sock
+    };
     let authoritative = matches!(
         child.containment(),
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
@@ -248,7 +280,11 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
             );
         }
         #[cfg(windows)]
-        let _ = status;
+        assert_eq!(
+            status.code(),
+            Some(0xC000013A_u32 as i32),
+            "the root must die to the console event, not to a loader-init kill or the sweep, got {status:?}"
+        );
     } else {
         let err = result.expect_err("a non-authoritative mechanism must always run the sweep");
         assert!(
@@ -328,7 +364,9 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
 
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST]);
+        .args(crate::test_child::fixture_argv(
+            crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,
+        ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
@@ -348,6 +386,105 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.
     let _ = child.kill_tree();
+}
+
+// The lone graceful ops must not fire a pid-addressed console event once the backend has reaped:
+// tokio replaces its inner state on `wait`, dropping the guard that holds the process handle, and
+// the OS may reissue that pid to a process leading a group in this console.
+//
+// `.contain()` is load-bearing — an uncontained child reports `GracefulMechanism::None` and would
+// be refused before the pid ever mattered, which is the wrong reason. Both assertions read the
+// error's VARIANT, not merely that one exists: an unguarded call returns `Ok` or the OS's `Io`,
+// never `Unassessable`, whichever way the recycled pid falls.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        child.graceful_mechanism(),
+        crate::graceful::GracefulMechanism::ConsoleGroup,
+        "the subject must be a child the signal would otherwise be sent to"
+    );
+    child.kill().expect("kill");
+    child.wait().await.expect("reap"); // tokio unpins the pid here
+    let err = child.terminate().expect_err("an unpinned pid must not be signalled");
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
+        "got {err:?}"
+    );
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect_err("the escalation trio inherits the refusal from its cooperative half");
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
+        "got {err:?}"
+    );
+}
+
+// The TREE graceful ops must refuse on the same terms: both Windows arms of `terminate_tree`
+// (job object and tree walk) address the root's bare pid exactly like the lone `terminate`, and
+// a root that exits while its descendants are still alive is the ordinary reason to reach for a
+// tree signal at all. The refusal is `Unassessable` — not `Ok`, which is what an unguarded call
+// returns after firing at whatever now holds the pid — and `graceful_shutdown_tree` inherits it:
+// the trace asserted below fires only if `terminate_tree` refused.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let id = child.id();
+    child.kill().expect("kill");
+    child.wait().await.expect("reap"); // tokio unpins the pid here
+    let err = child
+        .terminate_tree()
+        .expect_err("an unpinned pid must not be signalled");
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
+        "got {err:?}"
+    );
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    // Held, then superseded by the drained tree — the refusal reaching `graceful_shutdown_tree`
+    // at all is what this proves, not the disposition it already documents for that shape.
+    child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("a drained tree supersedes the held refusal");
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
+        ),
+        "graceful_shutdown_tree must inherit the refusal from its cooperative half"
+    );
+}
+
+// The pid guard must not swallow the refusals that never address a pid. An uncontained Windows
+// child records `GracefulMechanism::None` — permanent and pid-independent — so it must keep
+// answering `Unsupported` (what its own doc promises, and what the sync mirror returns for the
+// identical child) after the backend has unpinned the pid, not `Unassessable`, which is
+// documented as a transient could-not-determine condition a caller may retry.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]); // uncontained: leads no group of its own
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        child.graceful_mechanism(),
+        crate::graceful::GracefulMechanism::None,
+        "the subject must be a child whose refusal is permanent, not pid-dependent"
+    );
+    child.kill().expect("kill");
+    child.wait().await.expect("reap"); // tokio unpins the pid here
+    let err = child.terminate().expect_err("a child that leads no group is refused");
+    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
 }
 
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.

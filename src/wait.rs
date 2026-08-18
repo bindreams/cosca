@@ -66,6 +66,11 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 /// identity-verified. Signal-only — does not wait or reap. Already-dead ⇒ `Ok`; a real
 /// failure (no rights / `EPERM`) ⇒ `Err`. Windows has no per-process graceful signal ⇒
 /// `Unsupported`.
+///
+/// This is one mechanism, not the crate's whole graceful surface: on Windows a child that
+/// leads its own console process group is addressed through that group instead.
+/// [`crate::graceful::signal`], reached via [`Child::terminate`](crate::Child::terminate), is
+/// the mechanism-aware entry point that picks between them.
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     backend::terminate(id)
 }

@@ -258,7 +258,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         use std::os::windows::io::AsRawHandle;
         child.as_raw_handle()
     };
-    let (containment, attached) = match attach_or_fault(
+    let attachment = match attach_or_fault(
         child.id(),
         #[cfg(windows)]
         proc_handle,
@@ -316,8 +316,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         id,
         parent_ends,
         kill_on_drop,
-        containment,
-        attached,
+        attachment,
     ))
 }
 
@@ -723,7 +722,7 @@ pub(crate) fn attach_or_fault(
     pid: u32,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: crate::containment::Prepared,
-) -> Result<(crate::containment::Containment, crate::containment::Attached), Error> {
+) -> Result<crate::containment::Attachment, Error> {
     #[cfg(test)]
     if fault::force_attach_failure() {
         // Capture identity for the test to prove the child is reaped, then simulate an attach

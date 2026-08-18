@@ -103,6 +103,33 @@ mod log_capture {
 }
 pub use log_capture::{contains_since, install as install_log_capture, mark as log_mark};
 
+/// Is `pid` attached to OUR console? `None` when the probe found no console at all, so a
+/// broken or console-less probe can never satisfy an "absent" assertion — the two are
+/// different facts and folding them together would make an absence assertion unfailable.
+///
+/// The answer is only meaningful once the target has executed its own code: console
+/// registration is not synchronous with the spawn returning, so a probe taken at the instant
+/// `spawn()` returns reads "absent" for a perfectly ordinary console child. Every caller must
+/// complete a handshake with the target first.
+#[cfg(windows)]
+pub fn in_our_console(pid: u32) -> Option<bool> {
+    // Grow to whatever count the API reports rather than capping: a too-small buffer makes it
+    // return the REQUIRED count without filling, which a fixed cap would silently read as
+    // "absent".
+    let mut buf = vec![0u32; 16];
+    loop {
+        // SAFETY: standard Win32; `buf` is a valid writable slice.
+        let n = unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut buf) } as usize;
+        if n == 0 {
+            return None; // no console at all, or the probe itself failed
+        }
+        if n <= buf.len() {
+            return Some(buf[..n].contains(&pid));
+        }
+        buf.resize(n, 0);
+    }
+}
+
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
@@ -121,6 +148,49 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     let (mut sock, _) = listener.accept().expect("accept");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
+    (child, sock)
+}
+
+/// `spawn_control`'s shape against the GUI-subsystem helper: it takes no mode argument (the
+/// binary has exactly one behaviour) and tags `b"G"`. A GUI-subsystem image never attaches to
+/// its spawner's console, so this is the only way to construct a child whose creation flags say
+/// nothing excludes delivery while the OS puts it out of reach.
+#[cfg(windows)]
+pub fn spawn_gui_control(contain: bool) -> (cosca::Child, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
+    let mut cmd = cosca::Command::new();
+    cmd.executable(exe).args([exe, addr.as_str()]);
+    if contain {
+        cmd.contain();
+    }
+    let child = cmd.spawn().expect("spawn gui control child");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read tag");
+    assert_eq!(&tag, b"G", "wrong gui tag");
+    (child, sock)
+}
+
+/// Async sibling of [`spawn_gui_control`] — see there for why the GUI-subsystem image is the
+/// only way to construct a child whose flags say nothing excludes delivery while the OS puts it
+/// out of reach.
+#[cfg(all(windows, feature = "tokio"))]
+pub fn spawn_gui_control_async(contain: bool) -> (cosca::tokio::Child, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.args([exe, addr.as_str()]);
+    if contain {
+        cmd.contain();
+    }
+    let child = cmd.spawn().expect("spawn async gui control child");
+    let (mut sock, _) = listener.accept().expect("accept");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read tag");
+    assert_eq!(&tag, b"G", "wrong gui tag");
     (child, sock)
 }
 

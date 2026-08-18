@@ -157,14 +157,54 @@ impl Drop for JobHandle {
 /// `CREATE_NEW_PROCESS_GROUP`: child leads its own console group so
 /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can target it.
 /// Shared by the std path and the raw `CreateProcessW` backend via `windows_contain_setup`.
+/// What this word implies about cooperative shutdown is derived by [`mechanism_from_flags`].
 pub(crate) fn root_flags() -> u32 {
     CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0
 }
 
 /// Pre-spawn creation flags for a nested (non-root) spawn.
 /// Only `CREATE_NEW_PROCESS_GROUP` — no suspension needed for nested spawns.
+/// What this word implies about cooperative shutdown is derived by [`mechanism_from_flags`].
 pub(crate) fn group_flags() -> u32 {
     CREATE_NEW_PROCESS_GROUP.0
+}
+
+/// Which cooperative signal a child spawned with `creation_flags` can be sent, derived from the
+/// flag word the spawn actually passed to `CreateProcessW`.
+///
+/// Three rows:
+///
+/// - `CREATE_NEW_PROCESS_GROUP` absent → [`GracefulMechanism::None`]. The child sits in the
+///   spawner's group, so no console control event can ever be addressed to it individually by
+///   any process, and group leadership cannot be changed after creation. This is the one flat
+///   negative the flag word settles absolutely.
+/// - the group flag set, and none of `DETACHED_PROCESS` / `CREATE_NEW_CONSOLE` /
+///   `CREATE_NO_WINDOW` → [`GracefulMechanism::ConsoleGroup`].
+/// - the group flag set together with any of those three → [`GracefulMechanism::OtherConsoleGroup`].
+///
+/// What the results do **not** mean. `ConsoleGroup` says the flags do not *exclude* in-process
+/// delivery — it is not a claim the child is reachable. Console membership is not a function of
+/// the flag word at all: a GUI-subsystem image never attaches to the spawner's console whatever
+/// the flags say, and any child may `FreeConsole`/`AllocConsole`/`AttachConsole` after it starts.
+/// An out-of-console group makes `GenerateConsoleCtrlEvent` report success while delivering
+/// nothing, which is why the split exists. And `OtherConsoleGroup` is not "unreachable": a child
+/// spawned with window suppression owns a *private* console a helper process can attach to, so
+/// the claim is about the route from here, never a verdict on the child.
+///
+/// Any future creation-flag surface must extend this one function rather than deriving a
+/// mechanism of its own.
+pub(crate) fn mechanism_from_flags(creation_flags: u32) -> crate::graceful::GracefulMechanism {
+    use crate::graceful::GracefulMechanism;
+    use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
+
+    if creation_flags & CREATE_NEW_PROCESS_GROUP.0 == 0 {
+        return GracefulMechanism::None;
+    }
+    let out_of_console = DETACHED_PROCESS.0 | CREATE_NEW_CONSOLE.0 | CREATE_NO_WINDOW.0;
+    if creation_flags & out_of_console != 0 {
+        return GracefulMechanism::OtherConsoleGroup;
+    }
+    GracefulMechanism::ConsoleGroup
 }
 
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents
@@ -281,15 +321,48 @@ pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io:
 /// targeting its `pid` reaches the whole group without affecting the parent's console.
 /// `CTRL_C` cannot be group-targeted; `CTRL_BREAK` is the only option here.
 ///
+/// **Precondition: the caller holds something that pins `pid`** — the owning `Child`'s process
+/// handle, or an identity-verified `ProcessId`. This function takes a raw pid because Win32
+/// offers no verify-then-signal primitive, so an unpinned pid could name a recycled process.
+///
 /// **Requires the CALLER to have a console.** That is the failure this classifies; Windows
 /// can also report `ERROR_INVALID_PARAMETER` for a pid that names no process at all, which
-/// stays a raw `Error::Io`. A group that merely *drained* is not a failure — measured, a dead
-/// group leader still returns success. The failure code is authoritative; the console probe that follows only *confirms* it, so a
-/// console state change in the gap degrades the result to a raw `Error::Io` rather than to a
-/// false `NoConsole`. Targeting a group that is in a *different* console is NOT reported by
-/// Windows at all — it returns success and delivers nothing.
+/// stays a raw `Error::Io`. The failure code is authoritative; the console probe that follows
+/// only *confirms* it, so a console state change in the gap degrades the result to a raw
+/// `Error::Io` rather than to a false `NoConsole`.
+///
+/// **The Win32 return value is evidence in neither direction.** Measured: a target in another
+/// console returns success having delivered nothing, and the same class of target returns
+/// `ERROR_INVALID_PARAMETER` in another configuration. So the classification above must never
+/// be replaced with a return-code check, and success must never be read as delivery.
+///
+/// **An already-exited target is `Ok`**, because the pinned pid stays allocated and the call
+/// succeeds — matching the crate's "already-dead ⇒ `Ok`" contract for the lone signal. A dead
+/// group leader is not proof of an empty group either: a signal addressed to one still reaches
+/// live members of that group.
+///
+/// **Two known gaps a caller must plan around.** A target that shares no console with the caller
+/// is reported as success and receives nothing; a process attached to the child's *own* console
+/// can deliver an event to it, and `kill`/`kill_tree` need no console at all. And every call —
+/// including one to an ordinary group that has already drained — leaves a dead entry in the
+/// caller's console process list, which persists after the target exits.
+///
+/// **Absence from the caller's console list is not grounds to refuse.** Membership is readable
+/// (`GetConsoleProcessList`), so the first gap's condition is decidable here; the inference is
+/// what is missing. Absence is consistent with three states and only one of them is a
+/// non-delivery. A contained child is absent at the instant `spawn()` returns — measured 0/10,
+/// and 0/10 again for the suspend-then-resume shape a contained root uses — while a signal in
+/// that window is delivered and kills it, so refusing would turn a working teardown into an
+/// error. An already-exited child is absent too, because a real member's entry is removed on
+/// exit, where this function's contract is "already-dead ⇒ `Ok`". The genuinely-elsewhere target
+/// is the third, and separating it needs the TARGET's console rather than ours — a broker, not
+/// a probe.
 pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
     use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    debug_assert!(
+        pid != 0,
+        "pid 0 addresses every process attached to the caller's console, including the caller"
+    );
     // SAFETY: standard Win32 call targeting the child's own console group.
     match unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } {
         Ok(()) => Ok(()),

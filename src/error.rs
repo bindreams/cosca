@@ -132,8 +132,9 @@ pub enum Error {
     Containment { detail: String },
     /// The calling process has no attached console, so Windows' console-group graceful
     /// signal (`CTRL_BREAK`) cannot be delivered — the caller is a GUI-subsystem binary,
-    /// a service, or was spawned detached. Only the *graceful* tree ops are affected;
-    /// `kill_tree` needs no console.
+    /// a service, or was spawned detached. Every graceful op that reaches a console group is
+    /// affected, lone and tree alike; `kill` and `kill_tree` need no console, and a lone or
+    /// nested child that has no `kill_tree` still has `kill`.
     #[error("no attached console for the graceful console-group signal: {detail}")]
     NoConsole { detail: String },
     /// Privilege elevation could not be completed at runtime.
@@ -145,7 +146,8 @@ pub enum Error {
     /// Typically an unprivileged caller querying a service, or a parent that cannot open
     /// its own elevated child. Also covers the crate's own refusal to act on a target it
     /// cannot address safely — a pid that names a process *group* rather than a single
-    /// process — where nothing was asked of the OS at all; those carry no `source`.
+    /// process, or one the handle no longer pins against reuse — where nothing was asked of
+    /// the OS at all; those carry no `source`.
     #[error("could not determine the target process's state: {detail}")]
     Unassessable {
         detail: String,
