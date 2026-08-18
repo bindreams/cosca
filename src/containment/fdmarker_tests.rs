@@ -925,13 +925,13 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // A stand-in for the sibling record this assertion must ignore, emitted inside the window
     // it scans so the scoping below is proven on every run rather than argued: `log_capture` is
     // one process-global buffer, and every `kill_tree()` on a contained macOS child logs this
-    // same sentence under ITS OWN handle on its second pass. Safe to inject because no other
-    // test in this crate asserts on this sentence at all — only this one does, and only for
-    // `handle`.
+    // same sentence under ITS OWN handle on its second pass. Keyed on `0`, which `install`
+    // refuses as a write-end handle, so it is provably not `handle` and provably not any live
+    // marker's — the decoy cannot become the contamination it stands in for.
     log::debug!(
         "fd marker {:#x}: skipping this pass's group signal — no live member confirmed this \
          pass's pgid, so it may have been recycled",
-        handle.wrapping_add(1)
+        0u64
     );
 
     // Pass 2: T's own holder scan on THIS pass confirms a live member of `pgid` (T itself), so
