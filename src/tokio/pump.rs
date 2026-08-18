@@ -12,7 +12,7 @@ use super::child::Child;
 impl Child {
     pub async fn communicate(&mut self, input: Option<Vec<u8>>) -> Result<Output, Error> {
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
-        // `self.proc` (so the four-future join compiles), and the Tokio backend's `wait` internally
+        // `self.proc_mut()` (so the four-future join compiles), and the Tokio backend's `wait` internally
         // drops its own stdin, already taken here, so it cannot race the write future.
         let mut stdin = self.stdin();
         let mut stdout = self.stdout();
@@ -62,7 +62,7 @@ impl Child {
         };
         // `wait` is the sole borrow of `self` here (already mapped to `Error`); the stream futures
         // own their taken locals, so the four-future join has no aliasing conflict.
-        let wait = async { self.proc.wait().await };
+        let wait = async { self.proc_mut().wait().await };
 
         let ((), out, err, status) = ::tokio::try_join!(write, read_out, read_err, wait)?;
         Ok(Output {

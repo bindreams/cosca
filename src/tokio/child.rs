@@ -27,10 +27,14 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 #[cfg(windows)]
 pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 
+/// The `expect` behind the two backend accessors: nothing takes `proc`, so both are infallible.
+const PROC_TAKEN: &str = "the async child's process backend is never taken";
+
 #[derive(Debug)]
 pub struct Child {
-    // `pub(super)`: the sibling `pump` module borrows the backend for `communicate`'s `wait` future.
-    pub(super) proc: ProcSource,
+    /// `Option` only so the backend can be moved out of a `&mut self` receiver; nothing does.
+    /// Read it through `proc_mut()` / `proc()`, never directly.
+    proc: Option<ProcSource>,
     id: ProcessId,
     attached: Attached,
     kill_on_drop: bool,
@@ -60,7 +64,7 @@ impl Child {
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         Child {
-            proc,
+            proc: Some(proc),
             id,
             attached: attachment.attached,
             kill_on_drop,
@@ -70,6 +74,17 @@ impl Child {
             owned_std,
             elevation: None,
         }
+    }
+
+    /// The process backend. `pub(super)`: the sibling `pump` module borrows it for
+    /// `communicate`'s `wait` future, and `child::graceful` for its pid-pinning guard.
+    pub(super) fn proc_mut(&mut self) -> &mut ProcSource {
+        self.proc.as_mut().expect(PROC_TAKEN)
+    }
+    /// Shared read-only accessor for the two `pins_pid` guards, which hold `&self`.
+    #[cfg(windows)]
+    pub(super) fn proc(&self) -> &ProcSource {
+        self.proc.as_ref().expect(PROC_TAKEN)
     }
 
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
@@ -102,7 +117,8 @@ impl Child {
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
     pub(super) fn wait_and_reap_blocking(&mut self) {
-        self.proc.wait_and_reap(self.id.pid());
+        let pid = self.id.pid();
+        self.proc_mut().wait_and_reap(pid);
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -125,7 +141,7 @@ impl Child {
         if let Some(owned) = self.take_owned_in(crate::stdio::Fd::STDIN) {
             return Some(super::stdio::ChildStdin { inner: owned });
         }
-        self.proc.take_stdin().map(|s| super::stdio::ChildStdin {
+        self.proc_mut().take_stdin().map(|s| super::stdio::ChildStdin {
             inner: super::stdio::InInner::Tokio(s),
         })
     }
@@ -133,7 +149,7 @@ impl Child {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDOUT) {
             return Some(super::stdio::ChildStdout { inner: owned });
         }
-        self.proc.take_stdout().map(|s| super::stdio::ChildStdout {
+        self.proc_mut().take_stdout().map(|s| super::stdio::ChildStdout {
             inner: super::stdio::OutInner::Stdout(s),
         })
     }
@@ -141,7 +157,7 @@ impl Child {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDERR) {
             return Some(super::stdio::ChildStderr { inner: owned });
         }
-        self.proc.take_stderr().map(|s| super::stdio::ChildStderr {
+        self.proc_mut().take_stderr().map(|s| super::stdio::ChildStderr {
             inner: super::stdio::OutInner::Stderr(s),
         })
     }
@@ -357,11 +373,11 @@ impl Child {
     /// Block until the child exits, returning its status. For a bounded wait use
     /// `tokio::time::timeout(d, child.wait())`.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
-        self.proc.wait().await
+        self.proc_mut().wait().await
     }
     /// Exit status if the child has already exited (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
-        self.proc.try_wait()
+        self.proc_mut().try_wait()
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
@@ -371,7 +387,7 @@ impl Child {
     pub fn kill(&mut self) -> Result<(), Error> {
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc.start_kill() {
+        match self.proc_mut().start_kill() {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             other => other,
         }
@@ -491,7 +507,7 @@ impl Child {
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]
-        if !self.proc.pins_pid() {
+        if !self.proc().pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate_tree"));
         }
         // See kill_tree's identical precondition assert for the full rationale, including the
@@ -600,7 +616,7 @@ impl Child {
         started: ::tokio::sync::oneshot::Sender<()>,
         outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
     ) {
-        self.proc.install_wait_observer(started, outcome);
+        self.proc_mut().install_wait_observer(started, outcome);
     }
 }
 
@@ -646,7 +662,7 @@ impl Drop for Child {
         // collection is left to tokio's field-drop. `src/tokio/` mirrors the sync surface by hand
         // with nothing enforcing parity, so that difference is deliberate, not drift.
         let pid = self.id.pid();
-        self.proc.reap_now_on_drop(pid);
+        self.proc_mut().reap_now_on_drop(pid);
     }
 }
 
