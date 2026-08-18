@@ -58,3 +58,76 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
          forced code instead ({status:?})"
     );
 }
+
+/// A tokio child that exits promptly and needs no external binary: this test binary with a
+/// libtest filter that matches nothing. See `test_child::spawn_a_process_that_exits` for why the
+/// filter is mandatory (an unfiltered re-exec runs the whole suite, including this test).
+fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
+    let _guard = crate::child::spawn::spawn_lock();
+    ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "__cosca_no_such_test__"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn")
+}
+
+// `done_ok` is the whole diagnostic: an already-reaped child is legal for `Drop` (the user may
+// have `wait()`ed) and a broken precondition for a caller whose child was never awaited. Both
+// arms are pinned, so neither loosening the assert nor hard-firing it survives.
+//
+// Debug-only oracle, `kinfo_tests`' calm-release shape: `debug_assert!` is compiled out in the
+// release lane, where the same straight-line code returns instead — which the post-call assert
+// pins.
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "already-reaped child where one was impossible")
+)]
+#[tokio::test]
+async fn wait_and_reap_refuses_an_already_reaped_child_the_caller_never_awaited() {
+    let mut child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    child.wait().await.expect("wait");
+    super::wait_and_reap(&mut child, pid, false);
+    // Only reachable in release (debug panicked above, as expected):
+    assert!(child.id().is_none(), "the child was reaped by the wait() above");
+}
+
+#[tokio::test]
+async fn wait_and_reap_accepts_an_already_reaped_child_the_caller_may_have_awaited() {
+    let mut child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    child.wait().await.expect("wait");
+    super::wait_and_reap(&mut child, pid, true); // `Drop`'s disposition: legal, returns quietly
+}
+
+// The value the elevated-spawn cleanup path passes. That child is killed and reaped without ever
+// being awaited, so an already-reaped one means the precondition broke — passing `done_ok = true`
+// here would swallow it silently, the same shape this entry exists to remove from that path.
+//
+// `#[cfg(unix)]` with the entry itself: the Windows elevation arm has no deferred password.
+#[cfg(unix)]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "already-reaped child where one was impossible")
+)]
+#[tokio::test]
+async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        // `cosca::Command::args` is the FULL argv; libtest drops slot 0 as the binary name.
+        .args(["cosca_unit_tests", "--exact", "__cosca_no_such_test__"]);
+    cmd.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    cmd.stderr(crate::stdio::Stdio::null()).expect("stderr null");
+    let mut child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        cmd.spawn().expect("spawn")
+    };
+    child.wait().await.expect("wait");
+    child.wait_and_reap_blocking();
+    // Only reachable in release (debug panicked above, as expected):
+    assert!(
+        matches!(child.try_wait(), Ok(Some(_))),
+        "the child was reaped by the wait() above"
+    );
+}

@@ -103,11 +103,13 @@ impl ProcSource {
     ///
     /// Unix-only, so it needs no `Raw` arm: that backend exists only on Windows, and the sole
     /// caller ([`Child::wait_and_reap_blocking`](super::Child::wait_and_reap_blocking)) is the
-    /// POSIX elevated-spawn cleanup path.
+    /// POSIX elevated-spawn cleanup path. That child was never awaited, so `done_ok` is `false`
+    /// (matching the other never-awaited callers): an already-reaped one is a broken precondition,
+    /// not a case to return quietly from — which is the shape this entry exists to remove.
     #[cfg(unix)]
     pub(crate) fn wait_and_reap(&mut self, pid: u32) {
         match self {
-            ProcSource::Tokio(c) => super::wait_and_reap(c, pid, true),
+            ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false),
         }
     }
 

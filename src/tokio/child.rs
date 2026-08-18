@@ -91,7 +91,7 @@ impl Child {
         )
     }
     /// Blocking reap used by the POSIX spawn-error cleanup path (a sync context — no reactor
-    /// `await` available), delegating to the same per-backend primitive `Drop` uses.
+    /// `await` available).
     ///
     /// **Wait-only, and the caller must already have killed successfully** — that kill is the
     /// precondition that bounds this wait. Killing again here would gate the wait on the second
