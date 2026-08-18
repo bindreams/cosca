@@ -628,8 +628,9 @@ impl Drop for Child {
         if !self.kill_on_drop {
             return;
         }
-        // Tree teardown — the SOLE coverage for descendants (reap_now only guarantees the root),
-        // so surface a real mechanism failure in debug. A no-op for an uncontained child.
+        // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
+        // only the root), so surface a real mechanism failure in debug. A no-op for an
+        // uncontained child.
         //
         // MUST stay on the dropping thread, and the reason is mechanism-specific — deferring it
         // to a background thread or an awaitable teardown would take the guarantee away.
@@ -654,15 +655,27 @@ impl Drop for Child {
         }
         let _ = tree;
         // Guaranteed reap of the root on the real exit event (no park dependence). Briefly blocks
-        // the dropping thread; the child is SIGKILL'd so it exits at once. Dispatches per backend
-        // (tokio field-drop reap vs the raw handle's kill-then-wait).
+        // the dropping thread; the child is SIGKILL'd so it exits at once.
         //
         // The sync twin (`crate::Child`'s `Drop`) collects the status itself; this one must not —
         // tokio owns the child and its own reaping, so the wait is non-reaping (`WNOWAIT`) and the
         // collection is left to tokio's field-drop. `src/tokio/` mirrors the sync surface by hand
         // with nothing enforcing parity, so that difference is deliberate, not drift.
         let pid = self.id.pid();
-        self.proc_mut().reap_now_on_drop(pid);
+        let proc = self.proc_mut();
+        // Already reaped: no signal to issue and no exit to wait for.
+        if proc.is_reaped() {
+            return;
+        }
+        // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
+        // higher-integrity elevated child), and asserting would panic inside a destructor.
+        if proc.start_kill().is_err() {
+            if !matches!(proc.try_wait(), Ok(Some(_))) {
+                log::warn!("async child {pid} could not be terminated on drop; leaving it running");
+            }
+            return;
+        }
+        proc.wait_and_reap(pid);
     }
 }
 

@@ -87,13 +87,12 @@ impl ProcSource {
         }
     }
 
-    /// Guaranteed synchronous teardown for `Drop`: kill, then block until the child has exited.
-    /// **Invariant:** no `wait()` future for this child is in flight when this runs.
-    pub(crate) fn reap_now_on_drop(&mut self, pid: u32) {
+    /// `true` once the backend has collected the child's status, so no reap remains.
+    pub(crate) fn is_reaped(&self) -> bool {
         match self {
-            ProcSource::Tokio(c) => super::reap_now(c, pid, true),
+            ProcSource::Tokio(c) => c.id().is_none(),
             #[cfg(windows)]
-            ProcSource::Raw(r) => r.reap_blocking(),
+            ProcSource::Raw(r) => r.is_reaped(),
         }
     }
 
@@ -101,15 +100,15 @@ impl ProcSource {
     /// caller's own successful kill is what bounds the wait.
     /// **Invariant:** no `wait()` future for this child is in flight when this runs.
     ///
-    /// Unix-only, so it needs no `Raw` arm: that backend exists only on Windows, and the sole
-    /// caller ([`Child::wait_and_reap_blocking`](super::Child::wait_and_reap_blocking)) is the
-    /// POSIX elevated-spawn cleanup path. That child was never awaited, so `done_ok` is `false`
-    /// (matching the other never-awaited callers): an already-reaped one is a broken precondition,
-    /// not a case to return quietly from — which is the shape this entry exists to remove.
-    #[cfg(unix)]
+    /// `done_ok` is `false` for every caller: both reach here only past an
+    /// [`is_reaped`](ProcSource::is_reaped) check or on a child that was never awaited, so an
+    /// already-reaped one is a broken precondition, not a case to return quietly from — the shape
+    /// this entry exists to remove.
     pub(crate) fn wait_and_reap(&mut self, pid: u32) {
         match self {
             ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false),
+            #[cfg(windows)]
+            ProcSource::Raw(r) => r.wait_and_reap(),
         }
     }
 
