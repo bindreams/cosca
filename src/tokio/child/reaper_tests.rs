@@ -86,6 +86,8 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
         pid,
         origin,
         probe,
+        force_panic: false,
+        force_release_panic: false,
     }
 }
 
@@ -414,5 +416,91 @@ async fn concurrent_first_submits_share_one_init() {
         pool.inits.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "the in-lock re-check must admit exactly one init"
+    );
+}
+
+#[tokio::test]
+async fn teardown_panic_is_caught_and_reported() {
+    let ends = arm_probe();
+    let (child, _sock) = spawn_async_blocker();
+    super::fault::set_force_teardown_panic(true);
+    drop(child);
+
+    ends.entered.recv().expect("Drop must reach the handoff");
+    drop(ends.gate);
+    assert_eq!(
+        ends.outcome
+            .recv()
+            .expect("without the wait region's catch the worker unwinds and no outcome arrives"),
+        ReapOutcome::Panicked,
+        "a panicking teardown must be caught and reported"
+    );
+    assert!(
+        !super::fault::take_force_teardown_panic(),
+        "the fault must have been consumed at submit time"
+    );
+}
+
+#[tokio::test]
+async fn release_region_panic_does_not_unwind_run_teardown() {
+    let (probe, ends) = probe_pair();
+    drop(ends.gate); // released up front: this test is about the region after the wait
+    let mut job = bare_job(std::thread::current().id(), Some(probe));
+    job.force_release_panic = true;
+
+    // `join`'s `Err` IS the thread-death edge, so the broken world fails deterministically with
+    // no cross-thread race.
+    let h = std::thread::spawn(move || super::run_teardown(job));
+    assert!(
+        h.join().is_ok(),
+        "run_teardown must not unwind out of its release region"
+    );
+    // Vacuity pin: had the seeded panic not fired, the release region would have completed and
+    // sent `Reaped` — turning this red.
+    assert!(
+        ends.outcome.recv().is_err(),
+        "the panicking release region must drop the probe unsent"
+    );
+}
+
+#[tokio::test]
+async fn unkillable_root_is_not_submitted() {
+    use std::io::{Read as _, Write as _};
+    let ends = arm_probe();
+    let (child, mut sock) = spawn_async_blocker();
+    let id = child.id();
+    super::fault::set_force_kill_failure(true);
+    drop(child);
+
+    ends.entered.recv().expect("Drop must reach the handoff");
+    // Nothing is submitted, so nothing gates; releasing anyway keeps a broken world that DID
+    // submit from wedging a worker instead of failing the assertion below.
+    drop(ends.gate);
+    // Race-free: the seam REPLACED the kill, so the child was never signalled.
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "an unkillable root must be left running"
+    );
+    assert!(
+        !super::fault::take_force_kill_failure(),
+        "the fault must have been consumed"
+    );
+
+    // Release it so it exits of its own accord — the real edge a submitted job would complete on.
+    sock.write_all(b"x").expect("release the unsignalled child");
+    sock.set_read_timeout(Some(CHILD_EXIT_BOUND))
+        .expect("bound the released child's exit");
+    let mut buf = [0u8; 1];
+    match sock.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("the released child did not exit: {other:?}"),
+    }
+    // The probe's outcome sender dropped with the job that was never built. A submitted job would
+    // by now have reaped the exited child and reported `Reaped`.
+    assert!(
+        ends.outcome.recv().is_err(),
+        "a child whose kill failed must not be submitted"
     );
 }

@@ -22,6 +22,14 @@ pub(crate) struct ReapJob {
     pub(crate) origin: std::thread::ThreadId,
     #[cfg(test)]
     pub(crate) probe: Option<test_probe::DropProbe>,
+    /// Seeded panic in the wait region. Sampled at submit time on the dropping thread — a
+    /// thread-local armed by the test is invisible on a worker.
+    #[cfg(test)]
+    pub(crate) force_panic: bool,
+    /// Seeded panic in the release region. Set directly on a hand-built job, so it needs no
+    /// thread-local of its own.
+    #[cfg(test)]
+    pub(crate) force_release_panic: bool,
 }
 
 /// A wedged child occupies one worker and no other; the rest keep draining the shared queue. Not
@@ -173,6 +181,13 @@ fn work(rx: crossbeam_channel::Receiver<ReapJob>) {
 }
 
 fn submit_to(lazy: &LazyPool, job: ReapJob) {
+    // Sampled HERE, on the submitting thread: the region it models runs on a worker, where a
+    // thread-local armed by the test is invisible.
+    #[cfg(test)]
+    let job = ReapJob {
+        force_panic: fault::take_force_teardown_panic(),
+        ..job
+    };
     match lazy.get() {
         Some(pool) => pool.dispatch(job),
         None => release(job),
@@ -220,6 +235,10 @@ pub(crate) fn run_teardown(job: ReapJob) {
     let origin = job.origin;
     #[cfg(test)]
     let probe = job.probe;
+    #[cfg(test)]
+    let force_panic = job.force_panic;
+    #[cfg(test)]
+    let force_release_panic = job.force_release_panic;
     let mut proc = job.proc;
     let attached = job.attached;
     let pipes = job.pipes;
@@ -242,12 +261,20 @@ pub(crate) fn run_teardown(job: ReapJob) {
                 let _ = p.gate.recv(); // a dropped sender is also a release
             }
         }
+        #[cfg(test)]
+        if force_panic {
+            panic!("forced teardown panic (test seam)");
+        }
         proc.wait_and_reap(pid);
     }));
 
     let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if waited.is_err() {
             log::error!("reaping child {pid} panicked; releasing its resources anyway");
+        }
+        #[cfg(test)]
+        if force_release_panic {
+            panic!("forced release-region panic (test seam)");
         }
         // `Child`'s declaration order — `proc` first, so the pid stays pinned for the whole wait
         // and every other release stays ordered after the reap.
@@ -280,6 +307,8 @@ pub(crate) mod fault {
 
     thread_local! {
         static FORCE_SPAWN_FAILURES: Cell<usize> = const { Cell::new(0) };
+        static FORCE_TEARDOWN_PANIC: Cell<bool> = const { Cell::new(false) };
+        static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Fail the first `n` `Builder::spawn` attempts of the NEXT init entered from THIS thread.
@@ -289,6 +318,25 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_force_spawn_failures() -> usize {
         FORCE_SPAWN_FAILURES.with(|f| f.replace(0))
+    }
+
+    /// Force the NEXT teardown to panic in its wait region. Sampled at submit time into
+    /// [`ReapJob::force_panic`](super::ReapJob::force_panic), because the region it models runs
+    /// on a worker.
+    pub(crate) fn set_force_teardown_panic(on: bool) {
+        FORCE_TEARDOWN_PANIC.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_teardown_panic() -> bool {
+        FORCE_TEARDOWN_PANIC.with(|f| f.replace(false))
+    }
+
+    /// Force the NEXT root `start_kill` in `Drop` on THIS thread to report failure. It REPLACES
+    /// the kill rather than masking its result, so the child really is left unsignalled.
+    pub(crate) fn set_force_kill_failure(on: bool) {
+        FORCE_KILL_FAILURE.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_kill_failure() -> bool {
+        FORCE_KILL_FAILURE.with(|f| f.replace(false))
     }
 }
 
