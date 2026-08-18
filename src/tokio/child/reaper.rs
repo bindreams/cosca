@@ -1,7 +1,43 @@
 //! The wait-and-reap half of the async [`Child`](super::Child)'s teardown.
 //!
-//! `Drop` issues every signal on the dropping thread and hands what remains here, so the wait —
-//! and only the wait — runs on a reaper thread.
+//! **The split.** `Drop` issues every signal on the dropping thread and hands what remains here,
+//! so the wait — and only the wait — moves. The tree kill stays put for one mechanism-specific
+//! reason: on Windows a job object's kill is the only signal that reaches a nested descendant
+//! leading its own console group, and console control events stop at that boundary. (On Unix
+//! `hard_kill` and `terminate_tree` have the same radius.)
+//!
+//! **The invariant, and its owner.** *Every job sent is eventually received.* The channel is the
+//! only scheduler; a pool exists only at full width; every receiver predates any send and never
+//! exits after publication. Its owner is the init critical section, which writes the cell once,
+//! last, under a single predicate. No counter, no growth decision, no idle accounting.
+//!
+//! The job carries the process backend and every field whose release must stay ordered after the
+//! reap, not a bare pid: the backend pins the pid for the whole wait, and a bare pid would let
+//! the runtime's orphan queue reap it and the OS recycle it onto another of our children — under
+//! our own `waitid`.
+//!
+//! **Footprint.** A few parked threads for the process's life after the first kill-on-drop drop.
+//! Their stacks are reserved, not committed, and deliberately left at the default size: the
+//! teardown logs into an arbitrary consumer logger, and its panic path may capture a backtrace.
+//!
+//! **Degraded mode, which must not become ordinary.** Publication is all-or-nothing: a pool that
+//! cannot start every worker abandons — the started workers are joined on the queue's disconnect
+//! edge, each spawn's `io::Error` is logged (outside the init guard, so no dropping thread
+//! convoys behind a consumer's `Log` impl), the job in hand is released to the runtime's orphan
+//! handling, and the cell stays empty so the NEXT submit retries. Reaching it needs a spawn
+//! failure, and it re-arms its own retry. Its worst case is a machine so thread-starved that
+//! every drop performs that many failing spawn syscalls under the lock — syscalls only, no
+//! arbitrary code.
+//!
+//! **At the bound, jobs queue rather than being released.** A queued job pins the process
+//! handle (or, on Unix, the zombie and its pid), the containment resource — a cgroup leaf, a
+//! job-object handle, or the marker fds — and the pipe and stdio handles. That is still the
+//! better trade: every worker being wedged means the reap could not have completed anyway, and
+//! the runtime's orphan handling would not have managed it either. Process exit with jobs still
+//! queued is benign, since the roots are already signalled and the OS reaps them.
+//!
+//! The backlog `debug` log fires on healthy bursts too — it reports depth, not a fault, and no
+//! decision reads it.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
