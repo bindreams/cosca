@@ -525,6 +525,9 @@ impl Drop for Child {
             );
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
+        // Blocks until the child has exited (except when the kill failed). Deliberately unlike
+        // the async twin, `cosca::tokio::Child`'s `Drop`, which only signals: a sync caller owns
+        // the thread it is blocking, so "after drop, the child is gone" costs nobody a worker.
         self.proc.teardown_on_drop();
     }
 }

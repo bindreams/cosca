@@ -2,6 +2,24 @@
 //!
 //! `Drop` signals the tree and the root on the dropping thread, then hands what remains to a
 //! bounded pool of reaper threads.
+//!
+//! The job carries the process backend and every field whose release must stay ordered after the
+//! reap, not a bare pid: the backend pins the pid for the whole wait, and a bare pid would let
+//! the runtime's orphan queue reap it and let the OS recycle it onto another of our children —
+//! under our own `waitid`.
+//!
+//! Workers are immortal. The loop ends only on disconnect, which cannot happen (both channel ends
+//! live in a `static`), and the job body runs inside `catch_unwind`, so a panic cannot end it
+//! either. That is what keeps the live-worker count monotone.
+//!
+//! Degraded mode is a knowing trade, not an oversight: under thread exhaustion the alternatives
+//! are blocking the dropping thread (reinstating the defect at the worst moment) or holding
+//! pinned pids in our own queue indefinitely. The child goes to the runtime's orphan handling
+//! instead, which is best-effort — the one place this module uses the mechanism it otherwise
+//! rejects.
+//!
+//! Process exit with jobs still queued is benign: the root is already signalled by then, so the
+//! worst case is a zombie the OS reaps when the process exits.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

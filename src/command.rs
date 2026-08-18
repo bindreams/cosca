@@ -202,6 +202,9 @@ impl Command {
         self
     }
 
+    /// Tear the child (and its contained tree) down when the handle drops. On by default.
+    /// The sync [`Child`](crate::Child) blocks until the child has exited; the async
+    /// [`Child`](crate::tokio::Child) only signals — see its `Drop` for what each guarantees.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self

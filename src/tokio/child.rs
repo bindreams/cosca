@@ -624,6 +624,12 @@ impl Child {
     }
 }
 
+/// Signals the tree and the root and does NOT wait: the child is not necessarily gone when
+/// `drop` returns, and neither is it necessarily reaped. A caller that must observe the teardown
+/// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
+/// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
+///
+/// The sync [`Child`](crate::Child)'s `Drop` still blocks; that divergence is deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
         // The opt-out/`detach()` contract: nothing is signalled and nothing is logged.
@@ -639,6 +645,11 @@ impl Drop for Child {
         // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
         // only the root), so surface a real mechanism failure in debug. A no-op for an
         // uncontained child.
+        //
+        // MUST stay on the dropping thread: the graceful phase's signal stops at group
+        // boundaries (`CTRL_BREAK` reaches only the root's console group, `SIGTERM` via `killpg`
+        // only the root's process group), so a nested descendant leading its own group survives
+        // it and this is the only thing that reaches it before `drop` returns.
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             debug_assert!(
