@@ -9,14 +9,17 @@
 //! under our own `waitid`.
 //!
 //! Workers are immortal. The loop ends only on disconnect, which cannot happen (both channel ends
-//! live in a `static`), and the job body runs inside `catch_unwind`, so a panic cannot end it
-//! either. That is what keeps the live-worker count monotone.
+//! live in the pool), and the whole job body runs inside `catch_unwind`, so a panic cannot end it
+//! either. Nothing decrements the slot count on exit, so were a worker to die anyway the pool
+//! would narrow permanently — but no job is stranded by that, because a submitter only ever sends
+//! against a token a live worker published.
 //!
-//! Degraded mode is a knowing trade, not an oversight: under thread exhaustion the alternatives
-//! are blocking the dropping thread (reinstating the defect at the worst moment) or holding
-//! pinned pids in our own queue indefinitely. The child goes to the runtime's orphan handling
-//! instead, which is best-effort — the one place this module uses the mechanism it otherwise
-//! rejects.
+//! Degraded mode is a knowing trade, not an oversight: when the OS refuses a thread the
+//! alternatives are blocking the dropping thread (reinstating the defect at the worst moment) or
+//! holding pinned pids in our own queue indefinitely. The child goes to the runtime's orphan
+//! handling instead, which is best-effort — the one place this module uses the mechanism it
+//! otherwise rejects. Reaching the bound is NOT this case: there the workers exist and are
+//! working, so the job queues.
 //!
 //! Process exit with jobs still queued is benign: the root is already signalled by then, so the
 //! worst case is a zombie the OS reaps when the process exits.
@@ -41,91 +44,173 @@ pub(crate) struct ReapJob {
     pub(crate) origin: std::thread::ThreadId,
     #[cfg(test)]
     pub(crate) probe: Option<test_probe::DropProbe>,
-    /// Sampled at submit time on the dropping thread — a thread-local armed by the test is
-    /// invisible on a worker.
+    /// Sampled on the dropping thread — see `fault::set_force_teardown_panic`.
     #[cfg(test)]
     pub(crate) force_panic: bool,
 }
 
-/// A wedged child occupies one worker and no other; the rest keep servicing their own jobs. Not
-/// a throughput device — an ordinary reap waits microseconds on an already-killed child.
+/// The pool's bulkhead width: a wedged job occupies one worker and no other, so up to this many
+/// independently wedged children can be in flight before a further one has to wait. Not a
+/// throughput device — an ordinary reap waits microseconds on an already-killed child.
 const REAPER_POOL_THREADS: usize = 4;
 
-/// Reserved worker slots. Monotone: a reserved slot is released only when the spawn itself
-/// fails, and a started worker never exits.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-type Queue = (crossbeam_channel::Sender<ReapJob>, crossbeam_channel::Receiver<ReapJob>);
-
-/// Both ends live here for the process's life, so the channel can never disconnect.
-fn queue() -> &'static Queue {
-    static QUEUE: OnceLock<Queue> = OnceLock::new();
-    QUEUE.get_or_init(crossbeam_channel::unbounded)
+/// What [`Pool::start_worker`] managed to do about the absence of an idle worker.
+enum WorkerStart {
+    /// A worker was started; it owes its starter one receive.
+    Started,
+    /// Every slot is taken and none is idle. The job queues — see [`Pool::dispatch`].
+    AtBound,
+    /// The OS refused the thread. Degraded mode.
+    SpawnFailed,
 }
 
-fn worker(rx: crossbeam_channel::Receiver<ReapJob>) {
-    for job in rx {
-        run_teardown(job);
+/// A bounded set of reaper threads over one MPMC queue.
+///
+/// **The queue's invariant:** every job sent is backed by a receive no other job can take — either
+/// an idle token claimed from a parked worker, or the first receive owed by a worker this submit
+/// just started. A worker holds no token while it runs a job, so a wedged one is never sent to.
+/// The single exception is the at-bound path, which queues deliberately.
+struct Pool {
+    tx: crossbeam_channel::Sender<ReapJob>,
+    rx: crossbeam_channel::Receiver<ReapJob>,
+    /// Workers parked in `recv` that no submitter has claimed. **Published by the worker itself**,
+    /// so a thread that failed to start cannot contribute one — which is what makes this a
+    /// liveness signal rather than a proxy for one.
+    idle: AtomicUsize,
+    /// Slots taken by a started-or-starting thread. The CAP, and only the cap: a reservation here
+    /// never authorises a send.
+    spawned: AtomicUsize,
+    bound: usize,
+}
+
+impl Pool {
+    fn new(bound: usize) -> Pool {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Pool {
+            tx,
+            rx,
+            idle: AtomicUsize::new(0),
+            spawned: AtomicUsize::new(0),
+            bound,
+        }
     }
-    debug_assert!(false, "reaper channel disconnected");
-}
 
-/// ONE spawn attempt — no loop, no retry budget. The bound is on live workers; the retry is one
-/// attempt per submit while there are none.
-fn ensure_worker() -> bool {
-    let live = LIVE.load(Ordering::Acquire);
-    // Grow only when there is nobody at all, or when the queue is already backing up. A burst of
-    // short-lived children is serviced by one worker without creating threads for it.
-    if live < REAPER_POOL_THREADS && (live == 0 || !queue().0.is_empty()) {
-        // Reserve before spawning, so concurrent submits cannot overshoot the bound.
-        if LIVE.fetch_add(1, Ordering::AcqRel) < REAPER_POOL_THREADS {
-            let rx = queue().1.clone();
-            if let Err(e) = std::thread::Builder::new()
-                .name("cosca-reaper".to_string())
-                .spawn(move || worker(rx))
-            {
-                LIVE.fetch_sub(1, Ordering::AcqRel);
-                log::error!("spawning a reaper thread failed: {e}");
-            }
+    /// Take one idle token, or report that no parked worker is available. An unbounded CAS retry,
+    /// not a budget.
+    fn claim_idle(&self) -> bool {
+        self.idle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    fn start_worker(&'static self, force_spawn_failure: bool) -> WorkerStart {
+        let reserved = self
+            .spawned
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.bound).then_some(n + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return WorkerStart::AtBound;
+        }
+        // The seam sits on the spawn itself, so the branch a real thread exhaustion takes is the
+        // branch under test. A constant `false` outside test builds.
+        let spawned = if force_spawn_failure {
+            Err(std::io::Error::other("forced thread-spawn failure (test seam)"))
         } else {
-            LIVE.fetch_sub(1, Ordering::AcqRel);
+            std::thread::Builder::new()
+                .name("cosca-reaper".to_string())
+                .spawn(move || self.work())
+                .map(|_| ())
+        };
+        match spawned {
+            Ok(()) => WorkerStart::Started,
+            Err(e) => {
+                // Roll the slot back. No job was sent — the caller still holds it — so nothing is
+                // stranded, and no concurrent submitter was told a worker exists.
+                self.spawned.fetch_sub(1, Ordering::AcqRel);
+                log::error!("spawning a reaper thread failed: {e}");
+                WorkerStart::SpawnFailed
+            }
         }
     }
-    LIVE.load(Ordering::Acquire) > 0
+
+    fn work(&'static self) {
+        // The first receive is owed to the thread that started this worker, so no token is
+        // published for it; every later park publishes one.
+        let mut publish = false;
+        loop {
+            if publish {
+                self.idle.fetch_add(1, Ordering::Release);
+            }
+            publish = true;
+            match self.rx.recv() {
+                // The guard the module header promises: a panic anywhere in the job.
+                Ok(job) => {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_teardown(job)));
+                }
+                Err(_) => break,
+            }
+        }
+        debug_assert!(false, "reaper channel disconnected");
+    }
+
+    /// Hand the job to a worker. **Identity-preserving:** the job stays in hand until a receive is
+    /// secured for it, and is never enqueued speculatively and never dequeued — with a shared FIFO
+    /// what you dequeue is not what you enqueued, so a thread recovering "a" job would release
+    /// another thread's child and report it on the wrong probe.
+    fn dispatch(&'static self, job: ReapJob) {
+        #[cfg(test)]
+        let job = {
+            let mut job = job;
+            job.force_panic = fault::take_force_teardown_panic(); // sampled here — see `fault`
+            job
+        };
+        #[cfg(test)]
+        let force_spawn_failure = fault::take_force_spawn_failure();
+        #[cfg(not(test))]
+        let force_spawn_failure = false;
+
+        if !self.claim_idle() {
+            match self.start_worker(force_spawn_failure) {
+                WorkerStart::Started => {}
+                WorkerStart::AtBound => {
+                    // Queue rather than release. Every worker being busy is the ordinary shape of
+                    // a burst of short-lived children, each finishing in microseconds; and if they
+                    // are instead all wedged, the runtime's orphan handling could not reap this
+                    // child either, so releasing would trade a delay for a leak.
+                    log::debug!(
+                        "reaper pool at its bound ({}); child {} waits for a worker",
+                        self.bound,
+                        job.pid
+                    );
+                }
+                WorkerStart::SpawnFailed => {
+                    release(job);
+                    return;
+                }
+            }
+        }
+        if let Err(e) = self.tx.send(job) {
+            // Unreachable: both ends live in the pool, which outlives the process. Even so,
+            // recover the job rather than dropping it unordered.
+            debug_assert!(false, "the reaper channel cannot disconnect");
+            release(e.into_inner());
+        }
+    }
 }
 
-/// Hand the job to a worker. **Identity-preserving:** the job stays in hand until a worker is
-/// known to exist, and is never enqueued speculatively — with a shared FIFO, what you dequeue is
-/// not what you enqueued, so a thread recovering "a" job would release another thread's child and
-/// report it on the wrong probe.
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| Pool::new(REAPER_POOL_THREADS))
+}
+
 pub(crate) fn submit(job: ReapJob) {
-    #[cfg(test)]
-    let job = {
-        let mut job = job;
-        // Sampled HERE, on the dropping thread: the region it models runs on a worker, where a
-        // thread-local armed by the test is invisible.
-        job.force_panic = fault::take_force_teardown_panic();
-        if fault::take_force_no_reaper() {
-            release(job);
-            return;
-        }
-        job
-    };
-    if !ensure_worker() {
-        release(job);
-        return;
-    }
-    if let Err(e) = queue().0.send(job) {
-        // Unreachable: the receiver lives in a `static` for the process's life. Even so, recover
-        // the job rather than dropping it unordered.
-        debug_assert!(false, "the reaper channel cannot disconnect");
-        release(e.into_inner());
-    }
+    pool().dispatch(job);
 }
 
-/// Degraded mode: no worker exists and the spawn failed. The root is already signalled, so the
-/// remaining cost is the reap — handed to tokio's orphan handling (a no-op on Windows, which has
-/// nothing to reap). `error`, not `warn`: the crate is knowingly giving up its own guarantee.
+/// Degraded mode — see the module header for why this is the least bad option. `error`, not
+/// `warn`: the crate is knowingly giving up its own guarantee.
 fn release(job: ReapJob) {
     log::error!(
         "no reaper thread is available; child {} is left to the runtime's orphan handling (it is \
@@ -161,6 +246,11 @@ pub(crate) fn run_teardown(job: ReapJob) {
     let owned_std = job.owned_std;
     let pid = job.pid;
 
+    #[cfg(test)]
+    if let Some(p) = probe.as_ref() {
+        let _ = p.started.send(std::thread::current().id());
+    }
+
     // Executing elsewhere ⇒ the test may hold the teardown until it has observed the
     // not-yet-reaped state. Executing on the dropping thread means the teardown was inlined, so
     // skipping the gate lets that broken world fail on an assertion instead of deadlocking.
@@ -171,8 +261,9 @@ pub(crate) fn run_teardown(job: ReapJob) {
         }
     }
 
-    // `proc` is BORROWED into the region, never moved: an unwind must not destroy a resource
-    // whose release the outer code still owns and orders.
+    // `proc` is BORROWED into this inner region, never moved, so a panic in the wait cannot
+    // destroy a resource whose release the code below still owns and orders. The worker wraps the
+    // whole call as well, which is what keeps the loop alive.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         if force_panic {
@@ -283,24 +374,25 @@ pub(crate) mod fault {
     use std::cell::Cell;
 
     thread_local! {
-        static FORCE_NO_REAPER: Cell<bool> = const { Cell::new(false) };
+        static FORCE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
         static FORCE_TEARDOWN_PANIC: Cell<bool> = const { Cell::new(false) };
         static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Force the NEXT submit on THIS thread to take the release branch. Forces the DECISION, not
-    /// the spawn: the pool is process-global and the suite runs in parallel, so a worker is
-    /// almost always already live.
-    pub(crate) fn set_force_no_reaper(on: bool) {
-        FORCE_NO_REAPER.with(|f| f.set(on));
+    /// Force the NEXT reaper-thread spawn on THIS thread to fail. Sits on the `Builder::spawn`
+    /// call itself, so the branch a real thread exhaustion takes is the branch under test — the
+    /// slot reservation, its rollback and the release are all genuinely executed. A test drives
+    /// it through a pool of its own, where "no worker is idle" is a fact rather than a fake.
+    pub(crate) fn set_force_spawn_failure(on: bool) {
+        FORCE_SPAWN_FAILURE.with(|f| f.set(on));
     }
-    pub(crate) fn take_force_no_reaper() -> bool {
-        FORCE_NO_REAPER.with(|f| f.replace(false))
+    pub(crate) fn take_force_spawn_failure() -> bool {
+        FORCE_SPAWN_FAILURE.with(|f| f.replace(false))
     }
 
-    /// Force the NEXT teardown to panic. SAMPLED AT SUBMIT TIME into `ReapJob::force_panic`,
-    /// because the region it models runs on a worker, where a thread-local armed on the test
-    /// thread is invisible.
+    /// Force the NEXT teardown to panic. Sampled at DISPATCH time into `ReapJob::force_panic`:
+    /// the region it models runs on a worker, where a thread-local armed on the test thread is
+    /// invisible.
     pub(crate) fn set_force_teardown_panic(on: bool) {
         FORCE_TEARDOWN_PANIC.with(|f| f.set(on));
     }
@@ -334,6 +426,9 @@ pub(crate) mod test_probe {
     pub(crate) struct DropProbe {
         /// The dropping thread's id, sent from `Drop` before the handoff.
         pub(crate) entered: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        /// The executing worker's id, sent on entry to the teardown and BEFORE the gate — the
+        /// only way to observe which worker a job occupies while it is still wedged on it.
+        pub(crate) started: std::sync::mpsc::Sender<std::thread::ThreadId>,
         /// Held teardowns wait here; a dropped sender releases them.
         pub(crate) gate: std::sync::mpsc::Receiver<()>,
         pub(crate) outcome: std::sync::mpsc::Sender<ReapOutcome>,

@@ -100,18 +100,19 @@ impl Child {
             Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
         )
     }
-    /// Blocking kill-then-reap used by the POSIX spawn-error cleanup path (a sync context — no
-    /// reactor `await` available), delegating to the same per-backend primitive `Drop` uses.
+    /// Blocking reap for the POSIX spawn-error cleanup path (a sync context — no reactor `await`
+    /// available), delegating to the same per-backend primitive `Drop` uses.
+    ///
+    /// **Wait-only; the caller must already have killed**, which is what bounds the wait. Killing
+    /// again here would reintroduce the defect the reaper pool exists to avoid: a second kill can
+    /// fail, every kill-then-wait path reads a failed kill as "do not wait", and the reap would
+    /// then be lost silently on the ordinary success path.
+    ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
-    pub(super) fn reap_blocking(&mut self) {
+    pub(super) fn wait_and_reap_blocking(&mut self) {
         let pid = self.id.pid();
-        let proc = self.proc.as_mut().expect(PROC_TAKEN);
-        // A failed kill is not a live process to wait on — the same early return `reap_now` makes,
-        // spelled out because the wait no longer carries a kill of its own.
-        if proc.start_kill().is_ok() {
-            proc.wait_and_reap(pid);
-        }
+        self.proc.as_mut().expect(PROC_TAKEN).wait_and_reap(pid);
     }
 
     /// The child's stable identity — valid after `wait`.

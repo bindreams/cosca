@@ -14,23 +14,69 @@ use super::{run_teardown, ReapJob};
 use crate::identity::{ProcessId, Resolved};
 use crate::test_child::spawn_async_blocker;
 
-/// The three ends a test keeps: the dropping thread's id, the gate release, and the outcome.
+/// The ends a test keeps: the dropping thread's id, the executing worker's id, the gate release,
+/// and the outcome.
 struct ProbeEnds {
     entered: mpsc::Receiver<std::thread::ThreadId>,
+    started: mpsc::Receiver<std::thread::ThreadId>,
     gate: mpsc::Sender<()>,
     outcome: mpsc::Receiver<ReapOutcome>,
 }
 
-fn arm_probe() -> ProbeEnds {
+fn probe_pair() -> (DropProbe, ProbeEnds) {
     let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
     let (gate, gate_rx) = mpsc::channel();
     let (outcome_tx, outcome) = mpsc::channel();
-    arm(DropProbe {
-        entered: entered_tx,
-        gate: gate_rx,
-        outcome: outcome_tx,
-    });
-    ProbeEnds { entered, gate, outcome }
+    (
+        DropProbe {
+            entered: entered_tx,
+            started: started_tx,
+            gate: gate_rx,
+            outcome: outcome_tx,
+        },
+        ProbeEnds {
+            entered,
+            started,
+            gate,
+            outcome,
+        },
+    )
+}
+
+fn arm_probe() -> ProbeEnds {
+    let (probe, ends) = probe_pair();
+    arm(probe);
+    ends
+}
+
+/// A pool of this test's own. The process-global one is shared with every other test in the
+/// binary, so neither its worker count nor its idleness is a fact a test may reason about; these
+/// two do exactly that. Leaked because workers borrow it for their whole life — which is the
+/// pool's design, not a concession to the test.
+fn private_pool() -> &'static super::Pool {
+    Box::leak(Box::new(super::Pool::new(super::REAPER_POOL_THREADS)))
+}
+
+/// A job around a bare `::tokio::process::Child` that exits at once. Built by hand rather than by
+/// emptying a `cosca` handle, which would hit `PROC_TAKEN` in its own `Drop` and panic the test.
+fn bare_job(origin: std::thread::ThreadId, probe: Option<DropProbe>) -> ReapJob {
+    let mut cmd = ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args(["--exact", "__cosca_no_such_test__"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let proc = cmd.spawn().expect("spawn a child that exits");
+    let pid = proc.id().expect("a freshly spawned child has a pid");
+    ReapJob {
+        proc: super::super::ProcSource::Tokio(proc),
+        attached: crate::containment::Attached::None,
+        pipes: Default::default(),
+        owned_std: Default::default(),
+        pid,
+        origin,
+        probe,
+        force_panic: false,
+    }
 }
 
 #[tokio::test]
@@ -128,30 +174,10 @@ async fn drop_reaps_on_a_worker_thread() {
 
 #[tokio::test]
 async fn teardown_reports_the_executing_thread_not_the_origin() {
-    // Built by hand around a bare `::tokio::process::Child`, NOT by emptying a `cosca` handle —
-    // an emptied handle would hit `PROC_TAKEN` in its own `Drop` and panic the test.
-    let mut cmd = ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"));
-    cmd.args(["--exact", "__cosca_no_such_test__"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let proc = cmd.spawn().expect("spawn a child that exits");
-    let pid = proc.id().expect("a freshly spawned child has a pid");
-
-    let (entered, _entered_rx) = mpsc::channel();
-    let (gate_tx, gate) = mpsc::channel();
-    let (outcome, outcome_rx) = mpsc::channel();
-    drop(gate_tx); // a dropped sender is a release, so the worker never blocks
+    let (probe, ends) = probe_pair();
+    drop(ends.gate); // a dropped sender is a release, so the worker never blocks
     let origin = std::thread::current().id();
-    let job = ReapJob {
-        proc: super::super::ProcSource::Tokio(proc),
-        attached: crate::containment::Attached::None,
-        pipes: Default::default(),
-        owned_std: Default::default(),
-        pid,
-        origin,
-        probe: Some(DropProbe { entered, gate, outcome }),
-        force_panic: false,
-    };
+    let job = bare_job(origin, Some(probe));
 
     // `h.thread().id()` is a value the TEST holds without asking the executing thread, and it
     // differs from `origin` — so an implementation reporting `job.origin` fails here. Calling
@@ -163,31 +189,122 @@ async fn teardown_reports_the_executing_thread_not_the_origin() {
 
     assert_ne!(executing, origin, "the teardown must run off the origin thread");
     assert_eq!(
-        outcome_rx.recv().expect("the teardown must report an outcome"),
+        ends.outcome.recv().expect("the teardown must report an outcome"),
         ReapOutcome::Reaped(executing),
         "the reported thread must be the EXECUTING one, not the job's origin"
     );
 }
 
+/// The bulkhead: `REAPER_POOL_THREADS` independently wedged jobs must occupy one worker EACH, a
+/// further one must wait rather than grow a thread, and releasing one must free only that worker.
 #[tokio::test]
-async fn no_reaper_available_releases_the_job_in_hand() {
-    let ends = arm_probe();
-    let (child, _sock) = spawn_async_blocker();
-    fault::set_force_no_reaper(true);
-    drop(child);
+async fn a_wedged_job_occupies_one_worker_and_the_pool_stops_at_its_bound() {
+    let pool = private_pool();
+    let bound = super::REAPER_POOL_THREADS;
+    let origin = std::thread::current().id();
 
-    ends.entered.recv().expect("Drop must reach the handoff");
-    // Release the gate: the release path never gates, but a broken world that submitted the job
-    // would otherwise wedge the worker behind it instead of failing the assertion below.
+    // One more job than the pool is wide, each wedged on its own held gate.
+    let mut ends: Vec<ProbeEnds> = Vec::new();
+    for _ in 0..=bound {
+        let (probe, e) = probe_pair();
+        ends.push(e);
+        pool.dispatch(bare_job(origin, Some(probe)));
+    }
+
+    // Deterministic on the dispatching thread, and the assertion that fails FIRST if growth is
+    // driven by the wrong signal: a wedged worker publishes no idle token, so each of the first
+    // `bound` dispatches must have had to start a thread of its own, and the last must not.
+    assert_eq!(
+        pool.spawned.load(std::sync::atomic::Ordering::Acquire),
+        bound,
+        "the pool must grow one worker per concurrently wedged job, up to its bound"
+    );
+    assert_eq!(
+        pool.idle.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a worker running a job must publish no idle token"
+    );
+
+    // Behavioural form of the same claim: `bound` DISTINCT workers are wedged at once.
+    let workers: Vec<std::thread::ThreadId> = (0..bound)
+        .map(|i| ends[i].started.recv().expect("each wedged job must reach a worker"))
+        .collect();
+    assert_eq!(
+        workers.iter().collect::<std::collections::HashSet<_>>().len(),
+        bound,
+        "each wedged job must occupy a worker of its own"
+    );
+    // Race-free: every worker is wedged on a gate this test still holds, so the extra job CANNOT
+    // have started. A fifth thread would have taken it.
+    assert!(
+        matches!(ends[bound].started.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "the pool must not exceed its bound"
+    );
+
+    // Release ONE. Its reap completes, and the freed worker — not a new one — picks up the job
+    // that was waiting.
+    let first = ends.remove(0);
+    drop(first.gate);
+    assert_eq!(
+        first.outcome.recv().expect("the released job must reap"),
+        ReapOutcome::Reaped(workers[0]),
+        "the released job reaps on the worker it was wedged on"
+    );
+    let queued = ends.last().expect("the queued job's ends");
+    assert_eq!(
+        queued
+            .started
+            .recv()
+            .expect("the queued job must run once a worker frees"),
+        workers[0],
+        "the waiting job must reuse the freed worker rather than grow the pool"
+    );
+    // Isolation: the still-gated jobs are untouched by any of that. Race-free — this test holds
+    // their gates.
+    for (i, e) in ends.iter().enumerate().take(bound - 1) {
+        assert!(
+            matches!(e.outcome.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "wedged job {i} must be unaffected by another job's release"
+        );
+    }
+
+    // Let the rest finish so the leaked pool's workers reap their children.
+    for e in ends {
+        drop(e.gate);
+        e.outcome.recv().expect("every job must reap once released");
+    }
+}
+
+#[tokio::test]
+async fn thread_spawn_failure_releases_the_job_in_hand() {
+    // A pool of its own, so "no worker is idle" is a fact and only the `Builder::spawn` call is
+    // faked: the slot reservation, its rollback and the release all genuinely run.
+    let pool = private_pool();
+    let (probe, ends) = probe_pair();
+    // The release path never gates; releasing anyway keeps a world that DID find a worker from
+    // wedging one behind the gate instead of failing the assertion below.
     drop(ends.gate);
+    fault::set_force_spawn_failure(true);
+    pool.dispatch(bare_job(std::thread::current().id(), Some(probe)));
+
     assert_eq!(
         ends.outcome.recv().expect("the release path must report an outcome"),
         ReapOutcome::Released,
-        "with no reaper available the job must be released in hand, not reaped"
+        "a job that could not be given a worker must be released in hand, not queued"
     );
     assert!(
-        !fault::take_force_no_reaper(),
+        !fault::take_force_spawn_failure(),
         "the fault must have been consumed — a flag nothing read cannot pass this test"
+    );
+    assert_eq!(
+        pool.spawned.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a failed spawn must roll its reserved slot back"
+    );
+    assert_eq!(
+        pool.idle.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a thread that never started must publish no idle token"
     );
 }
 
