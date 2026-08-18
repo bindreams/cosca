@@ -3,6 +3,7 @@
 
 use std::sync::mpsc;
 
+use super::fault;
 use super::test_probe::{arm, DropProbe, ReapOutcome};
 use super::{run_teardown, ReapJob};
 use crate::identity::{ProcessId, Resolved};
@@ -145,4 +146,86 @@ async fn teardown_reports_the_executing_thread_not_the_origin() {
         ReapOutcome::Reaped(executing),
         "the reported thread must be the EXECUTING one, not the job's origin"
     );
+}
+
+#[tokio::test]
+async fn no_reaper_available_releases_the_job_in_hand() {
+    let ends = arm_probe();
+    let (child, _sock) = spawn_async_blocker();
+    fault::set_force_no_reaper(true);
+    drop(child);
+
+    ends.entered.recv().expect("Drop must reach the handoff");
+    // Release the gate: the release path never gates, but a broken world that submitted the job
+    // would otherwise wedge the worker behind it instead of failing the assertion below.
+    drop(ends.gate);
+    assert_eq!(
+        ends.outcome.recv().expect("the release path must report an outcome"),
+        ReapOutcome::Released,
+        "with no reaper available the job must be released in hand, not reaped"
+    );
+    assert!(
+        !fault::take_force_no_reaper(),
+        "the fault must have been consumed — a flag nothing read cannot pass this test"
+    );
+}
+
+#[tokio::test]
+async fn teardown_panic_is_caught_and_reported() {
+    let ends = arm_probe();
+    let (child, _sock) = spawn_async_blocker();
+    fault::set_force_teardown_panic(true);
+    drop(child);
+
+    ends.entered.recv().expect("Drop must reach the handoff");
+    drop(ends.gate);
+    assert_eq!(
+        ends.outcome
+            .recv()
+            .expect("without catch_unwind the worker unwinds and no outcome ever arrives"),
+        ReapOutcome::Panicked,
+        "a panicking teardown must be caught and reported"
+    );
+    assert!(
+        !fault::take_force_teardown_panic(),
+        "the fault must have been consumed at submit time"
+    );
+}
+
+#[tokio::test]
+async fn unkillable_root_is_not_submitted() {
+    use std::io::{Read as _, Write as _};
+    let ends = arm_probe();
+    let (child, mut sock) = spawn_async_blocker();
+    let id = child.id();
+    fault::set_force_kill_failure(true);
+    drop(child);
+
+    ends.entered.recv().expect("Drop must reach the handoff");
+    // Nothing is submitted, so nothing gates; releasing anyway keeps a broken world that DID
+    // submit from wedging the worker instead of failing the assertion below.
+    drop(ends.gate);
+    // The probe's outcome sender drops with the job that was never built: a submitted job would
+    // report `Reaped(_)` here and park a pool slot on a child nobody can kill.
+    assert!(
+        ends.outcome.recv().is_err(),
+        "a child whose kill failed must not be submitted"
+    );
+    assert!(!fault::take_force_kill_failure(), "the fault must have been consumed");
+    // Race-free: the fault REPLACED the kill, so nothing was ever signalled.
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "an unkillable root must be left running"
+    );
+
+    // Release it so it exits. Its reaping is left to the runtime's orphan handling — the
+    // documented behaviour of this path — so the assertion is on the EXIT, not the reap.
+    sock.write_all(b"x").expect("release the unsignalled child");
+    let mut buf = [0u8; 1];
+    match sock.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("released child did not exit: {other:?}"),
+    }
 }

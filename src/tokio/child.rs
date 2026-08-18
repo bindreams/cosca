@@ -658,6 +658,15 @@ impl Drop for Child {
         }
         // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
         // higher-integrity elevated child), and asserting would panic inside a destructor.
+        // The test seam REPLACES the kill rather than masking its result — a masked kill would
+        // still have signalled the child, and the branch below is about one that was not.
+        #[cfg(test)]
+        let killed = if reaper::fault::take_force_kill_failure() {
+            Err(Error::Io(std::io::Error::other("forced kill failure (test seam)")))
+        } else {
+            proc.start_kill()
+        };
+        #[cfg(not(test))]
         let killed = proc.start_kill();
         if killed.is_err() {
             if !matches!(proc.try_wait(), Ok(Some(_))) {

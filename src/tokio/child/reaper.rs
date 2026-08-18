@@ -81,6 +81,18 @@ fn ensure_worker() -> bool {
 /// not what you enqueued, so a thread recovering "a" job would release another thread's child and
 /// report it on the wrong probe.
 pub(crate) fn submit(job: ReapJob) {
+    #[cfg(test)]
+    let job = {
+        let mut job = job;
+        // Sampled HERE, on the dropping thread: the region it models runs on a worker, where a
+        // thread-local armed by the test is invisible.
+        job.force_panic = fault::take_force_teardown_panic();
+        if fault::take_force_no_reaper() {
+            release(job);
+            return;
+        }
+        job
+    };
     if !ensure_worker() {
         release(job);
         return;
@@ -242,6 +254,49 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
             waited == WAIT_OBJECT_0,
             "wait_and_reap did not observe the child's exit: {waited:?}"
         );
+    }
+}
+
+/// Fault seams for the three off-nominal paths. Take-semantics, matching `crate::wait::fault`.
+/// Each is CONSUMED on the dropping thread; only the panic flag's effect is deferred, by riding
+/// in the job.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_NO_REAPER: Cell<bool> = const { Cell::new(false) };
+        static FORCE_TEARDOWN_PANIC: Cell<bool> = const { Cell::new(false) };
+        static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Force the NEXT submit on THIS thread to take the release branch. Forces the DECISION, not
+    /// the spawn: the pool is process-global and the suite runs in parallel, so a worker is
+    /// almost always already live.
+    pub(crate) fn set_force_no_reaper(on: bool) {
+        FORCE_NO_REAPER.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_no_reaper() -> bool {
+        FORCE_NO_REAPER.with(|f| f.replace(false))
+    }
+
+    /// Force the NEXT teardown to panic. SAMPLED AT SUBMIT TIME into `ReapJob::force_panic`,
+    /// because the region it models runs on a worker, where a thread-local armed on the test
+    /// thread is invisible.
+    pub(crate) fn set_force_teardown_panic(on: bool) {
+        FORCE_TEARDOWN_PANIC.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_teardown_panic() -> bool {
+        FORCE_TEARDOWN_PANIC.with(|f| f.replace(false))
+    }
+
+    /// Force the NEXT root `start_kill` in `Drop` on THIS thread to report failure. It REPLACES
+    /// the kill rather than masking its result, so the child really is left unsignalled.
+    pub(crate) fn set_force_kill_failure(on: bool) {
+        FORCE_KILL_FAILURE.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_kill_failure() -> bool {
+        FORCE_KILL_FAILURE.with(|f| f.replace(false))
     }
 }
 
