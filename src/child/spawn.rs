@@ -94,11 +94,32 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     spawn_unelevated(cmd, kill_on_drop)
 }
 
+/// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`
+/// backend rather than std? Both routers read this — the sync one below and the async mirror in
+/// `crate::tokio::spawn` — so the rule cannot be two copies that drift.
+///
+/// **Call it before `std::mem::take(cmd.fds_mut())`.** It reads `cmd.fds()`; after the take the
+/// map is empty and the fd term silently evaluates false.
+///
+/// Pinned by `spawn_tests::routes_to_raw_backend_answers_for_executables_and_high_descriptors`,
+/// which is also what makes the backend names in `tests/windows_creation_flags.rs` true for its
+/// argv legs (an argv-only command reports the same `argv[0]` whichever backend spawned it).
+#[cfg(windows)]
+pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
+    cmd.executable_path().is_some() || cmd.fds().keys().any(|slot| slot.raw() >= 3)
+}
+
 /// The non-elevated spawn core: resolve stdio, wire program/args, spawn, attach,
 /// read identity, adopt. Shared by the ordinary path and the elevation paths'
 /// already-elevated / derived-command continuations (which must spawn without
 /// re-entering the elevation branch).
 pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, Error> {
+    // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
+    // after, it would collapse to "does it have an executable()", and a high-descriptor-only
+    // command would take the std path — whose fd >= 3 collection is unix-only, so the
+    // descriptors would be dropped with no error and no panic.
+    #[cfg(windows)]
+    let to_raw_backend = routes_to_raw_backend(cmd);
     let fds = std::mem::take(cmd.fds_mut());
 
     // Windows routing. The raw `CreateProcessW` backend owns the cases std cannot
@@ -106,11 +127,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // (fd >= 3) via the MSVCRT `lpReserved2` fd-table. It handles both uncontained and
     // CONTAINED children (Job Object / TreeWalk).
     #[cfg(windows)]
-    {
-        let has_high_fd = fds.keys().any(|slot| slot.raw() >= 3);
-        if cmd.executable_path().is_some() || has_high_fd {
-            return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
-        }
+    if to_raw_backend {
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
     let mut std_cmd = build_std_command(cmd)?;
 

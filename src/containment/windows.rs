@@ -210,6 +210,8 @@ pub(crate) fn mechanism_from_flags(creation_flags: u32) -> crate::graceful::Grac
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents
 /// the child from inheriting the test runner's console handles. Best-effort.
 pub(crate) fn clear_std_handle_inheritance() {
+    #[cfg(test)]
+    observe::record_inheritance_cleared();
     for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: standard Win32 call; handle is not closed.
         unsafe {
@@ -371,6 +373,26 @@ pub(crate) fn terminate(pid: u32) -> Result<(), crate::error::Error> {
             io::Error::from(e),
             caller_has_console(),
         )),
+    }
+}
+
+/// Test-only: record that `clear_std_handle_inheritance` ran on THIS thread, so a test can prove
+/// a refused spawn did not mutate this process first. Take semantics, mirroring `fault`.
+///
+/// The real handle flags cannot serve as the observation: the mutation is process-global and
+/// permanent, so any earlier contained spawn in the same test binary would already have made it
+/// meaningless.
+#[cfg(test)]
+pub(crate) mod observe {
+    use std::cell::Cell;
+    thread_local! {
+        static INHERITANCE_CLEARED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn record_inheritance_cleared() {
+        INHERITANCE_CLEARED.with(|f| f.set(true));
+    }
+    pub(crate) fn take_inheritance_cleared() -> bool {
+        INHERITANCE_CLEARED.with(|f| f.replace(false))
     }
 }
 

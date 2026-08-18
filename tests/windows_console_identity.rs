@@ -10,7 +10,6 @@
 //! caller's pid IS in the child's list, under the identical handshake as every absence below.
 #![cfg(windows)]
 
-use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::os::windows::process::CommandExt;
 
@@ -47,30 +46,7 @@ impl Probe {
     }
 }
 
-/// Exact-key field extraction: substring matching is unsafe here because `console=0` is a
-/// substring of nothing but `sees_caller=0` shares its value alphabet with every other field.
-fn field<'a>(report: &'a str, key: &str) -> &'a str {
-    report
-        .split_ascii_whitespace()
-        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
-        .unwrap_or_else(|| panic!("no field {key} in report: {report}"))
-}
-
-/// The escaping `report-console-identity` applies to `argv0`, reproduced here so a test can
-/// state its expectation in plain text. Everything outside `[A-Za-z0-9._-]` becomes `%XX`,
-/// because `argv[0]` is unbounded caller data in a whitespace-delimited record and a checkout
-/// path containing a space would otherwise split it.
-fn escape_field(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
-            out.push(*b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
+use common::{escape_report_field as escape_field, read_report_line, report_field as field};
 
 /// Bind a report listener, spawn `exe` in `report-console-identity` mode with exactly `flags`
 /// through a RAW `std::process::Command` (cosca cannot express these flags in Task 1), and read
@@ -88,17 +64,8 @@ fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
         cmd.spawn().expect("spawn identity probe child")
     };
     let (sock, _) = listener.accept().expect("accept report socket");
-    let report = read_report(&sock);
+    let report = read_report_line(&sock);
     Probe { child, sock, report }
-}
-
-/// Read exactly the one report line. A child that panicked after connecting reaches us as EOF
-/// (an empty line), which fails the caller's field lookup loudly instead of hanging.
-fn read_report(sock: &TcpStream) -> String {
-    let mut reader = BufReader::new(sock.try_clone().expect("clone report socket"));
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read report line");
-    line
 }
 
 /// The CONTROL leg. A console-subsystem child spawned with no flags joins the caller's console,
@@ -309,7 +276,7 @@ fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn cosca identity probe child");
     let (sock, _) = listener.accept().expect("accept report socket");
-    let report = read_report(&sock);
+    let report = read_report_line(&sock);
     CoscaProbe { child, sock, report }
 }
 

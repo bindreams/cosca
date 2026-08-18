@@ -130,6 +130,44 @@ pub fn in_our_console(pid: u32) -> Option<bool> {
     }
 }
 
+/// Exact-key extraction from a `key=value` report line. Substring matching would be unsafe:
+/// `console=0` shares its value alphabet with every other field.
+#[cfg(windows)]
+pub fn report_field<'a>(report: &'a str, key: &str) -> &'a str {
+    report
+        .split_ascii_whitespace()
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("no field {key} in report: {report}"))
+}
+
+/// The escaping `report-console-identity` applies to its `argv0` field, so a test can state its
+/// expectation in plain text. ONE definition for every test crate that asserts on that field: two
+/// copies could drift apart and agree on the wrong answer.
+#[cfg(windows)]
+pub fn escape_report_field(value: &str) -> String {
+    let mut out = String::new();
+    for b in value.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Read exactly the one report line a `report-console-identity` child writes before it blocks. A
+/// child that panicked after connecting reaches us as EOF (an empty line), which fails the
+/// caller's field lookup loudly instead of hanging.
+#[cfg(windows)]
+pub fn read_report_line(sock: &TcpStream) -> String {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(sock.try_clone().expect("clone report socket"));
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read report line");
+    line
+}
+
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`

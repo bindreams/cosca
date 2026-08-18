@@ -69,6 +69,11 @@ pub(crate) struct WindowsSpawn {
     /// The complete word cosca supplies to the backend — see the module doc for why that is not
     /// the word the OS receives.
     pub creation_flags: u32,
+    /// Whether this spawn must set the inherited root marker so descendants join THIS group.
+    /// Read by the raw backends, which build their own environment block; the std path applies
+    /// the marker through the portable path `prepare` shares with Unix.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub marker_env: bool,
 }
 
 /// A bit `creation_flags` refuses, and what to reach for instead.
@@ -195,7 +200,10 @@ pub(crate) fn windows_spawn(
     if backend == SpawnBackend::Raw {
         creation_flags |= CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0;
     }
-    Ok(WindowsSpawn { creation_flags })
+    Ok(WindowsSpawn {
+        creation_flags,
+        marker_env: setup.marker_env,
+    })
 }
 
 #[cfg(all(test, windows))]
