@@ -39,19 +39,13 @@
 //! The backlog `debug` log fires on healthy bursts too — it reports depth, not a fault, and no
 //! decision reads it.
 
-use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::containment::Attached;
-use crate::stdio::Fd;
-
-/// Everything `Drop` hands over: the process backend plus every field that holds an OS resource
-/// and drops after it today, so the release order survives the handoff.
+/// Everything `Drop` hands over. The resource group is carried whole and in its own declaration
+/// order, so both what travels and the order it is released in live in exactly one place —
+/// [`OsResources`](super::OsResources).
 pub(crate) struct ReapJob {
-    pub(crate) proc: super::ProcSource,
-    pub(crate) attached: Attached,
-    pub(crate) pipes: super::FdPipes,
-    pub(crate) owned_std: BTreeMap<Fd, crate::tokio::stdio::OwnedStd>,
+    pub(crate) os: super::OsResources,
     pub(crate) pid: u32,
     /// The thread `Drop` ran on. `run_teardown` gates only when it is executing elsewhere.
     #[cfg(test)]
@@ -256,10 +250,7 @@ fn release(job: ReapJob) {
     );
     #[cfg(test)]
     let probe = job.probe;
-    drop(job.proc);
-    drop(job.attached);
-    drop(job.pipes);
-    drop(job.owned_std);
+    drop(job.os); // group order, single-sourced by `OsResources`
     #[cfg(test)]
     if let Some(p) = probe {
         let _ = p.outcome.send(test_probe::ReapOutcome::Released);
@@ -285,14 +276,11 @@ pub(crate) fn run_teardown(job: ReapJob) {
     let force_release_panic = job.force_release_panic;
     #[cfg(test)]
     let force_glue_panic = job.force_glue_panic;
-    let mut proc = job.proc;
-    let attached = job.attached;
-    let pipes = job.pipes;
-    let owned_std = job.owned_std;
+    let mut os = job.os;
     let pid = job.pid;
 
-    // `proc` is BORROWED into this region, never moved: an unwind must not destroy a resource
-    // whose release the region below owns and orders.
+    // `os` is BORROWED into this region, never moved: an unwind must not destroy a resource whose
+    // release the region below owns and orders.
     let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         if let Some(p) = probe.as_ref() {
@@ -311,7 +299,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
         if force_panic {
             panic!("forced teardown panic (test seam)");
         }
-        proc.wait_and_reap(pid);
+        os.proc_mut().wait_and_reap(pid);
     }));
 
     // The glue. Only a seeded fault reaches this, and only to give `work`'s recovery guard the
@@ -329,12 +317,9 @@ pub(crate) fn run_teardown(job: ReapJob) {
         if force_release_panic {
             panic!("forced release-region panic (test seam)");
         }
-        // `Child`'s declaration order — `proc` first, so the pid stays pinned for the whole wait
-        // and every other release stays ordered after the reap.
-        drop(proc);
-        drop(attached);
-        drop(pipes);
-        drop(owned_std);
+        // One drop, ordered by `OsResources`' own declaration order — `proc` first, so the pid
+        // stays pinned for the whole wait and every other release lands after the reap.
+        drop(os);
         #[cfg(test)]
         if let Some(p) = probe {
             let _ = p.outcome.send(if waited.is_err() {

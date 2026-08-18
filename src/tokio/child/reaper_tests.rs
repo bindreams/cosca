@@ -79,10 +79,10 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
     };
     let pid = proc.id().expect("a freshly spawned child has a pid");
     super::ReapJob {
-        proc: super::super::ProcSource::Tokio(proc),
-        attached: crate::containment::Attached::None,
-        pipes: Default::default(),
-        owned_std: Default::default(),
+        os: super::super::OsResources {
+            proc: Some(super::super::ProcSource::Tokio(proc)),
+            ..Default::default()
+        },
         pid,
         origin,
         probe,

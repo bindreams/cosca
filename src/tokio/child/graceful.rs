@@ -276,7 +276,7 @@ impl Child {
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
         } else if self.containment().can_observe_drain() {
-            match crate::tokio::wait::wait_tree_drained_dispatch(&self.attached, crate::wait::deadline_from(grace))
+            match crate::tokio::wait::wait_tree_drained_dispatch(&self.os.attached, crate::wait::deadline_from(grace))
                 .await
             {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
