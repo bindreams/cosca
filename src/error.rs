@@ -171,7 +171,9 @@ pub enum Error {
 /// A hard-wrapped string literal that loses its `\` line-continuation bakes the source
 /// indentation into the value, and both a variant match and a substring check read right past
 /// it. This is the one assertion that sees it.
-#[cfg(test)]
+// Windows-gated with its callers: every refusal detail it guards is behind `cfg(windows)`, so
+// off Windows it would be a `pub(crate)` item with no caller, which `-D warnings` rejects.
+#[cfg(all(test, windows))]
 pub(crate) fn assert_detail_is_not_hard_wrapped(detail: &str) {
     assert!(
         !detail.contains("  "),
