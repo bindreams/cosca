@@ -299,7 +299,16 @@ impl Child {
     /// child that owns a console can politely signal its own group-leading children.
     ///
     /// **And success here does not prove the event was delivered.** A root that shares no
-    /// console with the caller is reported as success and reaches nobody.
+    /// console with the caller is reported as success and reaches nobody — including a root
+    /// spawned with [`no_window`](crate::Command::no_window) or
+    /// [`detached`](crate::Command::detached), which gets a console of its own. Such a root is
+    /// reported as [`GracefulMechanism::OtherConsoleGroup`](crate::GracefulMechanism::OtherConsoleGroup)
+    /// by [`graceful_mechanism`](Child::graceful_mechanism): that is what cosca recorded about
+    /// the *route* from this process, never an authority on whether a signal will arrive. It is
+    /// also not "this child cannot be shut down politely" — a process attached to the child's own
+    /// console can deliver the event. The cooperative op returns `Ok` and delivers nothing; the
+    /// forced ops ([`kill`](Child::kill) / [`kill_tree`](Child::kill_tree), and the escalation
+    /// half of [`graceful_shutdown_tree`](Child::graceful_shutdown_tree)) are unaffected.
     ///
     /// **And it needs the caller to have a console.** The event is deliverable only within
     /// the *calling* process's console, so a GUI-subsystem binary, a service, or anything
