@@ -151,7 +151,54 @@ pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
             "a Job Object cannot span the integrity boundary of a runas child (deferred)",
         );
     }
+    // `ShellExecuteEx` accepts no creation flags at all, so every flag intent except window
+    // suppression has no mechanism here and is refused rather than silently dropped. Stated over
+    // the RECORDED state, not "a method was called": `creation_flags(0)` requests nothing.
+    let flags = cmd.flags_request();
+    if flags.detached {
+        return unsupported(
+            "detached() + elevate on Windows",
+            "the runas launch takes a show-command and no creation flags, so DETACHED_PROCESS              cannot be expressed. Elevate without it, or spawn unelevated.",
+        );
+    }
+    if flags.breakaway_from_job {
+        return unsupported(
+            "breakaway_from_job() + elevate on Windows",
+            "the runas launch takes a show-command and no creation flags, so              CREATE_BREAKAWAY_FROM_JOB cannot be expressed — and the runas child is created by a              system service, not by this process's job.",
+        );
+    }
+    if flags.raw != 0 {
+        return unsupported(
+            "creation_flags() + elevate on Windows",
+            "the runas launch takes a show-command and no creation flags, so an arbitrary              dwCreationFlags word cannot be expressed. no_window() is the one flag intent that              survives here, lowered to the launch's show-command.",
+        );
+    }
     Ok(())
+}
+
+/// The show-command the consent launch uses, from the caller's flag request.
+///
+/// Pure, so the selection is unit-testable without a UAC prompt.
+///
+/// **Reached only when a consent prompt is actually used.** `runas` returns
+/// `Transition::RunAsIs => RunasOutcome::AlreadyElevated` before it builds the
+/// `SHELLEXECUTEINFOW`, and `spawn_elevated`'s `AlreadyElevated` arm falls through to
+/// `spawn_unelevated` — so an already-elevated caller's `.elevate().no_window()` is carried by
+/// `CREATE_NO_WINDOW` on the ordinary backends and never touches this function.
+///
+/// The two lowerings differ observably for a graphical child: the show-command is the shell's
+/// initial show state for the whole launched application, where the creation flag concerns the
+/// child's console only.
+#[cfg(windows)]
+pub(crate) fn runas_show_command(
+    flags: &crate::command::flags::FlagsRequest,
+) -> windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
+    if flags.no_window {
+        SW_HIDE
+    } else {
+        SW_SHOWNORMAL
+    }
 }
 
 // ===== ShellExecuteEx("runas") launch =====
@@ -166,7 +213,6 @@ use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::RawChild;
@@ -304,7 +350,7 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
             lpFile: PCWSTR(file_w.as_ptr()),
             lpParameters: PCWSTR(params_w.as_ptr()),
             lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
-            nShow: SW_SHOWNORMAL.0,
+            nShow: runas_show_command(cmd.flags_request()).0,
             ..Default::default()
         };
         ShellExecuteExW(&mut info).map_err(|e| {
