@@ -784,6 +784,45 @@ fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() 
     );
 }
 
+/// A process-group member for the sweep tests: a `/bin/sh` that announces its own pid on a
+/// piped stdout and then blocks on a piped stdin. `pgid` is the group to join (`0` mints a new
+/// one of the member's own). The caller installs any marker on the returned command, spawns it,
+/// and must then take the readiness edge with [`await_member_ready`] before scanning for it.
+fn member_command(pgid: i32) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .process_group(pgid);
+    cmd
+}
+
+/// Block until a [`member_command`] child has announced itself, and check that the announcement
+/// came from that child.
+///
+/// The edge a spawned member must be scanned behind. `spawn()` returning reports the fork and
+/// the exec hand-off; it does not establish that the member's image is running, that its
+/// descriptor table answers a `proc_pidfdinfo` query, or that its `setpgid` is visible to
+/// `getpgid` — the three states a holder scan and the group-signal gate assert against. A
+/// `/bin/sleep` member can announce none of that, so the only way to wait for it would be a
+/// clock.
+fn await_member_ready(child: &mut std::process::Child) {
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read the member's announcement");
+    let announced: crate::identity::RawPid = line.trim().parse().expect("the announcement carries a pid");
+    assert_eq!(
+        announced,
+        child.id(),
+        "the announcement must come from the member itself"
+    );
+    // Hand the pipe back rather than dropping it: the member outlives this call, and closing
+    // the read end under a live child would make any later write to it a `SIGPIPE`.
+    child.stdout = Some(out.into_inner());
+}
+
 /// Item 1's central regression test: `sweep_pass`'s group-signal gate must re-fire on a LATER
 /// pass when THAT pass's own holder scan just confirmed a fresh, live, `getpgid`-verified member
 /// of `self.pgid` — closing the "a process joins the group strictly between passes" gap
@@ -795,7 +834,8 @@ fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() 
 /// to get a deterministic injection point *between* two passes with no sleep and no race:
 /// `hard_kill`'s own loop offers no such hook.
 ///
-/// Four roles, three real target processes:
+/// Four roles, three real target processes — all [`member_command`] members, none scanned until
+/// [`await_member_ready`] has read its announcement:
 /// - **P** mints a real, currently-valid pgid (`process_group(0)`: P's pgid == P's own pid), AND
 ///   carries a THROWAWAY marker (`scratch`, installed on P's own command) that exists only to
 ///   give pass 1 a valid `Marker` to call `sweep_pass` on — pass 1's own holder scan finding P
@@ -829,19 +869,18 @@ fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() 
 /// it.
 #[test]
 fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member() {
-    use std::os::unix::process::CommandExt;
     let _serialize = test_spawn_lock();
     crate::log_capture::install();
 
-    let mut p_cmd = std::process::Command::new("/bin/sleep");
-    p_cmd.arg("600").process_group(0); // pgid == P's own pid.
+    let mut p_cmd = member_command(0); // pgid == P's own pid.
     let scratch = super::install(&mut p_cmd, &[]).expect("install scratch marker on P");
     // P is deliberately left unreaped for the rest of the test — see the doc above ("P is left
     // an unreaped zombie throughout"). That's what keeps `pgid` allocated across the gap, so
     // clippy's zombie-processes lint is a false positive here, not a real leak.
     #[allow(clippy::zombie_processes)]
-    let p_child = p_cmd.spawn().expect("spawn P");
+    let mut p_child = p_cmd.spawn().expect("spawn P");
     drop(p_cmd);
+    await_member_ready(&mut p_child); // P's own group exists before T and Q ask to join it.
     let pgid = p_child.id() as i32;
 
     let pass1_marker = super::Marker::new(scratch, None, Some(pgid), false);
@@ -863,15 +902,21 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // Between passes: T's real marker is installed and T is spawned in the same breath (no
     // sweep_pass call in between — see the self-exclusion note above), born directly into
     // `pgid`. Q is born into `pgid` too, holding no marker.
-    let mut t_cmd = std::process::Command::new("/bin/sleep");
-    t_cmd.arg("600").process_group(pgid);
+    let mut t_cmd = member_command(pgid);
     let prepared = super::install(&mut t_cmd, &[]).expect("install marker on T");
     let mut t_child = t_cmd.spawn().expect("spawn T");
     drop(t_cmd);
+    // T is the member pass 2's own holder scan must find, so the scan runs behind T's
+    // announcement — the state `spawn()` returning leaves unestablished.
+    await_member_ready(&mut t_child);
 
-    let mut q_cmd = std::process::Command::new("/bin/sleep");
-    q_cmd.arg("600").process_group(pgid);
+    let mut q_cmd = member_command(pgid);
     let mut q_child = q_cmd.spawn().expect("spawn Q");
+    // Q's announcement proves it is a live member of `pgid`, blocked on its stdin, before the
+    // signal fires. It does NOT make a non-success exit proof of the signal: `wait()` closes Q's
+    // piped stdin before waiting, and `read` at EOF exits `sh` 1 on its own — which is why the
+    // assertion below is on the termination signal, not on `!success()`.
+    await_member_ready(&mut q_child);
 
     let marker = super::Marker::new(prepared, None, Some(pgid), false);
     let mark = crate::log_capture::mark();
@@ -892,12 +937,17 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
          found in this pass's own holder scan"
     );
 
-    // The proof: Q holds no marker and was never named `root`, so only a `killpg` on `pgid`
-    // could have killed it.
+    // The proof: Q holds no marker and was never named `root`, so a SIGKILL on Q can only have
+    // come from `killpg(pgid)`. It must be the signal that ended Q, not `wait()`'s own stdin
+    // close: a gate that stopped re-firing would leave Q alive to read that EOF and exit 1,
+    // which `signal()` reports as `None`.
+    use std::os::unix::process::ExitStatusExt;
     let status = q_child.wait().expect("reap Q");
-    assert!(
-        !status.success(),
-        "Q must have been killed by the pass-2 group signal (killpg), not left running; got {status:?}"
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "Q must have died from the pass-2 group signal (killpg on pgid), the only channel that \
+         reaches it; got {status:?}"
     );
 
     // T is reachable by the marker channel too (this same pass 2 call's own holder-kill loop),
