@@ -222,6 +222,15 @@ impl Child {
     /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
     /// sweep to act on yet.
     ///
+    /// **Windows, once the root's exit has been observed**, the cooperative half is refused
+    /// outright — this handle has stopped pinning the root's pid, see
+    /// [`terminate_tree`](Child::terminate_tree) — and that refusal is held on the same terms,
+    /// for a different reason. Nothing was sent, so nothing is owed a reply; the grace is spent
+    /// because the ROOT's OWN EXIT propagates, and a descendant reading a pipe whose write end
+    /// the root held gets EOF and exits on its own. The wait is the window that lets such a tree
+    /// finish shutting itself down; sweeping at once would kill a clean shutdown in progress.
+    /// Whatever is still alive at the end of it is swept as usual.
+    ///
     /// # Runtime
     ///
     /// On Unix, needs a runtime with the IO **and** time drivers enabled (the
@@ -240,9 +249,17 @@ impl Child {
         #[cfg(not(test))]
         let term_result = self.terminate_tree();
 
-        // Hold-and-continue ONLY for the error shapes #61's fix can produce as ORDINARY
-        // outcomes — see the sync `src/child/graceful.rs` twin's identical match for the full
-        // rationale.
+        // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
+        // dead mechanism — see the sync `src/child/graceful.rs` twin's identical match for the
+        // per-member rationale it shares.
+        //
+        // One shape reaches this arm that the sync twin cannot produce: the unpinned-pid refusal
+        // (`Child::unpinned_pid_refusal`, Windows), where NO signal was sent at all — so the
+        // reason to hold is not that a response to ours may still arrive. It is that the root has
+        // already exited and its exit PROPAGATES: a descendant reading a pipe whose write end the
+        // root held gets EOF and exits on its own. The grace is the window that lets such a tree
+        // finish shutting itself down, and force-sweeping immediately would kill a clean shutdown
+        // in progress — worse than spending a grace period on a tree that was not going to exit.
         let term = match term_result {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
@@ -363,8 +380,11 @@ pub(crate) mod fault {
     use std::cell::Cell;
 
     /// Which `terminate_tree` failure to fabricate on the next call, on this thread.
-    /// `Containment` and `UnassessablePerMember` exercise the hold-and-continue path this
-    /// task adds — both ORDINARY #61 outcomes, a signal was attempted. `Unsupported` and
+    /// `Containment` and `UnassessablePerMember` exercise the hold-and-continue path — both
+    /// per-member #61 outcomes, where a signal WAS attempted. The third shape that arm admits,
+    /// the unpinned-pid refusal (nothing sent at all), needs no seam: a real reaped child
+    /// produces it, and `windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped`
+    /// drives it that way. `Unsupported` and
     /// `UnassessableMechanism` exercise fail-fast paths: `Unsupported` models the
     /// PRE-EXISTING console-less-caller shape (`NoConsole`/`Unsupported`) this task must not
     /// touch; `UnassessableMechanism` models `Error::Unassessable { source: Some(_), .. }` —
