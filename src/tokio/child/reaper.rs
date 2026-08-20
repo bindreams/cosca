@@ -90,6 +90,17 @@ pub(crate) struct ReapJob {
 /// it; a larger number would imply a guarantee the pool cannot deliver.
 const REAPER_POOL_THREADS: usize = 2;
 
+// The floor above, enforced rather than left standing as prose. Two structural reasons:
+//
+// 1. Width 1 IS the failure this pool exists to prevent — one child that never exits stalls all
+//    future cleanup, permanently. "2 is the smallest width that is not that" is a correctness
+//    claim, so it is a contract assertion, at compile time.
+// 2. `pool_width_follows_its_bound` is the positive control for the published width and needs a
+//    private bound STRICTLY BELOW this constant; that bound is 1. Dropping to 1 here would not
+//    fail that test — it would silently vacate it, leaving a control that proves nothing. The
+//    coupling is invisible from either site alone.
+const _: () = assert!(REAPER_POOL_THREADS >= 2);
+
 /// A published pool: the sending half of the one queue its workers share.
 struct Pool {
     tx: crossbeam_channel::Sender<ReapJob>,
