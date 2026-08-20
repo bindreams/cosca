@@ -77,9 +77,18 @@ pub(crate) struct ReapJob {
     pub(crate) force_glue_panic: bool,
 }
 
-/// A wedged child occupies one worker and no other; the rest keep draining the shared queue. Not
-/// a throughput device — an ordinary reap waits microseconds on an already-killed child.
-const REAPER_POOL_THREADS: usize = 4;
+/// A bulkhead, not a rate. Nothing waits on a reap — `Drop` has already returned — and an
+/// ordinary one waits microseconds on an already-killed child, so a single worker services
+/// thousands a second. What a width buys is that a child killed but never exiting (blocked in the
+/// kernel on something that never returns: a hung mount, a dead device) parks its own worker and
+/// no other. Width 1 is one such child stalling all future cleanup permanently; **2 is the
+/// smallest width that is not that.**
+///
+/// Every worker past the second helps only against several INDEPENDENT wedges at once, while the
+/// real causes correlate — one hung mount wedges every child that touches it, and no fixed width
+/// survives that. So this bounds the damage of one pathological child and claims nothing beyond
+/// it; a larger number would imply a guarantee the pool cannot deliver.
+const REAPER_POOL_THREADS: usize = 2;
 
 /// A published pool: the sending half of the one queue its workers share.
 struct Pool {

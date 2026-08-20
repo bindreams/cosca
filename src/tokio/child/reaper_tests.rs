@@ -7,11 +7,13 @@
 //! `REAPER_POOL_THREADS - 1` concurrent holders — at full width, a later drop's job would queue
 //! behind holders that are themselves waiting, and libtest runs these in parallel.
 //!
-//! The budget is spent by [`arm_probe`] and nothing else. Exactly one test calls it
-//! (`drop_signals_the_root_and_returns_before_the_reap`, which holds across a blocking socket
-//! read — the gate IS its discriminator), leaving two of the three slots free. Every other
-//! global-pool test takes [`arm_probe_ungated`], which hands back no gate to hold; the
-//! pool-shape tests gate their own [`private_pool`]s, which are nobody else's.
+//! At today's width that budget is ONE, and it is fully spent: it is claimed by [`arm_probe`]
+//! and nothing else, and the sole caller — `drop_signals_the_root_and_returns_before_the_reap`,
+//! which holds across a blocking socket read, the gate being its discriminator — takes it. There
+//! is no margin. A second gated holder is not a tight fit but a wedged binary: it needs the width
+//! raised or that test moved onto a [`private_pool`] of its own. Every other global-pool test
+//! takes [`arm_probe_ungated`], which hands back no gate to hold, so the budget cannot be spent
+//! by accident; the pool-shape tests gate their own private pools, which are nobody else's.
 
 use std::sync::mpsc;
 use std::thread::ThreadId;
@@ -118,8 +120,8 @@ fn release_and_reap(ends: ProbeEnds) {
 }
 
 /// Arm a probe for the next `Child::drop` on this thread and keep its ends, GATE HELD — so the
-/// teardown parks a worker of the process-global pool until this test releases it. Spends one of
-/// the gate-holding budget in the file header; prefer [`arm_probe_ungated`].
+/// teardown parks a worker of the process-global pool until this test releases it. Spends the
+/// file header's whole gate-holding budget; prefer [`arm_probe_ungated`].
 fn arm_probe() -> ProbeEnds {
     let (probe, ends) = probe_pair();
     arm(probe);
@@ -296,13 +298,15 @@ async fn each_wedged_job_occupies_its_own_worker_and_the_extra_job_queues() {
 }
 
 /// The positive control that makes the published width falsifiable with no mutation at all: it
-/// runs at a width DIFFERENT from the constant, so hardcoding either the spawn loop or the
-/// predicate to `REAPER_POOL_THREADS` makes this pool abandon and the first `started.recv()` errs.
-/// Hardcoding BOTH — the only way a wider-than-bound pool can exist — publishes four workers, and
-/// the queued job then starts on one of the two THIS test never gated.
+/// runs at a width BELOW the constant, so hardcoding either the spawn loop or the predicate to
+/// `REAPER_POOL_THREADS` makes this pool abandon and the first `started.recv()` errs. Hardcoding
+/// BOTH — the only way a wider-than-bound pool can exist — publishes `REAPER_POOL_THREADS`
+/// workers, and the queued job then starts on one THIS test never gated. Below the constant, not
+/// above: a bound over it would leave the broken world SHORT of workers, and this test would then
+/// block on a `started.recv()` that never arrives instead of failing.
 #[tokio::test]
 async fn pool_width_follows_its_bound() {
-    const BOUND: usize = 2;
+    const BOUND: usize = 1;
     let pool = private_pool(BOUND);
     let mut ends = submit_gated(pool, BOUND + 1);
     let extra = ends.pop().expect("BOUND + 1 jobs were submitted");
@@ -311,7 +315,7 @@ async fn pool_width_follows_its_bound() {
         .iter()
         .map(|e| e.started.recv().expect("a pool of BOUND must take BOUND jobs at once"))
         .collect();
-    // Race-free: both workers are wedged on gates THIS test holds.
+    // Race-free: every worker is wedged on a gate THIS test holds.
     assert!(
         matches!(extra.started.try_recv(), Err(mpsc::TryRecvError::Empty)),
         "a pool of BOUND must not take a BOUND + 1'th job"
@@ -332,7 +336,7 @@ async fn pool_width_follows_its_bound() {
             .recv()
             .expect("the queued job must be taken once a worker frees up"),
         workers[0],
-        "a pool of BOUND has no third worker to take the queued job"
+        "a pool of BOUND has no spare worker to take the queued job"
     );
 
     release_and_reap(extra);
@@ -380,7 +384,7 @@ async fn any_spawn_failure_abandons_the_pool_and_the_next_dispatch_retries() {
 #[tokio::test]
 async fn total_spawn_failure_releases_the_job_in_hand() {
     // Its OWN pool: a second pool in one test would shadow an init mutation. This one exercises
-    // the join-of-zero-started path, where the test above joins three.
+    // the join-of-zero-started path, where the test above joins the ones that did start.
     let pool = private_pool(super::REAPER_POOL_THREADS);
 
     super::fault::set_force_spawn_failures(super::REAPER_POOL_THREADS);
@@ -400,6 +404,8 @@ async fn total_spawn_failure_releases_the_job_in_hand() {
 #[tokio::test]
 async fn concurrent_first_submits_share_one_init() {
     let pool = private_pool(super::REAPER_POOL_THREADS);
+    // More submitters than the pool has workers, whatever the width: the losers of the init race
+    // are genuine losers, and the assertion below is that none of them ran an init of its own.
     let submitters = super::REAPER_POOL_THREADS + 2;
     let origin = std::thread::current().id();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(submitters));
