@@ -233,7 +233,8 @@ impl Child {
     /// exits on its own — are given the window to finish, and the sweep takes only what is left.
     /// On **`TreeWalk`** there is no drain edge, so the wait watches the ROOT alone; the root
     /// has already exited by this refusal's own precondition, the watch resolves at once, and
-    /// the sweep follows immediately. Descendants get no window there, whatever `grace` says.
+    /// the sweep follows immediately. Descendants get no window there, whatever `grace` says
+    /// (bindreams/cosca#125).
     ///
     /// # Runtime
     ///
