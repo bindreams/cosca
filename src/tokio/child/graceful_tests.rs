@@ -465,6 +465,55 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
     );
 }
 
+// The held refusal buys a shutdown window only where a tree drain can be observed. `TreeWalk`
+// has none, so the grace-wait watches the ROOT alone — and this refusal's precondition IS that
+// the root has already exited, so the watch resolves at once and the sweep follows immediately.
+// The assertion is on elapsed time because that is the entire claim: checking only for `Ok`
+// passes just as well in the world where the full grace is spent.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
+    // Wide enough that the two worlds are three orders of magnitude apart, so the split below
+    // cannot be reached by jitter: this path is measured in milliseconds.
+    const GRACE: Duration = Duration::from_secs(10);
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        child.containment(),
+        crate::Containment::TreeWalk,
+        "the subject must be the mechanism that has no drain edge to watch"
+    );
+    let id = child.id();
+    child.kill().expect("kill");
+    child.wait().await.expect("reap"); // tokio unpins the pid here
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let started = std::time::Instant::now();
+    child
+        .graceful_shutdown_tree(GRACE)
+        .await
+        .expect("a swept tree supersedes the held refusal");
+    let elapsed = started.elapsed();
+
+    // Non-vacuity, first: a `terminate_tree` that returned `Ok` would produce the same fast,
+    // green run, and this test would then be measuring a path it never entered.
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
+        ),
+        "the refusal must have reached the hold-and-continue arm"
+    );
+    assert!(
+        elapsed < GRACE / 2,
+        "the root-only watch must resolve at once on an already-exited root rather than spend \
+         the grace: took {elapsed:?} of {GRACE:?}"
+    );
+}
+
 // The pid guard must not swallow the refusals that never address a pid. An uncontained Windows
 // child records `GracefulMechanism::None` — permanent and pid-independent — so it must keep
 // answering `Unsupported` (what its own doc promises, and what the sync mirror returns for the

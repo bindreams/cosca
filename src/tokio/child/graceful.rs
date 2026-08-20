@@ -222,6 +222,20 @@ impl Child {
     /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
     /// sweep to act on yet.
     ///
+    /// **Windows, once the root's exit has been observed**, the cooperative half is refused
+    /// outright — this handle has stopped pinning the root's pid, see
+    /// [`terminate_tree`](Child::terminate_tree). That refusal is held rather than returned:
+    /// nothing was sent, so nothing is owed a reply, and the sweep still has to run.
+    ///
+    /// **What the grace then buys is a property of the mechanism, and one arm buys nothing.**
+    /// On a **job object** the wait watches the whole tree, so descendants that the root's own
+    /// exit is already ending — one reading a pipe whose write end the root held gets EOF and
+    /// exits on its own — are given the window to finish, and the sweep takes only what is left.
+    /// On **`TreeWalk`** there is no drain edge, so the wait watches the ROOT alone; the root
+    /// has already exited by this refusal's own precondition, the watch resolves at once, and
+    /// the sweep follows immediately. Descendants get no window there, whatever `grace` says
+    /// (bindreams/cosca#125).
+    ///
     /// # Runtime
     ///
     /// On Unix, needs a runtime with the IO **and** time drivers enabled (the
@@ -240,9 +254,14 @@ impl Child {
         #[cfg(not(test))]
         let term_result = self.terminate_tree();
 
-        // Hold-and-continue ONLY for the error shapes #61's fix can produce as ORDINARY
-        // outcomes — see the sync `src/child/graceful.rs` twin's identical match for the full
-        // rationale.
+        // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
+        // dead mechanism — see the sync `src/child/graceful.rs` twin's identical match for the
+        // per-member rationale it shares.
+        //
+        // One shape reaches this arm that the sync twin cannot produce: the unpinned-pid refusal
+        // (`Child::unpinned_pid_refusal`, Windows), where NO signal was sent at all. Held anyway
+        // — not because a reply may still arrive, but for the sweep and, on a drain-observing
+        // mechanism, the window; see this function's rustdoc for what it costs per mechanism.
         let term = match term_result {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
@@ -354,17 +373,19 @@ impl Child {
 
 /// Test-only fault-injection seam for a forced `terminate_tree` failure inside
 /// `graceful_shutdown_tree`, mirroring `crate::wait::fault`'s shape. Duplicated (not shared)
-/// with `crate::child::graceful::fault` — see this crate's `#61` implementation plan, Task 7,
-/// "Structural note", for why: `mod graceful;` is private in both `src/child.rs` and
+/// with `crate::child::graceful::fault`: `mod graceful;` is private in both `src/child.rs` and
 /// `src/tokio/child.rs`, so a seam here is not nameable from the sync tree without widening
-/// that visibility, which is out of scope here.
+/// that visibility.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
 
     /// Which `terminate_tree` failure to fabricate on the next call, on this thread.
-    /// `Containment` and `UnassessablePerMember` exercise the hold-and-continue path this
-    /// task adds — both ORDINARY #61 outcomes, a signal was attempted. `Unsupported` and
+    /// `Containment` and `UnassessablePerMember` exercise the hold-and-continue path — both
+    /// per-member #61 outcomes, where a signal WAS attempted. The third shape that arm admits,
+    /// the unpinned-pid refusal (nothing sent at all), needs no seam: a real reaped child
+    /// produces it, and `windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped`
+    /// drives it that way. `Unsupported` and
     /// `UnassessableMechanism` exercise fail-fast paths: `Unsupported` models the
     /// PRE-EXISTING console-less-caller shape (`NoConsole`/`Unsupported`) this task must not
     /// touch; `UnassessableMechanism` models `Error::Unassessable { source: Some(_), .. }` —

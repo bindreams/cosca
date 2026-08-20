@@ -652,7 +652,7 @@ impl Child {
 /// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
 /// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
 ///
-/// The reap is handed to a small fixed pool of reaper threads (currently four) that starts on
+/// The reap is handed to a small fixed pool of reaper threads (currently two) that starts on
 /// the first kill-on-drop drop and persists for the process's life. It is guaranteed except on
 /// the two paths below, both of which are loud. Under thread exhaustion the pool cannot start,
 /// and the child goes to the runtime's orphan handling instead — an `error` per child, and each
