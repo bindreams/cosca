@@ -90,15 +90,10 @@ pub(crate) struct ReapJob {
 /// it; a larger number would imply a guarantee the pool cannot deliver.
 const REAPER_POOL_THREADS: usize = 2;
 
-// The floor above, enforced rather than left standing as prose. Two structural reasons:
-//
-// 1. Width 1 IS the failure this pool exists to prevent — one child that never exits stalls all
-//    future cleanup, permanently. "2 is the smallest width that is not that" is a correctness
-//    claim, so it is a contract assertion, at compile time.
-// 2. `pool_width_follows_its_bound` is the positive control for the published width and needs a
-//    private bound STRICTLY BELOW this constant; that bound is 1. Dropping to 1 here would not
-//    fail that test — it would silently vacate it, leaving a control that proves nothing. The
-//    coupling is invisible from either site alone.
+// The floor above as a contract assertion: width 1 is the failure this pool exists to prevent.
+// It is also half of a coupling — `pool_width_follows_its_bound` is a control only while its own
+// bound stays strictly below this constant, and lowering the width here would vacate that test
+// GREEN rather than fail it. The reciprocal assert lives at the test.
 const _: () = assert!(REAPER_POOL_THREADS >= 2);
 
 /// A published pool: the sending half of the one queue its workers share.

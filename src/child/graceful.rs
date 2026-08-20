@@ -327,10 +327,9 @@ impl Child {
 
 /// Test-only fault-injection seam for a forced `terminate_tree` failure inside
 /// `graceful_shutdown_tree`, mirroring `crate::wait::fault`'s shape. Duplicated (not shared)
-/// with `crate::tokio::child::graceful::fault` — see this crate's `#61` implementation plan,
-/// Task 7, "Structural note", for why: `mod graceful;` is private in both `src/child.rs` and
-/// `src/tokio/child.rs`, so a seam here is not nameable from the tokio tree without widening
-/// that visibility, which is out of scope here.
+/// with `crate::tokio::child::graceful::fault`: `mod graceful;` is private in both
+/// `src/child.rs` and `src/tokio/child.rs`, so a seam here is not nameable from the tokio tree
+/// without widening that visibility.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;

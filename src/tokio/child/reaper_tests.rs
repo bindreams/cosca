@@ -300,13 +300,18 @@ async fn each_wedged_job_occupies_its_own_worker_and_the_extra_job_queues() {
 /// The positive control that makes the published width falsifiable with no mutation at all: it
 /// runs at a width BELOW the constant, so hardcoding either the spawn loop or the predicate to
 /// `REAPER_POOL_THREADS` makes this pool abandon and the first `started.recv()` errs. Hardcoding
-/// BOTH — the only way a wider-than-bound pool can exist — publishes `REAPER_POOL_THREADS`
-/// workers, and the queued job then starts on one THIS test never gated. Below the constant, not
-/// above: a bound over it would leave the broken world SHORT of workers, and this test would then
-/// block on a `started.recv()` that never arrives instead of failing.
+/// BOTH — the only way a wider-than-bound pool can exist — publishes more workers than this test
+/// gates, so every job is taken at once and NOTHING ever queues; the worker-id `assert_eq!` at
+/// the end is what fails there (measured), while the `Empty` check before it catches that world
+/// only by timing. Below the constant, not above: a bound over it would leave the broken world
+/// SHORT of workers, and this test would then block on a `started.recv()` that never arrives
+/// instead of failing.
 #[tokio::test]
 async fn pool_width_follows_its_bound() {
     const BOUND: usize = 1;
+    // The reciprocal of `reaper.rs`'s width floor, so the coupling is enforced from both ends:
+    // widening the pool must not drag BOUND up to match, which vacates this control green.
+    const _: () = assert!(BOUND < super::REAPER_POOL_THREADS);
     let pool = private_pool(BOUND);
     let mut ends = submit_gated(pool, BOUND + 1);
     let extra = ends.pop().expect("BOUND + 1 jobs were submitted");

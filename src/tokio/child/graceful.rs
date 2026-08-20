@@ -224,12 +224,16 @@ impl Child {
     ///
     /// **Windows, once the root's exit has been observed**, the cooperative half is refused
     /// outright — this handle has stopped pinning the root's pid, see
-    /// [`terminate_tree`](Child::terminate_tree) — and that refusal is held on the same terms,
-    /// for a different reason. Nothing was sent, so nothing is owed a reply; the grace is spent
-    /// because the ROOT's OWN EXIT propagates, and a descendant reading a pipe whose write end
-    /// the root held gets EOF and exits on its own. The wait is the window that lets such a tree
-    /// finish shutting itself down; sweeping at once would kill a clean shutdown in progress.
-    /// Whatever is still alive at the end of it is swept as usual.
+    /// [`terminate_tree`](Child::terminate_tree). That refusal is held rather than returned:
+    /// nothing was sent, so nothing is owed a reply, and the sweep still has to run.
+    ///
+    /// **What the grace then buys is a property of the mechanism, and one arm buys nothing.**
+    /// On a **job object** the wait watches the whole tree, so descendants that the root's own
+    /// exit is already ending — one reading a pipe whose write end the root held gets EOF and
+    /// exits on its own — are given the window to finish, and the sweep takes only what is left.
+    /// On **`TreeWalk`** there is no drain edge, so the wait watches the ROOT alone; the root
+    /// has already exited by this refusal's own precondition, the watch resolves at once, and
+    /// the sweep follows immediately. Descendants get no window there, whatever `grace` says.
     ///
     /// # Runtime
     ///
@@ -254,12 +258,9 @@ impl Child {
         // per-member rationale it shares.
         //
         // One shape reaches this arm that the sync twin cannot produce: the unpinned-pid refusal
-        // (`Child::unpinned_pid_refusal`, Windows), where NO signal was sent at all — so the
-        // reason to hold is not that a response to ours may still arrive. It is that the root has
-        // already exited and its exit PROPAGATES: a descendant reading a pipe whose write end the
-        // root held gets EOF and exits on its own. The grace is the window that lets such a tree
-        // finish shutting itself down, and force-sweeping immediately would kill a clean shutdown
-        // in progress — worse than spending a grace period on a tree that was not going to exit.
+        // (`Child::unpinned_pid_refusal`, Windows), where NO signal was sent at all. Held anyway
+        // — not because a reply may still arrive, but for the sweep and, on a drain-observing
+        // mechanism, the window; see this function's rustdoc for what it costs per mechanism.
         let term = match term_result {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
@@ -371,10 +372,9 @@ impl Child {
 
 /// Test-only fault-injection seam for a forced `terminate_tree` failure inside
 /// `graceful_shutdown_tree`, mirroring `crate::wait::fault`'s shape. Duplicated (not shared)
-/// with `crate::child::graceful::fault` — see this crate's `#61` implementation plan, Task 7,
-/// "Structural note", for why: `mod graceful;` is private in both `src/child.rs` and
+/// with `crate::child::graceful::fault`: `mod graceful;` is private in both `src/child.rs` and
 /// `src/tokio/child.rs`, so a seam here is not nameable from the sync tree without widening
-/// that visibility, which is out of scope here.
+/// that visibility.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
