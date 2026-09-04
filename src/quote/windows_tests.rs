@@ -1,4 +1,4 @@
-use crate::quote::windows::{first_token_and_rest_wide, first_token_wide, join_wide};
+use crate::quote::windows::{first_token_and_rest_wide, first_token_wide, join_wide, split_wide};
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
@@ -7,6 +7,12 @@ fn jw(args: &[&str]) -> String {
     let wides: Vec<Vec<u16>> = args.iter().map(|a| w(a)).collect();
     let refs: Vec<&[u16]> = wides.iter().map(|v| v.as_slice()).collect();
     String::from_utf16(&join_wide(&refs)).unwrap()
+}
+fn sw(s: &str) -> Vec<Vec<u16>> {
+    split_wide(&w(s)).unwrap()
+}
+fn sw_strings(s: &str) -> Vec<String> {
+    sw(s).into_iter().map(|t| String::from_utf16(&t).unwrap()).collect()
 }
 
 #[test]
@@ -71,6 +77,146 @@ fn backslashes_before_quote_are_doubled_plus_one() {
 fn trailing_backslashes_doubled_before_closing_quote() {
     assert_eq!(jw(&["a\\ b"]), "\"a\\ b\""); // single backslash, space forces quotes
     assert_eq!(jw(&["a b\\"]), "\"a b\\\\\""); // trailing \ doubled before closing "
+}
+
+// split_wide ================================================================
+
+#[test]
+fn split_wide_empty_input_returns_empty_vec() {
+    assert_eq!(split_wide(&[]).unwrap(), Vec::<Vec<u16>>::new());
+}
+
+#[test]
+fn split_wide_whitespace_only_input_returns_empty_vec() {
+    assert_eq!(sw("   \t "), Vec::<Vec<u16>>::new());
+}
+
+#[test]
+fn split_wide_simple_args() {
+    assert_eq!(sw_strings("a b c"), vec!["a", "b", "c"]);
+}
+
+#[test]
+fn split_wide_skips_leading_whitespace_before_argv0() {
+    // Same deliberate deviation `first_token_wide` already documents.
+    assert_eq!(sw_strings("   cmd arg"), vec!["cmd", "arg"]);
+}
+
+#[test]
+fn split_wide_tab_separates_rest_args() {
+    assert_eq!(sw_strings("prog\ta\tb"), vec!["prog", "a", "b"]);
+}
+
+#[test]
+fn split_wide_quoted_arg_with_embedded_space() {
+    assert_eq!(sw_strings("prog \"a b\""), vec!["prog", "a b"]);
+}
+
+#[test]
+fn split_wide_empty_quoted_arg_between_args() {
+    assert_eq!(sw_strings("prog \"\" x"), vec!["prog", "", "x"]);
+}
+
+#[test]
+fn split_wide_adjacent_empty_quotes_concatenate() {
+    // a""b -> ab: a fresh run of exactly 2 bare quotes (the mod-3 counter
+    // goes 0->1->2 and the run ends there) resets with no literal `"`.
+    assert_eq!(sw_strings("prog a\"\"b"), vec!["prog", "ab"]);
+}
+
+#[test]
+fn split_wide_triple_quote_run_yields_one_literal_quote() {
+    // The undocumented shell32 mod-3 rule: 3 consecutive bare quotes collapse
+    // to one literal `"` with no net toggle of "inside quotes".
+    assert_eq!(sw_strings("prog a\"\"\"b"), vec!["prog", "a\"b"]);
+}
+
+#[test]
+fn split_wide_double_quote_inside_quoted_region_embeds_literal_quote() {
+    // The classic "double a quote to embed one" idiom: "a""b" -> a"b.
+    assert_eq!(sw_strings("prog \"a\"\"b\""), vec!["prog", "a\"b"]);
+}
+
+#[test]
+fn split_wide_backslash_before_quote_odd_count() {
+    // One backslash before a quote: (1-1)/2 = 0 literal backslashes, quote is literal.
+    assert_eq!(sw_strings("prog a\\\"b"), vec!["prog", "a\"b"]);
+}
+
+#[test]
+fn split_wide_backslash_before_quote_even_count() {
+    // Two backslashes before a quote: 2/2 = 1 literal backslash, quote toggles.
+    assert_eq!(sw_strings("prog a\\\\\"b"), vec!["prog", "a\\b"]);
+}
+
+#[test]
+fn split_wide_trailing_backslash_stays_literal() {
+    assert_eq!(sw_strings("prog a\\"), vec!["prog", "a\\"]);
+}
+
+#[test]
+fn split_wide_backslashes_before_whitespace_stay_literal() {
+    // Not just end-of-input: backslashes not immediately followed by a quote
+    // are always literal, including right before a token-ending whitespace.
+    assert_eq!(sw_strings("prog a\\\\ b"), vec!["prog", "a\\\\", "b"]);
+}
+
+#[test]
+fn split_wide_argv0_only_no_further_args() {
+    assert_eq!(sw_strings("prog"), vec!["prog"]);
+}
+
+#[test]
+fn split_wide_trailing_whitespace_after_last_arg_yields_no_spurious_empty_token() {
+    assert_eq!(sw_strings("prog a   "), vec!["prog", "a"]);
+}
+
+#[test]
+fn split_wide_unterminated_quote_in_rest_arg_consumes_to_end() {
+    // Mirrors `unterminated_opening_quote_consumes_to_end` for argv[0], but
+    // through the args[1..] parser's own qcount/bcount state machine.
+    assert_eq!(sw_strings("prog \"abc"), vec!["prog", "abc"]);
+}
+
+#[test]
+fn split_wide_trailing_backslash_run_before_unterminated_opening_quote() {
+    // Exercises the truncate-on-EOF interaction: an even backslash run
+    // (halved to 1 literal `\`) immediately before a bare opening quote that
+    // toggles "inside quotes" and is then never closed (consumes to end, no
+    // literal `"` emitted since this quote was a toggle, not an escape).
+    assert_eq!(sw_strings("prog abc\\\\\""), vec!["prog", "abc\\"]);
+}
+
+#[test]
+fn split_wide_round_trips_join_wide_for_rest_args() {
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["a", "b"],
+        vec!["a b", "a\"b", "a\\b", "a\\\"b", "trail\\", "", "tab\tx"],
+        vec!["a\\\\\\\\b"],
+    ];
+    for rest in cases {
+        let joined = jw(&rest);
+        let full = format!("prog {joined}");
+        let result = sw_strings(&full);
+        let mut expected = vec!["prog".to_string()];
+        expected.extend(rest.iter().map(|s| s.to_string()));
+        assert_eq!(result, expected, "round-trip mismatch for {rest:?}");
+    }
+}
+
+#[test]
+fn split_wide_lone_surrogate_passes_through_verbatim() {
+    // 0xD800 is an unpaired surrogate: legal as a raw code unit, not valid on
+    // its own in a Rust `String`. Confirms split_wide doesn't require valid
+    // UTF-16 and doesn't treat it as a delimiter/quote/backslash.
+    let mut cmd: Vec<u16> = w("prog a");
+    cmd.push(0xD800u16);
+    cmd.push(b'b' as u16);
+    let result = split_wide(&cmd).unwrap();
+    let mut expected_arg = w("a");
+    expected_arg.push(0xD800u16);
+    expected_arg.push(b'b' as u16);
+    assert_eq!(result, vec![w("prog"), expected_arg]);
 }
 
 #[cfg(windows)]
@@ -155,6 +301,67 @@ mod roundtrip {
             let expected: Vec<Vec<u16>> = wides.clone();
             assert_eq!(parsed, expected, "round-trip mismatch for {:?}", case);
         }
+    }
+
+    #[test]
+    fn split_wide_matches_os_parse_for_representative_cases() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["plain", "args"],
+            vec!["has space", "a\"b", "a\\b", "a\\\"b", "trail\\", "", "tab\tx"],
+            vec!["prefix", "a\\\\\\\\ b"],
+        ];
+        for case in cases {
+            let wides: Vec<Vec<u16>> = case.iter().map(|a| w(a)).collect();
+            let refs: Vec<&[u16]> = wides.iter().map(|v| v.as_slice()).collect();
+            let line = join_wide(&refs);
+            let os_result = os_parse(&line);
+            let our_result = split_wide(&line).unwrap();
+            assert_eq!(our_result, os_result, "split_wide disagrees with OS for {:?}", case);
+            assert_eq!(
+                our_result, wides,
+                "split_wide disagrees with original argv for {:?}",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn split_wide_matches_os_parse_for_adversarial_quote_runs() {
+        // Hand-written lines exercising the shell32 mod-3 rule for runs of
+        // consecutive bare quotes, plus unterminated-quote edge cases — none
+        // producible by our own `join_wide`, which never emits 3+ adjacent
+        // unescaped quotes or an unclosed quoted region.
+        let lines = [
+            "prog a\"\"\"b",
+            "prog \"a\"\" b\"",
+            "prog \"\"\"",
+            "prog a\"\"\"\"b",
+            "prog \"\"\"x",
+            "prog \"abc",
+            "prog abc\\\\\"",
+        ];
+        for line in lines {
+            let cmd = w(line);
+            let os_result = os_parse(&cmd);
+            let our_result = split_wide(&cmd).unwrap();
+            assert_eq!(our_result, os_result, "split_wide disagrees with OS for {line:?}");
+        }
+    }
+
+    #[test]
+    fn split_wide_deviates_from_os_like_first_token_on_leading_whitespace() {
+        // Same deviation as `first_token_wide`, now exercised through the
+        // full splitter: we skip leading whitespace before argv[0]; the OS
+        // does not.
+        let input = w("   cmd arg");
+        let os_result = os_parse(&input);
+        let our_result = split_wide(&input).unwrap();
+        assert_ne!(our_result, os_result, "deviation should still exist for split_wide");
+        assert_eq!(
+            our_result,
+            vec![w("cmd"), w("arg")],
+            "split_wide should skip leading whitespace and return [\"cmd\", \"arg\"]"
+        );
     }
 }
 
