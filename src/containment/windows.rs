@@ -94,7 +94,9 @@ impl JobHandle {
         if let Some(job) = self.take() {
             // SAFETY: job is a valid handle we own; Win32 calls are safe.
             unsafe {
-                let _ = TerminateJobObject(job, 1);
+                if let Err(e) = TerminateJobObject(job, 1) {
+                    log::warn!("TerminateJobObject failed ({e}); the tree may still be running");
+                }
                 let _ = CloseHandle(job);
             }
         }
@@ -115,12 +117,17 @@ impl JobHandle {
         let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         // SAFETY: job is a valid handle; info is fully initialised (zeroed by default()).
         unsafe {
-            let _ = SetInformationJobObject(
+            if let Err(e) = SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
                 std::ptr::addr_of!(info).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
+            ) {
+                log::warn!(
+                    "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
+                     closing this handle will still kill the tree"
+                );
+            }
         }
     }
 }
@@ -500,7 +507,11 @@ pub(crate) mod fault {
 }
 
 /// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
-fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+///
+/// `pub(crate)`: also the sole constructor behind the public [`crate::containment::job::Job`]
+/// primitive — reused verbatim rather than duplicated, so `Command::contain()` and `Job::assign`
+/// share exactly one implementation.
+pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
     // SAFETY: all calls are standard Win32; owned handles are closed on every error path.
@@ -662,17 +673,17 @@ impl JobHandle {
 }
 
 /// The [`Error::Unassessable`](crate::error::Error::Unassessable) reported when a drain check
-/// finds the job handle already closed (`kill_tree()`/`hard_kill()`, or the `Child` was
-/// dropped): `TerminateJobObject`/`CloseHandle` are not documented as synchronous with member
+/// finds the job handle already closed (`kill_tree()`/`hard_kill()`, or the owning `Child`/`Job`
+/// was dropped): `TerminateJobObject`/`CloseHandle` are not documented as synchronous with member
 /// process teardown, so once the handle is gone there is no way left to ask whether every member
 /// has actually finished exiting — reporting `AllMembersExited` here would be a guess, not a
-/// live-checked verdict. Shared verbatim by `JobHandle::wait_drained`'s own early return and its
-/// tokio twin, `job_wait_tree_drained`.
+/// live-checked verdict. Shared verbatim by `JobHandle::wait_drained`'s own early return, its
+/// tokio twin `job_wait_tree_drained`, and the public [`crate::containment::job::Job`] wrapper.
 pub(crate) fn consumed_job_handle_error() -> crate::error::Error {
     crate::error::Error::Unassessable {
-        detail: "the job handle was already closed (kill_tree()/hard_kill(), or the Child was \
-                 dropped) before this drain check ran; whether every member has actually \
-                 finished exiting can no longer be observed"
+        detail: "the job handle was already closed (kill_tree()/hard_kill(), or the owning \
+                 Child/Job was dropped) before this drain check ran; whether every member has \
+                 actually finished exiting can no longer be observed"
             .into(),
         source: None,
     }

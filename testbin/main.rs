@@ -295,6 +295,23 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
         }
+        "spawn-grandchild-echo" => {
+            // Like spawn-grandchild, but both levels round-trip a byte (`control-echo-pid`)
+            // instead of merely holding the socket open. `control-block`'s EOF-on-death is
+            // proof of death, never proof of life (a still-alive peer produces no EOF either
+            // way); a test that must prove a descendant is POSITIVELY alive — e.g. that
+            // `disarm()` left the tree running rather than merely "hasn't been reaped yet" —
+            // needs the real round trip this mode gives both members.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(clippy::zombie_processes)]
+            // intentional: grandchild must outlive us; containment (or not) decides its fate
+            let _gc = std::process::Command::new(exe)
+                .args(["control-echo-pid", &addr, "G"])
+                .spawn()
+                .unwrap();
+            run_control_echo_pid(&addr, "R");
+        }
         #[cfg(unix)]
         "spawn-grandchild-setuid" => {
             // Like spawn-grandchild, but the grandchild is a SEPARATE, pre-provisioned

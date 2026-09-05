@@ -12,6 +12,8 @@ pub mod graceful;
 pub mod identity;
 pub mod quote;
 pub mod stdio;
+#[cfg(windows)]
+pub use containment::Job;
 pub use containment::{ContainMode, Containment};
 pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, EnvSanitizer, Privilege, Secret};
 pub use graceful::GracefulMechanism;
