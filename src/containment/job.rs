@@ -77,8 +77,9 @@ impl Job {
     /// teardown, and once this closes the handle there is nothing left to watch. Call
     /// [`wait_tree`](Job::wait_tree) *before* `kill_tree` if the caller needs the drain outcome.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.0.hard_kill();
-        Ok(())
+        self.0.hard_kill().map_err(|e| Error::Containment {
+            detail: format!("terminate the job's process tree: {e}"),
+        })
     }
 
     /// Clear `KILL_ON_JOB_CLOSE`, so that dropping (or having already dropped) this `Job` leaves
@@ -113,10 +114,12 @@ impl Job {
     /// `DuplicateHandle` pins a second, independent reference to the SAME job for the duration
     /// of this call; closing the original elsewhere cannot touch it.
     fn wait_tree_deadline(&self, deadline: Option<Option<Instant>>) -> Result<TreeDrain, Error> {
-        let Some(job) = self.0.as_handle() else {
+        // Duplicated under the lock so a concurrent `kill_tree`/`Drop` cannot close the
+        // original between the read and the `DuplicateHandle` call; the wait itself then
+        // runs on the duplicate, outside the lock.
+        let Some(dup) = self.0.with_handle(duplicate_job).transpose()? else {
             return Err(consumed_job_handle_error());
         };
-        let dup = duplicate(job)?;
         let result = wait_drained_raw(dup, deadline, None);
         // SAFETY: `dup` is a handle this function alone created and holds; nothing else
         // references it.
@@ -130,7 +133,9 @@ impl Job {
 /// `DuplicateHandle` a live handle into a second, independent reference to the same kernel
 /// object — used so [`Job::wait_tree_deadline`] never holds the original handle value across a
 /// (possibly long) wait.
-fn duplicate(handle: HANDLE) -> Result<HANDLE, Error> {
+/// `pub(crate)`: `JobHandle::wait_drained` needs the same duplicate-then-wait shape, so
+/// there is one implementation rather than two.
+pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, Error> {
     let mut dup = HANDLE::default();
     // SAFETY: `handle` is live for the duration of this call (borrowed from `self.0`, which
     // outlives this function call); `dup` is an out-parameter DuplicateHandle initializes.

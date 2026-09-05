@@ -13,7 +13,7 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::RwLock;
 
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_FAILED, WAIT_OBJECT_0,
@@ -38,12 +38,19 @@ fn null_ptr() -> *mut c_void {
 /// Owns the Job Object handle. `KILL_ON_JOB_CLOSE` means the whole process tree
 /// is terminated when this handle is closed (dropped or explicitly killed).
 ///
-/// Interior mutability via `AtomicPtr` allows `hard_kill` and `disarm` to be
-/// called via `&self` (required because `Child::kill_tree` takes `&self`).
+/// Interior mutability allows `hard_kill` and `disarm` to be called via `&self`
+/// (required because `Child::kill_tree` takes `&self`).
+///
+/// The lock is load-bearing, not incidental. Every use is "read the handle, then call
+/// Win32 with it", and an atomic makes only the read indivisible — leaving a window in
+/// which a concurrent `hard_kill`/`Drop` closes the handle before the call lands. Windows
+/// recycles closed handle values onto unrelated kernel objects, so that call would then
+/// operate on someone else's object: `disarm` writing a cleared `KILL_ON_JOB_CLOSE` to an
+/// unrelated job silently leaves *its* tree to outlive its owner. Holding the lock across
+/// the call is what makes load-then-use a single step.
 pub(crate) struct JobHandle {
-    /// The raw HANDLE value stored as an atomic `*mut c_void`.
-    /// Null means the handle has been consumed (taken/killed).
-    raw: AtomicPtr<c_void>,
+    /// The raw HANDLE value. Null means the handle has been consumed (taken/killed).
+    raw: RwLock<*mut c_void>,
 }
 
 // A Windows job-object HANDLE is a process-wide kernel handle; using it
@@ -52,11 +59,15 @@ pub(crate) struct JobHandle {
 // `!Send`, which would prevent this type from crossing thread boundaries.
 unsafe impl Send for JobHandle {}
 
+// SAFETY: the pointer is only ever read or replaced under `raw`'s lock, which is what makes
+// load-then-use indivisible; the job operations themselves are serialised by the kernel. This
+// is required rather than incidental: `Job` is public, its methods take `&self`, and callers
+// may share it across threads.
+unsafe impl Sync for JobHandle {}
+
 impl std::fmt::Debug for JobHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobHandle")
-            .field("raw", &self.raw.load(Ordering::Relaxed))
-            .finish()
+        f.debug_struct("JobHandle").field("raw", &self.peek()).finish()
     }
 }
 
@@ -64,24 +75,33 @@ impl JobHandle {
     fn new(handle: HANDLE) -> Self {
         debug_assert!(!handle.0.is_null(), "job handle must not be null");
         JobHandle {
-            raw: AtomicPtr::new(handle.0),
+            raw: RwLock::new(handle.0),
         }
     }
 
-    /// The raw job handle, or `None` once consumed. Backs the test-only
-    /// membership probe (`job_contains_pid`).
-    pub(crate) fn as_handle(&self) -> Option<HANDLE> {
-        let p = self.raw.load(Ordering::Relaxed);
-        if p.is_null() {
+    /// The raw value, for diagnostics only — never to call Win32 with. Use [`with_handle`].
+    fn peek(&self) -> *mut c_void {
+        *self.raw.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `f` with the live job handle, holding the lock so it cannot be closed and its
+    /// value recycled underneath the call. `None` once consumed.
+    ///
+    /// Keep `f` short and non-blocking: it holds off `hard_kill` and `Drop` for its duration.
+    /// A long wait must duplicate the handle inside `f` and then wait on the duplicate.
+    pub(crate) fn with_handle<R>(&self, f: impl FnOnce(HANDLE) -> R) -> Option<R> {
+        let guard = self.raw.read().unwrap_or_else(|e| e.into_inner());
+        if guard.is_null() {
             None
         } else {
-            Some(HANDLE(p))
+            Some(f(HANDLE(*guard)))
         }
     }
 
-    /// Atomically take the raw handle, leaving null. Returns `None` if already consumed.
+    /// Take the raw handle, leaving null. Returns `None` if already consumed.
     fn take(&self) -> Option<HANDLE> {
-        let p = self.raw.swap(null_ptr(), Ordering::AcqRel);
+        let mut guard = self.raw.write().unwrap_or_else(|e| e.into_inner());
+        let p = std::mem::replace(&mut *guard, null_ptr());
         if p.is_null() {
             None
         } else {
@@ -90,15 +110,19 @@ impl JobHandle {
     }
 
     /// Terminate every process in the job, then close the handle.
-    pub(crate) fn hard_kill(&self) {
-        if let Some(job) = self.take() {
-            // SAFETY: job is a valid handle we own; Win32 calls are safe.
-            unsafe {
-                if let Err(e) = TerminateJobObject(job, 1) {
-                    log::warn!("TerminateJobObject failed ({e}); the tree may still be running");
-                }
-                let _ = CloseHandle(job);
+    ///
+    /// Returns the `TerminateJobObject` failure rather than only logging it: a caller that is
+    /// told teardown succeeded while the tree is still running has no way to notice, and the
+    /// other containment mechanisms already report this.
+    pub(crate) fn hard_kill(&self) -> io::Result<()> {
+        let Some(job) = self.take() else { return Ok(()) };
+        // SAFETY: job is a valid handle we own; Win32 calls are safe.
+        unsafe {
+            let terminated = TerminateJobObject(job, 1).map_err(io::Error::from);
+            if let Err(e) = CloseHandle(job) {
+                log::warn!("CloseHandle on the job failed ({e}); the handle is leaked");
             }
+            terminated
         }
     }
 
@@ -106,34 +130,46 @@ impl JobHandle {
     /// Called by `Child::detach()` before the handle is released: otherwise
     /// dropping the job handle terminates the tree the caller intended to keep alive.
     pub(crate) fn disarm(&self) {
-        let p = self.raw.load(Ordering::Relaxed);
-        if p.is_null() {
-            return;
-        }
-        let job = HANDLE(p);
-        // A zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION has LimitFlags == 0, which
-        // clears KILL_ON_JOB_CLOSE. Best-effort: if this call fails the handle close
-        // in Drop will still fire the kill — but that's an unlikely kernel failure.
-        let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // SAFETY: job is a valid handle; info is fully initialised (zeroed by default()).
-        unsafe {
-            if let Err(e) = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::addr_of!(info).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) {
-                log::warn!(
-                    "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
-                     closing this handle will still kill the tree"
-                );
+        // Held across the call: this WRITES to the handle, so landing on a recycled value
+        // would clear KILL_ON_JOB_CLOSE on an unrelated job and quietly let its tree
+        // outlive its owner.
+        self.with_handle(|job| {
+            // A zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION has LimitFlags == 0, which
+            // clears KILL_ON_JOB_CLOSE.
+            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            // SAFETY: job is a valid handle; info is fully initialised (zeroed by default()).
+            unsafe {
+                if let Err(e) = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of!(info).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) {
+                    log::warn!(
+                        "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
+                         closing this handle will still kill the tree"
+                    );
+                }
             }
-        }
+        });
     }
 }
 
 #[cfg(all(windows, test))]
 impl JobHandle {
+    /// Test-only: read the handle without holding the lock across its use.
+    ///
+    /// Reintroduces the load-then-use gap that [`with_handle`](JobHandle::with_handle) exists
+    /// to close, so it is confined to tests, which do not race their own teardown.
+    pub(crate) fn as_handle(&self) -> Option<HANDLE> {
+        let p = self.peek();
+        if p.is_null() {
+            None
+        } else {
+            Some(HANDLE(p))
+        }
+    }
+
     /// Test-only: a real but empty job object (no process assigned). Cheap to create and
     /// cleanly closed on `Drop`; for variant-level assertions like
     /// `Attached::JobObject(_).is_actionable()`.
@@ -662,13 +698,22 @@ impl JobHandle {
         deadline: Option<Option<std::time::Instant>>,
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        let Some(job) = self.as_handle() else {
+        // Duplicate under the lock, then wait on the duplicate. The wait can block for the
+        // whole deadline, and holding the lock for that long would stall `hard_kill`/`Drop`
+        // (and, with an unbounded deadline, forever). The duplicate is an independent
+        // reference to the same job, so closing the original elsewhere cannot invalidate it.
+        let Some(dup) = self.with_handle(crate::containment::job::duplicate_job).transpose()? else {
             // The job was already consumed — `hard_kill()` or `Drop` already ran, nulling `raw`
             // and closing the underlying handle. See `consumed_job_handle_error`'s own doc for
             // why that is reported as `Unassessable` rather than a guessed `AllMembersExited`.
             return Err(consumed_job_handle_error());
         };
-        wait_drained_raw(job, deadline, cancel)
+        let result = wait_drained_raw(dup, deadline, cancel);
+        // SAFETY: `dup` is ours alone and no longer in use.
+        unsafe {
+            let _ = CloseHandle(dup);
+        }
+        result
     }
 }
 
@@ -976,9 +1021,6 @@ pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32
     let crate::containment::Attached::JobObject(job) = attached else {
         return false;
     };
-    let Some(job_handle) = job.as_handle() else {
-        return false;
-    };
 
     // Open the child process by PID; the backend doesn't expose its handle.
     // SAFETY: standard Win32 call; the handle is closed below.
@@ -990,13 +1032,17 @@ pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32
     };
 
     let mut in_job = windows::core::BOOL(0);
-    // SAFETY: both handles are valid for the duration of the call.
-    let ok = unsafe { IsProcessInJob(process_handle, Some(job_handle), &mut in_job) };
+    // Lock held across the query so the job handle cannot be closed and its value recycled
+    // between the read and the call.
+    let queried = job.with_handle(|job_handle| {
+        // SAFETY: both handles are valid for the duration of the call.
+        unsafe { IsProcessInJob(process_handle, Some(job_handle), &mut in_job) }
+    });
     // SAFETY: `process_handle` was opened above and must be closed.
     unsafe {
         let _ = CloseHandle(process_handle);
     }
-    ok.is_ok() && in_job.as_bool()
+    matches!(queried, Some(Ok(()))) && in_job.as_bool()
 }
 
 #[cfg(test)]
