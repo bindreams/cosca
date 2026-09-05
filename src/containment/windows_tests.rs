@@ -11,7 +11,7 @@ fn job_handle_debug_does_not_panic() {
     // a `JobHandle`.
     use super::JobHandle;
     let h = JobHandle::create_empty_for_test();
-    h.hard_kill();
+    h.hard_kill().expect("hard_kill on a live job");
     let s = format!("{h:?}");
     assert!(s.contains("JobHandle"), "debug output: {s}");
 }
@@ -24,7 +24,7 @@ fn job_handle_debug_does_not_panic() {
 fn wait_drained_on_a_consumed_handle_is_unassessable() {
     use super::JobHandle;
     let h = JobHandle::create_empty_for_test();
-    h.hard_kill();
+    h.hard_kill().expect("hard_kill on a live job");
     let err = h
         .wait_drained(Some(None), None)
         .expect_err("a consumed job handle must not report a live drain verdict");

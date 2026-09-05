@@ -435,7 +435,10 @@ async fn job_wait_tree_drained(
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
         return job.wait_drained(deadline, None);
     }
-    let Some(raw_job) = job.as_handle() else {
+    // Read under the lock: the duplicate below must be taken from a handle that cannot be
+    // closed — and its value recycled onto an unrelated object — between the read and the
+    // `DuplicateHandle` call.
+    let Some(raw_job) = job.with_handle(|h| h) else {
         // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
         // reaches here once that method's Duration::ZERO delegation above has already been
         // ruled out) — see `consumed_job_handle_error`'s own doc for the full justification.

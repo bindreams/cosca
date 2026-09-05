@@ -992,8 +992,10 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
     // Resume REGARDLESS of job assignment result. A frozen child cannot be left running.
     if let Err(resume_err) = resume_initial_threads(proc_handle) {
         if let Ok(job) = job_result {
-            // Kill via the job first (catches any threads the walk may have missed).
-            job.hard_kill();
+            // Kill via the job first (catches any threads the walk may have missed). The
+            // resume failure is what gets reported; a kill failure on top of it is logged
+            // by `hard_kill` and cannot change the outcome here.
+            let _ = job.hard_kill();
         }
         return Err(resume_err);
     }
