@@ -21,11 +21,30 @@ use windows::Win32::System::Threading::{
     CreateProcessW, ResumeThread, TerminateProcess, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
-/// One tree member's control channel: its pid, and the socket that proves it alive or dead.
+/// One tree member's control channel: its pid, the socket that proves it alive or dead, and
+/// an owned handle opened while it was provably alive.
+///
+/// The handle is what makes cleanup safe. Terminating by pid alone races the member's own
+/// exit: Windows recycles a dead process's pid, so a pid read at handshake time can name an
+/// unrelated process by the time a test tears down — and on a shared CI runner that is
+/// someone else's process. An open handle pins the pid for as long as it is held, so the
+/// terminate can only ever land on the intended member.
+///
 /// Mirrors `tests/macos_fdmarker.rs`'s `Member`.
 struct Member {
     pid: u32,
     sock: TcpStream,
+    process: HANDLE,
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        // SAFETY: `process` is this struct's own handle, opened once and closed only here.
+        unsafe {
+            let _ = TerminateProcess(self.process, 1);
+            let _ = CloseHandle(self.process);
+        }
+    }
 }
 
 impl Member {
@@ -174,10 +193,19 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
             .read_line(&mut line)
             .expect("read tag+pid");
         let (tag, pid) = line.trim().split_at(1);
-        let m = Member {
-            pid: pid.parse().expect("member pid"),
-            sock: s,
+        let pid: u32 = pid.parse().expect("member pid");
+        // Opened here, while the handshake proves the member alive — see `Member`'s doc for
+        // why a pid captured now cannot be trusted at teardown.
+        // SAFETY: standard Win32 call; the handle is closed by `Member::drop`.
+        let process = unsafe {
+            windows::Win32::System::Threading::OpenProcess(
+                windows::Win32::System::Threading::PROCESS_TERMINATE,
+                false,
+                pid,
+            )
+            .expect("open the member that just completed its handshake")
         };
+        let m = Member { pid, sock: s, process };
         match tag {
             "R" => root_member = Some(m),
             "G" => grand_member = Some(m),
@@ -222,21 +250,10 @@ fn disarm_leaves_every_descendant_running() {
     root_member.assert_alive("the root, after disarm + drop(Job)");
     grand_member.assert_alive("the grandchild, after disarm + drop(Job)");
 
-    // Cleanup: `Suspended::drop` only reaches the root; the grandchild survives it (a disarmed
-    // job, by design, is no longer this test's tool for reaching it) so it is torn down
-    // directly via its own pid.
+    // Cleanup: `Suspended::drop` only reaches the root; the grandchild survives it, because a
+    // disarmed job is by design no longer this test's tool for reaching it. `Member::drop`
+    // terminates each through its own pinned handle.
     root_member.sock.shutdown(std::net::Shutdown::Both).ok();
     grand_member.sock.shutdown(std::net::Shutdown::Both).ok();
     drop(root);
-    // SAFETY: `grand_member.pid` was just read from the process's own live handshake above.
-    unsafe {
-        if let Ok(h) = windows::Win32::System::Threading::OpenProcess(
-            windows::Win32::System::Threading::PROCESS_TERMINATE,
-            false,
-            grand_member.pid,
-        ) {
-            let _ = TerminateProcess(h, 1);
-            let _ = CloseHandle(h);
-        }
-    }
 }
