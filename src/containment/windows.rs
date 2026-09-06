@@ -27,7 +27,8 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, INFINITE, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    THREAD_SUSPEND_RESUME,
 };
 
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
@@ -189,7 +190,12 @@ impl Drop for JobHandle {
         if let Some(job) = self.take() {
             // SAFETY: job is a valid handle we own.
             unsafe {
-                let _ = CloseHandle(job);
+                if let Err(e) = CloseHandle(job) {
+                    // The close IS the teardown here: with KILL_ON_JOB_CLOSE still set, a
+                    // failed close means the tree was never reaped and the handle leaked.
+                    // Drop cannot report that, so it must at least be visible.
+                    log::warn!("closing the job handle failed ({e}); the tree may still be running");
+                }
             }
         }
     }
@@ -734,11 +740,6 @@ pub(crate) fn consumed_job_handle_error() -> crate::error::Error {
     }
 }
 
-/// The loop body of [`JobHandle::wait_drained`], taking the already-resolved raw handle rather
-/// than borrowing `&JobHandle` — the async wrapper (`tokio::wait`) copies the handle value out
-/// before handing it to `spawn_blocking`, since a `'static` blocking closure cannot capture a
-/// borrow. Sound because the async caller holds `&JobHandle` (transitively, `&Child`) across the
-/// whole `spawn_blocking` `.await`, so the job handle cannot be closed while this runs.
 /// Duplicate a job handle. One implementation for all three duplicate-then-wait sites (the
 /// sync wait, the async wait, and `Job::wait_tree`); it lives here, next to `JobHandle`,
 /// rather than in `job.rs`, because the public wrapper depends on this module and not the
@@ -746,6 +747,8 @@ pub(crate) fn consumed_job_handle_error() -> crate::error::Error {
 ///
 /// Call it as the closure passed to [`JobHandle::with_handle`], never on a handle returned
 /// out of one: the point is that the lock is still held while `DuplicateHandle` reads it.
+/// Returning the handle first and duplicating after is the same load-then-use gap with extra
+/// steps — and reads as correct, which is why it is called out here.
 pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Error> {
     use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
     use windows::Win32::System::Threading::GetCurrentProcess;
@@ -768,6 +771,12 @@ pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Erro
     Ok(dup)
 }
 
+/// The loop body of [`JobHandle::wait_drained`], taking an already-resolved raw handle rather
+/// than borrowing `&JobHandle`.
+///
+/// Every caller now hands in an owned duplicate taken under the lock, not the live handle, so
+/// this can run for an unbounded deadline without holding off `hard_kill`/`Drop` and without
+/// the handle being closed underneath it.
 pub(crate) fn wait_drained_raw(
     job: HANDLE,
     deadline: Option<Option<std::time::Instant>>,
@@ -810,7 +819,13 @@ pub(crate) fn wait_drained_raw(
         let mut denied: Option<io::Error> = None;
         for pid in pids.iter().take(budget) {
             // SAFETY: standard Win32 call; the handle is closed below on every path.
-            match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, *pid) } {
+            // `PROCESS_QUERY_LIMITED_INFORMATION` is required by `IsProcessInJob` below and is
+            // NOT implied by `PROCESS_SYNCHRONIZE`; without it every membership check fails
+            // ACCESS_DENIED, `handles` stays empty forever, and this loop spins instead of
+            // ever reaching `WaitForMultipleObjects`. (`job_contains_pid` opens for the same
+            // reason.) `LIMITED` rather than full query: it is the least right that works and
+            // is grantable across integrity levels.
+            match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) } {
                 // A pid enumerated a moment ago can have exited and had its number reused by
                 // the time it is opened, so membership is re-confirmed against the job rather
                 // than assumed. Waiting on a bystander would either hang the drain (it outlives
@@ -820,12 +835,23 @@ pub(crate) fn wait_drained_raw(
                     let mut in_job = windows::core::BOOL(0);
                     // SAFETY: both handles are valid for the duration of the call.
                     let confirmed = unsafe { IsProcessInJob(h, Some(job), &mut in_job) };
-                    if confirmed.is_ok() && in_job.as_bool() {
-                        handles.push(h);
-                    } else {
-                        // SAFETY: opened just above and not stored anywhere.
-                        unsafe {
+                    match confirmed {
+                        // A member: wait on it.
+                        Ok(()) if in_job.as_bool() => handles.push(h),
+                        // Openable but not in this job — the pid was recycled between the
+                        // enumeration and the open. Filtering it out is the point.
+                        Ok(()) => unsafe {
                             let _ = CloseHandle(h);
+                        },
+                        // The query itself failed, so membership is unknown. Recorded like any
+                        // other actionable failure rather than silently dropped: if it holds
+                        // for every member it would otherwise be invisible.
+                        Err(e) => {
+                            denied = Some(io::Error::from(e));
+                            // SAFETY: opened just above and not stored anywhere.
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
                         }
                     }
                 }

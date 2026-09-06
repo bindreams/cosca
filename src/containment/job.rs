@@ -75,9 +75,7 @@ impl Job {
     /// teardown, and once this closes the handle there is nothing left to watch. Call
     /// [`wait_tree`](Job::wait_tree) *before* `kill_tree` if the caller needs the drain outcome.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.0.hard_kill().map_err(|e| Error::Containment {
-            detail: format!("terminate the job's process tree: {e}"),
-        })
+        self.0.hard_kill().map_err(Error::Io)
     }
 
     /// Clear `KILL_ON_JOB_CLOSE`, so that dropping (or having already dropped) this `Job` leaves

@@ -118,9 +118,7 @@ impl Attached {
                 Ok(())
             }
             #[cfg(windows)]
-            Attached::JobObject(job) => job.hard_kill().map_err(|e| Error::Containment {
-                detail: format!("terminate the job's process tree: {e}"),
-            }),
+            Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(),
             Attached::TreeWalk(root) => {

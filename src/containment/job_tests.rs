@@ -159,18 +159,16 @@ fn job_is_send_and_sync() {
     assert_send_sync::<Job>();
 }
 
-/// `disarm` and `kill_tree` racing on one `Job` from two threads must not fault or corrupt.
+/// Both orderings of `disarm` and `kill_tree` on a shared `Job` complete without faulting.
 ///
-/// This is the case the lock exists for: both take `&self`, both use the handle, and one of
-/// them closes it. Before the handle was locked, `disarm` could write to a handle `kill_tree`
-/// had already closed — and Windows recycles a closed handle's value onto unrelated kernel
-/// objects, so that write could clear `KILL_ON_JOB_CLOSE` on someone else's job.
-///
-/// Either interleaving is a valid outcome; the assertion is that both calls complete and the
-/// job ends up consumed. Run repeatedly to widen the window rather than timed, so it cannot
-/// flake on a slow runner.
+/// Honest about what this is: a smoke test, not a regression guard. It does NOT fail against
+/// the pre-lock code — provoking a real handle-close-then-recycle interleaving is not portably
+/// possible, because it needs the OS to hand the recycled value to this same process inside a
+/// window measured in instructions. What actually holds the invariant is structural: the lock
+/// makes load-then-use indivisible, and `job_is_send_and_sync` pins the bound that makes the
+/// sharing legal in the first place.
 #[test]
-fn disarm_racing_kill_tree_is_safe() {
+fn disarm_and_kill_tree_from_two_threads_complete() {
     for _ in 0..64 {
         let mut child = spawn_blocker();
         let raw = child.as_raw_handle();
@@ -184,4 +182,49 @@ fn disarm_racing_kill_tree_is_safe() {
 
         let _ = child.wait();
     }
+}
+
+/// Once `kill_tree` has consumed the handle, `disarm` must observe that and do nothing.
+///
+/// This is the deterministic half of the concurrency story above, and it is the state the lock
+/// exists to make observable: without it, a `disarm` arriving after the close would read a
+/// stale value and write to whatever kernel object had inherited it.
+#[test]
+fn disarm_after_kill_tree_does_nothing() {
+    let mut child = spawn_blocker();
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives the borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+
+    job.kill_tree().expect("kill_tree");
+    let consumed = format!("{job:?}");
+    job.disarm(); // must be a no-op, not a write through a dangling value
+    assert_eq!(
+        consumed,
+        format!("{job:?}"),
+        "disarm on a consumed job must leave it consumed, not resurrect or mutate it"
+    );
+
+    let _ = child.wait();
+}
+
+/// A zero timeout on a live tree reports `MembersRemain` rather than blocking or guessing.
+#[test]
+fn wait_tree_timeout_zero_reports_members_remain() {
+    let mut child = spawn_blocker();
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives the borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+
+    let drain = job
+        .wait_tree_timeout(std::time::Duration::ZERO)
+        .expect("a zero-timeout drain query must succeed");
+    assert_eq!(
+        drain,
+        crate::containment::TreeDrain::MembersRemain,
+        "a live member must be reported as remaining"
+    );
+
+    job.kill_tree().expect("kill_tree");
+    let _ = child.wait();
 }
