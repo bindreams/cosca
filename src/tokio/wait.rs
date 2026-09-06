@@ -427,21 +427,13 @@ async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
-    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
-    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
     // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
     // call that cannot block (mirrors grace_wait's identical delegation).
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
         return job.wait_drained(deadline, None);
     }
-    let Some(raw_job) = job.as_handle() else {
-        // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
-        // reaches here once that method's Duration::ZERO delegation above has already been
-        // ruled out) — see `consumed_job_handle_error`'s own doc for the full justification.
-        return Err(crate::containment::windows::consumed_job_handle_error());
-    };
-
     /// An independently-owned duplicate of the job handle, held only by the spawned blocking
     /// task and closed by it on every exit path, panic included — see this function's own doc
     /// for why a borrowed handle is not safe to hand across the cancellation boundary here.
@@ -457,23 +449,20 @@ async fn job_wait_tree_drained(
             }
         }
     }
-    let mut dup = HANDLE::default();
-    // SAFETY: `raw_job` was just confirmed live via `job.as_handle()` above. Duplicating
-    // within our own process with `DUPLICATE_SAME_ACCESS` produces an independent handle to
-    // the same job object, valid for the spawned task's full lifetime regardless of what
-    // happens to `job`/`JobHandle` afterward.
-    unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            raw_job,
-            GetCurrentProcess(),
-            &mut dup,
-            0,
-            false,
-            DUPLICATE_SAME_ACCESS,
-        )
-    }
-    .map_err(|e| Error::Io(std::io::Error::from(e)))?;
+
+    // Duplicate INSIDE the closure, so the lock is still held when `DuplicateHandle` reads the
+    // handle. Returning the handle out of `with_handle` first would release the guard before
+    // the call — leaving the load-then-use gap this is meant to close — and Windows recycles a
+    // closed handle's value onto unrelated kernel objects.
+    let Some(dup) = job
+        .with_handle(crate::containment::windows::duplicate_job)
+        .transpose()?
+    else {
+        // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
+        // reaches here once that method's Duration::ZERO delegation above has already been
+        // ruled out) — see `consumed_job_handle_error`'s own doc for the full justification.
+        return Err(crate::containment::windows::consumed_job_handle_error());
+    };
     let job_dup = OwnedJobDup(dup);
 
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher

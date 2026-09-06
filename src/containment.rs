@@ -287,6 +287,13 @@ pub(crate) mod cgroup;
 #[path = "containment/windows.rs"]
 pub(crate) mod windows;
 
+/// The public Job Object primitive — see [`job::Job`].
+#[cfg(windows)]
+#[path = "containment/job.rs"]
+pub(crate) mod job;
+#[cfg(windows)]
+pub use job::Job;
+
 #[path = "containment/enumerate.rs"]
 pub(crate) mod enumerate;
 
