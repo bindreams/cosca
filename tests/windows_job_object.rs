@@ -257,3 +257,22 @@ fn disarm_leaves_every_descendant_running() {
     grand_member.sock.shutdown(std::net::Shutdown::Both).ok();
     drop(root);
 }
+
+/// Dropping a live `Job` reaps the tree, exactly as `kill_tree` does.
+///
+/// This is the path a caller reaches by doing nothing, and it is the one the `#[must_use]` on
+/// `assign` warns about — so it needs coverage of its own rather than being inferred from
+/// `kill_tree`'s. The distinction matters: `kill_tree` terminates explicitly, whereas this
+/// relies on `KILL_ON_JOB_CLOSE` firing when the last handle closes.
+#[test]
+fn dropping_a_live_job_reaps_every_descendant() {
+    let (root, job, mut root_member, mut grand_member) = spawn_contained_tree();
+    root_member.assert_alive("the root, before drop");
+    grand_member.assert_alive("the grandchild, before drop");
+
+    drop(job);
+
+    root_member.assert_dead("the root, after dropping the Job");
+    grand_member.assert_dead("the grandchild, after dropping the Job");
+    drop(root);
+}

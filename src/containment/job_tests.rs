@@ -148,3 +148,40 @@ fn job_debug_differs_before_and_after_kill_tree() {
     );
     let _ = child.wait();
 }
+
+/// `Job` is shared across threads by callers, which is exactly what makes its `&self` methods
+/// racy if the handle is not locked. Pinning the bound here means a future change that makes
+/// `Job` thread-hostile fails at compile time rather than silently narrowing what callers may
+/// do — the same assertion `Process` carries.
+#[test]
+fn job_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Job>();
+}
+
+/// `disarm` and `kill_tree` racing on one `Job` from two threads must not fault or corrupt.
+///
+/// This is the case the lock exists for: both take `&self`, both use the handle, and one of
+/// them closes it. Before the handle was locked, `disarm` could write to a handle `kill_tree`
+/// had already closed — and Windows recycles a closed handle's value onto unrelated kernel
+/// objects, so that write could clear `KILL_ON_JOB_CLOSE` on someone else's job.
+///
+/// Either interleaving is a valid outcome; the assertion is that both calls complete and the
+/// job ends up consumed. Run repeatedly to widen the window rather than timed, so it cannot
+/// flake on a slow runner.
+#[test]
+fn disarm_racing_kill_tree_is_safe() {
+    for _ in 0..64 {
+        let mut child = spawn_blocker();
+        let raw = child.as_raw_handle();
+        // SAFETY: `child` outlives the borrow.
+        let job = std::sync::Arc::new(Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job"));
+
+        let a = std::sync::Arc::clone(&job);
+        let t = std::thread::spawn(move || a.disarm());
+        job.kill_tree().expect("kill_tree");
+        t.join().expect("the disarming thread must not panic");
+
+        let _ = child.wait();
+    }
+}

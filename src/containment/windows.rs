@@ -702,7 +702,7 @@ impl JobHandle {
         // whole deadline, and holding the lock for that long would stall `hard_kill`/`Drop`
         // (and, with an unbounded deadline, forever). The duplicate is an independent
         // reference to the same job, so closing the original elsewhere cannot invalidate it.
-        let Some(dup) = self.with_handle(crate::containment::job::duplicate_job).transpose()? else {
+        let Some(dup) = self.with_handle(duplicate_job).transpose()? else {
             // The job was already consumed — `hard_kill()` or `Drop` already ran, nulling `raw`
             // and closing the underlying handle. See `consumed_job_handle_error`'s own doc for
             // why that is reported as `Unassessable` rather than a guessed `AllMembersExited`.
@@ -739,6 +739,35 @@ pub(crate) fn consumed_job_handle_error() -> crate::error::Error {
 /// before handing it to `spawn_blocking`, since a `'static` blocking closure cannot capture a
 /// borrow. Sound because the async caller holds `&JobHandle` (transitively, `&Child`) across the
 /// whole `spawn_blocking` `.await`, so the job handle cannot be closed while this runs.
+/// Duplicate a job handle. One implementation for all three duplicate-then-wait sites (the
+/// sync wait, the async wait, and `Job::wait_tree`); it lives here, next to `JobHandle`,
+/// rather than in `job.rs`, because the public wrapper depends on this module and not the
+/// other way round.
+///
+/// Call it as the closure passed to [`JobHandle::with_handle`], never on a handle returned
+/// out of one: the point is that the lock is still held while `DuplicateHandle` reads it.
+pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Error> {
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut dup = HANDLE::default();
+    // SAFETY: `handle` is live for the duration of this call (borrowed from `self.0`, which
+    // outlives this function call); `dup` is an out-parameter DuplicateHandle initializes.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .map_err(io::Error::from)?;
+    Ok(dup)
+}
+
 pub(crate) fn wait_drained_raw(
     job: HANDLE,
     deadline: Option<Option<std::time::Instant>>,
@@ -782,7 +811,24 @@ pub(crate) fn wait_drained_raw(
         for pid in pids.iter().take(budget) {
             // SAFETY: standard Win32 call; the handle is closed below on every path.
             match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, *pid) } {
-                Ok(h) => handles.push(h),
+                // A pid enumerated a moment ago can have exited and had its number reused by
+                // the time it is opened, so membership is re-confirmed against the job rather
+                // than assumed. Waiting on a bystander would either hang the drain (it outlives
+                // the tree) or, if it exits first, report the tree drained while members run.
+                Ok(h) => {
+                    use windows::Win32::System::JobObjects::IsProcessInJob;
+                    let mut in_job = windows::core::BOOL(0);
+                    // SAFETY: both handles are valid for the duration of the call.
+                    let confirmed = unsafe { IsProcessInJob(h, Some(job), &mut in_job) };
+                    if confirmed.is_ok() && in_job.as_bool() {
+                        handles.push(h);
+                    } else {
+                        // SAFETY: opened just above and not stored anywhere.
+                        unsafe {
+                            let _ = CloseHandle(h);
+                        }
+                    }
+                }
                 // ERROR_INVALID_PARAMETER: the pid no longer names a process — it exited in
                 // the race between the enumeration above and this open. That is real
                 // progress (this round's tree is shrinking), not a failure: loop back to
@@ -993,9 +1039,11 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
     if let Err(resume_err) = resume_initial_threads(proc_handle) {
         if let Ok(job) = job_result {
             // Kill via the job first (catches any threads the walk may have missed). The
-            // resume failure is what gets reported; a kill failure on top of it is logged
-            // by `hard_kill` and cannot change the outcome here.
-            let _ = job.hard_kill();
+            // resume failure is what gets reported; a kill failure on top of it cannot change
+            // that outcome, so it is logged here rather than swallowed.
+            if let Err(e) = job.hard_kill() {
+                log::warn!("job kill after a failed resume also failed ({e}); the tree may still be running");
+            }
         }
         return Err(resume_err);
     }

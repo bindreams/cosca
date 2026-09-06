@@ -9,12 +9,10 @@
 //! [`kill_tree`](Job::kill_tree), [`disarm`](Job::disarm), and the drain
 //! ([`wait_tree`](Job::wait_tree) / [`wait_tree_timeout`](Job::wait_tree_timeout)).
 
-use std::io;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::Foundation::CloseHandle;
 
 use crate::containment::windows::{
     assign_to_kill_on_close_job, consumed_job_handle_error, wait_drained_raw, JobHandle,
@@ -117,7 +115,11 @@ impl Job {
         // Duplicated under the lock so a concurrent `kill_tree`/`Drop` cannot close the
         // original between the read and the `DuplicateHandle` call; the wait itself then
         // runs on the duplicate, outside the lock.
-        let Some(dup) = self.0.with_handle(duplicate_job).transpose()? else {
+        let Some(dup) = self
+            .0
+            .with_handle(crate::containment::windows::duplicate_job)
+            .transpose()?
+        else {
             return Err(consumed_job_handle_error());
         };
         let result = wait_drained_raw(dup, deadline, None);
@@ -128,30 +130,6 @@ impl Job {
         }
         result
     }
-}
-
-/// `DuplicateHandle` a live handle into a second, independent reference to the same kernel
-/// object — used so [`Job::wait_tree_deadline`] never holds the original handle value across a
-/// (possibly long) wait.
-/// `pub(crate)`: `JobHandle::wait_drained` needs the same duplicate-then-wait shape, so
-/// there is one implementation rather than two.
-pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, Error> {
-    let mut dup = HANDLE::default();
-    // SAFETY: `handle` is live for the duration of this call (borrowed from `self.0`, which
-    // outlives this function call); `dup` is an out-parameter DuplicateHandle initializes.
-    unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            handle,
-            GetCurrentProcess(),
-            &mut dup,
-            0,
-            false,
-            DUPLICATE_SAME_ACCESS,
-        )
-    }
-    .map_err(io::Error::from)?;
-    Ok(dup)
 }
 
 #[cfg(test)]
