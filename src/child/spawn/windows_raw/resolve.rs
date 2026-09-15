@@ -30,10 +30,18 @@ pub(crate) fn resolve_executable(exe: &Path) -> Result<PathBuf, Error> {
 
 /// Resolve `exe` against an explicit `base_cwd` and `PATH` string.
 ///
-/// An absolute `exe` that is an existing file is returned unchanged. Otherwise
-/// the search visits `base_cwd` first, then each `PATH` directory, testing
-/// `dir/exe` and — only when `exe` carries no extension — `dir/exe.exe`; the
-/// first existing file wins. A miss is [`std::io::ErrorKind::NotFound`].
+/// A name containing a path separator — or a drive prefix such as `C:tool` —
+/// resolves against `base_cwd` with no search at all. Only a true bare name is
+/// searched, and that search visits the `PATH` directories **only, never
+/// `base_cwd`**, testing `dir/exe.exe` before `dir/exe` when `exe` carries no
+/// extension; the first existing file wins. `PATH` elements that are empty or
+/// relative are skipped, and the result is always absolute. A miss is
+/// [`std::io::ErrorKind::NotFound`].
+///
+/// Visiting `base_cwd` first was the previous behaviour, and it was a
+/// binary-planting hazard: `executable("helper")` loaded a `helper.exe` dropped in
+/// whatever directory the process happened to sit in. Reach it explicitly with
+/// `./helper`, which contains a separator.
 ///
 /// Existence is tested with [`Path::is_file`], not [`Path::exists`]: a directory
 /// is never a runnable program, so a same-named directory must not shadow the
