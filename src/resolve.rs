@@ -1,0 +1,165 @@
+//! Which file a `Command` loads.
+//!
+//! One policy for every platform and every spawn path, producing an ABSOLUTE path. That is what
+//! lets each backend skip its own search: `execvp` does not search a name containing a separator,
+//! and `ShellExecuteEx` does not search an absolute `lpFile`.
+//!
+//! Classification is byte-level and parameterised by [`ResolveInput::windows`] rather than using
+//! `std::path`, whose parsing is host-specific — `Path::new("C:tool").prefix()` is `None` off
+//! Windows, so a `Path`-based rule could not be exercised from a POSIX host at all.
+
+use crate::error::Error;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+/// Everything the policy reads. Taken as parameters so the rules are testable without touching
+/// the ambient environment.
+pub(crate) struct ResolveInput<'a> {
+    /// The program as the caller wrote it.
+    pub program: &'a Path,
+    /// The directory the CHILD will run in: `Command::cwd()` when set, else the parent's.
+    pub cwd: &'a Path,
+    /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
+    pub path_var: Option<&'a OsStr>,
+    /// Apply Windows rules: `;` separated `PATH`, `\` a separator, drive prefixes, the `.exe` rule.
+    pub windows: bool,
+}
+
+/// How the program names its file, which decides whether `PATH` is consulted at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// No separator and no drive prefix: the only shape that searches `PATH`.
+    BareName,
+    /// Contains a separator, or carries a drive prefix (`C:tool` means "relative to drive C's
+    /// current directory", so a `PATH` search for it would be a lie).
+    Located,
+}
+
+pub(crate) fn classify(program: &OsStr, windows: bool) -> Shape {
+    let bytes = program.as_encoded_bytes();
+    if bytes.iter().any(|&b| is_sep(b, windows)) {
+        return Shape::Located;
+    }
+    // `C:tool` names a file relative to drive C's own current directory. It has no separator, so
+    // a naive rule calls it bare and searches `PATH` — but joining a directory onto it collapses
+    // straight back to `C:tool` (`PathBuf::push` clears for any prefixed path), so the search is
+    // a lie that lands in a current directory.
+    if windows && has_drive_prefix(bytes) {
+        return Shape::Located;
+    }
+    Shape::BareName
+}
+
+fn is_sep(b: u8, windows: bool) -> bool {
+    b == b'/' || (windows && b == b'\\')
+}
+
+fn has_drive_prefix(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+/// The filenames to try in each candidate directory, in order.
+///
+/// `.exe` comes first so a directory holding both a script `tool` and a working `tool.exe` yields
+/// the one Win32 can load. `PATHEXT` is deliberately not consulted: `CreateProcessW` cannot load a
+/// `.bat`/`.cmd` image, so resolving to one produces a file that cannot be launched.
+fn filename_candidates(name: &OsStr, windows: bool) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(2);
+    if windows && !final_component_has_dot(name, windows) {
+        let mut with_exe = name.to_os_string();
+        with_exe.push(".exe");
+        out.push(with_exe);
+    }
+    out.push(name.to_os_string());
+    out
+}
+
+fn final_component_has_dot(name: &OsStr, windows: bool) -> bool {
+    let bytes = name.as_encoded_bytes();
+    let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
+    bytes[start..].contains(&b'.')
+}
+
+/// Split a `PATH` value on the simulated platform's separator.
+fn split_path_var(var: Option<&OsStr>, windows: bool) -> Vec<PathBuf> {
+    let sep = if windows { b';' } else { b':' };
+    let Some(var) = var else { return Vec::new() };
+    var.as_encoded_bytes()
+        .split(move |&b| b == sep)
+        // SAFETY: the bytes came from `as_encoded_bytes` and are split on an ASCII byte, which
+        // is the documented-safe way to slice an `OsStr`'s encoded form.
+        .map(|part| PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(part) }))
+        .collect()
+}
+
+/// Whether a candidate is a file this platform could actually exec.
+///
+/// On POSIX the execute bit is part of the answer: `execvp` skips a readable-but-non-executable
+/// match and keeps searching (measured), so keying on existence alone stops at a file that would
+/// have been passed over and hands it to exec, turning a working command into `EACCES`.
+/// `faccessat(AT_EACCESS)` asks for the ids that will actually exec, unlike `access`.
+fn is_execable(path: &Path, windows: bool) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if !windows {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: a read-only permission query on a valid NUL-terminated path.
+        return unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 };
+    }
+    let _ = windows;
+    true
+}
+
+pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
+    let name = input.program.as_os_str();
+    let candidates = filename_candidates(name, input.windows);
+
+    // The cwd is absolutised BEFORE joining. A relative one would otherwise be applied twice:
+    // the resolver joins it, and std chdirs the child into it as well, so `./tool` with
+    // `current_dir("sub")` would exec `sub/sub/tool` (measured).
+    let cwd_owned;
+    let cwd: &Path = if input.cwd.is_absolute() {
+        input.cwd
+    } else {
+        cwd_owned = std::env::current_dir().map_err(Error::Io)?.join(input.cwd);
+        &cwd_owned
+    };
+
+    let dirs: Vec<PathBuf> = match classify(name, input.windows) {
+        Shape::Located => vec![cwd.to_path_buf()],
+        // Only absolute elements are searched. An empty element means the current directory, and
+        // a relative one (`.`, `..`, `tools`) resolves against it just as surely — dropping only
+        // the empty ones would leave the hole open. Absoluteness is judged by the host's rules,
+        // which is correct on the platform that will actually spawn.
+        Shape::BareName => split_path_var(input.path_var, input.windows)
+            .into_iter()
+            .filter(|d| d.is_absolute())
+            .collect(),
+    };
+
+    for dir in dirs {
+        for candidate in &candidates {
+            let joined = dir.join(candidate);
+            // A drive-relative name (`C:tool`) survives the join unchanged, because `PathBuf::push`
+            // clears for any prefixed path — so it would resolve through drive C's own current
+            // directory, which cosca does not track. Refusing a non-absolute result fails closed
+            // there and keeps the contract every backend relies on: the answer is always absolute.
+            if joined.is_absolute() && is_execable(&joined, input.windows) {
+                return Ok(joined);
+            }
+        }
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("could not resolve executable: {}", input.program.display()),
+    )))
+}
+
+#[cfg(test)]
+#[path = "resolve_tests.rs"]
+mod resolve_tests;

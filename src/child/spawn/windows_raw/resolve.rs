@@ -1,7 +1,7 @@
 //! Program resolution + Windows environment-block construction for the raw
 //! `CreateProcessW` backend.
 //!
-//! [`resolve_executable`] applies a deliberate cwd+`PATH`+`.exe` rule (base cwd
+//! [`resolve_executable`] delegates to [`crate::resolve`] (`PATH`+`.exe` rule; the base cwd
 //! first, then `PATH` directories; append `.exe` only when the program has no
 //! extension) rather than full `CreateProcessW` search parity — this keeps
 //! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate
@@ -40,31 +40,12 @@ pub(crate) fn resolve_executable(exe: &Path) -> Result<PathBuf, Error> {
 /// executable (which would end the search early and hand `CreateProcessW` an
 /// unlaunchable path with no fallback).
 pub(crate) fn resolve_executable_in(exe: &Path, base_cwd: &Path, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    if exe.is_absolute() && exe.is_file() {
-        return Ok(exe.to_path_buf());
-    }
-
-    let append_exe = exe.extension().is_none();
-    let path_dirs = path.into_iter().flat_map(std::env::split_paths);
-    let dirs = std::iter::once(base_cwd.to_path_buf()).chain(path_dirs);
-
-    for dir in dirs {
-        let candidate = dir.join(exe);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        if append_exe {
-            let with_exe = candidate.with_extension("exe");
-            if with_exe.is_file() {
-                return Ok(with_exe);
-            }
-        }
-    }
-
-    Err(Error::Io(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("could not resolve executable: {}", exe.display()),
-    )))
+    crate::resolve::resolve(crate::resolve::ResolveInput {
+        program: exe,
+        cwd: base_cwd,
+        path_var: path,
+        windows: true,
+    })
 }
 
 // Environment block =====
