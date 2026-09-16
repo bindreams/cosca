@@ -1,9 +1,9 @@
 //! Program resolution + Windows environment-block construction for the raw
 //! `CreateProcessW` backend.
 //!
-//! [`resolve_executable`] delegates to [`crate::resolve`] (`PATH`+`.exe` rule; the base cwd
-//! first, then `PATH` directories; append `.exe` only when the program has no
-//! extension) rather than full `CreateProcessW` search parity — this keeps
+//! [`resolve_executable`] delegates to [`crate::resolve`] (a bare name is looked up in
+//! `PATH` only, never the current directory; append `.exe` only when the program has
+//! no extension) rather than full `CreateProcessW` search parity — this keeps
 //! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate
 //! concern. [`build_env_block`] produces the sorted, wide, double-NUL block
 //! `CreateProcessW` expects from a recorded [`EnvOp`] sequence.
@@ -30,13 +30,17 @@ pub(crate) fn resolve_executable(exe: &Path) -> Result<PathBuf, Error> {
 
 /// Resolve `exe` against an explicit `base_cwd` and `PATH` string.
 ///
-/// A name containing a path separator — or a drive prefix such as `C:tool` —
-/// resolves against `base_cwd` with no search at all. Only a true bare name is
-/// searched, and that search visits the `PATH` directories **only, never
-/// `base_cwd`**, testing `dir/exe.exe` before `dir/exe` when `exe` carries no
-/// extension; the first existing file wins. `PATH` elements that are empty or
-/// relative are skipped, and the result is always absolute. A miss is
-/// [`std::io::ErrorKind::NotFound`].
+/// A name containing a path separator resolves against `base_cwd` with no search at
+/// all. Only a true bare name is searched, and that search visits the `PATH`
+/// directories **only, never `base_cwd`**, testing `dir/exe.exe` before `dir/exe`
+/// when `exe` carries no extension; the first existing file wins. `PATH` elements
+/// that are empty or relative are skipped, and the result is always absolute. A miss
+/// is [`std::io::ErrorKind::NotFound`].
+///
+/// A drive-relative name such as `C:tool` always fails closed with `NotFound`, and is
+/// never loaded from `base_cwd`: joining a directory onto it collapses straight back
+/// to `C:tool` (`PathBuf::push` clears for any prefixed path), so resolving it would
+/// need drive C's own current directory, which cosca does not track.
 ///
 /// Visiting `base_cwd` first was the previous behaviour, and it was a
 /// binary-planting hazard: `executable("helper")` loaded a `helper.exe` dropped in

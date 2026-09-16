@@ -124,13 +124,18 @@ impl Command {
     /// so `argv[0]` is preserved (it no longer degrades to the executable path), and
     /// combining `executable` with [`commandline`](Self::commandline) is supported.
     /// A bare or relative `executable` is resolved with a deliberate rule (not full
-    /// `CreateProcessW` search parity): a name containing a path separator or a
-    /// drive prefix resolves against the working directory with no search, while a
-    /// true bare name is looked up in `PATH` **only — never the current directory**,
-    /// appending `.exe` when the name has no extension. Searching the current
-    /// directory first was the previous behaviour and was a binary-planting hazard:
-    /// `executable("helper")` would load a `helper.exe` dropped in whatever directory
-    /// the process happened to sit in. Write `./helper` to reach it explicitly.
+    /// `CreateProcessW` search parity): a name containing a path separator resolves
+    /// against the working directory with no search, while a true bare name is looked
+    /// up in `PATH` **only — never the current directory**, appending `.exe` when the
+    /// name has no extension. Searching the current directory first was the previous
+    /// behaviour and was a binary-planting hazard: `executable("helper")` would load a
+    /// `helper.exe` dropped in whatever directory the process happened to sit in.
+    /// Write `./helper` to reach it explicitly.
+    ///
+    /// A drive-relative name such as `C:tool` is **refused** with
+    /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
+    /// resolving it would need drive C's own current directory, which cosca does not
+    /// track, so it fails closed instead of guessing.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(path.into());
         self
