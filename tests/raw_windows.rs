@@ -299,15 +299,25 @@ fn uncontained_raw_child_has_no_containment() {
 /// helper process — a fresh, isolated process with its own cwd and no lock contention with this
 /// one — does the chdir and the vulnerable/fixed spawn itself, and reports the outcome on stdout.
 ///
-/// With the bug, the helper's inner spawn would find and load the planted `cosca_testbin.exe`
-/// from its own current directory — the CWE-426/427 binary-planting hole — and report "loaded".
-/// Fixed, the bare argv[0] is resolved through the crate's own PATH-only resolver
-/// (`lpApplicationName` is never NULL, and a bare name's resolution never consults any cwd), so
-/// the planted copy is never loaded and the helper reports "notfound".
+/// With the bug, the helper's inner spawn would find and load the planted decoy from its own
+/// current directory — the CWE-426/427 binary-planting hole — and report "loaded". Fixed, the
+/// bare argv[0] is resolved through the crate's own PATH-only resolver (`lpApplicationName` is
+/// never NULL, and a bare name's resolution never consults any cwd), so the planted copy is never
+/// loaded and the helper reports "notfound".
+///
+/// The decoy is planted under a FABRICATED name, never the literal "cosca_testbin": on a real
+/// build runner that literal name can legitimately resolve via the ACTUAL `PATH` (e.g. Cargo
+/// prepends a deps search directory on Windows for DLL resolution, and that directory can itself
+/// hold a same-named copy of this very binary) — measured on CI, where the fixed backend's
+/// legitimate PATH search silently found a real `cosca_testbin` and made the (undiscriminating)
+/// first version of this test report "loaded" for a reason having nothing to do with the bug.
+/// A name that exists nowhere but the planted decoy removes that ambiguity: any successful
+/// resolution of it can only have come from the vulnerable cwd search.
 #[test]
 fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
+    let decoy_program = "cosca_testbin_b2_cwd_decoy";
+    std::fs::copy(common::testbin(), dir.path().join(format!("{decoy_program}.exe"))).unwrap();
 
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -315,6 +325,7 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
             "cosca_testbin",
             "report-bare-argv0-cwd-spawn",
             dir.path().to_str().expect("tempdir path is valid UTF-8"),
+            decoy_program,
         ])
         .stdout(cosca::Stdio::pipe())
         .unwrap();

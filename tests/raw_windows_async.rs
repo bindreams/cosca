@@ -114,14 +114,21 @@ async fn async_contained_raw_child_is_in_our_job() {
 /// spawn itself (exercising the async raw backend specifically), and reports the outcome on
 /// stdout.
 ///
-/// With the bug, the helper's inner spawn would find and load the planted `cosca_testbin.exe`
-/// from its own current directory (CWE-426/427) and report "loaded". Fixed, the bare argv[0]
-/// resolves through the crate's own PATH-only resolver (never any cwd for a bare name), so the
-/// planted copy is never loaded and the helper reports "notfound".
+/// With the bug, the helper's inner spawn would find and load the planted decoy from its own
+/// current directory (CWE-426/427) and report "loaded". Fixed, the bare argv[0] resolves through
+/// the crate's own PATH-only resolver (never any cwd for a bare name), so the planted copy is
+/// never loaded and the helper reports "notfound".
+///
+/// The decoy is planted under a FABRICATED name, never the literal "cosca_testbin" — see the sync
+/// twin's doc for why: that literal name can legitimately resolve via the runner's ACTUAL `PATH`
+/// (measured on CI, where it made an earlier, undiscriminating version of this test report
+/// "loaded" for a reason unrelated to the bug). A name that exists nowhere but the planted decoy
+/// means any successful resolution of it can only have come from the vulnerable cwd search.
 #[tokio::test]
 async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
+    let decoy_program = "cosca_testbin_b2_cwd_decoy";
+    std::fs::copy(common::testbin(), dir.path().join(format!("{decoy_program}.exe"))).unwrap();
 
     let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
@@ -129,6 +136,7 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
             "cosca_testbin",
             "report-bare-argv0-cwd-spawn-async",
             dir.path().to_str().expect("tempdir path is valid UTF-8"),
+            decoy_program,
         ])
         .stdout(cosca::Stdio::pipe())
         .unwrap();

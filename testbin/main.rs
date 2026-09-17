@@ -765,17 +765,25 @@ fn main() {
             // documented order, the CALLING process's own cwd (this process, right here), never
             // the child's `lpCurrentDirectory`.
             //
+            // argv[3] is the BARE program name to attempt — the caller's decoy filename stem.
+            // Deliberately NOT the literal "cosca_testbin": that name can legitimately resolve
+            // via the REAL `PATH` on a build runner (e.g. Cargo prepends a deps search directory
+            // on Windows for DLL resolution, which can itself contain a same-named copy of this
+            // very binary), so a `spawn()` success would prove nothing about the cwd-planting bug
+            // either way — it could just as well be an unrelated, legitimate PATH hit. The caller
+            // instead plants the decoy under a fabricated name that cannot exist anywhere else,
+            // so any successful resolution of it can only have come from the vulnerable search.
+            //
             // Reports on stdout: "loaded" if the spawn found and ran a program from our cwd (the
             // pre-B2-fix vulnerability — CWE-426/427), "notfound" if it failed to find any
             // program at all (the fixed, correct behavior), or "othererr=<display>" for anything
             // else, so a caller sees the real cause instead of a silent miscount.
             let dir = &args[2];
+            let program = args[3].as_str();
             std::env::set_current_dir(dir).expect("chdir to the decoy directory");
 
             let mut c = cosca::Command::new();
-            c.args(["cosca_testbin", "exit", "0"])
-                .fd(3, cosca::Stdio::pipe_out())
-                .unwrap();
+            c.args([program, "exit", "0"]).fd(3, cosca::Stdio::pipe_out()).unwrap();
             match c.spawn() {
                 Ok(child) => {
                     let _ = child.wait();
@@ -791,12 +799,16 @@ fn main() {
         }
         #[cfg(all(windows, feature = "tokio"))]
         "report-bare-argv0-cwd-spawn-async" => {
-            // Async twin of `report-bare-argv0-cwd-spawn` — see there for the full rationale.
+            // Async twin of `report-bare-argv0-cwd-spawn` — see there for the full rationale,
+            // including why argv[3] (the bare program name to attempt) must be a fabricated
+            // decoy-only name rather than the literal "cosca_testbin" (which can legitimately
+            // resolve via the real `PATH` on a build runner, proving nothing either way).
             // Exercises the ASYNC raw backend (`src/tokio/spawn/windows_raw.rs`) specifically,
             // since it derives its own `program_token` fallback independently of the sync
             // backend. `Command::spawn` needs an IO-enabled Tokio runtime (its own docs), so this
             // process builds one just for this probe.
             let dir = &args[2];
+            let program = args[3].clone();
             std::env::set_current_dir(dir).expect("chdir to the decoy directory");
 
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -805,7 +817,7 @@ fn main() {
                 .expect("build a current-thread tokio runtime for the async spawn probe");
             rt.block_on(async {
                 let mut c = cosca::tokio::Command::new();
-                c.args(["cosca_testbin", "exit", "0"])
+                c.args([program.as_str(), "exit", "0"])
                     .fd(3, cosca::Stdio::pipe_out())
                     .unwrap();
                 match c.spawn() {
