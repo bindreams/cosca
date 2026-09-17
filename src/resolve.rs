@@ -1,8 +1,15 @@
-//! Which file a `Command` loads.
+//! Which file a `Command` loads — on the spawn paths that currently consult it.
 //!
-//! One policy for every platform and every spawn path, producing an ABSOLUTE path. That is what
-//! lets each backend skip its own search: `execvp` does not search a name containing a separator,
-//! and `ShellExecuteEx` does not search an absolute `lpFile`.
+//! **Coverage today: only the Windows raw `CreateProcessW` backend (sync and its tokio mirror),
+//! reached when `Command::executable_path()` is set or an fd >= 3 is mapped.** Every other spawn
+//! path resolves the program name itself, ignorant of this module entirely: POSIX spawning still
+//! calls `execvp`/`posix_spawn`'s own PATH search directly, and the Windows elevated
+//! (`ShellExecuteEx`) path still passes its `lpFile` through unresolved. `src/lib.rs`'s
+//! `#[cfg_attr(not(windows), allow(dead_code))]` on this module tracks exactly that: the `allow`
+//! goes away once the POSIX and default spawn paths route through it too.
+//! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
+//! up — `execvp` does not search a name containing a separator, and `ShellExecuteEx` does not
+//! search an absolute `lpFile` — but that wiring has not happened yet for either.
 //!
 //! Classification is byte-level and parameterised by [`ResolveInput::windows`] rather than using
 //! `std::path`, whose parsing is host-specific — `Path::new("C:tool").prefix()` is `None` off
@@ -61,8 +68,12 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
 /// The filenames to try in each candidate directory, in order.
 ///
 /// `.exe` comes first so a directory holding both a script `tool` and a working `tool.exe` yields
-/// the one Win32 can load. `PATHEXT` is deliberately not consulted: `CreateProcessW` cannot load a
-/// `.bat`/`.cmd` image, so resolving to one produces a file that cannot be launched.
+/// the one Win32 can load. `PATHEXT` is deliberately not consulted: `CreateProcessW` itself DOES
+/// run a `.bat`/`.cmd` image (via a hidden `cmd.exe` relaunch — see CVE-2024-24576/"BatBadBut"),
+/// which is exactly the hazard this crate refuses outright (see `reject_batch_program` in the
+/// Windows raw backend, and the Windows std backend's matching check). Resolving a bare name to a
+/// batch file here would just hand that refusal a target to reject; skipping `.bat`/`.cmd`
+/// candidates keeps that a separate, single concern instead of duplicating it into resolution.
 fn filename_candidates(name: &OsStr, windows: bool) -> Vec<std::ffi::OsString> {
     let mut out = Vec::with_capacity(2);
     if windows && !final_component_has_dot(name, windows) {
@@ -173,23 +184,20 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
 
     let dirs: Vec<PathBuf> = match classify(name, input.windows) {
         Shape::Located => vec![cwd.to_path_buf()],
-        // Only absolute elements are searched. An empty element means the current directory, and
-        // a relative one (`.`, `..`, `tools`) resolves against it just as surely — dropping only
-        // the empty ones would leave the hole open. Absoluteness is judged by the host's rules,
-        // which is correct on the platform that will actually spawn.
-        Shape::BareName => split_path_var(input.path_var, input.windows)
-            .into_iter()
-            .filter(|d| d.is_absolute())
-            .collect(),
+        Shape::BareName => split_path_var(input.path_var, input.windows),
     };
 
     for dir in dirs {
         for candidate in &candidates {
             let joined = dir.join(candidate);
-            // A drive-relative name (`C:tool`) survives the join unchanged, because `PathBuf::push`
-            // clears for any prefixed path — so it would resolve through drive C's own current
-            // directory, which cosca does not track. Refusing a non-absolute result fails closed
-            // there and keeps the contract every backend relies on: the answer is always absolute.
+            // Only an absolute `joined` is accepted — this is what actually keeps a relative or
+            // empty `PATH` element from resolving through the current directory (an empty element
+            // means "the current directory", and a relative one such as `.`/`tools` resolves
+            // against it just as surely). A drive-relative name (`C:tool`) survives the join
+            // unchanged too, because `PathBuf::push` clears for any prefixed path — so it would
+            // otherwise resolve through drive C's own current directory, which cosca does not
+            // track. This single check is also what keeps the contract every backend relies on:
+            // the answer is always absolute.
             if joined.is_absolute() && is_execable(&joined, input.windows) {
                 return Ok(joined);
             }
