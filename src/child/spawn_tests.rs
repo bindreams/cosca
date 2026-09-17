@@ -144,6 +144,36 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     assert!(super::routes_to_raw_backend(&both));
 }
 
+/// The batch gate must not be defeated by a name Windows still opens AS a batch file.
+///
+/// NTFS strips a trailing space or dot when resolving a path, and a data-stream suffix names the
+/// same file — so `x.bat `, `x.bat.` and `x.bat:s` all reach `cmd.exe`, while `Path::extension()`
+/// reports `bat ` / `""` / `bat:s` and a plain equality check misses every one.
+///
+/// This is inert on the raw `CreateProcessW` backend, which cannot load a batch image at all. It
+/// goes LIVE the moment `ShellExecuteEx` is a gated path, because that launches batch files
+/// through `cmd.exe` — which is the CVE-2024-24576 vector the gate exists to close.
+///
+/// Host-testable: `reject_batch_path` is pure and not `cfg`-gated, and `Path::extension()` splits
+/// these identically on every platform.
+#[test]
+fn reject_batch_path_is_not_defeated_by_a_trailing_space_dot_or_stream() {
+    use std::path::Path;
+    for probe in ["x.bat ", "x.bat.", "x.bat:s", "x.cmd ", "x.cmd.", "x.CMD:s", "x.bat. "] {
+        assert!(
+            super::reject_batch_path(Path::new(probe)).is_err(),
+            "{probe:?} must be refused — NTFS resolves it to the batch file"
+        );
+    }
+    // The plain forms keep working...
+    assert!(super::reject_batch_path(Path::new("x.bat")).is_err());
+    assert!(super::reject_batch_path(Path::new("x.CMD")).is_err());
+    // ...and ordinary programs stay allowed, including a stem that merely looks like one.
+    assert!(super::reject_batch_path(Path::new("x.exe")).is_ok());
+    assert!(super::reject_batch_path(Path::new("batch")).is_ok());
+    assert!(super::reject_batch_path(Path::new("x.batch")).is_ok());
+}
+
 /// A refused spawn must not have mutated this process first. `clear_std_handle_inheritance` is a
 /// real, process-global, un-undone `SetHandleInformation` on our own std handles, so running it
 /// before the refusal would leave a disposition-less side effect behind.

@@ -472,7 +472,17 @@ fn reject_batch_script(std_cmd: &std::process::Command) -> Result<(), Error> {
 /// (`reject_batch_script`) and the raw backend (`windows_raw::reject_batch_program`): cmd.exe
 /// batch escaping is a distinct, unimplemented vector (CVE-2024-24576 / BatBadBut).
 pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
-    if let Some(ext) = prog.extension() {
+    // Normalise the way NTFS resolves before looking at the extension, or the gate is bypassed by
+    // a name that still reaches cmd.exe: `x.bat:s` names the same file via a data stream, and
+    // `x.bat ` / `x.bat.` resolve to it because NTFS strips trailing spaces and dots. A plain
+    // `extension()` sees `bat:s`, `bat ` and `""` respectively and misses all three.
+    //
+    // Order matters: strip the stream suffix FIRST, then trim — trimming first would leave the
+    // `:s` in place and `x.bat:s ` would still slip through.
+    let name = prog.file_name().unwrap_or_default().to_string_lossy();
+    let name = name.split(':').next().unwrap_or_default();
+    let name = name.trim_end_matches([' ', '.']);
+    if let Some(ext) = std::path::Path::new(name).extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {
             return Err(Error::Unsupported {
