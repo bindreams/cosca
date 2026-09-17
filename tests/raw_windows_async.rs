@@ -100,35 +100,41 @@ async fn async_contained_raw_child_is_in_our_job() {
 /// Async twin of sync `fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd`: a
 /// `Command` with no `.executable()` still routes to the async raw backend purely via fd >= 3, so
 /// `image` used to be `None` and `lpApplicationName` NULL. `CreateProcessW`'s own search for a
-/// NULL `lpApplicationName` visits, at step 2 of its documented order, the CALLING PROCESS's
-/// current directory — THIS test binary's real process cwd — never the child's
-/// `lpCurrentDirectory`/`Command::cwd()`. So the decoy is planted there, via a process-cwd
-/// mutation guarded by `cosca::test_spawn_lock()` + `RestoreCwd` (mirrors the sync test and
-/// `src/resolve_tests.rs`'s cwd-mutating unit test): a decoy dropped merely in the child's own cwd
-/// sits outside that search path and cannot tell the pre-fix and post-fix code apart.
+/// NULL `lpApplicationName` visits, at step 2 of its documented order, the CALLING process's
+/// current directory — never the child's `lpCurrentDirectory`/`Command::cwd()`.
 ///
-/// With the bug, `CreateProcessW` would find and load the planted `cosca_testbin.exe` from the
-/// process's own current directory (CWE-426/427). Fixed, the bare argv[0] resolves through the
-/// crate's own PATH-only resolver (never any cwd for a bare name), so the planted copy is never
-/// loaded and the spawn fails closed with `NotFound`.
+/// That calling process cannot be THIS test process: mutating this process's own cwd under
+/// `cosca::test_spawn_lock()` while also calling `cosca::tokio::Command::spawn()` would
+/// self-deadlock, because that spawn takes the exact same non-reentrant mutex internally (see
+/// `tests/common/mod.rs`'s `output_locked`/`status_locked` docs and `src/test_child.rs`). Instead,
+/// this test plants the decoy in a tempdir and spawns the `cosca_testbin` helper's
+/// `report-bare-argv0-cwd-spawn-async` mode via one ordinary, single-level
+/// `cosca::tokio::Command::spawn()` call, passing the decoy directory as an argument. That helper
+/// — a fresh, isolated process with its own cwd — does the chdir and the vulnerable/fixed ASYNC
+/// spawn itself (exercising the async raw backend specifically), and reports the outcome on
+/// stdout.
+///
+/// With the bug, the helper's inner spawn would find and load the planted `cosca_testbin.exe`
+/// from its own current directory (CWE-426/427) and report "loaded". Fixed, the bare argv[0]
+/// resolves through the crate's own PATH-only resolver (never any cwd for a bare name), so the
+/// planted copy is never loaded and the helper reports "notfound".
 #[tokio::test]
 async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
 
-    let _guard = cosca::test_spawn_lock();
-    let _restore = common::RestoreCwd(std::env::current_dir().unwrap());
-    std::env::set_current_dir(dir.path()).unwrap();
-
     let mut c = cosca::tokio::Command::new();
-    // No `.executable()`, no `.current_dir()`: the search-relevant cwd is exactly this process's
-    // own (just mutated) cwd — the directory `CreateProcessW`'s own NULL-search would visit.
-    c.args(["cosca_testbin", "exit", "0"])
-        .fd(3, cosca::Stdio::pipe_out())
+    c.executable(common::testbin())
+        .args([
+            "cosca_testbin",
+            "report-bare-argv0-cwd-spawn-async",
+            dir.path().to_str().expect("tempdir path is valid UTF-8"),
+        ])
+        .stdout(cosca::Stdio::pipe())
         .unwrap();
-    let e = c.spawn().unwrap_err();
-    assert!(
-        matches!(&e, cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
-        "{e:?}"
-    );
+    let mut child = c.spawn().expect("spawn the probe helper");
+    let mut s = String::new();
+    child.stdout().unwrap().read_to_string(&mut s).await.unwrap();
+    child.wait().await.unwrap();
+    assert_eq!(s.trim(), "notfound", "helper report: {s}");
 }

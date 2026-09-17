@@ -168,27 +168,6 @@ pub fn read_report_line(sock: &TcpStream) -> String {
     line
 }
 
-/// Restores the process's current directory on drop — including while unwinding from a panic —
-/// so a test that must mutate the process-global cwd (e.g. to plant a decoy where
-/// `CreateProcessW`'s own NULL-`lpApplicationName` search would look: the CALLING process's
-/// current directory, step 2 of its documented search order — never the child's
-/// `lpCurrentDirectory`) can never leave it corrupted for the rest of the test binary. A private
-/// twin of `src/resolve_tests.rs`'s `RestoreCwd`: that one is `mod`-private to the crate's unit
-/// tests, and this crate compiles each `tests/*.rs` file as its own separate binary, so it cannot
-/// be named from here.
-///
-/// Pair with holding `cosca::test_spawn_lock()` for the guard's whole lifetime, declared BEFORE
-/// this guard so it drops AFTER — cwd is process-global, so a bare `set_current_dir` races every
-/// concurrent spawn and every other cwd-sensitive test.
-#[cfg(windows)]
-pub struct RestoreCwd(pub std::path::PathBuf);
-#[cfg(windows)]
-impl Drop for RestoreCwd {
-    fn drop(&mut self) {
-        std::env::set_current_dir(&self.0).expect("restore the process cwd after a cwd-mutating test");
-    }
-}
-
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
