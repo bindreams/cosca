@@ -11,11 +11,13 @@ fn resolve_absolute_existing_is_returned_as_is() {
 fn resolve_bare_name_is_not_taken_from_base_cwd() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_shadow.exe")).unwrap();
-    // INVERTED deliberately: a bare name searches PATH only. Resolving it from the current
-    // directory is the binary-planting hazard this resolver exists to avoid, so a matching file
-    // there with nothing on PATH must NOT resolve.
+    // INVERTED deliberately: a bare name searches system directories and then PATH, never the
+    // current directory. Resolving it from the current directory is the binary-planting hazard
+    // this resolver exists to avoid, so a matching file there with nothing in system_dirs or on
+    // PATH must NOT resolve. `system_dirs` is empty here — this test is about base_cwd, not
+    // system-directory precedence, which has its own tests in `crate::resolve_tests`.
     // Explicit base dir — no process-global SetCurrentDirectory, so parallel tests can't race.
-    let got = resolve_executable_in(std::path::Path::new("sp_shadow"), dir.path(), None);
+    let got = resolve_executable_in(std::path::Path::new("sp_shadow"), dir.path(), &[], None);
     assert!(got.is_err(), "{got:?}");
 }
 #[test]
@@ -196,6 +198,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
     let got = resolve_executable_in(
         std::path::Path::new("sp_dirtool"),
         base.path(),
+        &[],
         Some(joined.as_os_str()),
     )
     .unwrap();
@@ -205,7 +208,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
 fn resolve_absolute_directory_is_not_returned() {
     let dir = tempfile::tempdir().unwrap();
     // An absolute path naming an existing *directory* is not a runnable program.
-    let got = resolve_executable_in(dir.path(), std::path::Path::new("."), None);
+    let got = resolve_executable_in(dir.path(), std::path::Path::new("."), &[], None);
     assert!(got.is_err(), "{got:?}");
 }
 #[test]
@@ -217,10 +220,12 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
     std::fs::copy(&me, &base_copy).unwrap();
     std::fs::copy(&me, other.path().join("sp_pref.exe")).unwrap();
     // INVERTED deliberately: base_cwd is no longer searched for a bare name, so the PATH copy
-    // wins even though an identically named file sits in the current directory.
+    // wins even though an identically named file sits in the current directory. `system_dirs` is
+    // empty here — this test is about base_cwd vs PATH, not system-directory precedence.
     let got = resolve_executable_in(
         std::path::Path::new("sp_pref"),
         base.path(),
+        &[],
         Some(other.path().as_os_str()),
     )
     .unwrap();
@@ -237,6 +242,44 @@ fn clear_only_yields_empty_double_nul_block() {
         .unwrap();
     assert_eq!(b, vec![0u16, 0u16]);
 }
+// ── FIX: real Windows system directories, end to end (merge blocker) ────────────────
+//
+// The core ordering policy is pinned host-independently in `crate::resolve_tests` (it takes
+// `system_dirs` as fabricated `PathBuf`s, by design, so it can run without Windows at all). These
+// two tests instead exercise the REAL `GetSystemDirectoryW`/`GetWindowsDirectoryW`/`current_exe`
+// wiring in `windows_system_dirs` — the one part of this fix a cross-compile cannot validate,
+// because `cargo xwin check`/`clippy` only prove the code TYPE-CHECKS for Windows, never that it
+// runs correctly there. Only a real Windows test runner can catch a buffer-sizing bug in
+// `wide_dir_buffer`, a wrong Win32 return-value convention, or `System32` not actually being
+// where this crate assumes it is.
+#[test]
+fn windows_system_dirs_are_real_existing_directories() {
+    let dirs = windows_system_dirs();
+    // App dir, System32, and the Windows directory should all resolve under `cargo test`; assert
+    // loosely (`>= 2`) so a single unrelated `current_exe()` hiccup doesn't fail this test for a
+    // reason unrelated to the Win32 calls this test exists to check.
+    assert!(dirs.len() >= 2, "{dirs:?}");
+    for dir in &dirs {
+        assert!(dir.is_dir(), "{dir:?} is not a real, existing directory");
+    }
+    let system32 = dirs
+        .iter()
+        .find(|d| d.file_name().is_some_and(|n| n.eq_ignore_ascii_case("system32")));
+    assert!(system32.is_some(), "System32 missing from {dirs:?}");
+}
+
+#[test]
+fn resolve_finds_a_real_system32_binary_through_system_dirs() {
+    // `notepad.exe` ships in `System32` on every supported Windows version and is not normally on
+    // a dev machine's `PATH`, so successfully resolving the BARE name "notepad" with an empty
+    // `PATH` can only have come from `system_dirs` — proving the real wiring end to end, not just
+    // that `windows_system_dirs()` returns plausible-looking paths.
+    let dirs = windows_system_dirs();
+    let cwd = tempfile::tempdir().unwrap();
+    let got = resolve_executable_in(std::path::Path::new("notepad"), cwd.path(), &dirs, None).unwrap();
+    assert!(got.to_string_lossy().to_lowercase().contains("system32"), "{got:?}");
+}
+
 #[test]
 fn embedded_nul_in_key_is_rejected_as_invalid_input() {
     let e = build_env_block_from(&[], &[EnvOp::Set(OsString::from("a\u{0}b"), "1".into())]).unwrap_err();

@@ -14,6 +14,11 @@
 //! Classification is byte-level and parameterised by [`ResolveInput::windows`] rather than using
 //! `std::path`, whose parsing is host-specific — `Path::new("C:tool").prefix()` is `None` off
 //! Windows, so a `Path`-based rule could not be exercised from a POSIX host at all.
+//!
+//! A bare name is resolved from [`ResolveInput::system_dirs`] (Windows only) and then `PATH` —
+//! **never** the current directory. `system_dirs` is likewise taken as a parameter rather than
+//! queried from the OS here, for the same host-independence reason; see its doc for what it
+//! contains and why it precedes `PATH`.
 
 use crate::error::Error;
 use std::ffi::OsStr;
@@ -26,16 +31,35 @@ pub(crate) struct ResolveInput<'a> {
     pub program: &'a Path,
     /// The directory the CHILD will run in: `Command::cwd()` when set, else the parent's.
     pub cwd: &'a Path,
+    /// Directories searched for a bare name BEFORE `PATH`, in order. Ignored entirely when
+    /// `windows` is `false` — POSIX has no analogous search order to preserve.
+    ///
+    /// On Windows this reproduces `CreateProcessW`'s documented NULL-`lpApplicationName` search
+    /// order — app directory, then the System32 directory, then the Windows directory — MINUS the
+    /// parent's current directory, which this crate refuses to search at all (see `cwd`'s own
+    /// doc and the module doc above). That framing is what makes prepending these directories
+    /// provably monotonic rather than just "probably fine": the old, unpatched order was app dir
+    /// -> cwd -> System32 -> Windows dir -> `PATH`; removing the cwd step is a strict narrowing,
+    /// but if this crate ALSO silently dropped the system-directory precedence over `PATH` — which
+    /// is exactly what happens if `system_dirs` is left empty for a route that has no
+    /// `executable()` set — that would be a strict WIDENING on that route: a user-writable
+    /// directory placed early on `PATH` (a dev toolchain install, an `%LOCALAPPDATA%\...\WindowsApps`
+    /// shim) would then shadow e.g. `System32\find.exe`, a new way to load the wrong binary that
+    /// the pre-patch code never had. The caller passes these in (rather than this module calling
+    /// `GetSystemDirectoryW`/`GetWindowsDirectoryW`/`current_exe` itself) so the rule stays
+    /// testable from a POSIX host, exactly like `windows` below.
+    pub system_dirs: &'a [PathBuf],
     /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
     pub path_var: Option<&'a OsStr>,
     /// Apply Windows rules: `;` separated `PATH`, `\` a separator, drive prefixes, the `.exe` rule.
     pub windows: bool,
 }
 
-/// How the program names its file, which decides whether `PATH` is consulted at all.
+/// How the program names its file, which decides whether `PATH` (and, on Windows,
+/// `system_dirs`) is consulted at all.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Shape {
-    /// No separator and no drive prefix: the only shape that searches `PATH`.
+    /// No separator and no drive prefix: the only shape that searches `system_dirs` and `PATH`.
     BareName,
     /// Contains a separator, or carries a drive prefix (`C:tool` means "relative to drive C's
     /// current directory", so a `PATH` search for it would be a lie).
@@ -184,7 +208,21 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
 
     let dirs: Vec<PathBuf> = match classify(name, input.windows) {
         Shape::Located => vec![cwd.to_path_buf()],
-        Shape::BareName => split_path_var(input.path_var, input.windows),
+        // System directories precede `PATH` — never the cwd, which is deliberately absent from
+        // this list; see `ResolveInput::system_dirs`'s doc for why that ordering is what keeps
+        // this change a strict narrowing of the pre-patch `CreateProcessW` search rather than
+        // trading one hazard for another. Ignored outright off Windows: `system_dirs` is always
+        // empty there in practice, but the `input.windows` guard makes that a hard rule rather
+        // than a convention a future POSIX caller could violate by accident.
+        Shape::BareName => {
+            let mut dirs = if input.windows {
+                input.system_dirs.to_vec()
+            } else {
+                Vec::new()
+            };
+            dirs.extend(split_path_var(input.path_var, input.windows));
+            dirs
+        }
     };
 
     for dir in dirs {

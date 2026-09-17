@@ -29,9 +29,27 @@ fn go(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::Path
     resolve(ResolveInput {
         program: Path::new(program),
         cwd,
+        system_dirs: &[],
         path_var: path,
         windows: HOST_WINDOWS,
     })
+}
+
+/// Join directories into a `PATH` string using the GIVEN platform's separator, independent of the
+/// host — unlike [`path_var`], which uses [`std::env::join_paths`] and therefore only agrees with
+/// a `windows` flag that matches the real host (see this file's `HOST_WINDOWS` doc). The
+/// system-directory tests below deliberately force `windows: true`/`false` regardless of host —
+/// that IS the point (system directories are a Windows-only policy, exercised from any host per
+/// this module's own design) — so they need a `PATH` string built for the SIMULATED platform, not
+/// the host's.
+fn path_var_for(dirs: &[&Path], windows: bool) -> OsString {
+    let sep = if windows { ";" } else { ":" };
+    OsString::from(
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(sep),
+    )
 }
 
 // ── pure logic: safe to simulate either platform, since nothing touches the filesystem ──
@@ -300,4 +318,134 @@ fn a_drive_relative_name_fails_closed() {
     let cwd = tempfile::tempdir().unwrap();
     // Resolving it correctly needs drive C's own current directory, which cosca does not track.
     assert!(go("C:tool", cwd.path(), None).is_err());
+}
+
+// ── FIX: Windows system directories precede PATH for a bare name (merge blocker) ────────
+//
+// The maintainer's rule for landing a stacked PR one squashed commit at a time is that no commit
+// may make any route WORSE than it was on `main`, even while a LATER commit narrows a different
+// vulnerability on that same route. Before this crate resolved anything, a `Command` routed to the
+// raw backend purely by `fd >= 3` (no `executable()` set) passed a NULL `lpApplicationName`, so
+// `CreateProcessW` ran its OWN documented search order: app dir -> parent cwd -> System32 ->
+// Windows dir -> PATH. This crate's fix to stop searching the parent cwd (a binary-planting
+// hazard: a fd-mapped decoy planted in a tempdir cwd must not be picked up — see
+// `bare_name_is_not_resolved_from_the_current_directory` above) is a strict narrowing of that
+// order. But the NAIVE way to implement "stop searching the cwd" is "search PATH only" — which
+// ALSO drops system-directory precedence, a change nobody asked for and a strict WIDENING on this
+// route: a user-writable directory placed early on PATH (a dev toolchain install, an
+// `%LOCALAPPDATA%\...\WindowsApps` shim) would then shadow e.g. `System32\find.exe`, a new way to
+// get the wrong binary that did not exist even in the pre-patch code. These four tests exercise
+// `ResolveInput::system_dirs` directly with `windows` forced explicitly true/false — never
+// `HOST_WINDOWS` — because the policy under test is Windows-only by definition and this module is
+// deliberately built to be exercised from any host; forcing the flag (rather than relying on the
+// host actually being Windows) is what makes these tests run in ordinary CI, not just the Windows
+// runner.
+
+#[test]
+fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
+    // THE regression gate. If system-directory precedence over PATH is ever silently dropped
+    // again (e.g. by a future edit that forgets to prepend `system_dirs` before `split_path_var`,
+    // or that gates it on the wrong condition), this test starts finding the PATH decoy instead of
+    // the system-dir file, and fails. That is the entire point of this test's existence: pin the
+    // ordering, not just that resolution succeeds.
+    let cwd = tempfile::tempdir().unwrap();
+    let sysdir = tempfile::tempdir().unwrap();
+    let pathdir = tempfile::tempdir().unwrap();
+    let want = touch(sysdir.path(), "tool");
+    touch(pathdir.path(), "tool"); // PATH decoy: same name, must lose to the system dir.
+    let system_dirs = [sysdir.path().to_path_buf()];
+    let path = path_var_for(&[pathdir.path()], true);
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: cwd.path(),
+        system_dirs: &system_dirs,
+        path_var: Some(&path),
+        windows: true,
+    })
+    .unwrap();
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn bare_name_only_on_path_still_resolves_from_path() {
+    // Adding a search step ahead of PATH must not turn into REPLACING PATH: a name that exists
+    // only on PATH, with real (non-matching) system dirs present, must still resolve — otherwise
+    // this "fix" would trade the widening it closes for a new, opposite regression: real commands
+    // installed only via PATH (which is most of them) breaking outright.
+    let cwd = tempfile::tempdir().unwrap();
+    let sysdir = tempfile::tempdir().unwrap(); // present, but has nothing named "tool"
+    let pathdir = tempfile::tempdir().unwrap();
+    let want = touch(pathdir.path(), "tool");
+    let system_dirs = [sysdir.path().to_path_buf()];
+    let path = path_var_for(&[pathdir.path()], true);
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: cwd.path(),
+        system_dirs: &system_dirs,
+        path_var: Some(&path),
+        windows: true,
+    })
+    .unwrap();
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
+    // Every test in this file predating this fix calls `go()`, which passes `system_dirs: &[]`
+    // (see `go`'s definition above). That is only a safe default if an empty slice is truly a
+    // no-op — otherwise those tests would have silently stopped meaning what their own doc
+    // comments say the day this field was added, without a single one of them failing to notice.
+    // This test pins the no-op directly: positive control resolves via PATH exactly as
+    // `bare_name_resolves_from_path` above expects, and the negative control (nothing anywhere)
+    // still fails closed exactly as `bare_name_is_not_resolved_from_the_current_directory` expects.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let want = touch(bin.path(), "tool");
+    let path = path_var_for(&[bin.path()], true);
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: cwd.path(),
+        system_dirs: &[],
+        path_var: Some(&path),
+        windows: true,
+    })
+    .unwrap();
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+
+    // Negative control: nothing on PATH and an empty system_dirs must still fail closed, not
+    // silently succeed by, say, treating an empty slice as "search the cwd instead".
+    let miss = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: cwd.path(),
+        system_dirs: &[],
+        path_var: None,
+        windows: true,
+    });
+    assert!(miss.is_err(), "{miss:?}");
+}
+
+#[test]
+fn posix_ignores_system_dirs_entirely() {
+    // `system_dirs` exists to reproduce a WINDOWS-only search order (`CreateProcessW`'s
+    // NULL-`lpApplicationName` rule) — POSIX's own `execvp`/`posix_spawn` PATH search has no
+    // system-directory step at all, so consulting `system_dirs` off Windows would fabricate a
+    // search step POSIX resolution never had, which is a widening with no upstream justification
+    // (and directly contradicts this module's own POSIX-coverage doc). Gating on `input.windows`
+    // itself — rather than trusting every POSIX caller to always pass an empty slice — is what
+    // makes that impossible even if a future POSIX caller passes a non-empty `system_dirs` by
+    // mistake. The system dir here genuinely contains a matching, executable file: if the guard
+    // were ever weakened to "non-empty implies consult it", this test starts passing where it
+    // should keep failing, and that flip is exactly what it exists to catch.
+    let cwd = tempfile::tempdir().unwrap();
+    let sysdir = tempfile::tempdir().unwrap();
+    touch(sysdir.path(), "tool");
+    let system_dirs = [sysdir.path().to_path_buf()];
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: cwd.path(),
+        system_dirs: &system_dirs,
+        path_var: None,
+        windows: false,
+    });
+    assert!(got.is_err(), "{got:?}");
 }

@@ -301,9 +301,10 @@ fn uncontained_raw_child_has_no_containment() {
 ///
 /// With the bug, the helper's inner spawn would find and load the planted decoy from its own
 /// current directory — the CWE-426/427 binary-planting hole — and report "loaded". Fixed, the
-/// bare argv[0] is resolved through the crate's own PATH-only resolver (`lpApplicationName` is
-/// never NULL, and a bare name's resolution never consults any cwd), so the planted copy is never
-/// loaded and the helper reports "notfound".
+/// bare argv[0] is resolved through the crate's own resolver (`lpApplicationName` is never NULL),
+/// which for a bare name visits the system directories (app dir, `System32`, the Windows
+/// directory) and then `PATH` — never any cwd — so the planted copy is never loaded and the
+/// helper reports "notfound".
 ///
 /// The decoy is planted under a FABRICATED name, never the literal "cosca_testbin": on a real
 /// build runner that literal name can legitimately resolve via the ACTUAL `PATH` (e.g. Cargo
@@ -312,7 +313,10 @@ fn uncontained_raw_child_has_no_containment() {
 /// legitimate PATH search silently found a real `cosca_testbin` and made the (undiscriminating)
 /// first version of this test report "loaded" for a reason having nothing to do with the bug.
 /// A name that exists nowhere but the planted decoy removes that ambiguity: any successful
-/// resolution of it can only have come from the vulnerable cwd search.
+/// resolution of it can only have come from the vulnerable cwd search — and, since the decoy
+/// lives ONLY in this tempdir cwd, never the app dir, `System32`, or the Windows directory either,
+/// the system-directory search step added for the maintainer's merge-blocker fix cannot
+/// accidentally find it and mask a cwd-search regression this test would otherwise catch.
 #[test]
 fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();

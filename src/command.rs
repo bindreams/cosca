@@ -134,12 +134,17 @@ impl Command {
     /// [`commandline`](Self::commandline) is supported. A bare or relative
     /// `executable` is resolved with a deliberate rule (not full `CreateProcessW`
     /// search parity): a name containing a path separator resolves against the
-    /// working directory with no search, while a true bare name is looked up in
-    /// `PATH` **only — never the current directory**, appending `.exe` when the name
-    /// has no extension. Searching the current directory first was the previous
-    /// behaviour and was a binary-planting hazard: `executable("helper")` would load a
-    /// `helper.exe` dropped in whatever directory the process happened to sit in.
-    /// Write `./helper` to reach it explicitly.
+    /// working directory with no search, while a true bare name is looked up in the
+    /// system directories (the directory this process's own image loaded from,
+    /// `System32`, then the Windows directory) and then `PATH` — **never the current
+    /// directory** — appending `.exe` when the name has no extension. That order,
+    /// system directories before `PATH`, is deliberate: it is `CreateProcessW`'s own
+    /// documented search order with the current directory cut out, not a fresh rule,
+    /// so a directory placed early on `PATH` (a dev toolchain install, a per-user app
+    /// shim) still cannot shadow e.g. `System32\find.exe`. Searching the current
+    /// directory first was the previous behaviour and was a binary-planting hazard:
+    /// `executable("helper")` would load a `helper.exe` dropped in whatever directory
+    /// the process happened to sit in. Write `./helper` to reach it explicitly.
     ///
     /// A drive-relative name such as `C:tool` is **refused** with
     /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
