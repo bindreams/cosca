@@ -282,20 +282,33 @@ fn uncontained_raw_child_has_no_containment() {
 /// A `Command` with NO `.executable()` set still routes to the raw backend purely because it wires
 /// fd >= 3 (`routes_to_raw_backend`'s other trigger, independent of `executable()`). With no
 /// `executable()`, `image` used to be `None`, handing `CreateProcessW` a NULL `lpApplicationName`
-/// — which makes `CreateProcessW` perform its OWN image search, including the current directory,
-/// reopening the exact binary-planting hole (CWE-426/427) this crate's resolver otherwise closes.
-/// A same-named copy of `testbin` planted in the child's cwd, with nothing of that name on `PATH`,
-/// proves the fix: the bare argv[0] is resolved through the crate's own PATH-only resolver
-/// (`lpApplicationName` is never NULL), so the planted cwd copy is never loaded and the spawn fails
-/// closed with `NotFound` rather than silently launching the planted binary.
+/// — which makes `CreateProcessW` perform its OWN image search. That search's step 2 (per its
+/// documented order) is the CALLING PROCESS's current directory — i.e. THIS test binary's real
+/// process cwd at the moment of the call, never the child's `lpCurrentDirectory`/`Command::cwd()`.
+/// So the decoy must be planted there, which means mutating the process-global cwd (guarded by
+/// `cosca::test_spawn_lock()` + `RestoreCwd`, exactly like `src/resolve_tests.rs`'s cwd-mutating
+/// test) — a decoy dropped merely in the CHILD's cwd sits outside that search path either way and
+/// cannot tell the pre-fix and post-fix code apart (both fail `NotFound`, for different reasons).
+///
+/// With the bug, this exact setup would make `CreateProcessW` find and load the planted
+/// `cosca_testbin.exe` from the process's own current directory — the CWE-426/427 binary-planting
+/// hole. Fixed, the bare argv[0] is resolved through the crate's own PATH-only resolver
+/// (`lpApplicationName` is never NULL, and a bare name's resolution never consults any cwd), so
+/// the planted copy is never loaded and the spawn fails closed with `NotFound`.
 #[test]
-fn fd3_only_routing_does_not_load_a_binary_planted_in_cwd() {
+fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
 
+    let _guard = cosca::test_spawn_lock();
+    let _restore = common::RestoreCwd(std::env::current_dir().unwrap());
+    std::env::set_current_dir(dir.path()).unwrap();
+
     let mut c = cosca::Command::new();
+    // No `.executable()`, no `.current_dir()`: the child's search-relevant cwd is exactly this
+    // process's own (just mutated) cwd — the directory `CreateProcessW`'s own NULL-search would
+    // actually visit.
     c.args(["cosca_testbin", "exit", "0"])
-        .current_dir(dir.path())
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
     let e = c.spawn().unwrap_err();

@@ -97,21 +97,33 @@ async fn async_contained_raw_child_is_in_our_job() {
     child.kill_tree().expect("kill_tree");
 }
 
-/// Async twin of sync `fd3_only_routing_does_not_load_a_binary_planted_in_cwd`: a `Command` with no
-/// `.executable()` still routes to the async raw backend purely via fd >= 3, so `image` used to be
-/// `None` and `lpApplicationName` NULL — letting `CreateProcessW` search the current directory
-/// itself and reopening the binary-planting hole. A same-named copy of `testbin` planted in the
-/// child's cwd, with nothing of that name on `PATH`, proves the fix: the bare argv[0] is resolved
-/// through the crate's own PATH-only resolver, so the planted copy is never loaded and the spawn
-/// fails closed with `NotFound`.
+/// Async twin of sync `fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd`: a
+/// `Command` with no `.executable()` still routes to the async raw backend purely via fd >= 3, so
+/// `image` used to be `None` and `lpApplicationName` NULL. `CreateProcessW`'s own search for a
+/// NULL `lpApplicationName` visits, at step 2 of its documented order, the CALLING PROCESS's
+/// current directory — THIS test binary's real process cwd — never the child's
+/// `lpCurrentDirectory`/`Command::cwd()`. So the decoy is planted there, via a process-cwd
+/// mutation guarded by `cosca::test_spawn_lock()` + `RestoreCwd` (mirrors the sync test and
+/// `src/resolve_tests.rs`'s cwd-mutating unit test): a decoy dropped merely in the child's own cwd
+/// sits outside that search path and cannot tell the pre-fix and post-fix code apart.
+///
+/// With the bug, `CreateProcessW` would find and load the planted `cosca_testbin.exe` from the
+/// process's own current directory (CWE-426/427). Fixed, the bare argv[0] resolves through the
+/// crate's own PATH-only resolver (never any cwd for a bare name), so the planted copy is never
+/// loaded and the spawn fails closed with `NotFound`.
 #[tokio::test]
-async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_cwd() {
+async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
 
+    let _guard = cosca::test_spawn_lock();
+    let _restore = common::RestoreCwd(std::env::current_dir().unwrap());
+    std::env::set_current_dir(dir.path()).unwrap();
+
     let mut c = cosca::tokio::Command::new();
+    // No `.executable()`, no `.current_dir()`: the search-relevant cwd is exactly this process's
+    // own (just mutated) cwd — the directory `CreateProcessW`'s own NULL-search would visit.
     c.args(["cosca_testbin", "exit", "0"])
-        .current_dir(dir.path())
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
     let e = c.spawn().unwrap_err();
