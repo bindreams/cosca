@@ -21,7 +21,13 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
     assert!(got.is_err(), "{got:?}");
 }
 #[test]
-fn resolve_bare_name_appends_exe_from_path() {
+fn resolve_bare_extensionless_name_appends_exe() {
+    // Renamed from `..._from_path`: since the merge-blocker fix added system-directory search
+    // (`crate::resolve::ResolveInput::system_dirs`), "cmd" now resolves via `System32` — it lives
+    // there — rather than necessarily via the ambient `PATH`. That is fine for what this test
+    // actually pins (the `.exe`-append rule fires regardless of which searched directory supplies
+    // the match); the old name just asserted a stronger claim about the source directory than the
+    // test body ever checked.
     let p = resolve_executable(std::path::Path::new("cmd"), None, &[]).unwrap();
     assert!(
         p.is_absolute() && p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
@@ -66,23 +72,51 @@ fn resolve_executable_path_key_match_is_case_insensitive() {
     let got = resolve_executable(std::path::Path::new("sp_env_path_ci"), None, &ops);
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
+// A fabricated name, never "cmd" or another well-known system binary, is required by both tests
+// below now that `resolve_executable` also searches Windows system directories ahead of PATH (the
+// maintainer's merge-blocker fix — see `crate::resolve::ResolveInput::system_dirs`'s doc). `cmd`
+// genuinely lives in `System32`, so it keeps resolving there even with PATH fully cleared or
+// removed, which would silently mask exactly the PATH-defeat regression these two tests exist to
+// catch: measured directly — before this rename, both tests failed on real Windows CI with
+// `Ok("C:\\Windows\\system32\\cmd.exe")`, proving PATH-independent resolution is real, not
+// theoretical. A name that lives ONLY in a tempdir set as `PATH` removes that ambiguity.
 #[test]
 fn resolve_executable_env_clear_defeats_ambient_path() {
-    // Positive control: with no env ops, "cmd" resolves via the ambient PATH.
-    assert!(resolve_executable(std::path::Path::new("cmd"), None, &[]).is_ok());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_env_clear.exe")).unwrap();
+    let set = [EnvOp::Set(
+        OsString::from("PATH"),
+        dir.path().as_os_str().to_os_string(),
+    )];
+    // Positive control: with PATH pointed at the fabricated name's directory, it resolves — so a
+    // failure below is really about env_clear, not merely that this name can never resolve.
+    assert!(resolve_executable(std::path::Path::new("sp_env_clear"), None, &set).is_ok());
     // `Command::env_clear()` means the child sees NO environment at all, PATH included — the
     // resolver must not silently fall back to searching the PARENT's PATH once the child's own is
     // cleared.
-    let got = resolve_executable(std::path::Path::new("cmd"), None, &[EnvOp::Clear]);
+    let got = resolve_executable(std::path::Path::new("sp_env_clear"), None, &[EnvOp::Clear]);
     assert!(got.is_err(), "{got:?}");
 }
 #[test]
 fn resolve_executable_env_remove_path_defeats_ambient_path() {
-    assert!(resolve_executable(std::path::Path::new("cmd"), None, &[]).is_ok());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_env_remove.exe")).unwrap();
+    let set = [EnvOp::Set(
+        OsString::from("PATH"),
+        dir.path().as_os_str().to_os_string(),
+    )];
+    // Positive control, same reasoning as the env_clear test above.
+    assert!(resolve_executable(std::path::Path::new("sp_env_remove"), None, &set).is_ok());
+    // `EnvOp::Remove` on the just-`Set` key (case-folded, per `Command::env_remove`'s contract)
+    // must take the child's PATH away again — the resolver must not keep searching a directory the
+    // env ops explicitly removed.
     let got = resolve_executable(
-        std::path::Path::new("cmd"),
+        std::path::Path::new("sp_env_remove"),
         None,
-        &[EnvOp::Remove(OsString::from("path"))],
+        &[
+            EnvOp::Set(OsString::from("PATH"), dir.path().as_os_str().to_os_string()),
+            EnvOp::Remove(OsString::from("path")),
+        ],
     );
     assert!(got.is_err(), "{got:?}");
 }
