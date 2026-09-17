@@ -23,7 +23,7 @@ use windows::Win32::System::Threading::{
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock};
-use crate::command::{Command, EnvOp};
+use crate::command::{Command, EnvOp, ExecutableSpec};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
@@ -252,10 +252,13 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // Batch reject on the program token, resolve the executable, NUL-check, build the command line
     // — all shared verbatim with the sync raw backend.
     sync_raw::reject_batch_program(cmd)?;
-    let image = cmd
-        .executable_path()
-        .map(sync_raw::resolve::resolve_executable)
-        .transpose()?;
+    // Only a `Search` spec is resolved — the async backend must honour `raw_executable()`
+    // identically to the sync one, or the contract would depend on which API you spawned through.
+    let image = match cmd.executable_spec() {
+        Some(ExecutableSpec::Search(p)) => Some(sync_raw::resolve::resolve_executable(p)?),
+        Some(ExecutableSpec::Exact(p)) => Some(p.to_path_buf()),
+        None => None,
+    };
     if let Some(p) = &image {
         sync_raw::resolve::ensure_no_nul_wide(p.as_os_str())?;
     }
