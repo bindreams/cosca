@@ -262,7 +262,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .map(PathBuf::from)
         .or_else(|| sync_raw::program_token(cmd));
     let image = program
-        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd()))
+        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), cmd.env_ops()))
         .transpose()?;
     if let Some(p) = &image {
         sync_raw::resolve::ensure_no_nul_wide(p.as_os_str())?;

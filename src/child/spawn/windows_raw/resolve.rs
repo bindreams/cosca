@@ -18,7 +18,7 @@ use crate::error::Error;
 
 // Program resolution =====
 
-/// Resolve `exe` against the CHILD's cwd and the current process's `PATH`.
+/// Resolve `exe` against the CHILD's cwd and the CHILD's `PATH`.
 ///
 /// `cmd_cwd` is `Command::cwd()` — the directory the child will actually run in. When it is
 /// `None` (no override was set), the child inherits the parent's cwd, so
@@ -28,9 +28,16 @@ use crate::error::Error;
 /// directory, and that promise is also the documented escape hatch for reaching "the current
 /// directory explicitly" — reaching the parent's instead defeats it.
 ///
+/// `env_ops` is `Command::env_ops()` — the same recorded `env()`/`env_remove()`/`env_clear()`
+/// sequence [`build_env_block`] turns into the child's actual environment block. `PATH` is looked
+/// up through [`effective_path_var`], which replays those ops over the ambient `PATH` the same
+/// way [`build_env_block_from`] replays them over the ambient environment, so the directories
+/// searched here are the ones the CHILD will actually have — not silently the parent's, which
+/// [`crate::resolve::ResolveInput::path_var`]'s own doc already promises.
+///
 /// Convenience wrapper over [`resolve_executable_in`] seeded from `cmd_cwd` (or
-/// [`std::env::current_dir`]) and the `PATH` variable.
-pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>) -> Result<PathBuf, Error> {
+/// [`std::env::current_dir`]) and the child's effective `PATH`.
+pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env_ops: &[EnvOp]) -> Result<PathBuf, Error> {
     let base_cwd;
     let base_cwd: &Path = match cmd_cwd {
         Some(dir) => dir,
@@ -39,8 +46,26 @@ pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>) -> Result<P
             &base_cwd
         }
     };
-    let path = std::env::var_os("PATH");
+    let path = effective_path_var(env_ops);
     resolve_executable_in(exe, base_cwd, path.as_deref())
+}
+
+/// The `PATH` value the child will actually see, replaying `env_ops` over the ambient `PATH` —
+/// `Set`/`Remove` match the key case-insensitively (Windows env var names are), and `Clear` wipes
+/// it outright, mirroring [`build_env_block_from`]'s own base-then-ops replay exactly so the two
+/// never disagree about what the child's `PATH` ends up being.
+fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
+    let path_key = fold_key(OsStr::new("PATH"));
+    let mut path = std::env::var_os("PATH");
+    for op in env_ops {
+        match op {
+            EnvOp::Set(key, val) if fold_key(key) == path_key => path = Some(val.clone()),
+            EnvOp::Remove(key) if fold_key(key) == path_key => path = None,
+            EnvOp::Clear => path = None,
+            _ => {}
+        }
+    }
+    path
 }
 
 /// Resolve `exe` against an explicit `base_cwd` and `PATH` string.

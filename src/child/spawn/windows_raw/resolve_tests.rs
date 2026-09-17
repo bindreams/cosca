@@ -5,7 +5,7 @@ use std::ffi::OsString;
 #[test]
 fn resolve_absolute_existing_is_returned_as_is() {
     let me = std::env::current_exe().unwrap();
-    assert_eq!(resolve_executable(&me, None).unwrap(), me);
+    assert_eq!(resolve_executable(&me, None, &[]).unwrap(), me);
 }
 #[test]
 fn resolve_bare_name_is_not_taken_from_base_cwd() {
@@ -20,11 +20,69 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
 }
 #[test]
 fn resolve_bare_name_appends_exe_from_path() {
-    let p = resolve_executable(std::path::Path::new("cmd"), None).unwrap();
+    let p = resolve_executable(std::path::Path::new("cmd"), None, &[]).unwrap();
     assert!(
         p.is_absolute() && p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
         "{p:?}"
     );
+}
+// Item 4: `resolve_executable` must honor the CHILD's PATH, not the ambient one ────────
+//
+// `path_var`'s own doc (`crate::resolve::ResolveInput::path_var`) promises "the PATH the CHILD
+// will see, after env()/env_clear()" — but `resolve_executable` used to read
+// `std::env::var_os("PATH")` unconditionally, ignoring `Command::env_ops()` entirely. cosca's own
+// std backend already threads `env_ops` onto the child correctly (`apply_env` in
+// `child::spawn.rs`); the raw backend must match it, not silently search the PARENT's PATH while
+// the child would see a different one.
+#[test]
+fn resolve_executable_honors_an_env_set_path_override() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_env_path.exe")).unwrap();
+    let want = dir.path().join("sp_env_path.exe");
+    // Positive control: with no env ops, the fabricated name is not on the ambient PATH at all, so
+    // a pass below cannot be an accident of the ambient PATH already containing it.
+    assert!(resolve_executable(std::path::Path::new("sp_env_path"), None, &[]).is_err());
+
+    let ops = [EnvOp::Set(
+        OsString::from("PATH"),
+        dir.path().as_os_str().to_os_string(),
+    )];
+    let got = resolve_executable(std::path::Path::new("sp_env_path"), None, &ops);
+    assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+#[test]
+fn resolve_executable_path_key_match_is_case_insensitive() {
+    // Windows env var names are case-insensitive; `Command::env("Path", ...)` must override the
+    // same `PATH` the resolver consults, not silently coexist as a distinct key.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_env_path_ci.exe")).unwrap();
+    let want = dir.path().join("sp_env_path_ci.exe");
+    let ops = [EnvOp::Set(
+        OsString::from("Path"),
+        dir.path().as_os_str().to_os_string(),
+    )];
+    let got = resolve_executable(std::path::Path::new("sp_env_path_ci"), None, &ops);
+    assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+#[test]
+fn resolve_executable_env_clear_defeats_ambient_path() {
+    // Positive control: with no env ops, "cmd" resolves via the ambient PATH.
+    assert!(resolve_executable(std::path::Path::new("cmd"), None, &[]).is_ok());
+    // `Command::env_clear()` means the child sees NO environment at all, PATH included — the
+    // resolver must not silently fall back to searching the PARENT's PATH once the child's own is
+    // cleared.
+    let got = resolve_executable(std::path::Path::new("cmd"), None, &[EnvOp::Clear]);
+    assert!(got.is_err(), "{got:?}");
+}
+#[test]
+fn resolve_executable_env_remove_path_defeats_ambient_path() {
+    assert!(resolve_executable(std::path::Path::new("cmd"), None, &[]).is_ok());
+    let got = resolve_executable(
+        std::path::Path::new("cmd"),
+        None,
+        &[EnvOp::Remove(OsString::from("path"))],
+    );
+    assert!(got.is_err(), "{got:?}");
 }
 // B1: `resolve_executable`'s `cmd_cwd` parameter ─────────────────────────────────────
 //
@@ -36,7 +94,14 @@ fn resolve_bare_name_appends_exe_from_path() {
 // the exact directory this crate exists to stop trusting.
 #[test]
 fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
-    let process_dir = tempfile::tempdir().unwrap();
+    // No process-global `set_current_dir` here, deliberately: `resolve_executable`'s `Some(dir)`
+    // arm never reads `std::env::current_dir()` at all (see its match on `cmd_cwd`), so an
+    // explicit `cmd_cwd` needs no process-cwd mutation to prove it is honoured — mutating it
+    // anyway would only add this test to the process-global cwd race other tests in this binary
+    // must serialize against, for zero extra regression-catching power. The decoy below still
+    // proves the given cwd wins over the process's REAL (unmutated) cwd, which is a weaker but
+    // sufficient claim: it is wherever `cargo test` started this binary, almost certainly not
+    // `cmd_dir`.
     let cmd_dir = tempfile::tempdir().unwrap();
     let want = std::fs::copy(
         std::env::current_exe().unwrap(),
@@ -44,19 +109,9 @@ fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
     )
     .map(|_| cmd_dir.path().join("sp_b1_helper.exe"))
     .unwrap();
-    // A DIFFERENT file at the identical relative name under the PROCESS's own cwd: if the
-    // process cwd leaked into resolution, this decoy is the one that would resolve.
-    std::fs::copy(
-        std::env::current_exe().unwrap(),
-        process_dir.path().join("sp_b1_helper.exe"),
-    )
-    .unwrap();
 
-    let prev = std::env::current_dir().unwrap();
-    std::env::set_current_dir(process_dir.path()).unwrap();
     // Located name (contains a separator) — resolves against the given cwd with no PATH search.
-    let got = resolve_executable(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()));
-    std::env::set_current_dir(prev).unwrap();
+    let got = resolve_executable(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()), &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
@@ -66,13 +121,17 @@ fn resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given() {
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_b1_fallback.exe")).unwrap();
     let want = dir.path().join("sp_b1_fallback.exe");
 
-    let prev = std::env::current_dir().unwrap();
-    std::env::set_current_dir(dir.path()).unwrap();
     // `cmd_cwd: None` mirrors an unset `Command::cwd()` — the doc says that means "the parent's",
     // i.e. the real process cwd, so the `None` fallback must still reach it rather than resolving
-    // nothing.
-    let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None);
-    std::env::set_current_dir(prev).unwrap();
+    // nothing. Exercising that fallback needs an actual process-cwd mutation, which is
+    // process-global: serialize against `spawn_lock()` (see `crate::test_child::RestoreCwd`'s doc
+    // for exactly what that lock does and does not buy) and restore via `RestoreCwd`'s `Drop`,
+    // declared AFTER the lock guard so it runs — and un-does the mutation — BEFORE the lock
+    // releases, even if an assertion below panics.
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = crate::test_child::RestoreCwd::capture();
+    std::env::set_current_dir(dir.path()).unwrap();
+    let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
