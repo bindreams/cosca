@@ -19,7 +19,7 @@ pub(crate) mod flags;
 #[derive(Debug)]
 pub struct Command {
     input: CommandInput,
-    executable: Option<PathBuf>,
+    executable: Option<ExecutableSpec>,
     fds: BTreeMap<Fd, ResolvedStdio>,
     env_ops: Vec<EnvOp>,
     cwd: Option<PathBuf>,
@@ -28,6 +28,30 @@ pub struct Command {
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
     flags: FlagsRequest,
+}
+
+/// Which setter recorded the executable path, and therefore whether cosca resolves it before
+/// the OS sees it.
+///
+/// The variants are alternatives on ONE field: [`Command::executable`] and
+/// [`Command::raw_executable`] overwrite each other, last call wins. Downstream, only the sites
+/// that would otherwise resolve need the discriminant — everything that merely wants the path
+/// uses [`Command::executable_path`], which is variant-agnostic.
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutableSpec {
+    /// From [`Command::executable`]: cosca resolves it (`PATH`, `.exe`) before the OS sees it.
+    Search(PathBuf),
+    /// From [`Command::raw_executable`]: handed to the OS exactly as written.
+    Exact(PathBuf),
+}
+
+impl ExecutableSpec {
+    /// The path as written, whichever setter recorded it.
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            ExecutableSpec::Search(p) | ExecutableSpec::Exact(p) => p,
+        }
+    }
 }
 
 /// An environment variable operation, recorded in order.
@@ -136,8 +160,33 @@ impl Command {
     /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
     /// resolving it would need drive C's own current directory, which cosca does not
     /// track, so it fails closed instead of guessing.
+    /// This and [`raw_executable`](Self::raw_executable) are alternatives on one field: calling
+    /// either replaces the other, and the last call wins.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
-        self.executable = Some(path.into());
+        self.executable = Some(ExecutableSpec::Search(path.into()));
+        self
+    }
+
+    /// Load exactly this file, with **no resolution of any kind** — no `PATH` search, no `.exe`
+    /// appending, no existence check.
+    ///
+    /// This is the underlying primitive that [`executable`](Self::executable) layers a search
+    /// over. A relative value keeps the platform primitive's own meaning: it is resolved against
+    /// the **child's** working directory, exactly as `execve` and `CreateProcessW`'s
+    /// `lpApplicationName` do.
+    ///
+    /// The two setters are alternatives on one field: calling either replaces the other, and the
+    /// last call wins.
+    ///
+    /// # Platform note
+    ///
+    /// **On POSIX this contract is not yet honoured for a bare name.** cosca currently spawns
+    /// through `std::process`, whose exec call searches `PATH` for a name containing no
+    /// separator — so `raw_executable("tool")` may load a `tool` found on `PATH` rather than
+    /// failing. Write `./tool` to be unambiguous until cosca owns the POSIX spawn path. On
+    /// Windows the contract holds today.
+    pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
+        self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
     }
 
@@ -145,8 +194,25 @@ impl Command {
         &self.input
     }
 
+    /// The executable path as written, whichever setter recorded it.
+    ///
+    /// Deliberately variant-agnostic: most readers — the elevation `argv[0]` guards, backend
+    /// routing, the argv and command-line builders — want the path and nothing else. Only a
+    /// caller that must not resolve an `Exact` path should reach for
+    /// [`executable_spec`](Self::executable_spec).
     pub(crate) fn executable_path(&self) -> Option<&Path> {
-        self.executable.as_deref()
+        self.executable.as_ref().map(ExecutableSpec::path)
+    }
+
+    /// The path together with which setter recorded it.
+    ///
+    /// Consumed only by the Windows raw backends today — they are the sites that would otherwise
+    /// resolve an `Exact` path. Task 3 gives POSIX the same distinction and consumes it there
+    /// too, at which point this attribute goes away; until then it would be a genuine dead-code
+    /// warning on a host build, so the allow is scoped to exactly that case rather than blanket.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn executable_spec(&self) -> Option<&ExecutableSpec> {
+        self.executable.as_ref()
     }
 
     /// Wire descriptor `slot` to `target`. Errors now if the target's direction

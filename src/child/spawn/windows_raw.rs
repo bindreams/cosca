@@ -44,7 +44,7 @@ use crate::child::spawn::{
     attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, PipeOwnership,
 };
 use crate::child::Child;
-use crate::command::{Command, CommandInput, EnvOp};
+use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -55,7 +55,14 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd)?;
 
-    let image: Option<PathBuf> = cmd.executable_path().map(resolve::resolve_executable).transpose()?;
+    // Only a `Search` spec is resolved. `raw_executable()` means "load exactly this file", and
+    // this is the one site on Windows that would otherwise resolve it — silently turning a bare
+    // `raw_executable("tool")` into a PATH lookup and breaking the contract at its only user.
+    let image: Option<PathBuf> = match cmd.executable_spec() {
+        Some(ExecutableSpec::Search(p)) => Some(resolve::resolve_executable(p)?),
+        Some(ExecutableSpec::Exact(p)) => Some(p.to_path_buf()),
+        None => None,
+    };
     if let Some(p) = &image {
         resolve::ensure_no_nul_wide(p.as_os_str())?;
     }
