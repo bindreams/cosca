@@ -20,6 +20,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::GetFullPathNameW;
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 
 use super::env_key::EnvKey;
@@ -104,15 +106,26 @@ fn get_windows_directory() -> Option<PathBuf> {
 /// or the required length (including the NUL) when it was not, and `0` on failure — so `0` is the
 /// only outcome that means "give up", never "empty path".
 fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
+    // A system directory this process cannot determine is skipped, not fatal — see this
+    // function's doc. Callers that DO need the reason use `grow_wide_buffer` directly.
+    grow_wide_buffer(f).ok()
+}
+
+/// The shared buffer-growth loop, preserving the Win32 failure reason.
+///
+/// Same convention for every `GetXW`-shaped path API used here — `GetSystemDirectoryW`,
+/// `GetWindowsDirectoryW` and `GetFullPathNameW` alike: the copied length EXCLUDING the NUL on
+/// success, the required length INCLUDING it when the buffer was too small, and `0` on failure.
+fn grow_wide_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, std::io::Error> {
     let mut buf = vec![0u16; 260];
     loop {
         let len = f(Some(&mut buf)) as usize;
         if len == 0 {
-            return None;
+            return Err(std::io::Error::last_os_error());
         }
         if len < buf.len() {
             buf.truncate(len);
-            return Some(PathBuf::from(OsString::from_wide(&buf)));
+            return Ok(PathBuf::from(OsString::from_wide(&buf)));
         }
         // The documented convention leaves `len == buf.len()` unreachable: success returns the
         // copied length EXCLUDING the NUL (so strictly less than the buffer), and a too-small
@@ -131,6 +144,76 @@ fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
         // iteration, which is what makes the loop terminate without an arbitrary iteration cap.
         buf.resize(len.max(buf.len() + 1), 0);
     }
+}
+
+/// Refuse an empty program name.
+///
+/// `raw_executable("")` records a program that names no file, and the two Win32 sinks disagree
+/// about what to do with it: as `lpApplicationName` it becomes a pointer to a lone NUL rather
+/// than the NULL pointer, and whether `CreateProcessW` treats those identically is undocumented —
+/// if it does, the image search this crate exists to prevent is back, including the current
+/// directory. Rather than depend on which way that falls, an empty name fails closed here.
+///
+/// `Search` cannot produce this: `crate::resolve::resolve` returns an absolute path or errors.
+/// So the guard belongs on the `Exact` arms specifically.
+pub(crate) fn reject_empty_program(program: &Path) -> Result<(), Error> {
+    if program.as_os_str().is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "raw_executable() was given an empty path, which names no file",
+        )));
+    }
+    Ok(())
+}
+
+/// Complete a possibly-relative program name into an absolute path the way the Win32 loader
+/// itself would — **without searching, appending an extension, or touching the filesystem**.
+///
+/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and it exists
+/// for exactly one caller: the elevated path. `CreateProcessW` completes a partial
+/// `lpApplicationName` itself ("the function uses the current drive and current directory to
+/// complete the specification. The function will not use the search path"), so the raw backend
+/// can hand it a relative value untouched. `ShellExecuteEx` cannot be trusted with one: a
+/// path-less `lpFile` IS searched — `PATHEXT` applied, `lpDirectory` consulted as a search
+/// location — which is how the elevated path reached the `.bat`/`.cmd` vector. Completing the
+/// name here first means `lpFile` is always absolute, and an absolute `lpFile` is taken verbatim.
+///
+/// `GetFullPathNameW` is the right primitive rather than a hand-rolled join, on three counts
+/// documented by Win32 itself:
+///
+/// - It uses the same base the loader does — it "merges the name of the current drive and
+///   directory with a specified file name", matching `lpApplicationName`'s own wording.
+/// - It "does not verify that the resulting path and file name are valid, or that they see an
+///   existing file", so `raw_executable()`'s "no existence check" clause survives intact.
+/// - It resolves a DRIVE-RELATIVE name (`C:tool`) through that drive's own current directory —
+///   state Win32 tracks and cosca does not, which is why `executable()`'s search path fails such
+///   names closed instead. Here the platform answers it correctly.
+///
+/// The current directory is process-global and can change between calls, so this deliberately
+/// consumes the relative name exactly once and everything downstream uses the absolute result —
+/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code.
+pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
+    reject_empty_program(program)?;
+    // BEFORE widening. `to_wide_nul` appends a terminator, and `PCWSTR` stops at the FIRST NUL —
+    // so an interior NUL silently truncates the path Win32 sees. `raw_executable("C:\\a\\b.exe\0x")`
+    // would become `lpFile = C:\a\b.exe`, loading a file the caller did not name, elevated. The
+    // raw backend already fails such a path closed (`spawn_raw` NUL-checks the image); without
+    // this the same `Command` would error unelevated and silently load a different file elevated.
+    // It also closes the hole in `reject_empty_program`, which sees a non-empty `OsStr` for a
+    // value that widens to the empty string.
+    ensure_no_nul_wide("program path", program.as_os_str())?;
+    let wide = super::to_wide_nul(program.as_os_str());
+    let full = grow_wide_buffer(|buf| unsafe {
+        // SAFETY: `wide` is NUL-terminated; `GetFullPathNameW` writes into the given buffer or
+        // reports the required length, both honoured by `wide_dir_buffer`. The `lpFilePart`
+        // out-param is optional and unused here.
+        GetFullPathNameW(PCWSTR(wide.as_ptr()), buf, None)
+    })
+    // The Win32 reason is preserved rather than flattened: unlike the system-directory queries,
+    // `GetFullPathNameW`'s failures are INPUT-dependent (`ERROR_INVALID_NAME`,
+    // `ERROR_FILENAME_EXCED_RANGE`), so the code is what tells a caller which path was bad.
+    .map_err(Error::Io)?;
+    Ok(full)
 }
 
 /// Resolve `exe` against an explicit `base_cwd`, system directories, and `PATH` string.
@@ -308,15 +391,22 @@ pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
     Ok(())
 }
 
-/// Assert the same property of a wide string the crate PRODUCED rather than received.
+/// Assert the same property of a wide string that is ALREADY REFUSED upstream, rather than one
+/// received unchecked here.
 ///
-/// [`resolve_executable`] is the only such producer, and it cannot yield a NUL: every one of its
-/// returns is gated on [`Path::is_file`], which goes through `fs::metadata` and so is false for
-/// any path Win32 cannot encode. A NUL here would therefore be a broken contract in resolution,
-/// not a caller defect — and refusing it at runtime advertises a caller-facing vector that does
-/// not exist, sending a reader to audit an input they do not control. Asserted instead, so it
-/// still fails loudly in every debug build the moment resolution grows a return that is not
-/// `is_file`-gated.
+/// The one caller is `spawn_raw`'s image, and neither of the two ways that image is produced can
+/// carry a NUL by the time it arrives:
+///
+/// - Resolved by [`resolve_executable`] — every one of its returns is gated on [`Path::is_file`],
+///   which goes through `fs::metadata` and so is false for any path Win32 cannot encode.
+/// - Passed through verbatim by `raw_executable()`'s `Exact` arm of `windows_raw::image_for` —
+///   caller input, but `reject_batch_program` runs FIRST in both raw backends and
+///   [`ensure_no_nul_wide`]s that same token as the "program token".
+///
+/// So a NUL here would be a broken contract upstream, not a caller defect — and refusing it at
+/// runtime advertises a caller-facing vector that does not exist, sending a reader to audit an
+/// input they do not control. Asserted instead, so it still fails loudly in every debug build the
+/// moment either of those two guarantees is dropped.
 pub(crate) fn debug_assert_no_nul_wide(what: &str, s: &OsStr) {
     debug_assert!(
         !s.encode_wide().any(|unit| unit == 0),

@@ -19,7 +19,7 @@ pub(crate) mod flags;
 #[derive(Debug)]
 pub struct Command {
     input: CommandInput,
-    executable: Option<PathBuf>,
+    executable: Option<ExecutableSpec>,
     fds: BTreeMap<Fd, ResolvedStdio>,
     env_ops: Vec<EnvOp>,
     cwd: Option<PathBuf>,
@@ -28,6 +28,30 @@ pub struct Command {
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
     flags: FlagsRequest,
+}
+
+/// Which setter recorded the executable path, and therefore whether cosca resolves it before
+/// the OS sees it.
+///
+/// The variants are alternatives on ONE field: [`Command::executable`] and
+/// [`Command::raw_executable`] overwrite each other, last call wins. Downstream, only the sites
+/// that would otherwise resolve need the discriminant — everything that merely wants the path
+/// uses [`Command::executable_path`], which is variant-agnostic.
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutableSpec {
+    /// From [`Command::executable`]: cosca resolves it (`PATH`, `.exe`) before the OS sees it.
+    Search(PathBuf),
+    /// From [`Command::raw_executable`]: handed to the OS exactly as written.
+    Exact(PathBuf),
+}
+
+impl ExecutableSpec {
+    /// The path as written, whichever setter recorded it.
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            ExecutableSpec::Search(p) | ExecutableSpec::Exact(p) => p,
+        }
+    }
 }
 
 /// An environment variable operation, recorded in order.
@@ -210,8 +234,64 @@ impl Command {
     /// `executable` there is neither searched in `PATH` nor refused for a
     /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
     /// unresolved.
+    ///
+    /// This and [`raw_executable`](Self::raw_executable) are alternatives on one field: calling
+    /// either replaces the other, and the last call wins.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
-        self.executable = Some(path.into());
+        self.executable = Some(ExecutableSpec::Search(path.into()));
+        self
+    }
+
+    /// Load exactly this file, with **no resolution of any kind** — no `PATH` search, no `.exe`
+    /// appending, no existence check.
+    ///
+    /// This is the underlying primitive that [`executable`](Self::executable) layers a search
+    /// over. A relative value keeps the platform primitive's own meaning — but **which directory
+    /// that is differs by platform, and it is not the same one `executable()` uses**:
+    ///
+    /// - **Windows:** the **calling process's** current directory. `CreateProcessW` completes a
+    ///   partial `lpApplicationName` "using the current drive and current directory", and
+    ///   `lpCurrentDirectory` (what [`current_dir`](Self::current_dir) sets) does not affect
+    ///   image lookup at all. So `raw_executable("helper.exe").current_dir(r"D:\work")` loads
+    ///   `helper.exe` from wherever THIS process happens to sit, not from `D:\work`. Pass an
+    ///   absolute path if that distinction
+    ///   could ever matter — and note that a directory this process sits in may be writable by
+    ///   someone else, which is the binary-planting shape [`executable`](Self::executable)
+    ///   deliberately refuses to walk into.
+    /// - **POSIX:** the **child's** working directory, because the `chdir` happens before the
+    ///   exec.
+    ///
+    /// [`executable`](Self::executable) resolves against the child's working directory on both.
+    /// The divergence is inherited from the platform primitives, not chosen here.
+    ///
+    /// A drive-relative name (`C:tool`) is honoured rather than refused: it names a file relative
+    /// to drive C's own current directory, which Windows tracks and this crate does not.
+    /// [`executable`](Self::executable) fails such a name closed for exactly that reason; here
+    /// the platform answers it.
+    ///
+    /// The two setters are alternatives on one field: calling either replaces the other, and the
+    /// last call wins.
+    ///
+    /// # Platform note
+    ///
+    /// **On POSIX this contract is not yet honoured for a bare name.** cosca currently spawns
+    /// through `std::process`, whose exec call searches `PATH` for a name containing no
+    /// separator — so `raw_executable("tool")` may load a `tool` found on `PATH` instead of the
+    /// `tool` in the child's working directory, which is what the rule above promises. Write
+    /// `./tool` to be unambiguous until cosca owns the POSIX spawn path. A value that already
+    /// contains a separator is unaffected: `execve` does not search one.
+    ///
+    /// The same caveat applies to an elevated POSIX or macOS spawn for a different reason:
+    /// `sudo`/`pkexec`/`osascript` perform their own lookup on the name they are handed, which
+    /// cosca does not intercept.
+    ///
+    /// On Windows the contract holds on every spawn path, elevated or not. The elevated path
+    /// goes through `ShellExecuteEx`, whose `lpFile` **is** searched when it has no path
+    /// (`PATHEXT` applied, `lpDirectory` consulted), so cosca completes the name to an absolute
+    /// path first — using the same base and the same no-search, no-extension, no-existence-check
+    /// rules as above — rather than letting that search happen.
+    pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
+        self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
     }
 
@@ -219,8 +299,25 @@ impl Command {
         &self.input
     }
 
+    /// The executable path as written, whichever setter recorded it.
+    ///
+    /// Deliberately variant-agnostic: most readers — the elevation `argv[0]` guards, backend
+    /// routing, the argv and command-line builders — want the path and nothing else. Only a
+    /// caller that must not resolve an `Exact` path should reach for
+    /// [`executable_spec`](Self::executable_spec).
     pub(crate) fn executable_path(&self) -> Option<&Path> {
-        self.executable.as_deref()
+        self.executable.as_ref().map(ExecutableSpec::path)
+    }
+
+    /// The path together with which setter recorded it.
+    ///
+    /// Consumed only by the Windows raw backends today — they are the sites that would otherwise
+    /// resolve an `Exact` path. Task 3 gives POSIX the same distinction and consumes it there
+    /// too, at which point this attribute goes away; until then it would be a genuine dead-code
+    /// warning on a host build, so the allow is scoped to exactly that case rather than blanket.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn executable_spec(&self) -> Option<&ExecutableSpec> {
+        self.executable.as_ref()
     }
 
     /// Wire descriptor `slot` to `target`. Errors now if the target's direction

@@ -1,6 +1,7 @@
 use super::*;
 use crate::command::EnvOp;
 use std::ffi::OsString;
+use std::path::Path;
 
 /// Resolve against the PATH `ops` give a child of this process, as a spawn does.
 fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
@@ -716,4 +717,72 @@ fn resolution_searches_the_given_snapshot() {
         got.canonicalize().unwrap(),
         dir.path().join("sp_snapshot.exe").canonicalize().unwrap()
     );
+}
+
+// `absolutise_exact`: the `raw_executable()` contract, on the one path that needs it ──────
+//
+// These exist because the elevated `Exact` arm had NO coverage: replacing this function's whole
+// body with `Ok(program.to_path_buf())`, or deleting the arm in `elevation::windows::elevated_program`
+// that calls it, passed the entire suite on every platform. Each test below kills one of those
+// mutations. They need only a Windows runner, not elevation.
+
+/// The core promise: ABSOLUTE, but completed rather than searched.
+///
+/// A bare name must come back as the calling process's current directory joined with that name —
+/// which is what `CreateProcessW` would do with the same partial `lpApplicationName`, and is NOT
+/// what `ShellExecuteEx` would do with the same path-less `lpFile` (it would search `PATHEXT` and
+/// `lpDirectory`). Kills "replace the body with a passthrough".
+#[test]
+fn absolutise_exact_completes_a_bare_name_against_the_processes_cwd() {
+    let got = absolutise_exact(Path::new("tool")).unwrap();
+    assert_eq!(got, std::env::current_dir().unwrap().join("tool"), "{got:?}");
+    assert!(got.is_absolute());
+}
+
+/// No extension is invented. `executable("tool")` would look for `tool.exe`; this must not.
+#[test]
+fn absolutise_exact_never_appends_an_extension() {
+    let got = absolutise_exact(Path::new("tool")).unwrap();
+    assert_eq!(got.file_name().unwrap(), std::ffi::OsStr::new("tool"), "{got:?}");
+}
+
+/// No existence check — the file need not exist, per `GetFullPathNameW`'s own contract. A
+/// `NotFound` here would mean the resolver was used instead.
+#[test]
+fn absolutise_exact_succeeds_for_a_file_that_does_not_exist() {
+    let got = absolutise_exact(Path::new("no-such-file-983471.tmp")).unwrap();
+    assert!(got.is_absolute(), "{got:?}");
+    assert!(!got.exists(), "the probe name must genuinely not exist: {got:?}");
+}
+
+/// An already-absolute path is returned as itself, not re-rooted.
+#[test]
+fn absolutise_exact_leaves_an_absolute_path_absolute() {
+    let me = std::env::current_exe().unwrap();
+    assert_eq!(absolutise_exact(&me).unwrap(), me);
+}
+
+/// Empty fails closed: an empty `lpApplicationName` is a pointer to a lone NUL rather than the
+/// NULL pointer, and whether `CreateProcessW` treats those alike is undocumented.
+#[test]
+fn absolutise_exact_refuses_an_empty_program() {
+    assert!(absolutise_exact(Path::new("")).is_err());
+}
+
+/// An INTERIOR NUL fails closed. `PCWSTR` stops at the first NUL, so without this check
+/// `raw_executable("C:\\a\\b.exe\0junk")` would silently become `lpFile = C:\a\b.exe` — a
+/// different file than the caller named, loaded elevated. The raw backend already refuses such a
+/// path, so accepting it here would make the contract depend on which path you spawned through.
+///
+/// Note the empty-path guard alone does NOT catch this: the `OsStr` is non-empty.
+#[test]
+fn absolutise_exact_refuses_an_interior_nul() {
+    use std::os::windows::ffi::OsStringExt;
+    for units in [vec![0u16], "a.exe\0b".encode_utf16().collect::<Vec<u16>>()] {
+        let p = std::ffi::OsString::from_wide(&units);
+        assert!(
+            absolutise_exact(Path::new(&p)).is_err(),
+            "an interior NUL must be refused, not truncated: {p:?}"
+        );
+    }
 }

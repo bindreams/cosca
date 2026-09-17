@@ -118,6 +118,17 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     exe_only.executable("cmd").args(["cmd", "/C", "exit 0"]);
     assert!(super::routes_to_raw_backend(&exe_only), "an executable() routes to raw");
 
+    // BOTH setters must route here. The rule reads `executable_path()`, which is deliberately
+    // variant-agnostic, so this holds today — the case exists to stop it being "tightened" to
+    // `Search` only. That would send `raw_executable()` down the std path, where std resolves a
+    // bare name itself, breaking the no-resolution contract at the one backend that honours it.
+    let mut raw_exe_only = Command::new();
+    raw_exe_only.raw_executable("cmd").args(["cmd", "/C", "exit 0"]);
+    assert!(
+        super::routes_to_raw_backend(&raw_exe_only),
+        "a raw_executable() routes to raw too"
+    );
+
     let mut high_fd_only = Command::new();
     high_fd_only.args(["cmd", "/C", "exit 0"]);
     high_fd_only.fd(3, Stdio::pipe_out()).unwrap();

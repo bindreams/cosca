@@ -46,6 +46,13 @@ impl Command {
         self.inner.executable(p);
         self
     }
+    /// Mirrors [`cosca::Command::raw_executable`](crate::Command::raw_executable) — see there for
+    /// the contract. Without this delegate the async API cannot express "load exactly this file"
+    /// at all, and the `Exact` arm the async raw backend carries would be unreachable.
+    pub fn raw_executable<P: Into<std::path::PathBuf>>(&mut self, p: P) -> &mut Command {
+        self.inner.raw_executable(p);
+        self
+    }
     pub fn stdin(&mut self, t: Stdio) -> Result<&mut Command, Error> {
         self.inner.stdin(t)?;
         Ok(self)

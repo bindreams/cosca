@@ -187,3 +187,64 @@ fn the_containment_marker_is_named_as_std_names_it() {
     let block = resolve::ChildEnv::capture(&snapshot, &ops).into_block().unwrap();
     assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0__cosca_group_root=1\0\0");
 }
+
+// `image_for`: the Search/Exact distinction, at the one site that applies it ────────────
+//
+// This is the behaviour `raw_executable()` exists to create, and it had no test: the
+// `command_tests` cases exercise only the getters, and `spawn_tests` only backend routing.
+// These run on the Windows CI runner rather than the host, because `image_for` is inside the
+// `cfg(windows)` raw backend — the `Exact` arm touches no Win32 API, but it cannot be compiled
+// off Windows to be reached.
+
+/// [`image_for`] against the `PATH` a spawn of `cmd` would give its child.
+fn image(cmd: &Command) -> Result<Option<PathBuf>, Error> {
+    image_for(cmd, spawn_env(cmd)?.path.as_deref())
+}
+
+#[test]
+fn image_for_leaves_an_exact_program_completely_unresolved() {
+    // The contract in one assertion: a BARE name, which `executable()` would look up on PATH and
+    // turn absolute (and would append `.exe` to), survives byte-for-byte.
+    let mut cmd = Command::new();
+    cmd.raw_executable("tool").args(["tool"]);
+    let image = image(&cmd).expect("an exact program is never resolved, so it cannot fail");
+    assert_eq!(
+        image.as_deref(),
+        Some(Path::new("tool")),
+        "raw_executable must reach lpApplicationName exactly as written"
+    );
+}
+
+#[test]
+fn image_for_resolves_a_search_program_to_an_absolute_path() {
+    // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
+    // the same bare name through `executable()` is resolved and absolute. `cmd` is chosen because
+    // it lives in the System32 directory the bare-name search visits on any Windows host.
+    let mut cmd = Command::new();
+    cmd.executable("cmd").args(["cmd"]);
+    let image = image(&cmd).expect("cmd resolves on any Windows host").unwrap();
+    assert!(
+        image.is_absolute(),
+        "a Search program must be absolute by the time the backend sees it, got {image:?}"
+    );
+    assert_ne!(image, Path::new("cmd"), "it must actually have been resolved");
+}
+
+#[test]
+fn image_for_rejects_an_empty_exact_program() {
+    // An empty `lpApplicationName` is a pointer to a lone NUL, not the NULL pointer, and whether
+    // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
+    let mut cmd = Command::new();
+    cmd.raw_executable("").args(["tool"]);
+    assert!(image(&cmd).is_err(), "an empty exact program must be refused");
+}
+
+#[test]
+fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
+    // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
+    // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.
+    let mut cmd = Command::new();
+    cmd.args(["cmd", "/C", "exit 0"]);
+    let image = image(&cmd).expect("argv[0] resolves").unwrap();
+    assert!(image.is_absolute(), "the fallback must resolve too, got {image:?}");
+}

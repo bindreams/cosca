@@ -222,7 +222,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCL
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
-use crate::command::CommandInput;
+use crate::command::{CommandInput, ExecutableSpec};
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
@@ -338,9 +338,11 @@ fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
 }
 
 /// The loaded image. Honors `executable()`; an argv[0] distinct from a set `executable()` cannot
-/// be preserved by runas.
+/// be preserved by runas. A `raw_executable()` program is additionally COMPLETED to an absolute
+/// path — see the `Exact` arm below for why that is the opposite of searching for it.
 fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error> {
-    match cmd.executable_path() {
+    // The token AS WRITTEN, before any completion: argv[0], or the explicit executable.
+    let token = match cmd.executable_path() {
         Some(exe) => {
             if argv[0].as_os_str() != exe.as_os_str() {
                 return Err(Error::Unsupported {
@@ -349,9 +351,42 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
                     detail: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image".into(),
                 });
             }
-            Ok(exe.as_os_str().to_os_string())
+            exe.as_os_str().to_os_string()
         }
-        None => Ok(argv[0].clone()),
+        None => argv[0].clone(),
+    };
+
+    // `raw_executable()` promises "load exactly this file — no PATH search, no .exe appending, no
+    // existence check". On the raw backend that is free: `CreateProcessW` completes a partial
+    // `lpApplicationName` against the calling process's current directory and explicitly "will not
+    // use the search path". `ShellExecuteEx` is the opposite — a path-less `lpFile` IS searched,
+    // with `PATHEXT` applied and `lpDirectory` consulted as a search location (measured). So
+    // handing an `Exact` token through untouched here would not preserve the contract, it would
+    // DESTROY it: "load exactly this" would silently become "go find something like this",
+    // elevated, which is the one place that matters most.
+    //
+    // Completing the name ourselves is what keeps the two paths agreeing. `absolutise_exact` uses
+    // the same base the loader does and performs no search, no extension guessing and no
+    // filesystem access, so the promise survives verbatim and `lpFile` is absolute — and an
+    // absolute `lpFile` is taken verbatim by `ShellExecuteEx`.
+    //
+    // A `Search` token is NOT resolved here yet: `executable()` on the elevated path still reaches
+    // `ShellExecuteEx`'s own search unresolved. That is the pre-existing hole tracked as #135 and
+    // closed in the follow-up; it is deliberately not widened by this change, and `executable()`'s
+    // doc says so plainly.
+    //
+    // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
+    // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the
+    // same "program path" name, ahead of every other field — see its doc.
+    //
+    // Spelled out rather than `_ =>`: the discriminant IS the feature here, and this is the
+    // security sink. A future `ExecutableSpec` variant must not compile silently into the
+    // SEARCHING branch, which is the unsafe default.
+    match cmd.executable_spec() {
+        Some(ExecutableSpec::Exact(p)) => {
+            Ok(crate::child::spawn::windows_raw::resolve::absolutise_exact(p)?.into_os_string())
+        }
+        Some(ExecutableSpec::Search(_)) | None => Ok(token),
     }
 }
 
@@ -431,7 +466,11 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     let params_w = wide_nul("argument line", params.as_os_str())?;
     let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
-    // Refuse a `.bat`/`.cmd` SPELLED IN THE CALLER'S TOKEN. `ShellExecuteEx`'s `runas` resolves the
+    // Refuse a `.bat`/`.cmd` spelled in the program `elevated_program` returned — the caller's
+    // TOKEN, except on the `Exact` arm, where it is that token completed to an absolute path.
+    // (Completion only prefixes a directory and applies Win32's own normalisation, so it can add a
+    // `.bat` reading but never remove one; over-rejection is the safe direction here.)
+    // `ShellExecuteEx`'s `runas` resolves the
     // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into `%*`
     // UNESCAPED — and `join_wide` quotes only for whitespace, never for cmd metacharacters, so
     // `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED cmd.exe. That is
@@ -447,8 +486,9 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // resolves the token as a path, so `setup.bat.`, `setup.bat ` and `C:\tools\.bat` all reach the
     // same batch file while `Path::extension()` reads `None` or something that is not `bat`. That
     // class is closed by the batch-gate PR merging immediately before this one, which replaces the
-    // `Path::extension()` reading with a byte-level effective-name computation. NOTHING IN THIS
-    // TREE closes it: until that merge lands, do not read the gate below as covering it.
+    // `Path::extension()` reading with a byte-level effective-name computation. On the `Exact` arm
+    // `absolutise_exact` additionally hands this gate Win32's OWN normalisation of the token, so
+    // the trimmed spellings arrive already trimmed; the `Search` arm still gets the raw token.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {

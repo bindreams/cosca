@@ -1,10 +1,20 @@
 //! Which file a `Command` loads — on the spawn paths that currently consult it.
 //!
 //! **Coverage today: only the Windows raw `CreateProcessW` backend (sync and its tokio mirror),
-//! reached when `Command::executable_path()` is set or an fd >= 3 is mapped.** Every other spawn
-//! path resolves the program name itself, ignorant of this module entirely: POSIX spawning still
-//! calls `execvp`/`posix_spawn`'s own PATH search directly, and the Windows elevated
-//! (`ShellExecuteEx`) path still passes its `lpFile` through unresolved. `src/lib.rs`'s
+//! and only for a `Search` program** — i.e. one recorded by `Command::executable()`, or the
+//! argv[0]/first-token fallback when neither setter was called. That backend is reached when
+//! `Command::executable_path()` is set or an fd >= 3 is mapped.
+//!
+//! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through here
+//! on any path: "load exactly this file" is the absence of this module's policy, not an
+//! application of it. On the elevated path it is completed to an absolute path by
+//! `windows_raw::resolve::absolutise_exact`, which searches nothing — see its doc for why
+//! `ShellExecuteEx` forces that step where `CreateProcessW` does not.
+//!
+//! Every other spawn path resolves the program name itself, ignorant of this module entirely:
+//! POSIX spawning still calls `execvp`/`posix_spawn`'s own PATH search directly, and the Windows
+//! elevated (`ShellExecuteEx`) path still passes a `Search` `lpFile` through unresolved (#135).
+//! `src/lib.rs`'s
 //! `#[cfg_attr(not(windows), allow(dead_code))]` on this module tracks exactly that: the `allow`
 //! goes away once the POSIX and default spawn paths route through it too.
 //! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
