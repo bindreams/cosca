@@ -105,6 +105,14 @@ impl Command {
     /// the loaded image (`lpApplicationName`) independently of the command line
     /// (`lpCommandLine`), so `executable` selects the file that runs while the
     /// child's `argv[0]` is the command line's first token.
+    ///
+    /// Without `executable`, the loaded image comes from `line`'s own first token instead (see
+    /// [`crate::quote::windows::first_token_and_rest_wide`]'s doc for exactly how that token is
+    /// extracted). An UNQUOTED path containing a space fails closed with `NotFound` there rather
+    /// than being found via successive whitespace-delimited prefixes the way a NULL
+    /// `lpApplicationName` would be by `CreateProcessW` itself — see that doc for why (it is the
+    /// classic unquoted-service-path hijack vector, deliberately not replicated). Quote such a
+    /// path.
     pub fn commandline<S: Into<OsString>>(&mut self, line: S) -> &mut Command {
         self.input = CommandInput::CommandLine(line.into());
         self
@@ -119,15 +127,16 @@ impl Command {
     /// `executable("/bin/busybox").args(["sh", "-c", "..."])` correctly loads
     /// busybox while the child sees `"sh"` as its `argv[0]`.
     ///
-    /// On Windows, a set `executable` spawns through the raw `CreateProcessW`
-    /// backend, which sets `lpApplicationName` independently of `lpCommandLine` —
-    /// so `argv[0]` is preserved (it no longer degrades to the executable path), and
-    /// combining `executable` with [`commandline`](Self::commandline) is supported.
-    /// A bare or relative `executable` is resolved with a deliberate rule (not full
-    /// `CreateProcessW` search parity): a name containing a path separator resolves
-    /// against the working directory with no search, while a true bare name is looked
-    /// up in `PATH` **only — never the current directory**, appending `.exe` when the
-    /// name has no extension. Searching the current directory first was the previous
+    /// On Windows, for an UNELEVATED spawn, a set `executable` routes through the raw
+    /// `CreateProcessW` backend, which sets `lpApplicationName` independently of
+    /// `lpCommandLine` — so `argv[0]` is preserved (it no longer degrades to the
+    /// executable path), and combining `executable` with
+    /// [`commandline`](Self::commandline) is supported. A bare or relative
+    /// `executable` is resolved with a deliberate rule (not full `CreateProcessW`
+    /// search parity): a name containing a path separator resolves against the
+    /// working directory with no search, while a true bare name is looked up in
+    /// `PATH` **only — never the current directory**, appending `.exe` when the name
+    /// has no extension. Searching the current directory first was the previous
     /// behaviour and was a binary-planting hazard: `executable("helper")` would load a
     /// `helper.exe` dropped in whatever directory the process happened to sit in.
     /// Write `./helper` to reach it explicitly.
@@ -136,6 +145,13 @@ impl Command {
     /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
     /// resolving it would need drive C's own current directory, which cosca does not
     /// track, so it fails closed instead of guessing.
+    ///
+    /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
+    /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
+    /// backend (and this resolver) described above, so a bare or relative
+    /// `executable` there is neither searched in `PATH` nor refused for a
+    /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
+    /// unresolved.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(path.into());
         self
