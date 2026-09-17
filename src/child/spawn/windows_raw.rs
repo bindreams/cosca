@@ -55,7 +55,15 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd)?;
 
-    let image: Option<PathBuf> = cmd.executable_path().map(resolve::resolve_executable).transpose()?;
+    // A route to this backend never implies `executable()` is set (it can be reached purely by
+    // `fd >= 3`, see `routes_to_raw_backend`). Falling back to `program_token` here keeps
+    // `lpApplicationName` non-NULL either way: a NULL `lpApplicationName` makes `CreateProcessW`
+    // search for the image ITSELF, including the current directory, reopening the binary-planting
+    // hole this resolver otherwise closes.
+    let program: Option<PathBuf> = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
+    let image: Option<PathBuf> = program
+        .map(|p| resolve::resolve_executable(&p, cmd.cwd()))
+        .transpose()?;
     if let Some(p) = &image {
         resolve::ensure_no_nul_wide(p.as_os_str())?;
     }
@@ -313,7 +321,11 @@ pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
 }
 
 /// The program token (argv[0] / command-line first token) when `executable()` is unset.
-fn program_token(cmd: &Command) -> Option<PathBuf> {
+/// `pub(crate)`: shared with the async raw backend, and with `spawn_raw` itself, which resolves
+/// this token through [`resolve::resolve_executable`] so `lpApplicationName` is never NULL (a
+/// NULL `lpApplicationName` makes `CreateProcessW` perform its OWN search, which includes the
+/// current directory — the exact binary-planting hole this module's resolution otherwise closes).
+pub(crate) fn program_token(cmd: &Command) -> Option<PathBuf> {
     match cmd.input() {
         CommandInput::Empty => None,
         CommandInput::Argv(argv) => argv.first().map(PathBuf::from),

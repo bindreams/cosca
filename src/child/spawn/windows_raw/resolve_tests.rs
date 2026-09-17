@@ -5,7 +5,7 @@ use std::ffi::OsString;
 #[test]
 fn resolve_absolute_existing_is_returned_as_is() {
     let me = std::env::current_exe().unwrap();
-    assert_eq!(resolve_executable(&me).unwrap(), me);
+    assert_eq!(resolve_executable(&me, None).unwrap(), me);
 }
 #[test]
 fn resolve_bare_name_is_not_taken_from_base_cwd() {
@@ -20,11 +20,61 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
 }
 #[test]
 fn resolve_bare_name_appends_exe_from_path() {
-    let p = resolve_executable(std::path::Path::new("cmd")).unwrap();
+    let p = resolve_executable(std::path::Path::new("cmd"), None).unwrap();
     assert!(
         p.is_absolute() && p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
         "{p:?}"
     );
+}
+// B1: `resolve_executable`'s `cmd_cwd` parameter ─────────────────────────────────────
+//
+// The resolver was designed for the CHILD's cwd (`Command::cwd()` when set, else the parent's —
+// see `crate::resolve::ResolveInput::cwd`'s doc), but `resolve_executable` used to seed
+// `base_cwd` purely from `std::env::current_dir()`, silently ignoring a `Command::cwd()`
+// override. That broke the documented escape hatch: "write `./helper` to reach the current
+// directory explicitly" landed on the PARENT's ambient directory instead of the child's, which is
+// the exact directory this crate exists to stop trusting.
+#[test]
+fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
+    let process_dir = tempfile::tempdir().unwrap();
+    let cmd_dir = tempfile::tempdir().unwrap();
+    let want = std::fs::copy(
+        std::env::current_exe().unwrap(),
+        cmd_dir.path().join("sp_b1_helper.exe"),
+    )
+    .map(|_| cmd_dir.path().join("sp_b1_helper.exe"))
+    .unwrap();
+    // A DIFFERENT file at the identical relative name under the PROCESS's own cwd: if the
+    // process cwd leaked into resolution, this decoy is the one that would resolve.
+    std::fs::copy(
+        std::env::current_exe().unwrap(),
+        process_dir.path().join("sp_b1_helper.exe"),
+    )
+    .unwrap();
+
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(process_dir.path()).unwrap();
+    // Located name (contains a separator) — resolves against the given cwd with no PATH search.
+    let got = resolve_executable(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()));
+    std::env::set_current_dir(prev).unwrap();
+
+    assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+#[test]
+fn resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_b1_fallback.exe")).unwrap();
+    let want = dir.path().join("sp_b1_fallback.exe");
+
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+    // `cmd_cwd: None` mirrors an unset `Command::cwd()` — the doc says that means "the parent's",
+    // i.e. the real process cwd, so the `None` fallback must still reach it rather than resolving
+    // nothing.
+    let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None);
+    std::env::set_current_dir(prev).unwrap();
+
+    assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 #[test]
 fn empty_ops_inherit() {

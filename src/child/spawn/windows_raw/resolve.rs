@@ -18,14 +18,29 @@ use crate::error::Error;
 
 // Program resolution =====
 
-/// Resolve `exe` against the current process's cwd and `PATH`.
+/// Resolve `exe` against the CHILD's cwd and the current process's `PATH`.
 ///
-/// Convenience wrapper over [`resolve_executable_in`] seeded from
-/// [`std::env::current_dir`] and the `PATH` variable.
-pub(crate) fn resolve_executable(exe: &Path) -> Result<PathBuf, Error> {
-    let base_cwd = std::env::current_dir()?;
+/// `cmd_cwd` is `Command::cwd()` — the directory the child will actually run in. When it is
+/// `None` (no override was set), the child inherits the parent's cwd, so
+/// [`std::env::current_dir`] is the correct fallback. Seeding resolution from the parent's cwd
+/// UNCONDITIONALLY (ignoring a `Command::cwd()` override) would resolve `./helper` against the
+/// wrong directory: the doc on [`crate::resolve::ResolveInput::cwd`] promises the CHILD's
+/// directory, and that promise is also the documented escape hatch for reaching "the current
+/// directory explicitly" — reaching the parent's instead defeats it.
+///
+/// Convenience wrapper over [`resolve_executable_in`] seeded from `cmd_cwd` (or
+/// [`std::env::current_dir`]) and the `PATH` variable.
+pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>) -> Result<PathBuf, Error> {
+    let base_cwd;
+    let base_cwd: &Path = match cmd_cwd {
+        Some(dir) => dir,
+        None => {
+            base_cwd = std::env::current_dir()?;
+            &base_cwd
+        }
+    };
     let path = std::env::var_os("PATH");
-    resolve_executable_in(exe, &base_cwd, path.as_deref())
+    resolve_executable_in(exe, base_cwd, path.as_deref())
 }
 
 /// Resolve `exe` against an explicit `base_cwd` and `PATH` string.

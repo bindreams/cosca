@@ -81,14 +81,55 @@ fn final_component_has_dot(name: &OsStr, windows: bool) -> bool {
 }
 
 /// Split a `PATH` value on the simulated platform's separator.
+///
+/// On Windows a `PATH` element may be wrapped in a pair of `"` quotes, letting a directory that
+/// contains a literal `;` (or leading/trailing space) survive as ONE element rather than being
+/// torn in half by a naive byte-level `;` split. The quotes are consumed as delimiters, not
+/// content: `"C:\a;b"` is one element, `C:\a;b`; a plain, unquoted `C:\bin` passes through
+/// unchanged. Leaving the quotes IN the element would fail the `is_absolute()` filter the caller
+/// applies afterwards (a leading `"` is not a recognised drive prefix), so a quoted entry would
+/// be SILENTLY DROPPED rather than erroring — stripping them here is what keeps it alive.
+///
+/// On POSIX, `"` is an ordinary filename character and `;` is not a separator: quoting is
+/// deliberately NOT applied there — only `:` splits, and any quote characters in an element are
+/// preserved literally, matching every POSIX shell's own (quote-free) `PATH` handling.
 fn split_path_var(var: Option<&OsStr>, windows: bool) -> Vec<PathBuf> {
-    let sep = if windows { b';' } else { b':' };
     let Some(var) = var else { return Vec::new() };
-    var.as_encoded_bytes()
-        .split(move |&b| b == sep)
+    let bytes = var.as_encoded_bytes();
+    if windows {
+        split_path_var_windows(bytes)
+    } else {
+        split_path_var_posix(bytes)
+    }
+}
+
+fn split_path_var_posix(bytes: &[u8]) -> Vec<PathBuf> {
+    bytes
+        .split(|&b| b == b':')
         // SAFETY: the bytes came from `as_encoded_bytes` and are split on an ASCII byte, which
         // is the documented-safe way to slice an `OsStr`'s encoded form.
         .map(|part| PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(part) }))
+        .collect()
+}
+
+/// Windows `PATH` splitting with quote handling — see [`split_path_var`]'s doc for the rule.
+fn split_path_var_windows(bytes: &[u8]) -> Vec<PathBuf> {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut in_quotes = false;
+    for &b in bytes {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b';' if !in_quotes => parts.push(std::mem::take(&mut current)),
+            _ => current.push(b),
+        }
+    }
+    parts.push(current);
+    parts
+        .into_iter()
+        // SAFETY: the bytes came from `as_encoded_bytes`; dropping quote bytes and splitting on
+        // an ASCII byte are both the documented-safe way to slice an `OsStr`'s encoded form.
+        .map(|part| PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(&part) }))
         .collect()
 }
 

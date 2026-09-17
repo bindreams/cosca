@@ -96,3 +96,27 @@ async fn async_contained_raw_child_is_in_our_job() {
     assert_eq!(s, "x");
     child.kill_tree().expect("kill_tree");
 }
+
+/// Async twin of sync `fd3_only_routing_does_not_load_a_binary_planted_in_cwd`: a `Command` with no
+/// `.executable()` still routes to the async raw backend purely via fd >= 3, so `image` used to be
+/// `None` and `lpApplicationName` NULL — letting `CreateProcessW` search the current directory
+/// itself and reopening the binary-planting hole. A same-named copy of `testbin` planted in the
+/// child's cwd, with nothing of that name on `PATH`, proves the fix: the bare argv[0] is resolved
+/// through the crate's own PATH-only resolver, so the planted copy is never loaded and the spawn
+/// fails closed with `NotFound`.
+#[tokio::test]
+async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
+
+    let mut c = cosca::tokio::Command::new();
+    c.args(["cosca_testbin", "exit", "0"])
+        .current_dir(dir.path())
+        .fd(3, cosca::Stdio::pipe_out())
+        .unwrap();
+    let e = c.spawn().unwrap_err();
+    assert!(
+        matches!(&e, cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+        "{e:?}"
+    );
+}

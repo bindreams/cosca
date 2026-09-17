@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
@@ -252,9 +253,16 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // Batch reject on the program token, resolve the executable, NUL-check, build the command line
     // — all shared verbatim with the sync raw backend.
     sync_raw::reject_batch_program(cmd)?;
-    let image = cmd
+    // A route to this backend never implies `executable()` is set (it can be reached purely by
+    // `fd >= 3`, see `routes_to_raw_backend`). Falling back to `program_token` keeps
+    // `lpApplicationName` non-NULL either way — mirrors the sync raw backend exactly (see its
+    // comment for why a NULL `lpApplicationName` would reopen the binary-planting hole).
+    let program: Option<PathBuf> = cmd
         .executable_path()
-        .map(sync_raw::resolve::resolve_executable)
+        .map(PathBuf::from)
+        .or_else(|| sync_raw::program_token(cmd));
+    let image = program
+        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd()))
         .transpose()?;
     if let Some(p) = &image {
         sync_raw::resolve::ensure_no_nul_wide(p.as_os_str())?;

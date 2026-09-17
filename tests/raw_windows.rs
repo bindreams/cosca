@@ -278,3 +278,29 @@ fn uncontained_raw_child_has_no_containment() {
         .unwrap();
     assert!(matches!(c.spawn().unwrap().containment(), cosca::Containment::None));
 }
+
+/// A `Command` with NO `.executable()` set still routes to the raw backend purely because it wires
+/// fd >= 3 (`routes_to_raw_backend`'s other trigger, independent of `executable()`). With no
+/// `executable()`, `image` used to be `None`, handing `CreateProcessW` a NULL `lpApplicationName`
+/// — which makes `CreateProcessW` perform its OWN image search, including the current directory,
+/// reopening the exact binary-planting hole (CWE-426/427) this crate's resolver otherwise closes.
+/// A same-named copy of `testbin` planted in the child's cwd, with nothing of that name on `PATH`,
+/// proves the fix: the bare argv[0] is resolved through the crate's own PATH-only resolver
+/// (`lpApplicationName` is never NULL), so the planted cwd copy is never loaded and the spawn fails
+/// closed with `NotFound` rather than silently launching the planted binary.
+#[test]
+fn fd3_only_routing_does_not_load_a_binary_planted_in_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(common::testbin(), dir.path().join("cosca_testbin.exe")).unwrap();
+
+    let mut c = cosca::Command::new();
+    c.args(["cosca_testbin", "exit", "0"])
+        .current_dir(dir.path())
+        .fd(3, cosca::Stdio::pipe_out())
+        .unwrap();
+    let e = c.spawn().unwrap_err();
+    assert!(
+        matches!(&e, cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+        "{e:?}"
+    );
+}

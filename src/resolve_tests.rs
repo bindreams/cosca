@@ -51,6 +51,38 @@ fn path_var_is_split_on_the_simulated_platforms_separator() {
     );
 }
 
+// ── N1: quoted PATH elements ─────────────────────────────────────────────────────────
+
+#[test]
+fn windows_path_var_quoting_protects_an_embedded_separator() {
+    // A Windows PATH element may be wrapped in `"` so a directory containing a literal `;`
+    // survives as ONE element rather than being torn in half by a naive byte-level `;` split.
+    let got = split_path_var(Some(OsStr::new(r#""C:\a;b";C:\c"#)), true);
+    assert_eq!(got, vec![PathBuf::from(r"C:\a;b"), PathBuf::from(r"C:\c")], "{got:?}");
+}
+
+#[test]
+fn windows_path_var_quoting_strips_the_wrapping_quotes() {
+    // A quoted-but-unstripped element (`"C:\bin"`, quote characters retained) fails the
+    // `is_absolute()` filter downstream — a leading `"` is not a recognised drive prefix — and
+    // is therefore SILENTLY DROPPED rather than erroring, the exact hole this fix closes.
+    // `is_absolute()` itself is host-specific (see this file's HOST_WINDOWS note), so that half
+    // of the claim is proven separately, end to end, by
+    // `a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped` on a real Windows
+    // host; this test pins only the quote-stripping itself, which is pure byte logic.
+    let got = split_path_var(Some(OsStr::new(r#""C:\bin""#)), true);
+    assert_eq!(got, vec![PathBuf::from(r"C:\bin")], "{got:?}");
+}
+
+#[test]
+fn posix_path_var_quotes_are_not_special() {
+    // On POSIX, `"` is an ordinary filename character and `;` is not a PATH separator: quoting
+    // must NOT be applied there. Only `:` splits, and any quote characters in an element are
+    // preserved literally (they are part of the path, not delimiters).
+    let got = split_path_var(Some(OsStr::new(r#""/a;b":/c"#)), false);
+    assert_eq!(got, vec![PathBuf::from(r#""/a;b""#), PathBuf::from("/c")], "{got:?}");
+}
+
 #[test]
 fn exe_is_appended_only_on_windows_and_only_without_an_extension() {
     let names = |n, w| {
@@ -175,6 +207,22 @@ fn an_extensionless_file_still_resolves_when_no_exe_exists() {
     assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
+#[cfg(windows)]
+#[test]
+fn a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped() {
+    // N1, end to end: before quote handling, an unquoted split shredded `sub;dir` at the `;`,
+    // and even a quoted-but-unstripped entry failed `is_absolute()` and vanished with no error —
+    // a PATH entry that disappears rather than erroring. A real executable, reachable only
+    // through a quoted entry naming a directory that itself contains a literal `;`, must resolve.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let semi_dir = bin.path().join("sub;dir");
+    std::fs::create_dir(&semi_dir).unwrap();
+    let want = touch(&semi_dir, "tool");
+    let quoted = OsString::from(format!("\"{}\"", semi_dir.display()));
+    assert_eq!(go("tool", cwd.path(), Some(&quoted)).unwrap(), want);
+}
+
 // ── the contract every backend depends on ────────────────────────────────────────────
 
 #[test]
@@ -207,6 +255,19 @@ fn a_readable_but_non_executable_match_is_skipped() {
     assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
+/// Restores the process's current directory on drop — including while unwinding from a panic —
+/// so a test that must mutate the process-global cwd can never leave it corrupted for the rest of
+/// the (multithreaded) test binary. Paired with holding `spawn_lock()` for the guard's whole
+/// lifetime: cwd is process-global, so a bare `set_current_dir` races every concurrent spawn and
+/// every other cwd-sensitive test — the crate's own `spawn_lock()` (already used by ~24 files for
+/// exactly this) is the one lock every spawn already serializes on.
+struct RestoreCwd(PathBuf);
+impl Drop for RestoreCwd {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).expect("restore the process cwd after a cwd-mutating test");
+    }
+}
+
 #[test]
 fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     let tmp = tempfile::tempdir().unwrap();
@@ -218,11 +279,16 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&want, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let prev = std::env::current_dir().unwrap();
+    // `resolve()` absolutises a relative `cwd` via `std::env::current_dir()` (see resolve.rs's
+    // own "applied twice" note) — there is no way to exercise that fallback without actually
+    // mutating the process cwd. Serialize against every other spawn/cwd-sensitive test via the
+    // crate's spawn lock, and restore via `RestoreCwd`'s `Drop` (declared AFTER the lock guard,
+    // so it runs — and un-does the mutation — BEFORE the lock releases, even if an assertion
+    // below panics).
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = RestoreCwd(std::env::current_dir().unwrap());
     std::env::set_current_dir(tmp.path()).unwrap();
-    let got = go("./tool", Path::new("sub"), None);
-    std::env::set_current_dir(prev).unwrap();
-    let got = got.unwrap();
+    let got = go("./tool", Path::new("sub"), None).unwrap();
     assert!(got.is_absolute(), "{got:?}");
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
