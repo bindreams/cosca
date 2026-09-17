@@ -221,7 +221,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCL
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::RawChild;
-use crate::command::CommandInput;
+use crate::command::{CommandInput, ExecutableSpec};
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
@@ -296,7 +296,8 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
             detail: "set a program via .args([...]) before .elevate()".into(),
         });
     }
-    let program = match cmd.executable_path() {
+    // The token AS WRITTEN, before any resolution: argv[0], or the explicit executable.
+    let token = match cmd.executable_path() {
         Some(exe) => {
             if argv[0].as_os_str() != exe.as_os_str() {
                 return Err(Error::Unsupported {
@@ -308,6 +309,26 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
             exe.as_os_str().to_os_string()
         }
         None => argv[0].clone(),
+    };
+
+    // Gate on the INPUT token, before resolution — the same ordering the raw path uses, so a bad
+    // or nonexistent batch path errors loudly here instead of surfacing later as a spawn failure.
+    // This is the path where that vector is live: ShellExecuteEx launches batch files via cmd.exe.
+    crate::child::spawn::reject_batch_path(std::path::Path::new(&token))?;
+
+    // Then resolve. A bare `lpFile` IS searched by ShellExecuteEx — measured: PATHEXT applied and
+    // lpDirectory consulted as a search location — which bypasses cosca's resolution policy and
+    // reaches the .bat/.cmd vector the crate refuses everywhere else. An absolute `lpFile` is
+    // taken verbatim, so resolving first closes that half; `lpDirectory` still sets the child's
+    // working directory, so `current_dir()` is unaffected.
+    //
+    // An `Exact` spec is passed through untouched: `raw_executable()` means "load exactly this
+    // file", and resolving it here would honour that contract on the raw backend while silently
+    // breaking it under `.elevate()`.
+    let program = match cmd.executable_spec() {
+        Some(ExecutableSpec::Exact(_)) => token,
+        _ => crate::child::spawn::windows_raw::resolve::resolve_executable(std::path::Path::new(&token))?
+            .into_os_string(),
     };
     let tail_wide: Vec<Vec<u16>> = argv[1..].iter().map(|a| a.encode_wide().collect()).collect();
     let tail_refs: Vec<&[u16]> = tail_wide.iter().map(|v| v.as_slice()).collect();

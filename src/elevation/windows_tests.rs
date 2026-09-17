@@ -166,6 +166,56 @@ fn runas_shows_the_window_by_default() {
     assert_eq!(super::runas_show_command(&FlagsRequest::default()), SW_SHOWNORMAL);
 }
 
+// ===== the elevated path resolves before ShellExecuteEx =====
+
+/// A bare `lpFile` is SEARCHED by `ShellExecuteEx` — measured: `PATHEXT` is applied and
+/// `lpDirectory` is consulted as a search location, so it will happily launch a `.cmd`. That is
+/// the crate's own resolution policy bypassed, and the `.bat`/`.cmd` vector reached, on the one
+/// path that prompts for consent first.
+///
+/// An ABSOLUTE `lpFile` is taken verbatim (also measured), so resolving here closes the search
+/// half. `lpDirectory` still sets the child's working directory, so `current_dir()` is unaffected.
+#[test]
+fn elevated_program_is_resolved_to_an_absolute_path() {
+    let mut c = Command::new();
+    c.args(["cmd"]).elevate();
+    let (program, _params) = super::program_and_params(&c).expect("cmd resolves on any Windows host");
+    assert!(
+        std::path::Path::new(&program).is_absolute(),
+        "the elevated program must reach ShellExecuteEx already resolved, got {program:?}"
+    );
+}
+
+/// `raw_executable()` means "load exactly this file". The elevated path must not resolve it
+/// either, or the contract would hold on the raw backend and quietly break under `.elevate()`.
+#[test]
+fn an_exact_elevated_program_is_not_resolved() {
+    let mut c = Command::new();
+    c.raw_executable("cmd").args(["cmd"]).elevate();
+    let (program, _params) = super::program_and_params(&c).expect("an exact program is passed through");
+    assert_eq!(
+        program,
+        std::ffi::OsString::from("cmd"),
+        "an Exact spec must survive verbatim"
+    );
+}
+
+/// The batch gate runs on the INPUT token, before resolution — matching the raw path's ordering,
+/// so a bad or nonexistent batch path still errors loudly rather than surfacing as a spawn
+/// failure. This is the path where the vector is live: `ShellExecuteEx` launches batch files
+/// through `cmd.exe`.
+#[test]
+fn elevated_batch_program_is_rejected() {
+    for probe in ["x.bat", "x.cmd", "x.bat ", "x.bat.", "x.bat:s"] {
+        let mut c = Command::new();
+        c.args([probe]).elevate();
+        assert!(
+            is_unsupported(super::program_and_params(&c).map(|_| ())),
+            "{probe:?} must be refused before ShellExecuteEx can hand it to cmd.exe"
+        );
+    }
+}
+
 /// The consent launch accepts no creation flags at all, so a raw word is refused rather than
 /// silently dropped. Stated over the RECORDED state, not "a method was called": `creation_flags(0)`
 /// requests nothing, so there is nothing to refuse.
