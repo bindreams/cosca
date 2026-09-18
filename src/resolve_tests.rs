@@ -146,9 +146,10 @@ fn candidate(n: &str, w: bool) -> Vec<String> {
 
 #[test]
 fn bare_extensionless_name_gets_only_the_exe_candidate() {
-    // Catches the extensionless fallback candidate coming back: if `tool` (unchanged) were still a
-    // candidate, this would fail on the `vec!["tool"] not in the list` half of the assertion below
-    // even though it currently passes on the `contains "tool.exe"` half alone.
+    // Catches the extensionless fallback candidate coming back: under the old two-candidate rule
+    // this would have been `vec!["tool.exe", "tool"]`, which this exact-equality `assert_eq!`
+    // against the single-element `vec!["tool.exe"]` rejects just as surely as a candidate list of
+    // `vec!["tool"]` alone would be.
     let got = candidate("tool", true);
     assert_eq!(got, vec!["tool.exe"], "{got:?}");
 }
@@ -262,7 +263,12 @@ fn a_drive_relative_name_is_located_not_bare() {
 #[test]
 fn bare_name_is_not_resolved_from_the_current_directory() {
     let cwd = tempfile::tempdir().unwrap();
-    touch(cwd.path(), "tool");
+    // `&exe_name("tool")`, not literal `"tool"`: on a Windows host the candidate this resolution
+    // actually looks for is `tool.exe` (see the "FIX: single-candidate filename rule" tests above).
+    // Planting extensionless `tool` here made this vacuous on the one platform this test exists
+    // for — re-adding `cwd` to `Shape::BareName`'s dir list would still find nothing named
+    // `tool.exe` and this would keep passing for the wrong reason.
+    touch(cwd.path(), &exe_name("tool"));
     assert!(go("tool", cwd.path(), None).is_err(), "cwd must not be searched");
 }
 
@@ -307,8 +313,15 @@ fn empty_path_elements_are_skipped() {
     assert!(go("tool", cwd.path(), Some(&path_var(&[bin.path()]))).is_ok());
     // An empty element means "the current directory" — resolving through it would reopen the
     // binary-planting hole `resolve()`'s doc on the current directory exists to close. This is
-    // guarded by `resolve()`'s single `joined.is_absolute()` check (an empty `PATH` element joins
-    // to a relative path), not by a dedicated filter over `PATH` elements themselves.
+    // guarded by `resolve()`'s single `joined.is_absolute()` check: an empty `PATH` element joins
+    // to a RELATIVE path (`Shape::BareName` never puts `cwd` itself in `dirs`), which `is_execable`
+    // would then stat against the PROCESS's real OS cwd, not the `cwd` parameter `go()` was handed.
+    // For that hazard to be live, the process's real cwd must actually BE `cwd.path()` (holding the
+    // planted file) for the duration — otherwise deleting `joined.is_absolute() &&` still finds
+    // nothing there and this passes for the wrong reason, on any host.
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = crate::test_child::RestoreCwd::capture();
+    std::env::set_current_dir(cwd.path()).unwrap();
     let empty = if HOST_WINDOWS { ";;" } else { "::" };
     assert!(go("tool", cwd.path(), Some(OsStr::new(empty))).is_err());
 }
@@ -325,7 +338,11 @@ fn relative_path_elements_are_skipped() {
     );
     // `.` resolves against the process cwd just as surely as an empty element does — and is
     // rejected by the same `joined.is_absolute()` check `empty_path_elements_are_skipped`
-    // exercises above, not a distinct code path.
+    // exercises above, not a distinct code path. Same reasoning as there: the process's real OS cwd
+    // must actually be `cwd.path()` for this to be a live check.
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = crate::test_child::RestoreCwd::capture();
+    std::env::set_current_dir(cwd.path()).unwrap();
     assert!(go("tool", cwd.path(), Some(OsStr::new("."))).is_err());
 }
 
@@ -449,6 +466,17 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
 #[test]
 fn a_drive_relative_name_fails_closed() {
     let cwd = tempfile::tempdir().unwrap();
+    // If drive-relative resolution were ever accepted (i.e. `resolve()`'s `joined.is_absolute() &&`
+    // guard were deleted), `C:tool` would resolve via the process's REAL current directory on drive
+    // C — never the `cwd` parameter `go()` is handed, which a drive-relative candidate ignores
+    // entirely (`PathBuf::push` clears for any prefixed path, per this test's own comment below).
+    // Plant the file where the process's actual OS cwd is about to be, and mutate it there, so
+    // deleting the guard has something to find; a tempdir under `%TEMP%`, as here, lives on the
+    // runner's system drive, which is `C:` on every GitHub-hosted Windows runner this crate targets.
+    touch(cwd.path(), "tool.exe");
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = crate::test_child::RestoreCwd::capture();
+    std::env::set_current_dir(cwd.path()).unwrap();
     // Resolving it correctly needs drive C's own current directory, which cosca does not track.
     assert!(go("C:tool", cwd.path(), None).is_err());
 }

@@ -94,7 +94,21 @@ fn resolve_executable_env_clear_defeats_ambient_path() {
     // `Command::env_clear()` means the child sees NO environment at all, PATH included — the
     // resolver must not silently fall back to searching the PARENT's PATH once the child's own is
     // cleared.
-    let got = resolve_executable(std::path::Path::new("sp_env_clear"), None, &[EnvOp::Clear]);
+    //
+    // `[Set(PATH, dir), Clear]`, not bare `[Clear]`: with `EnvOp::Clear => path = None` deleted from
+    // `effective_path_var` (silently absorbed by its `_ => {}` arm), a bare `[Clear]` leaves the
+    // AMBIENT `PATH` in force, which never happens to contain this fabricated tempdir — so `is_err()`
+    // held for the wrong reason. Setting PATH to a directory that WOULD resolve, then clearing it,
+    // means Clear must actually discard a PATH that works, mirroring the sibling
+    // `..._env_remove_path_defeats_ambient_path` test's shape below.
+    let got = resolve_executable(
+        std::path::Path::new("sp_env_clear"),
+        None,
+        &[
+            EnvOp::Set(OsString::from("PATH"), dir.path().as_os_str().to_os_string()),
+            EnvOp::Clear,
+        ],
+    );
     assert!(got.is_err(), "{got:?}");
 }
 #[test]
@@ -224,8 +238,14 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
     // shadow the real executable found later on PATH — a directory can never run.
     // The shadow directory lives on PATH, AHEAD of the real executable: base_cwd is no longer
     // searched, so planting it there would no longer exercise the `is_file` guard at all.
+    //
+    // Named `sp_dirtool.exe`, not extensionless `sp_dirtool`: the single-candidate rule (see
+    // `crate::resolve`'s `filename_candidates` doc) means the only filename ever tried for a bare
+    // `sp_dirtool` is `sp_dirtool.exe`. An extensionless shadow directory is never even looked at,
+    // which would make `is_file()` -> `exists()` a silently green one-line mutation here — the
+    // shadow has to be named exactly what the search will actually stat.
     let shadow_dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(shadow_dir.path().join("sp_dirtool")).unwrap();
+    std::fs::create_dir(shadow_dir.path().join("sp_dirtool.exe")).unwrap();
     let path_copy = other.path().join("sp_dirtool.exe");
     std::fs::copy(std::env::current_exe().unwrap(), &path_copy).unwrap();
     let joined = std::env::join_paths([shadow_dir.path(), other.path()]).unwrap();
@@ -242,7 +262,16 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
 fn resolve_absolute_directory_is_not_returned() {
     let dir = tempfile::tempdir().unwrap();
     // An absolute path naming an existing *directory* is not a runnable program.
-    let got = resolve_executable_in(dir.path(), std::path::Path::new("."), &[], None);
+    //
+    // The directory itself is named `...exe` so `filename_candidates` leaves the name unchanged
+    // (its final component already ends in `.exe`) and the joined candidate is exactly this
+    // existing directory. Passing `dir.path()` bare would instead produce a candidate of
+    // `<tempdir-name>.exe`, which exists under NEITHER `is_file()` NOR `exists()` — making
+    // `is_file()` -> `exists()` a silently green one-line mutation, since nothing was ever there to
+    // tell the two checks apart.
+    let sub = dir.path().join("sp_dir_shadow.exe");
+    std::fs::create_dir(&sub).unwrap();
+    let got = resolve_executable_in(&sub, std::path::Path::new("."), &[], None);
     assert!(got.is_err(), "{got:?}");
 }
 #[test]
@@ -289,17 +318,37 @@ fn clear_only_yields_empty_double_nul_block() {
 #[test]
 fn windows_system_dirs_are_real_existing_directories() {
     let dirs = windows_system_dirs();
-    // App dir, System32, and the Windows directory should all resolve under `cargo test`; assert
-    // loosely (`>= 2`) so a single unrelated `current_exe()` hiccup doesn't fail this test for a
-    // reason unrelated to the Win32 calls this test exists to check.
-    assert!(dirs.len() >= 2, "{dirs:?}");
     for dir in &dirs {
         assert!(dir.is_dir(), "{dir:?} is not a real, existing directory");
     }
-    let system32 = dirs
-        .iter()
-        .find(|d| d.file_name().is_some_and(|n| n.eq_ignore_ascii_case("system32")));
-    assert!(system32.is_some(), "System32 missing from {dirs:?}");
+
+    // Exercise all THREE individual sources by calling each private accessor directly, not just
+    // the aggregate: a bound like `dirs.len() >= 2` (the old assertion here) survives deleting
+    // EITHER the `app_dir()` or the `get_windows_directory()` line from `windows_system_dirs`,
+    // even though this test's own preamble claims to cover all three. All three should resolve
+    // under `cargo test` on a real Windows runner, so each is asserted present outright rather than
+    // loosely.
+    let app = app_dir();
+    let sys32 = get_system_directory();
+    let win = get_windows_directory();
+    assert!(app.is_some(), "current_exe()'s parent should resolve under cargo test");
+    assert!(sys32.is_some(), "GetSystemDirectoryW should succeed under cargo test");
+    assert!(win.is_some(), "GetWindowsDirectoryW should succeed under cargo test");
+    let (app, sys32, win) = (app.unwrap(), sys32.unwrap(), win.unwrap());
+    assert!(dirs.contains(&app), "app dir {app:?} missing from {dirs:?}");
+    assert!(dirs.contains(&sys32), "System32 {sys32:?} missing from {dirs:?}");
+    assert!(dirs.contains(&win), "Windows dir {win:?} missing from {dirs:?}");
+
+    // Pin the ORDER too: app dir -> System32 -> Windows dir is the policy both
+    // `crate::resolve::ResolveInput::system_dirs` and the public `executable()` doc state — all
+    // three being merely PRESENT, in any order, would still let a widening regression (system-dir
+    // precedence over PATH silently reshuffled) through undetected.
+    let pos = |d: &PathBuf| dirs.iter().position(|x| x == d).unwrap();
+    let (app_pos, sys32_pos, win_pos) = (pos(&app), pos(&sys32), pos(&win));
+    assert!(
+        app_pos < sys32_pos && sys32_pos < win_pos,
+        "expected app dir < System32 < Windows dir, got positions {app_pos}, {sys32_pos}, {win_pos} in {dirs:?}"
+    );
 }
 
 #[test]
