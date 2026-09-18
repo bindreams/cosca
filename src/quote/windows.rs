@@ -70,6 +70,21 @@ fn append_arg(cmd: &mut Vec<u16>, arg: &[u16]) {
 /// line AFTER the first token (with the separating whitespace consumed). Used
 /// to feed `raw_arg` the args-only portion (std prepends the program itself).
 /// Returns `None` only for empty/whitespace-only input.
+///
+/// # Behaviour change from `CreateProcessW`'s own NULL-`lpApplicationName` heuristic
+///
+/// An UNQUOTED, unescaped token containing a space (e.g. `C:\Program Files\svc.exe arg`, with no
+/// surrounding `"`) stops at the first space here, same as any other unquoted token: the "program"
+/// extracted is just `C:\Program`, which then fails to resolve (`NotFound`) rather than launching
+/// anything. This is a deliberate, documented deviation from `CreateProcessW`'s own behaviour when
+/// `lpApplicationName` is NULL: the OS instead tries successive whitespace-delimited PREFIXES of
+/// the line as candidate images (`C:\Program.exe`, then `C:\Program Files\svc.exe`, ...) — the
+/// classic "unquoted service path" hijack vector, where a writable `C:\Program.exe` hijacks a
+/// service whose real, legitimate target is `C:\Program Files\svc.exe`. Failing closed instead of
+/// retrying is the safer choice cosca makes deliberately, but it IS an observable behaviour change
+/// versus that OS heuristic for anyone relying on it: an unquoted, spaced program path that the OS
+/// would previously have found (correctly or via the hijack vector) now reliably errors instead.
+/// The fix is on the caller: quote the path (`"C:\Program Files\svc.exe" arg`).
 pub fn first_token_and_rest_wide(cmd: &[u16]) -> Option<(Vec<u16>, Vec<u16>)> {
     let mut i = 0usize;
     while i < cmd.len() && is_blank(cmd[i]) {

@@ -1,70 +1,184 @@
 //! Program resolution + Windows environment-block construction for the raw
 //! `CreateProcessW` backend.
 //!
-//! [`resolve_executable`] applies a deliberate cwd+`PATH`+`.exe` rule (base cwd
-//! first, then `PATH` directories; append `.exe` only when the program has no
-//! extension) rather than full `CreateProcessW` search parity — this keeps
-//! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate
-//! concern. [`build_env_block`] produces the sorted, wide, double-NUL block
-//! `CreateProcessW` expects from a recorded [`EnvOp`] sequence.
+//! [`resolve_executable`] delegates to [`crate::resolve`] (a bare name is looked up in the
+//! system directories — app dir, System32, the Windows directory — and then `PATH`, never the
+//! current directory; `.exe` is appended unless the name's final component already ends in `.exe`
+//! or `.com`, case-insensitively) rather than full `CreateProcessW` search parity — this keeps
+//! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate concern. The
+//! system-directory step exists to reproduce
+//! `CreateProcessW`'s own NULL-`lpApplicationName` search order minus the current directory: see
+//! [`crate::resolve::ResolveInput::system_dirs`] for why dropping only the cwd (and not also the
+//! system directories' precedence over `PATH`) is what keeps this a strict narrowing of that
+//! order rather than trading one hazard for another. [`build_env_block`] produces the sorted,
+//! wide, double-NUL block `CreateProcessW` expects from a recorded [`EnvOp`] sequence.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 
 use crate::command::EnvOp;
 use crate::error::Error;
 
 // Program resolution =====
 
-/// Resolve `exe` against the current process's cwd and `PATH`.
+/// Resolve `exe` against the CHILD's cwd and the CHILD's `PATH`.
 ///
-/// Convenience wrapper over [`resolve_executable_in`] seeded from
-/// [`std::env::current_dir`] and the `PATH` variable.
-pub(crate) fn resolve_executable(exe: &Path) -> Result<PathBuf, Error> {
-    let base_cwd = std::env::current_dir()?;
-    let path = std::env::var_os("PATH");
-    resolve_executable_in(exe, &base_cwd, path.as_deref())
+/// `cmd_cwd` is `Command::cwd()` — the directory the child will actually run in. When it is
+/// `None` (no override was set), the child inherits the parent's cwd, so
+/// [`std::env::current_dir`] is the correct fallback. Seeding resolution from the parent's cwd
+/// UNCONDITIONALLY (ignoring a `Command::cwd()` override) would resolve `./helper` against the
+/// wrong directory: the doc on [`crate::resolve::ResolveInput::cwd`] promises the CHILD's
+/// directory, and that promise is also the documented escape hatch for reaching "the current
+/// directory explicitly" — reaching the parent's instead defeats it.
+///
+/// `env_ops` is `Command::env_ops()` — the same recorded `env()`/`env_remove()`/`env_clear()`
+/// sequence [`build_env_block`] turns into the child's actual environment block. `PATH` is looked
+/// up through [`effective_path_var`], which replays those ops over the ambient `PATH` the same
+/// way [`build_env_block_from`] replays them over the ambient environment, so the directories
+/// searched here are the ones the CHILD will actually have — not silently the parent's, which
+/// [`crate::resolve::ResolveInput::path_var`]'s own doc already promises.
+///
+/// Convenience wrapper over [`resolve_executable_in`] seeded from `cmd_cwd` (or
+/// [`std::env::current_dir`]), the real system directories, and the child's effective `PATH`.
+pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env_ops: &[EnvOp]) -> Result<PathBuf, Error> {
+    let base_cwd;
+    let base_cwd: &Path = match cmd_cwd {
+        Some(dir) => dir,
+        None => {
+            base_cwd = std::env::current_dir()?;
+            &base_cwd
+        }
+    };
+    let path = effective_path_var(env_ops);
+    let system_dirs = windows_system_dirs();
+    resolve_executable_in(exe, base_cwd, &system_dirs, path.as_deref())
 }
 
-/// Resolve `exe` against an explicit `base_cwd` and `PATH` string.
+/// The real system directories, in `CreateProcessW`'s NULL-`lpApplicationName` search order minus
+/// the current directory — see [`crate::resolve::ResolveInput::system_dirs`] for why that
+/// ordering matters. Queried here, at the one caller that has ambient OS access, rather than
+/// inside `crate::resolve` itself, which is deliberately parameterised so its rules stay
+/// exercisable from a POSIX host.
 ///
-/// An absolute `exe` that is an existing file is returned unchanged. Otherwise
-/// the search visits `base_cwd` first, then each `PATH` directory, testing
-/// `dir/exe` and — only when `exe` carries no extension — `dir/exe.exe`; the
-/// first existing file wins. A miss is [`std::io::ErrorKind::NotFound`].
+/// A step this process cannot determine is left out rather than failing the whole resolution:
+/// `resolve_executable`'s caller still falls through to `PATH`, exactly the outcome an empty
+/// `system_dirs` produces deliberately in tests, so a transient failure here degrades to
+/// (at worst) today's already-shipped behaviour rather than an unrelated spawn error.
+fn windows_system_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(3);
+    dirs.extend(app_dir());
+    dirs.extend(get_system_directory());
+    dirs.extend(get_windows_directory());
+    dirs
+}
+
+/// The directory the running process's own image was loaded from — step 1 of `CreateProcessW`'s
+/// search order.
+fn app_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+}
+
+/// The 32-bit Windows system directory (`System32`) — step 3 of `CreateProcessW`'s search order
+/// (step 2, the parent's current directory, is the one this crate deliberately never searches).
+fn get_system_directory() -> Option<PathBuf> {
+    // SAFETY: `GetSystemDirectoryW` writes into the given buffer, or reports the required length
+    // via its return value when the buffer is too small; both are honoured by `wide_dir_buffer`.
+    wide_dir_buffer(|buf| unsafe { GetSystemDirectoryW(buf) })
+}
+
+/// The Windows directory — step 5 of `CreateProcessW`'s search order (step 4, the 16-bit system
+/// directory, does not exist on any Windows version this crate targets).
+fn get_windows_directory() -> Option<PathBuf> {
+    // SAFETY: see `get_system_directory` — `GetWindowsDirectoryW` has the identical contract.
+    wide_dir_buffer(|buf| unsafe { GetWindowsDirectoryW(buf) })
+}
+
+/// Call a `GetXDirectoryW`-shaped Win32 function, growing the buffer until the directory fits.
+///
+/// These functions return the copied length (excluding the NUL) when the buffer was big enough,
+/// or the required length (including the NUL) when it was not, and `0` on failure — so `0` is the
+/// only outcome that means "give up", never "empty path".
+fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 260];
+    loop {
+        let len = f(Some(&mut buf)) as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buf.len() {
+            buf.truncate(len);
+            return Some(PathBuf::from(OsString::from_wide(&buf)));
+        }
+        buf.resize(len, 0);
+    }
+}
+
+/// The `PATH` value the child will actually see, replaying `env_ops` over the ambient `PATH` —
+/// `Set`/`Remove` match the key case-insensitively (Windows env var names are), and `Clear` wipes
+/// it outright, mirroring [`build_env_block_from`]'s own base-then-ops replay exactly so the two
+/// never disagree about what the child's `PATH` ends up being.
+fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
+    let path_key = fold_key(OsStr::new("PATH"));
+    let mut path = std::env::var_os("PATH");
+    for op in env_ops {
+        match op {
+            EnvOp::Set(key, val) if fold_key(key) == path_key => path = Some(val.clone()),
+            EnvOp::Remove(key) if fold_key(key) == path_key => path = None,
+            EnvOp::Clear => path = None,
+            _ => {}
+        }
+    }
+    path
+}
+
+/// Resolve `exe` against an explicit `base_cwd`, system directories, and `PATH` string.
+///
+/// A name containing a path separator resolves against `base_cwd` with no search at
+/// all. Only a true bare name is searched, and that search visits `system_dirs` and then the
+/// `PATH` directories — **never `base_cwd`**. Each directory is tried against exactly ONE
+/// filename — `exe` unchanged if its final component already ends in `.exe`/`.com`
+/// (case-insensitively), else `exe` with `.exe` appended; see
+/// [`crate::resolve`]'s `filename_candidates` doc for why there is no second, fallback filename
+/// to try per directory anymore. `PATH` elements that are empty or relative are skipped, and the
+/// result is always absolute. A miss is [`std::io::ErrorKind::NotFound`].
+///
+/// `system_dirs` visits BEFORE `PATH` — the app directory, `System32`, then the Windows
+/// directory, i.e. `CreateProcessW`'s own NULL-`lpApplicationName` search order minus `base_cwd`.
+/// This is what makes cutting `base_cwd` out of the search a strict narrowing of that order
+/// rather than an unrelated behaviour change: see [`crate::resolve::ResolveInput::system_dirs`]
+/// for the full monotonicity argument. Pass an empty slice to search `PATH` only.
+///
+/// A drive-relative name such as `C:tool` always fails closed with `NotFound`, and is
+/// never loaded from `base_cwd`: joining a directory onto it collapses straight back
+/// to `C:tool` (`PathBuf::push` clears for any prefixed path), so resolving it would
+/// need drive C's own current directory, which cosca does not track.
+///
+/// Visiting `base_cwd` first was the previous behaviour, and it was a
+/// binary-planting hazard: `executable("helper")` loaded a `helper.exe` dropped in
+/// whatever directory the process happened to sit in. Reach it explicitly with
+/// `./helper`, which contains a separator.
 ///
 /// Existence is tested with [`Path::is_file`], not [`Path::exists`]: a directory
 /// is never a runnable program, so a same-named directory must not shadow the
 /// executable (which would end the search early and hand `CreateProcessW` an
 /// unlaunchable path with no fallback).
-pub(crate) fn resolve_executable_in(exe: &Path, base_cwd: &Path, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    if exe.is_absolute() && exe.is_file() {
-        return Ok(exe.to_path_buf());
-    }
-
-    let append_exe = exe.extension().is_none();
-    let path_dirs = path.into_iter().flat_map(std::env::split_paths);
-    let dirs = std::iter::once(base_cwd.to_path_buf()).chain(path_dirs);
-
-    for dir in dirs {
-        let candidate = dir.join(exe);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        if append_exe {
-            let with_exe = candidate.with_extension("exe");
-            if with_exe.is_file() {
-                return Ok(with_exe);
-            }
-        }
-    }
-
-    Err(Error::Io(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("could not resolve executable: {}", exe.display()),
-    )))
+pub(crate) fn resolve_executable_in(
+    exe: &Path,
+    base_cwd: &Path,
+    system_dirs: &[PathBuf],
+    path: Option<&OsStr>,
+) -> Result<PathBuf, Error> {
+    crate::resolve::resolve(crate::resolve::ResolveInput {
+        program: exe,
+        cwd: base_cwd,
+        system_dirs,
+        path_var: path,
+        windows: true,
+    })
 }
 
 // Environment block =====

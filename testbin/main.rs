@@ -749,6 +749,92 @@ fn main() {
             report_sock.flush().unwrap();
         }
         #[cfg(windows)]
+        "report-bare-argv0-cwd-spawn" => {
+            // Set OUR OWN cwd to the decoy directory given as argv[2], then attempt — from
+            // inside this fully isolated process — the exact vulnerable/fixed spawn shape B2
+            // covers: a bare argv[0] with no `.executable()`/`.current_dir()`, routed to the raw
+            // backend purely via an fd >= 3. Running the scenario HERE, rather than in the
+            // PARENT test process, avoids mutating (and having to restore) the parent's own
+            // process-global cwd under `cosca::test_spawn_lock()` — that lock is the exact SAME
+            // non-reentrant mutex `cosca::Command::spawn()` already takes internally (see
+            // `tests/common/mod.rs`'s `output_locked`/`status_locked` docs and
+            // `src/test_child.rs`), so holding it across a `spawn()` call self-deadlocks. A
+            // fresh, separately-cwd'd process sidesteps that entirely: no shared mutable state,
+            // no lock held across a spawn, and the discrimination is unchanged —
+            // `CreateProcessW`'s own NULL-`lpApplicationName` search visits, at step 2 of its
+            // documented order, the CALLING process's own cwd (this process, right here), never
+            // the child's `lpCurrentDirectory`.
+            //
+            // argv[3] is the BARE program name to attempt — the caller's decoy filename stem.
+            // Deliberately NOT the literal "cosca_testbin": that name can legitimately resolve
+            // via the REAL `PATH` on a build runner (e.g. Cargo prepends a deps search directory
+            // on Windows for DLL resolution, which can itself contain a same-named copy of this
+            // very binary), so a `spawn()` success would prove nothing about the cwd-planting bug
+            // either way — it could just as well be an unrelated, legitimate PATH hit. The caller
+            // instead plants the decoy under a fabricated name that cannot exist anywhere else,
+            // so any successful resolution of it can only have come from the vulnerable search.
+            //
+            // Reports on stdout: "loaded" if the spawn found and ran a program from our cwd (the
+            // pre-B2-fix vulnerability — CWE-426/427), "notfound" if it failed to find any
+            // program at all (the fixed, correct behavior), or "othererr=<display>" for anything
+            // else, so a caller sees the real cause instead of a silent miscount.
+            let dir = &args[2];
+            let program = args[3].as_str();
+            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+
+            let mut c = cosca::Command::new();
+            c.args([program, "exit", "0"]).fd(3, cosca::Stdio::pipe_out()).unwrap();
+            match c.spawn() {
+                Ok(child) => {
+                    let _ = child.wait();
+                    println!("loaded");
+                }
+                Err(cosca::error::Error::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                    println!("notfound");
+                }
+                Err(e) => {
+                    println!("othererr={e}");
+                }
+            }
+        }
+        #[cfg(all(windows, feature = "tokio"))]
+        "report-bare-argv0-cwd-spawn-async" => {
+            // Async twin of `report-bare-argv0-cwd-spawn` — see there for the full rationale,
+            // including why argv[3] (the bare program name to attempt) must be a fabricated
+            // decoy-only name rather than the literal "cosca_testbin" (which can legitimately
+            // resolve via the real `PATH` on a build runner, proving nothing either way).
+            // Exercises the ASYNC raw backend (`src/tokio/spawn/windows_raw.rs`) specifically,
+            // since it derives its own `program_token` fallback independently of the sync
+            // backend. `Command::spawn` needs an IO-enabled Tokio runtime (its own docs), so this
+            // process builds one just for this probe.
+            let dir = &args[2];
+            let program = args[3].clone();
+            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a current-thread tokio runtime for the async spawn probe");
+            rt.block_on(async {
+                let mut c = cosca::tokio::Command::new();
+                c.args([program.as_str(), "exit", "0"])
+                    .fd(3, cosca::Stdio::pipe_out())
+                    .unwrap();
+                match c.spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait().await;
+                        println!("loaded");
+                    }
+                    Err(cosca::error::Error::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                        println!("notfound");
+                    }
+                    Err(e) => {
+                        println!("othererr={e}");
+                    }
+                }
+            });
+        }
+        #[cfg(windows)]
         "report-console-lone" => {
             use std::fmt::Write as _;
             use std::time::Duration;

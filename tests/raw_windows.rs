@@ -278,3 +278,64 @@ fn uncontained_raw_child_has_no_containment() {
         .unwrap();
     assert!(matches!(c.spawn().unwrap().containment(), cosca::Containment::None));
 }
+
+/// A `Command` with NO `.executable()` set still routes to the raw backend purely because it wires
+/// fd >= 3 (`routes_to_raw_backend`'s other trigger, independent of `executable()`). With no
+/// `executable()`, `image` used to be `None`, handing `CreateProcessW` a NULL `lpApplicationName`
+/// — which makes `CreateProcessW` perform its OWN image search. That search's step 2 (per its
+/// documented order) is the CALLING PROCESS's current directory — never the child's
+/// `lpCurrentDirectory`/`Command::cwd()`. So the decoy must be planted in a process's REAL cwd at
+/// the moment of the vulnerable/fixed spawn call — a decoy dropped merely in the CHILD's
+/// `Command::cwd()` sits outside that search path either way and cannot tell the pre-fix and
+/// post-fix code apart (both fail `NotFound`, for different reasons).
+///
+/// That process cannot be THIS test process, though: it cannot mutate its own cwd under
+/// `cosca::test_spawn_lock()` while it also calls `cosca::Command::spawn()`, because that spawn
+/// takes the exact same non-reentrant mutex internally (see `tests/common/mod.rs`'s
+/// `output_locked`/`status_locked` docs and `src/test_child.rs`) — holding the guard across the
+/// call self-deadlocks the test process forever. Instead, this test plants the decoy in a tempdir
+/// and spawns the `cosca_testbin` helper's `report-bare-argv0-cwd-spawn` mode via one ordinary,
+/// single-level `cosca::Command::spawn()` call, passing the decoy directory as an argument. THAT
+/// helper process — a fresh, isolated process with its own cwd and no lock contention with this
+/// one — does the chdir and the vulnerable/fixed spawn itself, and reports the outcome on stdout.
+///
+/// With the bug, the helper's inner spawn would find and load the planted decoy from its own
+/// current directory — the CWE-426/427 binary-planting hole — and report "loaded". Fixed, the
+/// bare argv[0] is resolved through the crate's own resolver (`lpApplicationName` is never NULL),
+/// which for a bare name visits the system directories (app dir, `System32`, the Windows
+/// directory) and then `PATH` — never any cwd — so the planted copy is never loaded and the
+/// helper reports "notfound".
+///
+/// The decoy is planted under a FABRICATED name, never the literal "cosca_testbin": on a real
+/// build runner that literal name can legitimately resolve via the ACTUAL `PATH` (e.g. Cargo
+/// prepends a deps search directory on Windows for DLL resolution, and that directory can itself
+/// hold a same-named copy of this very binary) — measured on CI, where the fixed backend's
+/// legitimate PATH search silently found a real `cosca_testbin` and made the (undiscriminating)
+/// first version of this test report "loaded" for a reason having nothing to do with the bug.
+/// A name that exists nowhere but the planted decoy removes that ambiguity: any successful
+/// resolution of it can only have come from the vulnerable cwd search — and, since the decoy
+/// lives ONLY in this tempdir cwd, never the app dir, `System32`, or the Windows directory either,
+/// the system-directory search step added for the maintainer's merge-blocker fix cannot
+/// accidentally find it and mask a cwd-search regression this test would otherwise catch.
+#[test]
+fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let decoy_program = "cosca_testbin_b2_cwd_decoy";
+    std::fs::copy(common::testbin(), dir.path().join(format!("{decoy_program}.exe"))).unwrap();
+
+    let mut c = cosca::Command::new();
+    c.executable(common::testbin())
+        .args([
+            "cosca_testbin",
+            "report-bare-argv0-cwd-spawn",
+            dir.path().to_str().expect("tempdir path is valid UTF-8"),
+            decoy_program,
+        ])
+        .stdout(cosca::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("spawn the probe helper");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    assert_eq!(s.trim(), "notfound", "helper report: {s}");
+}

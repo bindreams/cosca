@@ -105,6 +105,14 @@ impl Command {
     /// the loaded image (`lpApplicationName`) independently of the command line
     /// (`lpCommandLine`), so `executable` selects the file that runs while the
     /// child's `argv[0]` is the command line's first token.
+    ///
+    /// Without `executable`, the loaded image comes from `line`'s own first token instead (see
+    /// [`crate::quote::windows::first_token_and_rest_wide`]'s doc for exactly how that token is
+    /// extracted). An UNQUOTED path containing a space fails closed with `NotFound` there rather
+    /// than being found via successive whitespace-delimited prefixes the way a NULL
+    /// `lpApplicationName` would be by `CreateProcessW` itself — see that doc for why (it is the
+    /// classic unquoted-service-path hijack vector, deliberately not replicated). Quote such a
+    /// path.
     pub fn commandline<S: Into<OsString>>(&mut self, line: S) -> &mut Command {
         self.input = CommandInput::CommandLine(line.into());
         self
@@ -119,13 +127,52 @@ impl Command {
     /// `executable("/bin/busybox").args(["sh", "-c", "..."])` correctly loads
     /// busybox while the child sees `"sh"` as its `argv[0]`.
     ///
-    /// On Windows, a set `executable` spawns through the raw `CreateProcessW`
-    /// backend, which sets `lpApplicationName` independently of `lpCommandLine` —
-    /// so `argv[0]` is preserved (it no longer degrades to the executable path), and
-    /// combining `executable` with [`commandline`](Self::commandline) is supported.
-    /// A bare or relative `executable` is resolved with a deliberate rule (not full
-    /// `CreateProcessW` search parity): the current directory first, then each
-    /// `PATH` directory, appending `.exe` when the name has no extension.
+    /// On Windows, for an UNELEVATED spawn, a set `executable` routes through the raw
+    /// `CreateProcessW` backend, which sets `lpApplicationName` independently of
+    /// `lpCommandLine` — so `argv[0]` is preserved (it no longer degrades to the
+    /// executable path), and combining `executable` with
+    /// [`commandline`](Self::commandline) is supported. A bare or relative
+    /// `executable` is resolved with a deliberate rule (not full `CreateProcessW`
+    /// search parity): a name containing a path separator resolves against the
+    /// working directory with no search, while a true bare name is looked up in the
+    /// system directories (the directory this process's own image loaded from,
+    /// `System32`, then the Windows directory) and then `PATH` — **never the current
+    /// directory**. That order, system directories before `PATH`, is deliberate: it is
+    /// `CreateProcessW`'s own documented search order with the current directory cut
+    /// out, not a fresh rule, so a directory placed early on `PATH` (a dev toolchain
+    /// install, a per-user app shim) still cannot shadow e.g. `System32\find.exe`.
+    /// Searching the current directory first was the previous behaviour and was a
+    /// binary-planting hazard: `executable("helper")` would load a `helper.exe` dropped
+    /// in whatever directory the process happened to sit in. Write `./helper` to reach
+    /// it explicitly.
+    ///
+    /// Independently of that search, EVERY resolved name (bare or pathed alike) is
+    /// checked against exactly one filename, never two: if the name's final path
+    /// component already ends in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is
+    /// left alone, never doubled into `TOOL.EXE.exe`), it is used as-is; otherwise
+    /// `.exe` is appended. There is no extensionless fallback candidate any more — a
+    /// directory holding only an extensionless `tool` (no `tool.exe`) will not resolve,
+    /// matching `CreateProcessW`, `cmd.exe`, and both PowerShell editions, all of which
+    /// refuse to run an extensionless image by bare name (measured on real Windows CI).
+    /// This also means a bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
+    /// now resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
+    /// resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
+    /// deliberately excluded from the exact-match allowlist: resolving to a script is a
+    /// separate, not-yet-implemented feature (planned as its own follow-up), not a
+    /// judgement that scripts are unsafe — this crate's existing, separate batch-path
+    /// rejection (CVE-2024-24576) is unaffected either way.
+    ///
+    /// A drive-relative name such as `C:tool` is **refused** with
+    /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
+    /// resolving it would need drive C's own current directory, which cosca does not
+    /// track, so it fails closed instead of guessing.
+    ///
+    /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
+    /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
+    /// backend (and this resolver) described above, so a bare or relative
+    /// `executable` there is neither searched in `PATH` nor refused for a
+    /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
+    /// unresolved.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(path.into());
         self

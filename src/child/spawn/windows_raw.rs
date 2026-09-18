@@ -55,7 +55,15 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd)?;
 
-    let image: Option<PathBuf> = cmd.executable_path().map(resolve::resolve_executable).transpose()?;
+    // A route to this backend never implies `executable()` is set (it can be reached purely by
+    // `fd >= 3`, see `routes_to_raw_backend`). Falling back to `program_token` here keeps
+    // `lpApplicationName` non-NULL either way: a NULL `lpApplicationName` makes `CreateProcessW`
+    // search for the image ITSELF, including the current directory, reopening the binary-planting
+    // hole this resolver otherwise closes.
+    let program: Option<PathBuf> = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
+    let image: Option<PathBuf> = program
+        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), cmd.env_ops()))
+        .transpose()?;
     if let Some(p) = &image {
         resolve::ensure_no_nul_wide(p.as_os_str())?;
     }
@@ -312,8 +320,17 @@ pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
     Ok(())
 }
 
-/// The program token (argv[0] / command-line first token) when `executable()` is unset.
-fn program_token(cmd: &Command) -> Option<PathBuf> {
+/// The program token (argv[0] / command-line first token) when `executable()` is unset. Can
+/// itself return `None` — an empty argv, or a `commandline()` with no usable first token (see
+/// [`crate::quote::windows::first_token_wide`]'s doc on empty/whitespace-only input). `pub(crate)`:
+/// shared with the async raw backend, and with `spawn_raw` itself, which resolves a `Some` token
+/// through [`resolve::resolve_executable`]. `lpApplicationName` ends up NULL only if BOTH
+/// `executable()` is unset AND this returns `None` — [`raw_program_and_line`]'s three arms each
+/// reject that combination outright before `CreateProcessW` is ever reached, which is what
+/// actually keeps `lpApplicationName` from going NULL (a NULL `lpApplicationName` makes
+/// `CreateProcessW` perform its OWN search, which includes the current directory — the exact
+/// binary-planting hole this module's resolution otherwise closes).
+pub(crate) fn program_token(cmd: &Command) -> Option<PathBuf> {
     match cmd.input() {
         CommandInput::Empty => None,
         CommandInput::Argv(argv) => argv.first().map(PathBuf::from),
@@ -352,6 +369,21 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
         }
         CommandInput::CommandLine(line) => {
             resolve::ensure_no_nul_wide(line)?;
+            // Mirrors the `Empty`/`Argv` arms above: with no `executable()` set, `program_token`
+            // (and therefore `lpApplicationName`) depends on THIS line having a usable first
+            // token. `first_token_wide` is documented to return `None` for an empty or
+            // whitespace-only line, so without this check that case reached `CreateProcessW` with
+            // `lpApplicationName == NULL` — which makes it perform its OWN image search,
+            // including the current directory, reopening the binary-planting hole resolution
+            // otherwise closes.
+            if cmd.executable_path().is_none() {
+                let wide: Vec<u16> = line.encode_wide().collect();
+                if crate::quote::windows::first_token_wide(&wide).is_none() {
+                    return Err(Error::Io(std::io::Error::other(
+                        "empty or whitespace-only command line with no executable() set",
+                    )));
+                }
+            }
             Ok(line.encode_wide().collect())
         }
     }
@@ -409,3 +441,7 @@ impl Drop for AttributeList {
         unsafe { DeleteProcThreadAttributeList(self.list) };
     }
 }
+
+#[cfg(test)]
+#[path = "windows_raw_tests.rs"]
+mod windows_raw_tests;
