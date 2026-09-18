@@ -89,30 +89,88 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
-/// The filenames to try in each candidate directory, in order.
+/// The single filename tried in each candidate directory — ONE candidate, not a fallback pair.
+/// Applies identically to a [`Shape::BareName`] and a [`Shape::Located`] program: extension
+/// handling and the PATH/`system_dirs` search are INDEPENDENT axes (see `resolve`'s use of this
+/// function, called once before the shape match). `executable()` is the smart setter on both axes,
+/// not just the search one — someone writing `executable("bin/my-program")` for code that builds
+/// on both platforms must not be forced to conditionally append `.exe` themselves; anyone with a
+/// genuinely extensionless image at a known path can bypass this rule entirely by resolving it
+/// externally and handing `executable()` the exact, already-correct file name.
 ///
-/// `.exe` comes first so a directory holding both a script `tool` and a working `tool.exe` yields
-/// the one Win32 can load. `PATHEXT` is deliberately not consulted: `CreateProcessW` itself DOES
-/// run a `.bat`/`.cmd` image (via a hidden `cmd.exe` relaunch — see CVE-2024-24576/"BatBadBut"),
-/// which is exactly the hazard this crate refuses outright (see `reject_batch_program` in the
-/// Windows raw backend, and the Windows std backend's matching check). Resolving a bare name to a
-/// batch file here would just hand that refusal a target to reject; skipping `.bat`/`.cmd`
-/// candidates keeps that a separate, single concern instead of duplicating it into resolution.
+/// # The rule
+///
+/// - POSIX (`windows` is `false`): `name` unchanged, always. POSIX has no loader-level notion of
+///   an "executable extension" for this crate to reproduce.
+/// - Windows: if the FINAL PATH COMPONENT of `name` already ends in `.exe` or `.com` — compared
+///   CASE-INSENSITIVELY, so `TOOL.EXE` is left as `TOOL.EXE`, never doubled into `TOOL.EXE.exe` —
+///   use `name` unchanged. Otherwise use `name` with `.exe` appended.
+///
+/// # Why `.exe` *and* `.com`, and why this is NOT a statement about scripts
+///
+/// `.exe` and `.com` are exactly the two extensions `CreateProcessW` loads directly as a PE image.
+/// A `.com` file on a modern Windows install (`more.com`, `chcp.com`, `tree.com`, all shipped in
+/// `System32`) is an ordinary PE whose extension is cosmetic; leaving `.com` off the allowlist
+/// would turn `args(["more.com"])` into a search for the nonexistent `more.com.exe`, breaking
+/// resolution of a name that the system-directory search (added earlier in this same PR) makes
+/// work today.
+///
+/// Script extensions (`.bat`/`.cmd`) are deliberately NOT in the allowlist — but NOT because this
+/// crate treats a script as an illegitimate target. Resolving a bare name to a script is a
+/// SEPARATE, CURRENTLY UNIMPLEMENTED feature: batch support needs its own `cmd.exe`
+/// metacharacter quoter (alongside the existing MSVCRT one) plus PATHEXT-based resolution, and is
+/// planned as its own follow-up PR. Until it lands, `tool.bat` resolves as `tool.bat.exe` (a miss),
+/// same as any other non-`.exe`/`.com` dotted name. This is unrelated to — and does not weaken —
+/// this crate's existing, separate batch-path rejection (see `reject_batch_path`'s own message:
+/// "cmd.exe batch escaping is not implemented (CVE-2024-24576)").
+///
+/// # Monotonicity — stated honestly, in both directions
+///
+/// Measured on real Windows CI (amd64 and arm64 alike): `CreateProcessW` with a NULL
+/// `lpApplicationName`, and `cmd.exe`, `pwsh` 7, and Windows PowerShell 5.1 alike, all refuse to
+/// run an extensionless PE by bare name — a directory holding only `tool` (no extension) yields
+/// `ERROR_FILE_NOT_FOUND`/"not recognized" from every one of them. So this rule NARROWS for a bare
+/// extensionless name: the old rule tried `tool.exe` then `tool`, and that second candidate never
+/// actually ran on any of those four surfaces — dropping it removes a candidate nothing on the
+/// platform could launch anyway.
+///
+/// Those same three shells (unlike `CreateProcessW` itself) resolve a bare DOTTED name via
+/// PATHEXT — typing `foo.bar` runs `foo.bar.exe` when that file exists — while the OLD has-a-dot
+/// heuristic here refused to append `.exe` to anything already containing a `.`, so `python3.11`
+/// could never resolve even though every one of those shells finds `python3.11.exe`. So this rule
+/// also WIDENS for a dotted name: it now appends `.exe` where it used to leave the name alone. That
+/// widening is deliberate and matches the three shells, measured — it does NOT match
+/// `CreateProcessW`'s own NULL-`lpApplicationName` behaviour, and is not meant to: that parity is
+/// already given up on for `.bat`/`.cmd`, above.
+///
+/// # Not a permanent rule
+///
+/// This one-candidate rule for a BARE name is expected to be superseded by proper PATHEXT-based
+/// resolution once batch support lands (see the `.bat`/`.cmd` note above) — a future reader should
+/// not assume it is permanent. The `Located` behaviour (extension decided purely from the name, no
+/// search) is expected to survive that change unchanged.
 fn filename_candidates(name: &OsStr, windows: bool) -> Vec<std::ffi::OsString> {
-    let mut out = Vec::with_capacity(2);
-    if windows && !final_component_has_dot(name, windows) {
-        let mut with_exe = name.to_os_string();
-        with_exe.push(".exe");
-        out.push(with_exe);
+    if !windows || has_loadable_extension(name, windows) {
+        return vec![name.to_os_string()];
     }
-    out.push(name.to_os_string());
-    out
+    let mut with_exe = name.to_os_string();
+    with_exe.push(".exe");
+    vec![with_exe]
 }
 
-fn final_component_has_dot(name: &OsStr, windows: bool) -> bool {
+/// Whether `name`'s final path component already ends in `.exe` or `.com`, compared
+/// case-insensitively — `TOOL.EXE` must not become `TOOL.EXE.exe`. These are the two extensions
+/// `CreateProcessW` loads directly as a PE image; see `filename_candidates`'s doc for why exactly
+/// these two and no others.
+fn has_loadable_extension(name: &OsStr, windows: bool) -> bool {
     let bytes = name.as_encoded_bytes();
     let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
-    bytes[start..].contains(&b'.')
+    let final_component = &bytes[start..];
+    ends_with_ignore_ascii_case(final_component, b".exe") || ends_with_ignore_ascii_case(final_component, b".com")
+}
+
+fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {
+    bytes.len() >= suffix.len() && bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// Split a `PATH` value on the simulated platform's separator.

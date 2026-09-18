@@ -3,9 +3,10 @@
 //!
 //! [`resolve_executable`] delegates to [`crate::resolve`] (a bare name is looked up in the
 //! system directories — app dir, System32, the Windows directory — and then `PATH`, never the
-//! current directory; append `.exe` only when the program has no extension) rather than full
-//! `CreateProcessW` search parity — this keeps `.bat`/`.cmd` out of resolution so batch-program
-//! rejection stays a separate concern. The system-directory step exists to reproduce
+//! current directory; `.exe` is appended unless the name's final component already ends in `.exe`
+//! or `.com`, case-insensitively) rather than full `CreateProcessW` search parity — this keeps
+//! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate concern. The
+//! system-directory step exists to reproduce
 //! `CreateProcessW`'s own NULL-`lpApplicationName` search order minus the current directory: see
 //! [`crate::resolve::ResolveInput::system_dirs`] for why dropping only the cwd (and not also the
 //! system directories' precedence over `PATH`) is what keeps this a strict narrowing of that
@@ -138,10 +139,12 @@ fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
 ///
 /// A name containing a path separator resolves against `base_cwd` with no search at
 /// all. Only a true bare name is searched, and that search visits `system_dirs` and then the
-/// `PATH` directories — **never `base_cwd`** — testing `dir/exe.exe` before `dir/exe`
-/// when `exe` carries no extension; the first existing file wins. `PATH` elements
-/// that are empty or relative are skipped, and the result is always absolute. A miss
-/// is [`std::io::ErrorKind::NotFound`].
+/// `PATH` directories — **never `base_cwd`**. Each directory is tried against exactly ONE
+/// filename — `exe` unchanged if its final component already ends in `.exe`/`.com`
+/// (case-insensitively), else `exe` with `.exe` appended; see
+/// [`crate::resolve`]'s `filename_candidates` doc for why there is no second, fallback filename
+/// to try per directory anymore. `PATH` elements that are empty or relative are skipped, and the
+/// result is always absolute. A miss is [`std::io::ErrorKind::NotFound`].
 ///
 /// `system_dirs` visits BEFORE `PATH` — the app directory, `System32`, then the Windows
 /// directory, i.e. `CreateProcessW`'s own NULL-`lpApplicationName` search order minus `base_cwd`.

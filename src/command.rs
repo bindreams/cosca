@@ -137,14 +137,30 @@ impl Command {
     /// working directory with no search, while a true bare name is looked up in the
     /// system directories (the directory this process's own image loaded from,
     /// `System32`, then the Windows directory) and then `PATH` — **never the current
-    /// directory** — appending `.exe` when the name has no extension. That order,
-    /// system directories before `PATH`, is deliberate: it is `CreateProcessW`'s own
-    /// documented search order with the current directory cut out, not a fresh rule,
-    /// so a directory placed early on `PATH` (a dev toolchain install, a per-user app
-    /// shim) still cannot shadow e.g. `System32\find.exe`. Searching the current
-    /// directory first was the previous behaviour and was a binary-planting hazard:
-    /// `executable("helper")` would load a `helper.exe` dropped in whatever directory
-    /// the process happened to sit in. Write `./helper` to reach it explicitly.
+    /// directory**. That order, system directories before `PATH`, is deliberate: it is
+    /// `CreateProcessW`'s own documented search order with the current directory cut
+    /// out, not a fresh rule, so a directory placed early on `PATH` (a dev toolchain
+    /// install, a per-user app shim) still cannot shadow e.g. `System32\find.exe`.
+    /// Searching the current directory first was the previous behaviour and was a
+    /// binary-planting hazard: `executable("helper")` would load a `helper.exe` dropped
+    /// in whatever directory the process happened to sit in. Write `./helper` to reach
+    /// it explicitly.
+    ///
+    /// Independently of that search, EVERY resolved name (bare or pathed alike) is
+    /// checked against exactly one filename, never two: if the name's final path
+    /// component already ends in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is
+    /// left alone, never doubled into `TOOL.EXE.exe`), it is used as-is; otherwise
+    /// `.exe` is appended. There is no extensionless fallback candidate any more — a
+    /// directory holding only an extensionless `tool` (no `tool.exe`) will not resolve,
+    /// matching `CreateProcessW`, `cmd.exe`, and both PowerShell editions, all of which
+    /// refuse to run an extensionless image by bare name (measured on real Windows CI).
+    /// This also means a bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
+    /// now resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
+    /// resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
+    /// deliberately excluded from the exact-match allowlist: resolving to a script is a
+    /// separate, not-yet-implemented feature (planned as its own follow-up), not a
+    /// judgement that scripts are unsafe — this crate's existing, separate batch-path
+    /// rejection (CVE-2024-24576) is unaffected either way.
     ///
     /// A drive-relative name such as `C:tool` is **refused** with
     /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
