@@ -146,16 +146,25 @@ impl Command {
     /// in whatever directory the process happened to sit in. Write `./helper` to reach
     /// it explicitly.
     ///
-    /// Independently of that search, EVERY resolved name (bare or pathed alike) is
-    /// checked against exactly one filename, never two: if the name's final path
-    /// component already ends in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is
-    /// left alone, never doubled into `TOOL.EXE.exe`), it is used as-is; otherwise
-    /// `.exe` is appended. There is no extensionless fallback candidate any more — a
-    /// directory holding only an extensionless `tool` (no `tool.exe`) will not resolve,
-    /// matching `CreateProcessW`, `cmd.exe`, and both PowerShell editions, all of which
-    /// refuse to run an extensionless image by bare name (measured on real Windows CI).
+    /// The `.exe` rule is a property of names that get SEARCHED, not of files that get
+    /// LOADED, so it differs by shape. If the name's final path component already ends
+    /// in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is left alone, never doubled
+    /// into `TOOL.EXE.exe`), it is used as-is either way. Otherwise:
+    ///
+    /// - a **bare name** is checked against `name.exe` and nothing else. There is no
+    ///   extensionless fallback candidate — a directory holding only an extensionless
+    ///   `tool` will not resolve, matching `CreateProcessW`, `cmd.exe`, and both
+    ///   PowerShell editions, all of which refuse to run an extensionless image by bare
+    ///   name (measured on real Windows CI). `PATHEXT` cannot express "no extension", so
+    ///   there is nothing to be compatible with.
+    /// - a **pathed name** is checked against the exact name the caller wrote first, then
+    ///   `name.exe`. `CreateProcessW` documents "no default extension is assumed" for the
+    ///   `lpApplicationName` this backend sets, and the PE format makes no extension
+    ///   normative, so `executable(r"C:\tools\payload.tmp")` names exactly that file.
+    ///   Where both `bin\tool` and `bin\tool.exe` exist, the extensionless one wins.
+    ///
     /// This also means a bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
-    /// now resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
+    /// resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
     /// resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
     /// deliberately excluded from the exact-match allowlist: resolving to a script is a
     /// separate, not-yet-implemented feature (planned as its own follow-up), not a

@@ -57,7 +57,7 @@ pub(crate) struct ResolveInput<'a> {
 
 /// How the program names its file, which decides whether `PATH` (and, on Windows,
 /// `system_dirs`) is consulted at all.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Shape {
     /// No separator and no drive prefix: the only shape that searches `system_dirs` and `PATH`.
     BareName,
@@ -89,73 +89,109 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
-/// The single filename tried in each candidate directory — ONE candidate, not a fallback pair.
-/// Applies identically to a [`Shape::BareName`] and a [`Shape::Located`] program: extension
-/// handling and the PATH/`system_dirs` search are INDEPENDENT axes (see `resolve`'s use of this
-/// function, called once before the shape match). `executable()` is the smart setter on both axes,
-/// not just the search one — someone writing `executable("bin/my-program")` for code that builds
-/// on both platforms must not be forced to conditionally append `.exe` themselves; anyone with a
-/// genuinely extensionless image at a known path can bypass this rule entirely by resolving it
-/// externally and handing `executable()` the exact, already-correct file name.
+/// The filenames tried in each candidate directory, in order.
+///
+/// **`.exe` is a property of names that get SEARCHED, not of files that get LOADED.** That split
+/// is what the two shapes encode, and it is the platform's own, not this crate's invention:
+///
+/// - The PE/COFF format makes no extension normative — an image is identified by `MZ`, the `PE\0\0`
+///   signature at the offset in `0x3c`, and header flags such as `IMAGE_FILE_DLL`. A valid PE
+///   named `myapp` or `payload.tmp` is a valid PE.
+/// - `CreateProcessW` documents, for the `lpApplicationName` this resolver actually feeds: "This
+///   parameter must include the file name extension; **no default extension is assumed**." Its
+///   command-line mode agrees the moment a path is involved: ".exe is appended" only "if the file
+///   name does not contain a directory path".
+/// - `PATHEXT` is a `cmd.exe` feature, and it cannot express "no extension" — there is no entry
+///   meaning "try the bare name". That, not the loader, is why an extensionless image is
+///   unreachable by bare name.
+/// - Microsoft's current app model draws the same line: `uap5:ExecutionAlias`/`uap8:ExecutionAlias`
+///   require the `Alias` — the name a user TYPES — to end in `.exe`, while the manifest's
+///   `Executable=` path, which names the file, carries no such constraint.
 ///
 /// # The rule
 ///
-/// - POSIX (`windows` is `false`): `name` unchanged, always. POSIX has no loader-level notion of
-///   an "executable extension" for this crate to reproduce.
-/// - Windows: if the FINAL PATH COMPONENT of `name` already ends in `.exe` or `.com` — compared
-///   CASE-INSENSITIVELY, so `TOOL.EXE` is left as `TOOL.EXE`, never doubled into `TOOL.EXE.exe` —
-///   use `name` unchanged. Otherwise use `name` with `.exe` appended.
+/// - POSIX (`windows` is `false`): `name` unchanged, always, either shape. POSIX has no
+///   loader-level notion of an "executable extension" for this crate to reproduce.
+/// - Windows, final path component already ending in `.exe`/`.com` (compared CASE-INSENSITIVELY,
+///   so `TOOL.EXE` is never doubled into `TOOL.EXE.exe`): `name` unchanged, either shape. There is
+///   nothing to append that would not name a file the caller did not write.
+/// - Windows, [`Shape::BareName`]: `name` + `.exe`, and ONLY that. See the monotonicity note.
+/// - Windows, [`Shape::Located`]: `name` **then** `name` + `.exe` — the exact name the caller wrote
+///   first, the portable fallback second.
 ///
-/// # Why `.exe` *and* `.com`, and why this is NOT a statement about scripts
+/// # Why `Located` tries the exact name first
+///
+/// A located name visits exactly one directory: the one the caller named. There is no search to
+/// bias, so the ordering answers only "did the caller mean this file?" — and they wrote it, so yes.
+/// Refusing it would make `executable()` unable to name a perfectly loadable image (a staged
+/// `payload.tmp`, a content-addressed cache entry, a `.scr`, anything named by hash), a restriction
+/// neither the format, the loader, nor the app model imposes.
+///
+/// The `.exe` fallback stays because it is the reason the rule exists at all: someone writing
+/// `executable("bin/my-program")` for code that builds on both platforms must not be forced to
+/// append `.exe` conditionally themselves.
+///
+/// One consequence, stated plainly: where both `bin/tool` and `bin/tool.exe` exist, the
+/// extensionless one wins. A writer who can create files in that directory but not overwrite a
+/// locked, running `tool.exe` can therefore decide the outcome. This is the ordering `main`
+/// shipped, kept deliberately — the alternative loses the ability to name an exact file, which is
+/// the whole point of the located axis.
+///
+/// # Why `.exe` *and* `.com`
 ///
 /// `.exe` and `.com` are exactly the two extensions `CreateProcessW` loads directly as a PE image.
 /// A `.com` file on a modern Windows install (`more.com`, `chcp.com`, `tree.com`, all shipped in
 /// `System32`) is an ordinary PE whose extension is cosmetic; leaving `.com` off the allowlist
 /// would turn `args(["more.com"])` into a search for the nonexistent `more.com.exe`, breaking
-/// resolution of a name that the system-directory search (added earlier in this same PR) makes
-/// work today.
+/// resolution of a name the system-directory search makes work today.
 ///
 /// Script extensions (`.bat`/`.cmd`) are deliberately NOT in the allowlist — but NOT because this
 /// crate treats a script as an illegitimate target. Resolving a bare name to a script is a
 /// SEPARATE, CURRENTLY UNIMPLEMENTED feature: batch support needs its own `cmd.exe`
 /// metacharacter quoter (alongside the existing MSVCRT one) plus PATHEXT-based resolution, and is
-/// planned as its own follow-up PR. Until it lands, `tool.bat` resolves as `tool.bat.exe` (a miss),
-/// same as any other non-`.exe`/`.com` dotted name. This is unrelated to — and does not weaken —
-/// this crate's existing, separate batch-path rejection (see `reject_batch_path`'s own message:
-/// "cmd.exe batch escaping is not implemented (CVE-2024-24576)").
+/// planned as its own follow-up PR. This is unrelated to — and does not weaken — this crate's
+/// existing, separate batch-path rejection (see `reject_batch_path`'s own message: "cmd.exe batch
+/// escaping is not implemented (CVE-2024-24576)").
 ///
-/// # Monotonicity — stated honestly, in both directions
+/// # Monotonicity of the BARE-name rule — stated honestly, in both directions
+///
+/// This section justifies the single candidate for [`Shape::BareName`] ONLY. It is measured on the
+/// surfaces that resolve a bare name, and deliberately does not reach the located axis above.
 ///
 /// Measured on real Windows CI (amd64 and arm64 alike): `CreateProcessW` with a NULL
 /// `lpApplicationName`, and `cmd.exe`, `pwsh` 7, and Windows PowerShell 5.1 alike, all refuse to
 /// run an extensionless PE by bare name — a directory holding only `tool` (no extension) yields
-/// `ERROR_FILE_NOT_FOUND`/"not recognized" from every one of them. So this rule NARROWS for a bare
+/// `ERROR_FILE_NOT_FOUND`/"not recognized" from every one of them. So this NARROWS for a bare
 /// extensionless name: the old rule tried `tool.exe` then `tool`, and that second candidate never
 /// actually ran on any of those four surfaces — dropping it removes a candidate nothing on the
-/// platform could launch anyway.
+/// platform could launch anyway, and removes the hazard of an ambient extensionless file winning
+/// in some directory the search visits.
 ///
 /// Those same three shells (unlike `CreateProcessW` itself) resolve a bare DOTTED name via
 /// PATHEXT — typing `foo.bar` runs `foo.bar.exe` when that file exists — while the OLD has-a-dot
 /// heuristic here refused to append `.exe` to anything already containing a `.`, so `python3.11`
 /// could never resolve even though every one of those shells finds `python3.11.exe`. So this rule
-/// also WIDENS for a dotted name: it now appends `.exe` where it used to leave the name alone. That
-/// widening is deliberate and matches the three shells, measured — it does NOT match
+/// also WIDENS for a dotted bare name: it now appends `.exe` where it used to leave the name alone.
+/// That widening is deliberate and matches the three shells, measured — it does NOT match
 /// `CreateProcessW`'s own NULL-`lpApplicationName` behaviour, and is not meant to: that parity is
 /// already given up on for `.bat`/`.cmd`, above.
 ///
 /// # Not a permanent rule
 ///
-/// This one-candidate rule for a BARE name is expected to be superseded by proper PATHEXT-based
+/// The one-candidate rule for a BARE name is expected to be superseded by proper PATHEXT-based
 /// resolution once batch support lands (see the `.bat`/`.cmd` note above) — a future reader should
-/// not assume it is permanent. The `Located` behaviour (extension decided purely from the name, no
-/// search) is expected to survive that change unchanged.
-fn filename_candidates(name: &OsStr, windows: bool) -> Vec<std::ffi::OsString> {
+/// not assume it is permanent. The `Located` behaviour is expected to survive that change
+/// unchanged, because PATHEXT is a search mechanism and the located axis does not search.
+fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ffi::OsString> {
     if !windows || has_loadable_extension(name, windows) {
         return vec![name.to_os_string()];
     }
     let mut with_exe = name.to_os_string();
     with_exe.push(".exe");
-    vec![with_exe]
+    match shape {
+        Shape::BareName => vec![with_exe],
+        Shape::Located => vec![name.to_os_string(), with_exe],
+    }
 }
 
 /// Whether `name`'s final path component already ends in `.exe` or `.com`, compared
@@ -251,7 +287,10 @@ fn is_execable(path: &Path, windows: bool) -> bool {
 
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     let name = input.program.as_os_str();
-    let candidates = filename_candidates(name, input.windows);
+    // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the
+    // exact name the caller wrote, a searched one does not — see `filename_candidates`).
+    let shape = classify(name, input.windows);
+    let candidates = filename_candidates(name, input.windows, shape);
 
     // The cwd is absolutised BEFORE joining. A relative one would otherwise be applied twice:
     // the resolver joins it, and std chdirs the child into it as well, so `./tool` with
@@ -264,7 +303,7 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
         &cwd_owned
     };
 
-    let dirs: Vec<PathBuf> = match classify(name, input.windows) {
+    let dirs: Vec<PathBuf> = match shape {
         Shape::Located => vec![cwd.to_path_buf()],
         // System directories precede `PATH` — never the cwd, which is deliberately absent from
         // this list; see `ResolveInput::system_dirs`'s doc for why that ordering is what keeps

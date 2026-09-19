@@ -139,12 +139,12 @@ fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
 ///
 /// A name containing a path separator resolves against `base_cwd` with no search at
 /// all. Only a true bare name is searched, and that search visits `system_dirs` and then the
-/// `PATH` directories — **never `base_cwd`**. Each directory is tried against exactly ONE
-/// filename — `exe` unchanged if its final component already ends in `.exe`/`.com`
-/// (case-insensitively), else `exe` with `.exe` appended; see
-/// [`crate::resolve`]'s `filename_candidates` doc for why there is no second, fallback filename
-/// to try per directory anymore. `PATH` elements that are empty or relative are skipped, and the
-/// result is always absolute. A miss is [`std::io::ErrorKind::NotFound`].
+/// `PATH` directories — **never `base_cwd`**. A final component already ending in `.exe`/`.com`
+/// (case-insensitively) is used unchanged; otherwise a SEARCHED name is tried as `exe.exe` only,
+/// while a PATHED one is tried as `exe` first and `exe.exe` second — see [`crate::resolve`]'s
+/// `filename_candidates` doc for why the extension rule belongs to the searched axis and not the
+/// located one. `PATH` elements that are empty or relative are skipped, and the result is always
+/// absolute. A miss is [`std::io::ErrorKind::NotFound`].
 ///
 /// `system_dirs` visits BEFORE `PATH` — the app directory, `System32`, then the Windows
 /// directory, i.e. `CreateProcessW`'s own NULL-`lpApplicationName` search order minus `base_cwd`.

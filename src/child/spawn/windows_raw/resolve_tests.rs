@@ -239,7 +239,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
     // The shadow directory lives on PATH, AHEAD of the real executable: base_cwd is no longer
     // searched, so planting it there would no longer exercise the `is_file` guard at all.
     //
-    // Named `sp_dirtool.exe`, not extensionless `sp_dirtool`: the single-candidate rule (see
+    // Named `sp_dirtool.exe`, not extensionless `sp_dirtool`: the bare-name candidate rule (see
     // `crate::resolve`'s `filename_candidates` doc) means the only filename ever tried for a bare
     // `sp_dirtool` is `sp_dirtool.exe`. An extensionless shadow directory is never even looked at,
     // which would make `is_file()` -> `exists()` a silently green one-line mutation here — the

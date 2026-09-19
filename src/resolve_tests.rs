@@ -25,14 +25,17 @@ fn touch(dir: &Path, name: &str) -> std::path::PathBuf {
     p
 }
 
-/// The filename resolution will actually look for, on the HOST platform, for a logical
+/// A filename resolution is guaranteed to look for on the HOST platform, for a logical
 /// extensionless name `base` searched via `go()` (which uses `HOST_WINDOWS`, per this file's own
-/// doc above). Mirrors `filename_candidates`'s single-candidate rule — `.exe` appended on Windows,
-/// `base` unchanged on POSIX — so a `go()`-driven filesystem test plants the exact file resolution
-/// will look for on whichever host actually runs it, including a real Windows CI runner, where a
-/// bare or located `tool` now only ever resolves via `tool.exe` (see the "FIX: single-candidate
-/// filename rule" tests below for the rule itself; this just keeps host-touching tests in sync
-/// with it rather than re-deriving it at each call site).
+/// doc above) — `.exe` appended on Windows, `base` unchanged on POSIX. Planting this keeps a
+/// `go()`-driven filesystem test working on whichever host actually runs it, including a real
+/// Windows CI runner, rather than re-deriving the rule at each call site.
+///
+/// `.exe` is the candidate a BARE name resolves through, and it is also the second candidate a
+/// LOCATED name falls back to, so planting it is correct for either shape (see the "filename
+/// candidate rule" tests below). Tests that care about the located axis specifically — that the
+/// exact name is tried, and tried FIRST — force `windows: true` via `go_win` and plant real
+/// filenames instead, so they gate in ordinary CI rather than only on the Windows runner.
 fn exe_name(base: &str) -> String {
     if HOST_WINDOWS {
         format!("{base}.exe")
@@ -121,24 +124,36 @@ fn posix_path_var_quotes_are_not_special() {
     assert_eq!(got, vec![PathBuf::from(r#""/a;b""#), PathBuf::from("/c")], "{got:?}");
 }
 
-// ── FIX: single-candidate filename rule (merge blocker) ──────────────────────────────
+// ── the filename candidate rule ──────────────────────────────────────────────────────
 //
-// Replaces the old two-candidate rule (`tool.exe` then a `tool` fallback, gated on "does the name
-// already contain a dot"). Measured on real Windows CI (amd64 and arm64): `CreateProcessW` with a
-// NULL `lpApplicationName`, `cmd.exe`, `pwsh` 7, and Windows PowerShell 5.1 all refuse to run an
-// extensionless PE by bare name, so the old fallback candidate never ran on any of those four
-// surfaces — dropping it is a narrowing. But those same three shells (unlike `CreateProcessW`) DO
-// resolve a bare DOTTED name via PATHEXT (`foo.bar` runs `foo.bar.exe`), which the old has-a-dot
-// heuristic could never produce — `python3.11` could never resolve even though every shell finds
-// `python3.11.exe`. So the new rule also widens for a dotted name. See `filename_candidates`'s doc
-// in `src/resolve.rs` for the full rationale, including why exactly `.exe`/`.com` (not scripts).
+// `.exe` belongs to names that get SEARCHED, not to files that get LOADED, so the rule differs by
+// shape. Replaces an old rule gated on "does the name already contain a dot".
 //
-// Every case below also asserts there is exactly ONE candidate: two candidates whose second one
-// never matches would pass every assertion here while quietly leaving the pre-fix ordering hazard
-// (an ambient extensionless file able to win in some future directory ordering) in place.
+// SEARCHED (bare): one candidate, `tool.exe`. Measured on real Windows CI (amd64 and arm64):
+// `CreateProcessW` with a NULL `lpApplicationName`, `cmd.exe`, `pwsh` 7, and Windows PowerShell
+// 5.1 all refuse to run an extensionless PE by bare name, so an extensionless fallback candidate
+// never ran on any of those four surfaces — omitting it is a narrowing. `PATHEXT` has no entry
+// meaning "try the bare name", so there is nothing to be compatible with either. Those same three
+// shells (unlike `CreateProcessW`) DO resolve a bare DOTTED name via PATHEXT (`foo.bar` runs
+// `foo.bar.exe`), which the old has-a-dot heuristic could never produce — `python3.11` could never
+// resolve even though every shell finds `python3.11.exe`. So the rule also widens for a dotted
+// bare name.
+//
+// LOADED (located): two candidates, the exact name FIRST and `.exe` second. The PE format makes no
+// extension normative and `CreateProcessW` documents "no default extension is assumed" for the
+// `lpApplicationName` this resolver feeds, so a file the caller named by path must stay nameable.
+// The `.exe` fallback is kept so `executable("bin/my-program")` stays portable.
+//
+// See `filename_candidates`'s doc in `src/resolve.rs` for the full rationale, including why
+// exactly `.exe`/`.com` (not scripts).
+//
+// A BARE name asserts there is exactly ONE candidate: a second, never-matching candidate would
+// pass every assertion here while quietly leaving the pre-fix ordering hazard (an ambient
+// extensionless file able to win in some future directory ordering) in place. A LOCATED name is
+// the opposite case and deliberately has two — see `filename_candidates`'s doc.
 
 fn candidate(n: &str, w: bool) -> Vec<String> {
-    filename_candidates(OsStr::new(n), w)
+    filename_candidates(OsStr::new(n), w, classify(OsStr::new(n), w))
         .iter()
         .map(|c| c.to_string_lossy().into_owned())
         .collect()
@@ -196,12 +211,37 @@ fn a_bat_extension_is_not_yet_in_the_allowlist() {
 }
 
 #[test]
-fn a_located_name_gets_the_exe_rule_too() {
-    // Extension handling and PATH search are independent axes: a pathed name (containing a
-    // separator, so `Shape::Located`) still gets exactly the same exe-appending rule as a bare
-    // name. Catches a regression that scoped the rule to `Shape::BareName` only.
+fn a_located_name_tries_the_exact_name_before_the_exe_one() {
+    // The `.exe` convention belongs to names that get SEARCHED, not to files that get LOADED:
+    // the PE/COFF format makes no extension normative, and `CreateProcessW` documents
+    // "no default extension is assumed" for the `lpApplicationName` this resolver feeds. So a
+    // pathed name keeps naming the file the caller wrote — exact FIRST — while still appending
+    // `.exe` as a fallback so `executable("bin/my-program")` stays portable across platforms.
+    //
+    // Catches both regressions: dropping the exact candidate (which made an extensionless or
+    // `.bin` PE unnameable, the `main` -> this-branch regression) and dropping the `.exe` one
+    // (which would break the cross-platform ergonomic the rule exists for).
     let got = candidate("bin/my-program", true);
-    assert_eq!(got, vec!["bin/my-program.exe"], "{got:?}");
+    assert_eq!(got, vec!["bin/my-program", "bin/my-program.exe"], "{got:?}");
+}
+
+#[test]
+fn a_located_dotted_name_also_tries_exact_before_exe() {
+    // `.bin` is not a loadable extension, but `CreateProcessW` loads the file regardless of what
+    // it is called, so the exact name must still be tried first.
+    let got = candidate(r"tools\thing.bin", true);
+    assert_eq!(got, vec![r"tools\thing.bin", r"tools\thing.bin.exe"], "{got:?}");
+}
+
+#[test]
+fn a_located_name_already_ending_in_exe_or_com_gets_one_candidate() {
+    // Nothing to append: appending would only ever produce `x.exe.exe`, which names a file the
+    // caller did not write. One candidate, same as the bare case.
+    for n in [r"bin\tool.exe", r"bin\TOOL.EXE", r"bin\more.com"] {
+        let got = candidate(n, true);
+        assert_eq!(got.len(), 1, "{n:?} -> {got:?}");
+        assert_eq!(got[0], n, "{got:?}");
+    }
 }
 
 #[test]
@@ -225,7 +265,11 @@ fn posix_never_appends_exe_for_any_of_the_above() {
 }
 
 #[test]
-fn every_case_produces_exactly_one_candidate() {
+fn every_searched_name_produces_exactly_one_candidate() {
+    // BARE names only — the ones that visit `system_dirs`/`PATH`. A second candidate here would
+    // reintroduce the ordering hazard: an ambient extensionless file winning in some directory
+    // the search visits. A LOCATED name visits exactly one directory, the one the caller named,
+    // so it carries no such hazard and deliberately has two candidates (tested above).
     for (n, w) in [
         ("tool", true),
         ("python3.11", true),
@@ -233,11 +277,11 @@ fn every_case_produces_exactly_one_candidate() {
         ("TOOL.EXE", true),
         ("more.com", true),
         ("tool.bat", true),
-        ("bin/my-program", true),
         ("tool", false),
         ("python3.11", false),
+        ("bin/my-program", false), // POSIX never appends, located or not
     ] {
-        let got = filename_candidates(OsStr::new(n), w);
+        let got = filename_candidates(OsStr::new(n), w, classify(OsStr::new(n), w));
         assert_eq!(got.len(), 1, "{n:?} (windows={w}) -> {got:?}");
     }
 }
@@ -264,7 +308,7 @@ fn a_drive_relative_name_is_located_not_bare() {
 fn bare_name_is_not_resolved_from_the_current_directory() {
     let cwd = tempfile::tempdir().unwrap();
     // `&exe_name("tool")`, not literal `"tool"`: on a Windows host the candidate this resolution
-    // actually looks for is `tool.exe` (see the "FIX: single-candidate filename rule" tests above).
+    // actually looks for is `tool.exe` (see the "filename candidate rule" tests above).
     // Planting extensionless `tool` here made this vacuous on the one platform this test exists
     // for — re-adding `cwd` to `Shape::BareName`'s dir list would still find nothing named
     // `tool.exe` and this would keep passing for the wrong reason.
@@ -294,12 +338,91 @@ fn path_wins_over_an_identically_named_file_in_cwd() {
 #[test]
 fn a_name_with_a_separator_resolves_against_cwd() {
     let cwd = tempfile::tempdir().unwrap();
-    // Located (contains a separator) gets the SAME single-candidate exe rule as a bare name — see
-    // the "FIX: single-candidate filename rule" tests below for why that is deliberate, not an
-    // oversight.
+    // Located (contains a separator) tries the exact name first and `.exe` second, so planting
+    // either one resolves; `exe_name` plants whichever the HOST would find first.
     let want = touch(cwd.path(), &exe_name("tool"));
     let got = go("./tool", cwd.path(), None).unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+/// Drive `resolve` with the WINDOWS rules regardless of host, so the located-name candidate
+/// ordering is gated in ordinary CI rather than only on the Windows runner. Nothing here touches
+/// a Windows API — `Shape::Located` visits exactly one directory and `is_execable` reduces to
+/// `is_file()` when `windows` is true — so the simulation exercises the real rule.
+fn go_win(program: &str, cwd: &Path) -> Result<std::path::PathBuf, Error> {
+    resolve(ResolveInput {
+        program: Path::new(program),
+        cwd,
+        system_dirs: &[],
+        path_var: None,
+        windows: true,
+    })
+}
+
+#[test]
+fn a_located_extensionless_image_resolves_on_windows() {
+    // THE REGRESSION GATE. `main` returned an existing absolute/pathed file verbatim; extending
+    // the bare-name rule to the located axis briefly made `executable(r"C:\tools\myapp")` a hard
+    // `NotFound` for any image not named `.exe`/`.com`. Neither `CreateProcessW` mode does that —
+    // the command-line mode
+    // documents "if the file name contains a path, .exe is not appended", and `lpApplicationName`
+    // (what this resolver actually feeds) documents "no default extension is assumed".
+    let cwd = tempfile::tempdir().unwrap();
+    let want = touch(cwd.path(), "myapp");
+    let got = go_win("./myapp", cwd.path()).expect("an extensionless pathed image must resolve");
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn a_located_image_with_an_unrelated_extension_resolves_on_windows() {
+    // Same gate, for the `.bin`/`.dat`/staged-payload shape: the PE/COFF format makes no
+    // extension normative, so cosca must not invent one for a file the caller named by path.
+    let cwd = tempfile::tempdir().unwrap();
+    let want = touch(cwd.path(), "thing.bin");
+    let got = go_win("./thing.bin", cwd.path()).expect("a .bin image must resolve");
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn a_located_name_prefers_the_exact_file_over_the_exe_one() {
+    // Candidate ORDER, pinned: with both `myapp` and `myapp.exe` present, the exact name the
+    // caller wrote wins. This is `main`'s ordering, kept deliberately — "you named this file"
+    // is the whole point of the located axis. Flipping the two candidates fails here.
+    let cwd = tempfile::tempdir().unwrap();
+    let want = touch(cwd.path(), "myapp");
+    touch(cwd.path(), "myapp.exe");
+    let got = go_win("./myapp", cwd.path()).unwrap();
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn a_located_name_still_falls_back_to_exe_when_only_that_exists() {
+    // The cross-platform ergonomic the `.exe` rule exists for: `executable("bin/my-program")`
+    // written once must find `my-program.exe` on Windows without the caller appending it. Losing
+    // the second candidate fails here, so neither candidate can be dropped without a red test.
+    let cwd = tempfile::tempdir().unwrap();
+    let want = touch(cwd.path(), "my-program.exe");
+    let got = go_win("./my-program", cwd.path()).unwrap();
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn a_bare_name_never_gets_the_exact_candidate_even_on_the_located_fix() {
+    // The located fix must NOT leak into the searched axis: a bare `tool` with only an
+    // extensionless `tool` on PATH still fails, because `PATHEXT` cannot express "no extension"
+    // and `CreateProcessW`/`cmd.exe`/both PowerShells all refuse it (measured on Windows CI).
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    touch(bin.path(), "tool");
+    let pv = path_var_for(&[bin.path()], true);
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: cwd.path(),
+        system_dirs: &[],
+        path_var: Some(&pv),
+        windows: true,
+    });
+    assert!(got.is_err(), "a searched bare name must stay .exe-only: {got:?}");
 }
 
 #[test]
@@ -353,7 +476,7 @@ fn relative_path_elements_are_skipped() {
 fn only_the_exe_file_is_ever_tried_even_alongside_an_extensionless_namesake() {
     // Renamed from `exe_suffix_is_preferred_over_an_extensionless_file`: under the old two-
     // candidate rule this was a preference between two matches in the same directory. Under the
-    // single-candidate rule there is only ever one filename tried (`tool.exe`), so an extensionless
+    // bare-name rule there is only ever one filename tried (`tool.exe`), so an extensionless
     // `tool` sitting right next to it is never even looked at — this end-to-end (real filesystem)
     // test still passes, but for a different reason than its old name claimed.
     let cwd = tempfile::tempdir().unwrap();
@@ -392,8 +515,8 @@ fn a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped() {
     let bin = tempfile::tempdir().unwrap();
     let semi_dir = bin.path().join("sub;dir");
     std::fs::create_dir(&semi_dir).unwrap();
-    // `tool.exe`, not extensionless `tool`: the single-candidate rule (see the "FIX: single-
-    // candidate filename rule" tests above) means a bare `tool` only ever looks for `tool.exe` on
+    // `tool.exe`, not extensionless `tool`: the bare-name rule (see the "filename
+    // candidate rule" tests above) means a bare `tool` only ever looks for `tool.exe` on
     // Windows now, so this quoting test must plant the file it can actually find.
     let want = touch(&semi_dir, "tool.exe");
     let quoted = OsString::from(format!("\"{}\"", semi_dir.display()));
@@ -513,7 +636,7 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
     let sysdir = tempfile::tempdir().unwrap();
     let pathdir = tempfile::tempdir().unwrap();
     // `tool.exe`, not extensionless `tool`: forced `windows: true` below means resolution only
-    // ever looks for `tool.exe` (the single-candidate rule — see the "FIX: single-candidate
+    // ever looks for `tool.exe` (the bare-name rule — see the "filename candidate
     // filename rule" tests above), so an extensionless file here would never be found by either
     // side and `resolve(...).unwrap()` would panic on `NotFound` instead of exercising the
     // ordering this test exists to pin.
