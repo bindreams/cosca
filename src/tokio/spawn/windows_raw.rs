@@ -270,7 +270,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     if let Some(c) = cmd.cwd() {
         sync_raw::resolve::ensure_no_nul_wide(c.as_os_str())?;
     }
-    let app_name: Option<Vec<u16>> = image.as_ref().map(|p| sync_raw::to_wide_nul(p.as_os_str()));
+    // Never NULL — see `sync_raw::app_name_wide`. Mirrors the sync backend exactly.
+    let app_name: Vec<u16> = sync_raw::app_name_wide(image.as_deref())?;
     let mut cmdline = sync_raw::raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
 
@@ -348,7 +349,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         let _guard = spawn_lock();
         let r = sync_raw::spawn_step(
             all_handles,
-            app_name.as_deref(),
+            &app_name,
             &mut cmdline,
             &mut si,
             &env_block,

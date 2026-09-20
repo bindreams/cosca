@@ -113,6 +113,18 @@ fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
             buf.truncate(len);
             return Some(PathBuf::from(OsString::from_wide(&buf)));
         }
+        // The documented convention leaves `len == buf.len()` unreachable: success returns the
+        // copied length EXCLUDING the NUL (so strictly less than the buffer), and a too-small
+        // buffer returns the required length INCLUDING it (so strictly greater). If that ever
+        // held, `resize` would be a no-op and this loop would spin forever. Asserted rather than
+        // guarded with an iteration cap: the contract is what is being relied on, so a violation
+        // should be loud in debug, not silently truncated into a wrong answer in release.
+        debug_assert!(
+            len > buf.len(),
+            "GetXDirectoryW returned {len} for a {}-element buffer: the documented convention makes \
+             equality unreachable, and treating it as 'too small' would not grow the buffer",
+            buf.len()
+        );
         buf.resize(len, 0);
     }
 }

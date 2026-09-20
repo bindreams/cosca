@@ -34,8 +34,8 @@ fn touch(dir: &Path, name: &str) -> std::path::PathBuf {
 /// `.exe` is the candidate a BARE name resolves through, and it is also the second candidate a
 /// LOCATED name falls back to, so planting it is correct for either shape (see the "filename
 /// candidate rule" tests below). Tests that care about the located axis specifically — that the
-/// exact name is tried, and tried FIRST — force `windows: true` via `go_win` and plant real
-/// filenames instead, so they gate in ordinary CI rather than only on the Windows runner.
+/// exact name is tried, and tried FIRST — force `windows: true` via `go_win`/`go_win_path` and
+/// plant real filenames, so they gate in ordinary CI rather than only on the Windows runner.
 fn exe_name(base: &str) -> String {
     if HOST_WINDOWS {
         format!("{base}.exe")
@@ -349,14 +349,18 @@ fn a_name_with_a_separator_resolves_against_cwd() {
 /// ordering is gated in ordinary CI rather than only on the Windows runner. Nothing here touches
 /// a Windows API — `Shape::Located` visits exactly one directory and `is_execable` reduces to
 /// `is_file()` when `windows` is true — so the simulation exercises the real rule.
-fn go_win(program: &str, cwd: &Path) -> Result<std::path::PathBuf, Error> {
+fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::PathBuf, Error> {
     resolve(ResolveInput {
         program: Path::new(program),
         cwd,
         system_dirs: &[],
-        path_var: None,
+        path_var: path,
         windows: true,
     })
+}
+
+fn go_win(program: &str, cwd: &Path) -> Result<std::path::PathBuf, Error> {
+    go_win_path(program, cwd, None)
 }
 
 #[test]
@@ -407,25 +411,6 @@ fn a_located_name_still_falls_back_to_exe_when_only_that_exists() {
 }
 
 #[test]
-fn a_bare_name_never_gets_the_exact_candidate_even_on_the_located_fix() {
-    // The located fix must NOT leak into the searched axis: a bare `tool` with only an
-    // extensionless `tool` on PATH still fails, because `PATHEXT` cannot express "no extension"
-    // and `CreateProcessW`/`cmd.exe`/both PowerShells all refuse it (measured on Windows CI).
-    let cwd = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
-    touch(bin.path(), "tool");
-    let pv = path_var_for(&[bin.path()], true);
-    let got = resolve(ResolveInput {
-        program: Path::new("tool"),
-        cwd: cwd.path(),
-        system_dirs: &[],
-        path_var: Some(&pv),
-        windows: true,
-    });
-    assert!(got.is_err(), "a searched bare name must stay .exe-only: {got:?}");
-}
-
-#[test]
 fn empty_path_elements_are_skipped() {
     let cwd = tempfile::tempdir().unwrap();
     touch(cwd.path(), &exe_name("tool"));
@@ -471,7 +456,6 @@ fn relative_path_elements_are_skipped() {
 
 // ── the Windows .exe rule ────────────────────────────────────────────────────────────
 
-#[cfg(windows)]
 #[test]
 fn only_the_exe_file_is_ever_tried_even_alongside_an_extensionless_namesake() {
     // Renamed from `exe_suffix_is_preferred_over_an_extensionless_file`: under the old two-
@@ -483,11 +467,10 @@ fn only_the_exe_file_is_ever_tried_even_alongside_an_extensionless_namesake() {
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), "tool"); // must be ignored entirely, not merely lose a preference
     let want = touch(bin.path(), "tool.exe");
-    let p = path_var(&[bin.path()]);
-    assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
+    let p = path_var_for(&[bin.path()], true);
+    assert_eq!(go_win_path("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
-#[cfg(windows)]
 #[test]
 fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
     // INVERTED from the pre-fix behaviour (renamed from
@@ -499,12 +482,11 @@ fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), "tool");
-    let p = path_var(&[bin.path()]);
-    let got = go("tool", cwd.path(), Some(&p));
+    let p = path_var_for(&[bin.path()], true);
+    let got = go_win_path("tool", cwd.path(), Some(&p));
     assert!(got.is_err(), "{got:?}");
 }
 
-#[cfg(windows)]
 #[test]
 fn a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped() {
     // N1, end to end: before quote handling, an unquoted split shredded `sub;dir` at the `;`,
@@ -520,7 +502,7 @@ fn a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped() {
     // Windows now, so this quoting test must plant the file it can actually find.
     let want = touch(&semi_dir, "tool.exe");
     let quoted = OsString::from(format!("\"{}\"", semi_dir.display()));
-    assert_eq!(go("tool", cwd.path(), Some(&quoted)).unwrap(), want);
+    assert_eq!(go_win_path("tool", cwd.path(), Some(&quoted)).unwrap(), want);
 }
 
 // ── the contract every backend depends on ────────────────────────────────────────────
@@ -585,6 +567,20 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
+/// Stays `#[cfg(windows)]` deliberately, unlike the located/`PATH` gates above which force
+/// `windows: true` and run on every host.
+///
+/// Fail-closed for `C:tool` is not a property of this module's own logic — `classify` only routes
+/// it to [`Shape::Located`], and the refusal comes entirely from Windows `PathBuf::push`
+/// semantics: joining a prefixed path clears the buffer, so `joined` stays `C:tool.exe` and fails
+/// `is_absolute()`. Off Windows that join is an ordinary append, so under simulation the rule
+/// INVERTS and a planted `C:tool.exe` resolves. Forcing `windows: true` here would therefore
+/// assert the opposite of the real behaviour.
+///
+/// Consequence worth knowing: the fail-closed guarantee has exactly one gate, and it only runs on
+/// the Windows runner. `a_drive_relative_name_is_located_not_bare` pins `classify`'s half on every
+/// host, but not the outcome. Making this host-testable needs the platform trait in #143, which
+/// would let the join behaviour be part of the simulated platform rather than the host's.
 #[cfg(windows)]
 #[test]
 fn a_drive_relative_name_fails_closed() {

@@ -2,8 +2,18 @@ use super::*;
 use crate::command::EnvOp;
 use std::ffi::OsString;
 
+/// Renamed from `resolve_absolute_existing_is_returned_as_is`, which named a property the code no
+/// longer has: there is no "absolute and exists -> return unchanged" shortcut any more (that was
+/// `main`'s `exe.is_absolute() && exe.is_file()` early return, deleted with the rewrite). An
+/// absolute path now goes through the ordinary located path — one directory, the exact name
+/// tried first — which lands on the same answer by a different route.
+///
+/// The old name also passed for the wrong reason: `current_exe()` ends in `.exe` on Windows, so
+/// it took the already-has-a-loadable-extension branch and could never have caught the located
+/// `.exe`-appending regression. The extensionless and unrelated-extension cases are gated in
+/// `crate::resolve`'s own tests, which force `windows: true` and so run on every host.
 #[test]
-fn resolve_absolute_existing_is_returned_as_is() {
+fn resolve_an_absolute_path_to_an_existing_image_yields_that_path() {
     let me = std::env::current_exe().unwrap();
     assert_eq!(resolve_executable(&me, None, &[]).unwrap(), me);
 }

@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 use windows::Win32::System::Threading::{
@@ -70,7 +70,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     if let Some(c) = cmd.cwd() {
         resolve::ensure_no_nul_wide(c.as_os_str())?;
     }
-    let app_name: Option<Vec<u16>> = image.as_ref().map(|p| to_wide_nul(p.as_os_str()));
+    // Never NULL — see `app_name_wide`. A NULL `lpApplicationName` would make `CreateProcessW`
+    // search for the image itself, including the calling process's current directory.
+    let app_name: Vec<u16> = app_name_wide(image.as_deref())?;
     let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
 
@@ -150,7 +152,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         let _guard = spawn_lock();
         let r = spawn_step(
             all_handles,
-            app_name.as_deref(),
+            &app_name,
             &mut cmdline,
             &mut si,
             &env_block,
@@ -239,7 +241,7 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_step(
     handles: &[HANDLE],
-    app: Option<&[u16]>,
+    app: &[u16],
     cmdline: &mut [u16],
     si: &mut STARTUPINFOEXW,
     env: &Option<Vec<u16>>,
@@ -252,8 +254,39 @@ pub(crate) fn spawn_step(
     }
     // Only the syscall's own Result is classified — the inherit loop above stays outside, since
     // an access-denied from `SetHandleInformation` is not a breakaway denial.
-    proc::create_process(app, cmdline, si, env, cwd, flags)
+    // `Some`, never `None`: `app` is non-optional here precisely so a NULL `lpApplicationName`
+    // cannot be expressed at this layer. `proc::create_process` keeps the `Option` because it is
+    // the thin, faithful Win32 wrapper; the policy that this backend never passes NULL lives here.
+    // See [`app_name_wide`] for why NULL is a security boundary and not a convenience.
+    proc::create_process(Some(app), cmdline, si, env, cwd, flags)
         .map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, request))
+}
+
+/// The resolved image as the NUL-terminated wide string `CreateProcessW` takes for
+/// `lpApplicationName` — erroring rather than yielding NULL.
+///
+/// A NULL `lpApplicationName` makes `CreateProcessW` perform its OWN image search, and step 2 of
+/// that documented search is the CALLING process's current directory — the binary-planting hole
+/// (CWE-426/427) this module's resolution exists to close.
+///
+/// No input shape reaches here with no image today: `program_token` yields `Some` for every
+/// `CommandInput` arm that [`raw_program_and_line`] does not reject outright. But that guarantee
+/// currently lives in the *pairwise agreement* of two functions, reached a dozen lines apart, and
+/// duplicated across the sync and async backends — and the `CommandLine` arm re-derives
+/// `first_token_wide` independently rather than reusing `program_token`. A fourth `CommandInput`
+/// variant, or a change to `first_token_wide`'s empty-input contract, would reopen CWE-426 with
+/// no test failing. This turns that reconstructed argument into one checked contract at the site
+/// that matters.
+///
+/// A hard error, not a `debug_assert!`: a release build must fail closed rather than hand
+/// `CreateProcessW` a NULL and let it search.
+pub(crate) fn app_name_wide(image: Option<&Path>) -> Result<Vec<u16>, Error> {
+    let image = image.ok_or_else(|| {
+        Error::Io(std::io::Error::other(
+            "internal: the raw backend resolved no image; refusing to let CreateProcessW search for one",
+        ))
+    })?;
+    Ok(to_wide_nul(image.as_os_str()))
 }
 
 /// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn

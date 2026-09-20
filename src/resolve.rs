@@ -48,6 +48,18 @@ pub(crate) struct ResolveInput<'a> {
     /// the pre-patch code never had. The caller passes these in (rather than this module calling
     /// `GetSystemDirectoryW`/`GetWindowsDirectoryW`/`current_exe` itself) so the rule stays
     /// testable from a POSIX host, exactly like `windows` below.
+    ///
+    /// **The monotonicity argument above is stated against the NULL-`lpApplicationName`
+    /// baseline**, i.e. the route where `executable()` is unset and `CreateProcessW` did its own
+    /// search. It does not transfer wholesale to the `executable()` route, whose pre-patch order
+    /// was `base_cwd` -> `PATH` and which never consulted the app directory, `System32` or the
+    /// Windows directory at all. On that route the app directory is a NEW search source: a
+    /// consumer installed at `...\Programs\MyApp\myapp.exe` calling `executable("tool")` now
+    /// prefers `...\Programs\MyApp\tool.exe` over a `tool.exe` on `PATH`. Net-net that route
+    /// still narrows, because the cwd step it DID have is gone and the directory holding the
+    /// running image is not attacker-writable in any install worth defending — but it is a
+    /// behaviour change in both directions, not a pure narrowing, and saying otherwise would
+    /// overstate it.
     pub system_dirs: &'a [PathBuf],
     /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
     pub path_var: Option<&'a OsStr>,
@@ -211,13 +223,20 @@ fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {
 
 /// Split a `PATH` value on the simulated platform's separator.
 ///
-/// On Windows a `PATH` element may be wrapped in a pair of `"` quotes, letting a directory that
-/// contains a literal `;` (or leading/trailing space) survive as ONE element rather than being
-/// torn in half by a naive byte-level `;` split. The quotes are consumed as delimiters, not
-/// content: `"C:\a;b"` is one element, `C:\a;b`; a plain, unquoted `C:\bin` passes through
-/// unchanged. Leaving the quotes IN the element would fail the `is_absolute()` filter the caller
-/// applies afterwards (a leading `"` is not a recognised drive prefix), so a quoted entry would
-/// be SILENTLY DROPPED rather than erroring — stripping them here is what keeps it alive.
+/// On Windows a `"` toggles quoting, so a `;` inside quotes does not split — letting a directory
+/// that contains a literal `;` (or leading/trailing space) survive as ONE element rather than
+/// being torn in half by a naive byte-level `;` split. `"C:\a;b"` is one element, `C:\a;b`; a
+/// plain, unquoted `C:\bin` passes through unchanged.
+///
+/// Every `"` is consumed as a delimiter wherever it appears, not only a wrapping pair: an
+/// interior `C:\Pro"gram Files"\bin` yields `C:\Program Files\bin`, with the quotes removed and
+/// the remainder concatenated. That matches `std::env::split_paths`'s own Windows parser, which
+/// this replaced, so the behaviour is deliberate — but it does mean a `"` is never preserved as
+/// a literal path character on Windows.
+///
+/// Stripping is what keeps a quoted entry alive at all: leaving the quotes IN would fail the
+/// `is_absolute()` filter the caller applies afterwards (a leading `"` is not a recognised drive
+/// prefix), so the entry would be SILENTLY DROPPED rather than erroring.
 ///
 /// On POSIX, `"` is an ordinary filename character and `;` is not a separator: quoting is
 /// deliberately NOT applied there — only `:` splits, and any quote characters in an element are
@@ -268,6 +287,19 @@ fn split_path_var_windows(bytes: &[u8]) -> Vec<PathBuf> {
 /// match and keeps searching (measured), so keying on existence alone stops at a file that would
 /// have been passed over and hands it to exec, turning a working command into `EACCES`.
 /// `faccessat(AT_EACCESS)` asks for the ids that will actually exec, unlike `access`.
+///
+/// That argument is about the `PATH` SEARCH, and it is applied to a [`Shape::Located`] name too,
+/// where `execvp` does not search and would report `EACCES` rather than skipping. So once the
+/// POSIX spawn path routes through this module (see the module doc), `resolve("./tool")` against
+/// a non-executable `./tool` will report `NotFound` where the platform reports
+/// `PermissionDenied`. That is deliberate — one predicate for "can this be exec'd" beats a
+/// shape-dependent one, and the caller learns the file is unusable either way — but the error
+/// KIND diverges, and anything matching on it should know that before the POSIX path lands.
+///
+/// Note the `windows` parameter is a runtime flag while the `faccessat` call sits behind
+/// `#[cfg(unix)]`: simulating POSIX on a Windows HOST therefore skips the execute-bit check
+/// entirely. See #143 — that mismatch is the concrete motivation for replacing this flag with a
+/// platform trait.
 fn is_execable(path: &Path, windows: bool) -> bool {
     if !path.is_file() {
         return false;
