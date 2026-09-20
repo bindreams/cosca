@@ -231,8 +231,30 @@ use crate::identity::ProcessId;
 /// `ERROR_CANCELLED` (1223) as an HRESULT (0x800704C7) — the UAC-declined code.
 const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x800704C7_u32 as i32);
 
-fn wide_nul(s: &OsStr) -> Vec<u16> {
-    s.encode_wide().chain(std::iter::once(0)).collect()
+/// A NUL-terminated wide string for a `SHELLEXECUTEINFOW` field, REFUSING an interior NUL.
+///
+/// `PCWSTR` stops at the first NUL, so a value containing one is silently TRUNCATED rather than
+/// rejected — and every field here decides something security-relevant:
+///
+/// - `lpFile` would load a DIFFERENT FILE than the caller named, elevated.
+/// - `lpDirectory` would run the elevated child somewhere other than `current_dir()` asked for.
+/// - `lpParameters` would drop everything after the NUL, silently shortening the argument line an
+///   elevated program acts on.
+///
+/// The raw `CreateProcessW` backend already refuses all three (it NUL-checks the image, the cwd,
+/// and every argv token). Without this, the SAME `Command` fails loudly unelevated and quietly
+/// does something else under `.elevate()` — the contract must not depend on which path ran.
+///
+/// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
+/// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
+fn wide_nul(what: &str, s: &OsStr) -> Result<Vec<u16>, Error> {
+    if s.encode_wide().any(|unit| unit == 0) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the elevated {what} contains an embedded NUL, which Win32 would silently truncate"),
+        )));
+    }
+    Ok(s.encode_wide().chain(std::iter::once(0)).collect())
 }
 
 /// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
@@ -329,6 +351,29 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
     reject_unsupported_config(cmd)?;
     let (program, params) = program_and_params(cmd)?; // validates commandline()/argv0 too
 
+    // Input validation stays with `reject_unsupported_config`, ABOVE the short-circuit, so every
+    // verdict here is a property of the REQUEST rather than of the caller's ambient privilege.
+    // Putting it below would make the same `Command` refused when unelevated and accepted when
+    // already elevated — the exact "depends which path ran" divergence these checks exist to
+    // remove. It also costs nothing: none of this depends on what the planner decides.
+
+    // .bat/.cmd, refused here as on every other backend. `ShellExecuteEx`'s `runas` resolves the
+    // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into
+    // `%*` UNESCAPED — and `join_wide` quotes only for whitespace, never for cmd metacharacters,
+    // so `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED cmd.exe. That is
+    // CVE-2024-24576, which the raw and std backends both refuse outright.
+    crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
+
+    // Refused for an interior NUL rather than silently truncated — see `wide_nul`. `params` is
+    // the JOINED argument line, so a NUL in any single argv element is caught here.
+    let dir = cmd
+        .cwd()
+        .map(|d| wide_nul("working directory", d.as_os_str()))
+        .transpose()?;
+    let file_w = wide_nul("program path", program.as_os_str())?;
+    let params_w = wide_nul("argument line", params.as_os_str())?;
+    let verb_w = wide_nul("verb", OsStr::new("runas"))?;
+
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasOutcome::AlreadyElevated),
         Transition::Reject { error } => return Err(error),
@@ -338,11 +383,6 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         }
         Transition::ElevateWindows { .. } => {}
     }
-
-    let dir = cmd.cwd().map(|d| wide_nul(d.as_os_str()));
-    let file_w = wide_nul(program.as_os_str());
-    let params_w = wide_nul(params.as_os_str());
-    let verb_w = wide_nul(OsStr::new("runas"));
 
     let com = ComInit::init()?;
     // SAFETY: `info` is fully initialized with the correct cbSize; the wide buffers

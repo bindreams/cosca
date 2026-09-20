@@ -209,3 +209,135 @@ fn elevation_accepts_no_window() {
     c.args(["whoami"]).elevate().no_window();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
+
+// ===== interior NULs must be refused, not silently truncated =====
+
+/// `PCWSTR` stops at the first NUL, so every `SHELLEXECUTEINFOW` string field is TRUNCATED rather
+/// than rejected when it contains one. Each truncation changes what an ELEVATED process does:
+/// a different image loads, a different working directory applies, or the argument line is cut
+/// short. The raw `CreateProcessW` backend already refuses all three, so leaving them unchecked
+/// here makes the outcome depend on whether `.elevate()` was called — the one thing that must
+/// never be true of a safety check.
+///
+/// Tested directly on the builder rather than through `ShellExecuteExW`, so it needs no UAC
+/// prompt and no elevated child.
+#[test]
+fn wide_nul_refuses_an_interior_nul_in_any_value() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    // A value whose FIRST unit is NUL, and one where the NUL hides in the middle — the second is
+    // the dangerous shape, because it looks like a perfectly ordinary path until Win32 cuts it.
+    for units in [
+        vec![0u16],
+        "C:\\a\\b.exe\0junk".encode_utf16().collect::<Vec<u16>>(),
+        "D:\\work\0junk".encode_utf16().collect::<Vec<u16>>(),
+    ] {
+        let value = OsString::from_wide(&units);
+        let got = super::wide_nul("probe field", &value);
+        assert!(
+            got.is_err(),
+            "an interior NUL must be refused, not truncated to {:?}",
+            value.to_string_lossy().split('\0').next().unwrap()
+        );
+        match got.unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e:?}"),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+    }
+}
+
+/// The ordinary case still works, so the guard above is gating NULs rather than rejecting
+/// everything — and the result really is NUL-TERMINATED, which is what `PCWSTR` requires.
+#[test]
+fn wide_nul_accepts_an_ordinary_value_and_terminates_it() {
+    let w = super::wide_nul("program path", std::ffi::OsStr::new("C:\\tools\\app.exe")).unwrap();
+    assert_eq!(w.last(), Some(&0), "the buffer must be NUL-terminated: {w:?}");
+    assert!(!w[..w.len() - 1].contains(&0), "no interior NUL in a clean value");
+}
+
+/// THE WIRING of all three fallible call sites, not the helper. `wide_nul` being correct is worthless if a field is built by an
+/// inline `encode_wide().chain(once(0))` instead — reverting any single call site to that leaves
+/// the helper's own tests green, so this drives `launch_runas_with_host` and pins that the
+/// truncating value is actually refused where it is used.
+///
+/// Uses a program path that cannot exist, so a call site that ESCAPED the check would proceed to
+/// `ShellExecuteExW` and come back `Elevation { .. }` (file not found, no prompt) rather than
+/// `Io(InvalidInput)`. Both outcomes are errors — only the KIND distinguishes wired from unwired.
+///
+/// One leg per fallible field — `lpFile`, `lpParameters`, `lpDirectory`. A single-argv,
+/// no-cwd probe only reaches `lpFile`: with an empty joined parameter line and `cmd.cwd() ==
+/// None`, reverting either of the other two call sites to an inline
+/// `encode_wide().chain(once(0))` leaves every test green, which is exactly the gap this test
+/// exists to close.
+///
+/// Run for both privilege levels because the check now sits above the short-circuit: an
+/// already-elevated caller must get the same refusal, not a silent `AlreadyElevated`.
+#[test]
+fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let nul_path = OsString::from_wide(
+        &r"Z:\cosca-nonexistent\x.exe"
+            .encode_utf16()
+            .chain([0])
+            .chain("junk".encode_utf16())
+            .collect::<Vec<u16>>(),
+    );
+
+    let clean = OsString::from(r"Z:\cosca-nonexistent\x.exe");
+    for elevated in [false, true] {
+        // lpFile, lpParameters, lpDirectory — one probe each, every other field clean so the
+        // refusal can only have come from the field under test.
+        let mut by_program = Command::new();
+        by_program.args([nul_path.clone()]).elevate();
+
+        let mut by_argument = Command::new();
+        by_argument.args([clean.clone(), nul_path.clone()]).elevate();
+
+        let mut by_cwd = Command::new();
+        by_cwd.args([clean.clone()]).current_dir(&nul_path).elevate();
+
+        for (field, c) in [
+            ("lpFile", &mut by_program),
+            ("lpParameters", &mut by_argument),
+            ("lpDirectory", &mut by_cwd),
+        ] {
+            match super::launch_runas_with_host(c, &win_host(elevated)) {
+                Err(Error::Io(e)) => assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "elevated={elevated} {field}: expected the NUL refusal, got {e:?}"
+                ),
+                other => panic!(
+                    "elevated={elevated} {field}: a truncating NUL must be refused at the call \
+                     site, got {:?}",
+                    other.map(|_| "Ok")
+                ),
+            }
+        }
+    }
+}
+
+/// `.bat`/`.cmd` must be refused here exactly as on every other backend. `ShellExecuteEx`'s
+/// `runas` resolves the `batfile` association through `cmd.exe` and substitutes `lpParameters`
+/// into `%*` unescaped, while `join_wide` quotes only for whitespace — so an argument like
+/// `a&calc` is command injection into an ELEVATED shell (CVE-2024-24576).
+///
+/// Privilege-independent for the same reason as the config gate: the already-elevated caller
+/// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
+/// of the request rather than of the host.
+#[test]
+fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
+    for elevated in [false, true] {
+        for probe in ["setup.bat", "setup.cmd", "SETUP.BAT"] {
+            let mut c = Command::new();
+            c.args([probe, "a&calc"]).elevate();
+            assert!(
+                is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated)).map(|_| ())),
+                "elevated={elevated}: {probe:?} must be refused before ShellExecuteEx hands it to cmd.exe"
+            );
+        }
+    }
+}
