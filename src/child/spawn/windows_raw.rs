@@ -70,11 +70,19 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     if let Some(c) = cmd.cwd() {
         resolve::ensure_no_nul_wide(c.as_os_str())?;
     }
-    // Never NULL — see `app_name_wide`. A NULL `lpApplicationName` would make `CreateProcessW`
-    // search for the image itself, including the calling process's current directory.
-    let app_name: Vec<u16> = app_name_wide(image.as_deref())?;
     let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
+    // AFTER `raw_program_and_line`, deliberately. Both reject the same three no-program states —
+    // `CommandInput::Empty`, an empty argv, and a blank `commandline()` with no `executable()` —
+    // but that function names WHICH one ("no program specified", "empty argv", "empty or
+    // whitespace-only command line..."), whereas this can only report the internal invariant.
+    // Ordering this first turned three ordinary caller mistakes into an `internal:` error and
+    // made `raw_program_and_line`'s own blank-command-line check unreachable in production.
+    //
+    // This stays as the backstop that makes a NULL `lpApplicationName` UNREPRESENTABLE if those
+    // two ever drift apart — a NULL would make `CreateProcessW` search for the image itself,
+    // including the calling process's current directory.
+    let app_name: Vec<u16> = app_name_wide(image.as_deref())?;
 
     // Containment: mirror `prepare`'s pre-spawn decision on the raw path. An uncontained spawn keeps
     // the defaults (`contain_flags` 0, a `mode: None`/`is_root: false` `Prepared`); a Strongest root
@@ -269,14 +277,18 @@ pub(crate) fn spawn_step(
 /// that documented search is the CALLING process's current directory — the binary-planting hole
 /// (CWE-426/427) this module's resolution exists to close.
 ///
-/// No input shape reaches here with no image today: `program_token` yields `Some` for every
-/// `CommandInput` arm that [`raw_program_and_line`] does not reject outright. But that guarantee
-/// currently lives in the *pairwise agreement* of two functions, reached a dozen lines apart, and
-/// duplicated across the sync and async backends — and the `CommandLine` arm re-derives
-/// `first_token_wide` independently rather than reusing `program_token`. A fourth `CommandInput`
-/// variant, or a change to `first_token_wide`'s empty-input contract, would reopen CWE-426 with
-/// no test failing. This turns that reconstructed argument into one checked contract at the site
-/// that matters.
+/// In practice nothing reaches here with no image, because [`raw_program_and_line`] runs FIRST
+/// and rejects the same three no-program states with a message naming which one. This is the
+/// backstop, not the primary gate — and it is deliberately not ordered first, because doing so
+/// reported ordinary caller mistakes as internal faults.
+///
+/// It earns its place because the primary gate is an argument rather than a check: `program_token`
+/// yielding `Some` for every `CommandInput` arm that `raw_program_and_line` rejects is a
+/// *pairwise agreement* between two functions, duplicated across the sync and async backends, and
+/// the `CommandLine` arm re-derives `first_token_wide` independently rather than reusing
+/// `program_token`. A fourth `CommandInput` variant, or a change to `first_token_wide`'s
+/// empty-input contract, would break that agreement — and this is what stops the break becoming
+/// CWE-426 rather than an error.
 ///
 /// A hard error, not a `debug_assert!`: a release build must fail closed rather than hand
 /// `CreateProcessW` a NULL and let it search.

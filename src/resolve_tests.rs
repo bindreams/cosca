@@ -2,11 +2,22 @@ use super::*;
 use std::ffi::OsString;
 use std::path::Path;
 
-/// The host's own platform. Any test that touches the filesystem MUST use this rather than a
-/// simulated flag: a simulated platform and real paths cannot agree. Simulating POSIX on Windows
-/// splits `C:\\Users\\...` on its own drive colon, so every candidate is shredded and the test
-/// either fails or — worse — passes vacuously. (Simulating Windows on POSIX happens to work only
-/// because POSIX paths contain no `;`, which is luck, not a property to rely on.)
+/// The host's own platform.
+///
+/// The rule this encodes is DIRECTIONAL, not symmetric. Simulating POSIX on Windows is never safe
+/// for a filesystem test: `C:\\Users\\...` is split on its own drive colon, so every candidate is
+/// shredded and the test either fails or — worse — passes vacuously. Any filesystem test that
+/// could run POSIX-simulated must therefore use this flag.
+///
+/// Simulating WINDOWS on a POSIX host is the carve-out, and several filesystem tests below take
+/// it deliberately (`go_win`/`go_win_path`, plus the system-directory block). It works because a
+/// POSIX tempdir path contains no `;` and no drive prefix, so `;`-splitting is a no-op and
+/// `is_absolute()` agrees with the host — the Windows rules then apply to paths they cannot
+/// mangle. That is a property of the paths these tests construct, not a general licence: a
+/// `windows: true` filesystem test that used a path containing `;` would be back in the shredding
+/// case. The carve-out exists because the alternative is worse — the located candidate order, the
+/// `PATH` quoting rule and the system-directory precedence would otherwise be gated only on the
+/// Windows runner.
 const HOST_WINDOWS: bool = cfg!(windows);
 
 /// A `PATH` value in the HOST's syntax, for filesystem tests.
@@ -139,10 +150,12 @@ fn posix_path_var_quotes_are_not_special() {
 // resolve even though every shell finds `python3.11.exe`. So the rule also widens for a dotted
 // bare name.
 //
-// LOADED (located): two candidates, the exact name FIRST and `.exe` second. The PE format makes no
-// extension normative and `CreateProcessW` documents "no default extension is assumed" for the
-// `lpApplicationName` this resolver feeds, so a file the caller named by path must stay nameable.
-// The `.exe` fallback is kept so `executable("bin/my-program")` stays portable.
+// LOADED (located): the exact name FIRST, always. The PE format makes no extension normative and
+// `CreateProcessW` documents "no default extension is assumed" for the `lpApplicationName` this
+// resolver feeds, so a file the caller named by path must stay nameable. A second `.exe` candidate
+// follows ONLY when the name has no extension at all, keeping `executable("bin/my-program")`
+// portable while leaving a dotted name (`thing.bin`) with exactly one candidate — which is what
+// `main` did, and what keeps this axis a no-op rather than a widening.
 //
 // See `filename_candidates`'s doc in `src/resolve.rs` for the full rationale, including why
 // exactly `.exe`/`.com` (not scripts).
@@ -226,11 +239,23 @@ fn a_located_name_tries_the_exact_name_before_the_exe_one() {
 }
 
 #[test]
-fn a_located_dotted_name_also_tries_exact_before_exe() {
-    // `.bin` is not a loadable extension, but `CreateProcessW` loads the file regardless of what
-    // it is called, so the exact name must still be tried first.
+fn a_located_dotted_name_gets_only_the_exact_candidate() {
+    // `.bin` is not a LOADABLE extension, but it IS an extension — and `main` keyed its `.exe`
+    // fallback on `Path::extension().is_none()`. Appending here would let
+    // `executable(r"tools\thing.bin")` resolve to `thing.bin.exe` when `thing.bin` is absent,
+    // which `main` refused: a widening on the located axis, and one a writer of that directory
+    // could exploit. One candidate, the name as written.
     let got = candidate(r"tools\thing.bin", true);
-    assert_eq!(got, vec![r"tools\thing.bin", r"tools\thing.bin.exe"], "{got:?}");
+    assert_eq!(got, vec![r"tools\thing.bin"], "{got:?}");
+}
+
+#[test]
+fn a_located_name_with_only_a_leading_dot_still_gets_the_exe_fallback() {
+    // `Path::extension()` treats a leading dot as part of the stem, not an extension separator,
+    // so `.helper` has NO extension and keeps the portable `.exe` fallback. Pinned because
+    // `has_any_extension` reimplements that rule byte-wise and could easily get it backwards.
+    let got = candidate(r"bin\.helper", true);
+    assert_eq!(got, vec![r"bin\.helper", r"bin\.helper.exe"], "{got:?}");
 }
 
 #[test]
@@ -279,7 +304,6 @@ fn every_searched_name_produces_exactly_one_candidate() {
         ("tool.bat", true),
         ("tool", false),
         ("python3.11", false),
-        ("bin/my-program", false), // POSIX never appends, located or not
     ] {
         let got = filename_candidates(OsStr::new(n), w, classify(OsStr::new(n), w));
         assert_eq!(got.len(), 1, "{n:?} (windows={w}) -> {got:?}");
@@ -345,10 +369,13 @@ fn a_name_with_a_separator_resolves_against_cwd() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-/// Drive `resolve` with the WINDOWS rules regardless of host, so the located-name candidate
-/// ordering is gated in ordinary CI rather than only on the Windows runner. Nothing here touches
-/// a Windows API — `Shape::Located` visits exactly one directory and `is_execable` reduces to
-/// `is_file()` when `windows` is true — so the simulation exercises the real rule.
+/// Drive `resolve` with the WINDOWS rules regardless of host, so rules that only ship on Windows
+/// are still gated in ordinary CI rather than only on the Windows runner.
+///
+/// Nothing here touches a Windows API: `is_execable` reduces to `is_file()` when `windows` is
+/// true, and the `PATH` splitting that the bare-name callers exercise is pure byte logic over
+/// tempdir paths that contain no `;`. See `HOST_WINDOWS` for why simulating Windows on POSIX is
+/// safe here while the reverse never is.
 fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::PathBuf, Error> {
     resolve(ResolveInput {
         program: Path::new(program),
@@ -457,12 +484,12 @@ fn relative_path_elements_are_skipped() {
 // ── the Windows .exe rule ────────────────────────────────────────────────────────────
 
 #[test]
-fn only_the_exe_file_is_ever_tried_even_alongside_an_extensionless_namesake() {
-    // Renamed from `exe_suffix_is_preferred_over_an_extensionless_file`: under the old two-
-    // candidate rule this was a preference between two matches in the same directory. Under the
-    // bare-name rule there is only ever one filename tried (`tool.exe`), so an extensionless
-    // `tool` sitting right next to it is never even looked at — this end-to-end (real filesystem)
-    // test still passes, but for a different reason than its old name claimed.
+fn the_exe_file_wins_over_an_extensionless_namesake_beside_it() {
+    // Named for what it can actually observe. Re-adding an extensionless SECOND candidate for a
+    // bare name would NOT fail this test — `tool.exe` is tried first and wins either way — so it
+    // cannot gate the one-candidate property despite the directory being set up for it. That
+    // property is gated by `bare_extensionless_name_gets_only_the_exe_candidate`, which compares
+    // the candidate list directly; this one pins the end-to-end outcome on a real filesystem.
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), "tool"); // must be ignored entirely, not merely lose a preference
@@ -485,6 +512,12 @@ fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
     let p = path_var_for(&[bin.path()], true);
     let got = go_win_path("tool", cwd.path(), Some(&p));
     assert!(got.is_err(), "{got:?}");
+
+    // Positive control: the SAME directory and PATH resolve once `tool.exe` is present, so the
+    // miss above is the candidate rule and not a broken `path_var_for` silently dropping the
+    // entry — which would leave this test green for the wrong reason.
+    let want = touch(bin.path(), "tool.exe");
+    assert_eq!(go_win_path("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
 #[test]
@@ -733,4 +766,60 @@ fn posix_ignores_system_dirs_entirely() {
         windows: false,
     });
     assert!(got.is_err(), "{got:?}");
+}
+
+// ── the located axis does not search, and a miss is NotFound ─────────────────────────
+
+#[test]
+fn a_located_name_never_falls_back_to_a_search() {
+    // `resolve_executable_in`'s doc promises a name containing a separator "resolves against
+    // base_cwd with NO SEARCH AT ALL". Nothing gated that: making `Shape::Located` also visit
+    // `system_dirs`/`PATH` passed the whole suite. The consequence is concrete —
+    // `executable("./helper")` with no `./helper` present would silently load a `helper.exe` from
+    // `PATH`, a file the caller explicitly did not name.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    // A decoy the search WOULD find, under both located candidate spellings.
+    touch(bin.path(), "helper");
+    touch(bin.path(), "helper.exe");
+    let pv = path_var_for(&[bin.path()], true);
+    let got = go_win_path("./helper", cwd.path(), Some(&pv));
+    assert!(
+        got.is_err(),
+        "a located name must not be searched for on PATH, got {got:?}"
+    );
+}
+
+#[test]
+fn a_miss_is_reported_as_not_found() {
+    // `Command::executable`'s PUBLIC doc promises `ErrorKind::NotFound` for a drive-relative name,
+    // and `resolve_executable_in`'s promises it for any miss. Nothing asserted the kind, so
+    // changing it was invisible.
+    let cwd = tempfile::tempdir().unwrap();
+    let err = go_win_path("no-such-program-41d9", cwd.path(), None).unwrap_err();
+    match err {
+        Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e:?}"),
+        other => panic!("a miss must be an Io(NotFound), got {other:?}"),
+    }
+}
+
+#[test]
+fn a_directory_named_like_the_program_is_not_returned() {
+    // `is_execable` keys on `is_file()`, not `exists()`. It matters most on POSIX, where
+    // `faccessat(X_OK)` SUCCEEDS on a directory — so an `exists()`-based check would hand a
+    // directory to exec. Both existing gates for this live in the `#[cfg(windows)]` module, which
+    // is the wrong platform for the hazard.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    std::fs::create_dir(bin.path().join(exe_name("tool"))).unwrap();
+    let p = path_var(&[bin.path()]);
+    let got = go("tool", cwd.path(), Some(&p));
+    assert!(got.is_err(), "a directory must never resolve as a program: {got:?}");
+
+    // Positive control: a real file in the same slot DOES resolve, so the assertion above is
+    // gating `is_file()` rather than an unrelated lookup failure.
+    let bin2 = tempfile::tempdir().unwrap();
+    let want = touch(bin2.path(), &exe_name("tool"));
+    let p2 = path_var(&[bin2.path()]);
+    assert_eq!(go("tool", cwd.path(), Some(&p2)).unwrap(), want);
 }

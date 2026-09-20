@@ -270,10 +270,12 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     if let Some(c) = cmd.cwd() {
         sync_raw::resolve::ensure_no_nul_wide(c.as_os_str())?;
     }
-    // Never NULL — see `sync_raw::app_name_wide`. Mirrors the sync backend exactly.
-    let app_name: Vec<u16> = sync_raw::app_name_wide(image.as_deref())?;
     let mut cmdline = sync_raw::raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
+    // Ordered after `raw_program_and_line` for the same reason as the sync backend — see its
+    // comment: that call names which no-program mistake the caller made, this one is the backstop
+    // that keeps a NULL `lpApplicationName` unrepresentable.
+    let app_name: Vec<u16> = sync_raw::app_name_wide(image.as_deref())?;
 
     // Containment: mirror the sync raw backend's pre-spawn decision. Uncontained keeps the defaults
     // (flags 0, `mode: None`/`is_root: false`); a Strongest root spawns CREATE_SUSPENDED and is

@@ -3,8 +3,9 @@
 //!
 //! [`resolve_executable`] delegates to [`crate::resolve`] (a bare name is looked up in the
 //! system directories — app dir, System32, the Windows directory — and then `PATH`, never the
-//! current directory; `.exe` is appended unless the name's final component already ends in `.exe`
-//! or `.com`, case-insensitively) rather than full `CreateProcessW` search parity — this keeps
+//! current directory, resolving through `name.exe` alone; a name containing a separator is not
+//! searched at all and is tried as written first, falling back to `name.exe` only when it carries
+//! no extension) rather than full `CreateProcessW` search parity — this keeps
 //! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate concern. The
 //! system-directory step exists to reproduce
 //! `CreateProcessW`'s own NULL-`lpApplicationName` search order minus the current directory: see
@@ -115,17 +116,20 @@ fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
         }
         // The documented convention leaves `len == buf.len()` unreachable: success returns the
         // copied length EXCLUDING the NUL (so strictly less than the buffer), and a too-small
-        // buffer returns the required length INCLUDING it (so strictly greater). If that ever
-        // held, `resize` would be a no-op and this loop would spin forever. Asserted rather than
-        // guarded with an iteration cap: the contract is what is being relied on, so a violation
-        // should be loud in debug, not silently truncated into a wrong answer in release.
+        // buffer returns the required length INCLUDING it (so strictly greater). Loud in debug if
+        // that is ever violated.
         debug_assert!(
             len > buf.len(),
             "GetXDirectoryW returned {len} for a {}-element buffer: the documented convention makes \
              equality unreachable, and treating it as 'too small' would not grow the buffer",
             buf.len()
         );
-        buf.resize(len, 0);
+        // `.max(buf.len() + 1)` is load-bearing in RELEASE, where the assert is compiled out: a
+        // bare `resize(len, 0)` with `len == buf.len()` is a NO-OP, so `f` would be re-called with
+        // an identical buffer and this loop would spin forever — a hang on every raw-backend
+        // spawn, not a wrong answer. Growing by at least one guarantees progress on every
+        // iteration, which is what makes the loop terminate without an arbitrary iteration cap.
+        buf.resize(len.max(buf.len() + 1), 0);
     }
 }
 

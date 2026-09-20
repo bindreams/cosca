@@ -202,8 +202,29 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
     with_exe.push(".exe");
     match shape {
         Shape::BareName => vec![with_exe],
+        // A located name with SOME extension gets exactly one candidate, the name as written.
+        // `main` keyed its `.exe` fallback on `Path::extension().is_none()`, so appending to a
+        // dotted name here would be a WIDENING on the located axis: `executable(r"C:\t\thing.bin")`
+        // would newly resolve to `thing.bin.exe` when `thing.bin` is absent, loading a file a
+        // writer of that directory could plant where `main` returned `NotFound`. The monotonicity
+        // argument below is measured on the SEARCHED axis and does not license that.
+        Shape::Located if has_any_extension(name, windows) => vec![name.to_os_string()],
         Shape::Located => vec![name.to_os_string(), with_exe],
     }
+}
+
+/// Whether `name`'s final component carries any extension at all, matching `Path::extension()`'s
+/// rule that a LEADING dot is not an extension separator (`.bashrc` has none).
+///
+/// Distinct from [`has_loadable_extension`], which asks the narrower "is it already `.exe`/`.com`".
+/// This one decides whether a located name gets the `.exe` fallback, and keeping it identical to
+/// `main`'s `Path::extension().is_none()` test is what makes the located axis a no-op against
+/// pre-PR behaviour rather than a widening.
+fn has_any_extension(name: &OsStr, windows: bool) -> bool {
+    let bytes = name.as_encoded_bytes();
+    let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
+    let final_component = &bytes[start..];
+    !matches!(final_component.iter().rposition(|&b| b == b'.'), Some(0) | None)
 }
 
 /// Whether `name`'s final path component already ends in `.exe` or `.com`, compared
