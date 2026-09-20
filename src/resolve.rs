@@ -128,8 +128,9 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
 ///   so `TOOL.EXE` is never doubled into `TOOL.EXE.exe`): `name` unchanged, either shape. There is
 ///   nothing to append that would not name a file the caller did not write.
 /// - Windows, [`Shape::BareName`]: `name` + `.exe`, and ONLY that. See the monotonicity note.
-/// - Windows, [`Shape::Located`]: `name` **then** `name` + `.exe` — the exact name the caller wrote
-///   first, the portable fallback second.
+/// - Windows, [`Shape::Located`]: `name` first, always. `name` + `.exe` follows ONLY when the
+///   name carries no extension at all AND has a non-empty final component — see
+///   [`takes_the_exe_fallback`], which is what keeps this axis from widening against `main`.
 ///
 /// # Why `Located` tries the exact name first
 ///
@@ -208,23 +209,37 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
         // would newly resolve to `thing.bin.exe` when `thing.bin` is absent, loading a file a
         // writer of that directory could plant where `main` returned `NotFound`. The monotonicity
         // argument below is measured on the SEARCHED axis and does not license that.
-        Shape::Located if has_any_extension(name, windows) => vec![name.to_os_string()],
-        Shape::Located => vec![name.to_os_string(), with_exe],
+        Shape::Located if takes_the_exe_fallback(name, windows) => vec![name.to_os_string(), with_exe],
+        Shape::Located => vec![name.to_os_string()],
     }
 }
 
-/// Whether `name`'s final component carries any extension at all, matching `Path::extension()`'s
-/// rule that a LEADING dot is not an extension separator (`.bashrc` has none).
+/// Whether a LOCATED name gets the second, `.exe` candidate.
 ///
 /// Distinct from [`has_loadable_extension`], which asks the narrower "is it already `.exe`/`.com`".
-/// This one decides whether a located name gets the `.exe` fallback, and keeping it identical to
-/// `main`'s `Path::extension().is_none()` test is what makes the located axis a no-op against
-/// pre-PR behaviour rather than a widening.
-fn has_any_extension(name: &OsStr, windows: bool) -> bool {
+/// This decides the fallback, and it exists to keep the located axis from WIDENING against `main`,
+/// which keyed on `Path::extension().is_none()` and appended via `Path::with_extension`.
+///
+/// Two ways to get that wrong, both of which this rules out: a name whose final component already
+/// carries an extension must not gain `name.exe` (`main` refused it), and a name with no final
+/// component at all must not gain one either — appending to a separator-terminated name produces
+/// a dotfile INSIDE the named directory rather than a sibling of it.
+fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
     let bytes = name.as_encoded_bytes();
     let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
     let final_component = &bytes[start..];
-    !matches!(final_component.iter().rposition(|&b| b == b'.'), Some(0) | None)
+    // A SEPARATOR-TERMINATED name has an empty final component: it names a directory, not a file,
+    // so there is no filename to append to. Returning `true` here appended the literal `.exe` to
+    // the whole string, yielding `C:\tools\thing.bin\.exe` — a file a writer of that directory
+    // could plant, loaded where `main` (which used `Path::with_extension`, a no-op on a name with
+    // no file name) returned `NotFound`. That is the exact widening this rule exists to prevent,
+    // reintroduced by the rule itself.
+    if final_component.is_empty() {
+        return false;
+    }
+    // Otherwise: only when there is no extension, matching `Path::extension()`'s rule that a
+    // LEADING dot is part of the stem (`.bashrc` has none) — which is what `main` keyed on.
+    matches!(final_component.iter().rposition(|&b| b == b'.'), Some(0) | None)
 }
 
 /// Whether `name`'s final path component already ends in `.exe` or `.com`, compared
@@ -340,6 +355,15 @@ fn is_execable(path: &Path, windows: bool) -> bool {
 
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     let name = input.program.as_os_str();
+    // An empty program names no file. Without this it classifies as a bare name and the `.exe`
+    // rule turns it into the single candidate `.exe`, so `executable("")` resolves to any file
+    // literally named `.exe` on `PATH` or in a system directory — a trivially plantable target.
+    if name.is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "an empty program name resolves to nothing",
+        )));
+    }
     // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the
     // exact name the caller wrote, a searched one does not — see `filename_candidates`).
     let shape = classify(name, input.windows);

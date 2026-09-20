@@ -157,7 +157,8 @@ fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
 /// all. Only a true bare name is searched, and that search visits `system_dirs` and then the
 /// `PATH` directories — **never `base_cwd`**. A final component already ending in `.exe`/`.com`
 /// (case-insensitively) is used unchanged; otherwise a SEARCHED name is tried as `exe.exe` only,
-/// while a PATHED one is tried as `exe` first and `exe.exe` second — see [`crate::resolve`]'s
+/// while a PATHED one is tried as `exe` first and — only when it carries no extension at all and
+/// names an actual file rather than a directory — `exe.exe` second. See [`crate::resolve`]'s
 /// `filename_candidates` doc for why the extension rule belongs to the searched axis and not the
 /// located one. `PATH` elements that are empty or relative are skipped, and the result is always
 /// absolute. A miss is [`std::io::ErrorKind::NotFound`].

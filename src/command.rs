@@ -157,11 +157,14 @@ impl Command {
     ///   PowerShell editions, all of which refuse to run an extensionless image by bare
     ///   name (measured on real Windows CI). `PATHEXT` cannot express "no extension", so
     ///   there is nothing to be compatible with.
-    /// - a **pathed name** is checked against the exact name the caller wrote first, then
-    ///   `name.exe`. `CreateProcessW` documents "no default extension is assumed" for the
+    /// - a **pathed name** is checked against the exact name the caller wrote, first and
+    ///   always. `CreateProcessW` documents "no default extension is assumed" for the
     ///   `lpApplicationName` this backend sets, and the PE format makes no extension
     ///   normative, so `executable(r"C:\tools\payload.tmp")` names exactly that file.
-    ///   Where both `bin\tool` and `bin\tool.exe` exist, the extensionless one wins.
+    ///   A second `name.exe` candidate follows only when the name carries no extension at
+    ///   all and names a file rather than a directory, so `tools\thing.bin` and
+    ///   `tools\thing.bin\` each have exactly one candidate. Where both `bin\tool` and
+    ///   `bin\tool.exe` exist, the extensionless one wins.
     ///
     /// This also means a bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
     /// resolves to `python3.11.exe` — matching how those same shells use PATHEXT to

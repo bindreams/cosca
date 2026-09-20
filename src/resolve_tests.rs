@@ -162,8 +162,8 @@ fn posix_path_var_quotes_are_not_special() {
 //
 // A BARE name asserts there is exactly ONE candidate: a second, never-matching candidate would
 // pass every assertion here while quietly leaving the pre-fix ordering hazard (an ambient
-// extensionless file able to win in some future directory ordering) in place. A LOCATED name is
-// the opposite case and deliberately has two — see `filename_candidates`'s doc.
+// extensionless file able to win in some future directory ordering) in place. A LOCATED name may have
+// two, but only when it carries no extension and names a file — see `takes_the_exe_fallback`.
 
 fn candidate(n: &str, w: bool) -> Vec<String> {
     filename_candidates(OsStr::new(n), w, classify(OsStr::new(n), w))
@@ -294,7 +294,7 @@ fn every_searched_name_produces_exactly_one_candidate() {
     // BARE names only — the ones that visit `system_dirs`/`PATH`. A second candidate here would
     // reintroduce the ordering hazard: an ambient extensionless file winning in some directory
     // the search visits. A LOCATED name visits exactly one directory, the one the caller named,
-    // so it carries no such hazard and deliberately has two candidates (tested above).
+    // so it carries no such hazard and may have a second candidate (tested above).
     for (n, w) in [
         ("tool", true),
         ("python3.11", true),
@@ -822,4 +822,35 @@ fn a_directory_named_like_the_program_is_not_returned() {
     let want = touch(bin2.path(), &exe_name("tool"));
     let p2 = path_var(&[bin2.path()]);
     assert_eq!(go("tool", cwd.path(), Some(&p2)).unwrap(), want);
+}
+
+#[test]
+fn a_separator_terminated_located_name_gets_no_exe_fallback() {
+    // THE WIDENING GUARD. Appending to a name that ends in a separator produces a DOTFILE INSIDE
+    // the named directory — `C:\tools\thing.bin\.exe` — which a writer of that directory can
+    // plant, and which `main` never looked for (it appended via `Path::with_extension`, a no-op
+    // when the path has no file name). Catches both halves: treating the empty final component as
+    // "no extension", and appending a raw string instead of replacing an extension.
+    for n in [r"tools\thing.bin\", r"bin\tool\", "bin/tool/", r"C:\"] {
+        let got = candidate(n, true);
+        assert_eq!(
+            got,
+            vec![n.to_string()],
+            "{n:?} must yield exactly one candidate: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_program_never_resolves() {
+    // `classify("")` is a bare name, and the `.exe` rule turned it into the single candidate
+    // `.exe` — so `executable("")` resolved to any file literally named `.exe` sitting in a PATH
+    // or system directory, which is trivially plantable. An empty name names no file; it must
+    // fail closed on every axis.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    touch(bin.path(), ".exe");
+    let pv = path_var_for(&[bin.path()], true);
+    assert!(go_win_path("", cwd.path(), Some(&pv)).is_err(), "bare empty name");
+    assert!(go_win_path("", cwd.path(), None).is_err(), "bare empty name, no PATH");
 }
