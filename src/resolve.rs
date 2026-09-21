@@ -101,10 +101,25 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
+/// `bytes` as Win32 itself reads them: a path component's trailing dots and spaces are trimmed
+/// before the file is opened, so `tool.`, `tool ` and `tool` all name one file, and `...`, `. `
+/// and `..` all name the directory `.` does.
+///
+/// A verbatim (`\\?\`) path suppresses that normalisation in the OS, so applying it everywhere
+/// refuses a literal trailing-dot name such a path could technically open. Deliberate: failing
+/// closed on a shape no ordinary caller writes beats carrying a second, verbatim-only rule under
+/// which a name is a directory here and a file there.
+fn win32_trim(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|&b| b != b'.' && b != b' ').map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
 /// Whether `program` names a DIRECTORY rather than a file, so no search could make it executable.
 ///
 /// True when the final component — taken after the drive prefix, if any — is empty (a
-/// separator-terminated name, a root, or the empty string) or is `.`/`..`.
+/// separator-terminated name, a root, or the empty string) or is `.`/`..`. On Windows the
+/// component is read through [`win32_trim`] first, so the rule refuses the SHAPE rather than a
+/// list of spellings: `...` and `. ` denote a directory there just as surely as `.` does.
 ///
 /// `Path::file_name` answers the same question, but host-specifically: off Windows it sees neither
 /// `\` nor the `C:` prefix, so a `Path`-based rule could not be exercised from a POSIX host at
@@ -117,7 +132,14 @@ fn names_no_file(program: &OsStr, windows: bool) -> bool {
         bytes
     };
     let start = rest.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
-    matches!(&rest[start..], b"" | b"." | b"..")
+    let final_component = &rest[start..];
+    if windows {
+        win32_trim(final_component).is_empty()
+    } else {
+        // POSIX normalises nothing: a trailing dot or space is an ordinary filename character,
+        // and only `.`/`..` are the directory itself.
+        matches!(final_component, b"" | b"." | b"..")
+    }
 }
 
 /// The filenames tried in each candidate directory, in order.
@@ -218,19 +240,32 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
     if !windows || has_loadable_extension(name, windows) {
         return vec![name.to_os_string()];
     }
-    let mut with_exe = name.to_os_string();
-    with_exe.push(".exe");
     match shape {
-        Shape::BareName => vec![with_exe],
+        // Appended to the name as Win32 READS it, not as it was typed: `tool.` and `tool ` open
+        // `tool`, so appending to the raw bytes would search every system and `PATH` directory for
+        // `tool..exe`/`tool .exe` — names the caller never wrote and a writer of any of those
+        // directories can plant. `main` appended to neither (`Path::new("tool.").extension()` is
+        // `Some("")`), so a searched name and its Win32-equal spelling resolve alike here.
+        Shape::BareName => vec![push_exe(win32_trim(name.as_encoded_bytes()))],
         // A located name with SOME extension gets exactly one candidate, the name as written.
         // `main` keyed its `.exe` fallback on `Path::extension().is_none()`, so appending to a
         // dotted name here would be a WIDENING on the located axis: `executable(r"C:\t\thing.bin")`
         // would newly resolve to `thing.bin.exe` when `thing.bin` is absent, loading a file a
         // writer of that directory could plant where `main` returned `NotFound`. The monotonicity
         // argument below is measured on the SEARCHED axis and does not license that.
-        Shape::Located if takes_the_exe_fallback(name, windows) => vec![name.to_os_string(), with_exe],
+        Shape::Located if takes_the_exe_fallback(name, windows) => {
+            vec![name.to_os_string(), push_exe(name.as_encoded_bytes())]
+        }
         Shape::Located => vec![name.to_os_string()],
     }
+}
+
+fn push_exe(bytes: &[u8]) -> std::ffi::OsString {
+    // SAFETY: the bytes came from `as_encoded_bytes` and are truncated only at an ASCII boundary,
+    // which is the documented-safe way to slice an `OsStr`'s encoded form.
+    let mut out = unsafe { OsStr::from_encoded_bytes_unchecked(bytes) }.to_os_string();
+    out.push(".exe");
+    out
 }
 
 /// Whether a LOCATED name gets the second, `.exe` candidate.
@@ -259,20 +294,31 @@ fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
     if final_component.is_empty() {
         return false;
     }
+    // A Win32-normalised final component (`bin\tool `, `bin\tool.`) gets no fallback either.
+    // Appending to the raw bytes invents `bin\tool .exe`; appending to the trimmed stem names
+    // `bin\tool.exe`, which `main` — keying on the RAW name's `Path::extension()` — never looked
+    // for. Both widen, so the located axis appends nothing at all. A NARROWING against `main`,
+    // which did look for `bin\tool .exe`, and the only one this rule takes deliberately.
+    if windows && win32_trim(final_component).len() != final_component.len() {
+        return false;
+    }
     // Otherwise: only when there is no extension, matching `Path::extension()`'s rule that a
     // LEADING dot is part of the stem (`.bashrc` has none) — which is what `main` keyed on.
     matches!(final_component.iter().rposition(|&b| b == b'.'), Some(0) | None)
 }
 
-/// Whether `name`'s final path component already ends in `.exe` or `.com`, compared
-/// case-insensitively — `TOOL.EXE` must not become `TOOL.EXE.exe`. These are the two extensions
-/// `CreateProcessW` loads directly as a PE image; see `filename_candidates`'s doc for why exactly
-/// these two and no others.
+/// Whether `name` already ends in `.exe` or `.com`, compared case-insensitively — `TOOL.EXE` must
+/// not become `TOOL.EXE.exe`. These are the two extensions `CreateProcessW` loads directly as a PE
+/// image; see `filename_candidates`'s doc for why exactly these two and no others.
+///
+/// Unlike its sibling classifiers this does NOT split off the final component first: neither
+/// suffix contains a separator, so "the whole string ends in `.exe`" and "its final component
+/// does" are one predicate for every input. [`win32_trim`] is not redundant in the same way —
+/// `tool.exe.` opens `tool.exe`, and missing that would invent `tool.exe..exe`.
 fn has_loadable_extension(name: &OsStr, windows: bool) -> bool {
     let bytes = name.as_encoded_bytes();
-    let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
-    let final_component = &bytes[start..];
-    ends_with_ignore_ascii_case(final_component, b".exe") || ends_with_ignore_ascii_case(final_component, b".com")
+    let bytes = if windows { win32_trim(bytes) } else { bytes };
+    ends_with_ignore_ascii_case(bytes, b".exe") || ends_with_ignore_ascii_case(bytes, b".com")
 }
 
 fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {

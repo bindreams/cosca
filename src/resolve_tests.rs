@@ -920,6 +920,75 @@ fn a_dot_terminated_name_never_invents_a_planted_sibling() {
 }
 
 #[test]
+fn a_win32_normalised_stemless_name_is_refused() {
+    // Win32 trims trailing dots and spaces from a path component before opening it, so `...`,
+    // `. `, ` .` and `.. ` name a directory exactly as `.` does — none of them reachable by a
+    // match arm listing `""`/`.`/`..`. Enumerating spellings leaves the next one open; the SHAPE
+    // is what must be refused.
+    let cwd = tempfile::tempdir().unwrap();
+    for n in [
+        "...",
+        "....",
+        ". ",
+        " .",
+        ".. ",
+        "   ",
+        r"C:\t\...",
+        r"C:\t\. ",
+        r"C:\t\dir\.. ",
+    ] {
+        assert_refused_on_shape(n, go_win_path(n, cwd.path(), None));
+    }
+}
+
+#[test]
+fn a_dot_run_name_never_invents_a_planted_exe() {
+    // The live half, on the filesystem: `...` grew the candidate `....exe` and searched every
+    // system and `PATH` directory for it — a file a writer of any of them can plant under a name
+    // the caller never wrote.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    touch(bin.path(), "....exe");
+    let pv = path_var_for(&[bin.path()], true);
+    let got = go_win_path("...", cwd.path(), Some(&pv));
+    assert!(
+        got.is_err(),
+        "`...` must not resolve to the planted ....exe, got {got:?}"
+    );
+}
+
+#[test]
+fn a_trailing_dot_or_space_is_normalised_before_exe_is_appended() {
+    // Win32 opens `tool.` and `tool ` as `tool`, so appending to the raw bytes invents
+    // `tool..exe`/`tool .exe` — plantable names the caller never wrote. `main` invented neither:
+    // `Path::new("tool.").extension()` is `Some("")`, so it appended nothing and tried `tool.`,
+    // which Win32 opens as `tool`.
+    assert_eq!(candidate("tool.", true), vec!["tool.exe"]);
+    assert_eq!(candidate("tool ", true), vec!["tool.exe"]);
+    assert_eq!(candidate("tool. ", true), vec!["tool.exe"]);
+    // Loadable once normalised: nothing to append, `tool.exe.` already opens `tool.exe`.
+    assert_eq!(candidate("tool.exe.", true), vec!["tool.exe."]);
+    // LOCATED gets no fallback at all: appending to the normalised stem names `bin\tool.exe`,
+    // which `main` never looked for either (it appended to the raw bytes, or not at all).
+    assert_eq!(candidate(r"bin\tool.", true), vec![r"bin\tool."]);
+    assert_eq!(candidate(r"bin\tool ", true), vec![r"bin\tool "]);
+}
+
+#[test]
+fn a_trailing_dot_or_space_is_an_ordinary_posix_filename() {
+    // The normalisation is Windows-only. On POSIX `tool.`, `tool ` and `...` are three distinct,
+    // legitimate files and none of them names a directory, so neither the refusal nor the
+    // rewriting may reach them.
+    for n in ["tool.", "tool ", "...", ". ", " .", "....", "a.", "bin/tool."] {
+        assert!(
+            !names_no_file(OsStr::new(n), false),
+            "{n:?} is an ordinary POSIX filename"
+        );
+        assert_eq!(candidate(n, false), vec![n.to_string()], "POSIX never rewrites a name");
+    }
+}
+
+#[test]
 fn a_name_with_a_stem_still_resolves() {
     // Negative control for the three tests above: the refusal must key on a MISSING stem, not on
     // a leading dot. `.helper` and `..helper` are ordinary filenames and must survive.
