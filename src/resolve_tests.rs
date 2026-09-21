@@ -337,7 +337,8 @@ fn bare_name_is_not_resolved_from_the_current_directory() {
     // for — re-adding `cwd` to `Shape::BareName`'s dir list would still find nothing named
     // `tool.exe` and this would keep passing for the wrong reason.
     touch(cwd.path(), &exe_name("tool"));
-    assert!(go("tool", cwd.path(), None).is_err(), "cwd must not be searched");
+    // A miss, not a refusal: the name is fine, the cwd is simply not a place this searches.
+    assert_not_found("tool", go("tool", cwd.path(), None));
 }
 
 #[test]
@@ -458,7 +459,7 @@ fn empty_path_elements_are_skipped() {
     let _restore = crate::test_child::RestoreCwd::capture();
     std::env::set_current_dir(cwd.path()).unwrap();
     let empty = if HOST_WINDOWS { ";;" } else { "::" };
-    assert!(go("tool", cwd.path(), Some(OsStr::new(empty))).is_err());
+    assert_not_found("tool", go("tool", cwd.path(), Some(OsStr::new(empty))));
 }
 
 #[test]
@@ -478,7 +479,7 @@ fn relative_path_elements_are_skipped() {
     let _guard = crate::child::spawn::spawn_lock();
     let _restore = crate::test_child::RestoreCwd::capture();
     std::env::set_current_dir(cwd.path()).unwrap();
-    assert!(go("tool", cwd.path(), Some(OsStr::new("."))).is_err());
+    assert_not_found("tool", go("tool", cwd.path(), Some(OsStr::new("."))));
 }
 
 // ── the Windows .exe rule ────────────────────────────────────────────────────────────
@@ -510,8 +511,7 @@ fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), "tool");
     let p = path_var_for(&[bin.path()], true);
-    let got = go_win_path("tool", cwd.path(), Some(&p));
-    assert!(got.is_err(), "{got:?}");
+    assert_not_found("tool", go_win_path("tool", cwd.path(), Some(&p)));
 
     // Positive control: the SAME directory and PATH resolve once `tool.exe` is present, so the
     // miss above is the candidate rule and not a broken `path_var_for` silently dropping the
@@ -600,37 +600,26 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-/// Stays `#[cfg(windows)]` deliberately, unlike the located/`PATH` gates above which force
-/// `windows: true` and run on every host.
+/// The end-to-end half of [`a_drive_relative_name_is_refused_on_shape`], on a real Windows runner
+/// with a plantable file where the process's own current directory is.
 ///
-/// Fail-closed for `C:tool` is not a property of this module's own logic — `classify` only routes
-/// it to [`Shape::Located`], and the refusal comes entirely from Windows `PathBuf::push`
-/// semantics: joining a prefixed path clears the buffer, so `joined` stays `C:tool.exe` and fails
-/// `is_absolute()`. Off Windows that join is an ordinary append, so under simulation the rule
-/// INVERTS and a planted `C:tool.exe` resolves. Forcing `windows: true` here would therefore
-/// assert the opposite of the real behaviour.
-///
-/// Consequence worth knowing: the fail-closed guarantee has exactly one gate, and it only runs on
-/// the Windows runner. `a_drive_relative_name_is_located_not_bare` pins `classify`'s half on every
-/// host, but not the outcome. Making this host-testable needs the platform trait in #143, which
-/// would let the join behaviour be part of the simulated platform rather than the host's.
+/// The refusal itself no longer depends on the host: `resolve` states it explicitly, before any
+/// candidate is built, so the host-independent test pins it on every platform. What only a
+/// Windows runner can show is that a drive-relative name does not resolve through the process's
+/// REAL current directory on drive C — the directory the `cwd` parameter never names, since
+/// `PathBuf::push` clears for any prefixed path.
 #[cfg(windows)]
 #[test]
 fn a_drive_relative_name_fails_closed() {
     let cwd = tempfile::tempdir().unwrap();
-    // If drive-relative resolution were ever accepted (i.e. `resolve()`'s `joined.is_absolute() &&`
-    // guard were deleted), `C:tool` would resolve via the process's REAL current directory on drive
-    // C — never the `cwd` parameter `go()` is handed, which a drive-relative candidate ignores
-    // entirely (`PathBuf::push` clears for any prefixed path, per this test's own comment below).
-    // Plant the file where the process's actual OS cwd is about to be, and mutate it there, so
-    // deleting the guard has something to find; a tempdir under `%TEMP%`, as here, lives on the
+    // Planted where the process's actual OS cwd is about to be, so any route that reached drive
+    // C's current directory has something to find; a tempdir under `%TEMP%`, as here, lives on the
     // runner's system drive, which is `C:` on every GitHub-hosted Windows runner this crate targets.
     touch(cwd.path(), "tool.exe");
     let _guard = crate::child::spawn::spawn_lock();
     let _restore = crate::test_child::RestoreCwd::capture();
     std::env::set_current_dir(cwd.path()).unwrap();
-    // Resolving it correctly needs drive C's own current directory, which cosca does not track.
-    assert!(go("C:tool", cwd.path(), None).is_err());
+    assert_refused_on_shape("C:tool", go("C:tool", cwd.path(), None));
 }
 
 // ── FIX: Windows system directories precede PATH for a bare name (merge blocker) ────────
@@ -739,7 +728,7 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
         path_var: None,
         windows: true,
     });
-    assert!(miss.is_err(), "{miss:?}");
+    assert_not_found("tool", miss);
 }
 
 #[test]
@@ -765,7 +754,7 @@ fn posix_ignores_system_dirs_entirely() {
         path_var: None,
         windows: false,
     });
-    assert!(got.is_err(), "{got:?}");
+    assert_not_found("tool", got);
 }
 
 // ── the located axis does not search, and a miss is NotFound ─────────────────────────
@@ -783,18 +772,15 @@ fn a_located_name_never_falls_back_to_a_search() {
     touch(bin.path(), "helper");
     touch(bin.path(), "helper.exe");
     let pv = path_var_for(&[bin.path()], true);
-    let got = go_win_path("./helper", cwd.path(), Some(&pv));
-    assert!(
-        got.is_err(),
-        "a located name must not be searched for on PATH, got {got:?}"
-    );
+    // A miss, not a refusal: `./helper` is a perfectly good name, it just is not there.
+    assert_not_found("./helper", go_win_path("./helper", cwd.path(), Some(&pv)));
 }
 
 #[test]
 fn a_miss_is_reported_as_not_found() {
-    // `Command::executable`'s PUBLIC doc promises `ErrorKind::NotFound` for a drive-relative name,
-    // and `resolve_executable_in`'s promises it for any miss. Nothing asserted the kind, so
-    // changing it was invisible.
+    // `resolve_executable_in`'s doc promises `ErrorKind::NotFound` for a miss. Nothing asserted
+    // the kind, so changing it was invisible. (A drive-relative name is a REFUSAL, not a miss —
+    // see the module doc's kind rule and `a_drive_relative_name_is_refused_on_shape`.)
     let cwd = tempfile::tempdir().unwrap();
     let err = go_win_path("no-such-program-41d9", cwd.path(), None).unwrap_err();
     match err {
@@ -813,8 +799,8 @@ fn a_directory_named_like_the_program_is_not_returned() {
     let bin = tempfile::tempdir().unwrap();
     std::fs::create_dir(bin.path().join(exe_name("tool"))).unwrap();
     let p = path_var(&[bin.path()]);
-    let got = go("tool", cwd.path(), Some(&p));
-    assert!(got.is_err(), "a directory must never resolve as a program: {got:?}");
+    // A directory is not a match, so this is an ordinary miss.
+    assert_not_found("tool", go("tool", cwd.path(), Some(&p)));
 
     // Positive control: a real file in the same slot DOES resolve, so the assertion above is
     // gating `is_file()` rather than an unrelated lookup failure.
@@ -851,18 +837,58 @@ fn an_empty_program_never_resolves() {
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), ".exe");
     let pv = path_var_for(&[bin.path()], true);
-    assert!(go_win_path("", cwd.path(), Some(&pv)).is_err(), "bare empty name");
-    assert!(go_win_path("", cwd.path(), None).is_err(), "bare empty name, no PATH");
+    assert_refused_on_shape("", go_win_path("", cwd.path(), Some(&pv)));
+    assert_refused_on_shape("", go_win_path("", cwd.path(), None));
 }
 
-/// A stemless name must be refused for its SHAPE, not merely missed by the search. Asserting
+/// A refused name must be refused for its SHAPE, not merely missed by the search. Asserting
 /// `is_err()` alone passes vacuously — the file does not exist either — so it would not have
-/// caught the planted-sibling case at all.
+/// caught the planted-sibling case at all. See `resolve`'s module doc for the kind rule.
 fn assert_refused_on_shape(name: &str, got: Result<std::path::PathBuf, Error>) {
     match got {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
         other => panic!("{name:?} names no file and must be refused on shape, got {other:?}"),
     }
+}
+
+/// The other half of the kind rule: the name was ACCEPTED and searched, and nothing matched.
+fn assert_not_found(name: &str, got: Result<std::path::PathBuf, Error>) {
+    match got {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        other => panic!("{name:?} was searched and missed, so it must be NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_drive_relative_name_is_refused_on_shape() {
+    // `C:tool` names a file relative to drive C's OWN current directory — state cosca does not
+    // track and never will, so no filesystem can make it resolve. Under the kind rule that is a
+    // refusal, not a search miss. It reported `NotFound` only incidentally: `PathBuf::push` clears
+    // for a prefixed path, so every candidate failed `resolve`'s `is_absolute()` filter and the
+    // loop fell through to the generic trailing error, which would have changed kind silently if
+    // that filter ever did.
+    let cwd = tempfile::tempdir().unwrap();
+    for n in ["C:tool", "D:sub/x", "C:tool.exe", r"Z:a\b"] {
+        assert_refused_on_shape(n, go_win_path(n, cwd.path(), None));
+    }
+}
+
+#[test]
+fn an_accepted_name_that_is_simply_absent_is_not_found() {
+    // The negative control for every refusal in this block, and the other half of the kind rule:
+    // each of these IS accepted, IS searched, and merely misses — a different disk (or `PATH`)
+    // resolves any of them, so none may be reported as refused.
+    let cwd = tempfile::tempdir().unwrap();
+    for n in [
+        "tool",
+        "./missing",
+        r"C:\abs\missing.exe",
+        r"sub\missing",
+        "sub/missing",
+    ] {
+        assert_not_found(n, go_win_path(n, cwd.path(), None));
+    }
+    assert_not_found("tool", go(&exe_name("tool"), cwd.path(), None));
 }
 
 #[test]
@@ -912,11 +938,7 @@ fn a_dot_terminated_name_never_invents_a_planted_sibling() {
     std::fs::create_dir(&dir).unwrap();
     touch(&dir, "..exe");
     let named = format!("{}/.", dir.display());
-    let got = go_win_path(&named, cwd.path(), None);
-    assert!(
-        got.is_err(),
-        "{named:?} must not resolve to the planted ..exe, got {got:?}"
-    );
+    assert_refused_on_shape(&named, go_win_path(&named, cwd.path(), None));
 }
 
 #[test]
@@ -950,11 +972,7 @@ fn a_dot_run_name_never_invents_a_planted_exe() {
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), "....exe");
     let pv = path_var_for(&[bin.path()], true);
-    let got = go_win_path("...", cwd.path(), Some(&pv));
-    assert!(
-        got.is_err(),
-        "`...` must not resolve to the planted ....exe, got {got:?}"
-    );
+    assert_refused_on_shape("...", go_win_path("...", cwd.path(), Some(&pv)));
 }
 
 #[test]

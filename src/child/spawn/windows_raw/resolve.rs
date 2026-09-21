@@ -157,11 +157,12 @@ fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
 /// all. Only a true bare name is searched, and that search visits `system_dirs` and then the
 /// `PATH` directories — **never `base_cwd`**. A final component already ending in `.exe`/`.com`
 /// (case-insensitively) is used unchanged; otherwise a SEARCHED name is tried as `exe.exe` only,
-/// while a PATHED one is tried as `exe` first and — only when it carries no extension at all and
-/// names an actual file rather than a directory — `exe.exe` second. See [`crate::resolve`]'s
-/// `filename_candidates` doc for why the extension rule belongs to the searched axis and not the
-/// located one. `PATH` elements that are empty or relative are skipped, and the result is always
-/// absolute. A miss is [`std::io::ErrorKind::NotFound`].
+/// while a PATHED one is tried as `exe` first and — only when it carries no extension at all —
+/// `exe.exe` second. See [`crate::resolve`]'s `filename_candidates` doc for why the extension
+/// rule belongs to the searched axis and not the located one. `PATH` elements that are empty or
+/// relative are skipped, and the result is always absolute. A miss is
+/// [`std::io::ErrorKind::NotFound`]; a name refused on its shape is
+/// [`std::io::ErrorKind::InvalidInput`], per [`crate::resolve`]'s error-kind rule.
 ///
 /// `system_dirs` visits BEFORE `PATH` — the app directory, `System32`, then the Windows
 /// directory, i.e. `CreateProcessW`'s own NULL-`lpApplicationName` search order minus `base_cwd`.
@@ -169,10 +170,10 @@ fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
 /// rather than an unrelated behaviour change: see [`crate::resolve::ResolveInput::system_dirs`]
 /// for the full monotonicity argument. Pass an empty slice to search `PATH` only.
 ///
-/// A drive-relative name such as `C:tool` always fails closed with `NotFound`, and is
-/// never loaded from `base_cwd`: joining a directory onto it collapses straight back
-/// to `C:tool` (`PathBuf::push` clears for any prefixed path), so resolving it would
-/// need drive C's own current directory, which cosca does not track.
+/// A drive-relative name such as `C:tool` is refused outright — `InvalidInput`, before any
+/// search — and is never loaded from `base_cwd`: resolving it would need drive C's own current
+/// directory, which cosca does not track. A name that names no file (`C:\`, `tools\dir\`,
+/// `...`, a bare `\\server\share`) is refused the same way.
 ///
 /// Visiting `base_cwd` first was the previous behaviour, and it was a
 /// binary-planting hazard: `executable("helper")` loaded a `helper.exe` dropped in

@@ -19,6 +19,24 @@
 //! **never** the current directory. `system_dirs` is likewise taken as a parameter rather than
 //! queried from the OS here, for the same host-independence reason; see its doc for what it
 //! contains and why it precedes `PATH`.
+//!
+//! # Which error kind
+//!
+//! The two kinds [`resolve`] returns answer different questions, and the split is part of the
+//! public contract (see [`crate::Command::executable`]):
+//!
+//! - [`std::io::ErrorKind::InvalidInput`] — the string was NOT ACCEPTED. It was refused on its
+//!   shape; no search ran, and no filesystem result is being reported.
+//! - [`std::io::ErrorKind::NotFound`] — the string was acceptable, the search ran to this
+//!   module's policy, and nothing matched.
+//!
+//! The operational test for a new rule is **could a different filesystem make this input
+//! succeed?** No — the refusal is a property of the string, not of the disk — means
+//! `InvalidInput`. Yes means `NotFound`. So `C:tool` (relative to a drive's own current
+//! directory, which cosca does not track) and `C:\` (a directory, whatever is on the disk) are
+//! refusals, while a missing `tool` or `C:\abs\missing.exe` is a miss. A refusal must be stated
+//! explicitly and early, never left to fall out of candidate filtering: that reports the right
+//! kind by accident and changes it silently when the filtering does.
 
 use crate::error::Error;
 use std::ffi::OsStr;
@@ -99,6 +117,15 @@ fn is_sep(b: u8, windows: bool) -> bool {
 
 fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+/// Whether `program` is DRIVE-RELATIVE: a drive prefix not followed by a separator, as in
+/// `C:tool` or `D:sub\x`. Such a name is relative to that drive's own current directory — state
+/// cosca does not track, so no filesystem can make it resolve. Refused, never searched; see the
+/// module doc's error-kind rule.
+fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
+    let bytes = program.as_encoded_bytes();
+    windows && has_drive_prefix(bytes) && !bytes.get(2).is_some_and(|&b| is_sep(b, windows))
 }
 
 /// The length of the Windows PREFIX — the leading run naming a volume, share, device or verbatim
@@ -493,7 +520,20 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     if names_no_file(name, input.windows) {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("program names a directory, not a file: {:?}", input.program),
+            format!("program does not name a file: {:?}", input.program),
+        )));
+    }
+    // Refused EXPLICITLY, and before any search. `C:tool` did report `NotFound`, but only as a
+    // side effect of candidate filtering — `PathBuf::push` clears for a prefixed path, so every
+    // candidate failed the `is_absolute()` check below and the loop fell through to the trailing
+    // error. Nothing stated the intent, and the kind would have changed silently with that check.
+    if is_drive_relative(name, input.windows) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "program is relative to a drive's own current directory, which cosca does not track: {:?}",
+                input.program
+            ),
         )));
     }
     // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the

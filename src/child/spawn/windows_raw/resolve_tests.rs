@@ -2,6 +2,16 @@ use super::*;
 use crate::command::EnvOp;
 use std::ffi::OsString;
 
+/// The name was accepted and searched, and nothing matched — `NotFound`, never a shape refusal.
+/// A bare `is_err()` cannot tell the two apart, which is how the kind drifted unnoticed before;
+/// see `crate::resolve`'s module doc for the rule.
+fn assert_not_found(got: Result<PathBuf, Error>) {
+    match got {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        other => panic!("a search miss must be Io(NotFound), got {other:?}"),
+    }
+}
+
 /// Renamed from `resolve_absolute_existing_is_returned_as_is`, which named a property the code no
 /// longer has: there is no "absolute and exists -> return unchanged" shortcut any more (that was
 /// `main`'s `exe.is_absolute() && exe.is_file()` early return, deleted with the rewrite). An
@@ -27,8 +37,12 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
     // PATH must NOT resolve. `system_dirs` is empty here — this test is about base_cwd, not
     // system-directory precedence, which has its own tests in `crate::resolve_tests`.
     // Explicit base dir — no process-global SetCurrentDirectory, so parallel tests can't race.
-    let got = resolve_executable_in(std::path::Path::new("sp_shadow"), dir.path(), &[], None);
-    assert!(got.is_err(), "{got:?}");
+    assert_not_found(resolve_executable_in(
+        std::path::Path::new("sp_shadow"),
+        dir.path(),
+        &[],
+        None,
+    ));
 }
 #[test]
 fn resolve_bare_extensionless_name_appends_exe() {
@@ -59,7 +73,7 @@ fn resolve_executable_honors_an_env_set_path_override() {
     let want = dir.path().join("sp_env_path.exe");
     // Positive control: with no env ops, the fabricated name is not on the ambient PATH at all, so
     // a pass below cannot be an accident of the ambient PATH already containing it.
-    assert!(resolve_executable(std::path::Path::new("sp_env_path"), None, &[]).is_err());
+    assert_not_found(resolve_executable(std::path::Path::new("sp_env_path"), None, &[]));
 
     let ops = [EnvOp::Set(
         OsString::from("PATH"),
@@ -119,7 +133,7 @@ fn resolve_executable_env_clear_defeats_ambient_path() {
             EnvOp::Clear,
         ],
     );
-    assert!(got.is_err(), "{got:?}");
+    assert_not_found(got);
 }
 #[test]
 fn resolve_executable_env_remove_path_defeats_ambient_path() {
@@ -142,7 +156,7 @@ fn resolve_executable_env_remove_path_defeats_ambient_path() {
             EnvOp::Remove(OsString::from("path")),
         ],
     );
-    assert!(got.is_err(), "{got:?}");
+    assert_not_found(got);
 }
 // B1: `resolve_executable`'s `cmd_cwd` parameter ─────────────────────────────────────
 //
@@ -281,8 +295,7 @@ fn resolve_absolute_directory_is_not_returned() {
     // tell the two checks apart.
     let sub = dir.path().join("sp_dir_shadow.exe");
     std::fs::create_dir(&sub).unwrap();
-    let got = resolve_executable_in(&sub, std::path::Path::new("."), &[], None);
-    assert!(got.is_err(), "{got:?}");
+    assert_not_found(resolve_executable_in(&sub, std::path::Path::new("."), &[], None));
 }
 #[test]
 fn path_wins_over_base_cwd_when_both_have_exe() {

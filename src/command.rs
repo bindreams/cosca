@@ -162,9 +162,15 @@ impl Command {
     ///   `lpApplicationName` this backend sets, and the PE format makes no extension
     ///   normative, so `executable(r"C:\tools\payload.tmp")` names exactly that file.
     ///   A second `name.exe` candidate follows only when the name carries no extension at
-    ///   all and names a file rather than a directory, so `tools\thing.bin` and
-    ///   `tools\thing.bin\` each have exactly one candidate. Where both `bin\tool` and
-    ///   `bin\tool.exe` exist, the extensionless one wins.
+    ///   all, so `tools\thing.bin` has exactly one candidate. Where both `bin\tool` and
+    ///   `bin\tool.exe` exist, the extensionless one wins. A name that names no file —
+    ///   `tools\thing.bin\`, a root, a bare `\\server\share` — has none: it is refused
+    ///   before any candidate is built (see the error kinds below).
+    ///
+    /// Windows trims a path component's trailing dots and spaces before opening it, and so
+    /// does this resolver: `tool.` and `tool ` are searched for as `tool.exe`, never as the
+    /// plantable `tool..exe`, and `...` names a directory exactly as `.` does. A pathed name
+    /// with such a component keeps its exact candidate and gains no `.exe` one.
     ///
     /// This also means a bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
     /// resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
@@ -174,10 +180,21 @@ impl Command {
     /// judgement that scripts are unsafe — this crate's existing, separate batch-path
     /// rejection (CVE-2024-24576) is unaffected either way.
     ///
-    /// A drive-relative name such as `C:tool` is **refused** with
-    /// [`std::io::ErrorKind::NotFound`] rather than loaded from the working directory:
-    /// resolving it would need drive C's own current directory, which cosca does not
-    /// track, so it fails closed instead of guessing.
+    /// # Error kinds
+    ///
+    /// The two kinds answer different questions:
+    ///
+    /// - [`std::io::ErrorKind::InvalidInput`] — the name was NOT ACCEPTED. It was refused on
+    ///   its shape and nothing was searched for, so no filesystem result is being reported.
+    ///   A drive-relative name such as `C:tool` is refused this way rather than loaded from
+    ///   the working directory: resolving it would need drive C's own current directory,
+    ///   which cosca does not track. So is a name that names no file at all (`C:\`, `.`,
+    ///   `tools\dir\`, `...`, `\\server\share`).
+    /// - [`std::io::ErrorKind::NotFound`] — the name was acceptable, the search above ran,
+    ///   and nothing matched.
+    ///
+    /// The dividing line is whether a different filesystem could make the name succeed: if
+    /// no disk ever could, the refusal is a property of the string, and it is `InvalidInput`.
     ///
     /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
     /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
