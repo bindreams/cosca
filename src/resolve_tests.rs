@@ -975,6 +975,62 @@ fn a_trailing_dot_or_space_is_normalised_before_exe_is_appended() {
 }
 
 #[test]
+fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
+    // A share, a volume or a device namespace is a ROOT, not a file — the same shape as `C:\`,
+    // which was already refused while these were not. On Windows `Path::file_name()` is `None`
+    // for every one of them (they parse as a prefix plus a root, with no `Normal` component), so
+    // `main`'s `with_extension("exe")` was a NO-OP — `set_extension` returns false when there is
+    // no file stem — and `main` never looked for `\\server\share.exe`. Stripping only a DRIVE
+    // prefix read `share` as a filename and grew exactly that candidate.
+    let cwd = tempfile::tempdir().unwrap();
+    for n in [
+        r"\\server\share",
+        r"\\server\share\",
+        "//server/share",
+        r"\\?\C:",
+        r"\\?\C:\",
+        r"\\?\UNC\server\share",
+        r"\\?\GLOBALROOT",
+        r"\\.\pipe",
+        r"\\",
+        r"\\?\",
+    ] {
+        assert_refused_on_shape(n, go_win_path(n, cwd.path(), None));
+    }
+}
+
+#[test]
+fn a_prefix_only_located_name_never_grows_an_exe_candidate() {
+    // `resolve` refuses these before `filename_candidates` runs; this pins the candidate rule
+    // itself, which `takes_the_exe_fallback`'s own doc promises is defence in depth for any
+    // future caller that does not go through `resolve`.
+    for n in [r"\\server\share", r"\\?\C:", r"\\?\UNC\server\share", r"\\.\pipe"] {
+        let got = candidate(n, true);
+        assert_eq!(got, vec![n.to_string()], "{n:?} must not grow a candidate: {got:?}");
+    }
+}
+
+#[test]
+fn a_name_under_a_windows_prefix_is_still_a_filename() {
+    // The negative control: only the PREFIX itself is not a filename. Everything below it is one,
+    // with the ordinary candidate rule — including `\\.\pipe\x`, whose `x` IS a `Normal`
+    // component on Windows, so `main` appended there too and this stays main-parity.
+    for (n, want) in [
+        (
+            r"\\server\share\tool",
+            vec![r"\\server\share\tool", r"\\server\share\tool.exe"],
+        ),
+        (r"\\?\C:\tools\thing.bin", vec![r"\\?\C:\tools\thing.bin"]),
+        (r"\\?\UNC\server\share\tool.exe", vec![r"\\?\UNC\server\share\tool.exe"]),
+        (r"\\.\pipe\x", vec![r"\\.\pipe\x", r"\\.\pipe\x.exe"]),
+    ] {
+        assert!(!names_no_file(OsStr::new(n), true), "{n:?} names a file");
+        let got = candidate(n, true);
+        assert_eq!(got, want, "{n:?} -> {got:?}");
+    }
+}
+
+#[test]
 fn a_trailing_dot_or_space_is_an_ordinary_posix_filename() {
     // The normalisation is Windows-only. On POSIX `tool.`, `tool ` and `...` are three distinct,
     // legitimate files and none of them names a directory, so neither the refusal nor the

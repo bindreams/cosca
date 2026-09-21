@@ -101,6 +101,59 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
+/// The length of the Windows PREFIX — the leading run naming a volume, share, device or verbatim
+/// namespace rather than anything inside it: `C:`, `\\server\share`, `\\?\C:`,
+/// `\\?\UNC\server\share`, `\\?\namespace`, `\\.\device`. `0` when there is none.
+///
+/// A prefix's own components are not filenames, so nothing may be appended to one: `\\server\share`
+/// is a share root exactly as `C:\` is a volume root. `Path::file_name` agrees — it is `None` for
+/// every prefix-only path — but only on a Windows HOST, which is why this is parsed byte-wise
+/// here, mirroring `std::path::Prefix`'s own rules (including `/` for `\` everywhere except
+/// inside a verbatim path, where `std` takes the separator literally).
+fn windows_prefix_len(bytes: &[u8]) -> usize {
+    if !(bytes.len() >= 2 && is_sep(bytes[0], true) && is_sep(bytes[1], true)) {
+        return if has_drive_prefix(bytes) { 2 } else { 0 };
+    }
+    // End offset of the component starting at `at`, exclusive of its separator.
+    let component = |at: usize, verbatim: bool| {
+        bytes[at..]
+            .iter()
+            .position(|&b| if verbatim { b == b'\\' } else { is_sep(b, true) })
+            .map_or(bytes.len(), |i| at + i)
+    };
+    if bytes.len() >= 4 && bytes[2] == b'?' && is_sep(bytes[3], true) && !bytes[..4].contains(&b'/') {
+        // `\\?\UNC\server\share`: server and share belong to the prefix, as they do without it.
+        if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && bytes[7] == b'\\' {
+            let server = component(8, true);
+            if server >= bytes.len() {
+                return bytes.len();
+            }
+            return component(server + 1, true);
+        }
+        // `\\?\C:` — a drive is recognised only EXACTLY here, matching `std`: `\\?\C:x` is the
+        // verbatim namespace `C:x`, not drive C.
+        if has_drive_prefix(&bytes[4..]) && bytes.get(6).is_none_or(|&b| b == b'\\') {
+            return 6;
+        }
+        return component(4, true);
+    }
+    if bytes.len() >= 4 && bytes[2] == b'.' && is_sep(bytes[3], true) {
+        return component(4, false); // `\\.\device`
+    }
+    // `\\server\share`. Missing either half is no prefix at all (`std` parses none), leaving the
+    // ordinary final-component rule to answer — which refuses `\\` and `\\server\` anyway.
+    let server = component(2, false);
+    if server == 2 || server >= bytes.len() {
+        return 0;
+    }
+    let share = component(server + 1, false);
+    if share == server + 1 {
+        0
+    } else {
+        share
+    }
+}
+
 /// `bytes` as Win32 itself reads them: a path component's trailing dots and spaces are trimmed
 /// before the file is opened, so `tool.`, `tool ` and `tool` all name one file, and `...`, `. `
 /// and `..` all name the directory `.` does.
@@ -116,18 +169,19 @@ fn win32_trim(bytes: &[u8]) -> &[u8] {
 
 /// Whether `program` names a DIRECTORY rather than a file, so no search could make it executable.
 ///
-/// True when the final component — taken after the drive prefix, if any — is empty (a
-/// separator-terminated name, a root, or the empty string) or is `.`/`..`. On Windows the
+/// True when the final component — taken after the Windows prefix, if any — is empty (a
+/// separator-terminated name, a root, a bare prefix such as `\\server\share`, or the empty
+/// string) or is `.`/`..`. On Windows the
 /// component is read through [`win32_trim`] first, so the rule refuses the SHAPE rather than a
 /// list of spellings: `...` and `. ` denote a directory there just as surely as `.` does.
 ///
 /// `Path::file_name` answers the same question, but host-specifically: off Windows it sees neither
-/// `\` nor the `C:` prefix, so a `Path`-based rule could not be exercised from a POSIX host at
-/// all. Byte-level and parameterised, like every other classifier here — see the module doc.
+/// `\` nor any prefix, so a `Path`-based rule could not be exercised from a POSIX host at all.
+/// Byte-level and parameterised, like every other classifier here — see the module doc.
 fn names_no_file(program: &OsStr, windows: bool) -> bool {
     let bytes = program.as_encoded_bytes();
-    let rest = if windows && has_drive_prefix(bytes) {
-        &bytes[2..]
+    let rest = if windows {
+        &bytes[windows_prefix_len(bytes)..]
     } else {
         bytes
     };
@@ -277,14 +331,22 @@ fn push_exe(bytes: &[u8]) -> std::ffi::OsString {
 /// Two ways to get that wrong, both of which this rules out: a name whose final component already
 /// carries an extension must not gain `name.exe` (`main` refused it), and a name with no final
 /// component at all must not gain one either — appending to a separator-terminated name produces
-/// a dotfile INSIDE the named directory rather than a sibling of it.
+/// a dotfile INSIDE the named directory rather than a sibling of it. A bare PREFIX
+/// (`\\server\share`, `\\?\C:`) has no final component for the same reason `C:\` has none, which
+/// is why the prefix comes off first: `main`, whose `Path::with_extension` was a no-op on a path
+/// with no file name, never looked for `\\server\share.exe` either.
 ///
 /// [`resolve`] refuses a stemless name before reaching here, so the empty case is defence in depth
 /// for any future caller of this function that does not go through it.
 fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
     let bytes = name.as_encoded_bytes();
-    let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
-    let final_component = &bytes[start..];
+    let rest = if windows {
+        &bytes[windows_prefix_len(bytes)..]
+    } else {
+        bytes
+    };
+    let start = rest.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
+    let final_component = &rest[start..];
     // A SEPARATOR-TERMINATED name has an empty final component: it names a directory, not a file,
     // so there is no filename to append to. Returning `true` here appended the literal `.exe` to
     // the whole string, yielding `C:\tools\thing.bin\.exe` — a file a writer of that directory
