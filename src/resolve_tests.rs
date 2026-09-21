@@ -889,6 +889,9 @@ fn an_accepted_name_that_is_simply_absent_is_not_found() {
     for n in [
         "tool",
         "1:tool",
+        // `std` recognises a verbatim drive whichever separator follows it, so this is
+        // `\\?\C:` plus a path, not a bare prefix. Pins the parser against `std`'s own rule.
+        r"\\?\C:/x",
         "./missing",
         r"C:\abs\missing.exe",
         r"sub\missing",
@@ -1033,6 +1036,17 @@ fn a_prefix_only_located_name_never_grows_an_exe_candidate() {
     for n in [r"\\server\share", r"\\?\C:", r"\\?\UNC\server\share", r"\\.\pipe"] {
         let got = candidate(n, true);
         assert_eq!(got, vec![n.to_string()], "{n:?} must not grow a candidate: {got:?}");
+    }
+}
+
+#[test]
+fn a_stemless_bare_name_grows_no_candidate_either() {
+    // `resolve` refuses these before `filename_candidates` runs, but the candidate rule must not
+    // depend on that — the same defence in depth `takes_the_exe_fallback` keeps for the located
+    // axis. Appending to a name Win32 trims to nothing hands a bypassing caller exactly the
+    // plantable `.exe`/`....exe` the refusal exists to prevent.
+    for n in ["", "...", "   ", ". "] {
+        assert_eq!(candidate(n, true), vec![n.to_string()], "{n:?}");
     }
 }
 

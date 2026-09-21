@@ -159,7 +159,7 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
         }
         // `\\?\C:` — a drive is recognised only EXACTLY here, matching `std`: `\\?\C:x` is the
         // verbatim namespace `C:x`, not drive C.
-        if has_drive_prefix(&bytes[4..]) && bytes.get(6).is_none_or(|&b| b == b'\\') {
+        if has_drive_prefix(&bytes[4..]) && bytes.get(6).is_none_or(|&b| is_sep(b, true)) {
             return 6;
         }
         return component(4, true);
@@ -327,7 +327,12 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
         // `tool..exe`/`tool .exe` — names the caller never wrote and a writer of any of those
         // directories can plant. `main` appended to neither (`Path::new("tool.").extension()` is
         // `Some("")`), so a searched name and its Win32-equal spelling resolve alike here.
-        Shape::BareName => vec![push_exe(win32_trim(name.as_encoded_bytes()))],
+        Shape::BareName => match win32_trim(name.as_encoded_bytes()) {
+            // Nothing left to append to. `resolve` refuses this shape before reaching here; the
+            // guard keeps the rule from handing a future bypassing caller the plantable `.exe`.
+            [] => vec![name.to_os_string()],
+            trimmed => vec![push_exe(trimmed)],
+        },
         // A located name with SOME extension gets exactly one candidate, the name as written.
         // `main` keyed its `.exe` fallback on `Path::extension().is_none()`, so appending to a
         // dotted name here would be a WIDENING on the located axis: `executable(r"C:\t\thing.bin")`
