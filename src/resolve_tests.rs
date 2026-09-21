@@ -1013,7 +1013,8 @@ fn the_exe_rule_appends_to_the_name_as_written() {
     // `tool.` carries an empty one (`Path::extension()` is `Some("")`), so it gets no fallback —
     // the same rule that gives `tools\thing.bin` exactly one candidate.
     assert_eq!(candidate(r"bin\tool.", true), vec![r"bin\tool."]);
-    // An INTERIOR dot-run is an ordinary directory name, and the final component decides alone.
+    // The trailing space keeps the fallback wherever the component sits — including under a
+    // dot-run directory, which is an ordinary interior component and changes nothing.
     assert_eq!(
         candidate(r"C:\dir\...\tool ", true),
         vec![r"C:\dir\...\tool ", r"C:\dir\...\tool .exe"]
