@@ -854,3 +854,81 @@ fn an_empty_program_never_resolves() {
     assert!(go_win_path("", cwd.path(), Some(&pv)).is_err(), "bare empty name");
     assert!(go_win_path("", cwd.path(), None).is_err(), "bare empty name, no PATH");
 }
+
+/// A stemless name must be refused for its SHAPE, not merely missed by the search. Asserting
+/// `is_err()` alone passes vacuously — the file does not exist either — so it would not have
+/// caught the planted-sibling case at all.
+fn assert_refused_on_shape(name: &str, got: Result<std::path::PathBuf, Error>) {
+    match got {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        other => panic!("{name:?} names no file and must be refused on shape, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_program_with_no_stem_is_refused() {
+    // A path whose final component is empty, `.` or `..` names a DIRECTORY, so it cannot name an
+    // executable — and resolving it anyway is not merely futile, it invents names. `C:\t\.` grew
+    // the candidate `C:\t\..exe`, a file in `C:\t` that the caller never wrote; a bare `.` grew
+    // `..exe` and searched `PATH` for it. Refusing on the shape closes every such spelling at
+    // once, where guarding one candidate rule at a time leaves the next one open.
+    let cwd = tempfile::tempdir().unwrap();
+    for n in [
+        "",
+        r"C:\t\thing.bin\",
+        r"C:\t\dir\",
+        "bin/",
+        r"C:\t\.",
+        r"C:\t\..",
+        ".",
+        "..",
+        r"C:\",
+        "C:",
+        "C:.",
+        "C:..",
+    ] {
+        assert_refused_on_shape(n, go_win_path(n, cwd.path(), None));
+    }
+}
+
+#[test]
+fn a_stemless_program_is_refused_on_posix_too() {
+    // The rule is not a Windows one: `execvp("bin/")`, `execvp(".")` and `execvp("..")` fail for
+    // the same reason. Only the separator set is platform-dependent, so `bin\` stays a legitimate
+    // single-component filename here — a backslash is an ordinary character on POSIX.
+    let cwd = tempfile::tempdir().unwrap();
+    for n in ["", "bin/", ".", "..", "/"] {
+        assert_refused_on_shape(n, go(n, cwd.path(), None));
+    }
+}
+
+#[test]
+fn a_dot_terminated_name_never_invents_a_planted_sibling() {
+    // The live half of the bug, on the filesystem: with `..exe` planted beside it, `C:\t\.` used
+    // to resolve to that file. The directory it names is real and the plant is real, so nothing
+    // but the stem rule stops this one.
+    let cwd = tempfile::tempdir().unwrap();
+    let dir = cwd.path().join("t");
+    std::fs::create_dir(&dir).unwrap();
+    touch(&dir, "..exe");
+    let named = format!("{}/.", dir.display());
+    let got = go_win_path(&named, cwd.path(), None);
+    assert!(
+        got.is_err(),
+        "{named:?} must not resolve to the planted ..exe, got {got:?}"
+    );
+}
+
+#[test]
+fn a_name_with_a_stem_still_resolves() {
+    // Negative control for the three tests above: the refusal must key on a MISSING stem, not on
+    // a leading dot. `.helper` and `..helper` are ordinary filenames and must survive.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = cwd.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for n in [".helper", "..helper", "tool.exe"] {
+        touch(&bin, n);
+        let got = go_win_path(&format!("{}/{}", bin.display(), n), cwd.path(), None);
+        assert!(got.is_ok(), "{n:?} has a stem and must resolve, got {got:?}");
+    }
+}

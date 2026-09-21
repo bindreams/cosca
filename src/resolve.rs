@@ -101,6 +101,25 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
+/// Whether `program` names a DIRECTORY rather than a file, so no search could make it executable.
+///
+/// True when the final component — taken after the drive prefix, if any — is empty (a
+/// separator-terminated name, a root, or the empty string) or is `.`/`..`.
+///
+/// `Path::file_name` answers the same question, but host-specifically: off Windows it sees neither
+/// `\` nor the `C:` prefix, so a `Path`-based rule could not be exercised from a POSIX host at
+/// all. Byte-level and parameterised, like every other classifier here — see the module doc.
+fn names_no_file(program: &OsStr, windows: bool) -> bool {
+    let bytes = program.as_encoded_bytes();
+    let rest = if windows && has_drive_prefix(bytes) {
+        &bytes[2..]
+    } else {
+        bytes
+    };
+    let start = rest.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
+    matches!(&rest[start..], b"" | b"." | b"..")
+}
+
 /// The filenames tried in each candidate directory, in order.
 ///
 /// **`.exe` is a property of names that get SEARCHED, not of files that get LOADED.** That split
@@ -224,6 +243,9 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
 /// carries an extension must not gain `name.exe` (`main` refused it), and a name with no final
 /// component at all must not gain one either — appending to a separator-terminated name produces
 /// a dotfile INSIDE the named directory rather than a sibling of it.
+///
+/// [`resolve`] refuses a stemless name before reaching here, so the empty case is defence in depth
+/// for any future caller of this function that does not go through it.
 fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
     let bytes = name.as_encoded_bytes();
     let start = bytes.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
@@ -355,13 +377,15 @@ fn is_execable(path: &Path, windows: bool) -> bool {
 
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     let name = input.program.as_os_str();
-    // An empty program names no file. Without this it classifies as a bare name and the `.exe`
-    // rule turns it into the single candidate `.exe`, so `executable("")` resolves to any file
-    // literally named `.exe` on `PATH` or in a system directory — a trivially plantable target.
-    if name.is_empty() {
+    // A name with no stem does not merely fail to resolve, it INVENTS one: the `.exe` rule turned
+    // `""` into the candidate `.exe`, `.` into `..exe`, and `C:\t\.` into `C:\t\..exe` — each a
+    // file that a writer of the searched directory can plant under a name the caller never wrote.
+    // Guarding one candidate rule at a time leaves the next spelling open, so the shape is refused
+    // outright. `InvalidInput`, not `NotFound`: nothing was looked for.
+    if names_no_file(name, input.windows) {
         return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "an empty program name resolves to nothing",
+            std::io::ErrorKind::InvalidInput,
+            format!("program names a directory, not a file: {:?}", input.program),
         )));
     }
     // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the
