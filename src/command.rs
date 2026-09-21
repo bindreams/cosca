@@ -173,12 +173,12 @@ impl Command {
     ///   `tools\thing.bin\`, a root, a bare `\\server\share` — has none: it is refused
     ///   before any candidate is built (see the error kinds below).
     ///
-    /// Windows trims a path component's trailing dots and spaces before opening it, and so
-    /// does this resolver: `tool.` and `tool ` are searched for as `tool.exe`, never as the
-    /// plantable `tool..exe`, and `...` names a directory exactly as `.` does. A pathed name
-    /// with such a component keeps its exact candidate and gains no `.exe` one.
+    /// The rule is applied to the name AS WRITTEN. This resolver manipulates paths; it does
+    /// not reproduce the trimming Windows performs on a path string on its way into an API,
+    /// which describes the string rather than what may exist on disk. So a trailing dot or
+    /// space is an ordinary part of a name here: `tool.` is searched for as `tool..exe`.
     ///
-    /// This also means a bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
+    /// A bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
     /// resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
     /// resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
     /// deliberately excluded from the exact-match allowlist: resolving to a script is a
@@ -195,7 +195,7 @@ impl Command {
     ///   A drive-relative name such as `C:tool` is refused this way rather than loaded from
     ///   the working directory: resolving it would need drive C's own current directory,
     ///   which cosca does not track. So is a name that names no file at all (`C:\`, `.`,
-    ///   `tools\dir\`, `...`, `\\server\share`).
+    ///   `tools\dir\`, `\\server\share`).
     /// - [`std::io::ErrorKind::NotFound`] — the name was acceptable, the search above ran,
     ///   and nothing matched.
     ///
