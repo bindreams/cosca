@@ -186,18 +186,17 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
 ///
 /// True when the final component — taken after the Windows prefix, if any — is empty (a
 /// separator-terminated name, a root, a bare prefix such as `\\server\share`, or the empty
-/// string) or is `.`/`..`. NOTHING ELSE, on either platform: this module does pure path
-/// manipulation, and its reference is `PureWindowsPath`, which normalises separators and nothing
-/// else — `C:\dir\...` has name `...`, `C:\dir\tool.` has name `tool.`, and a lone space is a
-/// name. Win32's trimming of a component's trailing dots and spaces describes what an API does to
-/// a path STRING on its way in, not what may exist on disk; Microsoft's own rule concedes a
-/// trailing-space name can be created, so simulating the trim here would refuse names that name
-/// real files.
+/// string) or is `.`/`..`. NOTHING ELSE, on either platform.
 ///
-/// The empty final component is read straight off the RAW string, which is what this module
-/// works on. `PureWindowsPath` reports `y` for `C:\dir\y\`, but only because it collapses the
-/// trailing separator first, as its own normalisation step — refusing that shape is a direct
-/// reading of what the caller wrote, not a policy overlay.
+/// The component question is `PureWindowsPath`'s, and this agrees with it: `C:\dir\...` has name
+/// `...`, `C:\dir\tool.` has name `tool.`, a lone space is a name. Win32's trimming of trailing
+/// dots and spaces is not modelled, because it describes what an API does to a path STRING on its
+/// way in and not what may exist on disk — Microsoft's own rule concedes a trailing-space name can
+/// be created, so trimming here would refuse names that name real files.
+///
+/// The one deliberate divergence is the trailing separator: `PureWindowsPath` reports `y` for
+/// `C:\dir\y\` because it collapses the separator first. This module reads the RAW string, where
+/// the empty final component is still present, and refuses it.
 ///
 /// `Path::file_name` answers the same question, but host-specifically: off Windows it sees neither
 /// `\` nor any prefix, so a `Path`-based rule could not be exercised from a POSIX host at all.
@@ -239,12 +238,10 @@ fn names_no_file(program: &OsStr, windows: bool) -> bool {
 /// - Windows, final path component already ending in `.exe`/`.com` (compared CASE-INSENSITIVELY,
 ///   so `TOOL.EXE` is never doubled into `TOOL.EXE.exe`): `name` unchanged, either shape. There is
 ///   nothing to append that would not name a file the caller did not write.
-/// - Windows, [`Shape::BareName`]: `name` + `.exe`, and ONLY that. Appended to the name AS
-///   WRITTEN — this resolver manipulates paths and does not simulate Win32's normalisation of a
-///   string on its way into an API, so `tool.` yields `tool..exe` and `...` yields `....exe`.
-///   Odd-looking, but it is the one rule, unbranched: a name is a name, and appending to anything
-///   but what the caller wrote would search for a file they did not name. See the monotonicity
-///   note.
+/// - Windows, [`Shape::BareName`]: `name` + `.exe`, and ONLY that, appended to the name AS
+///   WRITTEN. `tool.` yields `tool..exe` and `...` yields `....exe` — odd-looking, but the one
+///   rule unbranched, and appending to anything but what the caller wrote would search for a file
+///   they did not name. See the monotonicity note, which counts this as a widening.
 /// - Windows, [`Shape::Located`]: `name` first, always. `name` + `.exe` follows ONLY when the
 ///   name carries no extension at all AND has a non-empty final component — see
 ///   [`takes_the_exe_fallback`], which is what keeps this axis from widening against `main`.
@@ -306,6 +303,16 @@ fn names_no_file(program: &OsStr, windows: bool) -> bool {
 /// `CreateProcessW`'s own NULL-`lpApplicationName` behaviour, and is not meant to: that parity is
 /// already given up on for `.bat`/`.cmd`, above.
 ///
+/// A bare name whose trailing character is a dot or a space is the same widening, and named
+/// separately because it is the plantable one. `main` searched for the literal `tool.`, which
+/// Win32 opens as `tool`; this rule searches for `tool..exe` (and `...` for `....exe`), names
+/// `main` never looked for and a writer of any searched directory can create. It is kept because
+/// the alternative is worse: trimming first searches for `tool.exe`, a name the caller did not
+/// write EITHER, and buys the refusal of `...` — which names a file, so refusing it reports
+/// `InvalidInput` for an input some filesystem satisfies, breaking this module's own kind rule.
+/// The shells' PATHEXT behaviour was measured on `foo.bar`, not on a trailing-dot name; that this
+/// case falls under the same rule is an argument from uniformity, not a measurement.
+///
 /// # Not a permanent rule
 ///
 /// The one-candidate rule for a BARE name is expected to be superseded by proper PATHEXT-based
@@ -317,14 +324,11 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
         return vec![name.to_os_string()];
     }
     match shape {
-        // Nothing to append to. `resolve` refuses this shape before reaching here; the guard keeps
-        // the rule from handing a future bypassing caller the plantable `.exe`/`..exe`, the same
-        // defence in depth [`takes_the_exe_fallback`] keeps for the located axis.
+        // Nothing to append to: `.exe` would become the whole name (`.` -> `..exe`), a plant under
+        // a name the caller never wrote. `resolve` refuses this shape before reaching here, so the
+        // guard is defence in depth for a future caller that bypasses it — the located axis asks
+        // the same question, through [`takes_the_exe_fallback`].
         Shape::BareName if names_no_file(name, windows) => vec![name.to_os_string()],
-        // The name AS WRITTEN, plus `.exe` — no trimming, no normalisation. `tool.` yields
-        // `tool..exe`: the same rule as `tool` -> `tool.exe` applied to an odd-looking name, not a
-        // special case. Trimming the dot first would search every system and `PATH` directory for
-        // `tool.exe`, a DIFFERENT file from the one the caller named.
         Shape::BareName => vec![push_exe(name.as_encoded_bytes())],
         // A located name with SOME extension gets exactly one candidate, the name as written.
         // `main` keyed its `.exe` fallback on `Path::extension().is_none()`, so appending to a
@@ -340,8 +344,8 @@ fn filename_candidates(name: &OsStr, windows: bool, shape: Shape) -> Vec<std::ff
 }
 
 fn push_exe(bytes: &[u8]) -> std::ffi::OsString {
-    // SAFETY: the bytes came from `as_encoded_bytes` and are truncated only at an ASCII boundary,
-    // which is the documented-safe way to slice an `OsStr`'s encoded form.
+    // SAFETY: both callers pass a whole `as_encoded_bytes` slice, unsliced, which round-trips by
+    // definition.
     let mut out = unsafe { OsStr::from_encoded_bytes_unchecked(bytes) }.to_os_string();
     out.push(".exe");
     out
@@ -354,16 +358,20 @@ fn push_exe(bytes: &[u8]) -> std::ffi::OsString {
 /// which keyed on `Path::extension().is_none()` and appended via `Path::with_extension`.
 ///
 /// Two ways to get that wrong, both of which this rules out: a name whose final component already
-/// carries an extension must not gain `name.exe` (`main` refused it), and a name with no final
-/// component at all must not gain one either — appending to a separator-terminated name produces
-/// a dotfile INSIDE the named directory rather than a sibling of it. A bare PREFIX
-/// (`\\server\share`, `\\?\C:`) has no final component for the same reason `C:\` has none, which
-/// is why the prefix comes off first: `main`, whose `Path::with_extension` was a no-op on a path
-/// with no file name, never looked for `\\server\share.exe` either.
+/// carries an extension must not gain `name.exe` (`main` refused it), and a name that names no
+/// file must not gain one either — there `.exe` becomes the whole final component, naming a
+/// dotfile INSIDE the directory (`C:\tools\dir\` -> `C:\tools\dir\.exe`) or a sibling of it
+/// (`C:\t\.` -> `C:\t\..exe`), either of which a writer of that directory can plant and which
+/// `main` — whose `Path::with_extension` is a no-op on a path with no file name — never looked
+/// for. That second question is [`names_no_file`]'s, and is asked by calling it: the bare axis
+/// asks the same one, and two spellings of a single rule drift apart.
 ///
-/// [`resolve`] refuses a stemless name before reaching here, so the empty case is defence in depth
-/// for any future caller of this function that does not go through it.
+/// [`resolve`] refuses such a name before reaching here, so this is defence in depth for any
+/// future caller of this function that does not go through it.
 fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
+    if names_no_file(name, windows) {
+        return false;
+    }
     let bytes = name.as_encoded_bytes();
     let rest = if windows {
         &bytes[windows_prefix_len(bytes)..]
@@ -372,15 +380,6 @@ fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
     };
     let start = rest.iter().rposition(|&b| is_sep(b, windows)).map_or(0, |i| i + 1);
     let final_component = &rest[start..];
-    // A SEPARATOR-TERMINATED name has an empty final component: it names a directory, not a file,
-    // so there is no filename to append to. Returning `true` here appended the literal `.exe` to
-    // the whole string, yielding `C:\tools\thing.bin\.exe` — a file a writer of that directory
-    // could plant, loaded where `main` (which used `Path::with_extension`, a no-op on a name with
-    // no file name) returned `NotFound`. That is the exact widening this rule exists to prevent,
-    // reintroduced by the rule itself.
-    if final_component.is_empty() {
-        return false;
-    }
     // Otherwise: only when there is no extension, matching `Path::extension()`'s rule that a
     // LEADING dot is part of the stem (`.bashrc` has none) — which is what `main` keyed on.
     matches!(final_component.iter().rposition(|&b| b == b'.'), Some(0) | None)

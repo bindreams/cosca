@@ -173,14 +173,16 @@ impl Command {
     ///   `tools\thing.bin\`, a root, a bare `\\server\share` — has none: it is refused
     ///   before any candidate is built (see the error kinds below).
     ///
-    /// The rule is applied to the name AS WRITTEN. This resolver manipulates paths; it does
-    /// not reproduce the trimming Windows performs on a path string on its way into an API,
-    /// which describes the string rather than what may exist on disk. So a trailing dot or
-    /// space is an ordinary part of a name here: `tool.` is searched for as `tool..exe`.
+    /// Both bullets read the name AS WRITTEN. Windows trims a path component's trailing
+    /// dots and spaces on the way into an API, but that describes the string rather than
+    /// what may exist on disk, and this resolver does not reproduce it — so a trailing dot
+    /// or space is an ordinary part of a name. A bare `tool.` is therefore searched for as
+    /// `tool..exe`, while a pathed `bin\tool.` carries an extension (an empty one) and so
+    /// gets no second candidate at all.
     ///
-    /// A bare name with a non-`.exe`/`.com` dot, such as `python3.11`,
-    /// resolves to `python3.11.exe` — matching how those same shells use PATHEXT to
-    /// resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
+    /// A bare name with a non-`.exe`/`.com` dot, such as `python3.11`, resolves to
+    /// `python3.11.exe` — matching how `cmd.exe` and both PowerShell editions use PATHEXT
+    /// to resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
     /// deliberately excluded from the exact-match allowlist: resolving to a script is a
     /// separate, not-yet-implemented feature (planned as its own follow-up), not a
     /// judgement that scripts are unsafe — this crate's existing, separate batch-path

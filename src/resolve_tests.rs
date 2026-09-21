@@ -894,8 +894,7 @@ fn an_accepted_name_that_is_simply_absent_is_not_found() {
         r"\\?\C:/x",
         "./missing",
         r"C:\abs\missing.exe",
-        // A dot-run INTERIOR component is an ordinary directory name, and the final component
-        // names the file — neither is trimmed, so this is searched like any other pathed name.
+        // A dot-run INTERIOR component is an ordinary directory name: searched, not refused.
         r"C:\dir\...\tool.exe",
         r"sub\missing",
         "sub/missing",
@@ -957,11 +956,9 @@ fn a_dot_terminated_name_never_invents_a_planted_sibling() {
 
 #[test]
 fn a_trailing_dot_or_space_is_an_ordinary_name_on_both_platforms() {
-    // The resolver does PURE path manipulation, on either platform. Win32's trimming of a
-    // component's trailing dots and spaces describes what an API does to a path STRING on its way
-    // in; it says nothing about what may exist on disk, and Microsoft's own rule concedes such a
-    // file CAN be created. The reference is `PureWindowsPath`, which normalises separators and
-    // nothing else: `C:\dir\...` has name `...`, and a lone space is a name.
+    // A trailing dot or space is an ordinary filename character on either platform, so each of
+    // these names a file and gets searched for. Win32's trimming is not modelled: it describes a
+    // path STRING entering an API, and Microsoft's own rule concedes such a file CAN be created.
     let cwd = tempfile::tempdir().unwrap();
     for n in [
         "...",
@@ -1001,10 +998,9 @@ fn a_dot_run_name_is_searched_for_like_any_other_bare_name() {
 
 #[test]
 fn the_exe_rule_appends_to_the_name_as_written() {
-    // No normalisation of any kind before appending. `tool.` yields `tool..exe` — the SAME rule
-    // as `tool` -> `tool.exe`, applied to a name that merely looks odd, not a special case.
-    // Trimming the trailing dot first would search for `tool.exe`, a DIFFERENT file from the one
-    // the caller named, in every system and `PATH` directory.
+    // `.exe` goes onto the name the caller wrote, unmodified: `tool.` -> `tool..exe` is the SAME
+    // rule as `tool` -> `tool.exe`. Trimming the dot first would search every system and `PATH`
+    // directory for `tool.exe`, a DIFFERENT file from the one named.
     assert_eq!(candidate("tool.", true), vec!["tool..exe"]);
     assert_eq!(candidate("tool ", true), vec!["tool .exe"]);
     assert_eq!(candidate("tool. ", true), vec!["tool. .exe"]);
@@ -1017,6 +1013,11 @@ fn the_exe_rule_appends_to_the_name_as_written() {
     // `tool.` carries an empty one (`Path::extension()` is `Some("")`), so it gets no fallback —
     // the same rule that gives `tools\thing.bin` exactly one candidate.
     assert_eq!(candidate(r"bin\tool.", true), vec![r"bin\tool."]);
+    // An INTERIOR dot-run is an ordinary directory name, and the final component decides alone.
+    assert_eq!(
+        candidate(r"C:\dir\...\tool ", true),
+        vec![r"C:\dir\...\tool ", r"C:\dir\...\tool .exe"]
+    );
 }
 
 #[test]
@@ -1059,12 +1060,25 @@ fn a_prefix_only_located_name_never_grows_an_exe_candidate() {
 }
 
 #[test]
-fn a_stemless_bare_name_grows_no_candidate_either() {
-    // `resolve` refuses these before `filename_candidates` runs, but the candidate rule must not
-    // depend on that — the same defence in depth `takes_the_exe_fallback` keeps for the located
-    // axis. Appending to a name that names no file hands a bypassing caller exactly the plantable
-    // `.exe`/`..exe` the refusal exists to prevent.
-    for n in ["", ".", ".."] {
+fn a_name_that_names_no_file_grows_no_candidate_on_either_axis() {
+    // `resolve` refuses all of these before `filename_candidates` runs, but the candidate rule
+    // must not depend on that. The two axes must answer with ONE predicate: a `.`-terminated
+    // LOCATED name reads its final component as `.` exactly as a bare `.` does, and appending
+    // there yields `C:\t\..exe` — the plant `resolve`'s refusal exists to prevent, and the very
+    // file `a_dot_terminated_name_never_invents_a_planted_sibling` drops on disk.
+    for n in [
+        "",
+        ".",
+        "..",
+        r"C:\t\.",
+        r"C:\t\..",
+        r"a\.",
+        "./.",
+        r"\\server\share\.",
+        r"\\?\C:\.",
+        r"\\.\pipe\.",
+        r"C:\t\dir\",
+    ] {
         assert_eq!(candidate(n, true), vec![n.to_string()], "{n:?}");
     }
 }
