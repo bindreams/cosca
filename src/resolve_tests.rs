@@ -986,6 +986,20 @@ fn a_trailing_dot_or_space_is_an_ordinary_name_on_both_platforms() {
 }
 
 #[test]
+fn a_dot_run_name_is_searched_for_like_any_other_bare_name() {
+    // The live half, on the filesystem: `...` is a NAME, so the bare rule appends `.exe` to it and
+    // the search finds `....exe` exactly as it finds `tool.exe` for `tool`. Not a plantable
+    // invention — the candidate is the caller's own bytes plus the documented suffix, and a writer
+    // who can drop `....exe` into a searched directory can drop `tool.exe` there just as easily.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let planted = touch(bin.path(), "....exe");
+    let pv = path_var_for(&[bin.path()], true);
+    let got = go_win_path("...", cwd.path(), Some(&pv)).expect("`...` names a file and must resolve");
+    assert_eq!(got, planted, "{got:?}");
+}
+
+#[test]
 fn the_exe_rule_appends_to_the_name_as_written() {
     // No normalisation of any kind before appending. `tool.` yields `tool..exe` — the SAME rule
     // as `tool` -> `tool.exe`, applied to a name that merely looks odd, not a special case.
