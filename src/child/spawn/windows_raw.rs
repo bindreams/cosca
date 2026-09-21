@@ -307,6 +307,12 @@ pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
 pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
     let token = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     if let Some(prog) = token {
+        // NUL FIRST. `PCWSTR` stops at the first NUL, so a token like `C:\tools\setup\0.bat` is a
+        // NUL defect, not a batch one — but `Path::extension()` still reads `.bat` straight through
+        // the NUL (it is not a separator), so gating on the batch rule first blames the wrong thing
+        // and interpolates a raw U+0000 into the error string, which then reaches logs and
+        // terminals. Same ordering as the elevated path, for the same reason.
+        resolve::ensure_no_nul_wide(prog.as_os_str())?;
         reject_batch_path(&prog)?;
     }
     Ok(())
