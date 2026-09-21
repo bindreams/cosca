@@ -236,14 +236,17 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 /// `PCWSTR` stops at the first NUL, so a value containing one is silently TRUNCATED rather than
 /// rejected — and every field here decides something security-relevant:
 ///
-/// - `lpFile` would load a DIFFERENT FILE than the caller named, elevated.
+/// - `lpFile` truncated at the NUL would load a DIFFERENT FILE than the caller named, elevated.
 /// - `lpDirectory` would run the elevated child somewhere other than `current_dir()` asked for.
 /// - `lpParameters` would drop everything after the NUL, silently shortening the argument line an
 ///   elevated program acts on.
 ///
-/// The raw `CreateProcessW` backend already refuses all three (it NUL-checks the image, the cwd,
-/// and every argv token). Without this, the SAME `Command` fails loudly unelevated and quietly
-/// does something else under `.elevate()` — the contract must not depend on which path ran.
+/// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
+/// closes the interior-NUL divergence between the elevated and unelevated paths. A separate,
+/// still-open divergence is `ShellExecuteEx` resolving OTHER registered associations (`.lnk`,
+/// `.vbs`/`.js`/`.wsf`, `.msc`, …) that `CreateProcessW` refuses outright — see the batch gate
+/// below for the one class of that surface handled so far; an allowlist for the rest lands in a
+/// later PR.
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -357,11 +360,21 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
     // already elevated — the exact "depends which path ran" divergence these checks exist to
     // remove. It also costs nothing: none of this depends on what the planner decides.
 
-    // .bat/.cmd, refused here as on every other backend. `ShellExecuteEx`'s `runas` resolves the
-    // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into
-    // `%*` UNESCAPED — and `join_wide` quotes only for whitespace, never for cmd metacharacters,
-    // so `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED cmd.exe. That is
-    // CVE-2024-24576, which the raw and std backends both refuse outright.
+    // `program`'s NUL check runs BEFORE `reject_batch_path`: a NUL-truncated path (e.g.
+    // `C:\tools\setup` + NUL + `.bat`) must be diagnosed as the NUL, not misattributed to the
+    // batch gate below — the truncated prefix is not a batch file at all, and by rejecting here
+    // first, `program` is guaranteed NUL-free before `reject_batch_path` can format it into an
+    // error, so that error can never embed a raw NUL into a String that reaches logs/terminals.
+    let file_w = wide_nul("program path", program.as_os_str())?;
+
+    // .bat/.cmd is the one association refused here, as on every other backend. `ShellExecuteEx`'s
+    // `runas` resolves the `batfile` association, which routes through `cmd.exe` and substitutes
+    // `lpParameters` into `%*` UNESCAPED — and `join_wide` quotes only for whitespace, never for
+    // cmd metacharacters, so `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED
+    // cmd.exe. That is CVE-2024-24576, which the raw and std backends both refuse outright.
+    // `ShellExecuteEx` can still resolve OTHER registered associations with a `runas` verb (`.lnk`,
+    // `.vbs`/`.js`/`.wsf`, `.msc`, …) that `CreateProcessW` refuses — a residual divergence an
+    // extension allowlist closes in a later PR, not this one.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     // Refused for an interior NUL rather than silently truncated — see `wide_nul`. `params` is
@@ -370,7 +383,6 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         .cwd()
         .map(|d| wide_nul("working directory", d.as_os_str()))
         .transpose()?;
-    let file_w = wide_nul("program path", program.as_os_str())?;
     let params_w = wide_nul("argument line", params.as_os_str())?;
     let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
