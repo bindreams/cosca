@@ -222,7 +222,11 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
 /// `Path::file_name` answers the same question, but host-specifically: off Windows it sees neither
 /// `\` nor any prefix, so a `Path`-based rule could not be exercised from a POSIX host at all.
 /// Byte-level and parameterised, like every other classifier here — see the module doc.
-fn names_no_file(program: &OsStr, windows: bool) -> bool {
+///
+/// `pub(crate)` for `windows_raw::resolve::reject_unnameable_program`: the `Exact` arms refuse the
+/// same shapes, and sharing the predicate is what stops the two axes drifting apart on what counts
+/// as a filename.
+pub(crate) fn names_no_file(program: &OsStr, windows: bool) -> bool {
     matches!(final_component(program, windows), b"" | b"." | b"..")
 }
 

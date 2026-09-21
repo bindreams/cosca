@@ -336,7 +336,7 @@ pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<Pa
     match cmd.executable_spec() {
         Some(ExecutableSpec::Search(p)) => Ok(Some(resolve::resolve_executable(p, cmd.cwd(), path)?)),
         Some(ExecutableSpec::Exact(p)) => {
-            resolve::reject_empty_program(p)?;
+            resolve::reject_unnameable_program(p)?;
             Ok(Some(p.to_path_buf()))
         }
         None => program_token(cmd)

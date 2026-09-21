@@ -240,6 +240,19 @@ fn image_for_rejects_an_empty_exact_program() {
 }
 
 #[test]
+fn image_for_rejects_an_exact_program_that_names_no_file() {
+    // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
+    // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but only after the
+    // spawn is under way; refusing here keeps the two `raw_executable()` sinks agreeing on which
+    // inputs are nameable at all, rather than differing by which path you spawned through.
+    for n in [r"C:\t\dir\", r"C:\t\.", ".", "..", "C:"] {
+        let mut cmd = Command::new();
+        cmd.raw_executable(n).args(["tool"]);
+        assert!(image_for(&cmd).is_err(), "{n:?} names no file and must be refused");
+    }
+}
+
+#[test]
 fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
     // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
     // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.

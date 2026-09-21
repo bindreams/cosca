@@ -146,21 +146,27 @@ fn grow_wide_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, st
     }
 }
 
-/// Refuse an empty program name.
+/// Refuse a program name that names no file — empty, separator-terminated, a root, or a final
+/// component of `.`/`..`.
 ///
-/// `raw_executable("")` records a program that names no file, and the two Win32 sinks disagree
-/// about what to do with it: as `lpApplicationName` it becomes a pointer to a lone NUL rather
-/// than the NULL pointer, and whether `CreateProcessW` treats those identically is undocumented —
-/// if it does, the image search this crate exists to prevent is back, including the current
-/// directory. Rather than depend on which way that falls, an empty name fails closed here.
+/// `raw_executable("")` is the sharpest case: as `lpApplicationName` an empty string becomes a
+/// pointer to a lone NUL rather than the NULL pointer, and whether `CreateProcessW` treats those
+/// identically is undocumented — if it does, the image search this crate exists to prevent is
+/// back, including the current directory. The wider rule covers the rest of the shape:
+/// `raw_executable(r"C:\t\dir\")` promises "load exactly this file" while naming a directory, a
+/// promise no completion can keep.
 ///
-/// `Search` cannot produce this: `crate::resolve::resolve` returns an absolute path or errors.
-/// So the guard belongs on the `Exact` arms specifically.
-pub(crate) fn reject_empty_program(program: &Path) -> Result<(), Error> {
-    if program.as_os_str().is_empty() {
+/// The predicate is [`crate::resolve::names_no_file`] rather than a local copy, so the `Exact` and
+/// `Search` arms cannot drift apart on what counts as a filename — and so the rule stays covered
+/// by tests that run on any host, not only the Windows runner.
+///
+/// `Search` reaches the same verdict through [`crate::resolve::resolve`], which refuses these
+/// before it searches; this is the `Exact` arms' equivalent.
+pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
+    if crate::resolve::names_no_file(program.as_os_str(), true) {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "raw_executable() was given an empty path, which names no file",
+            format!("raw_executable() was given a path that names no file: {program:?}"),
         )));
     }
     Ok(())
@@ -193,13 +199,13 @@ pub(crate) fn reject_empty_program(program: &Path) -> Result<(), Error> {
 /// consumes the relative name exactly once and everything downstream uses the absolute result —
 /// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
-    reject_empty_program(program)?;
+    reject_unnameable_program(program)?;
     // BEFORE widening. `to_wide_nul` appends a terminator, and `PCWSTR` stops at the FIRST NUL —
     // so an interior NUL silently truncates the path Win32 sees. `raw_executable("C:\\a\\b.exe\0x")`
     // would become `lpFile = C:\a\b.exe`, loading a file the caller did not name, elevated. The
     // raw backend already fails such a path closed (`spawn_raw` NUL-checks the image); without
     // this the same `Command` would error unelevated and silently load a different file elevated.
-    // It also closes the hole in `reject_empty_program`, which sees a non-empty `OsStr` for a
+    // It also closes the hole in `reject_unnameable_program`, which sees a non-empty `OsStr` for a
     // value that widens to the empty string.
     ensure_no_nul_wide("program path", program.as_os_str())?;
     let wide = super::to_wide_nul(program.as_os_str());
