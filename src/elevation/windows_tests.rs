@@ -215,6 +215,34 @@ fn already_elevated_inherit_only_is_run_as_is() {
     ));
 }
 
+/// The elevated `Exact` arm, which is otherwise UNTESTED — replacing it with `let program =
+/// token;` passes the whole suite on every platform, including Windows CI. What that mutation
+/// restores is the worst outcome this PR exists to prevent: `lpFile = "tool"` path-less, so
+/// `ShellExecuteEx` performs its OWN lookup (PATHEXT applied, `lpDirectory` consulted as a search
+/// location) and loads a file the caller did not name, ELEVATED.
+///
+/// Two assertions kill it: the result must be absolute, and for a relative input it must DIFFER
+/// from the token as written.
+#[test]
+fn elevated_exact_program_is_completed_to_an_absolute_path() {
+    let mut c = Command::new();
+    c.raw_executable("tool.exe").args(["tool.exe"]).elevate();
+    let argv = super::elevated_argv(&c).expect("an argv command");
+    let program = super::elevated_program(&c, argv).expect("a relative Exact program completes");
+    let p = std::path::Path::new(&program);
+    assert!(
+        p.is_absolute(),
+        "an Exact program must reach lpFile absolute, got {program:?}"
+    );
+    assert_ne!(
+        p.as_os_str(),
+        std::ffi::OsStr::new("tool.exe"),
+        "a relative Exact token must have been completed, not passed through"
+    );
+    // Completed, NOT searched: no extension invented and the file name is untouched.
+    assert_eq!(p.file_name().unwrap(), std::ffi::OsStr::new("tool.exe"), "{program:?}");
+}
+
 // ===== creation-flag intents on the consent-prompt path =====
 
 /// `ShellExecuteEx` takes a show-command and no creation-flag word, so this is the only knob the

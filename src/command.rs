@@ -259,7 +259,10 @@ impl Command {
     ///   someone else, which is the binary-planting shape [`executable`](Self::executable)
     ///   deliberately refuses to walk into.
     /// - **POSIX:** the **child's** working directory, because the `chdir` happens before the
-    ///   exec.
+    ///   exec — but only where cosca owns the exec. cosca currently spawns through
+    ///   `std::process`, whose own docs call this case "platform specific and unstable" for a
+    ///   relative program with `current_dir` set, so treat it as unspecified rather than
+    ///   guaranteed until cosca owns the POSIX spawn path. Pass an absolute path to be certain.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -268,6 +271,16 @@ impl Command {
     /// to drive C's own current directory, which Windows tracks and this crate does not.
     /// [`executable`](Self::executable) fails such a name closed for exactly that reason; here
     /// the platform answers it.
+    ///
+    /// # Elevated `argv[0]`
+    ///
+    /// `ShellExecuteEx` derives the child's `argv[0]` from `lpFile`, and cosca completes a
+    /// relative `Exact` program to an absolute path before handing it over — so an elevated child
+    /// sees `argv[0]` as that absolute path, where the same `Command` spawned unelevated passes
+    /// argv verbatim. `raw_executable("tool.exe").args(["tool.exe"])` therefore yields
+    /// `argv[0] == "tool.exe"` unelevated and the completed path under `.elevate()`. The
+    /// alternative — leaving `lpFile` relative — would let `ShellExecuteEx` search for the image,
+    /// which is the hazard the completion exists to remove.
     ///
     /// The two setters are alternatives on one field: calling either replaces the other, and the
     /// last call wins.

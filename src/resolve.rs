@@ -5,11 +5,15 @@
 //! argv[0]/first-token fallback when neither setter was called. That backend is reached when
 //! `Command::executable_path()` is set or an fd >= 3 is mapped.
 //!
-//! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through here
-//! on any path: "load exactly this file" is the absence of this module's policy, not an
+//! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through
+//! [`resolve`]: "load exactly this file" is the absence of this module's SEARCH policy, not an
 //! application of it. On the elevated path it is completed to an absolute path by
 //! `windows_raw::resolve::absolutise_exact`, which searches nothing — see its doc for why
 //! `ShellExecuteEx` forces that step where `CreateProcessW` does not.
+//!
+//! It does, however, share this module's naming CLASSIFIERS: both `Exact` arms refuse a program
+//! that names no file via [`names_no_file`], so the two axes cannot drift apart on what counts as
+//! a filename. Classifying is not searching.
 //!
 //! Every other spawn path resolves the program name itself, ignorant of this module entirely:
 //! POSIX spawning still calls `execvp`/`posix_spawn`'s own PATH search directly, and the Windows

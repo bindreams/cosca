@@ -734,6 +734,12 @@ fn resolution_searches_the_given_snapshot() {
 /// `lpDirectory`). Kills "replace the body with a passthrough".
 #[test]
 fn absolutise_exact_completes_a_bare_name_against_the_processes_cwd() {
+    // TWO unsynchronised reads of the process-global cwd — one inside `GetFullPathNameW`, one in
+    // the assertion — and five tests in this same binary call `set_current_dir`. libtest runs
+    // them in parallel, so without the lock a `set_current_dir` landing between the two reads
+    // fails this assertion for reasons unrelated to what it tests. Same pairing as its sibling
+    // above; see `crate::test_child::RestoreCwd`'s doc.
+    let _guard = crate::child::spawn::spawn_lock();
     let got = absolutise_exact(Path::new("tool")).unwrap();
     assert_eq!(got, std::env::current_dir().unwrap().join("tool"), "{got:?}");
     assert!(got.is_absolute());

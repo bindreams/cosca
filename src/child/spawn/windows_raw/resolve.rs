@@ -199,6 +199,11 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// consumes the relative name exactly once and everything downstream uses the absolute result —
 /// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
+    // Checked TWICE, on purpose, because the two checks catch different things.
+    //
+    // BEFORE: `\\?\` paths suspend Win32 normalisation entirely, so for them the input is the
+    // only meaningful reading — `\\?\C:\t\.` keeps a literal `.` component that the post-check
+    // below would never see.
     reject_unnameable_program(program)?;
     // BEFORE widening. `to_wide_nul` appends a terminator, and `PCWSTR` stops at the FIRST NUL —
     // so an interior NUL silently truncates the path Win32 sees. `raw_executable("C:\\a\\b.exe\0x")`
@@ -219,6 +224,12 @@ pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
     // `GetFullPathNameW`'s failures are INPUT-dependent (`ERROR_INVALID_NAME`,
     // `ERROR_FILENAME_EXCED_RANGE`), so the code is what tells a caller which path was bad.
     .map_err(Error::Io)?;
+    // AFTER: normalisation STRIPS trailing dots and spaces from the final component, so it can
+    // CREATE the shape the pre-check refuses. `C:\t\...` passes as written — `...` is neither
+    // empty nor `.`/`..` — and normalises to `C:\t\`, a directory, which would then be handed to
+    // `ShellExecuteEx` as `lpFile` under `runas`. Checking only the spelling refuses the spelling
+    // and not the shape.
+    reject_unnameable_program(&full)?;
     Ok(full)
 }
 
