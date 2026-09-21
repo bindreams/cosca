@@ -1019,6 +1019,9 @@ fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
         r"\\?\C:",
         r"\\?\C:\",
         r"\\?\UNC\server\share",
+        // `std` matches the `UNC\` marker through the same `/`-for-`\` normalisation it applies
+        // to the rest of a prefix, so this is a share root too.
+        r"\\?\UNC/server\share",
         r"\\?\GLOBALROOT",
         r"\\.\pipe",
         r"\\",

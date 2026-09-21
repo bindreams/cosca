@@ -135,8 +135,9 @@ fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
 /// A prefix's own components are not filenames, so nothing may be appended to one: `\\server\share`
 /// is a share root exactly as `C:\` is a volume root. `Path::file_name` agrees — it is `None` for
 /// every prefix-only path — but only on a Windows HOST, which is why this is parsed byte-wise
-/// here, mirroring `std::path::Prefix`'s own rules (including `/` for `\` everywhere except
-/// inside a verbatim path, where `std` takes the separator literally).
+/// here, mirroring `std::path::Prefix`'s own rules: `/` stands in for `\` throughout the prefix,
+/// including a verbatim one's `UNC\` marker and drive colon, but NOT between the components that
+/// follow a verbatim prefix, where `std` takes the separator literally.
 fn windows_prefix_len(bytes: &[u8]) -> usize {
     if !(bytes.len() >= 2 && is_sep(bytes[0], true) && is_sep(bytes[1], true)) {
         return if has_drive_prefix(bytes) { 2 } else { 0 };
@@ -150,7 +151,7 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
     };
     if bytes.len() >= 4 && bytes[2] == b'?' && is_sep(bytes[3], true) && !bytes[..4].contains(&b'/') {
         // `\\?\UNC\server\share`: server and share belong to the prefix, as they do without it.
-        if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && bytes[7] == b'\\' {
+        if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && is_sep(bytes[7], true) {
             let server = component(8, true);
             if server >= bytes.len() {
                 return bytes.len();
