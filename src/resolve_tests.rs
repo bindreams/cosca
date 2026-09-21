@@ -319,6 +319,11 @@ fn a_drive_relative_name_is_located_not_bare() {
     // C's current directory. It must never reach the PATH search.
     assert_eq!(classify(OsStr::new("C:tool"), true), Shape::Located);
     assert_eq!(classify(OsStr::new("tool"), true), Shape::BareName);
+    // A drive prefix is a WINDOWS notion: off Windows `C:tool` is an ordinary one-component
+    // filename, and calling it located would stop it being searched for on `PATH` at all.
+    assert_eq!(classify(OsStr::new("C:tool"), false), Shape::BareName);
+    // And it takes a drive LETTER: `1:tool` has none, so it is bare on either platform.
+    assert_eq!(classify(OsStr::new("1:tool"), true), Shape::BareName);
     assert_eq!(classify(OsStr::new(r"dir\tool"), true), Shape::Located);
     assert_eq!(classify(OsStr::new("dir/tool"), true), Shape::Located);
     // Off Windows a backslash is an ordinary character and there are no drive prefixes.
@@ -879,8 +884,11 @@ fn an_accepted_name_that_is_simply_absent_is_not_found() {
     // each of these IS accepted, IS searched, and merely misses — a different disk (or `PATH`)
     // resolves any of them, so none may be reported as refused.
     let cwd = tempfile::tempdir().unwrap();
+    // `1:tool` is in the list on purpose: a drive prefix takes a LETTER, so this is an ordinary
+    // bare name that gets searched, not a drive-relative refusal.
     for n in [
         "tool",
+        "1:tool",
         "./missing",
         r"C:\abs\missing.exe",
         r"sub\missing",
@@ -1059,6 +1067,26 @@ fn a_trailing_dot_or_space_is_an_ordinary_posix_filename() {
             "{n:?} is an ordinary POSIX filename"
         );
         assert_eq!(candidate(n, false), vec![n.to_string()], "POSIX never rewrites a name");
+    }
+}
+
+/// `#[cfg(unix)]`, not a `windows: false` simulation: this touches the filesystem, and
+/// POSIX-simulating on a Windows host shreds every candidate on its drive colon (see
+/// `HOST_WINDOWS`). On a POSIX host `go` already applies the POSIX rules.
+#[cfg(unix)]
+#[test]
+fn a_posix_name_with_a_stem_still_resolves() {
+    // The POSIX twin, and the negative control for the separator set — the one half of the stem
+    // rule that is platform-dependent. A backslash is an ordinary filename character here, so
+    // `bin\` and `a\.` are single-component names WITH a stem: a rule reading them through the
+    // Windows separator set would see `bin/` and `a/.` and refuse both.
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let pv = path_var_for(&[bin.path()], false);
+    for n in [r"bin\", r"a\.", ".helper", "..helper"] {
+        touch(bin.path(), n);
+        let got = go(n, cwd.path(), Some(&pv));
+        assert!(got.is_ok(), "{n:?} has a stem on POSIX and must resolve, got {got:?}");
     }
 }
 
