@@ -194,10 +194,12 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
 /// exist on disk — Microsoft's own rule concedes a trailing-space name can be created, so trimming
 /// here would refuse names that name real files.
 ///
-/// It is not the authority on what is REFUSED, and diverges on all three shapes above, because it
-/// normalises the string first: it collapses `C:\dir\y\` to `y` and drops the `.` in `C:\dir\.` to
-/// give `dir`, and it reports `..` as an ordinary name. This module reads the RAW string, where
-/// each of those final components survives, and refuses all three.
+/// It is not the authority on what is REFUSED, because it normalises the string first, and each of
+/// the three shapes has inputs where that shows: it collapses `C:\dir\y\` to `y`, it drops the `.`
+/// in `C:\dir\.` to give `dir`, and it reports `..` as an ordinary name. This module reads the RAW
+/// string, where each of those final components survives, and refuses all three. (On the commonest
+/// spellings it does agree — a lone `.`, a root, a bare prefix and `""` are all nameless there
+/// too; it is the longer forms that diverge.)
 ///
 /// `Path::file_name` answers the same question, but host-specifically: off Windows it sees neither
 /// `\` nor any prefix, so a `Path`-based rule could not be exercised from a POSIX host at all.
@@ -210,6 +212,10 @@ fn names_no_file(program: &OsStr, windows: bool) -> bool {
 /// "which component does the rule read" has ONE answer: `names_no_file` classifies on it and
 /// [`takes_the_exe_fallback`] tests its extension, and a separator set or prefix rule that changed
 /// in only one of them would leave the two judging different bytes.
+///
+/// BOTH halves are gated on `windows`, not just the prefix: off Windows `\` is an ordinary
+/// filename character, so `final_component(r"C:\dir\tool", false)` is the whole string. Byte-level
+/// and parameterised, like every other classifier here — see the module doc.
 fn final_component(program: &OsStr, windows: bool) -> &[u8] {
     let bytes = program.as_encoded_bytes();
     let rest = if windows {
@@ -312,18 +318,16 @@ fn final_component(program: &OsStr, windows: bool) -> &[u8] {
 /// `CreateProcessW`'s own NULL-`lpApplicationName` behaviour, and is not meant to: that parity is
 /// already given up on for `.bat`/`.cmd`, above.
 ///
-/// A bare name ending in a DOT (`tool.`, `...`, `tool. `) falls in that same widening set, and is
-/// named separately because it is the plantable one: `Path::extension()` is `Some("")` there, so
-/// `main` searched only for the literal `tool.` — which Win32 opens as `tool` — while this rule
-/// searches for `tool..exe`, a name `main` never looked for and a writer of any searched directory
-/// can create. (A name ending only in SPACES, `tool ` or `. `, is not in this set: its
-/// `Path::extension()` is `None`, so `main` searched `tool ` and `tool .exe` both, and dropping
-/// the first is the extensionless narrowing above.) The dot case is kept because the alternative
-/// is worse: trimming first searches for `tool.exe`, a name the caller did not write EITHER, and
-/// buys the refusal of `...` — which names a file, so refusing it reports `InvalidInput` for an
-/// input some filesystem satisfies, breaking this module's own kind rule. The shells' PATHEXT
-/// behaviour was measured on `foo.bar`, not on a trailing-dot name; that this case falls under the
-/// same rule is an argument from uniformity, not a measurement.
+/// Membership in that widening set is `Path::extension().is_some()` and nothing else — never a
+/// judgement about where the dot sits. `tool.`, `...`, `.. ` and `tool. ` are all in it, and are
+/// worth calling out because they are the plantable ones: `main` searched only for the literal
+/// `tool.`, which Win32 opens as `tool`, whereas this rule searches for `tool..exe`, a name `main`
+/// never looked for and a writer of any searched directory can create. Kept anyway, because
+/// trimming is worse: it searches for `tool.exe`, a name the caller did not write EITHER, and buys
+/// the refusal of `...` — which names a file, so refusing it reports `InvalidInput` for an input
+/// some filesystem satisfies, breaking this module's own kind rule. The shells' PATHEXT behaviour
+/// was measured on `foo.bar` and on none of these; that they fall under the same rule is an
+/// argument from uniformity, not a measurement.
 ///
 /// # Not a permanent rule
 ///
