@@ -399,9 +399,12 @@ fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
 /// not become `TOOL.EXE.exe`. These are the two extensions `CreateProcessW` loads directly as a PE
 /// image; see `filename_candidates`'s doc for why exactly these two and no others.
 ///
-/// Unlike its sibling classifiers this does NOT split off the final component first: neither
-/// suffix contains a separator, so "the whole string ends in `.exe`" and "its final component
-/// does" are one predicate for every input — which is also why it needs no `windows` flag.
+/// Unlike its sibling classifiers this does NOT split off the final component first, and so takes
+/// no `windows` flag. Neither suffix contains a separator, so for every input that REACHES here
+/// the two readings coincide: [`resolve`] refuses a [`names_no_file`] name first, and only such a
+/// name can have its final component swallowed by a prefix (`\\server\share.exe` ends in `.exe`
+/// while its final component is empty). A future caller bypassing that refusal would get the
+/// whole-string answer; compare `final_component(name, windows)` instead if it needs the other.
 fn has_loadable_extension(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     ends_with_ignore_ascii_case(bytes, b".exe") || ends_with_ignore_ascii_case(bytes, b".com")

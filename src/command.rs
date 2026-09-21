@@ -148,7 +148,7 @@ impl Command {
     ///
     /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a
     /// descriptor >= 3 also routes an unelevated Windows spawn through the raw backend, so
-    /// `Command::new("sub/helper").fd(3, ..)` is resolved by everything described here —
+    /// `Command::new().arg("sub/helper").fd(3, ..)` is resolved by everything described here —
     /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
     /// `executable` set at all.
     ///
