@@ -335,9 +335,13 @@ fn clear_only_yields_empty_double_nul_block() {
 // two tests instead exercise the REAL `GetSystemDirectoryW`/`GetWindowsDirectoryW`/`current_exe`
 // wiring in `windows_system_dirs` — the one part of this fix a cross-compile cannot validate,
 // because `cargo xwin check`/`clippy` only prove the code TYPE-CHECKS for Windows, never that it
-// runs correctly there. Only a real Windows test runner can catch a buffer-sizing bug in
-// `wide_dir_buffer`, a wrong Win32 return-value convention, or `System32` not actually being
-// where this crate assumes it is.
+// runs correctly there. What a real runner catches here is a wrong Win32 return-value convention
+// and `System32` not being where this crate assumes it is.
+//
+// NOT `wide_dir_buffer`'s grow loop: `System32` and the Windows directory fit the initial
+// 260-element buffer on every install, so the loop never runs and no test on any host reaches it.
+// Its own `debug_assert!` and the `.max(buf.len() + 1)` that keeps it from spinning are what
+// stand in for coverage there.
 #[test]
 fn windows_system_dirs_are_real_existing_directories() {
     let dirs = windows_system_dirs();

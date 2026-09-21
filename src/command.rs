@@ -146,6 +146,12 @@ impl Command {
     /// in whatever directory the process happened to sit in. Write `./helper` to reach
     /// it explicitly.
     ///
+    /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a
+    /// descriptor >= 3 also routes an unelevated Windows spawn through the raw backend, so
+    /// `Command::new("sub/helper").fd(3, ..)` is resolved by everything described here —
+    /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
+    /// `executable` set at all.
+    ///
     /// The `.exe` rule is a property of names that get SEARCHED, not of files that get
     /// LOADED, so it differs by shape. If the name's final path component already ends
     /// in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is left alone, never doubled
@@ -227,6 +233,10 @@ impl Command {
     /// table, not a bug. `Stdio::inherit()` on a `slot >= 3` (no defined parent
     /// stream) and a chained merge (a merge whose target is itself a merge) remain
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) on every platform.
+    ///
+    /// Routing to that backend also applies [`executable`](Self::executable)'s Windows
+    /// resolution policy — and its error kinds — to the program name, whether or not
+    /// `executable` is set.
     pub fn fd(&mut self, slot: impl Into<Fd>, target: Stdio) -> Result<&mut Command, Error> {
         let slot = slot.into();
         let resolved = target.resolve(slot)?;
