@@ -14,9 +14,11 @@ fn testbin() -> &'static str {
 /// failing test's stderr and prints it with the failure (and the CI cgroup step runs with
 /// `--nocapture`), so with this installed the reason lands directly above the assertion.
 ///
-/// Linux-gated because its only callers are: the cgroup containment mechanism is the only one
-/// in this binary that can degrade silently.
-#[cfg(target_os = "linux")]
+/// Unix-gated, not Linux-gated: BOTH Unix containment mechanisms that can degrade explain
+/// themselves through `log` — Linux's cgroup leaf (`cgroup::log_degrade`) and macOS's fd marker
+/// (`fdmarker::install`) — so routing only the Linux one leaves the macOS reasons on the floor
+/// on the host that has them.
+#[cfg(unix)]
 mod stderr_log {
     use std::sync::OnceLock;
 
@@ -39,7 +41,16 @@ mod stderr_log {
     pub fn install() {
         INSTALLED.get_or_init(|| {
             log::set_logger(&StderrLog).expect("first logger in this test binary");
-            log::set_max_level(log::LevelFilter::Trace);
+            // `Warn` is every degrade reason and nothing else. The max level is global and set
+            // once per process, so anything broader also spills cosca's internal progress into
+            // whichever unrelated tests happen to run after the first install — a set decided
+            // by libtest's scheduling, not by any test.
+            //
+            // Caveat: `cgroup::log_degrade` warns once per reason and reports repeats at
+            // `debug`, so a SECOND test degrading for an already-warned reason has no reason
+            // beside its own failure under libtest's per-test capture. The cgroup lane runs
+            // `--nocapture`, where every record is printed in order and nothing is lost.
+            log::set_max_level(log::LevelFilter::Warn);
         });
     }
 }
@@ -632,6 +643,10 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain();
+    // Every contained-tree test below goes through here, and each of them asserts an achieved
+    // mechanism that can silently be a weaker one. Route the reason for that.
+    #[cfg(unix)]
+    stderr_log::install();
     let child = cmd.spawn().expect("spawn");
     // Accept both connections; keep the grandchild's (tag 'G'). Accepting it is
     // proof the grandchild is alive — no is_alive() race.
