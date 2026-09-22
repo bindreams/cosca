@@ -518,22 +518,32 @@ fn setting_eszett_keeps_an_inherited_ss() {
     assert_eq!(got, [("SS".into(), "inherited".into()), ("ß".into(), "set".into())]);
 }
 
-/// The values of a cleared-then-set block, in block order, next to what std's `Command` holds for
-/// the same keys. `get_envs` iterates std's own `EnvKey` order, which is the order std writes its
-/// block in; values are indices, so both collisions and order are compared.
-fn block_order_vs_std(keys: &[OsString]) -> (Vec<OsString>, Vec<OsString>) {
+type Entries = Vec<(OsString, OsString)>;
+
+/// The raw block for `ops` over an empty base, next to what std's `Command` holds after the same
+/// ops. With nothing inherited, std's block is exactly `get_envs`' set entries: same keys (with
+/// std's casing), same values, and `get_envs` iterates std's own `EnvKey` order, which is the
+/// order std writes its block in.
+fn block_vs_std(ops: &[EnvOp]) -> (Entries, Entries) {
     let mut std_cmd = std::process::Command::new("unused");
-    std_cmd.env_clear();
-    let mut ops = vec![EnvOp::Clear];
-    for (i, key) in keys.iter().enumerate() {
-        let val = OsString::from(i.to_string());
-        std_cmd.env(key, &val);
-        ops.push(EnvOp::Set(key.clone(), val));
-    }
-    let block = build_env_block_from(&[], &ops).unwrap().unwrap();
-    let ours = block_entries(&block).into_iter().map(|(_, v)| v).collect();
-    let std = std_cmd.get_envs().map(|(_, v)| v.unwrap().to_os_string()).collect();
+    crate::child::spawn::apply_env(&mut std_cmd, ops);
+    let ours = block_entries(&build_env_block_from(&[], ops).unwrap().unwrap());
+    let std = std_cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_os_string(), v?.to_os_string())))
+        .collect();
     (ours, std)
+}
+
+/// A cleared env followed by one `Set` per key, valued by its index.
+fn set_each(keys: &[OsString]) -> Vec<EnvOp> {
+    std::iter::once(EnvOp::Clear)
+        .chain(
+            keys.iter()
+                .enumerate()
+                .map(|(i, key)| EnvOp::Set(key.clone(), i.to_string().into())),
+        )
+        .collect()
 }
 
 /// `CreateProcessW` expects the block sorted case-insensitively by ordinal, locale-free; std sorts
@@ -563,20 +573,50 @@ fn env_block_order_and_merges_match_std() {
     .map(OsString::from)
     .chain([wide(&[0xD800]), wide(&[0xDC00, u16::from(b'a')])])
     .collect();
-    let (ours, std) = block_order_vs_std(&keys);
+    let (ours, std) = block_vs_std(&set_each(&keys));
     assert_eq!(ours, std);
 }
 
-/// Every non-NUL code unit as a one-unit key: the raw backend and std agree on every merge and on
-/// the whole order.
+/// Every non-NUL code unit as a one-unit key: the raw backend and std agree on every merge, every
+/// emitted key and the whole order.
 #[test]
 fn env_block_matches_std_over_every_code_unit() {
     let keys: Vec<OsString> = (1..=u16::MAX).map(|u| wide(&[u])).collect();
-    let (ours, std) = block_order_vs_std(&keys);
+    let (ours, std) = block_vs_std(&set_each(&keys));
     assert_eq!(ours.len(), std.len());
     assert!(
         ours == std,
         "first divergence at {:?}",
         ours.iter().zip(&std).position(|(a, b)| a != b)
     );
+}
+
+/// When keys collide, std keeps the casing of the first op that named the variable since the last
+/// `Clear` (a `Remove` counts), and the raw backend must emit the same name.
+#[test]
+fn colliding_keys_keep_std_casing() {
+    let set = |k: &str, v: &str| EnvOp::Set(k.into(), v.into());
+    let remove = |k: &str| EnvOp::Remove(k.into());
+    for ops in [
+        vec![set("Path", "1"), set("PATH", "2")],
+        vec![remove("path"), set("PATH", "1")],
+        vec![EnvOp::Clear, remove("path"), set("PATH", "1")],
+        vec![set("a", "1"), EnvOp::Clear, set("A", "2")],
+    ] {
+        let (ours, std) = block_vs_std(&ops);
+        assert_eq!(ours, std, "{ops:?}");
+    }
+}
+
+/// An inherited variable keeps its inherited name when an op overrides it, as std's capture does.
+#[test]
+fn an_inherited_key_keeps_its_casing() {
+    let base = [(OsString::from("Path"), OsString::from("inherited"))];
+    for ops in [
+        vec![EnvOp::Set("PATH".into(), "x".into())],
+        vec![EnvOp::Remove("PATH".into()), EnvOp::Set("pAth".into(), "x".into())],
+    ] {
+        let block = build_env_block_from(&base, &ops).unwrap().unwrap();
+        assert_eq!(block_entries(&block), [("Path".into(), "x".into())], "{ops:?}");
+    }
 }

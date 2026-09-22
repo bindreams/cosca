@@ -573,7 +573,7 @@ fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error
     Ok(())
 }
 
-fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
+pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
     for op in ops {
         match op {
             EnvOp::Set(k, v) => {

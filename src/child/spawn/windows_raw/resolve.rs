@@ -215,29 +215,52 @@ pub(crate) fn build_env_block(ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> 
 /// Returns `Ok(None)` when `ops` is empty — the child inherits the parent
 /// environment. Otherwise the block is a UTF-16 sequence of `KEY=VAL\0` entries
 /// in [`EnvKey`] order and closed by a trailing `\0` (a double-NUL terminator).
-/// Keys collide when [`EnvKey`] says they are equal, last write wins, and the
-/// last writer's key casing is emitted. An embedded NUL in any key or value is
-/// [`std::io::ErrorKind::InvalidInput`].
+/// Keys collide when [`EnvKey`] says they are equal and the last write wins.
+/// The emitted name is std's: the inherited one if the variable is inherited
+/// and not removed, otherwise that of the first op naming it since the last
+/// `Clear` (a `Remove` counts, except after a `Clear`). This replays std's
+/// `CommandEnv` step for step, so both backends give a child the same block.
+/// An embedded NUL in any key or value is [`std::io::ErrorKind::InvalidInput`].
 pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> {
     if ops.is_empty() {
         return Ok(None);
     }
 
-    // The value keeps the original-case key so the emitted block preserves the
-    // caller's casing.
-    let mut vars: BTreeMap<EnvKey, (OsString, OsString)> = BTreeMap::new();
-    for (key, val) in base {
-        vars.insert(EnvKey::new(key), (key.clone(), val.clone()));
-    }
+    // std's `CommandEnv::{set, remove, clear}`, then `capture`. `BTreeMap::insert`
+    // keeps an existing equal key, which is what makes the first name stick.
+    let mut clear = false;
+    let mut changes: BTreeMap<EnvKey, Option<OsString>> = BTreeMap::new();
     for op in ops {
         match op {
             EnvOp::Set(key, val) => {
-                vars.insert(EnvKey::new(key), (key.clone(), val.clone()));
+                changes.insert(EnvKey::new(key), Some(val.clone()));
+            }
+            EnvOp::Remove(key) if clear => {
+                changes.remove(&EnvKey::new(key));
             }
             EnvOp::Remove(key) => {
-                vars.remove(&EnvKey::new(key));
+                changes.insert(EnvKey::new(key), None);
             }
-            EnvOp::Clear => vars.clear(),
+            EnvOp::Clear => {
+                clear = true;
+                changes.clear();
+            }
+        }
+    }
+    let mut vars: BTreeMap<EnvKey, OsString> = BTreeMap::new();
+    if !clear {
+        for (key, val) in base {
+            vars.insert(EnvKey::new(key), val.clone());
+        }
+    }
+    for (key, change) in changes {
+        match change {
+            Some(val) => {
+                vars.insert(key, val);
+            }
+            None => {
+                vars.remove(&key);
+            }
         }
     }
 
@@ -247,7 +270,8 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
     if vars.is_empty() {
         block.push(0);
     }
-    for (key, val) in vars.values() {
+    for (key, val) in &vars {
+        let key = key.name();
         ensure_no_nul_wide("environment key", key)?;
         ensure_no_nul_wide("environment value", val)?;
         block.extend(key.encode_wide());

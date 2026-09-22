@@ -1,7 +1,7 @@
 //! Environment-variable key identity, compared the way Windows and std's own `EnvKey` compare it.
 
 use std::cmp::Ordering;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 
 use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN};
@@ -11,18 +11,31 @@ use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREAT
 /// then compared by value. So `ß` never equals `SS`, surrogates (paired or not) match only
 /// themselves, and the order is the case-insensitive ordinal sort `CreateProcessW` expects of an
 /// environment block. The table is the OS's, so it is asked rather than modelled.
+///
+/// The key keeps the name it was created with. A map insert of an equal key keeps the existing
+/// key, so a map keeps the first name it saw for each variable, as std's does.
 #[derive(Clone, Debug)]
-pub(super) struct EnvKey(Vec<u16>);
+pub(super) struct EnvKey {
+    name: OsString,
+    wide: Vec<u16>,
+}
 
 impl EnvKey {
     pub(super) fn new(key: &OsStr) -> Self {
-        Self(key.encode_wide().collect())
+        Self {
+            name: key.to_os_string(),
+            wide: key.encode_wide().collect(),
+        }
+    }
+
+    pub(super) fn name(&self) -> &OsStr {
+        &self.name
     }
 }
 
 impl Ord for EnvKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        cmp_ignore_case(&self.0, &other.0, MAX_CHUNK)
+        cmp_ignore_case(&self.wide, &other.wide, MAX_CHUNK)
     }
 }
 
@@ -35,7 +48,7 @@ impl PartialOrd for EnvKey {
 impl PartialEq for EnvKey {
     fn eq(&self, other: &Self) -> bool {
         // One unit folds to one unit, so keys of different lengths are never equal.
-        self.0.len() == other.0.len() && self.cmp(other) == Ordering::Equal
+        self.wide.len() == other.wide.len() && self.cmp(other) == Ordering::Equal
     }
 }
 
