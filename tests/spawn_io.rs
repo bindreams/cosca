@@ -1381,6 +1381,8 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     let mut hello = String::new();
     worker.read_line(&mut hello).expect("read the worker's hello");
     assert!(hello.starts_with('G'), "expected the worker's tag, got {hello:?}");
+    let worker_pid: u32 = hello[1..].trim().parse().expect("the worker's pid");
+    let leaf = common::cgroup::cgroup_of(worker_pid);
     // Proof of life, after the spawn returned: a round trip only a live worker completes.
     worker.get_mut().write_all(b"x").expect("write to the worker");
     let mut echo = [0u8; 1];
@@ -1395,6 +1397,13 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     let mut buf = [0u8; 1];
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
+
+    // `cgroup.kill` is asynchronous: the worker's socket closes before it leaves the leaf, so
+    // `Drop`'s `rmdir` can precede the drain and leave the leaf behind.
+    drop(child);
+    if leaf.exists() {
+        common::cgroup::drain_and_remove_leaf(&leaf);
+    }
 }
 
 /// The unified-hierarchy path in the contents of a `/proc/<pid>/cgroup` file.
