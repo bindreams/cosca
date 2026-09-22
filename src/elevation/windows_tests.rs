@@ -215,14 +215,9 @@ fn already_elevated_inherit_only_is_run_as_is() {
     ));
 }
 
-/// The elevated `Exact` arm, which is otherwise UNTESTED — replacing it with `let program =
-/// token;` passes the whole suite on every platform, including Windows CI. What that mutation
-/// restores is the worst outcome this PR exists to prevent: `lpFile = "tool"` path-less, so
-/// `ShellExecuteEx` performs its OWN lookup (PATHEXT applied, `lpDirectory` consulted as a search
-/// location) and loads a file the caller did not name, ELEVATED.
-///
-/// Two assertions kill it: the result must be absolute, and for a relative input it must DIFFER
-/// from the token as written.
+/// Kills replacing `elevated_program`'s `Exact` arm with `let program = token;`, which hands
+/// `ShellExecuteEx` a path-less `lpFile` to search (see `absolutise_exact`'s doc): the result must
+/// be absolute, and for a relative input must DIFFER from the token as written.
 #[test]
 fn elevated_exact_program_is_completed_to_an_absolute_path() {
     let mut c = Command::new();

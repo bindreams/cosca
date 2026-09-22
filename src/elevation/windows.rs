@@ -356,19 +356,9 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
         None => argv[0].clone(),
     };
 
-    // `raw_executable()` promises "load exactly this file — no PATH search, no .exe appending, no
-    // existence check". On the raw backend that is free: `CreateProcessW` completes a partial
-    // `lpApplicationName` against the calling process's current directory and explicitly "will not
-    // use the search path". `ShellExecuteEx` is the opposite — a path-less `lpFile` IS searched,
-    // with `PATHEXT` applied and `lpDirectory` consulted as a search location (measured). So
-    // handing an `Exact` token through untouched here would not preserve the contract, it would
-    // DESTROY it: "load exactly this" would silently become "go find something like this",
-    // elevated, which is the one place that matters most.
-    //
-    // Completing the name ourselves is what keeps the two paths agreeing. `absolutise_exact` uses
-    // the same base the loader does and performs no search, no extension guessing and no
-    // filesystem access, so `lpFile` is absolute. Absolute stops `ShellExecuteEx`'s directory
-    // search but not its `PATHEXT`, which [`plan_runas`]'s image allowlist covers.
+    // An `Exact` token is completed, never passed through: `ShellExecuteEx` would search a
+    // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
+    // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
     //
     // A `Search` token is NOT resolved here yet: `executable()` on the elevated path still reaches
     // `ShellExecuteEx`'s own search unresolved. That is the pre-existing hole tracked as #135 and

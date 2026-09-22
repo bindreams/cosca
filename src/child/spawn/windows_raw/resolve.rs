@@ -175,19 +175,21 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// Complete a possibly-relative program name into an absolute path the way the Win32 loader
 /// itself would — **without searching, appending an extension, or touching the filesystem**.
 ///
-/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and its result
-/// is used by exactly one caller: the elevated path. `CreateProcessW` completes a partial
-/// `lpApplicationName` itself ("the function uses the current drive and current directory to
-/// complete the specification. The function will not use the search path"), so the raw backend
-/// hands it a relative value untouched, calling this only for its refusals and discarding the
-/// path. `ShellExecuteEx` cannot be trusted with one: a
-/// path-less `lpFile` IS searched — `PATHEXT` applied, `lpDirectory` consulted as a search
-/// location — which is how the elevated path reached the `.bat`/`.cmd` vector. Completing the
-/// name here first makes `lpFile` absolute, which stops the directory search but NOT `PATHEXT`:
-/// `ShellExecuteEx` applies it to an absolute extensionless `lpFile` too, and a planted
-/// `setup.bat` outranks an existing `setup` (measured). The consent path therefore also refuses a
-/// completed name not ending in `.exe`/`.com` — see [`crate::resolve::reject_unloadable_image`],
-/// which also says what that leaves unmeasured.
+/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`]. Its result is
+/// used by exactly one caller, the elevated path, because the two Win32 sinks treat a relative
+/// name oppositely:
+///
+/// - `CreateProcessW` completes a partial `lpApplicationName` itself ("the function uses the
+///   current drive and current directory to complete the specification. The function will not
+///   use the search path"), so the raw backend hands it a relative value untouched, calling this
+///   only for its refusals and discarding the path.
+/// - `ShellExecuteEx` SEARCHES a path-less `lpFile` — `PATHEXT` applied, `lpDirectory` consulted
+///   as a search location — which is how the elevated path reached the `.bat`/`.cmd` vector.
+///   Completing the name here makes `lpFile` absolute, which stops that directory search but NOT
+///   `PATHEXT`: `ShellExecuteEx` applies it to an absolute extensionless `lpFile` too, and a
+///   planted `setup.bat` outranks an existing `setup` (measured). The consent path therefore also
+///   refuses a completed name not ending in `.exe`/`.com` — see
+///   [`crate::resolve::reject_unloadable_image`], which also says what that leaves unmeasured.
 ///
 /// `GetFullPathNameW` is the right primitive rather than a hand-rolled join, on three counts
 /// documented by Win32 itself:
