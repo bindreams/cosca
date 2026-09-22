@@ -799,8 +799,8 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
 // Drop's leaf-removal reporting -----
 // `Drop` is the only place a leaf cosca could not remove is ever mentioned: it has returned by
 // the time anything could look, and nothing — cosca or a cgroup manager — revisits a `cosca-*`
-// leaf by name. A host accumulating them (issue #140) is diagnosable only if each one says so
-// as it happens.
+// leaf by name. A host accumulating them is diagnosable only if each one says so as it
+// happens.
 
 /// A leaf the host refuses to remove is reported through the real `Drop`. Real filesystem, any
 /// Linux host: a leaf directory holding a subdirectory refuses both `rmdir`s.
@@ -819,7 +819,7 @@ fn drop_reports_a_leaf_it_could_not_remove() {
     assert_eq!(
         crate::log_capture::levels_since(mark, "cosca-undeletable-leaf"),
         vec![log::Level::Warn],
-        "a leaf that outlived its Drop is the whole of what issue #140 has to go on"
+        "a leaf that outlived its Drop is reported, or never known about"
     );
 }
 
@@ -1097,7 +1097,7 @@ fn no_unified_line_never_quotes_a_line_it_could_not_parse() {
 
 /// A `cgroup.procs` that cannot be opened reports THAT step, and takes the leaf it just created
 /// with it. The leaf must not survive the degrade: a stray `cosca-*` cgroup is permanent on the
-/// host (nothing ever revisits it), which is issue #140's accumulation.
+/// host, since nothing ever revisits it.
 #[cfg(target_os = "linux")]
 #[test]
 fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
@@ -1123,8 +1123,7 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
         .collect();
     assert!(
         strays.is_empty(),
-        "the degrade left {strays:?} behind — a cosca-* cgroup this host then keeps forever \
-         (issue #140)"
+        "the degrade left {strays:?} behind — a cosca-* cgroup this host then keeps forever"
     );
 }
 

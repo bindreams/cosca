@@ -547,11 +547,6 @@ const REPORT_PLACED: i32 = -1;
 /// and loses the fork-proof kill — rather than failing, which makes exhaustion quiet: weaker
 /// containment, not an error. `LeafError::MapReportPage` is what makes it audible at all.
 ///
-/// A per-process slab — one shared page carved into 1024 slots, one handed to each live leaf —
-/// would cost 4 bytes and no VMA per child and remove the degrade condition entirely. It is not
-/// what this is, because a leaf is created and destroyed independently of every other and a slab
-/// needs a free list; at the fan-out cosca is built for that trade has not been worth making.
-///
 /// **Not a race.** The child stores its outcome strictly before `exec`, and `std`'s Unix
 /// spawn does not return to the parent until the child has exec'd (it reads the child's
 /// CLOEXEC error pipe to EOF). Every parent read therefore happens after the child's store,
@@ -889,9 +884,7 @@ impl Drop for CgroupLeaf {
         // Safety: we own this fd; it was created by try_create_leaf and never cloned.
         unsafe { libc::close(self.procs_fd) };
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
-        // to drain it, then retry. A leaf that outlives both attempts stays on this host until
-        // a cgroup manager reaps it, and a host accumulating stray `cosca-*` leaves is only
-        // diagnosable if each one says so as it happens (issue #140).
+        // to drain it, then retry. A leaf that outlives both attempts is reported.
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
