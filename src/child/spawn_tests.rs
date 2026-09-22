@@ -379,8 +379,18 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     let script = dir.path().join("deploy.bat");
-    std::fs::write(&script, "#!/bin/sh\nexit 7\n").expect("write");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // The write is serialized against every other spawn's `fork`, and the guard is dropped before
+    // OUR spawn — `spawn_unelevated` takes the same lock, and a `std::sync::Mutex` is not
+    // reentrant, so holding it across `spawn()` deadlocks. Scoping it to the write is what the
+    // race needs anyway: `fs::write`'s descriptor is writable, and a `fork` inside that window
+    // leaves the forked child holding it until it execs, during which `execve` on this script
+    // returns ETXTBSY. Measured: CI's linux/amd64 lane failed exactly that way while every other
+    // lane passed. Once the descriptor is closed, no later spawn can inherit it.
+    {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
 
     let mut c = Command::new();
     c.args([script.as_os_str()]);
