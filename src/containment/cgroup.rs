@@ -684,29 +684,32 @@ impl Drop for CgroupLeaf {
         // Close the parent-side procs fd.
         // Safety: we own this fd; it was created by try_create_leaf and never cloned.
         unsafe { libc::close(self.procs_fd) };
-        // Remove the leaf. If still occupied (e.g. hard_kill not yet called),
-        // fire cgroup.kill to drain it, then retry. The second remove_dir may
-        // still fail if the kernel hasn't finished reaping the killed tasks yet;
-        // we accept this (the leaf will be cleaned up by the cgroup manager when
-        // it finds it empty on next access, or by the slice's own teardown) — but
-        // an accepted leak is still a leak, and a host accumulating stray
-        // `cosca-*` leaves is only diagnosable if each one says so as it happens
-        // (issue #140).
-        if let Err(first) = fs::remove_dir(&self.leaf_path) {
-            let kill = fs::write(self.leaf_path.join("cgroup.kill"), b"1");
-            if let Err(second) = fs::remove_dir(&self.leaf_path) {
-                log::warn!(
-                    "cgroup leaf {} leaked: first rmdir failed ({first}), cgroup.kill {}, \
-                     second rmdir failed ({second}); the leaf stays on this host until a \
-                     cgroup manager reaps it",
-                    self.leaf_path.display(),
-                    match kill {
-                        Ok(()) => "succeeded".to_string(),
-                        Err(e) => format!("failed ({e})"),
-                    }
-                );
-            }
+        // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
+        // to drain it, then retry. A leaf that outlives both attempts stays on this host until
+        // a cgroup manager reaps it, and a host accumulating stray `cosca-*` leaves is only
+        // diagnosable if each one says so as it happens (issue #140).
+        let Err(first) = fs::remove_dir(&self.leaf_path) else {
+            return;
+        };
+        let kill = self.hard_kill();
+        let Err(second) = fs::remove_dir(&self.leaf_path) else {
+            return;
+        };
+        // A leaf that is GONE is not a leak: `rmdir` on a cgroup v2 leaf succeeds only once it
+        // is empty, so another party having removed it means it left nothing behind here.
+        if removed_after_drain(&second) {
+            return;
         }
+        log::warn!(
+            "cgroup leaf {} outlived its Drop: first rmdir failed ({first}), cgroup.kill {}, \
+             second rmdir failed ({second}); the leaf stays on this host until a cgroup manager \
+             reaps it",
+            self.leaf_path.display(),
+            match kill {
+                Ok(()) => "succeeded".to_string(),
+                Err(e) => format!("failed ({e})"),
+            }
+        );
     }
 }
 

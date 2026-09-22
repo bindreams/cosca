@@ -653,3 +653,52 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
         "an already-gone leaf is routine and must not be reported at warn, got {levels:?}"
     );
 }
+
+// Drop's leaf-removal reporting -----
+// `Drop` is the only place a leaf cosca could not remove is ever mentioned: it has returned by
+// the time anything could look, and nothing — cosca or a cgroup manager — revisits a `cosca-*`
+// leaf by name. A host accumulating them (issue #140) is diagnosable only if each one says so
+// as it happens.
+
+/// A leaf the host refuses to remove is reported through the real `Drop`. Real filesystem, any
+/// Linux host: a leaf directory holding a subdirectory refuses both `rmdir`s.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_reports_a_leaf_it_could_not_remove() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-undeletable-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+
+    let mark = crate::log_capture::mark();
+    drop(super::CgroupLeaf::for_test_at(leaf_path));
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-undeletable-leaf"),
+        vec![log::Level::Warn],
+        "a leaf that outlived its Drop is the whole of what issue #140 has to go on"
+    );
+}
+
+/// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
+/// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
+/// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note
+/// that the leaf is gone is the whole of what this path may say.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-already-gone-leaf");
+
+    let mark = crate::log_capture::mark();
+    drop(super::CgroupLeaf::for_test_at(leaf_path));
+
+    let levels = crate::log_capture::levels_since(mark, "cosca-already-gone-leaf");
+    assert!(
+        !levels.contains(&log::Level::Warn),
+        "an already-removed leaf left nothing on this host; reporting one as a leak is \
+         narrating a non-event, got {levels:?}"
+    );
+}
