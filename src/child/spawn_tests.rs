@@ -214,3 +214,63 @@ fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
     );
     child.wait().expect("reap");
 }
+
+// The batch gate's blind spot, pinned where it can RUN on any host =====
+
+/// An `OsString` carrying an interior NUL, built natively on either platform family (`OsStr` has
+/// no portable constructor that can express one).
+fn with_interior_nul(prefix: &str, suffix: &str) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.push(0);
+        bytes.extend_from_slice(suffix.as_bytes());
+        std::ffi::OsString::from_vec(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let units: Vec<u16> = prefix.encode_utf16().chain([0]).chain(suffix.encode_utf16()).collect();
+        std::ffi::OsString::from_wide(&units)
+    }
+}
+
+/// The two NUL/batch shapes behave OPPOSITELY in [`super::reject_batch_path`], and both callers
+/// (`launch_runas_with_host`, `windows_raw::reject_batch_program`) order their NUL check first
+/// because of it. The gate reads `Path::extension()`, and `\0` is not a separator:
+///
+/// - `setup` + NUL + `.bat` → `extension() == "bat"`: the gate FIRES, on a prefix (`setup`) that is
+///   not a batch file, and formats a raw U+0000 into its message.
+/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`: the gate is BLIND, even though
+///   Win32 truncates the token back to the real batch file `setup.bat`.
+///
+/// The second is why the NUL check is a control rather than a diagnostic nicety, and this test is
+/// the host-runnable half of that claim — the backend tests that consume it are Windows-only.
+#[test]
+fn the_batch_gate_fires_on_one_nul_shape_and_is_blind_to_the_other() {
+    let nul_then_bat = with_interior_nul("setup", ".bat");
+    let bat_then_nul = with_interior_nul("setup.bat", "junk");
+
+    assert_eq!(
+        std::path::Path::new(&nul_then_bat)
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned()),
+        Some("bat".to_owned())
+    );
+    assert!(
+        super::reject_batch_path(std::path::Path::new(&nul_then_bat)).is_err(),
+        "the gate must fire here — which is exactly the misattribution the NUL check preempts"
+    );
+
+    assert_ne!(
+        std::path::Path::new(&bat_then_nul)
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned()),
+        Some("bat".to_owned())
+    );
+    assert!(
+        super::reject_batch_path(std::path::Path::new(&bat_then_nul)).is_ok(),
+        "the gate is blind here, so only the NUL check stands between this token and cmd.exe"
+    );
+}

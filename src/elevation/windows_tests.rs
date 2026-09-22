@@ -381,6 +381,13 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
             .chain(".bat".encode_utf16())
             .collect::<Vec<u16>>(),
     );
+    // `\0` is not a path separator, so `extension()` reads straight through it: the batch gate
+    // really does see a `.bat` here, which is what makes the ordering load-bearing.
+    assert_eq!(
+        std::path::Path::new(&nul_bat).extension().map(|e| e.to_string_lossy()),
+        Some("bat".into()),
+        "premise: the batch gate must be able to fire on this token"
+    );
     for elevated in [false, true] {
         let mut c = Command::new();
         c.args([nul_bat.clone()]).elevate();
@@ -401,6 +408,52 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
             other => panic!(
                 "elevated={elevated}: a NUL-bearing batch-looking path must be diagnosed as a NUL, \
                  got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+}
+
+/// The mirror shape, and the one where the NUL check is not a diagnosis but the WHOLE control:
+/// `setup.bat` + NUL + `junk`. Win32 truncates it back to `setup.bat`, a real batch file, yet
+/// `Path::extension()` reads `bat\0junk`, so `reject_batch_path` cannot see it. Without the
+/// `wide_nul` on `program`, `ShellExecuteEx` loads the batch file and substitutes `a&calc` into an
+/// elevated `cmd.exe`'s `%*` — CVE-2024-24576, through a token that passed the batch gate.
+#[test]
+fn a_nul_after_a_batch_extension_is_refused_where_the_batch_gate_is_blind() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let bat_nul = OsString::from_wide(
+        &r"C:\tools\setup.bat"
+            .encode_utf16()
+            .chain([0])
+            .chain("junk".encode_utf16())
+            .collect::<Vec<u16>>(),
+    );
+    // The premise: the batch gate is blind to this token, so nothing but the NUL check refuses it.
+    assert!(
+        crate::child::spawn::reject_batch_path(std::path::Path::new(&bat_nul)).is_ok(),
+        "premise: `extension()` reads `bat\\0junk`, so the batch gate cannot refuse this"
+    );
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([bat_nul.clone(), OsString::from("a&calc")]).elevate();
+        match super::launch_runas_with_host(&mut c, &win_host(elevated)) {
+            Err(Error::Io(e)) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "elevated={elevated}: expected the NUL refusal, got {e:?}"
+                );
+                assert!(
+                    e.to_string().contains("program path"),
+                    "elevated={elevated}: the refusal must blame the program path, got {e}"
+                );
+            }
+            other => panic!(
+                "elevated={elevated}: a NUL that truncates back to a real batch file must be \
+                 refused, got {:?}",
                 other.map(|_| "Ok")
             ),
         }
