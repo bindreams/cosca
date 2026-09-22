@@ -904,6 +904,11 @@ impl CgroupLeaf {
         }
     }
 
+    /// The leaf's own directory, for the live-cgroup tests that shape it before dropping it.
+    pub(crate) fn leaf_path_for_test(&self) -> &Path {
+        &self.leaf_path
+    }
+
     /// Point this leaf's `Drop` at a test-owned "already reported" set. Without it a level
     /// assertion over a real `Drop` would depend on which test in this binary stranded a leaf
     /// first, which is process-wide state two tests cannot both own.

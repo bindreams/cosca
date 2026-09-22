@@ -894,6 +894,53 @@ fn survival_facts_name_the_descendants_and_the_populated_state() {
     );
 }
 
+/// A leaf holding a DESCENDANT cgroup is the case that can never clear, and the one `EBUSY`
+/// cannot be told apart from a member still exiting. Against a real cgroupfs: the descendant
+/// survives `cgroup.kill` (which kills processes, not directories), both `rmdir`s fail, and the
+/// leaf is permanent. Gated on `COSCA_TEST_CGROUP` like every other live-cgroup test — a true
+/// no-op without it, a loud panic if the marker is set and no usable leaf exists.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_reports_a_real_leaf_held_by_a_descendant_cgroup() {
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return;
+    }
+    crate::log_capture::install();
+    let mut leaf = super::try_create_leaf().unwrap_or_else(|e| {
+        panic!("COSCA_TEST_CGROUP is set but no usable delegated cgroup v2 leaf could be created ({e})")
+    });
+    leaf.report_survival_into_for_test(own_survival_set());
+    let leaf_path = leaf.leaf_path_for_test().to_path_buf();
+    let leaf_name = leaf_path
+        .file_name()
+        .expect("the leaf has a name")
+        .to_string_lossy()
+        .into_owned();
+    let descendant = leaf_path.join("cosca-descendant-probe");
+    std::fs::create_dir(&descendant).expect("create a descendant cgroup inside the leaf");
+
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+
+    assert!(
+        leaf_path.is_dir(),
+        "cgroup.kill kills processes, not directories: the leaf must still be here"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &leaf_name),
+        vec![log::Level::Warn],
+        "a leaf no amount of waiting can free is exactly what issue #140 needs to see"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "cosca-descendant-probe"),
+        "the record must name the descendant cgroup that is holding the leaf"
+    );
+
+    // Leave nothing behind: this test deliberately built the stray it is about.
+    std::fs::remove_dir(&descendant).expect("remove the descendant");
+    std::fs::remove_dir(&leaf_path).expect("remove the now-empty leaf");
+}
+
 // detach's disarm -----
 // `detach()` promises the tree keeps running. `Child::drop` returns early on it, but the leaf
 // is a field of that `Child` and its own `Drop` still runs — so the promise is only kept if
