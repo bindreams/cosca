@@ -257,7 +257,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .map(sync_raw::resolve::resolve_executable)
         .transpose()?;
     if let Some(p) = &image {
-        sync_raw::resolve::ensure_no_nul_wide("program image", p.as_os_str())?;
+        sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
     }
     if let Some(c) = cmd.cwd() {
         sync_raw::resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;

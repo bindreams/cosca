@@ -128,10 +128,11 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
 
 /// Reject a string carrying an embedded NUL, which Win32 would silently truncate at.
 ///
-/// Serves every wide string the raw backend builds — the environment block, the program image and
-/// token, the working directory, and each argv token — so `what` names the offending field. Without
-/// it the refusal blames one caller's field for every other caller's defect, sending the reader to
-/// audit the wrong input.
+/// Serves every wide string the raw backend builds out of CALLER INPUT — the environment block,
+/// the program token, the working directory, each argv token, and the command line — so `what`
+/// names the offending field. Without it the refusal blames one caller's field for every other
+/// caller's defect, sending the reader to audit the wrong input. The one wide string that is not
+/// caller input is the resolved program image; see [`debug_assert_no_nul_wide`].
 pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
     if s.encode_wide().any(|unit| unit == 0) {
         return Err(Error::Io(std::io::Error::new(
@@ -140,6 +141,22 @@ pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// Assert the same property of a wide string the crate PRODUCED rather than received.
+///
+/// [`resolve_executable`] is the only such producer, and it cannot yield a NUL: every one of its
+/// returns is gated on [`Path::is_file`], which goes through `fs::metadata` and so is false for
+/// any path Win32 cannot encode. A NUL here would therefore be a broken contract in resolution,
+/// not a caller defect — and refusing it at runtime advertises a caller-facing vector that does
+/// not exist, sending a reader to audit an input they do not control. Asserted instead, so it
+/// still fails loudly in every debug build the moment resolution grows a return that is not
+/// `is_file`-gated.
+pub(crate) fn debug_assert_no_nul_wide(what: &str, s: &OsStr) {
+    debug_assert!(
+        !s.encode_wide().any(|unit| unit == 0),
+        "the {what} contains an embedded NUL, which Win32 would silently truncate"
+    );
 }
 
 /// Case-fold an environment key for case-insensitive comparison and sorting.
