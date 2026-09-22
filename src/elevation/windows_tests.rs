@@ -304,15 +304,16 @@ fn wide_nul_accepts_an_ordinary_value_and_terminates_it() {
 /// panics on. That is the whole reason this drives the pure seam: on `launch_runas_with_host` the
 /// same escape would hand the probe to `ShellExecuteExW` and raise a UAC prompt under `cargo test`.
 ///
-/// One leg per fallible field — `lpFile`, `lpParameters`, `lpDirectory`. `plan_runas`
-/// has a FOURTH `wide_nul(...)?` call site, `verb_w`, but its input is the literal `"runas"`,
-/// which can never contain a NUL, so it has no failing case and is untested here. A single-argv,
-/// no-cwd probe only reaches `lpFile`: with an empty joined parameter line and `cmd.cwd() ==
-/// None`, reverting either of the other two call sites to an inline
-/// `encode_wide().chain(once(0))` leaves every test green, which is exactly the gap this test
-/// exists to close. Each leg also asserts the detail names ITS field, not just `InvalidInput` —
-/// a swap that trips the right error kind but blames the wrong field (finding 1's misattribution,
-/// in miniature) would otherwise still pass.
+/// One leg per field a caller can poison — `lpFile`, `lpParameters`, `lpDirectory`. A single-argv,
+/// no-cwd probe only reaches `lpFile`: with an empty joined parameter line and `cmd.cwd() == None`,
+/// dropping either of the other two checks leaves every test green, which is exactly the gap this
+/// test exists to close. Each leg also asserts the detail names ITS field, not just `InvalidInput`
+/// — a swap that trips the right error kind but blames the wrong field would otherwise still pass.
+///
+/// The `lpParameters` leg lands on the per-ELEMENT check, which is what can name `argument 1`;
+/// `plan_runas` has two further `wide_nul(...)?` sites with no failing input reachable from the
+/// public builder (`verb_w` is the literal `"runas"`, and `params_w` is the join of elements this
+/// leg already checked), so neither is tested here.
 ///
 /// Run for both privilege levels because the check now sits above the short-circuit: an
 /// already-elevated caller must get the same refusal, not a silent `AlreadyElevated`.
@@ -344,7 +345,7 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
 
         for (field, needle, c) in [
             ("lpFile", "program path", &by_program),
-            ("lpParameters", "argument line", &by_argument),
+            ("lpParameters", "argument 1", &by_argument),
             ("lpDirectory", "working directory", &by_cwd),
         ] {
             match super::plan_runas(c, &win_host(elevated)) {

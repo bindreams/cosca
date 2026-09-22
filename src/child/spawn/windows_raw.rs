@@ -352,8 +352,12 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
                 return Err(Error::Io(std::io::Error::other("empty argv")));
             }
             let mut wides: Vec<Vec<u16>> = Vec::with_capacity(argv.len());
-            for a in argv {
-                resolve::ensure_no_nul_wide("argument", a)?;
+            // Named by argv index: the command line is one joined string, so an unindexed label
+            // would leave the caller to find which of `args([..])` carried the NUL. Index 0 is
+            // argv[0] even when `executable()` names the loaded image — that token is checked
+            // separately, as the "program token".
+            for (i, a) in argv.iter().enumerate() {
+                resolve::ensure_no_nul_wide(&format!("argument {i}"), a)?;
                 wides.push(a.encode_wide().collect());
             }
             let refs: Vec<&[u16]> = wides.iter().map(Vec::as_slice).collect();

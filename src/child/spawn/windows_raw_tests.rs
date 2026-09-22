@@ -1,7 +1,8 @@
 //! Unit tests for the raw `CreateProcessW` backend's pre-spawn program gate
-//! ([`super::reject_batch_program`]), which runs before resolution and decides what a malformed
-//! program token is BLAMED on. Driven directly rather than through `spawn_raw`, so no child is
-//! created and the verdict is the gate's alone.
+//! ([`super::reject_batch_program`]) and command-line builder
+//! ([`super::raw_program_and_line`]), which run before resolution and decide what a malformed
+//! program token or argument is BLAMED on. Driven directly rather than through `spawn_raw`, so no
+//! child is created and the verdict is the checks' alone.
 
 use super::reject_batch_program;
 use crate::command::Command;
@@ -97,4 +98,15 @@ fn a_nul_in_the_program_token_is_not_blamed_on_the_environment() {
             "{via}: a program token is not the environment, got {msg}"
         );
     }
+}
+
+/// A NUL in a middle argv element must name WHICH element. By the time `CreateProcessW` reads it
+/// the command line is one joined string, so an unindexed label leaves the caller to bisect
+/// `args([..])` by hand — and `args(["a", "b\0c", "d"])` would name no element at all.
+#[test]
+fn a_nul_in_an_argument_is_blamed_on_its_index() {
+    let mut c = Command::new();
+    c.args([OsString::from("a"), nul_between("b", "c"), OsString::from("d")]);
+    let msg = invalid_input_message("argv", super::raw_program_and_line(&c).map(|_| ()));
+    assert!(msg.contains("argument 1"), "must name the offending element, got {msg}");
 }

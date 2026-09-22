@@ -250,14 +250,25 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
+/// `lpParameters` is additionally checked per argv ELEMENT by [`ensure_no_nul`] before the join,
+/// because by the time it is one string the refusal can no longer say which `args([..])` entry
+/// carried the NUL; the check here stays as the field's own, so removing that loop cannot open an
+/// unchecked sink.
 fn wide_nul(what: &str, s: &OsStr) -> Result<Vec<u16>, Error> {
+    ensure_no_nul(what, s)?;
+    Ok(s.encode_wide().chain(std::iter::once(0)).collect())
+}
+
+/// The refusal [`wide_nul`] carries, for a value checked before it becomes a field — an argv
+/// element, which `lpParameters` only reaches as part of one joined string.
+fn ensure_no_nul(what: &str, s: &OsStr) -> Result<(), Error> {
     if s.encode_wide().any(|unit| unit == 0) {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("the elevated {what} contains an embedded NUL, which Win32 would silently truncate"),
         )));
     }
-    Ok(s.encode_wide().chain(std::iter::once(0)).collect())
+    Ok(())
 }
 
 /// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
@@ -334,7 +345,13 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
         }
         None => argv[0].clone(),
     };
-    let tail_wide: Vec<Vec<u16>> = argv[1..].iter().map(|a| a.encode_wide().collect()).collect();
+    // NUL-checked per element, BEFORE the join: `lpParameters` is one string, so a refusal built
+    // from it could only say that some element carried a NUL.
+    let mut tail_wide: Vec<Vec<u16>> = Vec::with_capacity(argv.len() - 1);
+    for (i, a) in argv.iter().enumerate().skip(1) {
+        ensure_no_nul(&format!("argument {i}"), a)?;
+        tail_wide.push(a.encode_wide().collect());
+    }
     let tail_refs: Vec<&[u16]> = tail_wide.iter().map(|v| v.as_slice()).collect();
     let joined = crate::quote::windows::join_wide(&tail_refs);
     Ok((program, OsString::from_wide(&joined)))
