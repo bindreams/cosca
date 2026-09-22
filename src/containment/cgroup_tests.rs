@@ -320,12 +320,18 @@ use super::{log_degrade, parse_proc_stat_state, LeafError, Placement, PlacementR
 /// Every `LeafError` names the step, the path it touched, and the kernel's own reason.
 /// Asserted per variant: a step whose message drops any of the three is the silence this
 /// type exists to remove.
+///
+/// The reason is asserted as the source error's own rendering, not as `strerror` text: the same
+/// raw code renders differently per host (13 is "Permission denied" on Linux and macOS, "The data
+/// is invalid." on Windows), and "carried verbatim" is the claim.
 #[test]
 fn leaf_error_names_step_path_and_reason() {
-    let cases: Vec<(LeafError, &[&str])> = vec![
+    let reason = |code: i32| std::io::Error::from_raw_os_error(code).to_string();
+    let cases: Vec<(LeafError, &[&str], Option<String>)> = vec![
         (
             LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13)),
-            &["/proc/self/cgroup", "denied"],
+            &["/proc/self/cgroup"],
+            Some(reason(13)),
         ),
         (
             LeafError::NoUnifiedLine {
@@ -333,26 +339,30 @@ fn leaf_error_names_step_path_and_reason() {
                 controllers: "9:memory".into(),
             },
             &["/proc/self/cgroup", "0::", "9:memory"],
+            None,
         ),
         (
             LeafError::CreateLeafDir {
                 path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0"),
                 source: std::io::Error::from_raw_os_error(13),
             },
-            &["/sys/fs/cgroup/slice/cosca-7-0", "denied"],
+            &["/sys/fs/cgroup/slice/cosca-7-0"],
+            Some(reason(13)),
         ),
         (
             LeafError::KillUnsupported {
                 path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0"),
             },
             &["/sys/fs/cgroup/slice/cosca-7-0", "cgroup.kill"],
+            None,
         ),
         (
             LeafError::OpenProcs {
                 path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
                 source: std::io::Error::from_raw_os_error(13),
             },
-            &["cgroup.procs", "denied"],
+            &["cgroup.procs"],
+            Some(reason(13)),
         ),
         (
             LeafError::ReadCloexec {
@@ -360,6 +370,7 @@ fn leaf_error_names_step_path_and_reason() {
                 source: std::io::Error::from_raw_os_error(9),
             },
             &["cgroup.procs", "FD_CLOEXEC"],
+            Some(reason(9)),
         ),
         (
             LeafError::ClearCloexec {
@@ -367,15 +378,17 @@ fn leaf_error_names_step_path_and_reason() {
                 source: std::io::Error::from_raw_os_error(9),
             },
             &["cgroup.procs", "FD_CLOEXEC"],
+            Some(reason(9)),
         ),
         (
             LeafError::MapReportPage(std::io::Error::from_raw_os_error(12)),
-            &["report", "memory"],
+            &["report"],
+            Some(reason(12)),
         ),
     ];
-    for (err, needles) in cases {
+    for (err, needles, reason) in cases {
         let rendered = err.to_string();
-        for needle in needles {
+        for needle in needles.iter().copied().chain(reason.as_deref()) {
             assert!(
                 rendered.contains(needle),
                 "{err:?} renders as {rendered:?}, which does not mention {needle:?}"
@@ -389,7 +402,8 @@ fn leaf_error_names_step_path_and_reason() {
 #[test]
 fn placement_report_renders_the_childs_errno() {
     assert!(PlacementReport::WriteFailed(16).to_string().contains("errno 16"));
-    assert!(PlacementReport::WriteFailed(16).to_string().contains("busy"));
+    let busy = std::io::Error::from_raw_os_error(16).to_string();
+    assert!(PlacementReport::WriteFailed(16).to_string().contains(&busy));
     assert!(PlacementReport::Placed.to_string().contains("succeeded"));
     assert!(PlacementReport::NotReported.to_string().contains("did not run"));
 }
@@ -442,7 +456,7 @@ fn placement_unreadable_names_the_io_error() {
     }
     .to_string();
     assert!(rendered.contains("/cg/cgroup.procs"));
-    assert!(rendered.contains("denied"));
+    assert!(rendered.contains(&std::io::Error::from_raw_os_error(13).to_string()));
 }
 
 /// The degrade is logged at `warn` with the reason attached — the single line a human reading
