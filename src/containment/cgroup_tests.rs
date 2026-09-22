@@ -885,3 +885,98 @@ fn no_unified_line_never_quotes_a_line_it_could_not_parse() {
         "an unparsed line's content must not be echoed: {controllers:?}"
     );
 }
+
+// Leaf-creation steps past the cgroup.kill check -----
+// `create_leaf_under` refuses a leaf with no `cgroup.kill` before it reaches any later step, so
+// a temp directory cannot exercise those steps at all. The fault seam supplies exactly the one
+// fact a temp directory cannot (`cgroup.kill` is present); everything after it — the open, the
+// mapping, the unwind — then runs for real against the kernel's own errnos.
+
+/// A `cgroup.procs` that cannot be opened reports THAT step, and takes the leaf it just created
+/// with it. The leaf must not survive the degrade: a stray `cosca-*` cgroup is permanent on the
+/// host (nothing ever revisits it), which is issue #140's accumulation.
+#[cfg(target_os = "linux")]
+#[test]
+fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    super::fault::set_force_kill_supported(true);
+    let err = match super::create_leaf_under(dir.path()) {
+        Err(e) => e,
+        Ok(_) => panic!("a plain directory has no cgroup.procs to open; leaf creation must fail"),
+    };
+    assert!(
+        !super::fault::kill_supported_armed(),
+        "the seam must be consumed by the step it stands in for"
+    );
+    assert!(
+        matches!(err, LeafError::OpenProcs { .. }),
+        "expected OpenProcs, got {err:?}"
+    );
+    assert!(err.to_string().contains("cgroup.procs"), "got {err}");
+
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the degrade left {strays:?} behind — a cosca-* cgroup this host then keeps forever \
+         (issue #140)"
+    );
+}
+
+/// A report page that cannot be mapped is its own degrade reason, and unwinds the leaf too.
+/// `MapReportPage` is a condition that did not exist before the placement report did, so the
+/// step it names, and the fact it leaves nothing behind, are both worth pinning.
+#[cfg(target_os = "linux")]
+#[test]
+fn create_leaf_under_reports_an_unmappable_report_page_and_removes_the_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    super::fault::set_force_kill_supported(true);
+    super::fault::set_force_map_report_page_failure(true);
+    let err = match super::create_leaf_under(dir.path()) {
+        Err(e) => e,
+        Ok(_) => panic!("the report page could not be mapped; leaf creation must fail"),
+    };
+    assert!(
+        !super::fault::map_report_page_failure_armed(),
+        "the seam must be consumed by the mapping it fails"
+    );
+    assert!(
+        matches!(err, LeafError::MapReportPage(_)),
+        "expected MapReportPage, got {err:?}"
+    );
+    assert!(err.to_string().contains("Cannot allocate memory"), "got {err}");
+
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(strays.is_empty(), "a failed mapping left {strays:?} behind");
+}
+
+/// A `cgroup.procs` that cannot be READ is "membership unknown", never "not a member": the two
+/// have different fixes, and only one of them is a reason to throw the leaf away.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_of_reports_an_unreadable_cgroup_procs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unreadable-procs");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    match leaf.placement_of(4242) {
+        Placement::Unreadable {
+            pid,
+            path,
+            source,
+            report,
+        } => {
+            assert_eq!(pid, 4242);
+            assert_eq!(path, leaf_path.join("cgroup.procs"));
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            assert_eq!(report, PlacementReport::NotReported, "no child ever ran");
+        }
+        other => panic!("an unreadable cgroup.procs must not read as absent membership: {other}"),
+    }
+}
