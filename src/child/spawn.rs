@@ -391,12 +391,15 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     Ok(std_cmd)
 }
 
-// Pick the executable file to load (`executable` overrides argv[0]/first-token).
-fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> std::ffi::OsString {
-    match cmd.executable_path() {
-        Some(p) => p.as_os_str().to_os_string(),
-        None => fallback,
-    }
+// Pick the executable file to load (`executable` overrides argv[0]/first-token). On POSIX an
+// `Exact` program arrives absolute (see `Command::posix_executable`); on Windows a set executable
+// never reaches this std path, routing to the raw backend instead.
+fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<std::ffi::OsString, Error> {
+    #[cfg(unix)]
+    let exe = cmd.posix_executable()?;
+    #[cfg(not(unix))]
+    let exe = cmd.executable_path().map(std::path::Path::to_path_buf);
+    Ok(exe.map_or(fallback, std::path::PathBuf::into_os_string))
 }
 
 // Program + the trailing args (argv mode). `executable` overrides the loaded
@@ -419,7 +422,7 @@ fn resolve_program_argv<'a>(
     } else {
         argv[0].clone()
     };
-    let program = resolve_program(cmd, fallback);
+    let program = resolve_program(cmd, fallback)?;
     let rest = if argv.is_empty() { argv } else { &argv[1..] };
     Ok((program, rest))
 }
@@ -438,7 +441,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
     if argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
-    let program = resolve_program(cmd, argv[0].clone());
+    let program = resolve_program(cmd, argv[0].clone())?;
     let mut c = std::process::Command::new(&program);
     // When executable() overrides the loaded file, argv[0] from the command
     // line is the user's intended name — preserve it via arg0().
@@ -930,3 +933,7 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, unix))]
+#[path = "spawn/exact_posix_tests.rs"]
+mod exact_posix_tests;

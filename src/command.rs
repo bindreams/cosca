@@ -41,7 +41,8 @@ pub struct Command {
 pub(crate) enum ExecutableSpec {
     /// From [`Command::executable`]: cosca resolves it (`PATH`, `.exe`) before the OS sees it.
     Search(PathBuf),
-    /// From [`Command::raw_executable`]: handed to the OS exactly as written.
+    /// From [`Command::raw_executable`]: never searched — at most completed to an absolute path,
+    /// where a sink would otherwise search a relative one.
     Exact(PathBuf),
 }
 
@@ -258,11 +259,12 @@ impl Command {
     ///   could ever matter — and note that a directory this process sits in may be writable by
     ///   someone else, which is the binary-planting shape [`executable`](Self::executable)
     ///   deliberately refuses to walk into.
-    /// - **POSIX:** the **child's** working directory, because the `chdir` happens before the
-    ///   exec — but only where cosca owns the exec. cosca currently spawns through
-    ///   `std::process`, whose own docs call this case "platform specific and unstable" for a
-    ///   relative program with `current_dir` set, so treat it as unspecified rather than
-    ///   guaranteed until cosca owns the POSIX spawn path. Pass an absolute path to be certain.
+    /// - **POSIX:** the **child's** working directory — [`current_dir`](Self::current_dir) when
+    ///   set (itself read against this process's directory if relative), else this process's. The
+    ///   `chdir` happens before the exec, so that is where a relative path lands. cosca completes
+    ///   the name to an absolute path against that directory before any exec sees it, by pure
+    ///   join, so a bare `tool` means `./tool` and is never looked up on `PATH`, and `sudo`,
+    ///   `pkexec` or root's shell cannot look it up either.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -274,29 +276,21 @@ impl Command {
     ///
     /// # Elevated `argv[0]`
     ///
-    /// `ShellExecuteEx` derives the child's `argv[0]` from `lpFile`, and cosca completes a
-    /// relative `Exact` program to an absolute path before handing it over — so an elevated child
-    /// sees `argv[0]` as that absolute path, where the same `Command` spawned unelevated passes
-    /// argv verbatim. `raw_executable("tool.exe").args(["tool.exe"])` therefore yields
-    /// `argv[0] == "tool.exe"` unelevated and the completed path under `.elevate()`. The
-    /// alternative — leaving `lpFile` relative — would let `ShellExecuteEx` search for the image,
-    /// which is the hazard the completion exists to remove.
+    /// Every elevation backend derives the child's `argv[0]` from the program it is handed
+    /// (`ShellExecuteEx`'s `lpFile`, `sudo`'s and `osascript`'s exec), and that program is the
+    /// completed absolute path — so an elevated child sees `argv[0]` as that path, where the same
+    /// `Command` spawned unelevated passes argv verbatim. `raw_executable("tool").args(["tool"])`
+    /// therefore yields `argv[0] == "tool"` unelevated and the completed path under `.elevate()`
+    /// (an already-elevated Windows caller excepted: it re-spawns through `CreateProcessW`, argv
+    /// verbatim).
+    /// Handing the backend the relative name instead would let it search for the image, which is
+    /// the hazard the completion exists to remove.
     ///
     /// The two setters are alternatives on one field: calling either replaces the other, and the
     /// last call wins.
     ///
-    /// # Platform note
-    ///
-    /// **On POSIX this contract is not yet honoured for a bare name.** cosca currently spawns
-    /// through `std::process`, whose exec call searches `PATH` for a name containing no
-    /// separator — so `raw_executable("tool")` may load a `tool` found on `PATH` instead of the
-    /// `tool` in the child's working directory, which is what the rule above promises. Write
-    /// `./tool` to be unambiguous until cosca owns the POSIX spawn path. A value that already
-    /// contains a separator is unaffected: `execve` does not search one.
-    ///
-    /// The same caveat applies to an elevated POSIX or macOS spawn for a different reason:
-    /// `sudo`/`pkexec`/`osascript` perform their own lookup on the name they are handed, which
-    /// cosca does not intercept.
+    /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
+    /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
     ///
     /// On Windows the contract holds on every spawn path, elevated or not. The elevated path
     /// goes through `ShellExecuteEx`, whose `lpFile` **is** searched when it has no path
@@ -323,14 +317,26 @@ impl Command {
     }
 
     /// The path together with which setter recorded it.
-    ///
-    /// Consumed only by the Windows raw backends today — they are the sites that would otherwise
-    /// resolve an `Exact` path. Task 3 gives POSIX the same distinction and consumes it there
-    /// too, at which point this attribute goes away; until then it would be a genuine dead-code
-    /// warning on a host build, so the allow is scoped to exactly that case rather than blanket.
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn executable_spec(&self) -> Option<&ExecutableSpec> {
         self.executable.as_ref()
+    }
+
+    /// The program a POSIX exec sink is handed: an `Exact` one completed to an absolute path by
+    /// [`crate::resolve::exact::complete_posix`] against the child's working directory, so no
+    /// sink can search for it; a `Search` one as written. `None` when neither setter was called.
+    ///
+    /// Reads this process's cwd only for a relative `Exact` program with no absolute
+    /// [`current_dir`](Self::current_dir).
+    // Off unix the only caller is the macOS elevation module, itself dead there.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn posix_executable(&self) -> Result<Option<PathBuf>, Error> {
+        match self.executable_spec() {
+            Some(ExecutableSpec::Exact(p)) => {
+                crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), std::env::current_dir).map(Some)
+            }
+            Some(ExecutableSpec::Search(p)) => Ok(Some(p.clone())),
+            None => Ok(None),
+        }
     }
 
     /// Wire descriptor `slot` to `target`. Errors now if the target's direction

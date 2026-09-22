@@ -430,6 +430,27 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     assert!(!crate::log_capture::contains_since(mark, QUIET));
 }
 
+/// A bare `raw_executable()` is completed against the (absolute) cwd before the gate sees it, so
+/// it is accepted, and root's shell is handed an absolute path it cannot search for.
+#[test]
+fn a_bare_exact_program_is_completed_rather_than_refused() {
+    let mut c = Command::new();
+    c.raw_executable("tool")
+        .args(["tool", "-u"])
+        .current_dir("/work")
+        .elevation_auth(crate::elevation::Auth::Gui);
+    assert!(reject_structural_gui_config(&c).is_ok());
+    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let CommandInput::Argv(argv) = derived.input() else {
+        unreachable!()
+    };
+    assert!(
+        argv[2].to_str().unwrap().contains("cd -- /work && exec /work/tool -u"),
+        "{:?}",
+        argv[2]
+    );
+}
+
 #[test]
 fn the_cwd_reaches_both_osascript_and_the_payload() {
     let mut c = gui_cmd();

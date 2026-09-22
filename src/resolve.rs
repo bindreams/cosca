@@ -7,20 +7,20 @@
 //!
 //! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through
 //! [`resolve`]: "load exactly this file" is the absence of this module's SEARCH policy, not an
-//! application of it. On the elevated path it is completed to an absolute path by
-//! `windows_raw::resolve::absolutise_exact`, which searches nothing — see its doc for why
+//! application of it. Where a sink would search a relative name, it is completed to an absolute
+//! path instead, which searches nothing: on POSIX by [`exact::complete_posix`], on the Windows
+//! elevated path by `windows_raw::resolve::absolutise_exact` — see its doc for why
 //! `ShellExecuteEx` forces that step where `CreateProcessW` does not.
 //!
-//! It does, however, share this module's naming CLASSIFIERS: both `Exact` arms refuse a program
+//! It does, however, share this module's naming CLASSIFIERS: every `Exact` arm refuses a program
 //! that names no file via [`names_no_file`], so the two axes cannot drift apart on what counts as
 //! a filename. Classifying is not searching.
 //!
-//! Every other spawn path resolves the program name itself, ignorant of this module entirely:
-//! POSIX spawning still calls `execvp`/`posix_spawn`'s own PATH search directly, and the Windows
-//! elevated (`ShellExecuteEx`) path still passes a `Search` `lpFile` through unresolved (#135).
-//! `src/lib.rs`'s
+//! Every other spawn path resolves a `Search` program itself, ignorant of this module: POSIX
+//! spawning calls `execvp`/`posix_spawn`'s own PATH search, and the Windows elevated
+//! (`ShellExecuteEx`) path passes a `Search` `lpFile` through unresolved (#135). `src/lib.rs`'s
 //! `#[cfg_attr(not(windows), allow(dead_code))]` on this module tracks exactly that: the `allow`
-//! goes away once the POSIX and default spawn paths route through it too.
+//! goes away once those paths route through [`resolve`] too.
 //! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
 //! up — `execvp` does not search a name containing a separator, and `ShellExecuteEx` does not
 //! search an absolute `lpFile` — but that wiring has not happened yet for either.
@@ -55,6 +55,8 @@
 use crate::error::Error;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+pub(crate) mod exact;
 
 /// Everything the policy reads. Taken as parameters so the rules are testable without touching
 /// the ambient environment.

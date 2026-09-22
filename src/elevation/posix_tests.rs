@@ -894,4 +894,83 @@ mod rewrite_tests {
              is a false justification and loses setsid-proof containment for no reason"
         );
     }
+
+    // ===== raw_executable(): the wrapper is handed an absolute path =====
+
+    fn exact_tool(cwd: Option<&str>) -> Command {
+        let mut c = Command::new();
+        c.raw_executable("tool")
+            .args(["tool", "-x"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
+        c
+    }
+
+    /// `sudo` searches its own `secure_path` for a bare name, so a bare `tool` would load whatever
+    /// that search finds instead of the file in the child's working directory.
+    #[test]
+    fn a_bare_exact_program_reaches_the_wrapper_completed_against_the_childs_cwd() {
+        let rw = rewrite_with_host(&mut exact_tool(Some("/work")), &sudo_host()).expect("rewrite");
+        let a = derived_argv(&rw);
+        assert_eq!(
+            a[a.len() - 3..],
+            [OsString::from("--"), "/work/tool".into(), "-x".into()],
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_exact_program_without_a_cwd_is_completed_against_the_process_cwd() {
+        // Reads the process cwd twice (here and in the rewrite); other tests in this binary
+        // `set_current_dir` under this lock.
+        let _guard = crate::child::spawn::spawn_lock();
+        let rw = rewrite_with_host(&mut exact_tool(None), &sudo_host()).expect("rewrite");
+        let want = std::env::current_dir().unwrap().join("tool").into_os_string();
+        assert!(derived_argv(&rw).contains(&want), "{:?}", derived_argv(&rw));
+    }
+
+    /// `RunAsIs` spawns the program itself; it must be the completed one there too.
+    #[test]
+    fn an_already_elevated_exact_program_is_completed_too() {
+        let rw = rewrite_with_host(&mut exact_tool(Some("/work")), &elevated_sudo_host()).expect("rewrite");
+        assert_eq!(derived_argv(&rw), [OsString::from("/work/tool"), "-x".into()]);
+    }
+
+    #[test]
+    fn an_elevated_exact_program_that_names_no_file_is_refused() {
+        for n in ["", ".", "dir/"] {
+            let mut c = Command::new();
+            c.raw_executable(n)
+                .args([n])
+                .elevation_backend(Backend::Sudo)
+                .elevation_auth(Auth::NonInteractive);
+            match rewrite_with_host(&mut c, &sudo_host()) {
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                other => panic!(
+                    "{n:?} names no file and must be Io(InvalidInput), got {:?}",
+                    other.err()
+                ),
+            }
+        }
+    }
+
+    /// Negative control: a `Search` program still reaches the wrapper as written.
+    #[test]
+    fn an_elevated_search_program_is_passed_as_written() {
+        let mut c = Command::new();
+        c.executable("tool")
+            .args(["tool", "-x"])
+            .current_dir("/work")
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        let a = derived_argv(&rewrite_with_host(&mut c, &sudo_host()).expect("rewrite"));
+        assert_eq!(
+            a[a.len() - 3..],
+            [OsString::from("--"), "tool".into(), "-x".into()],
+            "{a:?}"
+        );
+    }
 }

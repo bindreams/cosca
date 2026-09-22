@@ -1,8 +1,10 @@
 //! macOS graphical elevation: the `osascript … with administrator privileges`
 //! effect path for [`Auth::Gui`](super::Auth::Gui).
 //!
-//! Everything here is PURE — no syscalls, no `cfg!` — so the whole module is
-//! compiled and unit-tested on every platform, exactly like [`super::plan`].
+//! Everything here is PURE — no `cfg!`, and no syscalls beyond reading this process's cwd for a
+//! relative `raw_executable()` with no absolute `current_dir()` (see
+//! [`Command::posix_executable`]) — so the whole module is compiled and unit-tested on every
+//! platform, exactly like [`super::plan`].
 //!
 //! # The two quoting layers
 //!
@@ -18,7 +20,7 @@
 //! [`wrap_do_shell_script`].
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::command::{Command, CommandInput};
@@ -158,8 +160,9 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
     Ok(script)
 }
 
-/// Program + args, honoring `executable()`. `exec`ing the program sets argv[0] to
-/// its own path, so an argv[0] distinct from a set `executable()` cannot survive.
+/// Program + args, honoring `executable()`; a `raw_executable()` program comes back absolute
+/// ([`Command::posix_executable`]). `exec`ing the program sets argv[0] to its own path, so an
+/// argv[0] distinct from a set `executable()` cannot survive.
 pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
@@ -187,20 +190,21 @@ pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>
             "set a program via .args([...]) before .elevate()".into(),
         ));
     };
-    match cmd.executable_path() {
-        Some(exe) => {
-            if first.as_os_str() != exe.as_os_str() {
-                return Err(unsupported(
-                    "macOS graphical elevation with an argv[0] distinct from executable()",
-                    "`do shell script` execs the program, which sets argv[0] to its own path; \
-                     a separate argv[0] cannot survive elevation"
-                        .into(),
-                ));
-            }
-            Ok((exe.as_os_str().to_os_string(), argv[1..].to_vec()))
-        }
-        None => Ok((first.clone(), argv[1..].to_vec())),
+    if cmd
+        .executable_path()
+        .is_some_and(|exe| first.as_os_str() != exe.as_os_str())
+    {
+        return Err(unsupported(
+            "macOS graphical elevation with an argv[0] distinct from executable()",
+            "`do shell script` execs the program, which sets argv[0] to its own path; \
+             a separate argv[0] cannot survive elevation"
+                .into(),
+        ));
     }
+    let program = cmd
+        .posix_executable()?
+        .map_or_else(|| first.clone(), PathBuf::into_os_string);
+    Ok((program, argv[1..].to_vec()))
 }
 
 /// The honest capability matrix for macOS graphical elevation. Every rejection below

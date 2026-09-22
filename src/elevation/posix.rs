@@ -432,8 +432,9 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
     map.into_iter().collect()
 }
 
-/// Program + args, honoring `executable()`. An argv[0] distinct from a set
-/// `executable()` cannot survive the backend wrapper → `Unsupported`.
+/// Program + args, honoring `executable()`; a `raw_executable()` program comes back absolute
+/// ([`Command::posix_executable`]), so the wrapper cannot search for it. An argv[0] distinct from
+/// a set `executable()` cannot survive the backend wrapper → `Unsupported`.
 fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
@@ -458,19 +459,22 @@ fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
     if argv.is_empty() {
         return Err(empty());
     }
-    match cmd.executable_path() {
-        Some(exe) => {
-            if argv[0].as_os_str() != exe.as_os_str() {
-                return Err(Error::Unsupported {
-                    op: "elevation with an argv[0] distinct from executable()".into(),
-                    platform: "unix",
-                    detail: "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot survive elevation".into(),
-                });
-            }
-            Ok((exe.as_os_str().to_os_string(), argv[1..].to_vec()))
-        }
-        None => Ok((argv[0].clone(), argv[1..].to_vec())),
+    if cmd
+        .executable_path()
+        .is_some_and(|exe| argv[0].as_os_str() != exe.as_os_str())
+    {
+        return Err(Error::Unsupported {
+            op: "elevation with an argv[0] distinct from executable()".into(),
+            platform: "unix",
+            detail:
+                "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot survive elevation"
+                    .into(),
+        });
     }
+    let program = cmd
+        .posix_executable()?
+        .map_or_else(|| argv[0].clone(), PathBuf::into_os_string);
+    Ok((program, argv[1..].to_vec()))
 }
 
 /// Structural request-validation, evaluated against the REQUESTED backend so the verdict
@@ -544,7 +548,8 @@ pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
     rewrite_with_host(cmd, &Host::detect())
 }
 
-/// PURE given `host`: gate + plan + sanitize + build a DERIVED command. The caller's
+/// PURE given `host` (and, for a relative `raw_executable()`, this process's cwd): gate + plan +
+/// sanitize + build a DERIVED command. The caller's
 /// `Command` `input`/`env_ops` are left untouched (non-destructive): the caller's fd 0-2
 /// stdio is MOVED into the derived command (`ResolvedStdio::File` is not `Clone`).
 pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
