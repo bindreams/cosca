@@ -1,4 +1,4 @@
-use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
+use crate::containment::cgroup::test_support::{block_on, childs_copy, entered_leaf_at, fork_running, reap};
 use crate::containment::cgroup::{LeafError, NotEntered, NotPlaced, PlacementReport};
 
 // removed_after_drain tests -----
@@ -480,20 +480,6 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
 // `detach()` promises the tree keeps running. `Child::drop` returns early on it, but the leaf
 // is a field of that `Child` and its own `Drop` still runs — so the promise is only kept if
 // `disarm` reaches the leaf.
-
-/// A test leaf at `leaf_path` whose verdict is taken, with the child reported `Placed`: an
-/// attached leaf whose `Drop` may kill.
-#[cfg(target_os = "linux")]
-pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containment::cgroup::CgroupLeaf {
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    // SAFETY: the slot's channel lives as long as `leaf`.
-    unsafe { leaf.placement_slot().report_placed_for_test() };
-    // The verdict needs a live pid: this process's own stands in for the child.
-    leaf.take_placement(std::process::id())
-        .expect("decidable")
-        .expect("the child reported Placed");
-    leaf
-}
 
 /// A disarmed leaf never writes `cgroup.kill`, and leaves the occupied directory alone. The
 /// occupant stands in for the detached tree; a real leaf refuses both `rmdir`s while one runs.

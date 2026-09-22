@@ -88,6 +88,7 @@ impl Child {
         pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
+        attachment.honor_kill_on_drop(kill_on_drop);
         Child {
             os: OsResources {
                 proc: Some(proc),

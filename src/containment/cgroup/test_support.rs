@@ -79,3 +79,17 @@ pub(crate) fn alone(name: &str) -> bool {
     );
     false
 }
+
+/// A test leaf at `leaf_path` whose verdict is taken, with the child reported `Placed`: an
+/// attached leaf whose `Drop` may kill.
+#[cfg(target_os = "linux")]
+pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containment::cgroup::CgroupLeaf {
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // SAFETY: the slot's channel lives as long as `leaf`.
+    unsafe { leaf.placement_slot().report_placed_for_test() };
+    // The verdict needs a live pid: this process's own stands in for the child.
+    leaf.take_placement(std::process::id())
+        .expect("decidable")
+        .expect("the child reported Placed");
+    leaf
+}

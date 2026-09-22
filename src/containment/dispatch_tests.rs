@@ -649,3 +649,68 @@ fn a_leaf_without_a_pidfd_degrades_without_a_kill() {
     assert!(matches!(attached, super::Attached::ProcessGroup(_)), "got {attached:?}");
     assert!(!leaf_path.exists(), "the leaf must be removed");
 }
+
+// kill_on_drop's reach into the containment resource =====
+// `Command::kill_on_drop(false)` and `Child::detach()` are documented as the same opt-out.
+// They are only the same if both reach the resource whose OWN `Drop` kills: it is a field of
+// the handle and drops with it whatever the flag says.
+
+/// A leaf standing in for a live contained tree: occupied (so `rmdir` fails and `Drop` would
+/// reach for `cgroup.kill`) and carrying an empty `cgroup.kill` to read the write back from.
+#[cfg(target_os = "linux")]
+fn occupied_leaf_for_test(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let leaf_path = dir.join(name);
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the live tree");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    leaf_path
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_attachment_for_test(leaf_path: &std::path::Path) -> super::Attachment {
+    super::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: super::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.to_path_buf(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    }
+}
+
+/// `kill_on_drop(false)` must disarm the cgroup leaf. Without it the handle's own teardown is
+/// skipped and the leaf's `Drop` kills the tree anyway — the opposite of the opt-out.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_on_drop_false_disarms_a_cgroup_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-false-leaf");
+
+    let attachment = cgroup_attachment_for_test(&leaf_path);
+    attachment.honor_kill_on_drop(false);
+    drop(attachment);
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "kill_on_drop(false) opts out of the teardown; a tree it killed anyway is the opposite"
+    );
+}
+
+/// The same leaf under `kill_on_drop(true)` DOES fire `cgroup.kill`, so the test above pins
+/// the disarm rather than an inert path.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-true-leaf");
+
+    let attachment = cgroup_attachment_for_test(&leaf_path);
+    attachment.honor_kill_on_drop(true);
+    drop(attachment);
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"1",
+        "the default is still a kill-on-drop teardown"
+    );
+}
