@@ -338,6 +338,27 @@ fn the_win32_and_posix_verdicts_differ_for_the_same_token() {
     invalid_input_message(on_posix(&bat_then_nul));
 }
 
+/// The WRAPPER, which none of the tests above reach: they spell `win32` out as data, so pinning
+/// [`super::reject_batch_path`]'s `cfg!(windows)` argument to `true` leaves every one of them
+/// green while POSIX callers get the Win32 diagnosis back — the regression this round already
+/// fixed once, in the gate the helper is only half of.
+#[test]
+fn the_gate_wrapper_asks_for_this_hosts_verdict() {
+    let bat_then_nul = with_interior_nul("setup.bat", "junk");
+    let nul_then_bat = with_interior_nul("setup", ".bat");
+    let via_host = |t: &std::ffi::OsStr| super::reject_batch_path(std::path::Path::new(t));
+
+    if cfg!(windows) {
+        assert!(unsupported_op(via_host(&bat_then_nul)).contains("setup.bat"));
+        assert!(via_host(&nul_then_bat).is_ok(), "`setup` is no batch file");
+    } else {
+        for token in [&bat_then_nul, &nul_then_bat] {
+            let msg = invalid_input_message(via_host(token));
+            assert!(msg.contains("NUL"), "the refusal must name the NUL: {msg}");
+        }
+    }
+}
+
 /// A clean `.bat` is still refused on either platform: the verdict is a property of the REQUEST,
 /// not of the host, and the NUL arm above must not have swallowed the batch rule.
 #[test]
@@ -366,6 +387,13 @@ fn the_std_backend_judges_the_program_token_the_caller_named() {
     assert!(
         !msg.contains('\0'),
         "the refusal must not carry a raw NUL into logs: {msg:?}"
+    );
+    // Which refusal, not just how it prints: off Win32 the defect is the NUL, and `Unsupported`
+    // would mean this call site asked for the Win32 verdict on a host that does not truncate.
+    #[cfg(not(windows))]
+    assert!(
+        !matches!(err, Error::Unsupported { .. }),
+        "off Win32 there is no cmd.exe to blame: {msg}"
     );
 }
 
