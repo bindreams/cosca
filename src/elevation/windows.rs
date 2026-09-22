@@ -361,9 +361,7 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
     //
     // A `Search` token is NOT resolved here yet: `executable()` on the elevated path still reaches
-    // `ShellExecuteEx`'s own search unresolved. That is the pre-existing hole tracked as #135 and
-    // closed in the follow-up; it is deliberately not widened by this change, and `executable()`'s
-    // doc says so plainly.
+    // `ShellExecuteEx`'s own search unresolved, as `executable()`'s doc says.
     //
     // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
     // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the

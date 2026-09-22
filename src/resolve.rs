@@ -18,7 +18,7 @@
 //!
 //! Every other spawn path resolves a `Search` program itself, ignorant of this module: POSIX
 //! spawning calls `execvp`/`posix_spawn`'s own PATH search, and the Windows elevated
-//! (`ShellExecuteEx`) path passes a `Search` `lpFile` through unresolved (#135). `src/lib.rs`'s
+//! (`ShellExecuteEx`) path passes a `Search` `lpFile` through unresolved. `src/lib.rs`'s
 //! `#[cfg_attr(not(windows), allow(dead_code))]` on this module tracks exactly that: the `allow`
 //! goes away once those paths route through [`resolve`] too.
 //! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
