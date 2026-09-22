@@ -707,9 +707,10 @@ fn a_drive_prefix_is_one_only_at_the_front_of_the_path() {
 /// and `std::process` spawn it — exit 0 — while the plain spelling of the same name fails with
 /// access-denied. Refusing those was refusing a genuinely loadable executable.
 ///
-/// The other half comes from std's source: for a verbatim program it never calls
-/// `GetFullPathNameW`, and `is_batch_file` is a literal test of the last four UTF-16 units of the
-/// string as given. So `\\?\C:\x.bat.` ends in `bat.`, cmd.exe is not substituted, and the image
+/// The other half comes from std's source: for a verbatim program `is_batch_file` is a literal
+/// test of the last four UTF-16 units of the string, and the prefix comes off first only when
+/// `GetFullPathNameW` round-trips the rest unchanged. So `\\?\C:\x.bat.` keeps its prefix and
+/// ends in `bat.`, cmd.exe is not substituted, and the image
 /// loads like any other — while the plain `C:\x.bat.` has its trailing dot trimmed on the way
 /// through `GetFullPathNameW` and reaches the batch file. Same name, different resolution, so the
 /// gate must not give them the same verdict.

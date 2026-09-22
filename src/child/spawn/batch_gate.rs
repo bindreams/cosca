@@ -129,7 +129,8 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
     // Past the early return `loaded` and `prog` are the same string, so the rest reads `prog`.
     let text = prog.as_os_str().to_string_lossy();
     // Only backslashes spell the verbatim prefix; `\\?\` and `//?/` are different paths to
-    // Win32, and only the first suppresses resolution.
+    // Win32, and only the first suppresses resolution. std's other verbatim prefix, `\??\`, is
+    // walked below; see `verbatim_refusal` for why that changes no verdict.
     let refusal = if text.starts_with(r"\\?\") {
         verbatim_refusal(&text)
     } else {
@@ -160,11 +161,19 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
 /// than it asks of any other path, and this is that question.
 ///
 /// For an ordinary program std runs the string through `GetFullPathNameW` and tests the RESULT;
-/// for a verbatim one it never makes that call, and `is_batch_file` is a literal test of the last
-/// four UTF-16 units of the string as given. So `\\?\C:\x.bat.` ends in `bat.`, cmd.exe is not
-/// substituted, and the image loads like any other — while the plain `C:\x.bat.` loses its
-/// trailing dot on the way through `GetFullPathNameW` and reaches the batch file. The prefix does
-/// not merely spell the same file differently; it selects a different resolution.
+/// for a verbatim one `is_batch_file` is a literal test of the last four UTF-16 units of the
+/// string. std does call `GetFullPathNameW` on a short `\\?\C:\…` program first (`to_user_path`,
+/// on the text after the prefix), but drops the prefix only when the result round-trips — and a
+/// string that round-trips reads the same under both tests. So `\\?\C:\x.bat.` keeps its prefix,
+/// ends in `bat.`, cmd.exe is not substituted, and the image loads like any other — while the plain
+/// `C:\x.bat.` loses its trailing dot on the way through `GetFullPathNameW` and reaches the batch
+/// file. The prefix does not merely spell the same file differently; it selects a different
+/// resolution.
+///
+/// std's `is_verbatim` also accepts `\??\`, which this gate does NOT route here: it walks `\??\…`
+/// as an ordinary rooted path. No verdict turns on that. A `\??\` string ending in `.bat`/`.cmd`
+/// has a final component ending in it, which the walk refuses; the walk's trimming only
+/// over-refuses (`\??\C:\x.bat.`, which std's literal test passes).
 ///
 /// Measured on Windows runners, both architectures: `...`, `....`, `" "` and `"x "` are creatable,
 /// listable and openable through the prefix, and both `CreateProcessW` and `std::process` spawn
