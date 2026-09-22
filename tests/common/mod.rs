@@ -354,6 +354,45 @@ pub fn spawn_tree_async(
     )
 }
 
+/// A contained async `spawn-grandchild-echo` tree: both members round-trip a byte, so a test can
+/// prove each POSITIVELY alive (see [`assert_echoes`]).
+#[cfg(feature = "tokio")]
+pub struct AsyncEchoTree {
+    pub child: cosca::tokio::Child,
+    pub root: TcpStream,
+    pub grand: TcpStream,
+    /// The grandchild's own pid, for reading the tree's cgroup back out of `/proc`.
+    pub grand_pid: u32,
+}
+
+/// Spawn a contained [`AsyncEchoTree`] with the given `kill_on_drop`.
+#[cfg(feature = "tokio")]
+pub fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.args([testbin(), "spawn-grandchild-echo", addr.as_str()]);
+    cmd.contain();
+    cmd.kill_on_drop(kill_on_drop);
+    let child = cmd.spawn().expect("spawn async echo tree");
+    let (mut root, mut grand) = (None, None);
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept");
+        match read_tag_and_pid(&mut s) {
+            (b'R', _) => root = Some(s),
+            (b'G', pid) => grand = Some((s, pid)),
+            (tag, _) => panic!("unexpected tree tag {:?}", tag as char),
+        }
+    }
+    let (grand, grand_pid) = grand.expect("grandchild G connected");
+    AsyncEchoTree {
+        child,
+        root: root.expect("root R connected"),
+        grand,
+        grand_pid,
+    }
+}
+
 /// Async `control-block` blocker (uncontained): a child that connects, tags "R", and blocks on
 /// its socket. The accept/tag-read is sync std (the test side); the CHILD is async.
 #[cfg(feature = "tokio")]

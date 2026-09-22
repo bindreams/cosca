@@ -322,9 +322,16 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     // `kill_on_drop` says — a Job Object's close fires KILL_ON_JOB_CLOSE, a cgroup leaf's Drop
     // fires cgroup.kill. So a contained `kill_on_drop(false)` tree survives only because the
     // spawn disarmed the resource (`Attachment::honor_kill_on_drop`), which is what makes
-    // `Command::kill_on_drop`'s "or detach() to opt one out after the fact" true.
+    // `Command::kill_on_drop`'s "or detach() to opt one out after the fact" true. On Linux
+    // outside the cgroup lane this is a process group, whose disarm is a no-op;
+    // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
     use std::io::{Read as _, Write as _};
     let (child, mut root, _grand) = common::spawn_grandchild_async_with(true, false);
+    assert_ne!(
+        child.containment(),
+        cosca::Containment::None,
+        "contained spawn must engage a mechanism"
+    );
     let root_id = child.id();
     drop(child); // contained + kill_on_drop(false) → nothing may kill the tree
     assert_eq!(
@@ -338,6 +345,60 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
         matches!(root.read(&mut buf), Ok(0)),
         "released root exits cleanly (EOF)"
     );
+}
+
+/// `detach()` must leave a cgroup-contained tree running: `CgroupLeaf::drop` kills an occupied
+/// leaf unless the detach disarmed it. Proven by a byte round trip through both members.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
+    common::cgroup::require_lane();
+    assert_async_opted_out_tree_survives(true, |mut child| child.detach());
+}
+
+/// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does. Only
+/// `Attachment::honor_kill_on_drop` at handle construction disarms the leaf here.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
+    common::cgroup::require_lane();
+    assert_async_opted_out_tree_survives(false, drop);
+}
+
+/// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
+/// the handle through `opt_out`, prove both members alive, then remove the leaf the tree keeps.
+#[cfg(target_os = "linux")]
+fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce(cosca::tokio::Child)) {
+    let common::AsyncEchoTree {
+        child,
+        mut root,
+        mut grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async(kill_on_drop);
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::CgroupV2,
+        "a process group's disarm is a no-op, so only CgroupV2 tests the leaf's"
+    );
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+    assert!(
+        leaf.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),
+        "the tree must be in a cosca leaf, got {}",
+        leaf.display()
+    );
+
+    opt_out(child);
+
+    common::assert_echoes(&mut root, "the opted-out root");
+    common::assert_echoes(&mut grand, "the opted-out grandchild");
+
+    // Release both: each read returns Ok(0) and the member exits on its own.
+    drop(root);
+    drop(grand);
+    common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
 // `async_drop_leaves_no_zombie` moved to `drop_reaps_on_a_worker_thread` in
