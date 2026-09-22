@@ -27,6 +27,10 @@
 // parse_v2_relative_path and cgroup_procs_contains are pure (no OS deps) —
 // compiled on all platforms so their unit tests run on any host.
 
+use std::fmt;
+use std::io;
+use std::path::PathBuf;
+
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
 /// success, or `None` when no such line is present (v1-only or empty).
@@ -76,18 +80,220 @@ pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
     None
 }
 
+/// Extract the process state letter (`R`, `S`, `Z`, …) from the contents of a
+/// `/proc/<pid>/stat` line. `None` when the line is absent or malformed — never a guessed
+/// state.
+///
+/// Field 2 (`comm`) is arbitrary bytes wrapped in parentheses and may itself contain spaces
+/// and parentheses, so splitting on whitespace from the start misplaces every later field.
+/// The scan therefore begins after the LAST `)` in the line, which is where the kernel's
+/// fixed-shape, whitespace-separated tail starts; field 3 there is the state.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_proc_stat_state(stat: &str) -> Option<char> {
+    let tail = &stat[stat.rfind(')')? + 1..];
+    tail.split_whitespace().next()?.chars().next()
+}
+
+// Degrade reasons =====
+// Pure data — no OS calls — so these compile, and their formatting is unit-tested, on every
+// host rather than only where the mechanism exists.
+
+/// Why a cgroup v2 leaf could not be created. Each variant names the step that failed, the
+/// path it touched, and the kernel's own reason: the caller degrades to a process group
+/// either way, but it degrades *stating which precondition was missing*.
+#[derive(Debug, thiserror::Error)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum LeafError {
+    /// `/proc/self/cgroup` could not be read (no procfs, or it is not mounted).
+    #[error("could not read /proc/self/cgroup: {0}")]
+    ReadProcSelfCgroup(#[source] io::Error),
+    /// `/proc/self/cgroup` has no `0::` line: a v1-only host, or no unified hierarchy.
+    #[error(
+        "/proc/self/cgroup has no cgroup v2 unified (`0::`) line — a v1-only host, or the \
+         unified hierarchy is not mounted; contents: {0:?}"
+    )]
+    NoUnifiedLine(String),
+    /// `mkdir` of the leaf failed — most often an undelegated slice the supervisor may not
+    /// write to (`EACCES`/`EPERM`), or a read-only cgroupfs (`EROFS`).
+    #[error("could not create the leaf cgroup {}: {source}", path.display())]
+    CreateLeafDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The leaf exists but exposes no `cgroup.kill`, so there is no atomic, fork-proof kill
+    /// and the mechanism would not be what `Containment::CgroupV2` promises.
+    #[error(
+        "the leaf cgroup {} has no cgroup.kill — the kernel is older than 5.14, so there is \
+         no atomic tree kill to back CgroupV2 containment",
+        path.display()
+    )]
+    KillUnsupported { path: PathBuf },
+    /// `cgroup.procs` could not be opened for writing.
+    #[error("could not open {} for writing: {source}", path.display())]
+    OpenProcs {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// `fcntl(F_GETFD)` on the `cgroup.procs` fd failed, so its FD_CLOEXEC state is unknown.
+    #[error("could not read the FD_CLOEXEC flag of {}: {source}", path.display())]
+    ReadCloexec {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// `fcntl(F_SETFD)` failed, so the fd would not survive into the child across `exec`.
+    #[error("could not clear FD_CLOEXEC on {}: {source}", path.display())]
+    ClearCloexec {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The shared page the child reports its self-placement outcome through could not be
+    /// mapped. Without it the child's own errno would be unobservable, so the leaf is not
+    /// created half-instrumented.
+    #[error("could not map the placement-report memory page shared with the forked child: {0}")]
+    MapReportPage(#[source] io::Error),
+}
+
+/// What the child's own `pre_exec` self-placement write reported back to the parent.
+///
+/// This is the one step whose reason lives entirely in the forked child: it runs after
+/// `fork`, in a copy-on-write address space, under async-signal-safety rules that forbid
+/// allocating or formatting anything. The child therefore reports a single word through a
+/// shared page (see [`ReportPage`]), which this enum names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum PlacementReport {
+    /// No outcome was ever stored: the `pre_exec` closure did not run.
+    NotReported,
+    /// The child's `write` to `cgroup.procs` succeeded — at that instant it WAS a member.
+    Placed,
+    /// The child's `write` to `cgroup.procs` failed with this errno.
+    WriteFailed(i32),
+}
+
+impl fmt::Display for PlacementReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlacementReport::NotReported => {
+                f.write_str("the child stored no self-placement outcome (its pre_exec closure did not run)")
+            }
+            PlacementReport::Placed => f.write_str("the child's pre_exec self-placement write succeeded"),
+            PlacementReport::WriteFailed(errno) => write!(
+                f,
+                "the child's pre_exec write to cgroup.procs failed: {} (errno {errno})",
+                io::Error::from_raw_os_error(*errno)
+            ),
+        }
+    }
+}
+
+/// The parent-side verdict on whether the spawned child is a member of the leaf, carrying
+/// every fact the verdict was reached from.
+///
+/// Membership is re-read from `cgroup.procs` after the spawn because the child's write can
+/// fail silently; when it reads back absent, "the write failed" and "the write succeeded and
+/// the child has since exited" are different diagnoses with different fixes, so both the
+/// child's own report and the child's current `/proc` state are captured here rather than
+/// collapsed into a bare `false`.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum Placement {
+    /// `cgroup.procs` lists the child's pid: the leaf owns the tree.
+    Confirmed,
+    /// `cgroup.procs` is readable but does not list the child's pid.
+    Absent {
+        pid: u32,
+        /// The `cgroup.procs` that was read.
+        path: PathBuf,
+        /// Its verbatim contents at the moment of the check.
+        procs: String,
+        /// What the child itself reported about its own write.
+        report: PlacementReport,
+        /// The child's `/proc/<pid>` state letter — `Z` means it had already exited, which
+        /// removes it from `cgroup.procs` whether or not the write ever succeeded.
+        child_state: Option<char>,
+    },
+    /// `cgroup.procs` could not be read at all, so membership is unknown rather than absent.
+    Unreadable {
+        pid: u32,
+        path: PathBuf,
+        source: io::Error,
+        report: PlacementReport,
+    },
+}
+
+impl fmt::Display for Placement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Placement::Confirmed => {
+                f.write_str("the child is a member of the leaf cgroup (not a degrade — reported in error)")
+            }
+            Placement::Absent {
+                pid,
+                path,
+                procs,
+                report,
+                child_state,
+            } => {
+                let listed = procs.trim();
+                write!(
+                    f,
+                    "the leaf cgroup was created but child {pid} is not listed in {} \
+                     (cgroup.procs is {}); {report}; {}",
+                    path.display(),
+                    if listed.is_empty() {
+                        "empty".to_string()
+                    } else {
+                        format!("{listed:?}")
+                    },
+                    match child_state {
+                        Some('Z') => "and the child is already a zombie — it exited before this \
+                                      check, so its membership ended before the check could see it"
+                            .to_string(),
+                        Some(state) => format!("and the child is still live (/proc state {state})"),
+                        None => "and the child's /proc state could not be read".to_string(),
+                    }
+                )
+            }
+            Placement::Unreadable {
+                pid,
+                path,
+                source,
+                report,
+            } => write!(
+                f,
+                "the leaf cgroup was created but membership of child {pid} could not be read \
+                 from {}: {source}; {report}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Record, at `warn`, that this spawn is not getting the containment it asked for and why.
+///
+/// One function for every degrade site so the wording is composed once: whichever step
+/// failed, CI output carries a single line naming the achieved mechanism and the reason the
+/// stronger one was unavailable. `warn` rather than `debug` because a degrade is a real
+/// reduction in the guarantee the caller requested, not routine progress.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn log_degrade(reason: &dyn fmt::Display) {
+    log::warn!("cgroup v2 containment: degrading to a process group — {reason}");
+}
+
 // Everything below is Linux-only. =====
 
 #[cfg(target_os = "linux")]
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
-use std::io;
-#[cfg(target_os = "linux")]
 use std::os::fd::{IntoRawFd, RawFd};
 #[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 /// Process-wide monotonic counter; combined with the pid, gives a unique leaf
 /// name even when the same process spawns on multiple threads simultaneously.
@@ -148,6 +354,130 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
+/// The kernel's current state letter for `pid`, or `None` when `/proc/<pid>/stat` cannot be
+/// read or parsed. A not-yet-reaped child reads as `Z`, which is what separates "the
+/// placement write failed" from "the child exited before membership was checked".
+#[cfg(target_os = "linux")]
+fn proc_state(pid: u32) -> Option<char> {
+    parse_proc_stat_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Sentinel stored in a [`ReportPage`] while the child has reported nothing. A fresh
+/// anonymous mapping is zero-filled, so this is also the page's initial state.
+#[cfg(target_os = "linux")]
+const REPORT_NOT_REPORTED: i32 = 0;
+/// Sentinel stored by the child when its `cgroup.procs` write succeeded. Negative so it can
+/// never collide with an errno, which `write(2)` only ever reports as positive.
+#[cfg(target_os = "linux")]
+const REPORT_PLACED: i32 = -1;
+
+/// A single machine word shared with the forked child (`MAP_SHARED | MAP_ANONYMOUS`), so the
+/// self-placement write's outcome crosses back out of the child.
+///
+/// `pre_exec` runs after `fork`, where every ordinary channel is closed to it: the address
+/// space is copy-on-write (the parent cannot see a normal store), and async-signal-safety
+/// forbids allocating, formatting or locking. A shared anonymous page costs one `mmap` per
+/// contained spawn and admits exactly one async-signal-safe operation — an aligned atomic
+/// store of one `i32` — which is all a report needs to be.
+///
+/// **Not a race.** The child stores its outcome strictly before `exec`, and `std`'s Unix
+/// spawn does not return to the parent until the child has exec'd (it reads the child's
+/// CLOEXEC error pipe to EOF). Every parent read therefore happens after the child's store,
+/// ordered by the kernel through that pipe, not by timing.
+#[cfg(target_os = "linux")]
+pub(crate) struct ReportPage {
+    ptr: *mut AtomicI32,
+}
+
+// Safety: the page is owned solely by this handle (never cloned, `munmap`ed exactly once by
+// `Drop`), and every access to it goes through an atomic.
+#[cfg(target_os = "linux")]
+unsafe impl Send for ReportPage {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for ReportPage {}
+
+#[cfg(target_os = "linux")]
+impl ReportPage {
+    pub(crate) fn new() -> io::Result<ReportPage> {
+        // Safety: a fresh anonymous mapping — no caller-supplied address, length or fd.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<AtomicI32>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let ptr = raw.cast::<AtomicI32>();
+        // Anonymous pages are zero-filled and REPORT_NOT_REPORTED is 0, so this store changes
+        // nothing — it states the initial sentinel instead of inheriting it from mmap's
+        // guarantee, so renaming or renumbering the sentinel cannot silently desynchronize.
+        // Safety: `ptr` is a live, aligned, writable mapping of exactly one AtomicI32.
+        unsafe { (*ptr).store(REPORT_NOT_REPORTED, Ordering::SeqCst) };
+        Ok(ReportPage { ptr })
+    }
+
+    /// A `Copy` handle to the page for capture by the `pre_exec` closure (which must not
+    /// capture the owning `ReportPage`: the leaf keeps it, and the child must not `munmap`).
+    pub(crate) fn slot(&self) -> ReportSlot {
+        ReportSlot { ptr: self.ptr }
+    }
+
+    /// The child's report, read from the parent after the spawn has returned.
+    pub(crate) fn read(&self) -> PlacementReport {
+        // Safety: as above; the mapping outlives this handle.
+        match unsafe { (*self.ptr).load(Ordering::SeqCst) } {
+            REPORT_NOT_REPORTED => PlacementReport::NotReported,
+            REPORT_PLACED => PlacementReport::Placed,
+            errno => PlacementReport::WriteFailed(errno),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReportPage {
+    fn drop(&mut self) {
+        // Safety: this handle owns the mapping and unmaps it exactly once.
+        unsafe { libc::munmap(self.ptr.cast(), std::mem::size_of::<AtomicI32>()) };
+    }
+}
+
+/// The child-side half of a [`ReportPage`]: a `Copy` pointer with one async-signal-safe
+/// operation. Owns nothing — the parent's `ReportPage` unmaps the page.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(crate) struct ReportSlot {
+    ptr: *mut AtomicI32,
+}
+
+// Safety: a raw pointer to a shared mapping that outlives every closure capturing it (the
+// owning `CgroupLeaf` is moved into `Prepared` and dropped only after the spawn completes).
+// `Sync` as well as `Send` because `Command::pre_exec` requires both of its closure, and the
+// only operation this type offers is an atomic store — sharing it across threads adds no
+// unsynchronized access.
+#[cfg(target_os = "linux")]
+unsafe impl Send for ReportSlot {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for ReportSlot {}
+
+#[cfg(target_os = "linux")]
+impl ReportSlot {
+    /// Store the child's outcome. Async-signal-safe: one aligned atomic store, no allocation.
+    ///
+    /// # Safety
+    /// The page this slot points at must still be mapped, which holds for as long as the
+    /// `CgroupLeaf` that produced it is alive.
+    unsafe fn report(self, value: i32) {
+        // Safety: the caller guarantees the mapping is live; the store is atomic.
+        unsafe { (*self.ptr).store(value, Ordering::SeqCst) };
+    }
+}
+
 /// A live leaf sub-cgroup created for a single spawned process tree.
 ///
 /// The `pre_exec` closure writes `"0"` to `procs_fd` to place the forked
@@ -165,6 +495,8 @@ pub(crate) struct CgroupLeaf {
     leaf_path: PathBuf,
     /// Pre-opened `cgroup.procs` fd (O_CLOEXEC cleared) for the `pre_exec` write.
     procs_fd: RawFd,
+    /// Where the forked child reports whether its self-placement write succeeded.
+    report: ReportPage,
 }
 
 // Safety: RawFd is an integer. CgroupLeaf is not Clone; the fd is used only in
@@ -186,19 +518,53 @@ impl CgroupLeaf {
         self.leaf_path.join("cgroup.events")
     }
 
-    /// Returns `true` when `pid` is listed in `cgroup.procs` of this leaf.
-    /// Used post-spawn (parent side) to confirm placement succeeded.
-    pub(crate) fn contains_pid(&self, pid: u32) -> bool {
-        match fs::read_to_string(self.leaf_path.join("cgroup.procs")) {
-            Ok(contents) => cgroup_procs_contains(&contents, pid),
-            Err(_) => false,
+    /// A `Copy` handle to this leaf's placement-report slot, for capture by the `pre_exec`
+    /// closure.
+    pub(crate) fn placement_slot(&self) -> ReportSlot {
+        self.report.slot()
+    }
+
+    /// Whether `pid` is a member of this leaf, with every fact the verdict rests on.
+    ///
+    /// Used post-spawn (parent side): the `pre_exec` write can fail, so membership is
+    /// confirmed against the kernel rather than assumed. On a negative verdict the child's
+    /// own report and its current `/proc` state come back with it — see [`Placement`].
+    pub(crate) fn placement_of(&self, pid: u32) -> Placement {
+        let path = self.leaf_path.join("cgroup.procs");
+        let report = self.report.read();
+        match fs::read_to_string(&path) {
+            Ok(procs) if cgroup_procs_contains(&procs, pid) => Placement::Confirmed,
+            Ok(procs) => Placement::Absent {
+                pid,
+                path,
+                procs,
+                report,
+                child_state: proc_state(pid),
+            },
+            Err(source) => Placement::Unreadable {
+                pid,
+                path,
+                source,
+                report,
+            },
         }
     }
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
     /// Best-effort: already-empty leaves are silently fine.
     pub(crate) fn hard_kill(&self) {
-        let _ = fs::write(self.leaf_path.join("cgroup.kill"), b"1");
+        let path = self.leaf_path.join("cgroup.kill");
+        if let Err(e) = fs::write(&path, b"1") {
+            // An already-removed leaf is the routine case (Drop ran, or the tree drained and
+            // a cgroup manager reaped the empty leaf) and is not a failure to kill anything.
+            // Any other errno means the atomic kill did NOT happen, which the caller reads as
+            // a completed teardown — say so rather than dropping it.
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                log::debug!("cgroup.kill: leaf {} is already gone", path.display());
+            } else {
+                log::warn!("cgroup.kill: could not kill the tree in {}: {e}", path.display());
+            }
+        }
     }
 
     /// Block until every process in the leaf has EXITED (not reaped), observed via
@@ -292,6 +658,7 @@ impl CgroupLeaf {
         CgroupLeaf {
             leaf_path: PathBuf::from("/nonexistent/cosca-cgroup-placeholder"),
             procs_fd: -1,
+            report: ReportPage::new().expect("map a placement-report page"),
         }
     }
 }
@@ -306,28 +673,49 @@ impl Drop for CgroupLeaf {
         // fire cgroup.kill to drain it, then retry. The second remove_dir may
         // still fail if the kernel hasn't finished reaping the killed tasks yet;
         // we accept this (the leaf will be cleaned up by the cgroup manager when
-        // it finds it empty on next access, or by the slice's own teardown).
-        if fs::remove_dir(&self.leaf_path).is_err() {
-            let _ = fs::write(self.leaf_path.join("cgroup.kill"), b"1");
-            let _ = fs::remove_dir(&self.leaf_path);
+        // it finds it empty on next access, or by the slice's own teardown) — but
+        // an accepted leak is still a leak, and a host accumulating stray
+        // `cosca-*` leaves is only diagnosable if each one says so as it happens
+        // (issue #140).
+        if let Err(first) = fs::remove_dir(&self.leaf_path) {
+            let kill = fs::write(self.leaf_path.join("cgroup.kill"), b"1");
+            if let Err(second) = fs::remove_dir(&self.leaf_path) {
+                log::warn!(
+                    "cgroup leaf {} leaked: first rmdir failed ({first}), cgroup.kill {}, \
+                     second rmdir failed ({second}); the leaf stays on this host until a \
+                     cgroup manager reaps it",
+                    self.leaf_path.display(),
+                    match kill {
+                        Ok(()) => "succeeded".to_string(),
+                        Err(e) => format!("failed ({e})"),
+                    }
+                );
+            }
         }
     }
 }
 
 /// Detect the current process's cgroup v2 path and create a leaf sub-cgroup
-/// for containment. Returns `None` on any failure so the caller falls back to
-/// the process-group mechanism.
+/// for containment. Returns the failing step on any failure, so the caller can
+/// fall back to the process-group mechanism *and say why it had to*.
 ///
 /// Failure conditions include: cgroup v2 not mounted at `/sys/fs/cgroup`,
 /// current process not in a v2 cgroup (v1-only system), leaf directory not
 /// writable (undelegated slice), or `cgroup.kill` absent (kernel < 5.14).
 #[cfg(target_os = "linux")]
-pub(crate) fn try_create_leaf() -> Option<CgroupLeaf> {
-    let cgroup_file = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel_path = parse_v2_relative_path(&cgroup_file)?;
+pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
+    let cgroup_file = fs::read_to_string("/proc/self/cgroup").map_err(LeafError::ReadProcSelfCgroup)?;
+    let rel_path = parse_v2_relative_path(&cgroup_file).ok_or_else(|| LeafError::NoUnifiedLine(cgroup_file.clone()))?;
 
-    let current = Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/'));
+    create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))
+}
 
+/// Create a containment leaf directly under `current` — the supervisor's own cgroup in
+/// production, and a temp directory in the tests that fail each precondition for real.
+///
+/// Every early return names its step: the caller degrades either way, but never silently.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError> {
     // Unique leaf name: pid + monotonic sequence counter avoids collisions when
     // the same process spawns on multiple threads simultaneously (same pid, but
     // different seq values mean different leaf names).
@@ -336,36 +724,85 @@ pub(crate) fn try_create_leaf() -> Option<CgroupLeaf> {
     let leaf_name = format!("cosca-{}-{}", unsafe { libc::getpid() }, seq);
     let leaf_path = current.join(&leaf_name);
 
-    fs::create_dir(&leaf_path).ok()?;
+    fs::create_dir(&leaf_path).map_err(|source| LeafError::CreateLeafDir {
+        path: leaf_path.clone(),
+        source,
+    })?;
+
+    // Every failure past this point removes the leaf it just created, so a degrade never
+    // leaves a stray `cosca-*` cgroup behind (issue #140).
+    let fail = |leaf_path: &Path, err: LeafError| -> LeafError {
+        let _ = fs::remove_dir(leaf_path);
+        err
+    };
 
     // Require cgroup.kill (kernel ≥ 5.14); without it there is no atomic kill.
     if !leaf_path.join("cgroup.kill").exists() {
-        let _ = fs::remove_dir(&leaf_path);
-        return None;
+        return Err(fail(
+            &leaf_path,
+            LeafError::KillUnsupported {
+                path: leaf_path.clone(),
+            },
+        ));
     }
+
+    // The report page is mapped before the fd is opened so a failure here unwinds nothing but
+    // the directory: a leaf whose child could not report its placement outcome would reopen
+    // exactly the silence this module is reporting its way out of.
+    let report = match ReportPage::new() {
+        Ok(r) => r,
+        Err(e) => return Err(fail(&leaf_path, LeafError::MapReportPage(e))),
+    };
 
     // Open cgroup.procs for writing. O_CLOEXEC is set by default on Linux; clear
     // it explicitly so the fd survives fork+exec into the child.
-    let procs_file: File = OpenOptions::new()
-        .write(true)
-        .open(leaf_path.join("cgroup.procs"))
-        .ok()?;
+    let procs_path = leaf_path.join("cgroup.procs");
+    let procs_file: File = match OpenOptions::new().write(true).open(&procs_path) {
+        Ok(f) => f,
+        Err(source) => {
+            return Err(fail(
+                &leaf_path,
+                LeafError::OpenProcs {
+                    path: procs_path,
+                    source,
+                },
+            ))
+        }
+    };
     let procs_fd = procs_file.into_raw_fd();
 
     // Safety: procs_fd is valid.
     let flags = unsafe { libc::fcntl(procs_fd, libc::F_GETFD) };
     if flags == -1 {
+        let source = io::Error::last_os_error();
+        // Safety: procs_fd is valid and owned here; closed exactly once on this path.
         unsafe { libc::close(procs_fd) };
-        let _ = fs::remove_dir(&leaf_path);
-        return None;
+        return Err(fail(
+            &leaf_path,
+            LeafError::ReadCloexec {
+                path: procs_path,
+                source,
+            },
+        ));
     }
     if unsafe { libc::fcntl(procs_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        let source = io::Error::last_os_error();
+        // Safety: as above.
         unsafe { libc::close(procs_fd) };
-        let _ = fs::remove_dir(&leaf_path);
-        return None;
+        return Err(fail(
+            &leaf_path,
+            LeafError::ClearCloexec {
+                path: procs_path,
+                source,
+            },
+        ));
     }
 
-    Some(CgroupLeaf { leaf_path, procs_fd })
+    Ok(CgroupLeaf {
+        leaf_path,
+        procs_fd,
+        report,
+    })
 }
 
 /// Place the calling process into the pre-created cgroup leaf by writing `"0"`
@@ -378,21 +815,41 @@ pub(crate) fn try_create_leaf() -> Option<CgroupLeaf> {
 /// `Ok(())` to fall back to the already-configured process group rather than
 /// aborting the spawn.
 ///
+/// The outcome — success, or the exact errno — is also stored in `slot` so it reaches the
+/// parent. The `Err` return value cannot: it is discarded by design (a failed placement must
+/// not abort the spawn), and nothing else the child computes survives its `exec`.
+///
 /// # Safety
 /// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
-/// open, writable fd in the child process. Async-signal-safe: raw `libc::write`
-/// + `libc::close`, no allocation, no format strings.
+/// open, writable fd in the child process, and `slot`'s page must still be mapped.
+/// Async-signal-safe: raw `libc::write` + `libc::close` + one atomic store, no allocation,
+/// no format strings.
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd) -> io::Result<()> {
+pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
     static ZERO: &[u8] = b"0";
     // Safety: ZERO is a valid buffer; procs_fd is valid (caller guarantees).
     let ret = unsafe { libc::write(procs_fd, ZERO.as_ptr().cast(), ZERO.len()) };
+    // Read errno before `close`, which is free to clobber it.
+    // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
+    let errno = if ret == -1 {
+        unsafe { *libc::__errno_location() }
+    } else {
+        0
+    };
     // Always close the fd — even on error — so it does not propagate to children.
     // Safety: procs_fd is valid; close is async-signal-safe.
     unsafe { libc::close(procs_fd) };
     if ret == -1 {
-        Err(io::Error::last_os_error())
+        // `write(2)` only ever sets a positive errno, but the report page's sentinels occupy
+        // 0 and -1, so a nonsensical value is mapped to EIO rather than read back as a
+        // fabricated "placed" or "not reported".
+        let reported = if errno > 0 { errno } else { libc::EIO };
+        // Safety: the caller guarantees the slot's page is mapped.
+        unsafe { slot.report(reported) };
+        Err(io::Error::from_raw_os_error(errno))
     } else {
+        // Safety: as above.
+        unsafe { slot.report(REPORT_PLACED) };
         Ok(())
     }
 }

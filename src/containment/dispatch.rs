@@ -426,7 +426,16 @@ pub(crate) fn prepare(
                 }
             }
 
-            let leaf = crate::containment::cgroup::try_create_leaf();
+            // A failed leaf creation degrades this spawn to the process group set above. The
+            // decision is unchanged; only the silence is — `log_degrade` names the step that
+            // failed and the kernel's reason for it.
+            let leaf = match crate::containment::cgroup::try_create_leaf() {
+                Ok(leaf) => Some(leaf),
+                Err(e) => {
+                    crate::containment::cgroup::log_degrade(&e);
+                    None
+                }
+            };
             if let Some(ref l) = leaf {
                 // Wire the pre_exec self-placement. The closure captures the raw
                 // fd integer (Copy) — not the leaf itself (which stays in Prepared).
@@ -436,10 +445,15 @@ pub(crate) fn prepare(
                 // Safety: pre_exec runs post-fork, pre-exec; the function is
                 // async-signal-safe (libc::write + libc::close, no alloc).
                 let procs_fd = l.procs_fd();
+                // The child's own outcome — success, or the write's errno — is stored here;
+                // it is the only channel out of a post-fork, pre-exec address space, and the
+                // `Err` below is discarded precisely so a failed placement cannot abort the
+                // spawn.
+                let slot = l.placement_slot();
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     std_cmd.pre_exec(move || {
-                        let _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd);
+                        let _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot);
                         Ok(())
                     });
                 }
@@ -559,13 +573,21 @@ fn attach_tree(
                     // (EBUSY — "no internal processes" rule when the supervisor
                     // is itself an undelegated leaf). Read cgroup.procs to
                     // confirm the child's pid is actually present.
-                    if leaf.contains_pid(raw_pid) {
-                        return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)));
+                    match leaf.placement_of(raw_pid) {
+                        crate::containment::cgroup::Placement::Confirmed => {
+                            return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)))
+                        }
+                        // Not a member — the leaf owns nothing; drop it (triggers rmdir) and
+                        // let the process group set pre-spawn be the real container. The
+                        // verdict carries the child's own report and its current state, so
+                        // "the write failed (errno)" and "the write succeeded and the child
+                        // then exited" are distinguishable from the log alone.
+                        reason => {
+                            crate::containment::cgroup::log_degrade(&reason);
+                            drop(leaf);
+                            return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
+                        }
                     }
-                    // Placement failed — the leaf is empty; drop it (triggers
-                    // rmdir). The process group set pre-spawn is the real container.
-                    drop(leaf);
-                    return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
                 }
                 // No cgroup leaf: fall back to process group (set pre-spawn).
                 return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));

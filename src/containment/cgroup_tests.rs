@@ -230,14 +230,17 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         // Unprovisioned: not a CI-cgroup environment — true no-op, never a false "ok".
         return;
     }
-    let leaf = super::try_create_leaf().expect(
-        "COSCA_TEST_CGROUP is set but no usable delegated cgroup v2 leaf could be created — is \
-         this process running inside a writable, delegated cgroup v2 slice with cgroup.kill \
-         support (kernel >= 5.14)?",
-    );
+    let leaf = super::try_create_leaf().unwrap_or_else(|e| {
+        panic!(
+            "COSCA_TEST_CGROUP is set but no usable delegated cgroup v2 leaf could be created \
+             ({e}) — is this process running inside a writable, delegated cgroup v2 slice with \
+             cgroup.kill support (kernel >= 5.14)?"
+        )
+    });
 
     let spawn_member = |leaf: &super::CgroupLeaf| -> std::process::Child {
         let procs_fd = leaf.procs_fd();
+        let slot = leaf.placement_slot();
         let mut cmd = Command::new("sleep");
         cmd.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
@@ -247,7 +250,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         // copy) — exactly its own documented contract. `leaf` outlives every member spawned
         // through it in this test.
         unsafe {
-            cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd));
+            cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot));
         }
         cmd.spawn().expect("spawn a real long-lived cgroup leaf member")
     };
@@ -267,14 +270,13 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         TreeDrain::MembersRemain,
         "both members are alive; must report MembersRemain"
     );
-    assert!(
-        leaf.contains_pid(a.id()),
-        "member a must actually be placed in the leaf"
-    );
-    assert!(
-        leaf.contains_pid(b.id()),
-        "member b must actually be placed in the leaf"
-    );
+    for (name, member) in [("a", &a), ("b", &b)] {
+        let placement = leaf.placement_of(member.id());
+        assert!(
+            matches!(placement, super::Placement::Confirmed),
+            "member {name} must actually be placed in the leaf: {placement}"
+        );
+    }
 
     // One survivor: `populated` never flips (still nonzero), so the verdict must not change.
     a.kill().expect("kill member a");
@@ -296,4 +298,302 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         TreeDrain::AllMembersExited,
         "both members exited; must report AllMembersExited"
     );
+}
+
+// Degrade-reason reporting =====
+// The diagnostic types are pure data, so their formatting is tested on every host.
+
+use std::path::PathBuf;
+
+use super::{log_degrade, parse_proc_stat_state, LeafError, Placement, PlacementReport};
+
+/// Every `LeafError` names the step, the path it touched, and the kernel's own reason.
+/// Asserted per variant: a step whose message drops any of the three is the silence this
+/// type exists to remove.
+#[test]
+fn leaf_error_names_step_path_and_reason() {
+    let cases: Vec<(LeafError, &[&str])> = vec![
+        (
+            LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13)),
+            &["/proc/self/cgroup", "denied"],
+        ),
+        (
+            LeafError::NoUnifiedLine("9:memory:/foo\n".into()),
+            &["/proc/self/cgroup", "0::", "9:memory:/foo"],
+        ),
+        (
+            LeafError::CreateLeafDir {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0"),
+                source: std::io::Error::from_raw_os_error(13),
+            },
+            &["/sys/fs/cgroup/slice/cosca-7-0", "denied"],
+        ),
+        (
+            LeafError::KillUnsupported {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0"),
+            },
+            &["/sys/fs/cgroup/slice/cosca-7-0", "cgroup.kill"],
+        ),
+        (
+            LeafError::OpenProcs {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
+                source: std::io::Error::from_raw_os_error(13),
+            },
+            &["cgroup.procs", "denied"],
+        ),
+        (
+            LeafError::ReadCloexec {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
+                source: std::io::Error::from_raw_os_error(9),
+            },
+            &["cgroup.procs", "FD_CLOEXEC"],
+        ),
+        (
+            LeafError::ClearCloexec {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
+                source: std::io::Error::from_raw_os_error(9),
+            },
+            &["cgroup.procs", "FD_CLOEXEC"],
+        ),
+        (
+            LeafError::MapReportPage(std::io::Error::from_raw_os_error(12)),
+            &["report", "memory"],
+        ),
+    ];
+    for (err, needles) in cases {
+        let rendered = err.to_string();
+        for needle in needles {
+            assert!(
+                rendered.contains(needle),
+                "{err:?} renders as {rendered:?}, which does not mention {needle:?}"
+            );
+        }
+    }
+}
+
+/// The child's own self-placement outcome is reported verbatim, errno included — the one
+/// step whose reason lives in the forked child and is otherwise unobservable to the parent.
+#[test]
+fn placement_report_renders_the_childs_errno() {
+    assert!(PlacementReport::WriteFailed(16).to_string().contains("errno 16"));
+    assert!(PlacementReport::WriteFailed(16).to_string().contains("busy"));
+    assert!(PlacementReport::Placed.to_string().contains("succeeded"));
+    assert!(PlacementReport::NotReported.to_string().contains("did not run"));
+}
+
+/// An absent child renders the pid, the leaf path, the file's actual contents and the child's
+/// own state — the four facts that separate "the write failed" from "the child already exited".
+#[test]
+fn placement_absent_renders_every_observed_fact() {
+    let absent = Placement::Absent {
+        pid: 4242,
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
+        procs: String::new(),
+        report: PlacementReport::Placed,
+        child_state: Some('Z'),
+    };
+    let rendered = absent.to_string();
+    for needle in ["4242", "cosca-7-0/cgroup.procs", "empty", "succeeded", "zombie"] {
+        assert!(
+            rendered.contains(needle),
+            "absent placement renders as {rendered:?}, which does not mention {needle:?}"
+        );
+    }
+}
+
+/// A live child that is nonetheless not a member is a different diagnosis from a zombie one,
+/// and must not be described as having exited.
+#[test]
+fn placement_absent_distinguishes_a_live_child() {
+    let rendered = Placement::Absent {
+        pid: 4242,
+        path: PathBuf::from("/cg/cgroup.procs"),
+        procs: "99\n".into(),
+        report: PlacementReport::WriteFailed(16),
+        child_state: Some('S'),
+    }
+    .to_string();
+    assert!(rendered.contains("99"), "the file's real contents must be quoted");
+    assert!(rendered.contains("errno 16"), "the child's errno must be carried");
+    assert!(!rendered.contains("zombie"), "a live child must not be called a zombie");
+}
+
+/// An unreadable `cgroup.procs` is its own diagnosis, never folded into "not a member".
+#[test]
+fn placement_unreadable_names_the_io_error() {
+    let rendered = Placement::Unreadable {
+        pid: 4242,
+        path: PathBuf::from("/cg/cgroup.procs"),
+        source: std::io::Error::from_raw_os_error(13),
+        report: PlacementReport::Placed,
+    }
+    .to_string();
+    assert!(rendered.contains("/cg/cgroup.procs"));
+    assert!(rendered.contains("denied"));
+}
+
+/// The degrade is logged at `warn` with the reason attached — the single line a human reading
+/// CI output needs to tell WHICH step failed from the bare fact that containment degraded.
+#[test]
+fn degrade_logs_the_reason_at_warn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    log_degrade(&LeafError::KillUnsupported {
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-degrade-probe-a41f"),
+    });
+    assert!(
+        crate::log_capture::contains_since(mark, "cosca-degrade-probe-a41f"),
+        "the degrade log must carry the failing step's own path"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "process group"),
+        "the degrade log must say what containment degraded TO"
+    );
+}
+
+// parse_proc_stat_state tests -----
+
+/// The ordinary case: a zombie child, the state that explains "placed, then left the set".
+#[test]
+fn proc_stat_state_reads_zombie() {
+    assert_eq!(
+        parse_proc_stat_state("42 (cosca_testbin) Z 1 42 42 0 -1 4194560\n"),
+        Some('Z')
+    );
+}
+
+/// `comm` is arbitrary bytes inside parentheses: a name containing spaces AND parentheses
+/// must not shift the field index, so the scan starts after the LAST `)`.
+#[test]
+fn proc_stat_state_survives_a_hostile_comm() {
+    assert_eq!(parse_proc_stat_state("42 (weird ) name (x) R 1 42\n"), Some('R'));
+}
+
+/// Truncated or malformed input yields no state rather than a guessed one.
+#[test]
+fn proc_stat_state_malformed_is_none() {
+    assert_eq!(parse_proc_stat_state(""), None);
+    assert_eq!(parse_proc_stat_state("42 (noparen"), None);
+    assert_eq!(parse_proc_stat_state("42 (comm)"), None);
+}
+
+// Linux failure-path tests -----
+// Real filesystem, no cgroup v2 required: `create_leaf_under` is parameterised by the
+// directory it creates the leaf in, so every precondition it checks can be failed for real
+// against a temp directory on any Linux host.
+
+/// A `mkdir` the kernel refuses reports the `mkdir` step, its path and its errno — not a
+/// bare "cgroups unavailable".
+///
+/// The refusal is a parent directory that does not exist (`ENOENT`), not one whose mode
+/// forbids writing: CI's cgroup lane runs as root, and root ignores directory permissions, so
+/// a mode-based refusal would be a no-op there and this test would assert nothing. `ENOENT`
+/// is uid-independent, and the step maps every errno the same way — it carries the kernel's
+/// reason rather than classifying it.
+#[cfg(target_os = "linux")]
+#[test]
+fn create_leaf_under_reports_a_refused_mkdir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parent = dir.path().join("no-such-slice");
+
+    let err = match super::create_leaf_under(&parent) {
+        Err(e) => e,
+        Ok(_) => panic!("creating a leaf under a nonexistent directory must fail"),
+    };
+    assert!(
+        matches!(err, LeafError::CreateLeafDir { .. }),
+        "expected CreateLeafDir, got {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("no-such-slice"), "path missing from {rendered:?}");
+    assert!(
+        rendered.contains("No such file or directory"),
+        "errno missing from {rendered:?}"
+    );
+}
+
+/// A writable directory with no `cgroup.kill` in the created leaf (i.e. not a cgroupfs, or a
+/// kernel older than 5.14) reports THAT, and leaves no stray directory behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn create_leaf_under_reports_a_missing_cgroup_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = match super::create_leaf_under(dir.path()) {
+        Err(e) => e,
+        Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
+    };
+    assert!(
+        matches!(err, LeafError::KillUnsupported { .. }),
+        "expected KillUnsupported, got {err:?}"
+    );
+    assert!(err.to_string().contains("cgroup.kill"), "got {err}");
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(strays.is_empty(), "a failed leaf creation left {strays:?} behind");
+}
+
+/// The child's self-placement errno crosses `fork` into the parent. Deterministic and
+/// cgroup-free: fd -1 is never writable, so the child's `write` always fails with `EBADF`,
+/// and the parent must read back that exact errno rather than a guess.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_report_crosses_fork_with_the_childs_errno() {
+    use std::os::unix::process::CommandExt;
+
+    let page = super::ReportPage::new().expect("map the report page");
+    assert_eq!(
+        page.read(),
+        PlacementReport::NotReported,
+        "a fresh page must report nothing, not a fabricated success"
+    );
+
+    let slot = page.slot();
+    let mut cmd = std::process::Command::new("/bin/true");
+    // SAFETY: the closure runs between fork and exec; it performs only the documented
+    // async-signal-safe operations (write, close, one atomic store into a shared page).
+    unsafe {
+        cmd.pre_exec(move || {
+            let _ = super::place_self_in_cgroup_pre_exec(-1, slot);
+            Ok(())
+        });
+    }
+    let status = cmd.spawn().expect("spawn").wait().expect("wait");
+    assert!(status.success(), "the failed placement must not abort the spawn");
+    assert_eq!(
+        page.read(),
+        PlacementReport::WriteFailed(libc::EBADF),
+        "the child's own errno must reach the parent verbatim"
+    );
+}
+
+/// A successful self-placement is reported too — the fact that separates "the write failed"
+/// from "the write worked and the child then left the set".
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_report_records_a_successful_write() {
+    use std::os::unix::process::CommandExt;
+
+    let page = super::ReportPage::new().expect("map the report page");
+    let slot = page.slot();
+    // /dev/null accepts any write, standing in for a writable cgroup.procs.
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    let mut cmd = std::process::Command::new("/bin/true");
+    // SAFETY: as above; `fd` is a valid writable descriptor inherited by the fork, and the
+    // closure closes only the child's copy.
+    unsafe {
+        cmd.pre_exec(move || {
+            let _ = super::place_self_in_cgroup_pre_exec(fd, slot);
+            Ok(())
+        });
+    }
+    cmd.spawn().expect("spawn").wait().expect("wait");
+    assert_eq!(page.read(), PlacementReport::Placed);
+    // SAFETY: the parent's own copy of the descriptor, closed exactly once.
+    unsafe { libc::close(fd) };
 }
