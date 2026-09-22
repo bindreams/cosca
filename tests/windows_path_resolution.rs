@@ -1001,6 +1001,279 @@ fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
             );
         }
     }
+    // Printed only, for now: which file do the other verbatim-looking spellings open?
+    let forward = dir.replace('\\', "/");
+    for name in LOOKALIKES {
+        for (tag, path) in [
+            ("//?/", format!("//?/{forward}/{name}")),
+            (r"\\?/", format!(r"\\?/{dir}\{name}")),
+            (r"\??\", format!(r"\??\{dir}\{name}")),
+        ] {
+            match std::fs::read_to_string(&path) {
+                Ok(body) => println!("  {tag:<5} {path:?} reads the file named {body:?}"),
+                Err(e) => println!(
+                    "  {tag:<5} {path:?} read FAILED: {e} (raw_os_error={:?})",
+                    e.raw_os_error()
+                ),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// One expected `GetFullPathNameW` result: `(input, the result, why)`.
+type Resolution = (String, String, &'static str);
+
+/// Check each row's `GetFullPathNameW` result exactly, printing every one.
+fn check_resolutions(rows: &[Resolution], facts: &mut Disagreements, failures: &mut Vec<String>) {
+    for (input, want, why) in rows {
+        match full_path_name(input) {
+            Ok(resolved) => {
+                println!(
+                    "  {input:?} -> {resolved:?}  std_has_bat_extension={}  ({why})",
+                    has_bat_extension(&resolved)
+                );
+                facts.check(
+                    &resolved == want,
+                    &format!("{input:?} resolves to {want:?} ({why})"),
+                    format_args!("{resolved:?}"),
+                );
+            }
+            Err(why) => failures.push(why),
+        }
+    }
+}
+
+/// Rows whose input and result are both literal.
+fn literal_rows(rows: &[(&str, &str, &'static str)]) -> Vec<Resolution> {
+    rows.iter()
+        .map(|&(input, want, why)| (input.to_string(), want.to_string(), why))
+        .collect()
+}
+
+/// Canary: `..` never pops a UNC path's `\\server\share`, but pops everything after `\\.\`.
+///
+/// So under a UNC root the share name is the floor: `\\srv\x.bat\y\..\..` is `\\srv\x.bat`, a
+/// batch-shaped name. Under `\\.\` the device name is an ordinary component: `\\.\C:\..\..\x.bat`
+/// is `\\.\x.bat`. `/` and `\` are interchangeable in the leading pair, so `//srv/…` and `\/srv\…`
+/// are UNC paths too. A `..` in the share slot is not popped: it IS the share name.
+///
+/// String-level only: `GetFullPathNameW` contacts no server and opens no device.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let rows = literal_rows(&[
+        (
+            r"\\srv\x.bat\..",
+            r"\\srv\x.bat",
+            "`..` right after the share pops nothing",
+        ),
+        (r"\\srv\x.bat\y\..\..", r"\\srv\x.bat", "the second `..` pops nothing"),
+        (
+            r"\\srv\x.bat\y.bat\..",
+            r"\\srv\x.bat",
+            "`..` pops the component after the share",
+        ),
+        (
+            r"\\srv\x.bat\..\y",
+            r"\\srv\x.bat\y",
+            "the walk continues from the share",
+        ),
+        (r"\\srv\x.bat\..\..\y", r"\\srv\x.bat\y", "however many `..`"),
+        (
+            r"\\srv\x.bat\...",
+            r"\\srv\x.bat\",
+            "a dots-only final component drops out",
+        ),
+        (r"\\srv\x.bat.", r"\\srv\x.bat", "the share name loses its trailing dot"),
+        (
+            r"\\srv\..\x.bat",
+            r"\\srv\..\x.bat",
+            "`..` in the share slot is the share name",
+        ),
+        (r"//srv/x.bat/..", r"\\srv\x.bat", "`//` is a UNC root"),
+        (r"\/srv\x.cmd\..", r"\\srv\x.cmd", r"`\/` is a UNC root"),
+        (r"/\srv\x.bat\..", r"\\srv\x.bat", r"`/\` is a UNC root"),
+        (
+            r"//srv/x.bat/y/../..",
+            r"\\srv\x.bat",
+            "slash-spelled, the share is still the floor",
+        ),
+        (
+            r"//srv/x.bat/../y",
+            r"\\srv\x.bat\y",
+            "slash-spelled, the walk continues from the share",
+        ),
+        (
+            r"\\.\C:\x.bat\..",
+            r"\\.\C:",
+            "a device path's `..` pops an ordinary component",
+        ),
+        (r"\\.\C:\..", r"\\.\", "the device name `C:` is popped too"),
+        (
+            r"\\.\C:\..\..\x.bat",
+            r"\\.\x.bat",
+            "popped past the device, a batch name is left",
+        ),
+        (r"\\.\x.bat\..", r"\\.\", "the device name is popped"),
+        (r"\\.\x.bat\y\..\..", r"\\.\", r"`\\.\` is the floor"),
+        (r"\\.\pipe\x.bat\..", r"\\.\pipe", "`pipe` is an ordinary component"),
+        (r"//./C:/x.bat/..", r"\\.\C:", r"`//./` is `\\.\`"),
+        (
+            r"\\.\C:\dir\x.bat.",
+            r"\\.\C:\dir\x.bat",
+            "a device path loses a trailing dot",
+        ),
+    ]);
+    check_resolutions(&rows, &mut facts, &mut failures);
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Canary: in `GetFullPathNameW`, `\\?\` and every slash spelling of it (`//?/`, `\\?/`, `/\?\`,
+/// `\/?\`) resolve alike — separators become `\`, trailing dots drop, `..` pops — while `\??\` is
+/// a rooted path on the current drive.
+///
+/// So `GetFullPathNameW`'s answer never says whether a string is verbatim: that is decided by the
+/// literal prefix, and only std's `is_verbatim` (`\\?\` or `\??\`, exactly) and the file APIs
+/// read it. [`a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain`] shows which file
+/// each spelling opens.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn verbatim_marker_spellings_resolve_alike() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let mut rows = literal_rows(&[
+        (r"\\?\C:\dir\x.bat.", r"\\?\C:\dir\x.bat", "the verbatim marker"),
+        (r"//?/C:/dir/x.bat.", r"\\?\C:\dir\x.bat", "slash-spelled"),
+        (
+            r"//?/C:/dir/...",
+            r"\\?\C:\dir\",
+            "slash-spelled, a dots-only name drops out",
+        ),
+        (
+            r"//?/C:/dir/x.bat/y/..",
+            r"\\?\C:\dir\x.bat",
+            "slash-spelled, `..` pops",
+        ),
+        (r"\\?/C:\dir\x.bat.", r"\\?\C:\dir\x.bat", "slash after `?`"),
+        (r"/\?\C:\dir\x.bat.", r"\\?\C:\dir\x.bat", "slash first"),
+        (r"\/?\C:\dir\x.bat.", r"\\?\C:\dir\x.bat", "slash second"),
+        (r"\\?\C:/dir/x.bat.", r"\\?\C:\dir\x.bat", "slashes after the marker"),
+    ]);
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let cwd = cwd.to_str().expect("cwd is not UTF-8").to_string();
+            println!("current directory: {cwd:?}");
+            match cwd.get(..2).filter(|d| d.ends_with(':')) {
+                Some(drive) => rows.push((
+                    r"\??\C:\dir\x.bat.".to_string(),
+                    format!(r"{drive}\??\C:\dir\x.bat"),
+                    r"`\??\` is rooted on the current drive",
+                )),
+                None => failures.push(format!("the current directory {cwd:?} has no drive letter")),
+            }
+        }
+        Err(e) => failures.push(format!("could not read the current directory: {e}")),
+    }
+    check_resolutions(&rows, &mut facts, &mut failures);
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Canary: a `:stream` suffix stays in the final component, and only a trailing dot or space is
+/// trimmed from it.
+///
+/// So the resolved name ends in the stream name: `x.exe:payload.bat` resolves to a string std's
+/// `has_bat_extension` reads as a batch file, `x.bat:s` to one it does not. String-level only: no
+/// stream is created or opened.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn a_stream_suffix_stays_in_the_final_component() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let mut rows = literal_rows(&[
+        (r"C:\dir\x.bat:s", r"C:\dir\x.bat:s", "kept as given"),
+        (
+            r"C:\dir\x.exe:payload.bat",
+            r"C:\dir\x.exe:payload.bat",
+            "kept as given",
+        ),
+        (r"C:\dir\x.bat::$DATA", r"C:\dir\x.bat::$DATA", "a stream type is kept"),
+        (
+            r"C:\dir\x.exe:p.bat:$DATA",
+            r"C:\dir\x.exe:p.bat:$DATA",
+            "a stream type is kept",
+        ),
+        (r"C:\dir\x.bat:", r"C:\dir\x.bat:", "an empty stream name is kept"),
+        (
+            r"C:\dir\x.bat:s.",
+            r"C:\dir\x.bat:s",
+            "a trailing dot is trimmed from the stream name",
+        ),
+        (
+            r"C:\dir\x.exe:p.bat.",
+            r"C:\dir\x.exe:p.bat",
+            "a trailing dot is trimmed",
+        ),
+        (
+            r"C:\dir\x.exe:p.bat ",
+            r"C:\dir\x.exe:p.bat",
+            "a trailing space is trimmed",
+        ),
+        (
+            r"\\?\C:\dir\x.exe:p.bat",
+            r"\\?\C:\dir\x.exe:p.bat",
+            "kept under the verbatim marker",
+        ),
+    ]);
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let cwd = cwd
+                .to_str()
+                .expect("cwd is not UTF-8")
+                .trim_end_matches('\\')
+                .to_string();
+            println!("current directory: {cwd:?}");
+            rows.push(("x.bat:s".to_string(), format!(r"{cwd}\x.bat:s"), "relative, kept"));
+            rows.push((
+                "x.exe:payload.bat".to_string(),
+                format!(r"{cwd}\x.exe:payload.bat"),
+                "relative, kept",
+            ));
+        }
+        Err(e) => failures.push(format!("could not read the current directory: {e}")),
+    }
+    check_resolutions(&rows, &mut facts, &mut failures);
+    // Drive-relative: which directory `C:` means depends on the per-drive current directory, so
+    // only the shape is asserted.
+    const DRIVE_RELATIVE: &str = r"C:x.bat:s";
+    match full_path_name(DRIVE_RELATIVE) {
+        Ok(resolved) => {
+            println!("  {DRIVE_RELATIVE:?} -> {resolved:?}  (drive-relative)");
+            facts.check(
+                resolved.starts_with(r"C:\") && resolved.ends_with(r"\x.bat:s"),
+                &format!(r"{DRIVE_RELATIVE:?} resolves to C:\…\x.bat:s"),
+                format_args!("{resolved:?}"),
+            );
+        }
+        Err(why) => failures.push(why),
+    }
     assert!(
         failures.is_empty(),
         "the measurement could not be taken: {}",
@@ -1240,108 +1513,6 @@ fn x_space_measured_in_a_single_directory() {
                 println!("  {tag} {path:?} -> {resolved:?}  file_part={part}");
             }
             Err(why) => println!("  {tag} {why}"),
-        }
-    }
-}
-
-/// Survey: UNC and device roots, slash spellings of the leading pair and the verbatim marker, and
-/// stream suffixes. String-level only: `GetFullPathNameW` contacts no server and opens nothing,
-/// and no stream is created.
-#[test]
-#[ignore = "platform survey: needs a Windows runner; prints a measurement rather than asserting"]
-fn roots_slashes_and_streams() {
-    survey_platform();
-    match std::env::current_dir() {
-        Ok(cwd) => println!("current directory: {cwd:?}"),
-        Err(e) => println!("could not read the current directory: {e}"),
-    }
-    let groups: &[(&str, &[&str])] = &[
-        (
-            "UNC: does `..` pop past the share?",
-            &[
-                r"\\srv\x.bat",
-                r"\\srv\x.bat\..",
-                r"\\srv\x.bat\..\",
-                r"\\srv\x.bat\.",
-                r"\\srv\x.bat\...",
-                r"\\srv\x.bat\y\..",
-                r"\\srv\x.bat\y\..\..",
-                r"\\srv\x.bat\..\y",
-                r"\\srv\x.bat\..\..\y",
-                r"\\srv\..\x.bat",
-                r"\\srv\x.bat.",
-                r"\\srv\x.bat\y.bat\..",
-            ],
-        ),
-        (
-            "`/` and `\\` in the leading pair",
-            &[
-                r"//srv/x.bat/..",
-                r"\/srv\x.cmd\..",
-                r"/\srv\x.bat\..",
-                r"//srv/x.bat/y/../..",
-                r"//srv/x.bat/../y",
-            ],
-        ),
-        (
-            r"`\\.\` device roots",
-            &[
-                r"\\.\C:\x.bat\..",
-                r"\\.\C:\dir\x.bat\y\..",
-                r"\\.\C:\..",
-                r"\\.\C:\..\..\x.bat",
-                r"\\.\x.bat\..",
-                r"\\.\x.bat\y\..\..",
-                r"\\.\pipe\x.bat\..",
-                r"//./C:/x.bat/..",
-                r"\\.\C:\dir\x.bat.",
-            ],
-        ),
-        (
-            "slash-spelled verbatim markers, and the NT prefix",
-            &[
-                r"\\?\C:\dir\x.bat.",
-                r"//?/C:/dir/x.bat.",
-                r"//?/C:/dir/...",
-                r"//?/C:/dir/x.bat/y/..",
-                r"\\?/C:\dir\x.bat.",
-                r"/\?\C:\dir\x.bat.",
-                r"\/?\C:\dir\x.bat.",
-                r"\\?\C:/dir/x.bat.",
-                r"\??\C:\dir\x.bat.",
-            ],
-        ),
-        (
-            "stream suffixes",
-            &[
-                r"x.bat:s",
-                r"x.exe:payload.bat",
-                r"C:x.bat:s",
-                r"C:\dir\x.bat:s",
-                r"C:\dir\x.exe:payload.bat",
-                r"C:\dir\x.bat::$DATA",
-                r"C:\dir\x.exe:p.bat:$DATA",
-                r"C:\dir\x.bat:s.",
-                r"C:\dir\x.exe:p.bat.",
-                r"C:\dir\x.exe:p.bat ",
-                r"C:\dir\x.bat:",
-                r"\\?\C:\dir\x.exe:p.bat",
-            ],
-        ),
-    ];
-    for (title, inputs) in groups {
-        println!("--- {title}");
-        for input in *inputs {
-            match full_path_name_parts(input) {
-                Ok((resolved, part)) => {
-                    let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
-                    println!(
-                        "  {input:?} -> {resolved:?}  file_part={part}  std_has_bat_extension={}",
-                        has_bat_extension(&resolved)
-                    );
-                }
-                Err(why) => println!("  {why}"),
-            }
         }
     }
 }
