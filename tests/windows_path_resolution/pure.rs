@@ -1,0 +1,110 @@
+//! The canary's string and buffer logic, free of Win32 so it can be tested by ordinary `cargo test`.
+
+/// `path` spelled so the file APIs take it literally: `\\?\` and `\??\` paths as given, a device
+/// path `\\.\X` as `\\?\X`, a UNC path under `\\?\UNC\`, anything else behind `\\?\`.
+pub fn verbatim_spelling(path: &str) -> String {
+    if path.starts_with(r"\\?\") || path.starts_with(r"\??\") {
+        path.to_string()
+    } else if let Some(rest) = path.strip_prefix(r"\\.\") {
+        format!(r"\\?\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{rest}")
+    } else {
+        format!(r"\\?\{path}")
+    }
+}
+
+/// Length of `path`'s root, the part `..` cannot pop, without a trailing separator: `C:`,
+/// `\\srv\share`, `\\?\C:`, `\\?\UNC\srv\share`, `\??\C:`, and `\\.` for a device path, whose
+/// device name `..` does pop (measured: `\\.\C:\..` is `\\.\`). `None` for a path with no root.
+pub fn root_len(path: &str) -> Option<usize> {
+    let component = |s: &str| s.find('\\').unwrap_or(s.len());
+    let server_share = |s: &str| {
+        let server = component(s);
+        match s.get(server + 1..) {
+            Some(rest) => server + 1 + component(rest),
+            None => s.len(),
+        }
+    };
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return Some(8 + server_share(rest));
+    }
+    if path.starts_with(r"\\.\") {
+        return Some(3);
+    }
+    for marker in [r"\\?\", r"\??\"] {
+        if let Some(rest) = path.strip_prefix(marker) {
+            return Some(4 + component(rest));
+        }
+    }
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        return Some(2 + server_share(rest));
+    }
+    let b = path.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':').then_some(2)
+}
+
+/// What `x\..\..` resolves to from the current directory `cwd`, trailing separators trimmed: the
+/// parent of `cwd`, or its root when `cwd` is a root, which `..` cannot leave.
+pub fn pop_past_expectation(cwd: &str) -> String {
+    let cwd = cwd.trim_end_matches('\\');
+    let root = root_len(cwd).unwrap_or(0).min(cwd.len());
+    match cwd[root..].rfind('\\') {
+        Some(i) => cwd[..root + i].trim_end_matches('\\').to_string(),
+        None => cwd[..root].to_string(),
+    }
+}
+
+/// The root a rooted path (`\…`) lands on from `cwd`: its drive (`C:`) or share (`\\srv\share`),
+/// per [`root_len`].
+pub fn rooted_prefix(cwd: &str) -> Option<String> {
+    root_len(cwd).map(|n| cwd[..n].to_string())
+}
+
+/// Compare one shape resolved under an existing root and a missing one, after mapping the missing
+/// root's name onto the existing one — in an error message as well as in a result. The roots must
+/// be siblings of equal length, so the mapping cannot itself introduce a difference.
+pub fn compare_across_roots(
+    existing: &Result<String, String>,
+    missing: &Result<String, String>,
+    root_e: &str,
+    root_n: &str,
+) -> String {
+    // Error messages quote their input with `{:?}`, which doubles each backslash.
+    let quoted = |r: &str| format!("{r:?}").trim_matches('"').to_string();
+    let (quoted_n, quoted_e) = (quoted(root_n), quoted(root_e));
+    let map = |s: &String| s.replace(root_n, root_e).replace(&quoted_n, &quoted_e);
+    if missing.as_ref().map(map).map_err(map) == *existing {
+        "identical".to_string()
+    } else {
+        format!("DIFFERS — exists: {existing:?}, missing: {missing:?}")
+    }
+}
+
+/// `ERROR_MORE_DATA`: the buffer was too small; the call reported the size it needs.
+pub const ERROR_MORE_DATA: u32 = 234;
+
+/// Call `read(buffer, bytes)` until the value fits, returning the units it wrote.
+///
+/// `read` gets the buffer and its size in BYTES, and returns a Win32 error code, setting `bytes` to
+/// the size written on success or needed on `ERROR_MORE_DATA` (the `RegGetValueW` contract). On
+/// `ERROR_MORE_DATA` the buffer grows to at least that and the call is retried, so a value that
+/// grows between calls is still read. Any other code is returned as `Err`.
+pub fn read_growing(mut read: impl FnMut(&mut [u16], &mut u32) -> u32) -> Result<Vec<u16>, u32> {
+    let mut buf = vec![0u16; 64];
+    loop {
+        let mut bytes = (buf.len() * 2) as u32;
+        match read(&mut buf, &mut bytes) {
+            0 => {
+                buf.truncate((bytes as usize / 2).min(buf.len()));
+                return Ok(buf);
+            }
+            // Always grow, so a call that under-reports its need still makes progress.
+            ERROR_MORE_DATA => {
+                let units = (bytes as usize).div_ceil(2).max(buf.len() + 1);
+                buf.resize(units, 0);
+            }
+            rc => return Err(rc),
+        }
+    }
+}

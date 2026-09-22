@@ -1,13 +1,7 @@
 # Windows path-resolution canary.
 #
-# `tests/windows_path_resolution.rs` asserts how Windows and Rust's `std::process` normalise path
-# strings. cosca's batch gate (CVE-2024-24576) rests on a model of that normalisation, which
-# depends on facts like these, so this workflow fails when Windows stops agreeing with the
-# measurement. The test file describes the platform only.
-#
-# The probes resolve strings, write inside a temp directory of their own and launch only
-# `cosca_testbin_image`: nothing here runs a batch file. They are `#[ignore]`d, so only this
-# workflow runs them.
+# Runs the platform canaries in tests/windows_path_resolution.rs on real Windows runners; see that
+# file for what is asserted and why.
 #
 # GitHub disables a scheduled workflow after 60 days without repository activity; re-enable it
 # from the Actions tab.
@@ -49,8 +43,11 @@ on:
 permissions:
   contents: read
 
+# A concurrency group holds one pending run, and a newly queued run cancels the pending one
+# whatever `cancel-in-progress` says. Only PR runs may supersede each other; a schedule or dispatch
+# run gets a group of its own so none is ever dropped.
 concurrency:
-  group: windows-probes-${{ github.ref }}
+  group: windows-probes-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

@@ -12,8 +12,8 @@
 //!
 //! # Two kinds of test
 //!
-//! **Canaries** assert a platform fact and FAIL when Windows disagrees, or when an asserted
-//! measurement could not be taken. A failure means any code modelling that fact must be re-derived
+//! **Canaries** assert a platform fact and FAIL when Windows disagrees, when an asserted
+//! measurement could not be taken, or when they checked nothing at all. A failure means any code modelling that fact must be re-derived
 //! from the new behaviour; do not loosen the assertion.
 //!
 //! **Surveys**, and the rows a canary prints without asserting, only print. A Win32 error there is
@@ -29,7 +29,7 @@
 //! ```
 //!
 //! `#[ignore]`d so that an ordinary `cargo test` never mistakes a platform measurement for
-//! coverage of cosca. `GetFullPathNameW` works on the string alone and touches no disk or network,
+//! coverage of cosca. Only `pure_tests`, which check the canary's own string logic, run by default. `GetFullPathNameW` works on the string alone and touches no disk or network,
 //! so UNC and device inputs here reach no server or device. The file and spawn tests write only
 //! inside a `tempfile` directory of their own and launch only `cosca_testbin_image`. Nothing here
 //! runs a batch file or needs elevation. Temp directories are removed on drop and planted files
@@ -37,12 +37,19 @@
 //! runner.
 #![cfg(windows)]
 
+#[path = "windows_path_resolution/pure.rs"]
+mod pure;
+#[path = "windows_path_resolution/pure_tests.rs"]
+mod pure_tests;
+
 use std::sync::OnceLock;
+
+use pure::{compare_across_roots, pop_past_expectation, read_growing, rooted_prefix, verbatim_spelling};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
-use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, GetFullPathNameW, BY_HANDLE_FILE_INFORMATION};
+use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0};
+use windows::Win32::Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, GetFullPathNameW, FILE_ID_INFO};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
@@ -68,45 +75,28 @@ struct Platform {
     detail: String,
 }
 
-/// A registry string under `HKLM`, or the Win32 error that stopped it being read.
+/// A registry string under `HKLM`, or the Win32 error that stopped it being read. A value that grows
+/// while being read is read again at its new size.
 fn reg_sz(subkey: &str, value: &str) -> Result<String, String> {
     use std::os::windows::ffi::OsStringExt;
     let (subkey_w, value_w) = (wide(subkey), wide(value));
-    let mut bytes = 0u32;
-    // SAFETY: both name buffers are nul-terminated and outlive the call; passing no data buffer is
-    // the documented size-query form, which writes only `bytes`.
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey_w.as_ptr()),
-            PCWSTR(value_w.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            None,
-            Some(&mut bytes),
-        )
-    };
-    if rc.0 != 0 {
-        return Err(format!("RegGetValueW size query failed: error {}", rc.0));
-    }
-    let mut buf = vec![0u16; bytes as usize / 2 + 1];
-    let mut bytes_out = buf.len() as u32 * 2;
-    // SAFETY: as above, and `buf` is a live allocation of `bytes_out` bytes that the call writes
-    // at most that many bytes into.
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey_w.as_ptr()),
-            PCWSTR(value_w.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut bytes_out),
-        )
-    };
-    if rc.0 != 0 {
-        return Err(format!("RegGetValueW failed: error {}", rc.0));
-    }
+    let buf = read_growing(|buf, bytes| {
+        // SAFETY: both name buffers are nul-terminated and outlive the call; `buf` is a live
+        // allocation of `*bytes` bytes that the call writes at most that many bytes into.
+        unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(subkey_w.as_ptr()),
+                PCWSTR(value_w.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(bytes),
+            )
+        }
+        .0
+    })
+    .map_err(|rc| format!("RegGetValueW failed: error {rc}"))?;
     let units = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
     Ok(std::ffi::OsString::from_wide(&buf[..units])
         .to_string_lossy()
@@ -173,41 +163,34 @@ fn measure_platform() -> Result<Platform, String> {
         ),
     };
     let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "<unset>".to_string());
-    let summary = format!(
-        "{build} {} {} / {} / runner image {} {}",
-        or_missing(reg_sz(KEY, "DisplayVersion")),
-        or_missing(reg_sz(KEY, "EditionID")),
-        std::env::consts::ARCH,
-        env("ImageOS"),
-        env("ImageVersion"),
-    );
+    // Each value read once, so the stamp and the detail block cannot disagree.
+    let display_version = or_missing(reg_sz(KEY, "DisplayVersion"));
+    let edition = or_missing(reg_sz(KEY, "EditionID"));
+    let (image_os, image_version) = (env("ImageOS"), env("ImageVersion"));
+    let arch = std::env::consts::ARCH;
+    let summary = format!("{build} {display_version} {edition} / {arch} / runner image {image_os} {image_version}");
     let detail = format!(
         "\n\
          ===== PLATFORM =========================================================\n\
          This is what the floating label resolved to on this run. Quote THIS, not the label.\n\
         \x20 OS build (RtlGetVersion + UBR) : {build}\n\
-        \x20 DisplayVersion                 : {}\n\
+        \x20 DisplayVersion                 : {display_version}\n\
         \x20 ProductName                    : {}\n\
-        \x20 EditionID                      : {}\n\
+        \x20 EditionID                      : {edition}\n\
         \x20 BuildLabEx                     : {}\n\
         \x20 CSD version                    : {:?}\n\
-        \x20 process architecture           : {}\n\
+        \x20 process architecture           : {arch}\n\
         \x20 PROCESSOR_ARCHITECTURE         : {}\n\
-        \x20 runner label / image           : {} / {} {}\n\
+        \x20 runner label / image           : {} / {image_os} {image_version}\n\
         \x20 RUNNER_OS / RUNNER_ARCH        : {} / {}\n\
          ========================================================================",
-        or_missing(reg_sz(KEY, "DisplayVersion")),
         or_missing(reg_sz(KEY, "ProductName")),
-        or_missing(reg_sz(KEY, "EditionID")),
         or_missing(reg_sz(KEY, "BuildLabEx")),
         String::from_utf16_lossy(&info.szCSDVersion)
             .trim_end_matches('\0')
             .to_string(),
-        std::env::consts::ARCH,
         env("PROCESSOR_ARCHITECTURE"),
         env("RUNNER_NAME"),
-        env("ImageOS"),
-        env("ImageVersion"),
         env("RUNNER_OS"),
         env("RUNNER_ARCH"),
     );
@@ -455,6 +438,8 @@ struct Disagreements {
     /// std::process` when the route under test runs through std.
     subject: &'static str,
     broken: Vec<String>,
+    /// Facts checked so far, broken or not.
+    checked: usize,
 }
 
 impl Default for Disagreements {
@@ -468,19 +453,27 @@ impl Disagreements {
         Self {
             subject,
             broken: Vec::new(),
+            checked: 0,
         }
     }
 
     /// Record `fact` as broken unless `holds`, with what was measured instead.
     fn check(&mut self, holds: bool, fact: &str, measured: impl std::fmt::Display) {
+        self.checked += 1;
         if !holds {
             self.broken.push(format!("{fact} — measured {measured}"));
         }
     }
 
-    /// Fail the test if any fact disagreed. Call after the measurement-failure assert, so a broken
-    /// probe is reported as one rather than as a platform change.
+    /// Fail the test if any fact disagreed, or if none was checked: a canary whose loops never ran
+    /// has measured nothing. Call after the measurement-failure assert, so a broken probe is
+    /// reported as one rather than as a platform change.
     fn assert_none(self) {
+        println!("facts checked: {}", self.checked);
+        assert!(
+            self.checked > 0,
+            "the measurement could not be taken: this canary checked no fact"
+        );
         assert!(
             self.broken.is_empty(),
             "The measured behaviour of {} has changed. Any code that models these facts (cosca's \
@@ -512,14 +505,19 @@ fn report_roots(roots: &[&str]) {
 }
 
 /// Every name in `dir`, as `FindFirstFileW` reports it.
-fn listing(dir: &str) -> Result<Vec<String>, String> {
+fn entries(dir: &str) -> Result<Vec<std::ffi::OsString>, String> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read_dir({dir:?}) failed: {e}"))? {
         let entry = entry.map_err(|e| format!("read_dir({dir:?}) entry failed: {e}"))?;
-        names.push(format!("{:?}", entry.file_name()));
+        names.push(entry.file_name());
     }
     names.sort();
     Ok(names)
+}
+
+/// [`entries`], quoted for the log.
+fn listing(dir: &str) -> Result<Vec<String>, String> {
+    entries(dir).map(|names| names.iter().map(|n| format!("{n:?}")).collect())
 }
 
 // Probes =====
@@ -587,23 +585,21 @@ fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
                     Err(why) => failures.push(why),
                 }
             }
-            // Popping past the path's own first component continues into the cwd's ancestors.
+            // Popping past the path's own first component continues into the cwd's ancestors, or
+            // stays at the root when the cwd is one.
             const POP_PAST: &str = r"x\..\..";
-            match std::path::Path::new(&cwd).parent().and_then(|p| p.to_str()) {
-                Some(parent) => match full_path_name(POP_PAST) {
-                    Ok(resolved) => {
-                        println!("{POP_PAST:?} -> {resolved:?}  (pops past its own first component)");
-                        let want = parent.trim_end_matches('\\');
-                        let got = resolved.trim_end_matches('\\');
-                        facts.check(
-                            got == want,
-                            &format!("{POP_PAST:?} resolves to the cwd's parent {want:?}"),
-                            format_args!("{resolved:?}"),
-                        );
-                    }
-                    Err(why) => failures.push(why),
-                },
-                None => failures.push(format!("the current directory {cwd:?} has no parent to pop into")),
+            match full_path_name(POP_PAST) {
+                Ok(resolved) => {
+                    println!("{POP_PAST:?} -> {resolved:?}  (pops past its own first component)");
+                    let want = pop_past_expectation(&cwd);
+                    let got = resolved.trim_end_matches('\\');
+                    facts.check(
+                        got == want,
+                        &format!("{POP_PAST:?} resolves to the cwd's parent, or its root, {want:?}"),
+                        format_args!("{resolved:?}"),
+                    );
+                }
+                Err(why) => failures.push(why),
             }
         }
         Err(e) => failures.push(format!(
@@ -766,12 +762,20 @@ fn only_dot_and_dotdot_are_refused_as_verbatim_file_names() {
                     outcome(&reopened),
                 );
             }
-            // Remove through the verbatim spelling, the only one guaranteed to name the literal
-            // entry. A failure here leaves the ephemeral runner to clean up, but say so.
-            if created {
-                if let Err(e) = std::fs::remove_file(&verbatim_back) {
-                    println!("  CLEANUP: {verbatim_back:?} could not be removed: {e}");
+            // Remove whatever the write produced — a plain `x ` creates `x` — through the verbatim
+            // spelling, the only one guaranteed to name the literal entry. The directory is this
+            // case's alone. A failure here leaves the ephemeral runner to clean up, but say so.
+            drop(reopened);
+            match entries(&format!(r"\\?\{case_dir}")) {
+                Ok(names) => {
+                    for entry in names {
+                        let path = format!(r"\\?\{case_dir}\{}", entry.to_string_lossy());
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            println!("  CLEANUP: {path:?} could not be removed: {e}");
+                        }
+                    }
                 }
+                Err(why) => println!("  CLEANUP: {why}"),
             }
         }
     }
@@ -886,10 +890,17 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
                 failures.push(format!("the payload at {verbatim:?} exited 0 without an image= line"));
                 continue;
             };
-            let loaded = file_identity(&verbatim_spelling(image));
+            // An image path that cannot be opened is a broken probe, not a changed platform.
+            let loaded = match file_identity(&verbatim_spelling(image)) {
+                Ok(id) => id,
+                Err(why) => {
+                    failures.push(format!("the reported image {image:?}: {why}"));
+                    continue;
+                }
+            };
             println!("  image={image:?} opened verbatim has identity {loaded:?}");
             facts.check(
-                loaded.as_ref() == Ok(&planted),
+                loaded == planted,
                 &format!("std::process on verbatim {name:?} loads that file, not another"),
                 format_args!("image={image:?} with identity {loaded:?}, planted {planted:?}"),
             );
@@ -904,32 +915,36 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
         "the measurement could not be taken: {}",
         failures.join("; ")
     );
+    // A creatable name that could not hold an image is a changed platform, reported here first.
     facts.assert_none();
+    // Otherwise every creatable name was spawned; without this a run that planted nothing would
+    // measure nothing and pass.
+    let expected = WEIRD_NAMES.iter().filter(|&&(_, _, creatable)| creatable).count();
+    assert!(
+        expected > 0 && spawnable == expected,
+        "the measurement could not be taken: images were planted under {spawnable} names, not the \
+         {expected} that can hold one"
+    );
 }
 
-/// The volume serial number and file index of `path`: the file's identity, whatever the spelling.
-fn file_identity(path: &str) -> Result<(u32, u64), String> {
+/// The volume serial number and 128-bit file ID of `path`: the file's identity, whatever the
+/// spelling. `GetFileInformationByHandle`'s 64-bit index is not unique on ReFS; `FileIdInfo` is.
+fn file_identity(path: &str) -> Result<(u64, [u8; 16]), String> {
     use std::os::windows::io::AsRawHandle;
     let file = std::fs::File::open(path).map_err(|e| format!("could not open {path:?}: {e}"))?;
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: the handle is owned by `file`, alive for the call; `info` is a live out-parameter.
-    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
-        .map_err(|e| format!("GetFileInformationByHandle({path:?}) failed: {e}"))?;
-    Ok((
-        info.dwVolumeSerialNumber,
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    ))
-}
-
-/// `path` spelled so the file APIs take it literally.
-fn verbatim_spelling(path: &str) -> String {
-    if path.starts_with(r"\\?\") {
-        path.to_string()
-    } else if let Some(rest) = path.strip_prefix(r"\\") {
-        format!(r"\\?\UNC\{rest}")
-    } else {
-        format!(r"\\?\{path}")
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: the handle is owned by `file`, alive for the call; `info` is a live out-parameter of
+    // exactly the size passed, the one `FileIdInfo` requires.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
     }
+    .map_err(|e| format!("GetFileInformationByHandleEx({path:?}, FileIdInfo) failed: {e}"))?;
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
 /// Canary: a plain `x.bat.` or `x.bat ` IS `x.bat`, while a verbatim one is a distinct file, and a
@@ -1187,13 +1202,13 @@ fn verbatim_marker_spellings_resolve_alike() {
         Ok(cwd) => {
             let cwd = cwd.to_str().expect("cwd is not UTF-8").to_string();
             println!("current directory: {cwd:?}");
-            match cwd.get(..2).filter(|d| d.ends_with(':')) {
-                Some(drive) => rows.push((
+            match rooted_prefix(&cwd) {
+                Some(root) => rows.push((
                     r"\??\C:\dir\x.bat.".to_string(),
-                    format!(r"{drive}\??\C:\dir\x.bat"),
-                    r"`\??\` is rooted on the current drive",
+                    format!(r"{root}\??\C:\dir\x.bat"),
+                    r"`\??\` is rooted on the current drive or share",
                 )),
-                None => failures.push(format!("the current directory {cwd:?} has no drive letter")),
+                None => failures.push(format!("the current directory {cwd:?} has no root")),
             }
         }
         Err(e) => failures.push(format!("could not read the current directory: {e}")),
@@ -1493,11 +1508,7 @@ fn which_segment_positions_get_trimmed() {
 fn cross_root(prefix: &str, shape: &str, seg: &str, root_e: &str, root_n: &str) -> String {
     let existing = full_path_name(&format!("{prefix}{}", build(shape, root_e, seg)));
     let missing = full_path_name(&format!("{prefix}{}", build(shape, root_n, seg)));
-    if missing.clone().map(|m| m.replace(root_n, root_e)) == existing {
-        "identical".to_string()
-    } else {
-        format!("DIFFERS — exists: {existing:?}, missing: {missing:?}")
-    }
+    compare_across_roots(&existing, &missing, root_e, root_n)
 }
 
 /// Survey: is `\\?\C:\dir\..` -> `\\?\C:` a Win32 answer or a probe artefact?
@@ -1642,16 +1653,26 @@ fn create_process(program: &str, out_path: &str) -> Result<(u32, String), String
 
     // SAFETY: `pi.hProcess` is the live handle CreateProcessW just handed us. INFINITE is not a
     // chosen timeout — the child is `cosca_testbin_image`, which exits on its own.
-    unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+    let waited = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+    // Captured before anything else can overwrite the thread's last error.
+    let wait_error = std::io::Error::last_os_error();
     let mut code = 0u32;
-    // SAFETY: the process has exited and `code` is a live out-parameter.
-    let got_code = unsafe { GetExitCodeProcess(pi.hProcess, &mut code) };
+    let got_code = if waited == WAIT_OBJECT_0 {
+        // SAFETY: the process has exited and `code` is a live out-parameter.
+        unsafe { GetExitCodeProcess(pi.hProcess, &mut code) }.map_err(|e| format!("GetExitCodeProcess failed: {e}"))
+    } else {
+        // Anything else leaves the child possibly running and the capture incomplete.
+        Err(format!(
+            "WaitForSingleObject returned {:#x}, not WAIT_OBJECT_0: {wait_error}",
+            waited.0
+        ))
+    };
     // SAFETY: both handles are owned by us and not used again.
     unsafe {
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
     }
-    got_code.map_err(|e| format!("GetExitCodeProcess failed: {e}"))?;
+    got_code?;
 
     drop(file);
     let captured = std::fs::read_to_string(out_path).map_err(|e| format!("could not read the capture file: {e}"))?;
