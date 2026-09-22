@@ -524,6 +524,8 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
 ///
 /// Fixing that here rather than by ordering a NUL check in front of each caller is what makes the
 /// verdict uniform: the std backend — the DEFAULT Windows path — has no NUL check of its own.
+///
+/// Off Win32 this refuses only the NUL: see [`reject_batch_path_on`].
 pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
     reject_batch_path_on(prog, cfg!(windows))
 }
@@ -532,22 +534,27 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 /// it, so one host can ask for either verdict — the same reason `elevation::plan::Host` carries
 /// its `Os`. Both are pinned from any host by `spawn_tests`.
 ///
-/// `win32` decides whether the truncated prefix is what runs:
+/// `win32` decides BOTH halves of the rule, because both are facts about Win32 rather than about
+/// the request:
 ///
-/// - Win32 truncates at the NUL, so the prefix IS the program and the batch rule reads it.
-/// - Off Win32 nothing truncates. A NUL makes the token name no file at all, and there is no
-///   cmd.exe for CVE-2024-24576 to reach — so the honest verdict is the NUL, and judging the
-///   prefix would send a Linux or macOS caller to audit a batch vector that cannot affect them.
-///   That is the same misattribution the prefix rule removes on Windows, one platform over.
+/// - Win32 truncates at the NUL, so the prefix IS the program; and it routes a `.bat`/`.cmd`
+///   through cmd.exe, which is what CVE-2024-24576 needs. The batch rule reads that prefix.
+/// - Off Win32 nothing truncates and nothing reads the extension. A NUL makes the token name no
+///   file at all, so that is the honest verdict; a clean `deploy.bat` is an ordinary executable
+///   the host runs, so refusing it would report "not supported on windows" about a Linux or macOS
+///   host that runs it fine — and send its caller to audit a batch vector that cannot reach them.
 fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error> {
     let loaded = win32_prefix(prog);
-    if !win32 && loaded.as_os_str() != prog.as_os_str() {
-        // A literal: interpolating the token would put a raw U+0000 into a message bound for logs
-        // and terminals, which is half of what this round is removing.
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the program path contains an embedded NUL, so it names no file",
-        )));
+    if !win32 {
+        if loaded.as_os_str() != prog.as_os_str() {
+            // A literal: interpolating the token would put a raw U+0000 into a message bound for
+            // logs and terminals, which is half of what this round is removing.
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the program path contains an embedded NUL, so it names no file",
+            )));
+        }
+        return Ok(());
     }
     if let Some(ext) = loaded.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();

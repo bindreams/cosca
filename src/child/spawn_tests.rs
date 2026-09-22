@@ -348,10 +348,14 @@ fn the_gate_wrapper_asks_for_this_hosts_verdict() {
     let nul_then_bat = with_interior_nul("setup", ".bat");
     let via_host = |t: &std::ffi::OsStr| super::reject_batch_path(std::path::Path::new(t));
 
+    let clean_bat = std::ffi::OsString::from(r"C:\tools\setup.bat");
+
     if cfg!(windows) {
+        assert!(unsupported_op(via_host(&clean_bat)).contains("setup.bat"));
         assert!(unsupported_op(via_host(&bat_then_nul)).contains("setup.bat"));
         assert!(via_host(&nul_then_bat).is_ok(), "`setup` is no batch file");
     } else {
+        assert!(via_host(&clean_bat).is_ok(), "no cmd.exe here to blame");
         for token in [&bat_then_nul, &nul_then_bat] {
             let msg = invalid_input_message(via_host(token));
             assert!(msg.contains("NUL"), "the refusal must name the NUL: {msg}");
@@ -359,14 +363,40 @@ fn the_gate_wrapper_asks_for_this_hosts_verdict() {
     }
 }
 
-/// A clean `.bat` is still refused on either platform: the verdict is a property of the REQUEST,
-/// not of the host, and the NUL arm above must not have swallowed the batch rule.
+/// The batch rule is a WIN32 verdict, like the truncation: `ShellExecuteEx` and `CreateProcessW`
+/// route a `.bat` through cmd.exe, which is what CVE-2024-24576 needs. Off Win32 there is no
+/// cmd.exe to reach and the extension carries no meaning, so refusing there would report
+/// "not supported on windows" for a program the host runs — and the NUL arm must not have
+/// swallowed the rule where it does apply.
 #[test]
-fn a_clean_batch_program_is_refused_under_either_verdict() {
+fn a_clean_batch_program_is_a_win32_verdict_only() {
     let token = std::ffi::OsString::from(r"C:\tools\setup.bat");
-    for r in [on_win32(&token), on_posix(&token)] {
-        assert!(unsupported_op(r).contains("setup.bat"));
-    }
+    assert!(unsupported_op(on_win32(&token)).contains("setup.bat"));
+    assert!(
+        on_posix(&token).is_ok(),
+        "off Win32 a .bat is judged by the host that will actually run it"
+    );
+}
+
+/// What makes that POSIX arm a correction rather than a preference: here `.bat` is an ordinary
+/// suffix, and the gate refused a command this host executes.
+#[cfg(unix)]
+#[test]
+fn a_posix_host_runs_its_own_executable_named_bat() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("deploy.bat");
+    std::fs::write(&script, "#!/bin/sh\nexit 7\n").expect("write");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let mut c = Command::new();
+    c.args([script.as_os_str()]);
+    let child = c.spawn().expect("a .bat this host can run must not be refused");
+    assert_eq!(
+        child.wait().expect("wait").code(),
+        Some(7),
+        "the host ran the script, so its own exit code must come back"
+    );
 }
 
 /// The std backend is the DEFAULT Windows path: `args([..])` with no `executable()` and no
