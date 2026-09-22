@@ -544,6 +544,37 @@ fn a_poisoned_program_path_is_named_before_a_poisoned_argument_or_cwd() {
     }
 }
 
+/// The cwd leg of that same rule, which no test above reaches: each multi-field probe poisons the
+/// program too, so the program's own check short-circuits before `lpDirectory` is ever built. A
+/// clean `.bat` with a truncating `current_dir()` is a NUL the caller can fix, and "batch escaping
+/// is not implemented" would never mention that `lpDirectory` truncates as well.
+#[test]
+fn a_poisoned_working_directory_is_named_before_the_batch_gate() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([std::ffi::OsString::from(r"C:\tools\setup.bat")])
+            .current_dir(nul_between(r"C:\work", "junk"))
+            .elevate();
+        match super::plan_runas(&c, &win_host(elevated)) {
+            Err(Error::Io(e)) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "elevated={elevated}: expected the NUL refusal, got {e:?}"
+                );
+                assert!(
+                    e.to_string().contains("working directory"),
+                    "elevated={elevated}: the refusal must name the working directory, got {e}"
+                );
+            }
+            other => panic!(
+                "elevated={elevated}: the cwd's NUL must be refused before the batch gate, got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+}
+
 /// The other side of that ordering: the batch gate must not jump ahead of a poisoned ARGUMENT
 /// either. A clean `.bat` with a truncating argument is a NUL the caller can fix, and
 /// "batch escaping is not implemented" would hide it.

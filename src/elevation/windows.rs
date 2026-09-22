@@ -417,9 +417,17 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // elevated path's own.
     let file_w = wide_nul("program path", program.as_os_str())?;
 
-    // Then the remaining fields, and only then the batch gate: a truncating argument is a defect
-    // the caller can fix, and "batch escaping is not implemented" would hide it.
+    // Then EVERY remaining field, and only then the batch gate: a truncating argument or working
+    // directory is a defect the caller can fix, and "batch escaping is not implemented" would hide
+    // it — a clean `.bat` next to a poisoned `current_dir()` would never mention that `lpDirectory`
+    // truncates too. `params` is checked per element, by index, inside `elevated_params`.
     let params = elevated_params(argv)?;
+    let dir = cmd
+        .cwd()
+        .map(|d| wide_nul("working directory", d.as_os_str()))
+        .transpose()?;
+    let params_w = wide_nul("argument line", params.as_os_str())?;
+    let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
     // Refuse a `.bat`/`.cmd` SPELLED IN THE CALLER'S TOKEN. `ShellExecuteEx`'s `runas` resolves the
     // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into `%*`
@@ -446,15 +454,6 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // otherwise fails `NotFound`; `setup.bat` is not a candidate either way. Those two land in later
     // PRs, not this one.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
-
-    // Refused for an interior NUL rather than silently truncated — see `wide_nul`. The argv
-    // elements `params` was joined from were checked individually above, by index.
-    let dir = cmd
-        .cwd()
-        .map(|d| wide_nul("working directory", d.as_os_str()))
-        .transpose()?;
-    let params_w = wide_nul("argument line", params.as_os_str())?;
-    let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
