@@ -385,11 +385,19 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
         let mut c = Command::new();
         c.args([nul_bat.clone()]).elevate();
         match super::launch_runas_with_host(&mut c, &win_host(elevated)) {
-            Err(Error::Io(e)) => assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::InvalidInput,
-                "elevated={elevated}: expected the NUL refusal, got {e:?}"
-            ),
+            Err(Error::Io(e)) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "elevated={elevated}: expected the NUL refusal, got {e:?}"
+                );
+                // The kind alone lets "right kind, blamed the wrong field" pass — which is the
+                // misattribution this test exists to catch, one level down.
+                assert!(
+                    e.to_string().contains("program path"),
+                    "elevated={elevated}: the refusal must blame the program path, got {e}"
+                );
+            }
             other => panic!(
                 "elevated={elevated}: a NUL-bearing batch-looking path must be diagnosed as a NUL, \
                  got {:?}",
