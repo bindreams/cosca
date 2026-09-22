@@ -2,6 +2,9 @@ use std::io::{Read, Write};
 
 use cosca::{Command, Fd, Stdio};
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
@@ -699,7 +702,7 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
         let (mut s, _) = listener.accept().expect("accept control conn");
-        match read_tag_and_pid(&mut s) {
+        match common::read_tag_and_pid(&mut s) {
             (b'R', pid) => root = Some((s, pid)),
             (b'G', pid) => grand = Some((s, pid)),
             (tag, _) => panic!("unexpected tree tag {:?}", tag as char),
@@ -714,85 +717,6 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
         #[cfg(target_os = "linux")]
         grand_pid: _grand_pid,
     }
-}
-
-/// Read one `<tag><pid>\n` line from a freshly accepted `control-echo-pid` connection.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-fn read_tag_and_pid(sock: &mut std::net::TcpStream) -> (u8, u32) {
-    let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    loop {
-        let n = sock.read(&mut b).expect("read the control line");
-        assert_ne!(n, 0, "the control connection closed before sending its tag line");
-        if b[0] == b'\n' {
-            break;
-        }
-        line.push(b[0]);
-    }
-    assert!(line.len() > 1, "a control line is a tag plus a pid, got {line:?}");
-    let pid = std::str::from_utf8(&line[1..])
-        .expect("the pid is ASCII")
-        .parse()
-        .expect("the pid is a number");
-    (line[0], pid)
-}
-
-/// Prove a `control-echo-pid` member is POSITIVELY alive: send a byte and read the echo back.
-/// A killed member gives EOF or `ConnectionReset` on the read instead, never the byte.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
-    sock.write_all(b"p")
-        .unwrap_or_else(|e| panic!("{who} must accept a write while alive: {e}"));
-    let mut b = [0u8; 1];
-    sock.read_exact(&mut b)
-        .unwrap_or_else(|e| panic!("{who} must echo the byte back while alive: {e}"));
-    assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
-}
-
-/// The cgroup v2 leaf `pid` is in, as an absolute path. Mirrors the join
-/// `containment::cgroup` makes for itself: `/proc/<pid>/cgroup`'s `0::` line is relative to
-/// this process's cgroup namespace, whose root is `/sys/fs/cgroup`.
-#[cfg(target_os = "linux")]
-fn cgroup_of(pid: u32) -> std::path::PathBuf {
-    let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read /proc/<pid>/cgroup");
-    let rel = contents
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("a cgroup v2 unified (`0::`) line")
-        .to_string();
-    std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
-}
-
-/// Wait for `leaf` to drain, then remove it.
-///
-/// A tree whose handle opted out of teardown keeps its leaf, and nothing — cosca, or any
-/// cgroup manager — ever revisits a `cosca-*` cgroup, so a test that walks away from one adds
-/// a permanent stray to the very lane that counts them (issue #140). Cleaning up is the test's
-/// own job, exactly as it is `drop_warns_for_a_real_leaf_held_by_a_descendant_cgroup`'s.
-///
-/// The wait is on the kernel's own edge, never on a clock: `cgroup.events`'s `populated` flips
-/// 1 -> 0 exactly when the leaf's last task exits, and `POLLPRI` fires on that transition.
-/// `populated` is read before every poll, so a transition that already happened is seen on the
-/// read rather than waited out for an edge that will not fire again.
-#[cfg(target_os = "linux")]
-fn drain_and_remove_leaf(leaf: &std::path::Path) {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-
-    use rustix::event::{poll, PollFd, PollFlags};
-
-    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open the leaf's cgroup.events");
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        events.seek(SeekFrom::Start(0)).expect("rewind cgroup.events");
-        events.read_to_string(&mut buf).expect("read cgroup.events");
-        if buf.lines().any(|l| l.trim() == "populated 0") {
-            break;
-        }
-        let mut fds = [PollFd::new(&events, PollFlags::PRI)];
-        poll(&mut fds, None).expect("poll cgroup.events");
-    }
-    std::fs::remove_dir(leaf).expect("remove the drained leaf");
 }
 
 #[cfg(unix)]
@@ -927,8 +851,8 @@ fn windows_detach_leaves_the_tree_running() {
 
     child.detach();
 
-    assert_echoes(&mut root, "the detached root");
-    assert_echoes(&mut grand, "the detached grandchild");
+    common::assert_echoes(&mut root, "the detached root");
+    common::assert_echoes(&mut grand, "the detached grandchild");
 
     // Release both: each read returns Ok(0) and the member exits on its own.
     drop(root);
@@ -951,8 +875,8 @@ fn windows_kill_on_drop_false_leaves_the_tree_running() {
 
     drop(child);
 
-    assert_echoes(&mut root, "the opted-out root");
-    assert_echoes(&mut grand, "the opted-out grandchild");
+    common::assert_echoes(&mut root, "the opted-out root");
+    common::assert_echoes(&mut grand, "the opted-out grandchild");
 
     drop(root);
     drop(grand);
@@ -1365,7 +1289,7 @@ fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: imp
          is a delegated cgroup v2 slice available?",
         child.containment()
     );
-    let leaf = cgroup_of(grand_pid);
+    let leaf = common::cgroup::cgroup_of(grand_pid);
     assert!(
         leaf.file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),
@@ -1375,13 +1299,13 @@ fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: imp
 
     opt_out(child);
 
-    assert_echoes(&mut root, "the opted-out root");
-    assert_echoes(&mut grand, "the opted-out grandchild");
+    common::assert_echoes(&mut root, "the opted-out root");
+    common::assert_echoes(&mut grand, "the opted-out grandchild");
 
     // Release both: each read returns Ok(0) and the member exits on its own.
     drop(root);
     drop(grand);
-    drain_and_remove_leaf(&leaf);
+    common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
 /// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
