@@ -348,6 +348,14 @@ fn leaf_error_names_step_path_and_reason() {
             None,
         ),
         (
+            LeafError::CheckKill {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.kill"),
+                source: std::io::Error::from_raw_os_error(13),
+            },
+            &["/sys/fs/cgroup/slice/cosca-7-0/cgroup.kill"],
+            Some(reason(13)),
+        ),
+        (
             LeafError::OpenProcs {
                 path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
                 source: std::io::Error::from_raw_os_error(13),
@@ -564,6 +572,45 @@ fn create_leaf_under_reports_a_missing_cgroup_kill() {
     assert!(err.to_string().contains("cgroup.kill"), "got {err}");
     let strays: Vec<_> = std::fs::read_dir(dir.path())
         .expect("read tempdir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(strays.is_empty(), "a failed leaf creation left {strays:?} behind");
+}
+
+/// A `cgroup.kill` the kernel cannot even look up is not a missing one: the errno is the
+/// diagnosis, and "the kernel is older than 5.14" would be a confident false cause.
+///
+/// The failing lookup is a path one component too long: the leaf itself fits in `PATH_MAX`,
+/// `<leaf>/cgroup.kill` does not, so the `stat` fails with `ENAMETOOLONG` for any uid.
+#[cfg(target_os = "linux")]
+#[test]
+fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The leaf is `<parent>/cosca-<pid>-<seq>`. Size `parent` so the leaf's length is 4084 plus
+    // the digits of `seq` — under PATH_MAX (4096, NUL included) for any seq below 10^11 — while
+    // the 12 bytes of "/cgroup.kill" push the lookup past it.
+    let pid_len = std::process::id().to_string().len();
+    let parent_len = 4084 - "/cosca-".len() - pid_len - "-".len();
+    let mut parent = dir.path().to_path_buf();
+    while parent.as_os_str().len() < parent_len {
+        let room = parent_len - parent.as_os_str().len() - 1;
+        parent.push("d".repeat(room.min(200)));
+    }
+    assert_eq!(parent.as_os_str().len(), parent_len, "the parent must be sized exactly");
+    std::fs::create_dir_all(&parent).expect("create the long parent");
+
+    let err = match super::create_leaf_under(&parent) {
+        Err(e) => e,
+        Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
+    };
+    assert!(
+        matches!(err, LeafError::CheckKill { .. }),
+        "expected CheckKill, got {err:?}"
+    );
+    let reason = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).to_string();
+    assert!(err.to_string().contains(&reason), "the errno is the diagnosis: {err}");
+    let strays: Vec<_> = std::fs::read_dir(&parent)
+        .expect("read the parent")
         .map(|e| e.expect("entry").file_name())
         .collect();
     assert!(strays.is_empty(), "a failed leaf creation left {strays:?} behind");
@@ -812,6 +859,10 @@ fn every_degrade_reason_has_its_own_kind() {
         }),
         Box::new(LeafError::KillUnsupported {
             path: PathBuf::from("/cg/leaf"),
+        }),
+        Box::new(LeafError::CheckKill {
+            path: PathBuf::from("/cg/leaf/cgroup.kill"),
+            source: std::io::Error::from_raw_os_error(13),
         }),
         Box::new(LeafError::OpenProcs {
             path: PathBuf::from("/cg/leaf/cgroup.procs"),

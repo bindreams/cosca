@@ -157,6 +157,13 @@ pub(crate) enum LeafError {
         path.display()
     )]
     KillUnsupported { path: PathBuf },
+    /// Whether the leaf has a `cgroup.kill` could not be determined: the lookup itself failed.
+    #[error("could not check for {}: {source}", path.display())]
+    CheckKill {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     /// `cgroup.procs` could not be opened for writing.
     #[error("could not open {} for writing: {source}", path.display())]
     OpenProcs {
@@ -303,6 +310,7 @@ pub(crate) enum DegradeKind {
     NoUnifiedLine,
     CreateLeafDir,
     KillUnsupported,
+    CheckKill,
     OpenProcs,
     MapReportPage,
     PlacementConfirmed,
@@ -323,6 +331,7 @@ impl DegradeReason for LeafError {
             LeafError::NoUnifiedLine { .. } => DegradeKind::NoUnifiedLine,
             LeafError::CreateLeafDir { .. } => DegradeKind::CreateLeafDir,
             LeafError::KillUnsupported { .. } => DegradeKind::KillUnsupported,
+            LeafError::CheckKill { .. } => DegradeKind::CheckKill,
             LeafError::OpenProcs { .. } => DegradeKind::OpenProcs,
             LeafError::MapReportPage(_) => DegradeKind::MapReportPage,
         }
@@ -976,19 +985,37 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         err
     };
 
-    // Require cgroup.kill (kernel ≥ 5.14); without it there is no atomic kill.
+    // Require cgroup.kill (kernel ≥ 5.14); without it there is no atomic kill. A lookup that
+    // fails is not an absent file, and is reported with its own errno.
+    let kill_path = leaf_path.join("cgroup.kill");
     // Test-only fault seam: treat the leaf as kill-capable (take semantics — see `fault`).
     #[cfg(test)]
-    let kill_supported = fault::take_force_kill_supported() || leaf_path.join("cgroup.kill").exists();
+    let kill_supported = if fault::take_force_kill_supported() {
+        Ok(true)
+    } else {
+        kill_path.try_exists()
+    };
     #[cfg(not(test))]
-    let kill_supported = leaf_path.join("cgroup.kill").exists();
-    if !kill_supported {
-        return Err(fail(
-            &leaf_path,
-            LeafError::KillUnsupported {
-                path: leaf_path.clone(),
-            },
-        ));
+    let kill_supported = kill_path.try_exists();
+    match kill_supported {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(fail(
+                &leaf_path,
+                LeafError::KillUnsupported {
+                    path: leaf_path.clone(),
+                },
+            ))
+        }
+        Err(source) => {
+            return Err(fail(
+                &leaf_path,
+                LeafError::CheckKill {
+                    path: kill_path,
+                    source,
+                },
+            ))
+        }
     }
 
     // The report page is mapped before the fd is opened so a failure here unwinds nothing but
