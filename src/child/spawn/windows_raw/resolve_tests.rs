@@ -129,7 +129,7 @@ fn embedded_nul_in_key_is_rejected_as_invalid_input() {
 }
 
 /// The NUL refusal must name WHICH field carried it. One checker serves the environment block, the
-/// program image, the working directory and every argv token, so a message fixed to "environment
+/// program token, the working directory and every argv token, so a message fixed to "environment
 /// key or value" reports a NUL in a PROGRAM PATH as a broken environment.
 #[test]
 fn a_nul_refusal_names_the_field_that_carried_it() {
@@ -140,10 +140,10 @@ fn a_nul_refusal_names_the_field_that_carried_it() {
     assert!(val.to_string().contains("environment value"), "{val}");
 
     // The `what` really is the caller's, not a constant the two legs above happen to share.
-    let other = ensure_no_nul_wide("program image", OsStr::new("a\u{0}b")).unwrap_err();
-    assert!(other.to_string().contains("program image"), "{other}");
+    let other = ensure_no_nul_wide("program token", OsStr::new("a\u{0}b")).unwrap_err();
+    assert!(other.to_string().contains("program token"), "{other}");
     assert!(
         !other.to_string().contains("environment"),
-        "a program image is not the environment: {other}"
+        "a program token is not the environment: {other}"
     );
 }

@@ -432,8 +432,8 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // not this one.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
-    // Refused for an interior NUL rather than silently truncated — see `wide_nul`. `params` is
-    // the JOINED argument line, so a NUL in any single argv element is caught here.
+    // Refused for an interior NUL rather than silently truncated — see `wide_nul`. The argv
+    // elements `params` was joined from were checked individually above, by index.
     let dir = cmd
         .cwd()
         .map(|d| wide_nul("working directory", d.as_os_str()))
