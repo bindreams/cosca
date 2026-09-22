@@ -1272,3 +1272,59 @@ fn placement_of_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
         Ok(()) => panic!("the child reported a failed write"),
     }
 }
+
+/// The child's `/proc` state is read BEFORE `cgroup.procs`, so a `Z` in the diagnosis means the
+/// child had exited before the file was read.
+///
+/// `cgroup.procs` is a FIFO here, so the read of it is an event the test can act on: its writer
+/// makes the child a zombie only once the read has begun, and lets the read finish only after.
+/// Read first, the state is the live child's; read second, it would be `Z`.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_of_reads_the_childs_state_before_cgroup_procs() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-ordered-reads");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let procs_path = leaf_path.join("cgroup.procs");
+    nix::unistd::mkfifo(&procs_path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo cgroup.procs");
+    // No report was stored, so the verdict reads both to diagnose the child.
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path);
+
+    // A live child, blocked reading a pipe nothing writes to.
+    let mut child = std::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let writer = std::thread::spawn(move || {
+        // Blocks until the verdict opens the FIFO to read it.
+        let mut fifo = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&procs_path)
+            .expect("open the FIFO");
+        child.kill().expect("kill the child");
+        // Block until the child has exited, leaving it unreaped (WNOWAIT): a zombie.
+        // SAFETY: `info` is a valid, writable siginfo_t; `pid` is this process's own child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+        fifo.write_all(b"listed\n").expect("write the FIFO");
+        child
+    });
+
+    let verdict = leaf.placement_of(pid);
+    writer.join().expect("the writer").wait().expect("reap the child");
+    match verdict {
+        Err(NotPlaced::Absent { procs, child_state, .. }) => {
+            assert_eq!(procs, "listed\n");
+            assert!(
+                child_state.is_some_and(|state| state != 'Z'),
+                "the state was read after cgroup.procs: {child_state:?}"
+            );
+        }
+        Err(other) => panic!("a readable cgroup.procs must be quoted: {other}"),
+        Ok(()) => panic!("no child reported a placement"),
+    }
+}
