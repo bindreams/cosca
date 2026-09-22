@@ -1248,11 +1248,10 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
 /// which is why this test used to pass with the disarm reverted.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_detach_leaves_the_tree_running() {
+    common::cgroup::require_lane();
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
     assert_opted_out_tree_survives(|| spawn_contained_echo_tree(true), |child| child.detach());
 }
 
@@ -1261,11 +1260,10 @@ fn linux_cgroup_v2_detach_leaves_the_tree_running() {
 /// with the handle whatever the flag says.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
+    common::cgroup::require_lane();
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
     assert_opted_out_tree_survives(|| spawn_contained_echo_tree(false), drop);
 }
 

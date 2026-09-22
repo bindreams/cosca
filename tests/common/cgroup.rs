@@ -1,5 +1,15 @@
 //! cgroup v2 helpers for the Linux cgroup lane.
 
+/// Fail a lane test run outside the lane. It is `#[ignore]`d, so reaching this means it was
+/// requested explicitly, and an unset `COSCA_TEST_CGROUP` is a misconfigured invocation.
+pub fn require_lane() {
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset: run it \
+         in a delegated cgroup with COSCA_TEST_CGROUP=1"
+    );
+}
+
 /// The cgroup v2 leaf `pid` is in, as an absolute path. Mirrors the join
 /// `containment::cgroup` makes for itself: `/proc/<pid>/cgroup`'s `0::` line is relative to
 /// this process's cgroup namespace, whose root is `/sys/fs/cgroup`.
