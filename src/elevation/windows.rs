@@ -366,7 +366,7 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
 }
 
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
-pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
+pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
 }
 
@@ -477,7 +477,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 
 /// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
 /// the child it launched. Everything that could refuse the request happened in [`plan_runas`].
-pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error> {
+pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<RunasOutcome, Error> {
     let launch = match plan_runas(cmd, host)? {
         RunasStep::AlreadyElevated => return Ok(RunasOutcome::AlreadyElevated),
         RunasStep::Launch(launch) => launch,
@@ -561,7 +561,7 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
 }
 
 pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error> {
-    match launch_runas(cmd)? {
+    match launch_runas(&*cmd)? {
         RunasOutcome::AlreadyElevated => {
             let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
             child.set_elevation(Some(crate::elevation::already_elevated_report(
