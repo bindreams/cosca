@@ -477,7 +477,7 @@ fn placement_unreadable_names_the_io_error() {
 #[test]
 fn degrade_logs_the_reason_at_warn() {
     crate::log_capture::install();
-    let warned = std::sync::atomic::AtomicU32::new(0);
+    let warned = std::sync::Mutex::default();
     let mark = crate::log_capture::mark();
     super::log_degrade_into(
         &warned,
@@ -857,7 +857,7 @@ fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
 #[test]
 fn a_repeated_degrade_reason_warns_once_then_reports_at_debug() {
     crate::log_capture::install();
-    let warned = std::sync::atomic::AtomicU32::new(0);
+    let warned = std::sync::Mutex::default();
     let reason = || LeafError::KillUnsupported {
         path: PathBuf::from("/sys/fs/cgroup/slice/cosca-once-probe-7c13"),
     };
@@ -880,7 +880,7 @@ fn a_repeated_degrade_reason_warns_once_then_reports_at_debug() {
 #[test]
 fn a_newly_seen_degrade_reason_still_warns() {
     crate::log_capture::install();
-    let warned = std::sync::atomic::AtomicU32::new(0);
+    let warned = std::sync::Mutex::default();
     super::log_degrade_into(
         &warned,
         &LeafError::KillUnsupported {
@@ -898,6 +898,54 @@ fn a_newly_seen_degrade_reason_still_warns() {
         crate::log_capture::levels_since(mark, "placement-report memory page"),
         vec![log::Level::Warn],
         "a second, different reason is a second thing the embedder has not been told"
+    );
+}
+
+/// One step failing for two different reasons is two conditions: a transient `ENOMEM` warning
+/// first must not silence a standing `EACCES` behind it.
+#[test]
+fn the_same_step_failing_with_a_new_errno_still_warns() {
+    crate::log_capture::install();
+    let warned = std::sync::Mutex::default();
+    let refused = |errno: i32, marker: &str| LeafError::CreateLeafDir {
+        path: PathBuf::from(format!("/sys/fs/cgroup/slice/{marker}")),
+        source: std::io::Error::from_raw_os_error(errno),
+    };
+
+    let mark = crate::log_capture::mark();
+    super::log_degrade_into(&warned, &refused(libc::ENOMEM, "cosca-errno-probe-e1c4"));
+    super::log_degrade_into(&warned, &refused(libc::EACCES, "cosca-errno-probe-e1c4"));
+    super::log_degrade_into(&warned, &refused(libc::EACCES, "cosca-errno-probe-e1c4"));
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-errno-probe-e1c4"),
+        vec![log::Level::Warn, log::Level::Warn, log::Level::Debug],
+    );
+}
+
+/// A child that reported nothing and a child whose write failed are different conditions, and
+/// so are two write failures with different errnos.
+#[test]
+fn each_placement_report_is_its_own_condition() {
+    crate::log_capture::install();
+    let warned = std::sync::Mutex::default();
+    let absent = |report: NotEntered| NotPlaced::Absent {
+        pid: 4242,
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-report-probe-9d27/cgroup.procs"),
+        procs: String::new(),
+        report,
+        child_state: None,
+    };
+
+    let mark = crate::log_capture::mark();
+    super::log_degrade_into(&warned, &absent(NotEntered::NotReported));
+    super::log_degrade_into(&warned, &absent(NotEntered::WriteFailed(libc::EBUSY)));
+    super::log_degrade_into(&warned, &absent(NotEntered::WriteFailed(libc::EINVAL)));
+    super::log_degrade_into(&warned, &absent(NotEntered::WriteFailed(libc::EBUSY)));
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-report-probe-9d27"),
+        vec![log::Level::Warn, log::Level::Warn, log::Level::Warn, log::Level::Debug],
     );
 }
 
@@ -940,12 +988,12 @@ fn every_degrade_reason_has_its_own_kind() {
             pid: 1,
             path: PathBuf::from("/cg/leaf/cgroup.procs"),
             source: std::io::Error::from_raw_os_error(13),
-            report: NotEntered::NotReported,
+            report: NotEntered::WriteFailed(16),
         }),
     ];
     let mut seen = Vec::new();
     for reason in &reasons {
-        let kind = reason.kind();
+        let kind = reason.condition().kind;
         assert!(!seen.contains(&kind), "{kind:?} is claimed by two different reasons");
         seen.push(kind);
     }

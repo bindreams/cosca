@@ -27,10 +27,11 @@
 // The parsers below are pure (no OS deps) — compiled on all platforms so their unit tests run
 // on any host.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
@@ -309,11 +310,8 @@ impl fmt::Display for NotPlaced {
     }
 }
 
-/// The distinct conditions a contained spawn can degrade for.
-///
-/// A reason's TEXT varies per spawn (paths, errnos, the child's own state); its kind is the
-/// thing an embedder can actually act on, and is what [`log_degrade`] reports once per process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The step a contained spawn degraded at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum DegradeKind {
     ReadProcSelfCgroup,
@@ -323,42 +321,67 @@ pub(crate) enum DegradeKind {
     CheckKill,
     OpenProcs,
     MapReportPage,
-    PlacementAbsent,
-    PlacementUnreadable,
+    PlacementNotReported,
+    PlacementWriteFailed,
+}
+
+/// One condition a contained spawn can degrade for: the step, and the errno it failed with
+/// where it has one.
+///
+/// A reason's TEXT varies per spawn (paths, the child's own state); its condition is what an
+/// embedder can act on, and is what [`log_degrade`] warns about once per process. The errno is
+/// part of it because one step fails for different reasons that need different fixes: a
+/// transient `ENOMEM` from `mkdir` is not the standing `EACCES` of an undelegated slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct DegradeCondition {
+    pub(crate) kind: DegradeKind,
+    pub(crate) errno: Option<i32>,
 }
 
 /// A reason a spawn degraded: its full text, plus which condition it is an instance of.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) trait DegradeReason: fmt::Display {
-    fn kind(&self) -> DegradeKind;
+    fn condition(&self) -> DegradeCondition;
 }
 
 impl DegradeReason for LeafError {
-    fn kind(&self) -> DegradeKind {
-        match self {
-            LeafError::ReadProcSelfCgroup(_) => DegradeKind::ReadProcSelfCgroup,
-            LeafError::NoUnifiedLine { .. } => DegradeKind::NoUnifiedLine,
-            LeafError::CreateLeafDir { .. } => DegradeKind::CreateLeafDir,
-            LeafError::KillUnsupported { .. } => DegradeKind::KillUnsupported,
-            LeafError::CheckKill { .. } => DegradeKind::CheckKill,
-            LeafError::OpenProcs { .. } => DegradeKind::OpenProcs,
-            LeafError::MapReportPage(_) => DegradeKind::MapReportPage,
+    fn condition(&self) -> DegradeCondition {
+        let (kind, source) = match self {
+            LeafError::ReadProcSelfCgroup(e) => (DegradeKind::ReadProcSelfCgroup, Some(e)),
+            LeafError::NoUnifiedLine { .. } => (DegradeKind::NoUnifiedLine, None),
+            LeafError::CreateLeafDir { source, .. } => (DegradeKind::CreateLeafDir, Some(source)),
+            LeafError::KillUnsupported { .. } => (DegradeKind::KillUnsupported, None),
+            LeafError::CheckKill { source, .. } => (DegradeKind::CheckKill, Some(source)),
+            LeafError::OpenProcs { source, .. } => (DegradeKind::OpenProcs, Some(source)),
+            LeafError::MapReportPage(e) => (DegradeKind::MapReportPage, Some(e)),
+        };
+        DegradeCondition {
+            kind,
+            errno: source.and_then(io::Error::raw_os_error),
         }
     }
 }
 
 impl DegradeReason for NotPlaced {
-    fn kind(&self) -> DegradeKind {
-        match self {
-            NotPlaced::Absent { .. } => DegradeKind::PlacementAbsent,
-            NotPlaced::Unreadable { .. } => DegradeKind::PlacementUnreadable,
+    /// The child's own report, never how `cgroup.procs` read: that is diagnosis, not cause.
+    fn condition(&self) -> DegradeCondition {
+        let (NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. }) = self;
+        match *report {
+            NotEntered::NotReported => DegradeCondition {
+                kind: DegradeKind::PlacementNotReported,
+                errno: None,
+            },
+            NotEntered::WriteFailed(errno) => DegradeCondition {
+                kind: DegradeKind::PlacementWriteFailed,
+                errno: Some(errno),
+            },
         }
     }
 }
 
-/// Which degrade kinds this process has already reported at `warn`, one bit per
-/// [`DegradeKind`].
-static WARNED: AtomicU32 = AtomicU32::new(0);
+/// The degrade conditions this process has already reported at `warn`.
+static WARNED: Mutex<BTreeSet<DegradeCondition>> = Mutex::new(BTreeSet::new());
 
 /// Record that this spawn is not getting the containment it asked for, and why.
 ///
@@ -366,13 +389,14 @@ static WARNED: AtomicU32 = AtomicU32::new(0);
 /// the log carries a single line naming the achieved mechanism and the reason the stronger one
 /// was unavailable.
 ///
-/// **Once per reason at `warn`, every time after that at `debug`.** Nearly every degrade
+/// **Once per condition at `warn`, every time after that at `debug`.** Nearly every degrade
 /// condition is a standing property of the host — an unprivileged container's read-only
 /// `/sys/fs/cgroup`, an undelegated slice, a kernel older than 5.14 — so it holds for every
 /// `.contain()` spawn this process will ever make. The first report is a real reduction in the
 /// guarantee the caller asked for and warns; the ten-thousandth tells an embedder nothing new
 /// about something it cannot fix, and a log an embedder learns to filter out is worse than no
-/// log. A genuinely NEW condition warns whatever has degraded before it.
+/// log. A genuinely NEW condition — see [`DegradeCondition`] — warns whatever has degraded
+/// before it.
 ///
 /// Repeats carry their own full text, so a process whose `log` max level admits `debug` keeps
 /// every degrading spawn on record. Below that they are gone, not merely hidden: `log!` tests
@@ -388,20 +412,25 @@ pub(crate) fn log_degrade(reason: &dyn DegradeReason) {
 /// The set is a parameter, not a hard-wired static, so a test drives the first-then-repeat
 /// transition against its own state instead of racing every other test in the binary for the
 /// process-wide one.
-fn log_degrade_into(warned: &AtomicU32, reason: &dyn DegradeReason) -> log::Level {
-    let kind = reason.kind();
-    debug_assert!(
-        (kind as u32) < u32::BITS,
-        "DegradeKind has outgrown the one-bit-per-kind set; widen WARNED"
-    );
-    let bit = 1u32 << (kind as u32);
-    let level = if warned.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+fn log_degrade_into(warned: &Mutex<BTreeSet<DegradeCondition>>, reason: &dyn DegradeReason) -> log::Level {
+    let level = report_level(warned, reason.condition());
+    log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
+    level
+}
+
+/// The level to report `condition` at: `Warn` the first time `seen` meets it, `Debug` after.
+///
+/// Generic over the condition so every once-per-condition report in the crate shares this one
+/// policy while keying on its own conditions.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn report_level<C: Ord>(seen: &Mutex<BTreeSet<C>>, condition: C) -> log::Level {
+    // A panic elsewhere while holding the lock cannot leave a set half-inserted; recover it
+    // rather than turn a log call into a second panic.
+    if seen.lock().unwrap_or_else(PoisonError::into_inner).insert(condition) {
         log::Level::Warn
     } else {
         log::Level::Debug
-    };
-    log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
-    level
+    }
 }
 
 // Everything below is Linux-only. =====
@@ -413,7 +442,7 @@ use std::os::fd::{IntoRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicI32, AtomicU64};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 /// Process-wide monotonic counter; combined with the pid, gives a unique leaf
 /// name even when the same process spawns on multiple threads simultaneously.
