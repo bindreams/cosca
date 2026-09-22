@@ -105,6 +105,14 @@ impl Command {
     /// the loaded image (`lpApplicationName`) independently of the command line
     /// (`lpCommandLine`), so `executable` selects the file that runs while the
     /// child's `argv[0]` is the command line's first token.
+    ///
+    /// Without `executable`, the loaded image comes from `line`'s own first token instead (see
+    /// [`crate::quote::windows::first_token_and_rest_wide`]'s doc for exactly how that token is
+    /// extracted). An UNQUOTED path containing a space fails closed with `NotFound` there rather
+    /// than being found via successive whitespace-delimited prefixes the way a NULL
+    /// `lpApplicationName` would be by `CreateProcessW` itself — see that doc for why (it is the
+    /// classic unquoted-service-path hijack vector, deliberately not replicated). Quote such a
+    /// path.
     pub fn commandline<S: Into<OsString>>(&mut self, line: S) -> &mut Command {
         self.input = CommandInput::CommandLine(line.into());
         self
@@ -119,13 +127,89 @@ impl Command {
     /// `executable("/bin/busybox").args(["sh", "-c", "..."])` correctly loads
     /// busybox while the child sees `"sh"` as its `argv[0]`.
     ///
-    /// On Windows, a set `executable` spawns through the raw `CreateProcessW`
-    /// backend, which sets `lpApplicationName` independently of `lpCommandLine` —
-    /// so `argv[0]` is preserved (it no longer degrades to the executable path), and
-    /// combining `executable` with [`commandline`](Self::commandline) is supported.
-    /// A bare or relative `executable` is resolved with a deliberate rule (not full
-    /// `CreateProcessW` search parity): the current directory first, then each
-    /// `PATH` directory, appending `.exe` when the name has no extension.
+    /// On Windows, for an UNELEVATED spawn, a set `executable` routes through the raw
+    /// `CreateProcessW` backend, which sets `lpApplicationName` independently of
+    /// `lpCommandLine` — so `argv[0]` is preserved (it no longer degrades to the
+    /// executable path), and combining `executable` with
+    /// [`commandline`](Self::commandline) is supported. A bare or relative
+    /// `executable` is resolved with a deliberate rule (not full `CreateProcessW`
+    /// search parity): a name containing a path separator resolves against the
+    /// working directory with no search, while a true bare name is looked up in the
+    /// system directories (the directory this process's own image loaded from,
+    /// `System32`, then the Windows directory) and then `PATH` — **never the current
+    /// directory**. That order, system directories before `PATH`, is deliberate: it is
+    /// `CreateProcessW`'s own documented search order with the current directory cut
+    /// out, not a fresh rule, so a directory placed early on `PATH` (a dev toolchain
+    /// install, a per-user app shim) still cannot shadow e.g. `System32\find.exe`.
+    /// Searching the current directory first was the previous behaviour and was a
+    /// binary-planting hazard: `executable("helper")` would load a `helper.exe` dropped
+    /// in whatever directory the process happened to sit in. Write `./helper` to reach
+    /// it explicitly.
+    ///
+    /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a
+    /// descriptor >= 3 also routes an unelevated Windows spawn through the raw backend, so
+    /// `Command::new().arg("sub/helper").fd(3, ..)` is resolved by everything described here —
+    /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
+    /// `executable` set at all.
+    ///
+    /// The `.exe` rule is a property of names that get SEARCHED, not of files that get
+    /// LOADED, so it differs by shape. If the name's final path component already ends
+    /// in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is left alone, never doubled
+    /// into `TOOL.EXE.exe`), it is used as-is either way. Otherwise:
+    ///
+    /// - a **bare name** is checked against `name.exe` and nothing else. There is no
+    ///   extensionless fallback candidate — a directory holding only an extensionless
+    ///   `tool` will not resolve, matching `CreateProcessW`, `cmd.exe`, and both
+    ///   PowerShell editions, all of which refuse to run an extensionless image by bare
+    ///   name (measured on real Windows CI). `PATHEXT` cannot express "no extension", so
+    ///   there is nothing to be compatible with.
+    /// - a **pathed name** is checked against the exact name the caller wrote, first and
+    ///   always. `CreateProcessW` documents "no default extension is assumed" for the
+    ///   `lpApplicationName` this backend sets, and the PE format makes no extension
+    ///   normative, so `executable(r"C:\tools\payload.tmp")` names exactly that file.
+    ///   A second `name.exe` candidate follows only when the name carries no extension at
+    ///   all, so `tools\thing.bin` has exactly one candidate. Where both `bin\tool` and
+    ///   `bin\tool.exe` exist, the extensionless one wins. A name that names no file —
+    ///   `tools\thing.bin\`, a root, a bare `\\server\share` — has none: it is refused
+    ///   before any candidate is built (see the error kinds below).
+    ///
+    /// Both bullets read the name AS WRITTEN. Windows trims a path component's trailing
+    /// dots and spaces on the way into an API, but that describes the string rather than
+    /// what may exist on disk, and this resolver does not reproduce it — so a trailing dot
+    /// or space is an ordinary part of a name. A bare `tool.` is therefore searched for as
+    /// `tool..exe`, while a pathed `bin\tool.` carries an extension (an empty one) and so
+    /// gets no second candidate at all.
+    ///
+    /// A bare name with a non-`.exe`/`.com` dot, such as `python3.11`, resolves to
+    /// `python3.11.exe` — matching how `cmd.exe` and both PowerShell editions use PATHEXT
+    /// to resolve it, which `CreateProcessW` itself does not do. `.bat`/`.cmd` are
+    /// deliberately excluded from the exact-match allowlist: resolving to a script is a
+    /// separate, not-yet-implemented feature (planned as its own follow-up), not a
+    /// judgement that scripts are unsafe — this crate's existing, separate batch-path
+    /// rejection (CVE-2024-24576) is unaffected either way.
+    ///
+    /// # Error kinds
+    ///
+    /// The two kinds answer different questions:
+    ///
+    /// - [`std::io::ErrorKind::InvalidInput`] — the name was NOT ACCEPTED. It was refused on
+    ///   its shape and nothing was searched for, so no filesystem result is being reported.
+    ///   A drive-relative name such as `C:tool` is refused this way rather than loaded from
+    ///   the working directory: resolving it would need drive C's own current directory,
+    ///   which cosca does not track. So is a name that names no file at all (`C:\`, `.`,
+    ///   `tools\dir\`, `\\server\share`).
+    /// - [`std::io::ErrorKind::NotFound`] — the name was acceptable, the search above ran,
+    ///   and nothing matched.
+    ///
+    /// The dividing line is whether a different filesystem could make the name succeed: if
+    /// no disk ever could, the refusal is a property of the string, and it is `InvalidInput`.
+    ///
+    /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
+    /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
+    /// backend (and this resolver) described above, so a bare or relative
+    /// `executable` there is neither searched in `PATH` nor refused for a
+    /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
+    /// unresolved.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(path.into());
         self
@@ -151,6 +235,10 @@ impl Command {
     /// table, not a bug. `Stdio::inherit()` on a `slot >= 3` (no defined parent
     /// stream) and a chained merge (a merge whose target is itself a merge) remain
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) on every platform.
+    ///
+    /// Routing to that backend also applies [`executable`](Self::executable)'s Windows
+    /// resolution policy — and its error kinds — to the program name, whether or not
+    /// `executable` is set.
     pub fn fd(&mut self, slot: impl Into<Fd>, target: Stdio) -> Result<&mut Command, Error> {
         let slot = slot.into();
         let resolved = target.resolve(slot)?;

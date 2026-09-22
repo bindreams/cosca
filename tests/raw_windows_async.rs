@@ -96,3 +96,57 @@ async fn async_contained_raw_child_is_in_our_job() {
     assert_eq!(s, "x");
     child.kill_tree().expect("kill_tree");
 }
+
+/// Async twin of sync `fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd`: a
+/// `Command` with no `.executable()` still routes to the async raw backend purely via fd >= 3, so
+/// `image` used to be `None` and `lpApplicationName` NULL. `CreateProcessW`'s own search for a
+/// NULL `lpApplicationName` visits, at step 2 of its documented order, the CALLING process's
+/// current directory — never the child's `lpCurrentDirectory`/`Command::cwd()`.
+///
+/// That calling process cannot be THIS test process: mutating this process's own cwd under
+/// `cosca::test_spawn_lock()` while also calling `cosca::tokio::Command::spawn()` would
+/// self-deadlock, because that spawn takes the exact same non-reentrant mutex internally (see
+/// `tests/common/mod.rs`'s `output_locked`/`status_locked` docs and `src/test_child.rs`). Instead,
+/// this test plants the decoy in a tempdir and spawns the `cosca_testbin` helper's
+/// `report-bare-argv0-cwd-spawn-async` mode via one ordinary, single-level
+/// `cosca::tokio::Command::spawn()` call, passing the decoy directory as an argument. That helper
+/// — a fresh, isolated process with its own cwd — does the chdir and the vulnerable/fixed ASYNC
+/// spawn itself (exercising the async raw backend specifically), and reports the outcome on
+/// stdout.
+///
+/// With the bug, the helper's inner spawn would find and load the planted decoy from its own
+/// current directory (CWE-426/427) and report "loaded". Fixed, the bare argv[0] resolves through
+/// the crate's own resolver — the system directories (app dir, `System32`, the Windows directory)
+/// and then `PATH`, never any cwd for a bare name — so the planted copy is never loaded and the
+/// helper reports "notfound".
+///
+/// The decoy is planted under a FABRICATED name, never the literal "cosca_testbin" — see the sync
+/// twin's doc for why: that literal name can legitimately resolve via the runner's ACTUAL `PATH`
+/// (measured on CI, where it made an earlier, undiscriminating version of this test report
+/// "loaded" for a reason unrelated to the bug). A name that exists nowhere but the planted decoy
+/// means any successful resolution of it can only have come from the vulnerable cwd search — and,
+/// since the decoy lives ONLY in this tempdir cwd, never the app dir, `System32`, or the Windows
+/// directory either, the resolver's system-directory search step cannot accidentally find it and
+/// mask a cwd-search regression this test would otherwise catch.
+#[tokio::test]
+async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let decoy_program = "cosca_testbin_b2_cwd_decoy";
+    std::fs::copy(common::testbin(), dir.path().join(format!("{decoy_program}.exe"))).unwrap();
+
+    let mut c = cosca::tokio::Command::new();
+    c.executable(common::testbin())
+        .args([
+            "cosca_testbin",
+            "report-bare-argv0-cwd-spawn-async",
+            dir.path().to_str().expect("tempdir path is valid UTF-8"),
+            decoy_program,
+        ])
+        .stdout(cosca::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("spawn the probe helper");
+    let mut s = String::new();
+    child.stdout().unwrap().read_to_string(&mut s).await.unwrap();
+    child.wait().await.unwrap();
+    assert_eq!(s.trim(), "notfound", "helper report: {s}");
+}
