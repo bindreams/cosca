@@ -25,10 +25,9 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
 
 /// Wait for `leaf` to drain, then remove it.
 ///
-/// A tree whose handle opted out of teardown keeps its leaf, and nothing — cosca, or any
-/// cgroup manager — ever revisits a `cosca-*` cgroup, so a test that walks away from one adds
-/// a permanent stray to the very lane that counts them (issue #140). Cleaning up is the test's
-/// own job, exactly as it is `drop_warns_for_a_real_leaf_held_by_a_descendant_cgroup`'s.
+/// A tree still running or still exiting when its handle drops leaves its leaf behind, and cosca
+/// does not come back for it. Removing it is the test's job, so the lane that counts stray
+/// `cosca-*` leaves counts none of the tests' own.
 ///
 /// The wait is on the kernel's own edge, never on a clock: `cgroup.events`'s `populated` flips
 /// 1 -> 0 exactly when the leaf's last task exits, and `POLLPRI` fires on that transition.

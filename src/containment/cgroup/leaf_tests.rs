@@ -531,7 +531,7 @@ fn an_armed_leaf_still_kills_the_tree_on_drop() {
 }
 
 /// A disarmed leaf whose tree has already gone still removes the empty directory: detach gives
-/// up the KILL, not the tidying. Nothing else ever removes a `cosca-*` leaf.
+/// up the KILL, not the tidying. cosca does not come back for a leaf it left.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
@@ -545,7 +545,7 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
 
     assert!(
         !leaf_path.exists(),
-        "an empty leaf is removable and nothing else will ever remove it"
+        "an empty leaf is removable, and cosca does not come back for one it left"
     );
 }
 

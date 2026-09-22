@@ -1267,11 +1267,39 @@ fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
     assert_opted_out_tree_survives(|| spawn_contained_echo_tree(false), drop);
 }
 
+/// An opted-out handle still removes the leaf of a tree that has fully exited, as
+/// `Command::kill_on_drop` says: `kill_tree` then `wait_tree` before the drop leaves nothing.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
+    common::cgroup::require_lane();
+    stderr_log::install();
+    let EchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = spawn_contained_echo_tree(false);
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    child.wait_tree().expect("wait_tree");
+    drop(child);
+
+    assert!(
+        !leaf.exists(),
+        "an opted-out handle must still remove the leaf of a drained tree: {}",
+        leaf.display()
+    );
+    drop((root, grand));
+}
+
 /// Shared body of the two cgroup opt-out tests: spawn a contained echo tree, note the leaf it
 /// was placed in, release the handle through `opt_out`, and prove BOTH members are still alive
-/// by a byte round trip. Then release the tree and remove the leaf it kept — the opt-out is
-/// exactly the case cosca cannot come back for, so leaving it is one more permanent `cosca-*`
-/// on the host (issue #140) in the lane that exists to count them.
+/// by a byte round trip. Then release the tree and remove the leaf it kept.
 #[cfg(target_os = "linux")]
 fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: impl FnOnce(cosca::Child)) {
     let EchoTree {

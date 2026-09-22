@@ -493,10 +493,13 @@ impl Command {
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
     ///
-    /// **Opting out of a [`CgroupV2`](crate::Containment::CgroupV2) teardown leaves a cgroup
-    /// directory behind.** The leaf is removed by the teardown this opts out of, and nothing —
-    /// cosca or any cgroup manager — comes back for one, so a supervisor that opts out per
-    /// spawn accumulates one empty `cosca-*` cgroup per contained child.
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
+    /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
+    /// but never kills to empty it. A tree still running keeps it, and so does one killed with
+    /// [`kill_tree`](crate::Child::kill_tree) that has not finished exiting, which
+    /// [`wait_tree`](crate::Child::wait_tree) before the drop prevents. cosca does not come back
+    /// for a leaf it left: the empty `cosca-*` directory stays until something else removes it,
+    /// such as systemd removing a stopped unit's cgroup subtree.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self
