@@ -23,7 +23,7 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
     std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
 }
 
-/// Wait for `leaf` to drain, then remove it.
+/// Wait for `leaf` to drain, then remove it, unless something else removes it first.
 ///
 /// A tree still running or still exiting when its handle drops leaves its leaf behind, and cosca
 /// does not come back for it. Removing it is the test's job, so the lane that counts stray
@@ -33,17 +33,31 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
 /// 1 -> 0 exactly when the leaf's last task exits, and `POLLPRI` fires on that transition.
 /// `populated` is read before every poll, so a transition that already happened is seen on the
 /// read rather than waited out for an edge that will not fire again.
+///
+/// The handle's own `Drop` may remove the leaf concurrently: the async handle drops it on a
+/// reaper thread. `ENOENT` or `ENODEV` from any step means it is gone, which is the goal.
 pub fn drain_and_remove_leaf(leaf: &std::path::Path) {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     use rustix::event::{poll, PollFd, PollFlags};
 
-    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open the leaf's cgroup.events");
+    let gone = |e: &std::io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENODEV));
+    let mut events = match std::fs::File::open(leaf.join("cgroup.events")) {
+        Ok(f) => f,
+        Err(e) if gone(&e) => return,
+        Err(e) => panic!("open the leaf's cgroup.events: {e}"),
+    };
     let mut buf = String::new();
     loop {
         buf.clear();
-        events.seek(SeekFrom::Start(0)).expect("rewind cgroup.events");
-        events.read_to_string(&mut buf).expect("read cgroup.events");
+        match events
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| events.read_to_string(&mut buf))
+        {
+            Ok(_) => {}
+            Err(e) if gone(&e) => return,
+            Err(e) => panic!("read cgroup.events: {e}"),
+        }
         if buf.lines().any(|l| l.trim() == "populated 0") {
             break;
         }
@@ -55,5 +69,9 @@ pub fn drain_and_remove_leaf(leaf: &std::path::Path) {
             Err(e) => panic!("poll cgroup.events: {e}"),
         }
     }
-    std::fs::remove_dir(leaf).expect("remove the drained leaf");
+    match std::fs::remove_dir(leaf) {
+        Ok(()) => {}
+        Err(e) if gone(&e) => {}
+        Err(e) => panic!("remove the drained leaf: {e}"),
+    }
 }

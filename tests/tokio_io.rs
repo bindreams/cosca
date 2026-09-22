@@ -234,10 +234,10 @@ fn cgroup_leaf_of(_: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
 }
 
 /// Remove the leaf a test's tree left behind, once the tree drains. Call it only after every
-/// member has been released or killed. The handle's `Drop` may already have removed the leaf.
+/// member has been released or killed.
 fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
     #[cfg(target_os = "linux")]
-    if let Some(leaf) = leaf.filter(|l| l.exists()) {
+    if let Some(leaf) = leaf {
         common::cgroup::drain_and_remove_leaf(&leaf);
     }
     #[cfg(not(target_os = "linux"))]
@@ -248,6 +248,7 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
     let (child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let leaf = cgroup_leaf_of(&child);
     // The containment assert guards the EOFs below from passing for unrelated reasons.
     assert_ne!(
         child.containment(),
@@ -266,6 +267,9 @@ async fn async_drop_tears_down_a_contained_tree() {
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
+    // The reaper thread drops the leaf after the reap, possibly before the killed grandchild
+    // has left it.
+    remove_leftover_leaf(leaf);
 }
 
 #[tokio::test]

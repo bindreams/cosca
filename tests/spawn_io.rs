@@ -1429,9 +1429,7 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     // `cgroup.kill` is asynchronous: the worker's socket closes before it leaves the leaf, so
     // `Drop`'s `rmdir` can precede the drain and leave the leaf behind.
     drop(child);
-    if leaf.exists() {
-        common::cgroup::drain_and_remove_leaf(&leaf);
-    }
+    common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
 /// The unified-hierarchy path in the contents of a `/proc/<pid>/cgroup` file.
