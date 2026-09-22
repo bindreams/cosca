@@ -550,6 +550,11 @@ impl CgroupLeaf {
     /// `remove_dir` of a nonexistent path is a harmless no-op — so it is
     /// usable ONLY for variant-level assertions, never for an operation that touches the
     /// fd or path.
+    ///
+    /// Its path is shared by every caller, so a test asserting on LOG RECORDS must not use
+    /// it: `log_capture` is process-wide, libtest runs this binary's tests in parallel, and
+    /// records from a concurrent sibling would be indistinguishable from its own. Such a test
+    /// names its own leaf through [`for_test_at`](Self::for_test_at).
     pub(crate) fn placeholder_for_test() -> CgroupLeaf {
         CgroupLeaf::for_test_at(PathBuf::from("/nonexistent/cosca-cgroup-placeholder"))
     }

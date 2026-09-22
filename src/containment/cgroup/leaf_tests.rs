@@ -353,14 +353,19 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
 
-    let leaf = crate::containment::cgroup::CgroupLeaf::placeholder_for_test();
+    // Its OWN leaf name, not the shared placeholder: `log_capture` is process-wide and
+    // libtest runs this file in parallel, so a marker a sibling test also emits makes the
+    // count below a count of whatever else happened to run alongside.
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
+        "/nonexistent/cosca-hard-kill-already-gone",
+    ));
     leaf.hard_kill()
         .expect("an already-removed leaf is a completed teardown, not a failure");
 
-    let levels = crate::log_capture::levels_since(mark, "cosca-cgroup-placeholder");
-    assert!(
-        !levels.contains(&log::Level::Warn),
-        "an already-gone leaf is routine and must not be reported at warn, got {levels:?}"
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-hard-kill-already-gone"),
+        vec![log::Level::Debug],
+        "an already-gone leaf is routine: exactly one record, and not at warn"
     );
 }
 
@@ -370,7 +375,10 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
 #[cfg(target_os = "linux")]
 #[test]
 fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
-    let leaf = crate::containment::cgroup::CgroupLeaf::placeholder_for_test();
+    // Its own leaf name, for the reason `hard_kill`'s twin above gives.
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
+        "/nonexistent/cosca-terminate-already-gone",
+    ));
     leaf.terminate()
         .expect("an already-removed leaf has no member left to signal");
 
