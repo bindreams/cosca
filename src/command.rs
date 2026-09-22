@@ -273,23 +273,13 @@ impl Command {
     /// [`executable`](Self::executable) fails such a name closed for exactly that reason; here
     /// the platform answers it.
     ///
-    /// # Elevated `argv[0]`
-    ///
-    /// Every elevation backend derives the child's `argv[0]` from the program it is handed
-    /// (`ShellExecuteEx`'s `lpFile`, `sudo`'s and `osascript`'s exec), and that program is the
-    /// completed absolute path — so an elevated child sees `argv[0]` as that path, where the same
-    /// `Command` spawned unelevated passes argv verbatim. `raw_executable("tool").args(["tool"])`
-    /// therefore yields `argv[0] == "tool"` unelevated and the completed path under `.elevate()`
-    /// (an already-elevated Windows caller excepted: it re-spawns through `CreateProcessW`, argv
-    /// verbatim).
-    /// Handing the backend the relative name instead would let it search for the image, which is
-    /// the hazard the completion exists to remove.
+    /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
+    /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
     ///
     /// The two setters are alternatives on one field: calling either replaces the other, and the
     /// last call wins.
     ///
-    /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
-    /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
+    /// # Elevation
     ///
     /// On Windows the elevated path goes through `ShellExecuteEx`, which searches a path-less
     /// `lpFile` and applies `PATHEXT` even to an absolute one. cosca completes the name to an
@@ -298,6 +288,14 @@ impl Command {
     /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
     /// `C:\tools\setup`. Whether `PATHEXT` is also applied to a name that already ends in `.exe`
     /// is unmeasured.
+    ///
+    /// Every elevation backend derives the child's `argv[0]` from the program it is handed
+    /// (`ShellExecuteEx`'s `lpFile`, `sudo`'s and `osascript`'s exec), and that program is the
+    /// completed absolute path. So `raw_executable("tool").args(["tool"])` yields
+    /// `argv[0] == "tool"` unelevated and the completed path under `.elevate()` — except from an
+    /// already-elevated Windows caller, which re-spawns through `CreateProcessW` with argv
+    /// verbatim. Handing the backend the relative name instead would let it search for the image,
+    /// which is the hazard the completion exists to remove.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
