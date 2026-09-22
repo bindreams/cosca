@@ -432,10 +432,11 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
     map.into_iter().collect()
 }
 
-/// Program + args, honoring `executable()`; a `raw_executable()` program comes back absolute
-/// ([`Command::posix_executable`]), so the wrapper cannot search for it. An argv[0] distinct from
-/// a set `executable()` cannot survive the backend wrapper → `Unsupported`.
-fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
+/// Program + args + the directory to run them in, honoring `executable()`; a `raw_executable()`
+/// program comes back absolute ([`Command::posix_launch`]), so the wrapper cannot search for it.
+/// An argv[0] distinct from a set `executable()` cannot survive the backend wrapper →
+/// `Unsupported`.
+fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>, Option<PathBuf>), Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
     // program set" with a message about re-quoting a command line that was never set.
@@ -471,10 +472,9 @@ fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
                     .into(),
         });
     }
-    let program = cmd
-        .posix_executable()?
-        .map_or_else(|| argv[0].clone(), PathBuf::into_os_string);
-    Ok((program, argv[1..].to_vec()))
+    let launch = cmd.posix_launch()?;
+    let program = launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string);
+    Ok((program, argv[1..].to_vec(), launch.cwd))
 }
 
 /// Structural request-validation, evaluated against the REQUESTED backend so the verdict
@@ -528,13 +528,14 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
     Ok(())
 }
 
-/// Transfer the caller's cwd / containment / kill-on-drop onto the derived command.
+/// Transfer the caller's cwd (as [`program_and_args`] returned it, so it matches the program) /
+/// containment / kill-on-drop onto the derived command.
 /// Does NOT suppress the fd marker — that is only correct for a real wrapper spawn
 /// (`ElevatePosix`), whose `closefrom` destroys it; `RunAsIs`'s derived command spawns the
 /// original program directly, with no wrapper to destroy anything, so its caller must
 /// suppress explicitly if that arm ever needs to.
-fn transfer_process_attrs(derived: &mut Command, cmd: &Command) {
-    if let Some(d) = cmd.cwd() {
+fn transfer_process_attrs(derived: &mut Command, cmd: &Command, cwd: Option<PathBuf>) {
+    if let Some(d) = cwd {
         derived.current_dir(d);
     }
     derived.set_contain(cmd.contain_request());
@@ -589,7 +590,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             // forwarded var never reaches the root child. Build a non-destructive derived
             // command (the ORIGINAL program + args, sanitized env, fds MOVED).
             let (kept, stripped) = cmd.elevation_request().sanitizer.apply(explicit_set_env(cmd.env_ops()));
-            let (program, args) = program_and_args(cmd)?;
+            let (program, args, cwd) = program_and_args(cmd)?;
             let mut argv = Vec::with_capacity(args.len() + 1);
             argv.push(program);
             argv.extend(args);
@@ -597,7 +598,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             let mut derived = Command::new();
             derived.set_input_argv(argv);
             derived.set_env_ops(env_ops);
-            transfer_process_attrs(&mut derived, cmd);
+            transfer_process_attrs(&mut derived, cmd, cwd);
             for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
                 derived.fds_mut().insert(slot, resolved);
             }
@@ -625,7 +626,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                             .into(),
                 });
             }
-            let (program, args) = program_and_args(cmd)?;
+            let (program, args, cwd) = program_and_args(cmd)?;
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
@@ -643,7 +644,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             let mut derived = Command::new();
             derived.set_input_argv(argv);
             derived.set_env_ops(new_ops);
-            transfer_process_attrs(&mut derived, cmd);
+            transfer_process_attrs(&mut derived, cmd, cwd);
             // Only THIS arm's derived command is a real wrapper spawn (`sudo`/`doas`/`pkexec`
             // …): its `closefrom` destroys an installed marker, so the marker must not be
             // installed on it at all. `RunAsIs` spawns the original program with no wrapper —

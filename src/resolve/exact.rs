@@ -11,8 +11,12 @@ use crate::error::Error;
 ///
 /// The base is `child_cwd` (what `Command::current_dir` set; joined onto `process_cwd()` when
 /// itself relative), or `process_cwd()` when unset. That is the directory the child's own exec
-/// reads a relative path against: std `chdir`s in the child before it execs, and a relative
-/// `current_dir` is read against this process's cwd at that `chdir`.
+/// would read a relative path against.
+///
+/// Returns the base alongside the program as [`Completed::child_cwd`], for the sink to run the
+/// child in. A base built from `process_cwd()` replaces `child_cwd`: left relative or unset, the
+/// child would read this process's cwd again at `fork`, and a `set_current_dir` in between would
+/// load one directory's file while running in another.
 ///
 /// Absolute is the point. Every POSIX sink searches a name it is handed bare — `execvp` walks
 /// `PATH` for a name with no `/`, and `sudo`, `doas`, `pkexec`, `run0` and root's `/bin/sh` each
@@ -32,7 +36,7 @@ pub(crate) fn complete_posix(
     program: &OsStr,
     child_cwd: Option<&Path>,
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> Result<PathBuf, Error> {
+) -> Result<Completed, Error> {
     if program.as_encoded_bytes().contains(&0) {
         // A literal: interpolating the token would put a raw U+0000 into logs and terminals.
         return Err(invalid_input(
@@ -44,15 +48,36 @@ pub(crate) fn complete_posix(
             "raw_executable() was given a path that names no file: {program:?}"
         )));
     }
+    let as_given = || child_cwd.map(Path::to_path_buf);
     if is_absolute(program) {
-        return Ok(PathBuf::from(program));
+        return Ok(Completed {
+            program: PathBuf::from(program),
+            child_cwd: as_given(),
+        });
     }
     let base = match child_cwd {
-        Some(dir) if is_absolute(dir.as_os_str()) => dir.as_os_str().to_os_string(),
+        Some(dir) if is_absolute(dir.as_os_str()) => {
+            return Ok(Completed {
+                program: PathBuf::from(join(dir.as_os_str(), program)),
+                child_cwd: as_given(),
+            })
+        }
         Some(dir) => join(process_cwd()?.as_os_str(), dir.as_os_str()),
         None => process_cwd()?.into_os_string(),
     };
-    Ok(PathBuf::from(join(&base, program)))
+    Ok(Completed {
+        program: PathBuf::from(join(&base, program)),
+        child_cwd: Some(PathBuf::from(base)),
+    })
+}
+
+/// [`complete_posix`]'s answer: the program to exec and the directory to run it in.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Completed {
+    pub(crate) program: PathBuf,
+    /// The base `program` was joined onto when that base came from `process_cwd()`; otherwise
+    /// `child_cwd` as given.
+    pub(crate) child_cwd: Option<PathBuf>,
 }
 
 fn is_absolute(p: &OsStr) -> bool {

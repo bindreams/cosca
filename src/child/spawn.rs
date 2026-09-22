@@ -360,21 +360,30 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
     // Program + args via the `quote` model.
-    let (program, mut std_cmd) = match cmd.input() {
+    let Launch {
+        program,
+        mut std_cmd,
+        cwd,
+    } = match cmd.input() {
         CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
         CommandInput::Argv(argv) => {
-            let (program, rest) = resolve_program_argv(cmd, argv)?;
+            let (Resolved { program, cwd }, rest) = resolve_program_argv(cmd, argv)?;
             let mut c = std::process::Command::new(&program);
             c.args(rest);
             // POSIX: when executable() overrides the loaded file, preserve the
-            // user's argv[0] via arg0(). Without this, std would set argv[0] to
-            // the executable path, silently dropping the user's intended name.
+            // user's argv[0] via arg0() — the executable as written when argv is
+            // empty. Without this, std would set argv[0] to the (possibly completed)
+            // program path, silently dropping the user's intended name.
             #[cfg(unix)]
-            if cmd.executable_path().is_some() && !argv.is_empty() {
+            if let Some(exe) = cmd.executable_path() {
                 use std::os::unix::process::CommandExt;
-                c.arg0(&argv[0]);
+                c.arg0(argv.first().map_or(exe.as_os_str(), std::ffi::OsString::as_os_str));
             }
-            (program, c)
+            Launch {
+                program,
+                std_cmd: c,
+                cwd,
+            }
         }
         CommandInput::CommandLine(line) => build_from_commandline(cmd, line)?,
     };
@@ -385,35 +394,48 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
-    if let Some(dir) = cmd.cwd() {
+    if let Some(dir) = cwd {
         std_cmd.current_dir(dir);
     }
     Ok(std_cmd)
 }
 
+/// The program to load and the directory to run it in, taken together so that both come from one
+/// reading of this process's cwd (see `Command::posix_launch`).
+struct Resolved {
+    program: std::ffi::OsString,
+    cwd: Option<std::path::PathBuf>,
+}
+
 // Pick the executable file to load (`executable` overrides argv[0]/first-token). On POSIX an
-// `Exact` program arrives absolute (see `Command::posix_executable`); on Windows a set executable
+// `Exact` program arrives absolute (see `Command::posix_launch`); on Windows a set executable
 // never reaches this std path, routing to the raw backend instead.
-fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<std::ffi::OsString, Error> {
+fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<Resolved, Error> {
     #[cfg(unix)]
-    let exe = cmd.posix_executable()?;
+    let crate::command::PosixLaunch { program: exe, cwd } = cmd.posix_launch()?;
     #[cfg(not(unix))]
-    let exe = cmd.executable_path().map(std::path::Path::to_path_buf);
-    Ok(exe.map_or(fallback, std::path::PathBuf::into_os_string))
+    let (exe, cwd) = (
+        cmd.executable_path().map(std::path::Path::to_path_buf),
+        cmd.cwd().map(std::path::Path::to_path_buf),
+    );
+    Ok(Resolved {
+        program: exe.map_or(fallback, std::path::PathBuf::into_os_string),
+        cwd,
+    })
 }
 
 // Program + the trailing args (argv mode). `executable` overrides the loaded
 // file; argv[0] is the conventional program name otherwise.
 //
-// POSIX: when `executable` is set and argv is non-empty, the user's argv[0] is
-// preserved via `CommandExt::arg0` (set on the caller's std_cmd). On Windows a
-// set `executable` never reaches this std path — it routes to the raw
+// POSIX: when `executable` is set, the user's argv[0] — the executable as written
+// for an empty argv — is preserved via `CommandExt::arg0` (set on the caller's
+// std_cmd). On Windows a set `executable` never reaches this std path — it routes to the raw
 // `CreateProcessW` backend, which preserves argv[0] independently of the loaded
 // image (argv[0] no longer degrades to the executable path).
 fn resolve_program_argv<'a>(
     cmd: &'a Command,
     argv: &'a [std::ffi::OsString],
-) -> Result<(std::ffi::OsString, &'a [std::ffi::OsString]), Error> {
+) -> Result<(Resolved, &'a [std::ffi::OsString]), Error> {
     if argv.is_empty() && cmd.executable_path().is_none() {
         return Err(Error::Io(std::io::Error::other("empty argv")));
     }
@@ -427,11 +449,16 @@ fn resolve_program_argv<'a>(
     Ok((program, rest))
 }
 
-/// The resolved program token alongside the `std::process::Command` built from it.
-type StdProgram = (std::ffi::OsString, std::process::Command);
+/// The resolved program token alongside the `std::process::Command` built from it and the
+/// directory to run it in.
+struct Launch {
+    program: std::ffi::OsString,
+    std_cmd: std::process::Command,
+    cwd: Option<std::path::PathBuf>,
+}
 
 #[cfg(unix)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdProgram, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<Launch, Error> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let words = crate::quote::posix::split(line.as_bytes())?;
@@ -441,7 +468,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
     if argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
-    let program = resolve_program(cmd, argv[0].clone())?;
+    let Resolved { program, cwd } = resolve_program(cmd, argv[0].clone())?;
     let mut c = std::process::Command::new(&program);
     // When executable() overrides the loaded file, argv[0] from the command
     // line is the user's intended name — preserve it via arg0().
@@ -450,11 +477,15 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
         c.arg0(&argv[0]);
     }
     c.args(&argv[1..]);
-    Ok((program, c))
+    Ok(Launch {
+        program,
+        std_cmd: c,
+        cwd,
+    })
 }
 
 #[cfg(windows)]
-fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<StdProgram, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<Launch, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
@@ -473,7 +504,11 @@ fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<S
     let program = std::ffi::OsString::from_wide(&first);
     let mut c = std::process::Command::new(&program);
     c.raw_arg(std::ffi::OsString::from_wide(&rest)); // args only — program is prepended by std
-    Ok((program, c))
+    Ok(Launch {
+        program,
+        std_cmd: c,
+        cwd: cmd.cwd().map(std::path::Path::to_path_buf),
+    })
 }
 
 /// The prefix Win32 acts on: everything before the first interior NUL, where `CreateProcessW` and

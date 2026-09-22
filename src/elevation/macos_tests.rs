@@ -678,3 +678,30 @@ end timeout"
         "the payload was cut short by the Apple event timeout: {stderr}"
     );
 }
+
+/// The relative-`current_dir` refusal is structural, so it is reported before the program is
+/// completed — and before an unreadable process cwd can fail that completion.
+///
+/// Unix only: Windows refuses to remove a directory that is a process's cwd.
+#[cfg(unix)]
+#[test]
+fn a_relative_cwd_is_refused_before_the_process_cwd_is_read() {
+    let mut c = Command::new();
+    c.raw_executable("tool")
+        .args(["tool"])
+        .current_dir("sub")
+        .elevation_auth(crate::elevation::Auth::Gui);
+    let gone = tempfile::tempdir().expect("tempdir");
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = crate::test_child::RestoreCwd::capture();
+    std::env::set_current_dir(gone.path()).expect("cd");
+    std::fs::remove_dir(gone.path()).expect("rmdir");
+    assert!(
+        std::env::current_dir().is_err(),
+        "precondition: the process cwd is unreadable"
+    );
+    match reject_structural_gui_config(&c) {
+        Err(Error::Unsupported { op, .. }) => assert!(op.contains("relative current_dir()"), "{op}"),
+        other => panic!("expected the relative-current_dir refusal, got {other:?}"),
+    }
+}

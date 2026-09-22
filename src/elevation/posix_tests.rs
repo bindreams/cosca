@@ -957,6 +957,40 @@ mod rewrite_tests {
         }
     }
 
+    /// The derived command's working directory: absolute, and the directory `program` was
+    /// completed against — one reading of the process cwd for both.
+    fn assert_runs_where_completed(rw: &PosixRewrite, program: &OsString) {
+        let cwd = rw.derived.as_ref().expect("derived").cwd().expect("a pinned cwd");
+        assert!(cwd.is_absolute(), "{cwd:?}");
+        assert_eq!(Some(cwd), std::path::Path::new(program).parent(), "{program:?}");
+    }
+
+    /// Wrapped and already-elevated alike, with a relative `current_dir` or none.
+    #[test]
+    fn an_elevated_exact_programs_cwd_is_the_directory_it_was_completed_against() {
+        // Reads the process cwd, which other tests in this binary move or delete under this lock.
+        let _guard = crate::child::spawn::spawn_lock();
+        for cwd in [Some("sub"), None] {
+            let rw = rewrite_with_host(&mut exact_tool(cwd), &sudo_host()).expect("rewrite");
+            let a = derived_argv(&rw);
+            assert_runs_where_completed(&rw, &a[a.len() - 2]);
+            let rw = rewrite_with_host(&mut exact_tool(cwd), &elevated_sudo_host()).expect("rewrite");
+            assert_runs_where_completed(&rw, &derived_argv(&rw)[0]);
+        }
+    }
+
+    /// Negative control: a `Search` program's relative `current_dir` is passed through.
+    #[test]
+    fn an_elevated_search_programs_relative_cwd_is_passed_through() {
+        let mut c = exact_tool(Some("sub"));
+        c.executable("tool");
+        let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
+        assert_eq!(
+            rw.derived.as_ref().expect("derived").cwd(),
+            Some(std::path::Path::new("sub"))
+        );
+    }
+
     /// Negative control: a `Search` program still reaches the wrapper as written.
     #[test]
     fn an_elevated_search_program_is_passed_as_written() {

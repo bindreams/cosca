@@ -3,7 +3,7 @@
 //!
 //! Everything here is PURE — no `cfg!`, and no syscalls beyond reading this process's cwd for a
 //! relative `raw_executable()` with no absolute `current_dir()` (see
-//! [`Command::posix_executable`]) — so the whole module is compiled and unit-tested on every
+//! [`Command::posix_launch`]) — so the whole module is compiled and unit-tested on every
 //! platform, exactly like [`super::plan`].
 //!
 //! # The two quoting layers
@@ -161,7 +161,7 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
 }
 
 /// Program + args, honoring `executable()`; a `raw_executable()` program comes back absolute
-/// ([`Command::posix_executable`]). `exec`ing the program sets argv[0] to its own path, so an
+/// ([`Command::posix_launch`]). `exec`ing the program sets argv[0] to its own path, so an
 /// argv[0] distinct from a set `executable()` cannot survive.
 pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
@@ -202,7 +202,8 @@ pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>
         ));
     }
     let program = cmd
-        .posix_executable()?
+        .posix_launch()?
+        .program
         .map_or_else(|| first.clone(), PathBuf::into_os_string);
     Ok((program, argv[1..].to_vec()))
 }
@@ -216,6 +217,23 @@ pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>
 /// (reachable only off-unix, where an `OsStr` is WTF-16). Both are typed; neither is
 /// a panic.
 pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
+    // The caller's cwd is applied twice — to osascript, and as `cd --` inside the
+    // script — and the trampoline does not carry a cwd across, so a RELATIVE path
+    // resolves against two different bases and the two silently disagree. Absolute
+    // makes them name the same directory. Checked before `program_and_args`, whose
+    // completion reads this process's cwd and could fail first with a less useful error.
+    if let Some(dir) = cmd.cwd() {
+        if !is_posix_absolute(dir.as_os_str())? {
+            return Err(unsupported(
+                "macOS graphical elevation with a relative current_dir()",
+                format!(
+                    "{dir:?} would resolve against this process's directory for osascript but \
+                     against whatever the authorization trampoline hands the elevated shell for \
+                     the command itself; pass an absolute path"
+                ),
+            ));
+        }
+    }
     let (program, _) = program_and_args(cmd)?;
     // root's /bin/sh resolves a bare name against ITS OWN PATH, so a relative
     // program would let the environment choose which binary runs as root. The crate
@@ -228,22 +246,6 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
                  so the binary that runs as root is not the one you selected; pass an absolute path"
             ),
         ));
-    }
-    // Same hole, for the directory. The caller's cwd is applied twice — to osascript,
-    // and as `cd --` inside the script — and the trampoline does not carry a cwd
-    // across, so a RELATIVE path resolves against two different bases and the two
-    // silently disagree. Absolute makes them name the same directory.
-    if let Some(dir) = cmd.cwd() {
-        if !is_posix_absolute(dir.as_os_str())? {
-            return Err(unsupported(
-                "macOS graphical elevation with a relative current_dir()",
-                format!(
-                    "{dir:?} would resolve against this process's directory for osascript but \
-                     against whatever the authorization trampoline hands the elevated shell for \
-                     the command itself; pass an absolute path"
-                ),
-            ));
-        }
     }
     for (&slot, resolved) in cmd.fds() {
         if slot.raw() >= 3 {

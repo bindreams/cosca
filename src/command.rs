@@ -30,6 +30,13 @@ pub struct Command {
     flags: FlagsRequest,
 }
 
+/// [`Command::posix_launch`]'s answer.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct PosixLaunch {
+    pub(crate) program: Option<PathBuf>,
+    pub(crate) cwd: Option<PathBuf>,
+}
+
 /// Which setter recorded the executable path, and therefore whether cosca resolves it before
 /// the OS sees it.
 ///
@@ -263,7 +270,10 @@ impl Command {
     ///   `chdir` happens before the exec, so that is where a relative path lands. cosca completes
     ///   the name to an absolute path against that directory before any exec sees it, by pure
     ///   join, so a bare `tool` means `./tool` and is never looked up on `PATH`, and `sudo`,
-    ///   `pkexec` or root's shell cannot look it up either.
+    ///   `pkexec` or root's shell cannot look it up either. Where that directory came from this
+    ///   process's, the child is run in it by absolute path too, so a later
+    ///   [`std::env::set_current_dir`] cannot load the file from one directory and run it in
+    ///   another.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -320,21 +330,31 @@ impl Command {
         self.executable.as_ref()
     }
 
-    /// The program a POSIX exec sink is handed: an `Exact` one completed to an absolute path by
-    /// [`crate::resolve::exact::complete_posix`] against the child's working directory, so no
-    /// sink can search for it; a `Search` one as written. `None` when neither setter was called.
+    /// The program and working directory a POSIX exec sink is handed. An `Exact` program is
+    /// completed to an absolute path by [`crate::resolve::exact::complete_posix`] against the
+    /// child's working directory, so no sink can search for it; a `Search` one is as written.
+    /// `program` is `None` when neither setter was called.
     ///
     /// Reads this process's cwd only for a relative `Exact` program with no absolute
-    /// [`current_dir`](Self::current_dir).
+    /// [`current_dir`](Self::current_dir), and then `cwd` is the absolute directory that one
+    /// reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given.
     // Off unix the only caller is the macOS elevation module, itself dead there.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn posix_executable(&self) -> Result<Option<PathBuf>, Error> {
+    pub(crate) fn posix_launch(&self) -> Result<PosixLaunch, Error> {
+        let as_given = |program| PosixLaunch {
+            program,
+            cwd: self.cwd().map(Path::to_path_buf),
+        };
         match self.executable_spec() {
             Some(ExecutableSpec::Exact(p)) => {
-                crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), std::env::current_dir).map(Some)
+                let done = crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), std::env::current_dir)?;
+                Ok(PosixLaunch {
+                    program: Some(done.program),
+                    cwd: done.child_cwd,
+                })
             }
-            Some(ExecutableSpec::Search(p)) => Ok(Some(p.clone())),
-            None => Ok(None),
+            Some(ExecutableSpec::Search(p)) => Ok(as_given(Some(p.clone()))),
+            None => Ok(as_given(None)),
         }
     }
 

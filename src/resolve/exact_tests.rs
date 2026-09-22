@@ -6,13 +6,17 @@ fn never() -> std::io::Result<PathBuf> {
     panic!("the process cwd must not be consulted here")
 }
 
-fn complete(program: &str, child_cwd: Option<&str>) -> Result<PathBuf, Error> {
+fn completed(program: &str, child_cwd: Option<&str>) -> Result<Completed, Error> {
     complete_posix(OsStr::new(program), child_cwd.map(Path::new), || {
         Ok(PathBuf::from("/proc-cwd"))
     })
 }
 
-fn invalid_input_message(r: Result<PathBuf, Error>) -> String {
+fn complete(program: &str, child_cwd: Option<&str>) -> Result<PathBuf, Error> {
+    completed(program, child_cwd).map(|c| c.program)
+}
+
+fn invalid_input_message(r: Result<Completed, Error>) -> String {
     match r {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => e.to_string(),
         other => panic!("expected Io(InvalidInput), got {other:?}"),
@@ -29,11 +33,33 @@ fn without_a_child_cwd_the_process_cwd_is_the_base() {
     assert_eq!(complete("tool", None).unwrap(), Path::new("/proc-cwd/tool"));
 }
 
-/// std resolves a relative `current_dir` against this process's cwd at `chdir`, so the base does
-/// too.
+/// A relative `current_dir` names a directory under this process's cwd, so the base does too.
 #[test]
 fn a_relative_child_cwd_is_itself_joined_onto_the_process_cwd() {
     assert_eq!(complete("tool", Some("sub")).unwrap(), Path::new("/proc-cwd/sub/tool"));
+}
+
+/// A base read from the process cwd is handed back as the child's cwd, so the sink runs the child
+/// where the program was completed rather than re-reading the process cwd at `fork`.
+#[test]
+fn a_base_read_from_the_process_cwd_becomes_the_childs_cwd() {
+    for (cwd, want) in [(Some("sub"), "/proc-cwd/sub"), (None, "/proc-cwd")] {
+        assert_eq!(
+            completed("tool", cwd).unwrap().child_cwd.as_deref(),
+            Some(Path::new(want))
+        );
+    }
+}
+
+/// Where the process cwd is not read, the child's cwd is left as given.
+#[test]
+fn a_child_cwd_is_left_as_given_when_the_process_cwd_is_not_read() {
+    let got = complete_posix(OsStr::new("tool"), Some(Path::new("/work")), never).unwrap();
+    assert_eq!(got.child_cwd.as_deref(), Some(Path::new("/work")));
+    for cwd in [Some("rel"), None] {
+        let got = complete_posix(OsStr::new("/usr/bin/id"), cwd.map(Path::new), never).unwrap();
+        assert_eq!(got.child_cwd.as_deref(), cwd.map(Path::new));
+    }
 }
 
 /// A pure join: `.`/`..` components are left for the kernel, which resolves them against the same
@@ -56,7 +82,7 @@ fn a_root_base_gets_no_doubled_separator() {
 #[test]
 fn an_absolute_program_is_returned_unchanged_without_reading_any_cwd() {
     let got = complete_posix(OsStr::new("/usr/bin/id"), Some(Path::new("rel")), never).unwrap();
-    assert_eq!(got, Path::new("/usr/bin/id"));
+    assert_eq!(got.program, Path::new("/usr/bin/id"));
 }
 
 /// An absolute child cwd is the whole base; the process cwd is not read, so a deleted process
@@ -64,7 +90,7 @@ fn an_absolute_program_is_returned_unchanged_without_reading_any_cwd() {
 #[test]
 fn an_absolute_child_cwd_does_not_read_the_process_cwd() {
     let got = complete_posix(OsStr::new("tool"), Some(Path::new("/work")), never).unwrap();
-    assert_eq!(got, Path::new("/work/tool"));
+    assert_eq!(got.program, Path::new("/work/tool"));
 }
 
 /// Nothing is appended and nothing is checked on disk.
