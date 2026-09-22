@@ -1,6 +1,6 @@
 use super::*;
 
-// Item 5: `lpApplicationName` must never silently end up NULL ──────────────────────────
+// ── `lpApplicationName` must never silently end up NULL ────────────────────────────────
 //
 // `CreateProcessW` performs its OWN image search when `lpApplicationName` is NULL, including
 // the CALLING process's current directory — the exact binary-planting hole this module's

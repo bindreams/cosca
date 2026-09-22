@@ -12,16 +12,14 @@ fn assert_not_found(got: Result<PathBuf, Error>) {
     }
 }
 
-/// Renamed from `resolve_absolute_existing_is_returned_as_is`, which named a property the code no
-/// longer has: there is no "absolute and exists -> return unchanged" shortcut any more (that was
-/// `main`'s `exe.is_absolute() && exe.is_file()` early return, deleted with the rewrite). An
-/// absolute path now goes through the ordinary located path — one directory, the exact name
-/// tried first — which lands on the same answer by a different route.
+/// There is no "absolute and exists -> return unchanged" shortcut: an absolute path goes through
+/// the ordinary located path — one directory, the exact name tried first — and lands on the same
+/// answer by a different route.
 ///
-/// The old name also passed for the wrong reason: `current_exe()` ends in `.exe` on Windows, so
-/// it took the already-has-a-loadable-extension branch and could never have caught the located
-/// `.exe`-appending regression. The extensionless and unrelated-extension cases are gated in
-/// `crate::resolve`'s own tests, which force `windows: true` and so run on every host.
+/// This cannot gate the located `.exe`-appending rule: `current_exe()` ends in `.exe` on Windows,
+/// so it takes the already-has-a-loadable-extension branch. The extensionless and
+/// unrelated-extension cases are gated in `crate::resolve`'s own tests, which force
+/// `windows: true` and so run on every host.
 #[test]
 fn resolve_an_absolute_path_to_an_existing_image_yields_that_path() {
     let me = std::env::current_exe().unwrap();
@@ -31,11 +29,11 @@ fn resolve_an_absolute_path_to_an_existing_image_yields_that_path() {
 fn resolve_bare_name_is_not_taken_from_base_cwd() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_shadow.exe")).unwrap();
-    // INVERTED deliberately: a bare name searches system directories and then PATH, never the
-    // current directory. Resolving it from the current directory is the binary-planting hazard
-    // this resolver exists to avoid, so a matching file there with nothing in system_dirs or on
-    // PATH must NOT resolve. `system_dirs` is empty here — this test is about base_cwd, not
-    // system-directory precedence, which has its own tests in `crate::resolve_tests`.
+    // A bare name searches system directories and then PATH, never the current directory.
+    // Resolving it from the current directory is the binary-planting hazard this resolver exists
+    // to avoid, so a matching file there with nothing in system_dirs or on PATH must NOT resolve.
+    // `system_dirs` is empty here — this test is about base_cwd, not system-directory precedence,
+    // which has its own tests in `crate::resolve_tests`.
     // Explicit base dir — no process-global SetCurrentDirectory, so parallel tests can't race.
     assert_not_found(resolve_executable_in(
         std::path::Path::new("sp_shadow"),
@@ -46,26 +44,22 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
 }
 #[test]
 fn resolve_bare_extensionless_name_appends_exe() {
-    // Renamed from `..._from_path`: since the merge-blocker fix added system-directory search
-    // (`crate::resolve::ResolveInput::system_dirs`), "cmd" now resolves via `System32` — it lives
-    // there — rather than necessarily via the ambient `PATH`. That is fine for what this test
-    // actually pins (the `.exe`-append rule fires regardless of which searched directory supplies
-    // the match); the old name just asserted a stronger claim about the source directory than the
-    // test body ever checked.
+    // Pins the `.exe`-append rule only, not which directory supplies the match: `cmd` lives in
+    // `System32`, so system-directory search (`crate::resolve::ResolveInput::system_dirs`) may
+    // satisfy it before the ambient `PATH` is ever consulted.
     let p = resolve_executable(std::path::Path::new("cmd"), None, &[]).unwrap();
     assert!(
         p.is_absolute() && p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
         "{p:?}"
     );
 }
-// Item 4: `resolve_executable` must honor the CHILD's PATH, not the ambient one ────────
+// ── `resolve_executable` honors the CHILD's PATH, not the ambient one ──────────────────
 //
 // `path_var`'s own doc (`crate::resolve::ResolveInput::path_var`) promises "the PATH the CHILD
-// will see, after env()/env_clear()" — but `resolve_executable` used to read
-// `std::env::var_os("PATH")` unconditionally, ignoring `Command::env_ops()` entirely. cosca's own
-// std backend already threads `env_ops` onto the child correctly (`apply_env` in
-// `child::spawn.rs`); the raw backend must match it, not silently search the PARENT's PATH while
-// the child would see a different one.
+// will see, after env()/env_clear()", so `resolve_executable` must apply `Command::env_ops()`
+// rather than reading `std::env::var_os("PATH")`. cosca's std backend already threads `env_ops`
+// onto the child correctly (`apply_env` in `child::spawn.rs`); the raw backend must match it, not
+// silently search the PARENT's PATH while the child would see a different one.
 #[test]
 fn resolve_executable_honors_an_env_set_path_override() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,13 +91,12 @@ fn resolve_executable_path_key_match_is_case_insensitive() {
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 // A fabricated name, never "cmd" or another well-known system binary, is required by both tests
-// below now that `resolve_executable` also searches Windows system directories ahead of PATH (the
-// maintainer's merge-blocker fix — see `crate::resolve::ResolveInput::system_dirs`'s doc). `cmd`
-// genuinely lives in `System32`, so it keeps resolving there even with PATH fully cleared or
-// removed, which would silently mask exactly the PATH-defeat regression these two tests exist to
-// catch: measured directly — before this rename, both tests failed on real Windows CI with
-// `Ok("C:\\Windows\\system32\\cmd.exe")`, proving PATH-independent resolution is real, not
-// theoretical. A name that lives ONLY in a tempdir set as `PATH` removes that ambiguity.
+// below, because `resolve_executable` searches Windows system directories ahead of PATH (see
+// `crate::resolve::ResolveInput::system_dirs`'s doc). `cmd` genuinely lives in `System32`, so it
+// keeps resolving there even with PATH fully cleared or removed, silently masking exactly the
+// PATH-defeat regression these two tests exist to catch — measured on real Windows CI, where a
+// `cmd`-based version of both tests returned `Ok("C:\\Windows\\system32\\cmd.exe")`. A name that
+// lives ONLY in a tempdir set as `PATH` removes that ambiguity.
 #[test]
 fn resolve_executable_env_clear_defeats_ambient_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -158,14 +151,13 @@ fn resolve_executable_env_remove_path_defeats_ambient_path() {
     );
     assert_not_found(got);
 }
-// B1: `resolve_executable`'s `cmd_cwd` parameter ─────────────────────────────────────
+// ── `resolve_executable`'s `cmd_cwd` parameter ────────────────────────────────────────
 //
-// The resolver was designed for the CHILD's cwd (`Command::cwd()` when set, else the parent's —
-// see `crate::resolve::ResolveInput::cwd`'s doc), but `resolve_executable` used to seed
-// `base_cwd` purely from `std::env::current_dir()`, silently ignoring a `Command::cwd()`
-// override. That broke the documented escape hatch: "write `./helper` to reach the current
-// directory explicitly" landed on the PARENT's ambient directory instead of the child's, which is
-// the exact directory this crate exists to stop trusting.
+// The resolver reads the CHILD's cwd (`Command::cwd()` when set, else the parent's — see
+// `crate::resolve::ResolveInput::cwd`'s doc), so `base_cwd` must honour a `Command::cwd()`
+// override rather than being seeded from `std::env::current_dir()`. Otherwise the documented
+// escape hatch breaks: "write `./helper` to reach the current directory explicitly" would land on
+// the PARENT's ambient directory, the exact directory this crate exists to stop trusting.
 #[test]
 fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
     // No process-global `set_current_dir` here, deliberately: `resolve_executable`'s `Some(dir)`
@@ -305,9 +297,9 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
     let base_copy = base.path().join("sp_pref.exe");
     std::fs::copy(&me, &base_copy).unwrap();
     std::fs::copy(&me, other.path().join("sp_pref.exe")).unwrap();
-    // INVERTED deliberately: base_cwd is no longer searched for a bare name, so the PATH copy
-    // wins even though an identically named file sits in the current directory. `system_dirs` is
-    // empty here — this test is about base_cwd vs PATH, not system-directory precedence.
+    // base_cwd is not searched for a bare name, so the PATH copy wins even though an identically
+    // named file sits in the current directory. `system_dirs` is empty here — this test is about
+    // base_cwd vs PATH, not system-directory precedence.
     let got = resolve_executable_in(
         std::path::Path::new("sp_pref"),
         base.path(),
@@ -328,7 +320,7 @@ fn clear_only_yields_empty_double_nul_block() {
         .unwrap();
     assert_eq!(b, vec![0u16, 0u16]);
 }
-// ── FIX: real Windows system directories, end to end (merge blocker) ────────────────
+// ── real Windows system directories, end to end ─────────────────────────────────────
 //
 // The core ordering policy is pinned host-independently in `crate::resolve_tests` (it takes
 // `system_dirs` as fabricated `PathBuf`s, by design, so it can run without Windows at all). These
@@ -350,9 +342,9 @@ fn windows_system_dirs_are_real_existing_directories() {
     }
 
     // Exercise all THREE individual sources by calling each private accessor directly, not just
-    // the aggregate: a bound like `dirs.len() >= 2` (the old assertion here) survives deleting
-    // EITHER the `app_dir()` or the `get_windows_directory()` line from `windows_system_dirs`,
-    // even though this test's own preamble claims to cover all three. All three should resolve
+    // the aggregate: a bound like `dirs.len() >= 2` survives deleting EITHER the `app_dir()` or
+    // the `get_windows_directory()` line from `windows_system_dirs`, even though this test's own
+    // preamble claims to cover all three. All three should resolve
     // under `cargo test` on a real Windows runner, so each is asserted present outright rather than
     // loosely.
     let app = app_dir();

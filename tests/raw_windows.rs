@@ -315,8 +315,8 @@ fn uncontained_raw_child_has_no_containment() {
 /// A name that exists nowhere but the planted decoy removes that ambiguity: any successful
 /// resolution of it can only have come from the vulnerable cwd search — and, since the decoy
 /// lives ONLY in this tempdir cwd, never the app dir, `System32`, or the Windows directory either,
-/// the system-directory search step added for the maintainer's merge-blocker fix cannot
-/// accidentally find it and mask a cwd-search regression this test would otherwise catch.
+/// the resolver's system-directory search step cannot accidentally find it and mask a cwd-search
+/// regression this test would otherwise catch.
 #[test]
 fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();

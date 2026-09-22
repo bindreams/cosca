@@ -99,7 +99,7 @@ fn path_var_is_split_on_the_simulated_platforms_separator() {
     );
 }
 
-// ── N1: quoted PATH elements ─────────────────────────────────────────────────────────
+// ── quoted PATH elements ─────────────────────────────────────────────────────────────
 
 #[test]
 fn windows_path_var_quoting_protects_an_embedded_separator() {
@@ -113,13 +113,12 @@ fn windows_path_var_quoting_protects_an_embedded_separator() {
 fn windows_path_var_quoting_strips_the_wrapping_quotes() {
     // A quoted-but-unstripped element (`"C:\bin"`, quote characters retained) fails the
     // `joined.is_absolute()` check inside `resolve()`'s search loop — a leading `"` is not a
-    // recognised drive prefix — and is therefore SILENTLY DROPPED rather than erroring. That is
-    // NOT a pre-existing hole this PR closes: the pre-PR splitter was `std::env::split_paths`,
-    // which was already quote-aware, so quote-stripping was never missing before this PR
-    // introduced its own hand-rolled `split_path_var_windows`. The hole (and its close) are both
-    // internal to this PR's own splitter — this test pins that the stripping this splitter itself
-    // needs is present. `is_absolute()` is host-specific (see this file's HOST_WINDOWS note), so
-    // that half of the claim is proven separately, end to end, by
+    // recognised drive prefix — and is therefore SILENTLY DROPPED rather than erroring. So
+    // `split_path_var_windows`, which parses quotes itself rather than deferring to
+    // `std::env::split_paths`, must strip them.
+    //
+    // `is_absolute()` is host-specific (see this file's HOST_WINDOWS note), so that half of the
+    // claim is proven separately, end to end, by
     // `a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped` on a real Windows
     // host; this test pins only the quote-stripping itself, which is pure byte logic.
     let got = split_path_var(Some(OsStr::new(r#""C:\bin""#)), true);
@@ -138,7 +137,7 @@ fn posix_path_var_quotes_are_not_special() {
 // ── the filename candidate rule ──────────────────────────────────────────────────────
 //
 // `.exe` belongs to names that get SEARCHED, not to files that get LOADED, so the rule differs by
-// shape. Replaces an old rule gated on "does the name already contain a dot".
+// shape.
 //
 // SEARCHED (bare): one candidate, `tool.exe`. Measured on real Windows CI (amd64 and arm64):
 // `CreateProcessW` with a NULL `lpApplicationName`, `cmd.exe`, `pwsh` 7, and Windows PowerShell
@@ -506,12 +505,10 @@ fn the_exe_file_wins_over_an_extensionless_namesake_beside_it() {
 
 #[test]
 fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
-    // INVERTED from the pre-fix behaviour (renamed from
-    // `an_extensionless_file_still_resolves_when_no_exe_exists`, which asserted the opposite):
-    // the extensionless fallback candidate is gone, so a bare `tool` with only an extensionless
-    // `tool` file on PATH — no `tool.exe` anywhere — must now fail to resolve, matching
+    // There is no extensionless fallback candidate, so a bare `tool` with only an extensionless
+    // `tool` file on PATH — no `tool.exe` anywhere — must fail to resolve, matching
     // `CreateProcessW`/`cmd.exe`/`pwsh`/`powershell.exe`, all of which refuse to run it (measured
-    // on real Windows CI). Catches the old two-candidate rule coming back.
+    // on real Windows CI). Catches a two-candidate rule being reintroduced.
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     touch(bin.path(), "tool");
@@ -627,11 +624,10 @@ fn a_drive_relative_name_fails_closed() {
     assert_refused_on_shape("C:tool", go("C:tool", cwd.path(), None));
 }
 
-// ── FIX: Windows system directories precede PATH for a bare name (merge blocker) ────────
+// ── Windows system directories precede PATH for a bare name ─────────────────────────────
 //
-// The maintainer's rule for landing a stacked PR one squashed commit at a time is that no commit
-// may make any route WORSE than it was on `main`, even while a LATER commit narrows a different
-// vulnerability on that same route. Before this crate resolved anything, a `Command` routed to the
+// No route may end up WORSE than it was on `main`, even where a different vulnerability on that
+// same route is being narrowed. Before this crate resolved anything, a `Command` routed to the
 // raw backend purely by `fd >= 3` (no `executable()` set) passed a NULL `lpApplicationName`, so
 // `CreateProcessW` ran its OWN documented search order: app dir -> parent cwd -> System32 ->
 // Windows dir -> PATH. This crate's fix to stop searching the parent cwd (a binary-planting

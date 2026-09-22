@@ -126,9 +126,8 @@ async fn async_contained_raw_child_is_in_our_job() {
 /// "loaded" for a reason unrelated to the bug). A name that exists nowhere but the planted decoy
 /// means any successful resolution of it can only have come from the vulnerable cwd search — and,
 /// since the decoy lives ONLY in this tempdir cwd, never the app dir, `System32`, or the Windows
-/// directory either, the system-directory search step added for the maintainer's merge-blocker
-/// fix cannot accidentally find it and mask a cwd-search regression this test would otherwise
-/// catch.
+/// directory either, the resolver's system-directory search step cannot accidentally find it and
+/// mask a cwd-search regression this test would otherwise catch.
 #[tokio::test]
 async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
