@@ -291,13 +291,12 @@ async fn async_detach_leaves_the_tree_running() {
 
 #[tokio::test]
 async fn async_kill_on_drop_false_leaves_the_root_running() {
-    // `kill_on_drop(false)` hits the async Drop early-return with `attached` STILL ARMED (unlike
-    // detach(), which also disarms). Drop must NOT run the teardown (hard_kill + the root's kill), so the
-    // root stays alive. Proven by positive liveness on the never-signaled root (race-free, mirroring
-    // async_detach_leaves_the_tree_running). UNCONTAINED on purpose: a Windows JobObject's
-    // KILL_ON_JOB_CLOSE fires when the job handle field drops (only `disarm()` clears it, and
-    // kill_on_drop(false) does not disarm), so a *contained* tree would die on Windows regardless of
-    // the flag — `Attached::None` isolates the kill_on_drop(false) early-return on every platform.
+    // `kill_on_drop(false)` hits the async Drop early-return, so the teardown (hard_kill + the
+    // root's kill) must not run and the root stays alive. Proven by positive liveness on the
+    // never-signaled root (race-free, mirroring async_detach_leaves_the_tree_running).
+    // UNCONTAINED on purpose: `Attached::None` isolates the early-return itself from the
+    // containment resource's own drop, which
+    // `async_kill_on_drop_false_leaves_a_contained_tree_running` covers separately.
     use std::io::{Read as _, Write as _};
     let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false);
     let root_id = child.id();
@@ -309,6 +308,30 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     );
     // Release it and observe a CLEAN voluntary exit (Ok(0) EOF), best-effort tearing the tree down.
     // `_grand` drops here too → its socket closes → the reparented grandchild exits.
+    root.write_all(b"x").expect("release the live root");
+    let mut buf = [0u8; 1];
+    assert!(
+        matches!(root.read(&mut buf), Ok(0)),
+        "released root exits cleanly (EOF)"
+    );
+}
+
+#[tokio::test]
+async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
+    // The containment resource is a FIELD of the handle and drops with it whatever
+    // `kill_on_drop` says — a Job Object's close fires KILL_ON_JOB_CLOSE, a cgroup leaf's Drop
+    // fires cgroup.kill. So a contained `kill_on_drop(false)` tree survives only because the
+    // spawn disarmed the resource (`Attachment::honor_kill_on_drop`), which is what makes
+    // `Command::kill_on_drop`'s "or detach() to opt one out after the fact" true.
+    use std::io::{Read as _, Write as _};
+    let (child, mut root, _grand) = common::spawn_grandchild_async_with(true, false);
+    let root_id = child.id();
+    drop(child); // contained + kill_on_drop(false) → nothing may kill the tree
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Alive,
+        "kill_on_drop(false) must leave a CONTAINED tree running after the handle drops"
+    );
     root.write_all(b"x").expect("release the live root");
     let mut buf = [0u8; 1];
     assert!(

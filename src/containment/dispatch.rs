@@ -51,6 +51,29 @@ pub(crate) struct Attachment {
     pub graceful: crate::graceful::GracefulMechanism,
 }
 
+impl Attachment {
+    /// Apply a handle's `kill_on_drop` decision to the containment resource.
+    ///
+    /// `Child::drop` returning early on `kill_on_drop == false` skips only ITS teardown. The
+    /// resource is a field of that handle and drops with it regardless — and a `CgroupLeaf`'s
+    /// `Drop` fires `cgroup.kill` over an occupied leaf, a Job Object's close fires
+    /// `KILL_ON_JOB_CLOSE`. So the opt-out has to reach the resource as well, which is what
+    /// [`Attached::disarm`] is for; without this, `kill_on_drop(false)` killed exactly the
+    /// contained trees [`Child::detach`](crate::Child::detach) (which disarms) keeps alive,
+    /// while [`Command::kill_on_drop`](crate::Command::kill_on_drop) documents the two as the
+    /// same opt-out.
+    ///
+    /// Applied when the handle is built rather than in `Drop`: the flag is fixed at spawn and
+    /// has no setter, and a supervisor that exits without running destructors still has its
+    /// Job Object handle closed by the OS — with `KILL_ON_JOB_CLOSE` still set, that close is
+    /// the kill. `detach()` disarms eagerly for the same reason.
+    pub(crate) fn honor_kill_on_drop(&self, kill_on_drop: bool) {
+        if !kill_on_drop {
+            self.attached.disarm();
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Attachment {
     /// The attachment for a UAC-elevated spawn, which `ShellExecuteEx("runas")` creates through

@@ -88,6 +88,7 @@ impl Child {
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
     ) -> Child {
+        attachment.honor_kill_on_drop(kill_on_drop);
         Child {
             proc,
             id,
