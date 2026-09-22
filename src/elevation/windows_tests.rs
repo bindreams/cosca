@@ -479,7 +479,7 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
             .collect::<Vec<u16>>(),
     );
     // `\0` is not a path separator, so `extension()` reads `bat` straight through it — the reason
-    // the batch gate cannot key on the extension, and the reason it has nothing to say here.
+    // the gate refuses the NUL ahead of its batch rule. Derived in `reject_batch_path_on`'s doc.
     assert_eq!(
         std::path::Path::new(&nul_bat).extension().map(|e| e.to_string_lossy()),
         Some("bat".into()),

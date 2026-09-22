@@ -358,11 +358,9 @@ fn the_gate_wrapper_asks_for_this_hosts_verdict() {
     }
 }
 
-/// The batch rule is a WIN32 verdict, like the truncation: `ShellExecuteEx` and `CreateProcessW`
-/// route a `.bat` through cmd.exe, which is what CVE-2024-24576 needs. Off Win32 there is no
-/// cmd.exe to reach and the extension carries no meaning, so refusing there would report
-/// "not supported on windows" for a program the host runs — and the NUL arm must not have
-/// swallowed the rule where it does apply.
+/// The batch rule is a WIN32 verdict — why, in [`super::reject_batch_path_on`]'s doc. Both legs
+/// matter: the NUL arm above must not have swallowed the rule where it does apply, and the rule
+/// must not reach a host with no cmd.exe to blame.
 #[test]
 fn a_clean_batch_program_is_a_win32_verdict_only() {
     let token = std::ffi::OsString::from(r"C:\tools\setup.bat");

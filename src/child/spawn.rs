@@ -422,9 +422,7 @@ fn resolve_program_argv<'a>(
     Ok((program, rest))
 }
 
-/// The resolved program token plus the `std::process::Command` built around it. The token is
-/// returned rather than read back off the command because the two differ on Unix — see
-/// `build_std_command`'s batch gate.
+/// The resolved program token alongside the `std::process::Command` built from it.
 type StdProgram = (std::ffi::OsString, std::process::Command);
 
 #[cfg(unix)]

@@ -409,7 +409,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // verdict here is a property of the REQUEST rather than of the caller's ambient privilege.
     // Putting it below would make the same `Command` refused when unelevated and accepted when
     // already elevated — the exact "depends which path ran" divergence these checks exist to
-    // remove. It also costs nothing: none of this depends on what the planner decides.
+    // remove.
 
     // Ahead of EVERY other field's check, including the per-element argv loop, because this is the
     // field that decides which image runs ELEVATED: `C:\tools\setup` + NUL + `.bat` launches
