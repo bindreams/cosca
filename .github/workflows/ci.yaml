@@ -77,9 +77,27 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
+          # clippy only on windows/amd64 (see the Clippy step below for why one
+          # Windows arch stands in for both).
+          components: ${{ matrix.os == 'windows' && matrix.arch == 'amd64' && 'clippy' || '' }}
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
+
+      # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
+      # backend) is otherwise never linted: the `lint` job only runs on
+      # ubuntu-latest, so clippy never type-checks it against a Windows target.
+      # --all-features so the feature-gated Windows paths are actually compiled.
+      #
+      # Runs on amd64 only, not arm64: nothing in this crate's Windows code is
+      # `cfg(target_arch = ...)`-gated (checked: no such attribute exists in the
+      # tree), so the two arches type-check and lint identically — confirmed by
+      # running this exact command against aarch64-pc-windows-msvc locally via
+      # `cargo xwin` and getting the same (clean) result. Linting both would
+      # double Windows runner-minutes for no additional coverage.
+      - name: Clippy (all targets, all features)
+        if: matrix.os == 'windows' && matrix.arch == 'amd64'
+        run: cargo clippy --locked --target ${{ matrix.target }} --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --locked --target ${{ matrix.target }}
