@@ -517,6 +517,11 @@ unsafe impl Sync for ReportPage {}
 #[cfg(target_os = "linux")]
 impl ReportPage {
     pub(crate) fn new() -> io::Result<ReportPage> {
+        // Test-only fault seam: fail the mapping (take semantics — see `fault`).
+        #[cfg(test)]
+        if fault::take_force_map_report_page_failure() {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
         // Safety: a fresh anonymous mapping — no caller-supplied address, length or fd.
         let raw = unsafe {
             libc::mmap(
@@ -831,6 +836,47 @@ impl Drop for CgroupLeaf {
     }
 }
 
+/// Test-only fault seams for the leaf-creation steps a temp directory cannot reach.
+///
+/// Thread-local with take semantics — arm and call on one thread, then assert the flag was
+/// consumed — so parallel tests in this binary cannot arm each other's faults, matching
+/// `treewalk::fault` and `fdmarker::fault`.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    thread_local! {
+        static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
+        static FORCE_MAP_REPORT_PAGE_FAILURE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Treat the NEXT created leaf as exposing `cgroup.kill`. Supplies the single fact a temp
+    /// directory cannot, so every step AFTER the check — the `cgroup.procs` open, the report
+    /// mapping, and the unwind that removes the leaf — runs for real, against the kernel's own
+    /// errnos, on any Linux host.
+    pub(crate) fn set_force_kill_supported(on: bool) {
+        FORCE_KILL_SUPPORTED.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_kill_supported() -> bool {
+        FORCE_KILL_SUPPORTED.with(|f| f.replace(false))
+    }
+    pub(crate) fn kill_supported_armed() -> bool {
+        FORCE_KILL_SUPPORTED.with(|f| f.get())
+    }
+
+    /// Fail the NEXT `ReportPage::new` with `ENOMEM` — the real exhaustion this mapping can
+    /// hit (`vm.max_map_count`), which no test may provoke for real without taking the host's
+    /// whole address space with it.
+    pub(crate) fn set_force_map_report_page_failure(on: bool) {
+        FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_map_report_page_failure() -> bool {
+        FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.replace(false))
+    }
+    pub(crate) fn map_report_page_failure_armed() -> bool {
+        FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.get())
+    }
+}
+
 /// Detect the current process's cgroup v2 path and create a leaf sub-cgroup
 /// for containment. Returns the failing step on any failure, so the caller can
 /// fall back to the process-group mechanism *and say why it had to*.
@@ -879,7 +925,12 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     };
 
     // Require cgroup.kill (kernel ≥ 5.14); without it there is no atomic kill.
-    if !leaf_path.join("cgroup.kill").exists() {
+    // Test-only fault seam: treat the leaf as kill-capable (take semantics — see `fault`).
+    #[cfg(test)]
+    let kill_supported = fault::take_force_kill_supported() || leaf_path.join("cgroup.kill").exists();
+    #[cfg(not(test))]
+    let kill_supported = leaf_path.join("cgroup.kill").exists();
+    if !kill_supported {
         return Err(fail(
             &leaf_path,
             LeafError::KillUnsupported {
