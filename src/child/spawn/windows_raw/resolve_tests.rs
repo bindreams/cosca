@@ -147,3 +147,16 @@ fn a_nul_refusal_names_the_field_that_carried_it() {
         "a program token is not the environment: {other}"
     );
 }
+
+/// [`debug_assert_no_nul_wide`] promises to fail LOUDLY the moment resolution grows a return that
+/// is not `is_file`-gated. An assert nobody fires is indistinguishable from an assert whose
+/// condition was inverted or dropped, so the promise is worth a probe of its own.
+///
+/// `debug_assertions`-only: the assert is compiled out of a release build by design, so in CI's
+/// `--release --lib` leg the expected panic would never arrive and a working crate would go red.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "program image contains an embedded NUL")]
+fn debug_assert_no_nul_wide_panics_on_an_embedded_nul() {
+    debug_assert_no_nul_wide("program image", OsStr::new("a\u{0}b"));
+}
