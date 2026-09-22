@@ -66,11 +66,20 @@ pub(crate) fn cgroup_procs_contains(contents: &str, pid: u32) -> bool {
 /// Summarize the contents of `/proc/self/cgroup` for a degrade record: how many lines it had,
 /// and the `<hierarchy-id>:<controller-list>` prefix of each — never the paths.
 ///
-/// A degrade record is handed to a sink cosca knows nothing about, and this file's paths are
-/// the caller's identity: the uid (`user-1000.slice`), the systemd session and scope ids, and
-/// under Kubernetes or Docker the pod UID and container id. None of that is the diagnosis. What
-/// separates "a v1-only host" from "the unified hierarchy is not mounted" from "the file was
-/// empty" is the line count and the controllers they named, which is exactly what comes back.
+/// What separates "a v1-only host" from "the unified hierarchy is not mounted" from "the file
+/// was empty" is the line count and the controllers named, and that is the whole of what comes
+/// back. The paths add nothing to it: this file is a whole-system dump of every hierarchy the
+/// caller is in, cosca reads it for one `0::` line, and in the case this error reports there
+/// is no such line — so none of those paths is one cosca ever touched. They are, however, the
+/// caller's identity (uid, systemd session and scope, pod UID and container id under
+/// Kubernetes or Docker), handed to a sink cosca knows nothing about.
+///
+/// **This is not a rule about paths in general, and the sibling variants deliberately do not
+/// follow it.** `CreateLeafDir`, `OpenProcs`, `KillUnsupported` and the rest each carry their
+/// path verbatim, because there it is the single path the failing syscall touched — the
+/// diagnosis itself, and what every library reports. "mkdir failed: EACCES" with the directory
+/// removed would be unactionable. The line drawn here is between a path cosca acted on and a
+/// file it only read to look something up in.
 ///
 /// A line the documented `<id>:<controllers>:<path>` shape does not explain is reported as
 /// unparseable rather than quoted: an unrecognized line is precisely the case where cosca
@@ -143,7 +152,8 @@ pub(crate) enum LeafError {
     #[error(
         "/proc/self/cgroup has no cgroup v2 unified (`0::`) line — a v1-only host, or the \
          unified hierarchy is not mounted; the file has {line_count} line(s), naming \
-         {controllers} (paths omitted — they identify the caller, not the fault)"
+         {controllers} (their paths are dropped: none of them is one cosca touched, and they \
+         do not tell these cases apart)"
     )]
     NoUnifiedLine { line_count: usize, controllers: String },
     /// `mkdir` of the leaf failed — most often an undelegated slice the supervisor may not
