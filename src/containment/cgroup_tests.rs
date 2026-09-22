@@ -1184,3 +1184,47 @@ fn placement_of_reports_an_unreadable_cgroup_procs() {
         Ok(()) => panic!("no child reported a placement"),
     }
 }
+
+/// A child that reported a failed write is diagnosed from the real `cgroup.procs` and its real
+/// `/proc` state. The child is a zombie — exited, not yet reaped — so its state is known.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_of_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-absent-procs");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let listed = format!("{}\n", std::process::id());
+    std::fs::write(leaf_path.join("cgroup.procs"), &listed).expect("write cgroup.procs");
+
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a no-op.
+    let _ = unsafe { super::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+
+    let mut child = std::process::Command::new("/bin/true").spawn().expect("spawn");
+    let pid = child.id();
+    // Block until the child has exited, leaving it unreaped (WNOWAIT): a zombie.
+    // SAFETY: `info` is a valid, writable siginfo_t; `pid` is this process's own child.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let waited = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+
+    let verdict = leaf.placement_of(pid);
+    child.wait().expect("reap the child");
+    match verdict {
+        Err(NotPlaced::Absent {
+            pid: reported,
+            path,
+            procs,
+            report,
+            child_state,
+        }) => {
+            assert_eq!(reported, pid);
+            assert_eq!(path, leaf_path.join("cgroup.procs"));
+            assert_eq!(procs, listed, "the file's real contents");
+            assert_eq!(report, NotEntered::WriteFailed(libc::EBADF));
+            assert_eq!(child_state, Some('Z'), "the child's real /proc state");
+        }
+        Err(other) => panic!("a readable cgroup.procs must be quoted: {other}"),
+        Ok(()) => panic!("the child reported a failed write"),
+    }
+}
