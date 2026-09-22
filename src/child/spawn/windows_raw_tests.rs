@@ -51,16 +51,20 @@ fn commands_with_token(token: &OsString) -> Vec<(&'static str, Command)> {
     ]
 }
 
-/// The mirror shape, and the one the ORDER fixes: `C:\tools\setup` + NUL + `.bat`. `\0` is not a
-/// path separator, so `Path::extension()` reads `bat` straight through it and `reject_batch_path`
-/// would fire — on a prefix (`C:\tools\setup`) that is not a batch file. That refusal points the
-/// caller at CVE-2024-24576 over a NUL defect AND interpolates a raw U+0000 into a message bound for
-/// logs and terminals. Running the NUL check first prevents both.
+/// The shape only this check refuses HERE: `C:\tools\setup` + NUL + `.bat`. Win32 truncates it to
+/// `C:\tools\setup`, which is no batch file, so `reject_batch_path` — reading that same prefix —
+/// passes it through. Deleting the check does not make the token launchable (resolution and the
+/// argv checks below still stop it), but it moves the refusal downstream onto a symptom.
 #[test]
 fn a_nul_before_a_batch_extension_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     let token = nul_between(r"C:\tools\setup", ".bat");
+    // Premise: the batch gate has nothing to say here, so this pins the NUL check and not the gate.
+    assert!(
+        crate::child::spawn::reject_batch_path(std::path::Path::new(&token)).is_ok(),
+        "premise: the batch gate reads `C:\\tools\\setup` and must not be what refuses this"
+    );
     for (via, c) in commands_with_token(&token) {
-        // `Unsupported` here — the batch gate winning the race — panics in the helper.
+        // An `Ok`, or any downstream error kind, panics in the helper.
         let msg = invalid_input_message(via, reject_batch_program(&c));
         assert!(
             !msg.contains('\0'),
@@ -87,7 +91,14 @@ fn a_clean_batch_token_is_still_refused_as_a_batch() {
 /// misattribution the NUL-before-batch ordering exists to prevent, one field over.
 #[test]
 fn a_nul_in_the_program_token_is_not_blamed_on_the_environment() {
-    for (via, c) in commands_with_token(&nul_between("setup.bat", "junk")) {
+    let token = nul_between("setup.bat", "junk");
+    // Premise: Win32 truncates this back to a real batch file, so the gate would ALSO refuse it —
+    // the NUL check running first is what decides the diagnosis.
+    assert!(
+        crate::child::spawn::reject_batch_path(std::path::Path::new(&token)).is_err(),
+        "premise: the batch gate reads `setup.bat` and refuses it"
+    );
+    for (via, c) in commands_with_token(&token) {
         let msg = invalid_input_message(via, reject_batch_program(&c));
         assert!(
             msg.contains("program token"),
