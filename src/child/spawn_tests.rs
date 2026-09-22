@@ -401,29 +401,27 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
 /// Host-independent on purpose: what it pins is that the gate judges the token the CALLER named.
 /// Before this round it read `std::process::Command::get_program()`, and std's Unix constructor
 /// had already swapped a NUL-bearing program for a `<string-with-nul>` sentinel — so on this host
-/// the call returned `Ok` and the token reached `spawn`. Which refusal comes back is the platform
-/// verdict tested above; that one comes back at all is the wiring.
+/// the call returned `Ok` and the token reached `spawn`.
+///
+/// The KIND is asserted on every host, not just off Win32: this token's extension is the one the
+/// batch rule could plausibly claim, so an `.expect_err` alone would be satisfied on a Windows run
+/// by the very misattribution the gate exists to prevent.
 #[test]
 fn the_std_backend_judges_the_program_token_the_caller_named() {
     let mut c = Command::new();
     c.args([with_interior_nul(r"C:\tools\setup.bat", "junk")]);
-    let err = super::build_std_command(&c).expect_err("a NUL-bearing program token must be refused");
-    let msg = err.to_string();
+    // An `Ok`, or the `Unsupported` batch refusal, panics in the helper.
+    let msg = invalid_input_message(super::build_std_command(&c));
     assert!(
         !msg.contains('\0'),
         "the refusal must not carry a raw NUL into logs: {msg:?}"
     );
-    // Which refusal, not just how it prints: off Win32 the defect is the NUL, and `Unsupported`
-    // would mean this call site asked for the Win32 verdict on a host that does not truncate.
-    #[cfg(not(windows))]
-    assert!(
-        !matches!(err, Error::Unsupported { .. }),
-        "off Win32 there is no cmd.exe to blame: {msg}"
-    );
 }
 
-/// The mirror shape on the same default path: the std backend must never tell the caller to audit
-/// batch escaping for `C:\tools\setup`, which is what Win32 would load and is not a batch file.
+/// The mirror shape on the same default path: `C:\tools\setup` + NUL + `.bat` must come back as
+/// the NUL, never as the batch vector — what Win32 would load is `C:\tools\setup`, which carries
+/// no batch vector at all.
+///
 /// Asserted as "not the batch refusal" rather than as an `Ok`, because the token is still refused
 /// — as a NUL here, and by std's own wide-string conversion a step later on Windows.
 #[test]
