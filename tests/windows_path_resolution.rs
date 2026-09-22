@@ -1295,9 +1295,10 @@ fn a_stream_suffix_stays_in_the_final_component() {
 
 /// Canary: an INTERIOR segment loses a single trailing period and nothing else.
 ///
-/// A trailing run of two or more periods is kept, and so are trailing spaces: interior `...` and
-/// `x ` are names, `x.` becomes `x`, `.. .` becomes `.. `. Both spellings, at one and two segments
-/// from the end, behave alike. This differs from the FINAL-component rule
+/// A trailing run of two or more periods is kept, and so are trailing spaces: interior `...`, `" "`
+/// and `x ` are names, `x.` becomes `x`, `.. .` becomes `.. `. Being names, a following `..` pops
+/// them: `y\x.bat\...\..` is `y\x.bat`. Both spellings, at one and two segments from the end,
+/// behave alike. This differs from the FINAL-component rule
 /// ([`a_final_dots_and_spaces_component_drops_out_and_pops_nothing`]), so a model of path
 /// normalisation needs both.
 #[test]
@@ -1317,6 +1318,7 @@ fn an_interior_segment_loses_only_a_single_trailing_period() {
         ("x .", "x "),
         ("...", "..."),
         (".. .", ".. "),
+        (" ", " "),
     ];
     let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
     let mut facts = Disagreements::default();
@@ -1334,28 +1336,24 @@ fn an_interior_segment_loses_only_a_single_trailing_period() {
     }
     check_resolutions(&rows, &mut facts, &mut failures);
 
-    // Printed only, for now: a kept interior segment popped by the `..` after it.
+    // A kept interior segment is a name, so the `..` after it pops it.
     match std::env::current_dir() {
-        Ok(cwd) => println!("current directory: {cwd:?}"),
-        Err(e) => println!("could not read the current directory: {e}"),
-    }
-    for input in [
-        r"y\x.bat\...\..",
-        r"y\x.bat\ \..",
-        r"y\x.bat\.. .\..",
-        r"C:\dir\ \z.exe",
-        r"\\?\C:\dir\ \z.exe",
-    ] {
-        match full_path_name_parts(input) {
-            Ok((resolved, part)) => {
-                let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
-                println!(
-                    "  {input:?} -> {resolved:?}  file_part={part}  std_has_bat_extension={}",
-                    has_bat_extension(&resolved)
-                );
-            }
-            Err(why) => println!("  {why}"),
+        Ok(cwd) => {
+            let cwd = cwd
+                .to_str()
+                .expect("cwd is not UTF-8")
+                .trim_end_matches('\\')
+                .to_string();
+            println!("current directory: {cwd:?}");
+            let popped = [
+                (r"y\x.bat\...\..", "`...` is kept, then popped"),
+                (r"y\x.bat\ \..", "a lone space is kept, then popped"),
+                (r"y\x.bat\.. .\..", "`.. .` becomes the name `.. `, then popped"),
+            ]
+            .map(|(input, why)| (input.to_string(), format!(r"{cwd}\y\x.bat"), why));
+            check_resolutions(&popped, &mut facts, &mut failures);
         }
+        Err(e) => failures.push(format!("could not read the current directory: {e}")),
     }
     assert!(
         failures.is_empty(),
