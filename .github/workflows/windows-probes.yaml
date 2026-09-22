@@ -1,0 +1,71 @@
+# Windows path-resolution canary.
+#
+# cosca's batch gate (CVE-2024-24576) predicts how Win32 normalises a program path — trailing dots
+# and spaces, `.`/`..`, verbatim `\\?\` prefixes — without resolving it.
+# `tests/windows_path_resolution.rs` asserts the platform facts that prediction rests on, so this
+# workflow fails when Windows stops agreeing with the model. That file says which fact backs which
+# part of the gate.
+#
+# The probes resolve strings, write inside a temp directory of their own and launch only
+# `cosca_testbin`: nothing here runs a batch file. They are `#[ignore]`d, so only this workflow runs
+# them.
+#
+# Run it by hand with:
+#
+#     gh workflow run windows-probes.yaml [-f filter=<test-name substring>]
+name: windows-probes
+
+on:
+  # Every change to code whose correctness depends on these facts.
+  pull_request:
+    paths:
+      - "src/child/spawn.rs"
+      - "src/child/spawn/batch_gate.rs"
+      - "src/resolve.rs"
+      - "tests/windows_path_resolution.rs"
+      # Which `windows` crate features are enabled decides what the probes can call.
+      - "Cargo.toml"
+      - ".github/workflows/windows-probes.yaml"
+  # `windows-latest` floats: a new Windows build can change the answer with no commit here.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Test-name filter (blank runs every probe)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-probes-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  path-resolution:
+    name: Path canary (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      # `--nocapture`: the surveys report only through stdout, and every canary prints what it
+      # measured before asserting on it.
+      - name: Run path-resolution probes
+        shell: bash
+        env:
+          FILTER: ${{ inputs.filter }}
+        run: >
+          cargo test --locked --target ${{ matrix.target }}
+          --test windows_path_resolution
+          -- "${FILTER}" --ignored --nocapture --test-threads=1
