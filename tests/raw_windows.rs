@@ -103,6 +103,9 @@ fn embedded_nul_in_commandline_is_rejected() {
         .spawn()
         .unwrap_err();
     assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
+    // The refusal must name the command line. One NUL checker serves every wide string the backend
+    // builds, so a message fixed to the environment would send the caller to audit `env()`.
+    assert!(e.to_string().contains("command line"), "{e}");
 }
 
 /// An embedded NUL in the working directory is rejected the same way (it would truncate the
@@ -113,7 +116,9 @@ fn embedded_nul_in_cwd_is_rejected() {
     c.executable(common::testbin())
         .commandline("x argv0-report")
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
-    assert!(matches!(c.spawn().unwrap_err(), cosca::error::Error::Io(_)));
+    let e = c.spawn().unwrap_err();
+    assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
+    assert!(e.to_string().contains("working directory"), "{e}");
 }
 
 /// A `.bat`/`.cmd` reached via `executable()` is rejected BEFORE resolution (CVE-2024-24576): a

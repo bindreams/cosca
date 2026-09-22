@@ -115,8 +115,8 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
         block.push(0);
     }
     for (key, val) in vars.values() {
-        ensure_no_nul_wide(key)?;
-        ensure_no_nul_wide(val)?;
+        ensure_no_nul_wide("environment key", key)?;
+        ensure_no_nul_wide("environment value", val)?;
         block.extend(key.encode_wide());
         block.push(u16::from(b'='));
         block.extend(val.encode_wide());
@@ -126,13 +126,17 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
     Ok(Some(block))
 }
 
-/// Reject a key or value carrying an embedded NUL, which would truncate the
-/// wide, NUL-delimited environment block.
-pub(crate) fn ensure_no_nul_wide(s: &OsStr) -> Result<(), Error> {
+/// Reject a string carrying an embedded NUL, which Win32 would silently truncate at.
+///
+/// Serves every wide string the raw backend builds — the environment block, the program image and
+/// token, the working directory, and each argv token — so `what` names the offending field. Without
+/// it the refusal blames one caller's field for every other caller's defect, sending the reader to
+/// audit the wrong input.
+pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
     if s.encode_wide().any(|unit| unit == 0) {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "environment key or value contains an embedded NUL",
+            format!("the {what} contains an embedded NUL, which Win32 would silently truncate"),
         )));
     }
     Ok(())

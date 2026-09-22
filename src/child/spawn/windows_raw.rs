@@ -57,10 +57,10 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
 
     let image: Option<PathBuf> = cmd.executable_path().map(resolve::resolve_executable).transpose()?;
     if let Some(p) = &image {
-        resolve::ensure_no_nul_wide(p.as_os_str())?;
+        resolve::ensure_no_nul_wide("program image", p.as_os_str())?;
     }
     if let Some(c) = cmd.cwd() {
-        resolve::ensure_no_nul_wide(c.as_os_str())?;
+        resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
     }
     let app_name: Option<Vec<u16>> = image.as_ref().map(|p| to_wide_nul(p.as_os_str()));
     let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
@@ -312,7 +312,7 @@ pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
         // the NUL (it is not a separator), so gating on the batch rule first blames the wrong thing
         // and interpolates a raw U+0000 into the error string, which then reaches logs and
         // terminals. Same ordering as the elevated path, for the same reason.
-        resolve::ensure_no_nul_wide(prog.as_os_str())?;
+        resolve::ensure_no_nul_wide("program token", prog.as_os_str())?;
         reject_batch_path(&prog)?;
     }
     Ok(())
@@ -350,14 +350,14 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
             }
             let mut wides: Vec<Vec<u16>> = Vec::with_capacity(argv.len());
             for a in argv {
-                resolve::ensure_no_nul_wide(a)?;
+                resolve::ensure_no_nul_wide("argument", a)?;
                 wides.push(a.encode_wide().collect());
             }
             let refs: Vec<&[u16]> = wides.iter().map(Vec::as_slice).collect();
             Ok(crate::quote::windows::join_wide(&refs))
         }
         CommandInput::CommandLine(line) => {
-            resolve::ensure_no_nul_wide(line)?;
+            resolve::ensure_no_nul_wide("command line", line)?;
             Ok(line.encode_wide().collect())
         }
     }
@@ -415,3 +415,7 @@ impl Drop for AttributeList {
         unsafe { DeleteProcThreadAttributeList(self.list) };
     }
 }
+
+#[cfg(test)]
+#[path = "windows_raw_tests.rs"]
+mod windows_raw_tests;
