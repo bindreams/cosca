@@ -447,20 +447,53 @@ fn placement_unreadable_names_the_io_error() {
 
 /// The degrade is logged at `warn` with the reason attached — the single line a human reading
 /// CI output needs to tell WHICH step failed from the bare fact that containment degraded.
+///
+/// Driven against this test's own "already warned" set: the process-wide one is shared with
+/// every other test in this binary, so a first-report assertion made through it would silently
+/// become an assertion about libtest's scheduling.
 #[test]
 fn degrade_logs_the_reason_at_warn() {
     crate::log_capture::install();
+    let warned = std::sync::atomic::AtomicU32::new(0);
     let mark = crate::log_capture::mark();
-    log_degrade(&LeafError::KillUnsupported {
-        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-degrade-probe-a41f"),
-    });
-    assert!(
-        crate::log_capture::contains_since(mark, "cosca-degrade-probe-a41f"),
-        "the degrade log must carry the failing step's own path"
+    super::log_degrade_into(
+        &warned,
+        &LeafError::KillUnsupported {
+            path: PathBuf::from("/sys/fs/cgroup/slice/cosca-degrade-probe-a41f"),
+        },
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-degrade-probe-a41f"),
+        vec![log::Level::Warn],
+        "a spawn that did not get the containment it asked for is news the first time"
     );
     assert!(
         crate::log_capture::contains_since(mark, "process group"),
         "the degrade log must say what containment degraded TO"
+    );
+}
+
+/// The process-wide entry point reports against a set that is shared and STICKY: whatever has
+/// degraded before it in this binary, a reason reported twice is at `debug` the second time.
+///
+/// Asserting the second report rather than the first is what makes this independent of test
+/// order — the bit is set either way by the time it runs.
+#[test]
+fn log_degrade_reports_through_a_sticky_process_wide_set() {
+    crate::log_capture::install();
+    let reason = || LeafError::ClearCloexec {
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-process-wide-probe-d582/cgroup.procs"),
+        source: std::io::Error::from_raw_os_error(9),
+    };
+    log_degrade(&reason());
+
+    let mark = crate::log_capture::mark();
+    log_degrade(&reason());
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-process-wide-probe-d582"),
+        vec![log::Level::Debug],
+        "the second report of one reason is a repeat, and still carries its own full text"
     );
 }
 
