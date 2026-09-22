@@ -315,9 +315,9 @@ impl Drop for ComInit {
     }
 }
 
-/// Program (loaded image) + the joined parameter line. Honors `executable()`; an
-/// argv[0] distinct from a set `executable()` cannot be preserved by runas.
-fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
+/// The argv runas can work from at all. Split from [`elevated_program`] and [`elevated_params`] so
+/// the program's NUL check can sit between them — see [`plan_runas`].
+fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
     let CommandInput::Argv(argv) = cmd.input() else {
         return Err(Error::Unsupported {
             op: "elevation of a commandline() command".into(),
@@ -332,7 +332,13 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
             detail: "set a program via .args([...]) before .elevate()".into(),
         });
     }
-    let program = match cmd.executable_path() {
+    Ok(argv)
+}
+
+/// The loaded image. Honors `executable()`; an argv[0] distinct from a set `executable()` cannot
+/// be preserved by runas.
+fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error> {
+    match cmd.executable_path() {
         Some(exe) => {
             if argv[0].as_os_str() != exe.as_os_str() {
                 return Err(Error::Unsupported {
@@ -341,20 +347,22 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
                     detail: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image".into(),
                 });
             }
-            exe.as_os_str().to_os_string()
+            Ok(exe.as_os_str().to_os_string())
         }
-        None => argv[0].clone(),
-    };
-    // NUL-checked per element, BEFORE the join: `lpParameters` is one string, so a refusal built
-    // from it could only say that some element carried a NUL.
+        None => Ok(argv[0].clone()),
+    }
+}
+
+/// The joined `lpParameters` line, NUL-checked per element BEFORE the join: `lpParameters` is one
+/// string, so a refusal built from it could only say that SOME element carried a NUL.
+fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
     let mut tail_wide: Vec<Vec<u16>> = Vec::with_capacity(argv.len() - 1);
     for (i, a) in argv.iter().enumerate().skip(1) {
         ensure_no_nul(&format!("argument {i}"), a)?;
         tail_wide.push(a.encode_wide().collect());
     }
     let tail_refs: Vec<&[u16]> = tail_wide.iter().map(|v| v.as_slice()).collect();
-    let joined = crate::quote::windows::join_wide(&tail_refs);
-    Ok((program, OsString::from_wide(&joined)))
+    Ok(OsString::from_wide(&crate::quote::windows::join_wide(&tail_refs)))
 }
 
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
@@ -392,7 +400,8 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // Structural config gate FIRST — privilege-independent (before the short-circuit), so
     // an already-elevated caller gets the same verdict for piped/env/contain/commandline.
     reject_unsupported_config(cmd)?;
-    let (program, params) = program_and_params(cmd)?; // validates commandline()/argv0 too
+    let argv = elevated_argv(cmd)?; // validates commandline()/empty argv too
+    let program = elevated_program(cmd, argv)?;
 
     // Input validation stays with `reject_unsupported_config`, ABOVE the short-circuit, so every
     // verdict here is a property of the REQUEST rather than of the caller's ambient privilege.
@@ -405,10 +414,16 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // `C:\tools\setup` elevated, a different program than the caller named, and the batch gate
     // below — which reads that same prefix — has nothing to say about it.
     //
-    // For the mirror shape `setup.bat` + NUL + `junk` the gate would refuse, so what running the
-    // NUL check FIRST buys there is attribution: the caller's defect is the NUL, not batch
-    // escaping.
+    // It runs before EVERY other field's check, including the per-element argv loop, because it is
+    // the field that decides which image runs elevated: a request poisoning both would otherwise
+    // come back naming only `argument 1`. For the mirror shape `setup.bat` + NUL + `junk` the
+    // batch gate would also refuse, so what running first buys there is attribution — the caller's
+    // defect is the NUL, not batch escaping.
     let file_w = wide_nul("program path", program.as_os_str())?;
+
+    // Then the remaining fields, and only then the batch gate: a truncating argument is a defect
+    // the caller can fix, and "batch escaping is not implemented" would hide it.
+    let params = elevated_params(argv)?;
 
     // Refuse a `.bat`/`.cmd` SPELLED IN THE CALLER'S TOKEN. `ShellExecuteEx`'s `runas` resolves the
     // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into `%*`

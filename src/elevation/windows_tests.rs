@@ -108,6 +108,18 @@ fn win_host(elevated: bool) -> crate::elevation::plan::Host {
     }
 }
 
+/// `prefix` + an interior NUL + `suffix` — the shape Win32 silently truncates at the NUL.
+fn nul_between(prefix: &str, suffix: &str) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    std::ffi::OsString::from_wide(
+        &prefix
+            .encode_utf16()
+            .chain([0])
+            .chain(suffix.encode_utf16())
+            .collect::<Vec<u16>>(),
+    )
+}
+
 #[test]
 fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privilege() {
     // Piped stdio must fail with Unsupported and never prompt — the gate runs BEFORE the
@@ -488,6 +500,60 @@ fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
             other => panic!(
                 "elevated={elevated}: a NUL that truncates back to a real batch file must be \
                  blamed on the NUL, got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+}
+
+/// WHICH field a MULTI-poisoned request names. Every leg above poisons exactly one, so none of
+/// them pins the order: with the per-element argv loop running ahead of the program's own check,
+/// `args(["setup.bat\0junk", "x\0y"])` came back "argument 1" and never mentioned that the program
+/// path — the field deciding which image runs ELEVATED — is truncating too. NUL on the program
+/// path first, for attribution, as on the raw backend.
+#[test]
+fn a_poisoned_program_path_is_named_before_a_poisoned_argument_or_cwd() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([nul_between(r"C:\tools\setup.bat", "junk"), nul_between("x", "y")])
+            .current_dir(nul_between(r"C:\work", "junk"))
+            .elevate();
+        match super::plan_runas(&c, &win_host(elevated)) {
+            Err(Error::Io(e)) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "elevated={elevated}: expected the NUL refusal, got {e:?}"
+                );
+                assert!(
+                    e.to_string().contains("program path"),
+                    "elevated={elevated}: the program path outranks the other poisoned fields, got {e}"
+                );
+            }
+            other => panic!(
+                "elevated={elevated}: a truncating NUL must be refused, got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+}
+
+/// The other side of that ordering: the batch gate must not jump ahead of a poisoned ARGUMENT
+/// either. A clean `.bat` with a truncating argument is a NUL the caller can fix, and
+/// "batch escaping is not implemented" would hide it.
+#[test]
+fn a_poisoned_argument_is_named_before_the_batch_gate() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([std::ffi::OsString::from(r"C:\tools\setup.bat"), nul_between("x", "y")])
+            .elevate();
+        match super::plan_runas(&c, &win_host(elevated)) {
+            Err(Error::Io(e)) => assert!(
+                e.to_string().contains("argument 1"),
+                "elevated={elevated}: the refusal must name the poisoned argument, got {e}"
+            ),
+            other => panic!(
+                "elevated={elevated}: the argument's NUL must be refused before the batch gate, got {:?}",
                 other.map(|_| "Ok")
             ),
         }
