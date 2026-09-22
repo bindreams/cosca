@@ -823,9 +823,33 @@ fn is_batch_program(file_name: &str) -> bool {
 /// or popped its own components away. That last case did NOT collapse to nothing — a relative
 /// path goes on popping into the ancestors of the current directory, so `x\..` resolves to
 /// whatever the cwd is and `.` resolves to the cwd itself, while a rooted one clamps at its root.
-/// The name is real, this gate just cannot see it, which is why [`reject_batch_path`] refuses
+/// The name is real, this gate just cannot see it, which is why [`reject_batch_path_on`] refuses
 /// `None` rather than accepting it. A data-stream spelling is not that — `x.bat:` names a file and
 /// comes back as one.
+///
+/// # A UNC root has a NAME, and `..` never pops it
+///
+/// `\\server\share` is a root the way `C:\` is, but unlike `C:\` its last component is a name.
+/// Win32 skips server and share before it collapses anything (ReactOS's `RtlpCollapsePath` calls
+/// `RtlpSkipUNCPrefix` first; .NET pins `\\LOCALHOST\share5\..` resolving to `\\LOCALHOST\share5`),
+/// so no number of `..` reaches past the share, and a share named `x.bat` stays the effective name.
+/// Walk a UNC path as if it had no root and every one of `\\srv\x.bat\..`, `//srv/x.bat/..`,
+/// `\/srv\x.cmd\..`, `\\srv\x.bat\.. ` and `\\srv\x.bat\y\..\..` reduces to `srv` — not a batch
+/// name, so the gate returns `Ok` on a token `std::process` hands straight to `cmd.exe`, and
+/// `make_bat_command_line` appends the rest of a `.commandline()` verbatim. `GetFullPathNameW`
+/// does no I/O, so the share need not exist for that to happen.
+///
+/// Server and share are POSITIONAL: Win32 takes the two segments after the `\\` without reading
+/// them, so a `.`, `..` or empty segment there is part of the root rather than an operation on it.
+/// That position has to be exact, not merely deep enough. A floor set one component too DEEP
+/// suppresses a pop Win32 performs, and the final name moves to a later component: skip the
+/// dots-only server in `\\...\x.bat\y\..` and the root becomes `x.bat\y`, the pop is clamped
+/// away, and the gate judges `y` while Win32 resolves `\\...\x.bat`.
+///
+/// A `\\.\` or `//?/` device path puts its root in the same two positions (.NET's `GetRootLength`
+/// counts `\\.\C:\` as the root of `\\.\C:\x`), so one rule covers both.
+///
+/// A literal `\\?\` never arrives: [`verbatim_refusal`] owns it.
 ///
 /// # The token, not the resolved path (#144)
 ///
@@ -842,7 +866,19 @@ fn win32_effective_file_name(prog: &std::path::Path) -> Option<String> {
     // Each surviving component, paired with whether it is the path's FIRST segment — the only
     // position a drive prefix can occupy.
     let mut stack: Vec<(&str, bool)> = Vec::new();
-    for (position, segment) in text.split(['/', '\\']).enumerate() {
+    let mut segments = text.split(['/', '\\']).enumerate();
+    // A UNC (or `\\.\` device) root: the two segments after the leading pair, taken by POSITION
+    // and never collapsed. `None` for a root with no share at all — `\\server` names nothing
+    // loadable.
+    let root = if starts_with_two_separators(&text) {
+        segments.nth(1).expect("two separators are two empty segments");
+        let (_, server) = segments.next()?;
+        let (_, share) = segments.next()?;
+        Some((server, share))
+    } else {
+        None
+    };
+    for (position, segment) in segments {
         // A repeated separator, never a component.
         if segment.is_empty() {
             continue;
@@ -854,6 +890,8 @@ fn win32_effective_file_name(prog: &std::path::Path) -> Option<String> {
             continue;
         }
         if segment == ".." {
+            // Popping an empty stack under a UNC root is popping into the root, which Win32
+            // clamps at; `pop` on an empty stack is exactly that no-op.
             stack.pop();
             continue;
         }
@@ -865,16 +903,43 @@ fn win32_effective_file_name(prog: &std::path::Path) -> Option<String> {
         }
         stack.push((name, position == 0));
     }
+    if stack.is_empty() {
+        if let Some((server, share)) = root {
+            return unc_root_name(server, share);
+        }
+    }
     let (last, leading) = stack.pop()?;
     // A BARE drive prefix names no file — and only the first segment can be one. Elsewhere a
     // component ending in `:` is a data-stream spelling of a real file: `a:` is the file `a`, just
     // as `x.exe:` is the file `x.exe`, and returning `None` for either made the gate refuse a
-    // loadable image over a one-character name. A UNC `\\server` yields `server`, which is a name
-    // like any other and simply is not a batch file.
+    // loadable image over a one-character name.
     if leading && is_drive_prefix(last) {
         return None;
     }
     Some(last.to_string())
+}
+
+/// The name a path collapsed onto its UNC root resolves to, judged conservatively.
+///
+/// Win32 resolves it to `\\server\share`, so the share is the name std tests. The server is
+/// judged as well: whether `..` spelled INSIDE the root is collapsed is not something this crate
+/// has measured, and were it collapsed `\\x.bat\..` would resolve to `\\x.bat`. So a batch-named
+/// server is returned in preference to the share, and a share that trims away to nothing names no
+/// file — both over-refusals, and both in the direction this gate may err.
+fn unc_root_name(server: &str, share: &str) -> Option<String> {
+    let server = server.trim_end_matches([' ', '.']);
+    if is_batch_program(server) {
+        return Some(server.to_string());
+    }
+    let share = share.trim_end_matches([' ', '.']);
+    (!share.is_empty()).then(|| share.to_string())
+}
+
+/// Whether the path opens with the two separators that make Win32 read a UNC root. Either
+/// separator spells it in either position: `\\srv`, `//srv` and `\/srv` are one path to Win32.
+fn starts_with_two_separators(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some('\\' | '/'), Some('\\' | '/')))
 }
 
 /// A bare `C:` — two bytes, a drive letter and a colon.

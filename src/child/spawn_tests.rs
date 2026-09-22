@@ -507,6 +507,28 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         "x.exe:payload.bat:$DATA",
         // The name IS the extension; `Path::extension()` reports `None` for it.
         ".bat",
+        // A UNC SHARE is a root `..` cannot pop, so a batch-named share stays the effective name
+        // however many `..` follow it — see `win32_effective_file_name`.
+        r"\\srv\x.bat",
+        r"\\srv\x.bat\..",
+        "//srv/x.bat/..",
+        r"\/srv\x.cmd\..",
+        "\\\\srv\\x.bat\\.. ",
+        r"\\srv\x.bat\y\..\..",
+        r"\\srv\x.bat \..",
+        r"\\srv\x.bat.\..",
+        r"\\srv\x.bat:s\..",
+        // The share is reached through `..` too: a UNC path may not pop past it either way.
+        r"\\srv\x.bat\y\..\..\..",
+        // Not the share but a file under it, popped back to.
+        r"\\srv\share\x.bat\y\..",
+        // A server with no share under it names no file at all.
+        r"\\server",
+        // The root is positional; see `win32_effective_file_name`.
+        r"\\...\x.bat\y\..",
+        r"\\.\x.bat\y\..",
+        "//?/x.bat/y/..",
+        r"\\x.bat\y\..",
     ] {
         assert!(
             super::reject_batch_path_on(Path::new(probe), true).is_err(),
@@ -529,9 +551,11 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         r"x.bat\y\.. ..",
         r"x.bat\y\ ",
         r"x\ ",
-        // A UNC server or share name is not a batch file either.
-        r"\\server",
+        // A UNC share name is not a batch file either, and the pops below it are clamped away.
         r"\\server\share",
+        r"\\server\share\..",
+        r"\\server\share\x.bat\..",
+        r"\\server\share\tool.exe",
     ] {
         assert!(
             super::reject_batch_path_on(Path::new(probe), true).is_ok(),
@@ -1417,10 +1441,45 @@ fn win32_effective_file_name_collapses_the_way_win32_resolves() {
         (r"C:\", None),
         ("C:", None),
         ("c:", None),
-        // A UNC server or share is a name like any other here; neither is a batch file, and
-        // pretending they name nothing would drop `\\server\share\x.bat`'s sibling spellings.
-        (r"\\server", Some("server")),
+        // A UNC SHARE is a root. Win32 never pops one — the effective name stays the share, which
+        // is a NAMED final component and so is judged like any other. Model it as a path with no
+        // root and `..` reduces every one of these to `srv`, which is not a batch name, and the
+        // gate accepts a token `std::process` hands to cmd.exe.
+        (r"\\srv\x.bat\..", Some("x.bat")),
+        ("//srv/x.bat/..", Some("x.bat")),
+        (r"\/srv\x.cmd\..", Some("x.cmd")),
+        ("\\\\srv\\x.bat\\.. ", Some("x.bat")),
+        (r"\\srv\x.bat\y\..\..", Some("x.bat")),
+        (r"\\srv\x.bat\y\..\..\..", Some("x.bat")),
+        // The share is trimmed like any other component before it is judged.
+        (r"\\srv\x.bat \..", Some("x.bat")),
+        (r"\\srv\x.bat.\..", Some("x.bat")),
+        // The root is POSITIONAL, and a floor one component too deep is an acceptance: skip the
+        // dots-only server here and the root becomes `x.bat\y`, `..` is clamped, and `y` is judged
+        // while Win32 resolves `\\...\x.bat`.
+        (r"\\...\x.bat\y\..", Some("x.bat")),
+        (r"\\\x.bat\y\..", Some("x.bat")),
+        (r"\\..\x.bat\y\..", Some("x.bat")),
+        // A device path's root sits in the same two positions.
+        (r"\\.\x.bat\y\..", Some("x.bat")),
+        ("//?/x.bat/y/..", Some("x.bat")),
+        (r"\\.\C:\tool.exe", Some("tool.exe")),
+        // Collapsed onto the root, a batch-named SERVER is judged too — whether `..` inside the
+        // root collapses is unmeasured, and if it does this is `\\x.bat`.
+        (r"\\x.bat\y\..", Some("x.bat")),
+        // ...and so it is with no `..` at all: `\\x.bat\y` is a share root, which is a directory.
+        (r"\\x.bat\y", Some("x.bat")),
+        (r"\\x.bat\y\tool.exe", Some("tool.exe")),
+        // A server with no share names no file: there is nothing under it to load. Nor does a
+        // share that trims away to nothing.
+        (r"\\server", None),
+        (r"\\server\", None),
+        (r"\\server\..", None),
+        (r"\\", None),
+        // An ordinary share, and a file under one.
         (r"\\server\share", Some("share")),
+        (r"\\server\share\tool.exe", Some("tool.exe")),
+        (r"\\server\share\x.bat\..", Some("share")),
         // A dots-and-spaces component — neither `.` nor `..`, yet nothing survives the trim —
         // drops out and leaves the component before it. Measured on a Windows runner:
         // `x.bat\y\...` resolves to `…\x.bat\y\`, so `y` is what stays.
@@ -1470,6 +1529,22 @@ fn for_every_string(max_len: u32, mut probe: impl FnMut(&str)) {
 fn the_extension_rule_this_replaced(prog: &std::path::Path) -> bool {
     let Some(name) = prog.file_name() else { return false };
     let name = name.to_string_lossy();
+    match name.rfind('.') {
+        None | Some(0) => false,
+        Some(dot) => {
+            let ext = name[dot + 1..].to_ascii_lowercase();
+            ext == "bat" || ext == "cmd"
+        }
+    }
+}
+
+/// [`the_extension_rule_this_replaced`] as Windows applied it to a `\\?\` path, spelled out
+/// because this host's `Path` cannot apply it: under the prefix only `\` separates and nothing is
+/// trimmed, so the file name is the last `\`-separated piece AS WRITTEN. macOS's `Path` instead
+/// splits `\\?\x.bat/` at the `/`, drops the empty tail and reports `x.bat` — a refusal the old
+/// rule never made on the host it ran on.
+fn verbatim_extension_rule_this_replaced(text: &str) -> bool {
+    let name = text.rsplit('\\').next().expect("rsplit yields at least one piece");
     match name.rfind('.') {
         None | Some(0) => false,
         Some(dot) => {
@@ -1532,7 +1607,10 @@ fn the_gate_never_accepts_what_the_rule_it_replaced_refused() {
 enum Comp {
     /// An ordinary name. `batch` is whether it reaches a batch file when it ends up final.
     Name { batch: bool },
-    /// Contributes nothing: `.`, and an empty segment between two separators.
+    /// An empty segment: a repeated separator mid-path, a root at the front — and, TWICE at the
+    /// front, the `\\` that opens a UNC root. Kept apart from [`Comp::Skip`] for that last reason.
+    Empty,
+    /// Contributes nothing: `.`.
     Skip,
     /// Pops the component before it: `..`, and `.. ` — the trailing space comes off first.
     Pop,
@@ -1549,7 +1627,7 @@ enum Comp {
 /// The vocabulary the component generator draws from: one entry per behaviour Win32 has, plus the
 /// spellings that have historically been read wrong.
 const COMPONENTS: [(&str, Comp); 17] = [
-    ("", Comp::Skip),
+    ("", Comp::Empty),
     (".", Comp::Skip),
     ("..", Comp::Pop),
     (".. ", Comp::Pop),
@@ -1568,6 +1646,17 @@ const COMPONENTS: [(&str, Comp); 17] = [
     ("C:", Comp::DrivePrefix),
 ];
 
+/// A component read as a ROOT segment of a UNC path, where Win32 takes it by position and never
+/// interprets it: the only question left is whether its name is a batch file, and whether it has a
+/// name at all once trimmed.
+fn as_root_name(comp: Comp) -> Option<bool> {
+    match comp {
+        Comp::Name { batch } => Some(batch),
+        Comp::DrivePrefix => Some(false),
+        Comp::Empty | Comp::Skip | Comp::Pop | Comp::Dots => None,
+    }
+}
+
 /// Whether the gate must refuse a path made of these components, resolved the way Win32 resolves
 /// one: a stack, `..` pops, and a final name that is a batch file — or no final name at all —
 /// refuses.
@@ -1576,95 +1665,221 @@ const COMPONENTS: [(&str, Comp); 17] = [
 /// are known here by construction, while `win32_effective_file_name` has to recover them from the
 /// joined string, and that re-parse is where every bypass in this gate's history has lived.
 ///
-/// Not independent of the gate's CLASSIFICATION. Two rules are declared here because production
-/// declares them, not because anything checks them: a leading empty segment contributes nothing
-/// (so a rooted `\x\..` pops to nothing rather than clamping at the root the way Win32 does), and
-/// a final [`Comp::DrivePrefix`] names no file. Both over-refuse, so agreement can never hide an
-/// ACCEPTANCE — the direction this gate exists to control. What it can hide is an over-refusal,
-/// and when #144 narrows one of them this test will fail and read like a regression. It is not:
-/// re-declare the rule here and the failure goes away.
+/// A UNC ROOT is modelled here on its own terms, not borrowed from the gate. Two leading
+/// [`Comp::Empty`] are the `\\`; the next two components are server and share, by position, and no
+/// `..` pops below them — the path then resolves to `\\server\share`, whose share is the final
+/// name. Without that model this oracle treated every rooted path as rootless and ACCEPTED
+/// `\\y\x.bat\..` exactly as the gate did, so their agreement proved only that one model was
+/// self-consistent. Agreement with an oracle hides whatever the two share; this one shares the
+/// classification in [`COMPONENTS`] and the "no final name refuses" rule, and nothing else.
 fn oracle_refuses(components: &[Comp]) -> bool {
-    let mut stack: Vec<Comp> = Vec::new();
-    for (position, comp) in components.iter().enumerate() {
+    let (root, rest) = match components {
+        [Comp::Empty, Comp::Empty, rest @ ..] => match rest {
+            [server, share, rest @ ..] => (Some((*server, *share)), rest),
+            // `\\server` alone, or less: no share, nothing loadable.
+            _ => return true,
+        },
+        _ => (None, components),
+    };
+    // `None` is a bare drive prefix, which names no file when it ends up final.
+    let mut stack: Vec<Option<bool>> = Vec::new();
+    for (i, comp) in rest.iter().enumerate() {
         match comp {
-            Comp::Skip | Comp::Dots => {}
+            Comp::Empty | Comp::Skip | Comp::Dots => {}
+            // An empty stack is the root, wherever there is one; popping it is a no-op.
             Comp::Pop => {
                 stack.pop();
             }
-            // A drive prefix is a prefix: past position 0 the same spelling is a file name
-            // with an unnamed stream, and `C:` carries no dot, so it is not a batch name.
-            Comp::DrivePrefix if position > 0 => stack.push(Comp::Name { batch: false }),
-            named => stack.push(*named),
+            // A drive prefix is a prefix only at the very front; elsewhere it is a stream spelling
+            // of a file named `C`, which is not a batch name.
+            Comp::DrivePrefix if i == 0 && root.is_none() => stack.push(None),
+            Comp::DrivePrefix => stack.push(Some(false)),
+            Comp::Name { batch } => stack.push(Some(*batch)),
         }
     }
-    match stack.last() {
+    match (stack.last(), root) {
+        (Some(Some(batch)), _) => *batch,
+        (Some(None), _) => true,
+        // Collapsed onto `\\server\share`: the share is what std tests.
+        (None, Some((_, share))) => as_root_name(share).unwrap_or(true),
         // Names no file of its own: Win32 resolves it against the current directory, whose
         // name the gate cannot see, so it must refuse rather than guess.
-        None | Some(Comp::DrivePrefix) => true,
-        Some(Comp::Name { batch }) => *batch,
-        Some(other) => unreachable!("only Name and DrivePrefix are ever pushed, got {other:?}"),
+        (None, None) => true,
     }
 }
 
-/// Exhaustive over COMPONENTS: every path up to four components deep over [`COMPONENTS`], under
-/// both separators, checked against a resolver that works from the component list instead of the
-/// string.
-///
-/// This is the envelope the character-level test cannot reach. Its shortest interesting probe,
-/// `.bat\a\..`, is nine characters; enumerating that many characters over a twelve-character
-/// alphabet is 12^9 — over five billion probes — and the spellings that have actually bypassed
-/// this gate all live out there. Generating components instead buys the length for a few tens of
-/// thousands of probes.
-///
-/// An exact agreement, not a one-sided property: an over-refusal is a failure here too, because
-/// the gate is allowed to refuse a directory and is not allowed to refuse `y\x.bat\..`, which
-/// loads `y`. Carries the no-regression property at this length as well — nothing the rule this
-/// PR replaced refused may come out accepted.
-#[test]
-fn the_gate_agrees_with_a_component_level_resolver() {
-    let mut disagreed: Vec<String> = Vec::new();
-    let mut newly_accepted: Vec<String> = Vec::new();
-    let (mut refused, mut accepted) = (0usize, 0usize);
-    for sep in ['\\', '/'] {
-        for depth in 1..=4u32 {
+/// The one over-refusal the gate declares and the oracle does not share: a path collapsed onto its
+/// UNC root is refused for a batch-named SERVER as well as a batch-named share, because whether
+/// `..` inside the root is collapsed is unmeasured. It may only ever LICENSE a refusal — an
+/// acceptance the oracle refuses is a failure whatever this says.
+fn declared_unc_over_refusal(components: &[Comp]) -> bool {
+    let [Comp::Empty, Comp::Empty, server, _share, rest @ ..] = components else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for comp in rest {
+        match comp {
+            Comp::Pop => depth = depth.saturating_sub(1),
+            Comp::Name { .. } | Comp::DrivePrefix => depth += 1,
+            Comp::Empty | Comp::Skip | Comp::Dots => {}
+        }
+    }
+    depth == 0 && as_root_name(*server) == Some(true)
+}
+
+/// The tally of one exhaustive comparison over [`COMPONENTS`].
+#[derive(Default, Debug)]
+struct Tally {
+    probes: u64,
+    refused: u64,
+    accepted: u64,
+    declared_over_refusals: u64,
+    /// The gate accepted what the oracle refuses. A hole.
+    holes: Vec<String>,
+    /// The gate refused what the oracle accepts, outside the declared over-refusal.
+    undeclared_over_refusals: Vec<String>,
+    /// The gate accepted what the rule it replaced refused.
+    newly_accepted: Vec<String>,
+    /// The same probe behind `\\?\`: accepted, yet std's literal verbatim test reads it as a batch
+    /// file.
+    verbatim_holes: Vec<String>,
+}
+
+/// Every path of `min_depth..=max_depth` components over [`COMPONENTS`], under both separators,
+/// judged by the gate and by [`oracle_refuses`].
+fn compare_gate_with_oracle(min_depth: u32, max_depth: u32) -> Tally {
+    let mut tally = Tally::default();
+    let mut texts: Vec<&str> = Vec::new();
+    let mut kinds: Vec<Comp> = Vec::new();
+    for sep in ["\\", "/"] {
+        for depth in min_depth..=max_depth {
             for mut index in 0..COMPONENTS.len().pow(depth) {
-                let mut texts: Vec<&str> = Vec::new();
-                let mut kinds: Vec<Comp> = Vec::new();
+                texts.clear();
+                kinds.clear();
                 for _ in 0..depth {
                     let (text, kind) = COMPONENTS[index % COMPONENTS.len()];
                     texts.push(text);
                     kinds.push(kind);
                     index /= COMPONENTS.len();
                 }
-                let probe = texts.join(&sep.to_string());
-                let want = oracle_refuses(&kinds);
+                let probe = texts.join(sep);
                 let path = std::path::Path::new(&probe);
+                let want = oracle_refuses(&kinds);
                 let got = super::reject_batch_path_on(path, true).is_err();
+                tally.probes += 1;
                 if the_extension_rule_this_replaced(path) && !got {
-                    newly_accepted.push(probe.clone());
+                    tally.newly_accepted.push(probe.clone());
                 }
-                if want == got {
-                    if got {
-                        refused += 1;
-                    } else {
-                        accepted += 1;
+                // The verbatim axis: std tests a `\\?\` program as the literal string, so a batch
+                // suffix is exactly what it substitutes cmd.exe for.
+                let verbatim = format!(r"\\?\{probe}");
+                let verbatim_path = std::path::Path::new(&verbatim);
+                let verbatim_got = super::reject_batch_path_on(verbatim_path, true).is_err();
+                let lower = verbatim.to_ascii_lowercase();
+                if (lower.ends_with(".bat") || lower.ends_with(".cmd")) && !verbatim_got {
+                    tally.verbatim_holes.push(verbatim.clone());
+                }
+                if verbatim_extension_rule_this_replaced(&verbatim) && !verbatim_got {
+                    tally.newly_accepted.push(verbatim);
+                }
+                match (want, got) {
+                    (true, false) => tally.holes.push(probe),
+                    (false, true) if declared_unc_over_refusal(&kinds) => {
+                        tally.declared_over_refusals += 1;
                     }
-                } else {
-                    let verb = if want { "refuse" } else { "accept" };
-                    disagreed.push(format!("{probe:?} must {verb}"));
+                    (false, true) => tally.undeclared_over_refusals.push(probe),
+                    (_, true) => tally.refused += 1,
+                    (_, false) => tally.accepted += 1,
                 }
             }
         }
     }
+    tally
+}
+
+/// Exhaustive over COMPONENTS: every path up to five components deep over [`COMPONENTS`], under
+/// both separators, checked against a resolver that works from the component list instead of the
+/// string.
+///
+/// This is the envelope the character-level test cannot reach. Its shortest interesting probe,
+/// `.bat\a\..`, is nine characters; enumerating that many characters over a twelve-character
+/// alphabet is 12^9 — over five billion probes — and the spellings that have actually bypassed
+/// this gate all live out there. Five components is the least that reaches a UNC pop:
+/// `\\srv\x.bat\..` is `["", "", "srv", "x.bat", ".."]`.
+///
+/// Every probe is judged a second time behind `\\?\`, where no oracle is needed: std's verbatim
+/// test is a literal suffix check, so a `.bat`/`.cmd` suffix must be refused and nothing else is
+/// asserted.
+///
+/// Exact agreement but for one declared over-refusal: the gate is allowed to refuse a directory
+/// and is not allowed to refuse `y\x.bat\..`, which loads `y`. Carries the no-regression property
+/// at this length as well — nothing the rule this PR replaced refused may come out accepted.
+#[test]
+fn the_gate_agrees_with_a_component_level_resolver() {
+    let mut tally = compare_gate_with_oracle(1, 5);
     // Truncated: a broken gate disagrees on tens of thousands of probes and the list is unreadable.
-    disagreed.truncate(20);
-    assert_eq!(disagreed, Vec::<String>::new(), "gate and resolver disagree");
-    newly_accepted.truncate(20);
-    assert_eq!(newly_accepted, Vec::<String>::new(), "refused before, accepted now");
-    // A generator that emitted only refusals (or only acceptances) would agree with a gate that
-    // had lost the other answer entirely, and would say nothing while doing it.
-    assert!(
-        refused > 1000 && accepted > 1000,
-        "{refused} refused, {accepted} accepted"
+    tally.holes.truncate(20);
+    tally.undeclared_over_refusals.truncate(20);
+    tally.newly_accepted.truncate(20);
+    tally.verbatim_holes.truncate(20);
+    assert_eq!(
+        tally.verbatim_holes,
+        Vec::<String>::new(),
+        "a verbatim batch suffix accepted"
     );
+    assert_eq!(
+        tally.holes,
+        Vec::<String>::new(),
+        "the gate accepts what Win32 resolves to a batch file"
+    );
+    assert_eq!(
+        tally.undeclared_over_refusals,
+        Vec::<String>::new(),
+        "the gate refuses what Win32 does not resolve to a batch file"
+    );
+    assert_eq!(
+        tally.newly_accepted,
+        Vec::<String>::new(),
+        "refused before, accepted now"
+    );
+    // A generator that emitted only refusals (or only acceptances) would agree with a gate that
+    // had lost the other answer entirely, and would say nothing while doing it — and one that
+    // never reached the declared over-refusal would never have exercised a UNC root collapse.
+    assert!(
+        tally.refused > 1000 && tally.accepted > 1000 && tally.declared_over_refusals > 0,
+        "{tally:?}"
+    );
+}
+
+/// The oracle's UNC model, pinned on the rows the gate once got wrong: an oracle without it
+/// accepts them, and then agreeing with it proves nothing about them.
+#[test]
+fn the_oracle_models_a_unc_root_of_its_own() {
+    let name = |batch| Comp::Name { batch };
+    let e = Comp::Empty;
+    // `\\y\x.bat\..`
+    assert!(oracle_refuses(&[e, e, name(false), name(true), Comp::Pop]));
+    // `\\y\x.bat\y\..\..`
+    assert!(oracle_refuses(&[
+        e,
+        e,
+        name(false),
+        name(true),
+        name(false),
+        Comp::Pop,
+        Comp::Pop
+    ]));
+    // `\\...\x.bat\y\..` — a dots-only server is a server, not a component to skip.
+    assert!(oracle_refuses(&[e, e, Comp::Dots, name(true), name(false), Comp::Pop]));
+    // `\\y\y\x.bat\..` pops back to the share `y`, which is no batch file.
+    assert!(!oracle_refuses(&[
+        e,
+        e,
+        name(false),
+        name(false),
+        name(true),
+        Comp::Pop
+    ]));
+    // `\y\x.bat\..` has ONE leading separator: a rooted path, not a UNC one.
+    assert!(!oracle_refuses(&[e, name(false), name(true), Comp::Pop]));
 }
