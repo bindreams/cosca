@@ -311,7 +311,13 @@ pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
         // NUL defect, not a batch one — but `Path::extension()` still reads `.bat` straight through
         // the NUL (it is not a separator), so gating on the batch rule first blames the wrong thing
         // and interpolates a raw U+0000 into the error string, which then reaches logs and
-        // terminals. Same ordering as the elevated path, for the same reason.
+        // terminals. The mirror token `C:\tools\setup.bat\0junk` has `extension() == "bat\0junk"`,
+        // which the batch rule cannot see at all, so this check is the only thing that refuses it
+        // HERE, before resolution.
+        //
+        // Unlike the elevated path, neither refusal is the last line of defence — resolution and
+        // the argv NUL checks below would also stop these tokens. What the ordering buys is a
+        // refusal that names the caller's actual defect instead of a downstream symptom.
         resolve::ensure_no_nul_wide("program token", prog.as_os_str())?;
         reject_batch_path(&prog)?;
     }
