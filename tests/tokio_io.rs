@@ -222,6 +222,28 @@ async fn async_run_line_round_trips() {
     assert_eq!(s, "hello\n");
 }
 
+/// The cgroup leaf a contained tree was placed in, if it got one. Read while the root is alive.
+#[cfg(target_os = "linux")]
+fn cgroup_leaf_of(child: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
+    (child.containment() == cosca::Containment::CgroupV2).then(|| common::cgroup::cgroup_of(child.id().pid()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_leaf_of(_: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Remove the leaf a test's tree left behind, once the tree drains. Call it only after every
+/// member has been released or killed. The handle's `Drop` may already have removed the leaf.
+fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
+    #[cfg(target_os = "linux")]
+    if let Some(leaf) = leaf.filter(|l| l.exists()) {
+        common::cgroup::drain_and_remove_leaf(&leaf);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = leaf;
+}
+
 #[tokio::test]
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
@@ -252,6 +274,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
     // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
     use std::io::{Read as _, Write as _};
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
@@ -263,12 +286,14 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
+    remove_leftover_leaf(leaf);
 }
 
 #[tokio::test]
 async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
-    let (mut child, mut root, _grand) = common::spawn_grandchild_async(true);
+    let (mut child, mut root, grand) = common::spawn_grandchild_async(true);
+    let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     child.detach();
     drop(child); // detached → Drop must NOT kill
@@ -286,7 +311,8 @@ async fn async_detach_leaves_the_tree_running() {
         matches!(root.read(&mut buf), Ok(0)),
         "released root exits cleanly (EOF)"
     );
-    // _grand drops here → its socket closes → the reparented grandchild exits.
+    drop(grand); // its socket closes → the reparented grandchild exits
+    remove_leftover_leaf(leaf);
 }
 
 #[tokio::test]
@@ -326,12 +352,13 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     // outside the cgroup lane this is a process group, whose disarm is a no-op;
     // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
     use std::io::{Read as _, Write as _};
-    let (child, mut root, _grand) = common::spawn_grandchild_async_with(true, false);
+    let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false);
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
         "contained spawn must engage a mechanism"
     );
+    let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     drop(child); // contained + kill_on_drop(false) → nothing may kill the tree
     assert_eq!(
@@ -345,6 +372,8 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
         matches!(root.read(&mut buf), Ok(0)),
         "released root exits cleanly (EOF)"
     );
+    drop(grand); // its socket closes → the reparented grandchild exits
+    remove_leftover_leaf(leaf);
 }
 
 /// `detach()` must leave a cgroup-contained tree running: `CgroupLeaf::drop` kills an occupied
