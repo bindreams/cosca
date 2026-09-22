@@ -238,25 +238,30 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         )
     });
 
-    let spawn_member = |leaf: &super::CgroupLeaf| -> std::process::Child {
+    // Each member reports through its OWN page. The leaf's slot is one word for the whole leaf
+    // (see `ReportPage`), so two members sharing it would overwrite each other and this test
+    // would be asserting the second member's outcome twice.
+    let spawn_member = |leaf: &super::CgroupLeaf, page: &super::ReportPage| -> std::process::Child {
         let procs_fd = leaf.procs_fd();
-        let slot = leaf.placement_slot();
+        let slot = page.slot();
         let mut cmd = Command::new("sleep");
         cmd.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
         // child; `procs_fd` is a valid, open, writable fd owned by `leaf` for the parent's whole
         // lifetime (fork gives the child its own fd-table entry pointing at the same underlying
         // open file description, and `place_self_in_cgroup_pre_exec` closes only that child-side
-        // copy) — exactly its own documented contract. `leaf` outlives every member spawned
-        // through it in this test.
+        // copy) — exactly its own documented contract. `leaf` and `page` both outlive every
+        // member spawned through them in this test.
         unsafe {
             cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot));
         }
         cmd.spawn().expect("spawn a real long-lived cgroup leaf member")
     };
 
-    let mut a = spawn_member(&leaf);
-    let mut b = spawn_member(&leaf);
+    let page_a = super::ReportPage::new().expect("map member a's report page");
+    let page_b = super::ReportPage::new().expect("map member b's report page");
+    let mut a = spawn_member(&leaf, &page_a);
+    let mut b = spawn_member(&leaf, &page_b);
 
     // A real bounded wait with both members alive: must report MembersRemain. The 250ms bound
     // is not a synchronization guess — it is the deadline `wait_drained` itself blocks on via a
@@ -270,11 +275,16 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         TreeDrain::MembersRemain,
         "both members are alive; must report MembersRemain"
     );
-    for (name, member) in [("a", &a), ("b", &b)] {
+    for (name, member, page) in [("a", &a, &page_a), ("b", &b, &page_b)] {
         let placement = leaf.placement_of(member.id());
         assert!(
             matches!(placement, super::Placement::Confirmed),
             "member {name} must actually be placed in the leaf: {placement}"
+        );
+        assert_eq!(
+            page.read(),
+            PlacementReport::Placed,
+            "member {name}'s own report must survive the other member's spawn"
         );
     }
 

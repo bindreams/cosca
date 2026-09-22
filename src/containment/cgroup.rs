@@ -196,6 +196,10 @@ pub(crate) enum LeafError {
 /// `fork`, in a copy-on-write address space, under async-signal-safety rules that forbid
 /// allocating or formatting anything. The child therefore reports a single word through a
 /// shared page (see [`ReportPage`]), which this enum names.
+///
+/// The word belongs to the LEAF, not to a child. Production creates one leaf per spawn, so the
+/// distinction is invisible there; several children sharing one leaf would share one slot and
+/// overwrite each other's reports (see [`ReportPage`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum PlacementReport {
@@ -243,7 +247,8 @@ pub(crate) enum Placement {
         path: PathBuf,
         /// Its verbatim contents at the moment of the check.
         procs: String,
-        /// What the child itself reported about its own write.
+        /// The leaf's placement report — the outcome of the last self-placement write made
+        /// through it, which for a production leaf is `pid`'s own.
         report: PlacementReport,
         /// The child's `/proc/<pid>` state letter — `Z` means it had already exited, which
         /// removes it from `cgroup.procs` whether or not the write ever succeeded.
@@ -254,6 +259,7 @@ pub(crate) enum Placement {
         pid: u32,
         path: PathBuf,
         source: io::Error,
+        /// As in [`Placement::Absent`]: the leaf's report, not `pid`'s in general.
         report: PlacementReport,
     },
 }
@@ -494,9 +500,32 @@ const REPORT_PLACED: i32 = -1;
 ///
 /// `pre_exec` runs after `fork`, where every ordinary channel is closed to it: the address
 /// space is copy-on-write (the parent cannot see a normal store), and async-signal-safety
-/// forbids allocating, formatting or locking. A shared anonymous page costs one `mmap` per
-/// contained spawn and admits exactly one async-signal-safe operation — an aligned atomic
-/// store of one `i32` — which is all a report needs to be.
+/// forbids allocating, formatting or locking. A shared anonymous page admits exactly one
+/// async-signal-safe operation — an aligned atomic store of one `i32` — which is all a report
+/// needs to be.
+///
+/// **One slot per LEAF, not per child.** The page belongs to the `CgroupLeaf`, and a production
+/// spawn creates one leaf per child, so leaf and child coincide there. A caller that routes
+/// several children through ONE leaf gets one slot for all of them, and the last store wins —
+/// `placement_of` would then attribute the last child's outcome to whichever pid it was asked
+/// about. Give each child its own [`ReportPage`] rather than sharing a leaf's.
+///
+/// # What this costs, and what it can cost a spawn
+/// One `mmap` per contained spawn, held for the contained child's whole lifetime: the kernel
+/// rounds the 4-byte length up to a page, so a live contained child holds **4 KiB of resident
+/// memory and one VMA** in the supervisor.
+///
+/// The VMA, not the memory, is the ceiling. `vm.max_map_count` defaults to 65530 mappings per
+/// process, and every live contained child spends one of them, so a supervisor holding tens of
+/// thousands of contained children at once approaches a limit this mechanism introduced. At
+/// that point `mmap` fails with `ENOMEM` and the spawn DEGRADES — it keeps its process group
+/// and loses the fork-proof kill — rather than failing, which makes exhaustion quiet: weaker
+/// containment, not an error. `LeafError::MapReportPage` is what makes it audible at all.
+///
+/// A per-process slab — one shared page carved into 1024 slots, one handed to each live leaf —
+/// would cost 4 bytes and no VMA per child and remove the degrade condition entirely. It is not
+/// what this is, because a leaf is created and destroyed independently of every other and a slab
+/// needs a free list; at the fan-out cosca is built for that trade has not been worth making.
 ///
 /// **Not a race.** The child stores its outcome strictly before `exec`, and `std`'s Unix
 /// spawn does not return to the parent until the child has exec'd (it reads the child's
@@ -578,11 +607,18 @@ pub(crate) struct ReportSlot {
     ptr: *mut AtomicI32,
 }
 
-// Safety: a raw pointer to a shared mapping that outlives every closure capturing it (the
-// owning `CgroupLeaf` is moved into `Prepared` and dropped only after the spawn completes).
-// `Sync` as well as `Send` because `Command::pre_exec` requires both of its closure, and the
-// only operation this type offers is an atomic store — sharing it across threads adds no
-// unsynchronized access.
+// Safety: a raw pointer to a shared mapping, with one operation — an atomic store — and one
+// caller: the `pre_exec` closure, which the kernel invokes only between the fork and the exec
+// of the single spawn the owning `CgroupLeaf` was created for. The leaf, and so the mapping, is
+// alive across all of that.
+//
+// The closure can OUTLIVE the mapping: on the spawn-FAILURE path in `child::spawn`, `Prepared`
+// (and with it the leaf's `munmap`) drops before the `Command` that still owns the closure. The
+// pointer dangles from then on, which is sound only because nothing ever invokes the closure
+// again — a `Command` whose spawn failed runs no further `pre_exec`.
+//
+// `Sync` as well as `Send` because `Command::pre_exec` requires both of its closure, and an
+// atomic store adds no unsynchronized access when shared across threads.
 #[cfg(target_os = "linux")]
 unsafe impl Send for ReportSlot {}
 #[cfg(target_os = "linux")]
