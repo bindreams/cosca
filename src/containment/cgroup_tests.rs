@@ -702,3 +702,111 @@ fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
          narrating a non-event, got {levels:?}"
     );
 }
+
+// Degrade-report volume -----
+// A degrade's REASON is usually a permanent property of the host (an unprivileged container's
+// read-only /sys/fs/cgroup, a kernel older than 5.14): an embedder spawning thousands of
+// contained children can act on the first report and on nothing after it.
+
+/// The first spawn to hit a given condition is news and warns; every later spawn hitting the
+/// SAME condition still reports, at `debug`. Driven against the test's own "already warned"
+/// state rather than the process-wide one, so the assertion does not depend on what other
+/// tests in this binary degraded first.
+#[test]
+fn a_repeated_degrade_reason_warns_once_then_reports_at_debug() {
+    crate::log_capture::install();
+    let warned = std::sync::atomic::AtomicU32::new(0);
+    let reason = || LeafError::KillUnsupported {
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-once-probe-7c13"),
+    };
+
+    let mark = crate::log_capture::mark();
+    for _ in 0..3 {
+        super::log_degrade_into(&warned, &reason());
+    }
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-once-probe-7c13"),
+        vec![log::Level::Warn, log::Level::Debug, log::Level::Debug],
+        "an embedder cannot act twice on one host property, and every repeat is still on \
+         record for a reader who turns the level up"
+    );
+}
+
+/// A condition nobody has been told about yet is news, whatever else has already degraded —
+/// the once-per-reason rule must not collapse distinct reasons into one report.
+#[test]
+fn a_newly_seen_degrade_reason_still_warns() {
+    crate::log_capture::install();
+    let warned = std::sync::atomic::AtomicU32::new(0);
+    super::log_degrade_into(
+        &warned,
+        &LeafError::KillUnsupported {
+            path: PathBuf::from("/sys/fs/cgroup/slice/cosca-distinct-probe-3b90"),
+        },
+    );
+
+    let mark = crate::log_capture::mark();
+    super::log_degrade_into(
+        &warned,
+        &LeafError::MapReportPage(std::io::Error::from_raw_os_error(12)),
+    );
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "placement-report memory page"),
+        vec![log::Level::Warn],
+        "a second, different reason is a second thing the embedder has not been told"
+    );
+}
+
+/// Every reason carries its OWN kind. Two reasons sharing one kind would make the second one
+/// ever seen silently arrive at `debug` — the exact silence this PR removes, reintroduced.
+#[test]
+fn every_degrade_reason_has_its_own_kind() {
+    use super::DegradeReason;
+
+    let reasons: Vec<Box<dyn DegradeReason>> = vec![
+        Box::new(LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13))),
+        Box::new(LeafError::NoUnifiedLine("9:memory:/foo\n".into())),
+        Box::new(LeafError::CreateLeafDir {
+            path: PathBuf::from("/cg/leaf"),
+            source: std::io::Error::from_raw_os_error(13),
+        }),
+        Box::new(LeafError::KillUnsupported {
+            path: PathBuf::from("/cg/leaf"),
+        }),
+        Box::new(LeafError::OpenProcs {
+            path: PathBuf::from("/cg/leaf/cgroup.procs"),
+            source: std::io::Error::from_raw_os_error(13),
+        }),
+        Box::new(LeafError::ReadCloexec {
+            path: PathBuf::from("/cg/leaf/cgroup.procs"),
+            source: std::io::Error::from_raw_os_error(9),
+        }),
+        Box::new(LeafError::ClearCloexec {
+            path: PathBuf::from("/cg/leaf/cgroup.procs"),
+            source: std::io::Error::from_raw_os_error(9),
+        }),
+        Box::new(LeafError::MapReportPage(std::io::Error::from_raw_os_error(12))),
+        Box::new(Placement::Confirmed),
+        Box::new(Placement::Absent {
+            pid: 1,
+            path: PathBuf::from("/cg/leaf/cgroup.procs"),
+            procs: String::new(),
+            report: PlacementReport::Placed,
+            child_state: None,
+        }),
+        Box::new(Placement::Unreadable {
+            pid: 1,
+            path: PathBuf::from("/cg/leaf/cgroup.procs"),
+            source: std::io::Error::from_raw_os_error(13),
+            report: PlacementReport::Placed,
+        }),
+    ];
+    let mut seen = Vec::new();
+    for reason in &reasons {
+        let kind = reason.kind();
+        assert!(!seen.contains(&kind), "{kind:?} is claimed by two different reasons");
+        seen.push(kind);
+    }
+}
