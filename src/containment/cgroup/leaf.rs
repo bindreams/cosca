@@ -111,8 +111,8 @@ pub(crate) struct CgroupLeaf {
     cgroup_path: Option<String>,
     /// Whether the spawn was abandoned before its verdict: the leaf is already dealt with.
     pub(super) abandoned: bool,
-    /// Whether `Drop` may still fire `cgroup.kill`. Cleared by `disarm` — see it for why this
-    /// is state rather than nothing.
+    /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
+    /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
     armed: AtomicBool,
 }
 

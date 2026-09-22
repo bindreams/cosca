@@ -570,6 +570,49 @@ fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
     );
 }
 
+// Drop's two flags -----
+// `entered` is whether the child entered the leaf, so it can hold anything at all; `armed` is
+// whether the caller still wants cosca to manage the tree. `Drop` kills only when both hold.
+
+/// All four combinations, each against an occupied leaf whose verdict is taken: only both-set
+/// writes `cgroup.kill`.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
+    for (entered, armed) in [(true, true), (true, false), (false, true), (false, false)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-two-flags-leaf");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+        std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+        let leaf = if entered {
+            entered_leaf_at(leaf_path.clone())
+        } else {
+            let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
+            // no-op. The slot's channel lives as long as `leaf`.
+            let _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+            assert!(
+                leaf.take_placement(std::process::id()).expect("decidable").is_err(),
+                "a failed write is not a placement"
+            );
+            leaf
+        };
+        if !armed {
+            leaf.disarm();
+        }
+        drop(leaf);
+
+        let expected: &[u8] = if entered && armed { b"1" } else { b"" };
+        assert_eq!(
+            std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+            expected,
+            "entered={entered}, armed={armed}"
+        );
+    }
+}
+
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
 /// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note
