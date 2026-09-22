@@ -479,7 +479,8 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     //
     // The one slice this tree does refuse: on this elevated `Exact` arm, `absolutise_exact` hands
     // the gate Win32's own normalisation, so trailing dots and spaces arrive stripped
-    // (`setup.bat.` is refused). `C:\tools\.bat` survives normalisation and still passes. The
+    // (`setup.bat.` is refused). `C:\tools\.bat` survives normalisation and still passes (the image
+    // allowlist below the planner refuses it, but only where a consent prompt is used). The
     // `Search` arm, and the raw backend's `raw_executable()` sink, which loads the caller's token
     // as written, get no such help: `raw_executable("setup.bat.")` passes unelevated.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
