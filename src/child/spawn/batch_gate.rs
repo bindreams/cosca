@@ -229,8 +229,10 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// - **Final**, it trims away to nothing and DROPS OUT, popping nothing. Measured on x64 and arm64
 ///   runners for `...`, `....`, `.. .`, `.. ..`, `" "`, `". "` and `".. "`: `x.bat\y\` plus any
 ///   of them resolves to `…\x.bat\y\`, so `y` survives and the batch file stays covered.
-/// - **Interior**, it is unmeasured, and the two readings disagree about what a later `..` pops.
-///   [`Interior`] names them; [`reject_batch_path_on`] asks for both.
+/// - **Interior**, it is kept as a name — a lone trailing `.` comes off, a run of two or more does
+///   not, spaces never do (measured by the Windows path probe's interior-trim table, not yet one of
+///   its assertions). Until the probe asserts it, [`reject_batch_path_on`] also asks the
+///   [`Interior::Dropped`] reading, and narrowing to [`Interior::Named`] is left to that follow-up.
 ///
 /// `None` means the path named no file of its own: it was empty, was a bare root or drive prefix,
 /// or popped its own components away. That last case did NOT collapse to nothing — a relative
@@ -335,7 +337,7 @@ pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interi
 }
 
 /// How to read a dots-and-spaces segment (`...`, `.. `, a lone space) that is NOT the path's final
-/// one — which no measurement has settled.
+/// one. [`Interior::Named`] is the measured reading; see [`win32_effective_file_name`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Interior {
     /// It drops out, as the measured final one does: `y\x.bat\...\..` resolves to `y`.
