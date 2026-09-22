@@ -365,10 +365,10 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
     }
 }
 
-/// A NUL-truncated path that only LOOKS like a batch file (`C:\tools\setup` + NUL + `.bat`) must be
-/// diagnosed as the NUL, not misattributed to the batch gate: the truncated prefix
-/// `C:\tools\setup` is not a batch file at all, and pointing the caller at CVE-2024-24576 sends
-/// them to fix the wrong thing. The NUL check on `program` must run before `reject_batch_path`.
+/// A NUL-truncated path that only LOOKS like a batch file (`C:\tools\setup` + NUL + `.bat`): Win32
+/// launches `C:\tools\setup`, a different program than the caller named and no batch file at all.
+/// `reject_batch_path` reads that same truncated prefix and so passes the token through — the NUL
+/// check on `program` is the only refusal standing between it and an elevated `ShellExecuteEx`.
 #[test]
 fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     use std::ffi::OsString;
@@ -381,12 +381,16 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
             .chain(".bat".encode_utf16())
             .collect::<Vec<u16>>(),
     );
-    // `\0` is not a path separator, so `extension()` reads straight through it: the batch gate
-    // really does see a `.bat` here, which is what makes the ordering load-bearing.
+    // `\0` is not a path separator, so `extension()` reads `bat` straight through it — the reason
+    // the batch gate cannot key on the extension, and the reason it has nothing to say here.
     assert_eq!(
         std::path::Path::new(&nul_bat).extension().map(|e| e.to_string_lossy()),
         Some("bat".into()),
-        "premise: the batch gate must be able to fire on this token"
+        "premise: the token's extension is misleading"
+    );
+    assert!(
+        crate::child::spawn::reject_batch_path(std::path::Path::new(&nul_bat)).is_ok(),
+        "premise: the batch gate reads `C:\\tools\\setup`, so nothing but the NUL check refuses this"
     );
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -414,13 +418,11 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     }
 }
 
-/// The mirror shape, and the one where the NUL check is not a diagnosis but the WHOLE control:
-/// `setup.bat` + NUL + `junk`. Win32 truncates it back to `setup.bat`, a real batch file, yet
-/// `Path::extension()` reads `bat\0junk`, so `reject_batch_path` cannot see it. Without the
-/// `wide_nul` on `program`, `ShellExecuteEx` loads the batch file and substitutes `a&calc` into an
-/// elevated `cmd.exe`'s `%*` — CVE-2024-24576, through a token that passed the batch gate.
+/// The mirror shape: `setup.bat` + NUL + `junk`, which Win32 truncates back to the real batch file
+/// `setup.bat`. Both gates refuse it, so what is pinned here is WHICH one wins — the caller's
+/// defect is the NUL, and being sent to audit batch escaping instead would hide it.
 #[test]
-fn a_nul_after_a_batch_extension_is_refused_where_the_batch_gate_is_blind() {
+fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -431,10 +433,11 @@ fn a_nul_after_a_batch_extension_is_refused_where_the_batch_gate_is_blind() {
             .chain("junk".encode_utf16())
             .collect::<Vec<u16>>(),
     );
-    // The premise: the batch gate is blind to this token, so nothing but the NUL check refuses it.
+    // The premise: the batch gate would also refuse this token, so the ordering is what decides
+    // the diagnosis. Without it the assertions below would be satisfied by either check.
     assert!(
-        crate::child::spawn::reject_batch_path(std::path::Path::new(&bat_nul)).is_ok(),
-        "premise: `extension()` reads `bat\\0junk`, so the batch gate cannot refuse this"
+        crate::child::spawn::reject_batch_path(std::path::Path::new(&bat_nul)).is_err(),
+        "premise: the batch gate reads `C:\\tools\\setup.bat` and refuses it"
     );
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -453,7 +456,7 @@ fn a_nul_after_a_batch_extension_is_refused_where_the_batch_gate_is_blind() {
             }
             other => panic!(
                 "elevated={elevated}: a NUL that truncates back to a real batch file must be \
-                 refused, got {:?}",
+                 blamed on the NUL, got {:?}",
                 other.map(|_| "Ok")
             ),
         }

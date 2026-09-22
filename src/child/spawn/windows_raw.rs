@@ -307,17 +307,14 @@ pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
 pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
     let token = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     if let Some(prog) = token {
-        // NUL FIRST. `PCWSTR` stops at the first NUL, so a token like `C:\tools\setup\0.bat` is a
-        // NUL defect, not a batch one — but `Path::extension()` still reads `.bat` straight through
-        // the NUL (it is not a separator), so gating on the batch rule first blames the wrong thing
-        // and interpolates a raw U+0000 into the error string, which then reaches logs and
-        // terminals. The mirror token `C:\tools\setup.bat\0junk` has `extension() == "bat\0junk"`,
-        // which the batch rule cannot see at all, so this check is the only thing that refuses it
-        // HERE, before resolution.
+        // NUL FIRST, for attribution. `reject_batch_path` keys on the prefix Win32 truncates to, so
+        // it decides both NUL/batch shapes correctly on its own — but on `C:\tools\setup.bat\0junk`
+        // it would report the batch vector, when the caller's defect is the NUL that made a
+        // `.bat`-suffixed token load a batch file in the first place.
         //
-        // Unlike the elevated path, neither refusal is the last line of defence — resolution and
-        // the argv NUL checks below would also stop these tokens. What the ordering buys is a
-        // refusal that names the caller's actual defect instead of a downstream symptom.
+        // Neither refusal is the last line of defence here — resolution and the argv NUL checks
+        // below would also stop these tokens. What the ordering buys is a refusal that names the
+        // caller's actual defect instead of a downstream symptom.
         resolve::ensure_no_nul_wide("program token", prog.as_os_str())?;
         reject_batch_path(&prog)?;
     }

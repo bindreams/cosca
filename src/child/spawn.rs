@@ -358,11 +358,11 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
     // Program + args via the `quote` model.
-    let mut std_cmd = match cmd.input() {
+    let (program, mut std_cmd) = match cmd.input() {
         CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
         CommandInput::Argv(argv) => {
             let (program, rest) = resolve_program_argv(cmd, argv)?;
-            let mut c = std::process::Command::new(program);
+            let mut c = std::process::Command::new(&program);
             c.args(rest);
             // POSIX: when executable() overrides the loaded file, preserve the
             // user's argv[0] via arg0(). Without this, std would set argv[0] to
@@ -372,12 +372,15 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
                 use std::os::unix::process::CommandExt;
                 c.arg0(&argv[0]);
             }
-            c
+            (program, c)
         }
         CommandInput::CommandLine(line) => build_from_commandline(cmd, line)?,
     };
-    // Reject .bat/.cmd (BatBadBut) — only meaningful on Windows.
-    reject_batch_script(&std_cmd)?;
+    // Reject .bat/.cmd (BatBadBut) — only meaningful on Windows. Judged on the token WE resolved,
+    // not on `std_cmd.get_program()`: std's Unix constructor swaps a NUL-bearing program for a
+    // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
+    // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
+    reject_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
     if let Some(dir) = cmd.cwd() {
         std_cmd.current_dir(dir);
@@ -418,8 +421,13 @@ fn resolve_program_argv<'a>(
     Ok((program, rest))
 }
 
+/// The resolved program token plus the `std::process::Command` built around it. The token is
+/// returned rather than read back off the command because the two differ on Unix — see
+/// `build_std_command`'s batch gate.
+type StdProgram = (std::ffi::OsString, std::process::Command);
+
 #[cfg(unix)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<std::process::Command, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdProgram, Error> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let words = crate::quote::posix::split(line.as_bytes())?;
@@ -430,7 +438,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
     let program = resolve_program(cmd, argv[0].clone());
-    let mut c = std::process::Command::new(program);
+    let mut c = std::process::Command::new(&program);
     // When executable() overrides the loaded file, argv[0] from the command
     // line is the user's intended name — preserve it via arg0().
     if cmd.executable_path().is_some() {
@@ -438,11 +446,11 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<st
         c.arg0(&argv[0]);
     }
     c.args(&argv[1..]);
-    Ok(c)
+    Ok((program, c))
 }
 
 #[cfg(windows)]
-fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<std::process::Command, Error> {
+fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<StdProgram, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
@@ -459,19 +467,62 @@ fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<s
     let (first, rest) = crate::quote::windows::first_token_and_rest_wide(&wide)
         .ok_or_else(|| Error::Io(std::io::Error::other("empty command line")))?;
     let program = std::ffi::OsString::from_wide(&first);
-    let mut c = std::process::Command::new(program);
+    let mut c = std::process::Command::new(&program);
     c.raw_arg(std::ffi::OsString::from_wide(&rest)); // args only — program is prepended by std
-    Ok(c)
+    Ok((program, c))
 }
 
-fn reject_batch_script(std_cmd: &std::process::Command) -> Result<(), Error> {
-    reject_batch_path(std::path::Path::new(std_cmd.get_program()))
+/// The prefix Win32 acts on: everything before the first interior NUL.
+///
+/// `CreateProcessW` and `PCWSTR` stop there, so the caller's whole token is not what gets loaded.
+/// Borrowed when there is no NUL, which is every ordinary path.
+fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    use std::borrow::Cow;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = prog.as_os_str().as_bytes();
+        match bytes.iter().position(|&b| b == 0) {
+            Some(i) => Cow::Borrowed(std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..i]))),
+            None => Cow::Borrowed(prog),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let units: Vec<u16> = prog.as_os_str().encode_wide().collect();
+        match units.iter().position(|&u| u == 0) {
+            Some(i) => Cow::Owned(std::path::PathBuf::from(std::ffi::OsString::from_wide(&units[..i]))),
+            None => Cow::Borrowed(prog),
+        }
+    }
+    // Neither family has Win32 to truncate anything, and neither has cmd.exe for the gate below
+    // to protect: the token is its own prefix.
+    #[cfg(not(any(unix, windows)))]
+    {
+        Cow::Borrowed(prog)
+    }
 }
 
-/// Reject a `.bat`/`.cmd` program by its path extension. Shared by the std path
-/// (`reject_batch_script`) and the raw backend (`windows_raw::reject_batch_program`): cmd.exe
-/// batch escaping is a distinct, unimplemented vector (CVE-2024-24576 / BatBadBut).
+/// Reject a `.bat`/`.cmd` program: cmd.exe batch escaping is a distinct, unimplemented vector
+/// (CVE-2024-24576 / BatBadBut). Shared by every backend — the std path (`build_std_command`), the
+/// raw one (`windows_raw::reject_batch_program`), and the elevated `ShellExecuteEx` launch.
+///
+/// Keyed on the prefix Win32 would load, NOT on the caller's whole token, because `\0` is not a
+/// path separator and `Path::extension()` reads straight through it — reporting the INVERSE of
+/// the truth on both NUL/batch shapes:
+///
+/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, yet Win32 loads the real batch
+///   file `setup.bat`. Keying on the extension misses it.
+/// - `setup` + NUL + `.bat` → `extension() == "bat"`, yet Win32 loads `setup`, which is no batch
+///   file. Keying on the extension blames CVE-2024-24576 for a program that does not carry that
+///   vector, and interpolates a raw U+0000 into a message bound for logs and terminals.
+///
+/// Fixing that here rather than by ordering a NUL check in front of each caller is what makes the
+/// verdict uniform: the std backend — the DEFAULT Windows path — has no NUL check of its own.
+/// Pinned on any host by `spawn_tests::the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token`.
 pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
+    let prog = win32_prefix(prog);
     if let Some(ext) = prog.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {

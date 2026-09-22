@@ -215,7 +215,7 @@ fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
     child.wait().expect("reap");
 }
 
-// The batch gate's blind spot, pinned where it can RUN on any host =====
+// The batch gate reads the prefix Win32 would load =====
 
 /// An `OsString` carrying an interior NUL, built natively on either platform family (`OsStr` has
 /// no portable constructor that can express one).
@@ -236,41 +236,79 @@ fn with_interior_nul(prefix: &str, suffix: &str) -> std::ffi::OsString {
     }
 }
 
-/// The two NUL/batch shapes behave OPPOSITELY in [`super::reject_batch_path`], and both callers
-/// (`launch_runas_with_host`, `windows_raw::reject_batch_program`) order their NUL check first
-/// because of it. The gate reads `Path::extension()`, and `\0` is not a separator:
+/// `Path::extension()` of `token` — the value [`super::reject_batch_path`] must NOT key on.
+fn extension_of(token: &std::ffi::OsStr) -> Option<String> {
+    std::path::Path::new(token)
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+}
+
+/// The `op` of an `Unsupported` refusal; panics on anything else, naming what came back.
+fn unsupported_op<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+    match r {
+        Err(Error::Unsupported { op, .. }) => op,
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `\0` is not a path separator, so `Path::extension()` reads straight through it — and on both
+/// NUL/batch shapes it reports the INVERSE of what Win32 loads:
 ///
-/// - `setup` + NUL + `.bat` → `extension() == "bat"`: the gate FIRES, on a prefix (`setup`) that is
-///   not a batch file, and formats a raw U+0000 into its message.
-/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`: the gate is BLIND, even though
-///   Win32 truncates the token back to the real batch file `setup.bat`.
+/// - `setup` + NUL + `.bat` → `extension() == "bat"`, but Win32 truncates to `setup`, which is no
+///   batch file. Keying on the extension blames CVE-2024-24576 for a program that does not carry
+///   that vector, and formats a raw U+0000 into a message bound for logs and terminals.
+/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, but Win32 truncates back to the
+///   real batch file `setup.bat`.
 ///
-/// The second is why the NUL check is a control rather than a diagnostic nicety, and this test is
-/// the host-runnable half of that claim — the backend tests that consume it are Windows-only.
+/// So the gate keys on the truncated prefix, which fixes both shapes for every backend at one
+/// site — including the std backend, which has no NUL check to order in front of it.
 #[test]
-fn the_batch_gate_fires_on_one_nul_shape_and_is_blind_to_the_other() {
+fn the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token() {
     let nul_then_bat = with_interior_nul("setup", ".bat");
     let bat_then_nul = with_interior_nul("setup.bat", "junk");
 
-    assert_eq!(
-        std::path::Path::new(&nul_then_bat)
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned()),
-        Some("bat".to_owned())
-    );
+    // Premise: the extension is inverted on both shapes, which is why the gate cannot use it.
+    assert_eq!(extension_of(&nul_then_bat), Some("bat".to_owned()));
+    assert_ne!(extension_of(&bat_then_nul), Some("bat".to_owned()));
+
     assert!(
-        super::reject_batch_path(std::path::Path::new(&nul_then_bat)).is_err(),
-        "the gate must fire here — which is exactly the misattribution the NUL check preempts"
+        super::reject_batch_path(std::path::Path::new(&nul_then_bat)).is_ok(),
+        "`setup` is not a batch file; refusing it as one sends the caller to audit the wrong defect"
     );
 
-    assert_ne!(
-        std::path::Path::new(&bat_then_nul)
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned()),
-        Some("bat".to_owned())
-    );
+    let op = unsupported_op(super::reject_batch_path(std::path::Path::new(&bat_then_nul)));
     assert!(
-        super::reject_batch_path(std::path::Path::new(&bat_then_nul)).is_ok(),
-        "the gate is blind here, so only the NUL check stands between this token and cmd.exe"
+        !op.contains('\0'),
+        "the refusal must not carry a raw NUL into logs: {op:?}"
+    );
+    assert!(op.contains("setup.bat"), "the refusal must name what Win32 loads: {op}");
+}
+
+/// The std backend is the DEFAULT Windows path: `args([..])` with no `executable()` and no
+/// fd >= 3 is false for `routes_to_raw_backend`, so it reaches the batch gate through
+/// [`super::build_std_command`] with no NUL check of its own. The gate alone therefore has to get
+/// both NUL/batch shapes right here, and this drives the real entry point rather than the helper.
+#[test]
+fn the_std_backend_refuses_a_program_win32_would_truncate_back_to_a_batch_file() {
+    let mut c = Command::new();
+    c.args([with_interior_nul(r"C:\tools\setup.bat", "junk")]);
+    let op = unsupported_op(super::build_std_command(&c));
+    assert!(
+        !op.contains('\0'),
+        "the refusal must not carry a raw NUL into logs: {op:?}"
+    );
+}
+
+/// The mirror shape on the same default path: the std backend must not tell the caller to audit
+/// batch escaping for `C:\tools\setup`, which is what Win32 would load and is not a batch file.
+/// Asserted as "not the batch refusal" rather than as an `Ok`, because on Windows std's own
+/// wide-string conversion refuses the interior NUL a step later.
+#[test]
+fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
+    let mut c = Command::new();
+    c.args([with_interior_nul(r"C:\tools\setup", ".bat")]);
+    assert!(
+        !matches!(super::build_std_command(&c), Err(Error::Unsupported { .. })),
+        "the truncated prefix is not a batch file, so the batch vector is the wrong diagnosis"
     );
 }

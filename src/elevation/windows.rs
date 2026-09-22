@@ -360,16 +360,14 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
     // already elevated — the exact "depends which path ran" divergence these checks exist to
     // remove. It also costs nothing: none of this depends on what the planner decides.
 
-    // `program`'s NUL check is a SECURITY CONTROL, and for one shape it is the ONLY one. A token
-    // `setup.bat` + NUL + `junk` truncates in Win32 back to `setup.bat` — a REAL batch file — but
-    // `Path::extension()` reads `bat\0junk`, so `reject_batch_path` below never fires on it. Drop
-    // this line and that token reaches `ShellExecuteEx`, which loads the batch file and hands
-    // `a&calc` to an elevated cmd.exe.
+    // `program`'s NUL check is a SECURITY CONTROL, and it is the ONLY one for every token whose
+    // truncated prefix is not a batch file: `C:\tools\setup` + NUL + `.bat` launches
+    // `C:\tools\setup` elevated, a different program than the caller named, and the batch gate
+    // below — which reads that same prefix — has nothing to say about it.
     //
-    // Running it BEFORE the batch gate additionally fixes the mirror shape: `C:\tools\setup` + NUL
-    // + `.bat` has `extension() == "bat"`, so the gate would blame CVE-2024-24576 for a prefix that
-    // is not a batch file, and would interpolate a raw U+0000 into an error bound for logs and
-    // terminals.
+    // For the mirror shape `setup.bat` + NUL + `junk` the gate would refuse, so what running the
+    // NUL check FIRST buys there is attribution: the caller's defect is the NUL, not batch
+    // escaping.
     let file_w = wide_nul("program path", program.as_os_str())?;
 
     // Refuse a `.bat`/`.cmd` SPELLED IN THE CALLER'S TOKEN. `ShellExecuteEx`'s `runas` resolves the
