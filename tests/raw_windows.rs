@@ -103,6 +103,9 @@ fn embedded_nul_in_commandline_is_rejected() {
         .spawn()
         .unwrap_err();
     assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
+    // The refusal must name the command line. One NUL checker serves every wide string the backend
+    // builds, so a message fixed to the environment would send the caller to audit `env()`.
+    assert!(e.to_string().contains("command line"), "{e}");
 }
 
 /// An embedded NUL in the working directory is rejected the same way (it would truncate the
@@ -113,7 +116,9 @@ fn embedded_nul_in_cwd_is_rejected() {
     c.executable(common::testbin())
         .commandline("x argv0-report")
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
-    assert!(matches!(c.spawn().unwrap_err(), cosca::error::Error::Io(_)));
+    let e = c.spawn().unwrap_err();
+    assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
+    assert!(e.to_string().contains("working directory"), "{e}");
 }
 
 /// A `.bat`/`.cmd` reached via `executable()` is rejected BEFORE resolution (CVE-2024-24576): a
@@ -129,6 +134,46 @@ fn batch_script_via_executable_is_unsupported() {
         .spawn()
         .unwrap_err();
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
+}
+
+/// End-to-end proof of the gate's ORDERING, through `spawn()` rather than the gate alone. A token
+/// carrying an interior NUL must come back as the NUL whichever side of the batch rule it falls:
+///
+/// - `x` + NUL + `.bat` has `extension() == "bat"`, so without the NUL-first ordering the batch gate
+///   claims it — CVE-2024-24576 for a prefix that is not a batch file.
+/// - `x.bat` + NUL + `junk` has `extension() == "bat\0junk"`, so the batch gate is blind and,
+///   without the NUL check, the refusal degrades to resolution's `NotFound`.
+///
+/// Both refusals precede resolution, so nothing is spawned and no batch file need exist.
+#[test]
+fn a_nul_bearing_program_token_is_refused_as_a_nul_on_either_side_of_the_batch_rule() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let nul_token = |prefix: &str, suffix: &str| {
+        OsString::from_wide(
+            &prefix
+                .encode_utf16()
+                .chain([0])
+                .chain(suffix.encode_utf16())
+                .collect::<Vec<u16>>(),
+        )
+    };
+
+    for token in [nul_token(r"C:\tools\x", ".bat"), nul_token(r"C:\tools\x.bat", "junk")] {
+        let e = cosca::Command::new()
+            .executable(&token)
+            .commandline("x")
+            .spawn()
+            .unwrap_err();
+        match e {
+            cosca::error::Error::Io(ref io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput, "{e:?}");
+                assert!(io.to_string().contains("program token"), "{e}");
+            }
+            other => panic!("a NUL-bearing program token must be refused as a NUL, got {other:?}"),
+        }
+    }
 }
 
 // Raw backend, sync fd >= 3 via the MSVCRT lpReserved2 table (Plan 12 Task 5) =====

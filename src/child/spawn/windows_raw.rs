@@ -65,10 +65,10 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .map(|p| resolve::resolve_executable(&p, cmd.cwd(), cmd.env_ops()))
         .transpose()?;
     if let Some(p) = &image {
-        resolve::ensure_no_nul_wide(p.as_os_str())?;
+        resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
     }
     if let Some(c) = cmd.cwd() {
-        resolve::ensure_no_nul_wide(c.as_os_str())?;
+        resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
     }
     let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
@@ -360,6 +360,11 @@ pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
 pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
     let token = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     if let Some(prog) = token {
+        // `reject_batch_path` refuses an interior NUL itself, ahead of its own batch rule (see its
+        // doc), so this check no longer decides the ORDER — it decides the WORDING. The raw
+        // backend names its fields "program token", "argument 0", "environment key"; the shared
+        // gate can only say "program path". `tests/raw_windows.rs` pins that vocabulary.
+        resolve::ensure_no_nul_wide("program token", prog.as_os_str())?;
         reject_batch_path(&prog)?;
     }
     Ok(())
@@ -405,15 +410,19 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
                 return Err(Error::Io(std::io::Error::other("empty argv")));
             }
             let mut wides: Vec<Vec<u16>> = Vec::with_capacity(argv.len());
-            for a in argv {
-                resolve::ensure_no_nul_wide(a)?;
+            // Named by argv index: the command line is one joined string, so an unindexed label
+            // would leave the caller to find which of `args([..])` carried the NUL. Index 0 is
+            // argv[0] even when `executable()` names the loaded image — that token is checked
+            // separately, as the "program token".
+            for (i, a) in argv.iter().enumerate() {
+                resolve::ensure_no_nul_wide(&format!("argument {i}"), a)?;
                 wides.push(a.encode_wide().collect());
             }
             let refs: Vec<&[u16]> = wides.iter().map(Vec::as_slice).collect();
             Ok(crate::quote::windows::join_wide(&refs))
         }
         CommandInput::CommandLine(line) => {
-            resolve::ensure_no_nul_wide(line)?;
+            resolve::ensure_no_nul_wide("command line", line)?;
             // Mirrors the `Empty`/`Argv` arms above: with no `executable()` set, `program_token`
             // (and therefore `lpApplicationName`) depends on THIS line having a usable first
             // token. `first_token_wide` is documented to return `None` for an empty or
@@ -429,6 +438,7 @@ pub(crate) fn raw_program_and_line(cmd: &Command) -> Result<Vec<u16>, Error> {
                     )));
                 }
             }
+
             Ok(line.encode_wide().collect())
         }
     }

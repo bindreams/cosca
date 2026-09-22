@@ -390,3 +390,36 @@ fn embedded_nul_in_key_is_rejected_as_invalid_input() {
         "{e:?}"
     );
 }
+
+/// The NUL refusal must name WHICH field carried it. One checker serves the environment block, the
+/// program token, the working directory and every argv token, so a message fixed to "environment
+/// key or value" reports a NUL in a PROGRAM PATH as a broken environment.
+#[test]
+fn a_nul_refusal_names_the_field_that_carried_it() {
+    let key = build_env_block_from(&[], &[EnvOp::Set(OsString::from("a\u{0}b"), "1".into())]).unwrap_err();
+    assert!(key.to_string().contains("environment key"), "{key}");
+
+    let val = build_env_block_from(&[], &[EnvOp::Set("K".into(), OsString::from("a\u{0}b"))]).unwrap_err();
+    assert!(val.to_string().contains("environment value"), "{val}");
+
+    // The `what` really is the caller's, not a constant the two legs above happen to share.
+    let other = ensure_no_nul_wide("program token", OsStr::new("a\u{0}b")).unwrap_err();
+    assert!(other.to_string().contains("program token"), "{other}");
+    assert!(
+        !other.to_string().contains("environment"),
+        "a program token is not the environment: {other}"
+    );
+}
+
+/// [`debug_assert_no_nul_wide`] promises to fail LOUDLY the moment resolution grows a return that
+/// is not `is_file`-gated. An assert nobody fires is indistinguishable from an assert whose
+/// condition was inverted or dropped, so the promise is worth a probe of its own.
+///
+/// `debug_assertions`-only: the assert is compiled out of a release build by design, so in CI's
+/// `--release --lib` leg the expected panic would never arrive and a working crate would go red.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "program image contains an embedded NUL")]
+fn debug_assert_no_nul_wide_panics_on_an_embedded_nul() {
+    debug_assert_no_nul_wide("program image", OsStr::new("a\u{0}b"));
+}

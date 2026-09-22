@@ -265,10 +265,10 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), cmd.env_ops()))
         .transpose()?;
     if let Some(p) = &image {
-        sync_raw::resolve::ensure_no_nul_wide(p.as_os_str())?;
+        sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
     }
     if let Some(c) = cmd.cwd() {
-        sync_raw::resolve::ensure_no_nul_wide(c.as_os_str())?;
+        sync_raw::resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
     }
     let mut cmdline = sync_raw::raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);

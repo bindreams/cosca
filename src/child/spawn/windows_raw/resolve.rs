@@ -247,8 +247,8 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
         block.push(0);
     }
     for (key, val) in vars.values() {
-        ensure_no_nul_wide(key)?;
-        ensure_no_nul_wide(val)?;
+        ensure_no_nul_wide("environment key", key)?;
+        ensure_no_nul_wide("environment value", val)?;
         block.extend(key.encode_wide());
         block.push(u16::from(b'='));
         block.extend(val.encode_wide());
@@ -258,16 +258,41 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
     Ok(Some(block))
 }
 
-/// Reject a key or value carrying an embedded NUL, which would truncate the
-/// wide, NUL-delimited environment block.
-pub(crate) fn ensure_no_nul_wide(s: &OsStr) -> Result<(), Error> {
+/// Reject a string carrying an embedded NUL, which Win32 would silently truncate at.
+///
+/// Serves every wide string built out of CALLER INPUT on either Windows launch path: the raw
+/// backend's environment block, program token, working directory, argv tokens and command line,
+/// and the elevated `SHELLEXECUTEINFOW`'s fields (via `elevation::windows::wide_nul`). `what`
+/// names the offending field, so the refusal does not blame one caller's field for another's
+/// defect. Shared rather than restated per path — the predicate and the sentence are the same, and
+/// two copies of them drifted apart once already.
+///
+/// The one wide string that is not caller input is the resolved program image; see
+/// [`debug_assert_no_nul_wide`].
+pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
     if s.encode_wide().any(|unit| unit == 0) {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "environment key or value contains an embedded NUL",
+            format!("the {what} contains an embedded NUL, which Win32 would silently truncate"),
         )));
     }
     Ok(())
+}
+
+/// Assert the same property of a wide string the crate PRODUCED rather than received.
+///
+/// [`resolve_executable`] is the only such producer, and it cannot yield a NUL: every one of its
+/// returns is gated on [`Path::is_file`], which goes through `fs::metadata` and so is false for
+/// any path Win32 cannot encode. A NUL here would therefore be a broken contract in resolution,
+/// not a caller defect — and refusing it at runtime advertises a caller-facing vector that does
+/// not exist, sending a reader to audit an input they do not control. Asserted instead, so it
+/// still fails loudly in every debug build the moment resolution grows a return that is not
+/// `is_file`-gated.
+pub(crate) fn debug_assert_no_nul_wide(what: &str, s: &OsStr) {
+    debug_assert!(
+        !s.encode_wide().any(|unit| unit == 0),
+        "the {what} contains an embedded NUL, which Win32 would silently truncate"
+    );
 }
 
 /// Case-fold an environment key for case-insensitive comparison and sorting.

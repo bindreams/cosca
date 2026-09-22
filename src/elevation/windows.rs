@@ -220,6 +220,7 @@ use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
 use crate::child::proc_handle::ProcHandle;
+use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
 use crate::command::CommandInput;
 use crate::containment::Attachment;
@@ -231,8 +232,37 @@ use crate::identity::ProcessId;
 /// `ERROR_CANCELLED` (1223) as an HRESULT (0x800704C7) — the UAC-declined code.
 const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x800704C7_u32 as i32);
 
-fn wide_nul(s: &OsStr) -> Vec<u16> {
-    s.encode_wide().chain(std::iter::once(0)).collect()
+/// A NUL-terminated wide string for a `SHELLEXECUTEINFOW` field, REFUSING an interior NUL.
+///
+/// `PCWSTR` stops at the first NUL, so a value containing one is silently TRUNCATED rather than
+/// rejected — and every field here decides something security-relevant:
+///
+/// - `lpFile` truncated at the NUL would load a DIFFERENT FILE than the caller named, elevated.
+/// - `lpDirectory` would run the elevated child somewhere other than `current_dir()` asked for.
+/// - `lpParameters` would drop everything after the NUL, silently shortening the argument line an
+///   elevated program acts on.
+///
+/// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
+/// closes the interior-NUL divergence between the elevated and unelevated paths. A separate,
+/// still-open divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse —
+/// both by an extension this gate never sees (PATHEXT completion of an extension-less token) and
+/// by other registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). See the
+/// batch gate below; neither is closed here.
+///
+/// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
+/// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
+/// `lpParameters` is additionally checked per argv ELEMENT by [`ensure_no_nul_wide`] before the
+/// join, because by the time it is one string the refusal can no longer say which `args([..])`
+/// entry carried the NUL; the check here stays as the field's own, so removing that loop cannot
+/// open an unchecked sink.
+///
+/// The predicate and its message come from the raw `CreateProcessW` backend rather than being
+/// restated here. Two copies of one sentence is exactly how the wording drifted apart before —
+/// "elevated program path" against "program path" — over a defect neither backend describes
+/// differently.
+fn wide_nul(what: &str, s: &OsStr) -> Result<Vec<u16>, Error> {
+    ensure_no_nul_wide(what, s)?;
+    Ok(s.encode_wide().chain(std::iter::once(0)).collect())
 }
 
 /// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
@@ -279,15 +309,23 @@ impl Drop for ComInit {
     }
 }
 
-/// Program (loaded image) + the joined parameter line. Honors `executable()`; an
-/// argv[0] distinct from a set `executable()` cannot be preserved by runas.
-fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
-    let CommandInput::Argv(argv) = cmd.input() else {
-        return Err(Error::Unsupported {
-            op: "elevation of a commandline() command".into(),
-            platform: "windows",
-            detail: "runas elevation requires an argv command (set .args([...]))".into(),
-        });
+/// The argv runas can work from at all. Split from [`elevated_program`] and [`elevated_params`] so
+/// the program's NUL check can sit between them — see [`plan_runas`].
+fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
+    // Matched variant by variant rather than through a catch-all `else`: `Empty` is not a
+    // `commandline()` command, and `Command::new().executable("x.exe").elevate()` told that it had
+    // elevated one is sent to audit a builder call its code never makes. It wants the same
+    // "no program" refusal the empty-argv case below already returns.
+    let argv: &[OsString] = match cmd.input() {
+        CommandInput::Argv(argv) => argv,
+        CommandInput::Empty => &[],
+        CommandInput::CommandLine(_) => {
+            return Err(Error::Unsupported {
+                op: "elevation of a commandline() command".into(),
+                platform: "windows",
+                detail: "runas elevation requires an argv command (set .args([...]))".into(),
+            })
+        }
     };
     if argv.is_empty() {
         return Err(Error::Unsupported {
@@ -296,7 +334,13 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
             detail: "set a program via .args([...]) before .elevate()".into(),
         });
     }
-    let program = match cmd.executable_path() {
+    Ok(argv)
+}
+
+/// The loaded image. Honors `executable()`; an argv[0] distinct from a set `executable()` cannot
+/// be preserved by runas.
+fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error> {
+    match cmd.executable_path() {
         Some(exe) => {
             if argv[0].as_os_str() != exe.as_os_str() {
                 return Err(Error::Unsupported {
@@ -305,32 +349,110 @@ fn program_and_params(cmd: &Command) -> Result<(OsString, OsString), Error> {
                     detail: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image".into(),
                 });
             }
-            exe.as_os_str().to_os_string()
+            Ok(exe.as_os_str().to_os_string())
         }
-        None => argv[0].clone(),
-    };
-    let tail_wide: Vec<Vec<u16>> = argv[1..].iter().map(|a| a.encode_wide().collect()).collect();
+        None => Ok(argv[0].clone()),
+    }
+}
+
+/// The joined `lpParameters` line, NUL-checked per element BEFORE the join: `lpParameters` is one
+/// string, so a refusal built from it could only say that SOME element carried a NUL.
+fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
+    let mut tail_wide: Vec<Vec<u16>> = Vec::with_capacity(argv.len() - 1);
+    for (i, a) in argv.iter().enumerate().skip(1) {
+        ensure_no_nul_wide(&format!("argument {i}"), a)?;
+        tail_wide.push(a.encode_wide().collect());
+    }
     let tail_refs: Vec<&[u16]> = tail_wide.iter().map(|v| v.as_slice()).collect();
-    let joined = crate::quote::windows::join_wide(&tail_refs);
-    Ok((program, OsString::from_wide(&joined)))
+    Ok(OsString::from_wide(&crate::quote::windows::join_wide(&tail_refs)))
 }
 
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
-pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
+pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
 }
 
-/// PURE given `host` (the Windows gate seam): gate, plan, then ShellExecuteEx(runas).
-pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error> {
+/// The validated `SHELLEXECUTEINFOW` payload: every string field, NUL-terminated, plus the show
+/// command. Built only when a consent prompt is actually warranted.
+pub(crate) struct RunasLaunch {
+    file_w: Vec<u16>,
+    params_w: Vec<u16>,
+    dir_w: Option<Vec<u16>>,
+    verb_w: Vec<u16>,
+    show: windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD,
+}
+
+/// What the launch will do, decided with no effect whatsoever.
+pub(crate) enum RunasStep {
+    AlreadyElevated,
+    Launch(Box<RunasLaunch>),
+}
+
+/// PURE given `host` (the Windows gate seam): every config gate, every input check, and the
+/// planner decision — and NOTHING that touches the system.
+///
+/// Split out from the launch so the unit tests can drive it. They probe what happens when a check
+/// is removed, and a test that drove `launch_runas_with_host` instead would, on the unelevated
+/// leg of that hypothetical, fall through the planner and issue a REAL `ShellExecuteExW` with
+/// verb `runas` — raising a UAC prompt and elevating the probe program on the developer's own
+/// machine. Returning the decision instead makes that outcome unreachable from a test.
+pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error> {
     let req = cmd.elevation_request();
     let (backend, auth) = (req.backend, req.auth.clone());
     // Structural config gate FIRST — privilege-independent (before the short-circuit), so
     // an already-elevated caller gets the same verdict for piped/env/contain/commandline.
     reject_unsupported_config(cmd)?;
-    let (program, params) = program_and_params(cmd)?; // validates commandline()/argv0 too
+    let argv = elevated_argv(cmd)?; // validates commandline()/empty argv too
+    let program = elevated_program(cmd, argv)?;
+
+    // Input validation stays with `reject_unsupported_config`, ABOVE the short-circuit, so every
+    // verdict here is a property of the REQUEST rather than of the caller's ambient privilege.
+    // Putting it below would make the same `Command` refused when unelevated and accepted when
+    // already elevated — the exact "depends which path ran" divergence these checks exist to
+    // remove.
+
+    // Ahead of EVERY other field's check, including the per-element argv loop, because this is the
+    // field that decides which image runs ELEVATED: `C:\tools\setup` + NUL + `.bat` launches
+    // `C:\tools\setup`, a program the caller never named, and a request poisoning the program and
+    // an argument together would otherwise come back naming only `argument 1`. `reject_batch_path`
+    // below refuses an interior NUL too, but it runs after those fields, so this ordering is the
+    // elevated path's own.
+    let file_w = wide_nul("program path", program.as_os_str())?;
+
+    // Then EVERY remaining field, and only then the batch gate: a truncating argument or working
+    // directory is a defect the caller can fix, and "batch escaping is not implemented" would hide
+    // it — a clean `.bat` next to a poisoned `current_dir()` would never mention that `lpDirectory`
+    // truncates too. `params` is checked per element, by index, inside `elevated_params`.
+    let params = elevated_params(argv)?;
+    let dir = cmd
+        .cwd()
+        .map(|d| wide_nul("working directory", d.as_os_str()))
+        .transpose()?;
+    let params_w = wide_nul("argument line", params.as_os_str())?;
+    let verb_w = wide_nul("verb", OsStr::new("runas"))?;
+
+    // Refuse a `.bat`/`.cmd` SPELLED IN THE CALLER'S TOKEN. `ShellExecuteEx`'s `runas` resolves the
+    // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into `%*`
+    // UNESCAPED — and `join_wide` quotes only for whitespace, never for cmd metacharacters, so
+    // `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED cmd.exe. That is
+    // CVE-2024-24576, which the raw and std backends both refuse outright.
+    //
+    // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE. It therefore does NOT
+    // close the batch vector. Two of the open surfaces are `wide_nul`'s doc's to name — PATHEXT
+    // completion of an extension-less token, and the other registered `runas` associations. Each
+    // lands in a later PR: resolution makes the completion ours (`resolve_executable_in` never
+    // reads PATHEXT), and an extension allowlist covers the associations.
+    //
+    // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
+    // resolves the token as a path, so `setup.bat.`, `setup.bat ` and `C:\tools\.bat` all reach the
+    // same batch file while `Path::extension()` reads `None` or something that is not `bat`. That
+    // class is closed by the batch-gate PR merging immediately before this one, which replaces the
+    // `Path::extension()` reading with a byte-level effective-name computation. NOTHING IN THIS
+    // TREE closes it: until that merge lands, do not read the gate below as covering it.
+    crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
-        Transition::RunAsIs => return Ok(RunasOutcome::AlreadyElevated),
+        Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
         Transition::Reject { error } => return Err(error),
         Transition::ElevatePosix { .. } => unreachable!("planner never yields ElevatePosix on a windows host"),
         Transition::ElevateMacosGui { .. } => {
@@ -339,10 +461,29 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         Transition::ElevateWindows { .. } => {}
     }
 
-    let dir = cmd.cwd().map(|d| wide_nul(d.as_os_str()));
-    let file_w = wide_nul(program.as_os_str());
-    let params_w = wide_nul(params.as_os_str());
-    let verb_w = wide_nul(OsStr::new("runas"));
+    Ok(RunasStep::Launch(Box::new(RunasLaunch {
+        file_w,
+        params_w,
+        dir_w: dir,
+        verb_w,
+        show: runas_show_command(cmd.flags_request()),
+    })))
+}
+
+/// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
+/// the child it launched. Everything that could refuse the request happened in [`plan_runas`].
+pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<RunasOutcome, Error> {
+    let launch = match plan_runas(cmd, host)? {
+        RunasStep::AlreadyElevated => return Ok(RunasOutcome::AlreadyElevated),
+        RunasStep::Launch(launch) => launch,
+    };
+    let RunasLaunch {
+        file_w,
+        params_w,
+        dir_w,
+        verb_w,
+        show,
+    } = *launch;
 
     let com = ComInit::init()?;
     // SAFETY: `info` is fully initialized with the correct cbSize; the wide buffers
@@ -354,8 +495,8 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
             lpVerb: PCWSTR(verb_w.as_ptr()),
             lpFile: PCWSTR(file_w.as_ptr()),
             lpParameters: PCWSTR(params_w.as_ptr()),
-            lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
-            nShow: runas_show_command(cmd.flags_request()).0,
+            lpDirectory: dir_w.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+            nShow: show.0,
             ..Default::default()
         };
         ShellExecuteExW(&mut info).map_err(|e| {
@@ -415,7 +556,7 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
 }
 
 pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error> {
-    match launch_runas(cmd)? {
+    match launch_runas(&*cmd)? {
         RunasOutcome::AlreadyElevated => {
             let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
             child.set_elevation(Some(crate::elevation::already_elevated_report(

@@ -35,7 +35,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         #[cfg(windows)]
         {
             use crate::elevation::windows::{launch_runas, RunasOutcome};
-            match launch_runas(cmd)? {
+            match launch_runas(&*cmd)? {
                 RunasOutcome::Launched { proc, pid, id, report } => {
                     let raw = windows_raw::RawAsyncChild::new_runas(proc, pid);
                     let mut child = Child::from_parts(
