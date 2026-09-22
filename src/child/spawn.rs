@@ -1141,7 +1141,7 @@ mod batch_gate;
 pub(crate) use batch_gate::reject_batch_path;
 #[cfg(test)]
 use batch_gate::{
-    is_batch_by_shell, is_batch_program, ntfs_stream_names, reject_batch_path_on, win32_effective_file_name,
+    is_batch_by_shell, is_batch_program, ntfs_stream_names, reject_batch_path_on, win32_effective_file_name, Interior,
 };
 
 // Windows raw `CreateProcessW` spawn backend.
