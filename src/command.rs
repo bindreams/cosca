@@ -236,8 +236,7 @@ impl Command {
     /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
     /// unresolved.
     ///
-    /// This and [`raw_executable`](Self::raw_executable) are alternatives on one field: calling
-    /// either replaces the other, and the last call wins.
+    /// See [`raw_executable`](Self::raw_executable) for how the two setters combine.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Search(path.into()));
         self
