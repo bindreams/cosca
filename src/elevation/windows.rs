@@ -443,15 +443,14 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // `runas` associations (see `wide_nul`'s doc). The image allowlist below the planner closes
     // both on the consent path, for every arm.
     //
-    // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
-    // resolves the token as a path, so `setup.bat.`, `setup.bat ` (one trailing space) and
-    // `C:\tools\.bat` all reach a batch file while `Path::extension()` reads `None` or something
-    // that is not `bat`. `reject_normalised_batch_path` refuses all three, as `image_for` does for
-    // the raw backend's unelevated `raw_executable()`. On the `Exact` arm `program` IS Win32's
-    // normalisation. On the others it is the token as written, and for a token the allowlist
-    // admits the two agree on the final component: one ending in `.exe`/`.com` has no trailing
-    // dot or space to strip. It is still the only batch gate that reads a stream piece
-    // (`setup.bat:.exe`).
+    // The third is token NORMALIZATION before the load, and the gate below does close it: it
+    // judges the name Win32 resolves the token to rather than `Path::extension()`, so trailing dots
+    // and spaces (`setup.bat.`, `setup.bat `), a leading-dot name (`C:\tools\.bat`), `..` collapse
+    // (`setup.bat\x\..`), a batch-named UNC share, and a data-stream piece (`x.exe:p.bat`) are all
+    // refused. What stays open is only what ShellExecuteEx finds by LOOKUP rather than by reading
+    // the token — the two surfaces above, plus an App Paths registration of a bare name — and the
+    // verbatim stream spellings (`\\?\C:\x.bat:s`, `\\?\C:\x.bat::$DATA`), which the gate accepts
+    // and whose handling by ShellExecuteEx is unmeasured (see `batch_gate::verbatim_refusal`).
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
     crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
 
