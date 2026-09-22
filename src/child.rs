@@ -405,6 +405,10 @@ impl Child {
     /// whatever `kill_on_drop` says. `disarm()` does that — it clears `KILL_ON_JOB_CLOSE` on a
     /// Job Object, and stops a cgroup leaf's `Drop` firing `cgroup.kill` — so the tree keeps
     /// running after `detach` under every mechanism.
+    ///
+    /// Under [`Containment::CgroupV2`](crate::Containment::CgroupV2) the detached tree keeps
+    /// its cgroup leaf, and cosca never revisits one: that empty `cosca-*` directory stays
+    /// until something else removes it.
     pub fn detach(mut self) {
         self.attached.disarm();
         self.kill_on_drop = false;

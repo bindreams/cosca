@@ -26,6 +26,11 @@ use std::fmt;
 #[non_exhaustive]
 pub enum Containment {
     /// Linux cgroup v2 leaf + `cgroup.kill`. Fork-proof; a confined child can't leave.
+    ///
+    /// The leaf directory is removed when the handle tears the tree down. A tree that outlives
+    /// its handle — [`Child::detach`](crate::Child::detach), or
+    /// [`kill_on_drop(false)`](crate::Command::kill_on_drop) — keeps it, and cosca never
+    /// revisits a leaf, so that empty `cosca-*` cgroup stays until something else removes it.
     CgroupV2,
     /// Windows Job Object + `KILL_ON_JOB_CLOSE`. Kernel-enforced for direct descendants.
     JobObject,

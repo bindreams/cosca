@@ -492,6 +492,11 @@ impl Command {
     ///
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
+    ///
+    /// **Opting out of a [`CgroupV2`](crate::Containment::CgroupV2) teardown leaves a cgroup
+    /// directory behind.** The leaf is removed by the teardown this opts out of, and nothing —
+    /// cosca or any cgroup manager — comes back for one, so a supervisor that opts out per
+    /// spawn accumulates one empty `cosca-*` cgroup per contained child.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self
