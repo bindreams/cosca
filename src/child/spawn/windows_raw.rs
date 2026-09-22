@@ -333,9 +333,7 @@ pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<Pa
     match cmd.executable_spec() {
         Some(ExecutableSpec::Search(p)) => Ok(Some(resolve::resolve_executable(p, cmd.cwd(), path)?)),
         Some(ExecutableSpec::Exact(p)) => {
-            // For its refusals only — the elevated sink's shape checks, before and after Win32
-            // normalisation, so both sinks agree on what names no file. The completed path is
-            // discarded: `lpApplicationName` gets the caller's token for the loader to complete.
+            // For its refusals only; see `absolutise_exact`'s doc.
             resolve::absolutise_exact(p)?;
             Ok(Some(p.to_path_buf()))
         }
