@@ -1407,3 +1407,33 @@ fn spawn_with_slot_closed(slot: Option<i32>) {
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must kill the worker");
 }
+
+/// Once a spawn has returned, the supervisor holds no descriptor for the child's leaf
+/// `cgroup.procs`: it is needed only for the child's own placement write, and one held per
+/// live child would spend the supervisor's fd limit on children it no longer needs it for.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
+    stderr_log::install();
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    let (child, mut gc_stream) = spawn_contained_tree();
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+
+    // The root is alive (it holds its control socket), so its cgroup is readable.
+    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
+    let procs = format!("{}/cgroup.procs", unified_cgroup(&cgroup));
+    let held: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .expect("list this process's fds")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .map(|target| target.to_string_lossy().into_owned())
+        .filter(|target| target.ends_with(&procs))
+        .collect();
+    assert!(held.is_empty(), "the supervisor still holds {held:?}");
+
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    let mut buf = [0u8; 1];
+    assert_eq!(gc_stream.read(&mut buf).expect("read the grandchild's socket"), 0);
+}

@@ -589,13 +589,13 @@ fn attach_tree(
                 }
 
                 // Strongest: cgroup v2 if available, else process group.
-                if let Some(leaf) = prepared.cgroup_leaf {
+                if let Some(mut leaf) = prepared.cgroup_leaf {
                     // The pre_exec write can fail (EBUSY — the "no internal processes" rule
                     // when the supervisor is itself an undelegated leaf). The child's own
                     // report of that write decides membership; re-reading cgroup.procs cannot,
                     // because it lists only live tasks and a placed child may already have
-                    // exited.
-                    match leaf.placement_of(raw_pid) {
+                    // exited. Taking the verdict releases the leaf's fd and report page.
+                    match leaf.take_placement(raw_pid) {
                         Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
                         // The child never entered the leaf, so nothing it forks did either. The
                         // process group set pre-spawn is the real container; the leaf is

@@ -237,7 +237,7 @@ impl fmt::Display for NotEntered {
 
 /// Why a spawned child is not in its leaf, with every fact the diagnosis rests on.
 ///
-/// The child's own report decides membership (see [`CgroupLeaf::placement_of`]).
+/// The child's own report decides membership (see [`CgroupLeaf::take_placement`]).
 /// `cgroup.procs` and the child's `/proc` state are read only to diagnose a child that
 /// reported no successful write.
 #[derive(Debug)]
@@ -438,7 +438,7 @@ pub(crate) fn report_level<C: Ord>(seen: &Mutex<BTreeSet<C>>, condition: C) -> l
 #[cfg(target_os = "linux")]
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
-use std::os::fd::{IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -532,20 +532,19 @@ const REPORT_PLACED: i32 = -1;
 /// **One slot per LEAF, not per child.** The page belongs to the `CgroupLeaf`, and a production
 /// spawn creates one leaf per child, so leaf and child coincide there. A caller that routes
 /// several children through ONE leaf gets one slot for all of them, and the last store wins —
-/// `placement_of` would then attribute the last child's outcome to whichever pid it was asked
+/// `take_placement` would then attribute the last child's outcome to whichever pid it was asked
 /// about. Give each child its own [`ReportPage`] rather than sharing a leaf's.
 ///
 /// # What this costs, and what it can cost a spawn
-/// One `mmap` per contained spawn, held for the contained child's whole lifetime: the kernel
-/// rounds the 4-byte length up to a page, so a live contained child holds **4 KiB of resident
-/// memory and one VMA** in the supervisor.
+/// One `mmap` per contained spawn — the kernel rounds the 4-byte length up to a page, so 4 KiB
+/// and one VMA — held from the leaf's creation until `attach` takes the placement verdict, and
+/// unmapped there along with the leaf's `cgroup.procs` fd. A live contained child costs the
+/// supervisor neither; only spawns in flight do.
 ///
-/// The VMA, not the memory, is the ceiling. `vm.max_map_count` defaults to 65530 mappings per
-/// process, and every live contained child spends one of them, so a supervisor holding tens of
-/// thousands of contained children at once approaches a limit this mechanism introduced. At
-/// that point `mmap` fails with `ENOMEM` and the spawn DEGRADES — it keeps its process group
-/// and loses the fork-proof kill — rather than failing, which makes exhaustion quiet: weaker
-/// containment, not an error. `LeafError::MapReportPage` is what makes it audible at all.
+/// A mapping that cannot be made (`ENOMEM`, or `vm.max_map_count` exhausted by something else)
+/// DEGRADES the spawn — it keeps its process group and loses the fork-proof kill — rather than
+/// failing it, which makes it quiet: weaker containment, not an error.
+/// `LeafError::MapReportPage` is what makes it audible at all.
 ///
 /// **Not a race.** The child stores its outcome strictly before `exec`, and `std`'s Unix
 /// spawn does not return to the parent until the child has exec'd (it reads the child's
@@ -632,10 +631,10 @@ pub(crate) struct ReportSlot {
 // of the single spawn the owning `CgroupLeaf` was created for. The leaf, and so the mapping, is
 // alive across all of that.
 //
-// The closure can OUTLIVE the mapping: on the spawn-FAILURE path in `child::spawn`, `Prepared`
-// (and with it the leaf's `munmap`) drops before the `Command` that still owns the closure. The
-// pointer dangles from then on, which is sound only because nothing ever invokes the closure
-// again — a `Command` whose spawn failed runs no further `pre_exec`.
+// The closure can OUTLIVE the mapping: `attach` unmaps it once the spawn has returned, and on the
+// spawn-FAILURE path `Prepared` (and with it the leaf's `munmap`) drops first — both before the
+// `Command` that still owns the closure. The pointer dangles from then on, which is sound only
+// because nothing ever invokes the closure again: each `Command` is spawned once.
 //
 // `Sync` as well as `Send` because `Command::pre_exec` requires both of its closure, and an
 // atomic store adds no unsynchronized access when shared across threads.
@@ -678,30 +677,45 @@ impl ReportSlot {
 /// rule), the closure returns an error and the spawn falls back to the
 /// process-group mechanism.
 ///
-/// `Drop` closes the parent's `procs_fd` and removes the leaf directory. If the leaf is still
-/// occupied, it fires `cgroup.kill` and retries — but only if the child reported entering it.
+/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report page: the child
+/// needs them only until its `exec`.
+///
+/// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill` and
+/// retries — but only if the child reported entering it.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
     leaf_path: PathBuf,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
     /// between `fork` and `exec`, and no program this process starts may inherit it. Numbered
-    /// 3 or above, so it never shares a number with the child's stdio.
-    procs_fd: RawFd,
-    /// Where the forked child reports whether its self-placement write succeeded.
-    report: ReportPage,
+    /// 3 or above, so it never shares a number with the child's stdio. `None` once the
+    /// placement verdict is taken.
+    procs_fd: Option<OwnedFd>,
+    /// Where the forked child reports whether its self-placement write succeeded. `None` once
+    /// the placement verdict is taken.
+    report: Option<ReportPage>,
+    /// Whether the child reported entering the leaf, recorded when `report` is released.
+    entered: bool,
 }
 
-// Safety: RawFd is an integer. CgroupLeaf is not Clone; the fd is used only in
-// the forked child (pre_exec write+close) and closed by Drop in the parent.
+/// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
 #[cfg(target_os = "linux")]
-unsafe impl Send for CgroupLeaf {}
+const RELEASED: &str = "the leaf's spawn-side resources are released once its placement verdict is taken";
 
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
-    /// Returns the raw `cgroup.procs` fd for capture in a `pre_exec` closure.
+    /// Returns the raw `cgroup.procs` fd for capture in a `pre_exec` closure. Only before the
+    /// placement verdict is taken.
     pub(crate) fn procs_fd(&self) -> RawFd {
-        self.procs_fd
+        self.procs_fd.as_ref().expect(RELEASED).as_raw_fd()
+    }
+
+    /// Whether the child reported entering this leaf.
+    fn child_entered(&self) -> bool {
+        match &self.report {
+            Some(page) => page.read() == PlacementReport::Placed,
+            None => self.entered,
+        }
     }
 
     /// The leaf's `cgroup.events` path — the drain edge. Both watches open it for themselves:
@@ -717,27 +731,30 @@ impl CgroupLeaf {
     /// Whatever keeps the `rmdir` from succeeding, cosca did not put there, and killing it would
     /// kill a process cosca was never asked to contain.
     pub(crate) fn remove_unentered(self) {
-        debug_assert_ne!(
-            self.report.read(),
-            PlacementReport::Placed,
-            "remove_unentered on a leaf its child entered"
-        );
+        debug_assert!(!self.child_entered(), "remove_unentered on a leaf its child entered");
     }
 
     /// A `Copy` handle to this leaf's placement-report slot, for capture by the `pre_exec`
-    /// closure.
+    /// closure. Only before the placement verdict is taken.
     pub(crate) fn placement_slot(&self) -> ReportSlot {
-        self.report.slot()
+        self.report.as_ref().expect(RELEASED).slot()
     }
 
     /// Whether `pid` entered this leaf: `Ok` when its own write into it succeeded.
     ///
-    /// Used post-spawn (parent side). The child's report is the verdict: `cgroup.procs` lists
-    /// only live tasks, so a placed child that has already exited reads back absent from it.
-    /// Only a child that reported no successful write has `cgroup.procs` and its `/proc` state
-    /// read, to diagnose why — see [`NotPlaced`].
-    pub(crate) fn placement_of(&self, pid: u32) -> Result<(), NotPlaced> {
-        let report = match self.report.read() {
+    /// Used once, post-spawn (parent side). The child's report is the verdict: `cgroup.procs`
+    /// lists only live tasks, so a placed child that has already exited reads back absent from
+    /// it. Only a child that reported no successful write has `cgroup.procs` and its `/proc`
+    /// state read, to diagnose why — see [`NotPlaced`].
+    ///
+    /// Taking the verdict closes the `cgroup.procs` fd and unmaps the report page: nothing
+    /// needs either after the child's `exec`, and otherwise every live contained child would
+    /// hold one fd and one mapping in the supervisor.
+    pub(crate) fn take_placement(&mut self, pid: u32) -> Result<(), NotPlaced> {
+        let report = self.report.take().expect(RELEASED).read();
+        self.procs_fd = None;
+        self.entered = report == PlacementReport::Placed;
+        let report = match report {
             PlacementReport::Placed => return Ok(()),
             PlacementReport::NotReported => NotEntered::NotReported,
             PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
@@ -868,7 +885,7 @@ impl CgroupLeaf {
 #[cfg(all(target_os = "linux", test))]
 impl CgroupLeaf {
     /// Test-only placeholder pointing at no real cgroup. Safe to construct and drop —
-    /// `close(-1)` and `remove_dir` of a nonexistent path are harmless no-ops — so it is
+    /// `remove_dir` of a nonexistent path is a harmless no-op — so it is
     /// usable ONLY for variant-level assertions, never for an operation that touches the
     /// fd or path.
     pub(crate) fn placeholder_for_test() -> CgroupLeaf {
@@ -877,24 +894,27 @@ impl CgroupLeaf {
 
     /// Test-only leaf pointing at `leaf_path`, which a test shapes with ordinary files and
     /// directories. Every operation that reads or writes the leaf path (`hard_kill`,
-    /// `placement_of`, `Drop`) then runs for real against the kernel's own errnos, on any
-    /// Linux host and without a cgroupfs. The fd is -1, so `close` is a no-op and nothing may
-    /// write through `procs_fd`.
+    /// `take_placement`, `Drop`) then runs for real against the kernel's own errnos, on any
+    /// Linux host and without a cgroupfs. It has no `cgroup.procs` fd.
     pub(crate) fn for_test_at(leaf_path: PathBuf) -> CgroupLeaf {
         CgroupLeaf {
             leaf_path,
-            procs_fd: -1,
-            report: ReportPage::new().expect("map a placement-report page"),
+            procs_fd: None,
+            report: Some(ReportPage::new().expect("map a placement-report page")),
+            entered: false,
         }
+    }
+
+    /// Whether the leaf still holds its `cgroup.procs` fd or its report page.
+    pub(crate) fn holds_spawn_resources(&self) -> bool {
+        self.procs_fd.is_some() || self.report.is_some()
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
-        // Close the parent-side procs fd.
-        // Safety: we own this fd; it was created by try_create_leaf and never cloned.
-        unsafe { libc::close(self.procs_fd) };
+        self.procs_fd = None;
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
         // to drain it, then retry — but only if the child entered it: a spawn that failed before
         // its pre_exec ran, or whose write failed, put nothing in the leaf. A leaf that outlives
@@ -902,7 +922,7 @@ impl Drop for CgroupLeaf {
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
-        if self.report.read() != PlacementReport::Placed {
+        if !self.child_entered() {
             if !removed_after_drain(&first) {
                 warn_leaf_left_behind(
                     &self.leaf_path,
@@ -1110,7 +1130,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         .open(&procs_path)
         .and_then(|file| Ok(rustix::io::fcntl_dupfd_cloexec(&file, 3)?));
     let procs_fd = match procs_fd {
-        Ok(fd) => fd.into_raw_fd(),
+        Ok(fd) => fd,
         Err(source) => {
             return Err(fail(
                 &leaf_path,
@@ -1124,8 +1144,9 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
 
     Ok(CgroupLeaf {
         leaf_path,
-        procs_fd,
-        report,
+        procs_fd: Some(procs_fd),
+        report: Some(report),
+        entered: false,
     })
 }
 

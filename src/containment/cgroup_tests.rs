@@ -264,10 +264,10 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     );
 }
 
-/// The parent's `cgroup.procs` fd stays close-on-exec for the leaf's whole life. The child's
-/// `pre_exec` write needs it only between `fork` and `exec`, where a CLOEXEC fd is still open;
-/// any other program this process starts meanwhile must not inherit a writable `cgroup.procs`,
-/// through which it could move itself into the leaf and be killed with it.
+/// The parent's `cgroup.procs` fd stays close-on-exec for as long as the parent holds it. The
+/// child's `pre_exec` write needs it only between `fork` and `exec`, where a CLOEXEC fd is still
+/// open; any other program this process starts meanwhile must not inherit a writable
+/// `cgroup.procs`, through which it could move itself into the leaf and be killed with it.
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
@@ -830,17 +830,20 @@ fn drop_reports_a_leaf_it_could_not_remove() {
 #[test]
 fn drop_kills_only_through_a_leaf_its_child_entered() {
     crate::log_capture::install();
-    for (report, kills) in [
+    let cases = [
         (PlacementReport::NotReported, false),
         (PlacementReport::WriteFailed(libc::EBADF), false),
         (PlacementReport::Placed, true),
-    ] {
+    ];
+    // Before the verdict the report is read from the page; after it, from what the verdict
+    // recorded when it released the page.
+    for ((report, kills), verdict_taken) in cases.into_iter().flat_map(|case| [(case, false), (case, true)]) {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-drop-kill-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
         std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
 
-        let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+        let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
         match report {
             PlacementReport::NotReported => {}
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
@@ -851,14 +854,19 @@ fn drop_kills_only_through_a_leaf_its_child_entered() {
             // SAFETY: the slot's page lives as long as `leaf`.
             PlacementReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
         }
-        assert_eq!(leaf.report.read(), report);
+        assert_eq!(leaf.report.as_ref().expect("the page").read(), report);
+        if verdict_taken {
+            assert_eq!(leaf.take_placement(4242).is_ok(), kills);
+            assert!(!leaf.holds_spawn_resources());
+        }
         let mark = crate::log_capture::mark();
         drop(leaf);
 
         assert_eq!(
             leaf_path.join("cgroup.kill").exists(),
             kills,
-            "a child that reported {report:?}: cgroup.kill written must be {kills}"
+            "a child that reported {report:?} (verdict taken: {verdict_taken}): cgroup.kill \
+             written must be {kills}"
         );
         assert_eq!(
             crate::log_capture::levels_since(mark, &leaf_path.to_string_lossy()),
@@ -1206,13 +1214,13 @@ fn create_leaf_under_reports_an_unmappable_report_page_and_removes_the_leaf() {
 /// A `cgroup.procs` that cannot be read is reported with the read's own error.
 #[cfg(target_os = "linux")]
 #[test]
-fn placement_of_reports_an_unreadable_cgroup_procs() {
+fn take_placement_reports_an_unreadable_cgroup_procs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-unreadable-procs");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
 
-    let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
-    match leaf.placement_of(4242) {
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    match leaf.take_placement(4242) {
         Err(NotPlaced::Unreadable {
             pid,
             path,
@@ -1233,14 +1241,14 @@ fn placement_of_reports_an_unreadable_cgroup_procs() {
 /// `/proc` state. The child is a zombie — exited, not yet reaped — so its state is known.
 #[cfg(target_os = "linux")]
 #[test]
-fn placement_of_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
+fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-absent-procs");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let listed = format!("{}\n", std::process::id());
     std::fs::write(leaf_path.join("cgroup.procs"), &listed).expect("write cgroup.procs");
 
-    let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
     // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a no-op.
     let _ = unsafe { super::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
 
@@ -1252,7 +1260,7 @@ fn placement_of_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
     let waited = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
     assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
 
-    let verdict = leaf.placement_of(pid);
+    let verdict = leaf.take_placement(pid);
     child.wait().expect("reap the child");
     match verdict {
         Err(NotPlaced::Absent {
@@ -1281,7 +1289,7 @@ fn placement_of_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
 /// Read first, the state is the live child's; read second, it would be `Z`.
 #[cfg(target_os = "linux")]
 #[test]
-fn placement_of_reads_the_childs_state_before_cgroup_procs() {
+fn take_placement_reads_the_childs_state_before_cgroup_procs() {
     use std::io::Write;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1290,7 +1298,7 @@ fn placement_of_reads_the_childs_state_before_cgroup_procs() {
     let procs_path = leaf_path.join("cgroup.procs");
     nix::unistd::mkfifo(&procs_path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo cgroup.procs");
     // No report was stored, so the verdict reads both to diagnose the child.
-    let leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
 
     // A live child, blocked reading a pipe nothing writes to.
     let mut child = std::process::Command::new("/bin/cat")
@@ -1314,7 +1322,7 @@ fn placement_of_reads_the_childs_state_before_cgroup_procs() {
         child
     });
 
-    let verdict = leaf.placement_of(pid);
+    let verdict = leaf.take_placement(pid);
     writer.join().expect("the writer").wait().expect("reap the child");
     match verdict {
         Err(NotPlaced::Absent { procs, child_state, .. }) => {

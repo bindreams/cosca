@@ -552,7 +552,13 @@ fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
     let (containment, attached) = decide(&leaf_path, ChildReport::Placed);
 
     assert_eq!(containment, crate::containment::Containment::CgroupV2);
-    assert!(matches!(attached, super::Attached::Cgroup(_)), "got {attached:?}");
+    let super::Attached::Cgroup(leaf) = &attached else {
+        panic!("got {attached:?}");
+    };
+    assert!(
+        !leaf.holds_spawn_resources(),
+        "a live child's leaf must not hold its cgroup.procs fd or report page past the verdict"
+    );
     assert!(
         !leaf_path.join("cgroup.kill").exists(),
         "the leaf owns a live tree; nothing may kill it at spawn time"
