@@ -781,10 +781,22 @@ fn absolutise_exact_refuses_an_empty_program() {
 /// cannot be honoured by a path with no file in it.
 ///
 /// The predicate itself is covered from any host in `crate::resolve`'s tests; this pins the
-/// WIRING, which is Windows-only. Kills "drop the call from `absolutise_exact`".
+/// WIRING, which is Windows-only. Kills "drop the call from `absolutise_exact`" for EACH of its two
+/// calls: `C:\t\...` and `C:\t\. ` (one trailing space) pass the pre-check as written and name no
+/// file only once `GetFullPathNameW` strips the final component's trailing dots and spaces.
 #[test]
 fn absolutise_exact_refuses_a_program_that_names_no_file() {
-    for n in [r"C:\t\dir\", r"C:\t\.", r"C:\t\..", ".", "..", r"C:\", "C:"] {
+    for n in [
+        r"C:\t\dir\",
+        r"C:\t\.",
+        r"C:\t\..",
+        ".",
+        "..",
+        r"C:\",
+        "C:",
+        r"C:\t\...",
+        r"C:\t\. ",
+    ] {
         let got = absolutise_exact(Path::new(n));
         assert!(got.is_err(), "{n:?} names no file and must be refused, got {got:?}");
     }
@@ -805,5 +817,21 @@ fn absolutise_exact_refuses_an_interior_nul() {
             absolutise_exact(Path::new(&p)).is_err(),
             "an interior NUL must be refused, not truncated: {p:?}"
         );
+    }
+}
+
+/// The NUL check runs FIRST, so a value that is both truncating and shapeless is blamed on the
+/// NUL: `x` + NUL + `\` would otherwise be reported as naming no file, which only its
+/// untruncated spelling does.
+#[test]
+fn absolutise_exact_reports_an_interior_nul_ahead_of_the_shape() {
+    use std::os::windows::ffi::OsStringExt;
+    let p = std::ffi::OsString::from_wide(&"x\0\\".encode_utf16().collect::<Vec<u16>>());
+    match absolutise_exact(Path::new(&p)) {
+        Err(Error::Io(e)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e:?}");
+            assert!(e.to_string().contains("embedded NUL"), "the NUL must be named: {e}");
+        }
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
 }

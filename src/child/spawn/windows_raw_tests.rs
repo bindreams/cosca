@@ -242,14 +242,27 @@ fn image_for_rejects_an_empty_exact_program() {
 #[test]
 fn image_for_rejects_an_exact_program_that_names_no_file() {
     // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
-    // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but only after the
-    // spawn is under way; refusing here keeps the two `raw_executable()` sinks agreeing on which
-    // inputs are nameable at all, rather than differing by which path you spawned through.
-    for n in [r"C:\t\dir\", r"C:\t\.", ".", "..", "C:"] {
+    // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but as an OS error
+    // after the spawn is under way; refusing here makes it `InvalidInput`, as on the elevated
+    // sink. `C:\t\...` and `C:\t\. ` (one trailing space) name no file only after Win32
+    // normalisation, so they pin the post-check.
+    for n in [r"C:\t\dir\", r"C:\t\.", ".", "..", "C:", r"C:\t\...", r"C:\t\. "] {
         let mut cmd = Command::new();
         cmd.raw_executable(n).args(["tool"]);
-        assert!(image_for(&cmd).is_err(), "{n:?} names no file and must be refused");
+        match image(&cmd) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!("{n:?} names no file and must be Io(InvalidInput), got {other:?}"),
+        }
     }
+}
+
+#[test]
+fn image_for_checks_an_exact_program_normalised_but_passes_it_as_written() {
+    // The post-check reads Win32's normalisation; what reaches `lpApplicationName` must still be
+    // the caller's token, relative and with its trailing dot, for the loader to complete.
+    let mut cmd = Command::new();
+    cmd.raw_executable(r"t\tool.").args(["tool"]);
+    assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(r"t\tool.")));
 }
 
 #[test]

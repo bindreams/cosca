@@ -175,11 +175,12 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// Complete a possibly-relative program name into an absolute path the way the Win32 loader
 /// itself would — **without searching, appending an extension, or touching the filesystem**.
 ///
-/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and it exists
-/// for exactly one caller: the elevated path. `CreateProcessW` completes a partial
+/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and its result
+/// is used by exactly one caller: the elevated path. `CreateProcessW` completes a partial
 /// `lpApplicationName` itself ("the function uses the current drive and current directory to
 /// complete the specification. The function will not use the search path"), so the raw backend
-/// can hand it a relative value untouched. `ShellExecuteEx` cannot be trusted with one: a
+/// hands it a relative value untouched, calling this only for its refusals and discarding the
+/// path. `ShellExecuteEx` cannot be trusted with one: a
 /// path-less `lpFile` IS searched — `PATHEXT` applied, `lpDirectory` consulted as a search
 /// location — which is how the elevated path reached the `.bat`/`.cmd` vector. Completing the
 /// name here first means `lpFile` is always absolute, and an absolute `lpFile` is taken verbatim.
@@ -195,24 +196,25 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 ///   state Win32 tracks and cosca does not, which is why `executable()`'s search path fails such
 ///   names closed instead. Here the platform answers it correctly.
 ///
-/// The current directory is process-global and can change between calls, so this deliberately
+/// The current directory is process-global and can change between calls, so the elevated path
 /// consumes the relative name exactly once and everything downstream uses the absolute result —
-/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code.
+/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code. The raw
+/// backend's discarded result is safe from that race: whether it names a file depends only on the
+/// token's own final component, not on the directory it was completed against.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
-    // Checked TWICE, on purpose, because the two checks catch different things.
-    //
-    // BEFORE: `\\?\` paths suspend Win32 normalisation entirely, so for them the input is the
-    // only meaningful reading — `\\?\C:\t\.` keeps a literal `.` component that the post-check
-    // below would never see.
-    reject_unnameable_program(program)?;
-    // BEFORE widening. `to_wide_nul` appends a terminator, and `PCWSTR` stops at the FIRST NUL —
-    // so an interior NUL silently truncates the path Win32 sees. `raw_executable("C:\\a\\b.exe\0x")`
-    // would become `lpFile = C:\a\b.exe`, loading a file the caller did not name, elevated. The
-    // raw backend already fails such a path closed (`spawn_raw` NUL-checks the image); without
-    // this the same `Command` would error unelevated and silently load a different file elevated.
-    // It also closes the hole in `reject_unnameable_program`, which sees a non-empty `OsStr` for a
-    // value that widens to the empty string.
+    // FIRST, ahead of the shape check, so the refusal names the NUL. `to_wide_nul` appends a
+    // terminator, and `PCWSTR` stops at the FIRST NUL — so an interior NUL silently truncates the
+    // path Win32 sees. `raw_executable("C:\\a\\b.exe\0x")` would become `lpFile = C:\a\b.exe`,
+    // loading a file the caller did not name, elevated. The raw backend already fails such a path
+    // closed (`spawn_raw` NUL-checks the image); without this the same `Command` would error
+    // unelevated and silently load a different file elevated. Ahead of the shape check so that
+    // `x` + NUL + `\` is blamed on its NUL, not on a trailing separator Win32 would never see.
     ensure_no_nul_wide("program path", program.as_os_str())?;
+    // The shape is checked TWICE, on purpose, because the two checks catch different things.
+    //
+    // BEFORE: normalisation can also REMOVE the shape. `C:\t\.` normalises to `C:\t`, whose final
+    // component `t` names a file, so only the spelling shows that the caller named a directory.
+    reject_unnameable_program(program)?;
     let wide = super::to_wide_nul(program.as_os_str());
     let full = grow_wide_buffer(|buf| unsafe {
         // SAFETY: `wide` is NUL-terminated; `GetFullPathNameW` writes into the given buffer or
@@ -396,8 +398,8 @@ impl ChildEnv {
 /// defect. Shared rather than restated per path — the predicate and the sentence are the same, and
 /// two copies of them drifted apart once already.
 ///
-/// The one wide string that is not caller input is the resolved program image; see
-/// [`debug_assert_no_nul_wide`].
+/// The raw backend's program image is the one wide string checked by assertion instead, because
+/// it is already refused upstream by the time it is built; see [`debug_assert_no_nul_wide`].
 pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
     if s.encode_wide().any(|unit| unit == 0) {
         return Err(Error::Io(std::io::Error::new(

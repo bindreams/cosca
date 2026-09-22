@@ -377,7 +377,7 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     //
     // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
     // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the
-    // same "program path" name, ahead of every other field — see its doc.
+    // same "program path" name, ahead of every other field and of its own shape checks.
     //
     // Spelled out rather than `_ =>`: the discriminant IS the feature here, and this is the
     // security sink. A future `ExecutableSpec` variant must not compile silently into the
@@ -486,9 +486,14 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // resolves the token as a path, so `setup.bat.`, `setup.bat ` and `C:\tools\.bat` all reach the
     // same batch file while `Path::extension()` reads `None` or something that is not `bat`. That
     // class is closed by the batch-gate PR merging immediately before this one, which replaces the
-    // `Path::extension()` reading with a byte-level effective-name computation. On the `Exact` arm
-    // `absolutise_exact` additionally hands this gate Win32's OWN normalisation of the token, so
-    // the trimmed spellings arrive already trimmed; the `Search` arm still gets the raw token.
+    // `Path::extension()` reading with a byte-level effective-name computation. NOTHING IN THIS
+    // TREE closes it: until that merge lands, do not read the gate below as covering it.
+    //
+    // The one slice this tree does refuse: on this elevated `Exact` arm, `absolutise_exact` hands
+    // the gate Win32's own normalisation, so trailing dots and spaces arrive stripped
+    // (`setup.bat.` is refused). `C:\tools\.bat` survives normalisation and still passes. The
+    // `Search` arm, and the raw backend's `raw_executable()` sink, which loads the caller's token
+    // as written, get no such help: `raw_executable("setup.bat.")` passes unelevated.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {

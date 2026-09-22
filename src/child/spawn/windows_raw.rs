@@ -322,8 +322,9 @@ pub(crate) fn spawn_step(
 /// The three arms:
 ///
 /// - `Search` — from `executable()`. Resolved through [`resolve::resolve_executable`]: the
-///   child's cwd, the child's `PATH` (`path`), the `.exe` rules. Always absolute on success.
-/// - `Exact` — from `raw_executable()`. Passed through untouched. This is the ONE site on
+///   child's cwd, the child's `PATH`, the `.exe` rules. Always absolute on success.
+/// - `Exact` — from `raw_executable()`. Passed through untouched once
+///   [`resolve::absolutise_exact`] has found that it names a file. This is the ONE site on
 ///   Windows that would otherwise resolve it, silently turning a bare `raw_executable("tool")`
 ///   into a `PATH` lookup and breaking the contract at its only user. A relative value keeps
 ///   `lpApplicationName`'s own meaning, which completes it against the CALLING process's current
@@ -336,7 +337,10 @@ pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<Pa
     match cmd.executable_spec() {
         Some(ExecutableSpec::Search(p)) => Ok(Some(resolve::resolve_executable(p, cmd.cwd(), path)?)),
         Some(ExecutableSpec::Exact(p)) => {
-            resolve::reject_unnameable_program(p)?;
+            // For its refusals only — the elevated sink's shape checks, before and after Win32
+            // normalisation, so both sinks agree on what names no file. The completed path is
+            // discarded: `lpApplicationName` gets the caller's token for the loader to complete.
+            resolve::absolutise_exact(p)?;
             Ok(Some(p.to_path_buf()))
         }
         None => program_token(cmd)
