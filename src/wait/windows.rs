@@ -14,6 +14,12 @@ use windows::Win32::System::Threading::{
 use crate::error::Error;
 use crate::identity::{HandleIdentity, Liveness, Opened, ProcessId};
 
+// THROWAWAY: proves the new Windows clippy CI step catches a real defect. Reverted
+// in the next commit.
+fn ci_probe_dead_code(x: i32) -> i32 {
+    x + 1
+}
+
 fn close(handle: HANDLE) {
     // Match identity/windows.rs: a failed CloseHandle of an owned handle is a contract
     // violation, asserted in debug.
