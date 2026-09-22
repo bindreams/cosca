@@ -430,7 +430,7 @@ use std::os::fd::{IntoRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicI32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
 
 /// Process-wide monotonic counter; combined with the pid, gives a unique leaf
 /// name even when the same process spawns on multiple threads simultaneously.
@@ -660,7 +660,8 @@ impl ReportSlot {
 /// process-group mechanism.
 ///
 /// `Drop` closes the parent's `procs_fd` and removes the leaf directory,
-/// firing `cgroup.kill` first if the leaf is still occupied.
+/// firing `cgroup.kill` first if the leaf is still occupied — unless
+/// [`disarm`](Self::disarm) has been called.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
@@ -669,6 +670,9 @@ pub(crate) struct CgroupLeaf {
     procs_fd: RawFd,
     /// Where the forked child reports whether its self-placement write succeeded.
     report: ReportPage,
+    /// Whether `Drop` may still fire `cgroup.kill`. Cleared by `disarm` — see it for why this
+    /// is state rather than nothing.
+    armed: AtomicBool,
 }
 
 // Safety: RawFd is an integer. CgroupLeaf is not Clone; the fd is used only in
@@ -681,6 +685,21 @@ impl CgroupLeaf {
     /// Returns the raw `cgroup.procs` fd for capture in a `pre_exec` closure.
     pub(crate) fn procs_fd(&self) -> RawFd {
         self.procs_fd
+    }
+
+    /// Neutralize `Drop`'s kill, for `detach()`.
+    ///
+    /// Dropping a `CgroupLeaf` is NOT inert, which is what makes this necessary: `Drop` fires
+    /// `cgroup.kill` whenever the first `rmdir` fails, and over a live detached tree that
+    /// `rmdir` always fails (`EBUSY`). `Child::drop` opting out via `kill_on_drop` does not
+    /// help — the leaf is a field of that `Child` and its own `Drop` runs regardless. So the
+    /// strongest mechanism was the one that broke `detach`'s "the tree keeps running", and it
+    /// takes real state to keep it.
+    ///
+    /// A disarmed `Drop` still tries the `rmdir` once, and still reports nothing: detach gives
+    /// up the kill, not the tidying.
+    pub(crate) fn disarm(&self) {
+        self.armed.store(false, Ordering::Relaxed);
     }
 
     /// The leaf's `cgroup.events` path — the drain edge. Both watches open it for themselves:
@@ -859,6 +878,7 @@ impl CgroupLeaf {
             leaf_path,
             procs_fd: -1,
             report: ReportPage::new().expect("map a placement-report page"),
+            armed: AtomicBool::new(true),
         }
     }
 }
@@ -876,6 +896,18 @@ impl Drop for CgroupLeaf {
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
+        // Detached (see `disarm`): the tree this leaf holds is meant to outlive the handle, so
+        // the `rmdir` that just failed is the whole of what Drop may do. The directory stays
+        // for as long as the tree does, and after that for good — the caller asked for the
+        // tree, and cosca has no way to come back for the leaf. Reported once, at `debug`: it
+        // is one more `cosca-*` on this host (issue #140), but an intended one.
+        if !self.armed.load(Ordering::Relaxed) {
+            log::debug!(
+                "cgroup leaf {} is left behind for a detached tree ({first})",
+                self.leaf_path.display()
+            );
+            return;
+        }
         let kill = self.hard_kill();
         let Err(second) = fs::remove_dir(&self.leaf_path) else {
             return;
@@ -1057,6 +1089,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         leaf_path,
         procs_fd,
         report,
+        armed: AtomicBool::new(true),
     })
 }
 
