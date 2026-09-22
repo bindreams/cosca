@@ -714,6 +714,24 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     );
 }
 
+/// `terminate` reads the same already-removed leaf as the same completed teardown. A caller
+/// doing terminate-then-kill must not get an error from the graceful half and success from the
+/// hard one over the identical leaf.
+#[cfg(target_os = "linux")]
+#[test]
+fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
+    let leaf = super::CgroupLeaf::placeholder_for_test();
+    leaf.terminate()
+        .expect("an already-removed leaf has no member left to signal");
+
+    let attached = crate::containment::Attached::Cgroup(leaf);
+    assert!(
+        attached.terminate(0).is_ok(),
+        "terminate and hard_kill must agree about an already-gone leaf"
+    );
+    assert!(attached.hard_kill().is_ok());
+}
+
 // Drop's leaf-removal reporting -----
 // `Drop` is the only place a leaf cosca could not remove is ever mentioned: it has returned by
 // the time anything could look, and nothing — cosca or a cgroup manager — revisits a `cosca-*`

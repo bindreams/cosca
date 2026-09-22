@@ -809,6 +809,11 @@ impl CgroupLeaf {
 
     /// SIGTERM every pid currently listed in `cgroup.procs`.
     ///
+    /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
+    /// ([`removed_after_drain`]): there is no member left to signal. The two halves must agree
+    /// about one leaf — a caller doing terminate-then-kill would otherwise take an error from
+    /// the graceful half and success from the hard one over the identical directory.
+    ///
     /// # PID-reuse window
     /// This reads the pid list then signals each entry. Between the read and
     /// the signal a pid may exit and be recycled, potentially signalling an
@@ -816,7 +821,15 @@ impl CgroupLeaf {
     /// path; the cgroup mechanism's advantage (atomic, pid-free kill) applies
     /// only to `hard_kill` via `cgroup.kill`.
     pub(crate) fn terminate(&self) -> io::Result<()> {
-        let content = fs::read_to_string(self.leaf_path.join("cgroup.procs"))?;
+        let path = self.leaf_path.join("cgroup.procs");
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if removed_after_drain(&e) => {
+                log::debug!("cgroup terminate: leaf {} is already gone", path.display());
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         for line in content.lines() {
             if let Ok(pid) = line.trim().parse::<i32>() {
                 let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
