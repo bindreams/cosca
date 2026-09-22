@@ -306,7 +306,7 @@ fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
 
 use std::path::PathBuf;
 
-use super::{log_degrade, parse_proc_stat_state, LeafError, Placement, PlacementReport};
+use super::{log_degrade, parse_proc_stat_state, LeafError, NotEntered, NotPlaced, PlacementReport};
 
 /// Every `LeafError` names the step, the path it touched, and the kernel's own reason.
 /// Asserted per variant: a step whose message drops any of the three is the silence this
@@ -395,11 +395,11 @@ fn placement_report_renders_the_childs_errno() {
 /// errno and its state — and never claims a membership that never began.
 #[test]
 fn placement_absent_renders_every_observed_fact() {
-    let absent = Placement::Absent {
+    let absent = NotPlaced::Absent {
         pid: 4242,
         path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
         procs: String::new(),
-        report: PlacementReport::WriteFailed(16),
+        report: NotEntered::WriteFailed(16),
         child_state: Some('Z'),
     };
     let rendered = absent.to_string();
@@ -425,11 +425,11 @@ fn placement_absent_renders_every_observed_fact() {
 /// A child whose `pre_exec` closure never ran made no write at all, and is reported as such.
 #[test]
 fn placement_absent_renders_a_child_that_reported_nothing() {
-    let rendered = Placement::Absent {
+    let rendered = NotPlaced::Absent {
         pid: 4242,
         path: PathBuf::from("/cg/cgroup.procs"),
         procs: String::new(),
-        report: PlacementReport::NotReported,
+        report: NotEntered::NotReported,
         child_state: Some('S'),
     }
     .to_string();
@@ -441,11 +441,11 @@ fn placement_absent_renders_a_child_that_reported_nothing() {
 /// and must not be described as having exited.
 #[test]
 fn placement_absent_distinguishes_a_live_child() {
-    let rendered = Placement::Absent {
+    let rendered = NotPlaced::Absent {
         pid: 4242,
         path: PathBuf::from("/cg/cgroup.procs"),
         procs: "99\n".into(),
-        report: PlacementReport::WriteFailed(16),
+        report: NotEntered::WriteFailed(16),
         child_state: Some('S'),
     }
     .to_string();
@@ -454,14 +454,14 @@ fn placement_absent_distinguishes_a_live_child() {
     assert!(!rendered.contains("zombie"), "a live child must not be called a zombie");
 }
 
-/// An unreadable `cgroup.procs` is its own diagnosis, never folded into "not a member".
+/// An unreadable `cgroup.procs` is reported with its own error, not as an empty file.
 #[test]
 fn placement_unreadable_names_the_io_error() {
-    let rendered = Placement::Unreadable {
+    let rendered = NotPlaced::Unreadable {
         pid: 4242,
         path: PathBuf::from("/cg/cgroup.procs"),
         source: std::io::Error::from_raw_os_error(13),
-        report: PlacementReport::Placed,
+        report: NotEntered::WriteFailed(16),
     }
     .to_string();
     assert!(rendered.contains("/cg/cgroup.procs"));
@@ -929,19 +929,18 @@ fn every_degrade_reason_has_its_own_kind() {
             source: std::io::Error::from_raw_os_error(13),
         }),
         Box::new(LeafError::MapReportPage(std::io::Error::from_raw_os_error(12))),
-        Box::new(Placement::Confirmed),
-        Box::new(Placement::Absent {
+        Box::new(NotPlaced::Absent {
             pid: 1,
             path: PathBuf::from("/cg/leaf/cgroup.procs"),
             procs: String::new(),
-            report: PlacementReport::Placed,
+            report: NotEntered::NotReported,
             child_state: None,
         }),
-        Box::new(Placement::Unreadable {
+        Box::new(NotPlaced::Unreadable {
             pid: 1,
             path: PathBuf::from("/cg/leaf/cgroup.procs"),
             source: std::io::Error::from_raw_os_error(13),
-            report: PlacementReport::Placed,
+            report: NotEntered::NotReported,
         }),
     ];
     let mut seen = Vec::new();
@@ -1111,8 +1110,7 @@ fn create_leaf_under_reports_an_unmappable_report_page_and_removes_the_leaf() {
     assert!(strays.is_empty(), "a failed mapping left {strays:?} behind");
 }
 
-/// A `cgroup.procs` that cannot be READ is "membership unknown", never "not a member": the two
-/// have different fixes, and only one of them is a reason to throw the leaf away.
+/// A `cgroup.procs` that cannot be read is reported with the read's own error.
 #[cfg(target_os = "linux")]
 #[test]
 fn placement_of_reports_an_unreadable_cgroup_procs() {
@@ -1122,17 +1120,18 @@ fn placement_of_reports_an_unreadable_cgroup_procs() {
 
     let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
     match leaf.placement_of(4242) {
-        Placement::Unreadable {
+        Err(NotPlaced::Unreadable {
             pid,
             path,
             source,
             report,
-        } => {
+        }) => {
             assert_eq!(pid, 4242);
             assert_eq!(path, leaf_path.join("cgroup.procs"));
             assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-            assert_eq!(report, PlacementReport::NotReported, "no child ever ran");
+            assert_eq!(report, NotEntered::NotReported, "no child ever ran");
         }
-        other => panic!("an unreadable cgroup.procs must not read as absent membership: {other}"),
+        Err(other) => panic!("an unreadable cgroup.procs must not read as an empty one: {other}"),
+        Ok(()) => panic!("no child reported a placement"),
     }
 }

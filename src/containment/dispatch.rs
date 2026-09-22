@@ -596,13 +596,11 @@ fn attach_tree(
                     // because it lists only live tasks and a placed child may already have
                     // exited.
                     match leaf.placement_of(raw_pid) {
-                        crate::containment::cgroup::Placement::Confirmed => {
-                            return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)))
-                        }
+                        Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
                         // The child never entered the leaf, so nothing it forks did either. The
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.
-                        reason => {
+                        Err(reason) => {
                             crate::containment::cgroup::log_degrade(&reason);
                             leaf.remove_unentered();
                             return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));

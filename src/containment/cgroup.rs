@@ -215,49 +215,61 @@ impl fmt::Display for PlacementReport {
     }
 }
 
-/// The parent-side verdict on whether the spawned child entered the leaf, carrying every fact
-/// the verdict was reached from.
+/// What a child that did not enter its leaf reported: never a successful write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum NotEntered {
+    /// Its `pre_exec` closure did not run.
+    NotReported,
+    /// Its `write` to `cgroup.procs` failed with this errno.
+    WriteFailed(i32),
+}
+
+impl fmt::Display for NotEntered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            NotEntered::NotReported => PlacementReport::NotReported.fmt(f),
+            NotEntered::WriteFailed(errno) => PlacementReport::WriteFailed(errno).fmt(f),
+        }
+    }
+}
+
+/// Why a spawned child is not in its leaf, with every fact the diagnosis rests on.
 ///
-/// The child's own report decides it. `cgroup.procs` lists only live tasks, so a placed child
-/// that has already exited reads back absent from it; the file is read only to diagnose a
-/// child that reported no successful write.
+/// The child's own report decides membership (see [`CgroupLeaf::placement_of`]).
+/// `cgroup.procs` and the child's `/proc` state are read only to diagnose a child that
+/// reported no successful write.
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) enum Placement {
-    /// The child's write to `cgroup.procs` succeeded: the leaf owns the tree, whether or not
-    /// the child is still alive to be listed.
-    Confirmed,
-    /// `cgroup.procs` is readable but does not list the child's pid.
+pub(crate) enum NotPlaced {
+    /// `cgroup.procs` was read.
     Absent {
         pid: u32,
         /// The `cgroup.procs` that was read.
         path: PathBuf,
-        /// Its verbatim contents at the moment of the check.
+        /// Its verbatim contents.
         procs: String,
         /// The leaf's placement report — the outcome of the last self-placement write made
         /// through it, which for a production leaf is `pid`'s own.
-        report: PlacementReport,
+        report: NotEntered,
         /// The child's `/proc/<pid>` state letter, read BEFORE `procs`: `Z` means it had
         /// exited before the file was read.
         child_state: Option<char>,
     },
-    /// `cgroup.procs` could not be read at all, so membership is unknown rather than absent.
+    /// `cgroup.procs` could not be read.
     Unreadable {
         pid: u32,
         path: PathBuf,
         source: io::Error,
-        /// As in [`Placement::Absent`]: the leaf's report, not `pid`'s in general.
-        report: PlacementReport,
+        /// As in [`NotPlaced::Absent`]: the leaf's report, not `pid`'s in general.
+        report: NotEntered,
     },
 }
 
-impl fmt::Display for Placement {
+impl fmt::Display for NotPlaced {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Placement::Confirmed => {
-                f.write_str("the child is a member of the leaf cgroup (not a degrade — reported in error)")
-            }
-            Placement::Absent {
+            NotPlaced::Absent {
                 pid,
                 path,
                 procs,
@@ -277,29 +289,20 @@ impl fmt::Display for Placement {
                     Some(state) => format!("it is still running (/proc state {state})"),
                     None => "its /proc state could not be read".to_string(),
                 };
-                match report {
-                    PlacementReport::Placed => write!(
-                        f,
-                        "the leaf cgroup was created and child {pid}'s write into it succeeded, but \
-                         {} does not list it (cgroup.procs is {listed}); {state}",
-                        path.display()
-                    ),
-                    PlacementReport::NotReported | PlacementReport::WriteFailed(_) => write!(
-                        f,
-                        "child {pid} never entered the leaf cgroup: {report}; {} is {listed}; {state}",
-                        path.display()
-                    ),
-                }
+                write!(
+                    f,
+                    "child {pid} never entered the leaf cgroup: {report}; {} is {listed}; {state}",
+                    path.display()
+                )
             }
-            Placement::Unreadable {
+            NotPlaced::Unreadable {
                 pid,
                 path,
                 source,
                 report,
             } => write!(
                 f,
-                "the leaf cgroup was created but membership of child {pid} could not be read \
-                 from {}: {source}; {report}",
+                "child {pid} never entered the leaf cgroup: {report}; {} could not be read: {source}",
                 path.display()
             ),
         }
@@ -320,7 +323,6 @@ pub(crate) enum DegradeKind {
     CheckKill,
     OpenProcs,
     MapReportPage,
-    PlacementConfirmed,
     PlacementAbsent,
     PlacementUnreadable,
 }
@@ -345,12 +347,11 @@ impl DegradeReason for LeafError {
     }
 }
 
-impl DegradeReason for Placement {
+impl DegradeReason for NotPlaced {
     fn kind(&self) -> DegradeKind {
         match self {
-            Placement::Confirmed => DegradeKind::PlacementConfirmed,
-            Placement::Absent { .. } => DegradeKind::PlacementAbsent,
-            Placement::Unreadable { .. } => DegradeKind::PlacementUnreadable,
+            NotPlaced::Absent { .. } => DegradeKind::PlacementAbsent,
+            NotPlaced::Unreadable { .. } => DegradeKind::PlacementUnreadable,
         }
     }
 }
@@ -692,33 +693,35 @@ impl CgroupLeaf {
         self.report.slot()
     }
 
-    /// Whether `pid` entered this leaf, with every fact the verdict rests on.
+    /// Whether `pid` entered this leaf: `Ok` when its own write into it succeeded.
     ///
-    /// Used post-spawn (parent side). The child's own report is the verdict; only when it is
-    /// not `Placed` are `cgroup.procs` and the child's `/proc` state read, to diagnose why —
-    /// see [`Placement`].
-    pub(crate) fn placement_of(&self, pid: u32) -> Placement {
-        let report = self.report.read();
-        if report == PlacementReport::Placed {
-            return Placement::Confirmed;
-        }
+    /// Used post-spawn (parent side). The child's report is the verdict: `cgroup.procs` lists
+    /// only live tasks, so a placed child that has already exited reads back absent from it.
+    /// Only a child that reported no successful write has `cgroup.procs` and its `/proc` state
+    /// read, to diagnose why — see [`NotPlaced`].
+    pub(crate) fn placement_of(&self, pid: u32) -> Result<(), NotPlaced> {
+        let report = match self.report.read() {
+            PlacementReport::Placed => return Ok(()),
+            PlacementReport::NotReported => NotEntered::NotReported,
+            PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
+        };
         let path = self.leaf_path.join("cgroup.procs");
         let child_state = proc_state(pid);
-        match fs::read_to_string(&path) {
-            Ok(procs) => Placement::Absent {
+        Err(match fs::read_to_string(&path) {
+            Ok(procs) => NotPlaced::Absent {
                 pid,
                 path,
                 procs,
                 report,
                 child_state,
             },
-            Err(source) => Placement::Unreadable {
+            Err(source) => NotPlaced::Unreadable {
                 pid,
                 path,
                 source,
                 report,
             },
-        }
+        })
     }
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
