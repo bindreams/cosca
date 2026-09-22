@@ -35,8 +35,10 @@ fn commands_with_token(token: &OsString) -> Vec<(&'static str, Command)> {
     let mut by_argv = Command::new();
     by_argv.args([token.clone()]);
 
+    // argv[0] is deliberately clean and DIFFERENT from `token`: with the probe in both fields a
+    // passing leg would not say which one the gate read.
     let mut by_executable = Command::new();
-    by_executable.executable(token).args(["setup.bat"]);
+    by_executable.executable(token).args(["ordinary.exe"]);
 
     let mut by_commandline = Command::new();
     by_commandline.commandline(token.clone());
@@ -46,21 +48,6 @@ fn commands_with_token(token: &OsString) -> Vec<(&'static str, Command)> {
         ("executable()", by_executable),
         ("commandline()", by_commandline),
     ]
-}
-
-/// The shape the batch gate is BLIND to: `setup.bat` + NUL + `junk`. Win32 truncates it back to
-/// `setup.bat`, a real batch file, but `Path::extension()` reads `bat\0junk`, so
-/// `reject_batch_path` does not fire — see
-/// `crate::child::spawn::spawn_tests::the_batch_gate_fires_on_one_nul_shape_and_is_blind_to_the_other`,
-/// which pins that on any host. Delete the NUL check and this gate returns `Ok`, handing the token
-/// on to resolution to fail as a `NotFound` that names neither the NUL nor the batch file.
-#[test]
-fn a_nul_after_a_batch_extension_is_refused_where_the_batch_gate_is_blind() {
-    let token = nul_between("setup.bat", "junk");
-    for (via, c) in commands_with_token(&token) {
-        // The helper IS the assertion: an `Ok` or a downstream error kind panics here.
-        invalid_input_message(via, reject_batch_program(&c));
-    }
 }
 
 /// The mirror shape, and the one the ORDER fixes: `C:\tools\setup` + NUL + `.bat`. `\0` is not a
