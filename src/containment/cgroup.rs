@@ -30,6 +30,7 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
@@ -273,15 +274,100 @@ impl fmt::Display for Placement {
     }
 }
 
-/// Record, at `warn`, that this spawn is not getting the containment it asked for and why.
+/// The distinct conditions a contained spawn can degrade for.
 ///
-/// One function for every degrade site so the wording is composed once: whichever step
-/// failed, CI output carries a single line naming the achieved mechanism and the reason the
-/// stronger one was unavailable. `warn` rather than `debug` because a degrade is a real
-/// reduction in the guarantee the caller requested, not routine progress.
+/// A reason's TEXT varies per spawn (paths, errnos, the child's own state); its kind is the
+/// thing an embedder can actually act on, and is what [`log_degrade`] reports once per process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn log_degrade(reason: &dyn fmt::Display) {
-    log::warn!("cgroup v2 containment: degrading to a process group — {reason}");
+pub(crate) enum DegradeKind {
+    ReadProcSelfCgroup,
+    NoUnifiedLine,
+    CreateLeafDir,
+    KillUnsupported,
+    OpenProcs,
+    ReadCloexec,
+    ClearCloexec,
+    MapReportPage,
+    PlacementConfirmed,
+    PlacementAbsent,
+    PlacementUnreadable,
+}
+
+/// A reason a spawn degraded: its full text, plus which condition it is an instance of.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) trait DegradeReason: fmt::Display {
+    fn kind(&self) -> DegradeKind;
+}
+
+impl DegradeReason for LeafError {
+    fn kind(&self) -> DegradeKind {
+        match self {
+            LeafError::ReadProcSelfCgroup(_) => DegradeKind::ReadProcSelfCgroup,
+            LeafError::NoUnifiedLine(_) => DegradeKind::NoUnifiedLine,
+            LeafError::CreateLeafDir { .. } => DegradeKind::CreateLeafDir,
+            LeafError::KillUnsupported { .. } => DegradeKind::KillUnsupported,
+            LeafError::OpenProcs { .. } => DegradeKind::OpenProcs,
+            LeafError::ReadCloexec { .. } => DegradeKind::ReadCloexec,
+            LeafError::ClearCloexec { .. } => DegradeKind::ClearCloexec,
+            LeafError::MapReportPage(_) => DegradeKind::MapReportPage,
+        }
+    }
+}
+
+impl DegradeReason for Placement {
+    fn kind(&self) -> DegradeKind {
+        match self {
+            Placement::Confirmed => DegradeKind::PlacementConfirmed,
+            Placement::Absent { .. } => DegradeKind::PlacementAbsent,
+            Placement::Unreadable { .. } => DegradeKind::PlacementUnreadable,
+        }
+    }
+}
+
+/// Which degrade kinds this process has already reported at `warn`, one bit per
+/// [`DegradeKind`].
+static WARNED: AtomicU32 = AtomicU32::new(0);
+
+/// Record that this spawn is not getting the containment it asked for, and why.
+///
+/// One function for every degrade site so the wording is composed once: whichever step failed,
+/// the log carries a single line naming the achieved mechanism and the reason the stronger one
+/// was unavailable.
+///
+/// **Once per reason at `warn`, every time after that at `debug`.** Nearly every degrade
+/// condition is a standing property of the host — an unprivileged container's read-only
+/// `/sys/fs/cgroup`, an undelegated slice, a kernel older than 5.14 — so it holds for every
+/// `.contain()` spawn this process will ever make. The first report is a real reduction in the
+/// guarantee the caller asked for and warns; the ten-thousandth tells an embedder nothing new
+/// about something it cannot fix, and a log an embedder learns to filter out is worse than no
+/// log. Nothing is dropped: repeats still carry their own full text at `debug`, so a reader who
+/// turns the level up sees every degrading spawn, and a genuinely NEW condition warns whatever
+/// has degraded before it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn log_degrade(reason: &dyn DegradeReason) {
+    log_degrade_into(&WARNED, reason);
+}
+
+/// [`log_degrade`] against an explicit "already warned" set, and reporting the level it chose.
+///
+/// The set is a parameter, not a hard-wired static, so a test drives the first-then-repeat
+/// transition against its own state instead of racing every other test in the binary for the
+/// process-wide one.
+fn log_degrade_into(warned: &AtomicU32, reason: &dyn DegradeReason) -> log::Level {
+    let kind = reason.kind();
+    debug_assert!(
+        (kind as u32) < u32::BITS,
+        "DegradeKind has outgrown the one-bit-per-kind set; widen WARNED"
+    );
+    let bit = 1u32 << (kind as u32);
+    let level = if warned.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        log::Level::Warn
+    } else {
+        log::Level::Debug
+    };
+    log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
+    level
 }
 
 // Everything below is Linux-only. =====
@@ -293,7 +379,7 @@ use std::os::fd::{IntoRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64};
 
 /// Process-wide monotonic counter; combined with the pid, gives a unique leaf
 /// name even when the same process spawns on multiple threads simultaneously.
