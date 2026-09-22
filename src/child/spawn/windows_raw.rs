@@ -313,11 +313,7 @@ pub(crate) fn spawn_step(
 /// Which file this backend will load, applying cosca's resolution policy to a `Search` program
 /// and deliberately NOT applying it to an `Exact` one.
 ///
-/// `pub(crate)`: the async raw backend calls this rather than keeping its own copy. The base
-/// hoisted `routes_to_raw_backend` for exactly this reason — "so the rule cannot be two copies
-/// that drift" — and image selection is the same kind of rule, with a worse failure mode if the
-/// two backends ever disagree: the `raw_executable()` contract would depend on whether you
-/// spawned through the sync or async API.
+/// `pub(crate)`: shared verbatim with the async raw backend so the two cannot silently diverge.
 ///
 /// The three arms:
 ///
