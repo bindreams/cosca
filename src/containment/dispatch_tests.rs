@@ -493,8 +493,10 @@ fn uac_elevated_attachment_has_no_in_process_route() {
 // `attach_tree` decides whether a Strongest root's leaf owns its tree. The child's own
 // self-placement report is the oracle: a later `cgroup.procs` read lists only LIVE tasks, so a
 // placed child that has already exited reads back as absent. Real filesystem, no cgroupfs: each
-// leaf is a temp directory shaped with ordinary files, and each report is stored by the real
-// `place_self_in_cgroup_pre_exec`, called in-process.
+// leaf is a temp directory shaped with ordinary files. These tests are about what the decision
+// does with a report, not how a child earns one: a failed write is made for real, in-process,
+// but `Placed` is stored directly, since a successful write to anything but a real `cgroup.procs`
+// is the very false report the live cgroup lane guards against.
 
 /// What the child's `pre_exec` closure reported, if it ran at all.
 #[cfg(target_os = "linux")]
@@ -512,17 +514,8 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
 
     let leaf = CgroupLeaf::for_test_at(leaf_path.to_path_buf());
     match report {
-        ChildReport::Placed => {
-            // /dev/null accepts any write, standing in for a cgroup.procs the kernel accepted.
-            let sink = std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .expect("open /dev/null");
-            let fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-            // SAFETY: `fd` is a valid descriptor this test owns, and the call closes it exactly
-            // once; the slot's page lives as long as `leaf`.
-            unsafe { place_self_in_cgroup_pre_exec(fd, leaf.placement_slot()) }.expect("write to /dev/null");
-        }
+        // SAFETY: the slot's page lives as long as `leaf`.
+        ChildReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
         ChildReport::WriteFailed => {
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
             // no-op. The slot's page lives as long as `leaf`.
@@ -548,11 +541,11 @@ fn leaf_listing_another_pid(dir: &std::path::Path) -> std::path::PathBuf {
     leaf_path
 }
 
-/// The kernel accepted the child's write, and the child has since exited: `cgroup.procs` no
-/// longer lists it. Anything it forked is still in the leaf, so the leaf owns the tree.
+/// A child that reported its write accepted, and has since exited: `cgroup.procs` no longer
+/// lists it. Anything it forked is still in the leaf, so the leaf owns the tree.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_placed_child_absent_from_cgroup_procs_is_still_cgroup_contained() {
+fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = leaf_listing_another_pid(dir.path());
 
@@ -570,7 +563,7 @@ fn a_placed_child_absent_from_cgroup_procs_is_still_cgroup_contained() {
 /// answers it.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_placed_child_with_an_unreadable_cgroup_procs_is_still_cgroup_contained() {
+fn a_placed_report_outranks_an_unreadable_cgroup_procs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-decision-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf (no cgroup.procs inside)");

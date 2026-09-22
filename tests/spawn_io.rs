@@ -1257,3 +1257,153 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
 }
+
+/// The unified-hierarchy path in the contents of a `/proc/<pid>/cgroup` file.
+#[cfg(target_os = "linux")]
+fn unified_cgroup(proc_cgroup: &str) -> &str {
+    proc_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("a cgroup v2 `0::` line")
+}
+
+/// A closed descriptor 0, 1 or 2 cannot capture the child's placement write.
+///
+/// A descriptor the supervisor opens takes the lowest free number. With 0, 1 or 2 closed at
+/// spawn time, a `cgroup.procs` fd opened there collides with the child's stdio: `std` `dup2`s
+/// the child's stdio onto 0/1/2 before any `pre_exec` runs, so the placement write lands in the
+/// user's file, succeeds, and reports a placement that never happened. A `Stdio::from_file` end
+/// is a dup numbered 3 or above, so it does not fill the gap first.
+///
+/// Each slot runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
+/// is process-wide, so in a binary with other tests running it would hand their next `open` the
+/// slot, and with 2 closed a failing assertion's message would go nowhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write() {
+    const NAME: &str = "linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write";
+    const SLOT_ENV: &str = "COSCA_TEST_CLOSED_SLOT";
+
+    stderr_log::install();
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    if let Ok(slot) = std::env::var(SLOT_ENV) {
+        return spawn_with_slot_closed(slot.parse().ok());
+    }
+    // "open" is the control: the same spawn with every slot open.
+    let failures: Vec<String> = ["open", "0", "1", "2"]
+        .into_iter()
+        .filter_map(|slot| {
+            let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(SLOT_ENV, slot)
+                .output()
+                .expect("run this test with one slot closed");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
+                format!(
+                    "slot {slot}: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// One case of [`linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write`]:
+/// spawn a contained `sh` with `slot` closed in this process and wired to a file in the child.
+#[cfg(target_os = "linux")]
+fn spawn_with_slot_closed(slot: Option<i32>) {
+    use std::io::{BufRead, Seek};
+
+    const CONTENTS: &[u8] = b"untouched\n";
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+    let own = unified_cgroup(&own).to_string();
+    let mut file = tempfile::tempfile().expect("tempfile");
+    file.write_all(CONTENTS).expect("fill the file");
+    file.rewind().expect("rewind the file");
+
+    let mut cmd = Command::new();
+    // The root stays alive in `wait` for as long as the worker does.
+    cmd.executable("/bin/sh")
+        .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & wait"#, testbin(), &addr]);
+    if let Some(slot) = slot {
+        cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
+            .expect("wire the slot to the file");
+    }
+    cmd.contain();
+
+    // Everything this process needs open is opened above, so nothing fills the gap but the spawn.
+    // SAFETY: `slot` is one of this process's own std descriptors; it is closed only across the
+    // spawn and restored from `saved` before anything else runs.
+    let saved = slot.map(|slot| unsafe {
+        let saved = libc::dup(slot);
+        assert!(saved >= 0, "dup({slot}): {}", std::io::Error::last_os_error());
+        assert_eq!(libc::close(slot), 0, "close({slot})");
+        (slot, saved)
+    });
+    let spawned = cmd.spawn();
+    if let Some((slot, saved)) = saved {
+        // SAFETY: `saved` is this process's own open descriptor, duplicated above.
+        unsafe {
+            assert_eq!(libc::dup2(saved, slot), slot, "restore fd {slot}");
+            libc::close(saved);
+        }
+    }
+    let child = spawned.expect("spawn");
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+
+    let (worker, _) = listener.accept().expect("accept the worker");
+    let mut worker = std::io::BufReader::new(worker);
+    let mut hello = String::new();
+    worker.read_line(&mut hello).expect("read the worker's hello");
+    let worker_pid: u32 = hello
+        .trim()
+        .strip_prefix('G')
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("expected the worker's tagged pid, got {hello:?}"));
+
+    // The root is alive in `wait`, so its cgroup is readable; the worker inherited the same one.
+    let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
+    let root_cgroup = unified_cgroup(&root_cgroup);
+    let leaf_prefix = format!("{own}/cosca-{}-", std::process::id());
+    assert!(
+        root_cgroup
+            .strip_prefix(&leaf_prefix)
+            .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())),
+        "slot {slot:?}: the child must be in its leaf {leaf_prefix}<seq>, but is in {root_cgroup}"
+    );
+    let worker_cgroup = std::fs::read_to_string(format!("/proc/{worker_pid}/cgroup")).expect("worker cgroup");
+    assert_eq!(
+        unified_cgroup(&worker_cgroup),
+        root_cgroup,
+        "the worker is in the root's leaf"
+    );
+
+    let mut written = Vec::new();
+    file.rewind().expect("rewind the file");
+    file.read_to_end(&mut written).expect("read the file back");
+    assert_eq!(
+        String::from_utf8_lossy(&written),
+        String::from_utf8_lossy(CONTENTS),
+        "slot {slot:?}: the placement write landed in the child's stdio file"
+    );
+
+    // Proof of life before the kill: a round trip only a live worker completes.
+    worker.get_mut().write_all(b"x").expect("write to the worker");
+    let mut echo = [0u8; 1];
+    worker.read_exact(&mut echo).expect("the worker echoes while alive");
+    assert_eq!(&echo, b"x");
+
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    let mut buf = [0u8; 1];
+    let n = worker.read(&mut buf).expect("read the worker's control socket");
+    assert_eq!(n, 0, "cgroup.kill must kill the worker");
+}

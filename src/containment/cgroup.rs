@@ -165,7 +165,7 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
-    /// `cgroup.procs` could not be opened for writing.
+    /// `cgroup.procs` could not be opened for writing, or moved to fd 3 or above.
     #[error("could not open {} for writing: {source}", path.display())]
     OpenProcs {
         path: PathBuf,
@@ -657,6 +657,18 @@ impl ReportSlot {
     }
 }
 
+#[cfg(all(target_os = "linux", test))]
+impl ReportSlot {
+    /// Store `Placed` without any write, for tests of what cosca does with a report.
+    ///
+    /// # Safety
+    /// As [`ReportSlot::report`].
+    pub(crate) unsafe fn report_placed_for_test(self) {
+        // Safety: the caller guarantees the mapping is live.
+        unsafe { self.report(REPORT_PLACED) };
+    }
+}
+
 /// A live leaf sub-cgroup created for a single spawned process tree.
 ///
 /// The `pre_exec` closure writes `"0"` to `procs_fd` to place the forked
@@ -674,7 +686,8 @@ pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
     leaf_path: PathBuf,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
-    /// between `fork` and `exec`, and no program this process starts may inherit it.
+    /// between `fork` and `exec`, and no program this process starts may inherit it. Numbered
+    /// 3 or above, so it never shares a number with the child's stdio.
     procs_fd: RawFd,
     /// Where the forked child reports whether its self-placement write succeeded.
     report: ReportPage,
@@ -1083,11 +1096,20 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         Err(e) => return Err(fail(&leaf_path, LeafError::MapReportPage(e))),
     };
 
-    // Open cgroup.procs for writing. std opens it O_CLOEXEC, and it stays that way: the
-    // child's pre_exec write runs after fork and before exec, where the fd is still open.
+    // Open cgroup.procs for writing, close-on-exec: the child's pre_exec write runs after fork
+    // and before exec, where the fd is still open.
+    //
+    // Then move it to fd 3 or above. `open` takes the lowest free number, so with 0, 1 or 2
+    // closed here the fd would share its number with one of the child's stdio slots, which std
+    // `dup2`s into place before any pre_exec runs: the placement write would land in the
+    // caller's stdio target instead, and report a placement that never happened.
     let procs_path = leaf_path.join("cgroup.procs");
-    let procs_file: File = match OpenOptions::new().write(true).open(&procs_path) {
-        Ok(f) => f,
+    let procs_fd = OpenOptions::new()
+        .write(true)
+        .open(&procs_path)
+        .and_then(|file| Ok(rustix::io::fcntl_dupfd_cloexec(&file, 3)?));
+    let procs_fd = match procs_fd {
+        Ok(fd) => fd.into_raw_fd(),
         Err(source) => {
             return Err(fail(
                 &leaf_path,
@@ -1098,7 +1120,6 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
             ))
         }
     };
-    let procs_fd = procs_file.into_raw_fd();
 
     Ok(CgroupLeaf {
         leaf_path,
