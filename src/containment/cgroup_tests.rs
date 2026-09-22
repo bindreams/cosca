@@ -827,11 +827,13 @@ fn every_degrade_reason_has_its_own_kind() {
     }
 }
 
-// /proc/self/cgroup disclosure -----
-// A degrade record goes to a sink the embedder chose, which cosca knows nothing about. The
-// PATHS in /proc/self/cgroup are the caller's identity — uid (`user-1000.slice`), systemd
-// session and scope ids, and under Kubernetes or Docker the pod UID and container id — and none
-// of them is the diagnosis for "this file has no 0:: line".
+// /proc/self/cgroup summary -----
+// `/proc/self/cgroup` is a whole-system dump of every hierarchy the caller is in, read to look
+// up one `0::` line. When there is no such line, none of its paths is one cosca touched, and
+// none of them separates a v1-only host from an unmounted unified hierarchy from an empty
+// file — so only the line count and controllers come back. The sibling variants keep their
+// paths for the opposite reason, pinned by `leaf_error_names_step_path_and_reason` and by
+// `the_leaf_path_reaches_the_record_verbatim` below.
 
 /// The summary keeps every fact that separates a v1-only host from an unmounted unified
 /// hierarchy from an empty file, and drops every path.
@@ -882,6 +884,25 @@ fn no_unified_line_summarizes_an_empty_file() {
     }
     .to_string();
     assert!(rendered.contains('0'), "the line count is the fact here: {rendered:?}");
+}
+
+/// The asymmetry is deliberate, not an oversight in the summary's reach: a step that FAILED on
+/// a path reports that path in full, identifiers and all. It is the one path the syscall
+/// touched, it is the diagnosis, and a record without it says only that some mkdir somewhere
+/// was refused.
+#[test]
+fn the_leaf_path_reaches_the_record_verbatim() {
+    let leaf = "/sys/fs/cgroup/kubepods/pod4f8c1e2a-9d3b-11ee-b9d1-0242ac120002/cosca-7-0";
+    let rendered = LeafError::CreateLeafDir {
+        path: PathBuf::from(leaf),
+        source: std::io::Error::from_raw_os_error(13),
+    }
+    .to_string();
+    assert!(
+        rendered.contains(leaf),
+        "the failing mkdir's own path is the diagnosis and must not be summarized away: got \
+         {rendered:?}"
+    );
 }
 
 /// A line the kernel format does not explain is reported as unparseable, never quoted: an
