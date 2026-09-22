@@ -661,6 +661,140 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     (child, gc.expect("grandchild connected"))
 }
 
+/// A contained `spawn-grandchild-echo` tree, with BOTH members' live control sockets.
+///
+/// Unlike [`spawn_contained_tree`], each member round-trips a byte instead of merely holding
+/// its socket open, so a test can prove a member is POSITIVELY alive. `control-block`'s EOF is
+/// proof of death and no evidence at all of life: a peer that was killed and a peer that is
+/// still running both fail to produce a byte, and the write that precedes the read succeeds
+/// against a dead peer too (the first write into a socket whose peer is gone is buffered, not
+/// refused). See `spawn-grandchild-echo` in `testbin/main.rs`.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+struct EchoTree {
+    child: cosca::Child,
+    root: std::net::TcpStream,
+    grand: std::net::TcpStream,
+    /// The grandchild's own pid, for reading the tree's cgroup back out of `/proc`.
+    #[cfg(target_os = "linux")]
+    grand_pid: u32,
+}
+
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = Command::new();
+    cmd.executable(testbin())
+        .args(["cosca_testbin", "spawn-grandchild-echo", &addr]);
+    cmd.contain();
+    cmd.kill_on_drop(kill_on_drop);
+    // As in `spawn_contained_tree`: every caller asserts an achieved mechanism that can
+    // silently be a weaker one, so route the reason for that.
+    #[cfg(unix)]
+    stderr_log::install();
+    let child = cmd.spawn().expect("spawn");
+    // Accept order is not guaranteed, so demux by tag. Both connections being accepted is
+    // itself proof both members are alive — no is_alive() race.
+    let (mut root, mut grand) = (None, None);
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept control conn");
+        match read_tag_and_pid(&mut s) {
+            (b'R', pid) => root = Some((s, pid)),
+            (b'G', pid) => grand = Some((s, pid)),
+            (tag, _) => panic!("unexpected tree tag {:?}", tag as char),
+        }
+    }
+    let (root, _root_pid) = root.expect("root R connected");
+    let (grand, _grand_pid) = grand.expect("grandchild G connected");
+    EchoTree {
+        child,
+        root,
+        grand,
+        #[cfg(target_os = "linux")]
+        grand_pid: _grand_pid,
+    }
+}
+
+/// Read one `<tag><pid>\n` line from a freshly accepted `control-echo-pid` connection.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn read_tag_and_pid(sock: &mut std::net::TcpStream) -> (u8, u32) {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        let n = sock.read(&mut b).expect("read the control line");
+        assert_ne!(n, 0, "the control connection closed before sending its tag line");
+        if b[0] == b'\n' {
+            break;
+        }
+        line.push(b[0]);
+    }
+    assert!(line.len() > 1, "a control line is a tag plus a pid, got {line:?}");
+    let pid = std::str::from_utf8(&line[1..])
+        .expect("the pid is ASCII")
+        .parse()
+        .expect("the pid is a number");
+    (line[0], pid)
+}
+
+/// Prove a `control-echo-pid` member is POSITIVELY alive: send a byte and read the echo back.
+/// A killed member gives EOF or `ConnectionReset` on the read instead, never the byte.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
+    sock.write_all(b"p")
+        .unwrap_or_else(|e| panic!("{who} must accept a write while alive: {e}"));
+    let mut b = [0u8; 1];
+    sock.read_exact(&mut b)
+        .unwrap_or_else(|e| panic!("{who} must echo the byte back while alive: {e}"));
+    assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
+}
+
+/// The cgroup v2 leaf `pid` is in, as an absolute path. Mirrors the join
+/// `containment::cgroup` makes for itself: `/proc/<pid>/cgroup`'s `0::` line is relative to
+/// this process's cgroup namespace, whose root is `/sys/fs/cgroup`.
+#[cfg(target_os = "linux")]
+fn cgroup_of(pid: u32) -> std::path::PathBuf {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read /proc/<pid>/cgroup");
+    let rel = contents
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .expect("a cgroup v2 unified (`0::`) line")
+        .to_string();
+    std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
+}
+
+/// Wait for `leaf` to drain, then remove it.
+///
+/// A tree whose handle opted out of teardown keeps its leaf, and nothing — cosca, or any
+/// cgroup manager — ever revisits a `cosca-*` cgroup, so a test that walks away from one adds
+/// a permanent stray to the very lane that counts them (issue #140). Cleaning up is the test's
+/// own job, exactly as it is `drop_warns_for_a_real_leaf_held_by_a_descendant_cgroup`'s.
+///
+/// The wait is on the kernel's own edge, never on a clock: `cgroup.events`'s `populated` flips
+/// 1 -> 0 exactly when the leaf's last task exits, and `POLLPRI` fires on that transition.
+/// `populated` is read before every poll, so a transition that already happened is seen on the
+/// read rather than waited out for an edge that will not fire again.
+#[cfg(target_os = "linux")]
+fn drain_and_remove_leaf(leaf: &std::path::Path) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    use rustix::event::{poll, PollFd, PollFlags};
+
+    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open the leaf's cgroup.events");
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        events.seek(SeekFrom::Start(0)).expect("rewind cgroup.events");
+        events.read_to_string(&mut buf).expect("read cgroup.events");
+        if buf.lines().any(|l| l.trim() == "populated 0") {
+            break;
+        }
+        let mut fds = [PollFd::new(&events, PollFlags::PRI)];
+        poll(&mut fds, None).expect("poll cgroup.events");
+    }
+    std::fs::remove_dir(leaf).expect("remove the drained leaf");
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_kill_tree_reaps_the_grandchild() {
@@ -777,39 +911,51 @@ fn windows_child_is_inside_our_job_after_spawn() {
     let _ = child.wait();
 }
 
-/// `detach()` must NOT kill the grandchild's process tree.
-/// Proof: the grandchild's control socket must stay open after detach. We
-/// prove liveness by writing a byte (which causes the grandchild's blocking
-/// `sock.read` to return 1, letting it exit cleanly) and then observing EOF —
-/// a voluntary, natural exit rather than a job-kill EOF. The critical ordering
-/// is: detach FIRST, then write. If KILL_ON_JOB_CLOSE fired on detach, the
-/// grandchild would already be dead and the write would fail with BrokenPipe.
+/// `detach()` must NOT kill the tree: `KILL_ON_JOB_CLOSE` has to be cleared before the job
+/// handle is released. Proof is a real byte round trip through BOTH members, taken AFTER the
+/// detach — a write alone proves nothing (the first write into a socket whose peer is gone is
+/// buffered, not refused) and a subsequent EOF proves only death.
 #[cfg(windows)]
 #[test]
 fn windows_detach_leaves_the_tree_running() {
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let EchoTree {
+        child,
+        mut root,
+        mut grand,
+    } = spawn_contained_echo_tree(true);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
-    // detach() must clear KILL_ON_JOB_CLOSE before closing the job handle.
     child.detach();
 
-    // Send a byte to the grandchild's control socket. If KILL_ON_JOB_CLOSE
-    // fired during detach, the grandchild is dead and this write fails with
-    // BrokenPipe — a hard assertion failure, not a silent pass.
-    gc_stream
-        .write_all(b"p")
-        .expect("grandchild control socket must accept write after detach (tree still alive)");
+    assert_echoes(&mut root, "the detached root");
+    assert_echoes(&mut grand, "the detached grandchild");
 
-    // Grandchild received the byte (its blocking read returned 1) and exited
-    // voluntarily — confirm by waiting for EOF on the control socket.
-    let mut buf = [0u8; 1];
-    let n = gc_stream
-        .read(&mut buf)
-        .expect("read grandchild control socket after detach");
-    assert_eq!(
-        n, 0,
-        "expected EOF after grandchild exited voluntarily; if n=1, it is still alive (not an error but unexpected)"
-    );
+    // Release both: each read returns Ok(0) and the member exits on its own.
+    drop(root);
+    drop(grand);
+}
+
+/// `kill_on_drop(false)` must leave a contained tree running, exactly as `detach()` does —
+/// `Command::kill_on_drop` documents the two as the same opt-out. The Job Object is a field of
+/// the handle and closes with it whatever the flag says, so this holds only because the spawn
+/// disarmed it.
+#[cfg(windows)]
+#[test]
+fn windows_kill_on_drop_false_leaves_the_tree_running() {
+    let EchoTree {
+        child,
+        mut root,
+        mut grand,
+    } = spawn_contained_echo_tree(false);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
+
+    drop(child);
+
+    assert_echoes(&mut root, "the opted-out root");
+    assert_echoes(&mut grand, "the opted-out grandchild");
+
+    drop(root);
+    drop(grand);
 }
 
 // Unix session containment =====
@@ -1168,11 +1314,14 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     assert_eq!(n, 0, "cgroup terminate must SIGTERM the grandchild, not just the root");
 }
 
-/// `detach()` must NOT kill a cgroup-contained tree. Same contract, and the same proof, as
-/// `windows_detach_leaves_the_tree_running`: detach FIRST, then write to the grandchild's
-/// control socket. `CgroupLeaf::drop` runs whatever `kill_on_drop` says, and its first `rmdir`
-/// fails `EBUSY` over a live detached tree — so without a disarm it fires `cgroup.kill` and the
-/// write below fails with `BrokenPipe`.
+/// `detach()` must NOT kill a cgroup-contained tree. `CgroupLeaf::drop` runs whatever
+/// `kill_on_drop` says, and its first `rmdir` fails `EBUSY` over a live detached tree — so
+/// without a disarm it fires `cgroup.kill` and both members below are already dead.
+///
+/// Same proof as `windows_detach_leaves_the_tree_running`: a real byte round trip through both
+/// members, taken AFTER the detach. A write alone proves nothing (the first write into a socket
+/// whose peer is gone is buffered, not refused) and the EOF that follows proves only death —
+/// which is why this test used to pass with the disarm reverted.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_cgroup_v2_detach_leaves_the_tree_running() {
@@ -1180,7 +1329,35 @@ fn linux_cgroup_v2_detach_leaves_the_tree_running() {
     if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         return; // unprovisioned: not a CI-cgroup environment.
     }
-    let (child, mut gc_stream) = spawn_contained_tree();
+    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(true), |child| child.detach());
+}
+
+/// `kill_on_drop(false)` must leave a cgroup-contained tree running, exactly as `detach()`
+/// does — `Command::kill_on_drop` documents the two as the same opt-out, and the leaf drops
+/// with the handle whatever the flag says.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
+    stderr_log::install();
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(false), drop);
+}
+
+/// Shared body of the two cgroup opt-out tests: spawn a contained echo tree, note the leaf it
+/// was placed in, release the handle through `opt_out`, and prove BOTH members are still alive
+/// by a byte round trip. Then release the tree and remove the leaf it kept — the opt-out is
+/// exactly the case cosca cannot come back for, so leaving it is one more permanent `cosca-*`
+/// on the host (issue #140) in the lane that exists to count them.
+#[cfg(target_os = "linux")]
+fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: impl FnOnce(cosca::Child)) {
+    let EchoTree {
+        child,
+        mut root,
+        mut grand,
+        grand_pid,
+    } = spawn();
     assert_eq!(
         child.containment(),
         cosca::Containment::CgroupV2,
@@ -1188,19 +1365,23 @@ fn linux_cgroup_v2_detach_leaves_the_tree_running() {
          is a delegated cgroup v2 slice available?",
         child.containment()
     );
+    let leaf = cgroup_of(grand_pid);
+    assert!(
+        leaf.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),
+        "the tree must be in a cosca leaf, got {}",
+        leaf.display()
+    );
 
-    child.detach();
+    opt_out(child);
 
-    gc_stream
-        .write_all(b"p")
-        .expect("grandchild control socket must accept write after detach (tree still alive)");
+    assert_echoes(&mut root, "the opted-out root");
+    assert_echoes(&mut grand, "the opted-out grandchild");
 
-    // The grandchild read its byte and exited voluntarily — a natural EOF, not a kill.
-    let mut buf = [0u8; 1];
-    let n = gc_stream
-        .read(&mut buf)
-        .expect("read grandchild control socket after detach");
-    assert_eq!(n, 0, "expected EOF after the grandchild exited voluntarily");
+    // Release both: each read returns Ok(0) and the member exits on its own.
+    drop(root);
+    drop(grand);
+    drain_and_remove_leaf(&leaf);
 }
 
 /// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
