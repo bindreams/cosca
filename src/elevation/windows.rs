@@ -438,23 +438,17 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // CVE-2024-24576, which the raw and std backends both refuse outright.
     //
     // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE. It therefore does NOT
-    // close the batch vector, and three surfaces stay open — only one of them an extension question:
-    //   - extension COMPLETION. `args(["setup", "a&calc"])` has no extension for `Path::extension`
-    //     to read, so it passes; with only `setup.bat` on PATH, `ShellExecuteEx` completes it via
-    //     PATHEXT and the same unescaped `%*` injection follows.
-    //   - other registered `runas` associations spelled outright (`.lnk`, `.vbs`/`.js`/`.wsf`,
-    //     `.msc`, …) that `CreateProcessW` refuses.
-    //   - token NORMALIZATION before the load. Win32 strips trailing dots and spaces and resolves
-    //     the token as a path, so `setup.bat.`, `setup.bat ` and `/tools/.bat` all reach the same
-    //     batch file while `Path::extension()` reads `None` or something that is not `bat`. The
-    //     batch-gate work landing ahead of this PR closes this class; nothing in THIS tree does,
-    //     so do not read the gate below as covering it.
-    // An extension allowlist addresses only the second. The first is closed by RESOLUTION: resolving
-    // `program` to an absolute path before the call makes the completion OURS, and ours never reads
-    // PATHEXT — `resolve_executable_in` tries `dir/setup`, then (only for an extension-less token)
-    // `dir/setup.exe`. So `setup` resolves to a same-named extension-less file where one exists and
-    // otherwise fails `NotFound`; `setup.bat` is not a candidate either way. Those two land in later
-    // PRs, not this one.
+    // close the batch vector. Two of the open surfaces are `wide_nul`'s doc's to name — PATHEXT
+    // completion of an extension-less token, and the other registered `runas` associations. Each
+    // lands in a later PR: resolution makes the completion ours (`resolve_executable_in` never
+    // reads PATHEXT), and an extension allowlist covers the associations.
+    //
+    // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
+    // resolves the token as a path, so `setup.bat.`, `setup.bat ` and `C:\tools\.bat` all reach the
+    // same batch file while `Path::extension()` reads `None` or something that is not `bat`. That
+    // class is closed by the batch-gate PR merging immediately before this one, which replaces the
+    // `Path::extension()` reading with a byte-level effective-name computation. NOTHING IN THIS
+    // TREE closes it: until that merge lands, do not read the gate below as covering it.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
