@@ -500,8 +500,12 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
             None => Cow::Borrowed(prog),
         }
     }
-    // No portable byte view to split on, and nothing here truncates: the token is its own prefix.
-    // A NUL then falls through to std's own program conversion, which refuses it at spawn.
+    // No portable byte view to split on, and nothing here truncates: the token IS its own prefix.
+    // `reject_batch_path_on` therefore finds prefix == token under `win32 == false` and returns
+    // `Ok`, leaving a NUL to std's own program conversion, which refuses it at spawn.
+    //
+    // Unreachable in any buildable configuration regardless: `crate::wait`'s `compile_error!`
+    // rejects every target that is not Linux, macOS or Windows.
     #[cfg(not(any(unix, windows)))]
     {
         Cow::Borrowed(prog)
