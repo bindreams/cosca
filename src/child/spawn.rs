@@ -376,7 +376,8 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
         }
         CommandInput::CommandLine(line) => build_from_commandline(cmd, line)?,
     };
-    // Reject .bat/.cmd (BatBadBut) — only meaningful on Windows. Judged on the token WE resolved,
+    // Reject .bat/.cmd (BatBadBut) on Windows, and an interior NUL everywhere — this is the std
+    // backend's only NUL check, and the default Windows path. Judged on the token WE resolved,
     // not on `std_cmd.get_program()`: std's Unix constructor swaps a NUL-bearing program for a
     // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
