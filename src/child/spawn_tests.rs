@@ -422,14 +422,13 @@ fn the_std_backend_judges_the_program_token_the_caller_named() {
 /// the NUL, never as the batch vector — what Win32 would load is `C:\tools\setup`, which carries
 /// no batch vector at all.
 ///
-/// Asserted as "not the batch refusal" rather than as an `Ok`, because the token is still refused
-/// — as a NUL here, and by std's own wide-string conversion a step later on Windows.
+/// Asserted as an `Io(InvalidInput)` and not merely as "not `Unsupported`": an `Ok` satisfies the
+/// negative form, which cannot tell "refused for the right reason" from "not refused at all" —
+/// and what follows an `Ok` here is `std::process`, whose own NUL check is an internal of another
+/// crate for this one to be leaning on.
 #[test]
 fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
     let mut c = Command::new();
     c.args([with_interior_nul(r"C:\tools\setup", ".bat")]);
-    assert!(
-        !matches!(super::build_std_command(&c), Err(Error::Unsupported { .. })),
-        "the truncated prefix is not a batch file, so the batch vector is the wrong diagnosis"
-    );
+    invalid_input_message(super::build_std_command(&c));
 }
