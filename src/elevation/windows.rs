@@ -408,9 +408,11 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     //   - other registered `runas` associations spelled outright (`.lnk`, `.vbs`/`.js`/`.wsf`,
     //     `.msc`, …) that `CreateProcessW` refuses.
     // An extension allowlist addresses only the second. The first is closed by RESOLUTION: resolving
-    // `program` to an absolute path before the call makes the completion ours, and the bare-name rule
-    // yields exactly one candidate (`setup.exe`), so a token that would have completed to `setup.bat`
-    // fails `NotFound` and never reaches `ShellExecuteEx`. Both land in later PRs, not this one.
+    // `program` to an absolute path before the call makes the completion OURS, and ours never reads
+    // PATHEXT — `resolve_executable_in` tries `dir/setup`, then (only for an extension-less token)
+    // `dir/setup.exe`. So `setup` resolves to a same-named extension-less file where one exists and
+    // otherwise fails `NotFound`; `setup.bat` is not a candidate either way. Both land in later PRs,
+    // not this one.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     // Refused for an interior NUL rather than silently truncated — see `wide_nul`. `params` is
