@@ -836,6 +836,27 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     );
 }
 
+/// A disarmed leaf whose directory is already GONE leaves nothing behind, so `Drop` must not
+/// say it did. `rmdir` failing with `ENOENT` is proof of removal, not of survival — the armed
+/// path already reads it that way, and a detached leaf's one `rmdir` is the only reading it
+/// gets.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
+    crate::log_capture::install();
+    let leaf = super::CgroupLeaf::for_test_at(PathBuf::from("/nonexistent/cosca-detached-gone-leaf"));
+    leaf.disarm();
+
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-detached-gone-leaf"),
+        Vec::<log::Level>::new(),
+        "nothing is left behind for the detached tree, so there is nothing to report"
+    );
+}
+
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
 /// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note

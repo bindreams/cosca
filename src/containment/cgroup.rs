@@ -906,11 +906,18 @@ impl Drop for CgroupLeaf {
         // for as long as the tree does, and after that for good — the caller asked for the
         // tree, and cosca has no way to come back for the leaf. Reported once, at `debug`: it
         // is one more `cosca-*` on this host (issue #140), but an intended one.
+        //
+        // Unless the leaf is GONE, which `ENOENT`/`ENODEV` prove ([`removed_after_drain`]) —
+        // nothing was left behind and there is nothing to report. The armed path reaches the
+        // same reading through its SECOND `rmdir`; a detached leaf's single one is the only
+        // reading it gets, so it must be made here.
         if !self.armed.load(Ordering::Relaxed) {
-            log::debug!(
-                "cgroup leaf {} is left behind for a detached tree ({first})",
-                self.leaf_path.display()
-            );
+            if !removed_after_drain(&first) {
+                log::debug!(
+                    "cgroup leaf {} is left behind for a detached tree ({first})",
+                    self.leaf_path.display()
+                );
+            }
             return;
         }
         let kill = self.hard_kill();
