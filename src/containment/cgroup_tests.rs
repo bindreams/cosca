@@ -823,6 +823,51 @@ fn drop_reports_a_leaf_it_could_not_remove() {
     );
 }
 
+/// `Drop` writes `cgroup.kill` only through a leaf its child reported entering. A spawn that
+/// failed before the child's `pre_exec` ran (a missing `current_dir`), or whose write failed,
+/// put nothing there: whatever keeps the leaf from being removed, cosca did not put there.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_kills_only_through_a_leaf_its_child_entered() {
+    crate::log_capture::install();
+    for (report, kills) in [
+        (PlacementReport::NotReported, false),
+        (PlacementReport::WriteFailed(libc::EBADF), false),
+        (PlacementReport::Placed, true),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-drop-kill-leaf");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+
+        let leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+        match report {
+            PlacementReport::NotReported => {}
+            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
+            // no-op. The slot's page lives as long as `leaf`.
+            PlacementReport::WriteFailed(_) => {
+                let _ = unsafe { super::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+            }
+            // SAFETY: the slot's page lives as long as `leaf`.
+            PlacementReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
+        }
+        assert_eq!(leaf.report.read(), report);
+        let mark = crate::log_capture::mark();
+        drop(leaf);
+
+        assert_eq!(
+            leaf_path.join("cgroup.kill").exists(),
+            kills,
+            "a child that reported {report:?}: cgroup.kill written must be {kills}"
+        );
+        assert_eq!(
+            crate::log_capture::levels_since(mark, &leaf_path.to_string_lossy()),
+            vec![log::Level::Warn],
+            "the unremoved leaf is reported either way"
+        );
+    }
+}
+
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
 /// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note

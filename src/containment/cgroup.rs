@@ -678,9 +678,8 @@ impl ReportSlot {
 /// rule), the closure returns an error and the spawn falls back to the
 /// process-group mechanism.
 ///
-/// `Drop` closes the parent's `procs_fd` and removes the leaf directory,
-/// firing `cgroup.kill` first if the leaf is still occupied — unless
-/// [`CgroupLeaf::remove_unentered`] consumed it.
+/// `Drop` closes the parent's `procs_fd` and removes the leaf directory. If the leaf is still
+/// occupied, it fires `cgroup.kill` and retries — but only if the child reported entering it.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
@@ -691,9 +690,6 @@ pub(crate) struct CgroupLeaf {
     procs_fd: RawFd,
     /// Where the forked child reports whether its self-placement write succeeded.
     report: ReportPage,
-    /// Whether `Drop` may write `cgroup.kill`. Cleared only by
-    /// [`CgroupLeaf::remove_unentered`].
-    may_hold_members: bool,
 }
 
 // Safety: RawFd is an integer. CgroupLeaf is not Clone; the fd is used only in
@@ -720,8 +716,12 @@ impl CgroupLeaf {
     /// The child reported no successful write, so nothing it forks is in the leaf either.
     /// Whatever keeps the `rmdir` from succeeding, cosca did not put there, and killing it would
     /// kill a process cosca was never asked to contain.
-    pub(crate) fn remove_unentered(mut self) {
-        self.may_hold_members = false;
+    pub(crate) fn remove_unentered(self) {
+        debug_assert_ne!(
+            self.report.read(),
+            PlacementReport::Placed,
+            "remove_unentered on a leaf its child entered"
+        );
     }
 
     /// A `Copy` handle to this leaf's placement-report slot, for capture by the `pre_exec`
@@ -885,7 +885,6 @@ impl CgroupLeaf {
             leaf_path,
             procs_fd: -1,
             report: ReportPage::new().expect("map a placement-report page"),
-            may_hold_members: true,
         }
     }
 }
@@ -897,11 +896,13 @@ impl Drop for CgroupLeaf {
         // Safety: we own this fd; it was created by try_create_leaf and never cloned.
         unsafe { libc::close(self.procs_fd) };
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
-        // to drain it, then retry. A leaf that outlives both attempts is reported.
+        // to drain it, then retry — but only if the child entered it: a spawn that failed before
+        // its pre_exec ran, or whose write failed, put nothing in the leaf. A leaf that outlives
+        // the removal is reported.
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
-        if !self.may_hold_members {
+        if self.report.read() != PlacementReport::Placed {
             if !removed_after_drain(&first) {
                 warn_leaf_left_behind(
                     &self.leaf_path,
@@ -1125,7 +1126,6 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         leaf_path,
         procs_fd,
         report,
-        may_hold_members: true,
     })
 }
 
