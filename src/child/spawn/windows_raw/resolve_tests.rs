@@ -775,15 +775,9 @@ fn absolutise_exact_refuses_an_empty_program() {
     assert!(absolutise_exact(Path::new("")).is_err());
 }
 
-/// A name that names a DIRECTORY fails closed on the `Exact` arm too. `GetFullPathNameW` would
-/// happily normalise `C:\t\.` to `C:\t` and hand a directory on to `ShellExecuteEx`, where the
-/// `runas` verb on a folder is not a spawn at all. `raw_executable`'s "load exactly this file"
-/// cannot be honoured by a path with no file in it.
-///
-/// The predicate itself is covered from any host in `crate::resolve`'s tests; this pins the
-/// WIRING, which is Windows-only. Kills "drop the call from `absolutise_exact`" for EACH of its two
-/// calls: `C:\t\...` and `C:\t\. ` (one trailing space) pass the pre-check as written and name no
-/// file only once `GetFullPathNameW` strips the final component's trailing dots and spaces.
+/// Kills dropping EITHER of `absolutise_exact`'s two shape checks (see its comments):
+/// `C:\t\.` needs the pre-check, while `C:\t\...` and `C:\t\. ` (one trailing space) name no file
+/// only after normalisation and need the post-check.
 #[test]
 fn absolutise_exact_refuses_a_program_that_names_no_file() {
     for n in [
@@ -820,9 +814,8 @@ fn absolutise_exact_refuses_an_interior_nul() {
     }
 }
 
-/// The NUL check runs FIRST, so a value that is both truncating and shapeless is blamed on the
-/// NUL: `x` + NUL + `\` would otherwise be reported as naming no file, which only its
-/// untruncated spelling does.
+/// Kills moving `absolutise_exact`'s NUL check below its shape check (see its comment):
+/// `x` + NUL + `\` must be blamed on the NUL.
 #[test]
 fn absolutise_exact_reports_an_interior_nul_ahead_of_the_shape() {
     use std::os::windows::ffi::OsStringExt;
