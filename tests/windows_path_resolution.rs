@@ -889,7 +889,7 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
             let loaded = file_identity(&verbatim_spelling(image));
             println!("  image={image:?} opened verbatim has identity {loaded:?}");
             facts.check(
-                loaded.as_ref() != Ok(&planted),
+                loaded.as_ref() == Ok(&planted),
                 &format!("std::process on verbatim {name:?} loads that file, not another"),
                 format_args!("image={image:?} with identity {loaded:?}, planted {planted:?}"),
             );
