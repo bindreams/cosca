@@ -318,8 +318,11 @@ fn leaf_error_names_step_path_and_reason() {
             &["/proc/self/cgroup", "denied"],
         ),
         (
-            LeafError::NoUnifiedLine("9:memory:/foo\n".into()),
-            &["/proc/self/cgroup", "0::", "9:memory:/foo"],
+            LeafError::NoUnifiedLine {
+                line_count: 1,
+                controllers: "9:memory".into(),
+            },
+            &["/proc/self/cgroup", "0::", "9:memory"],
         ),
         (
             LeafError::CreateLeafDir {
@@ -767,7 +770,10 @@ fn every_degrade_reason_has_its_own_kind() {
 
     let reasons: Vec<Box<dyn DegradeReason>> = vec![
         Box::new(LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13))),
-        Box::new(LeafError::NoUnifiedLine("9:memory:/foo\n".into())),
+        Box::new(LeafError::NoUnifiedLine {
+            line_count: 1,
+            controllers: "9:memory".into(),
+        }),
         Box::new(LeafError::CreateLeafDir {
             path: PathBuf::from("/cg/leaf"),
             source: std::io::Error::from_raw_os_error(13),
@@ -809,4 +815,73 @@ fn every_degrade_reason_has_its_own_kind() {
         assert!(!seen.contains(&kind), "{kind:?} is claimed by two different reasons");
         seen.push(kind);
     }
+}
+
+// /proc/self/cgroup disclosure -----
+// A degrade record goes to a sink the embedder chose, which cosca knows nothing about. The
+// PATHS in /proc/self/cgroup are the caller's identity — uid (`user-1000.slice`), systemd
+// session and scope ids, and under Kubernetes or Docker the pod UID and container id — and none
+// of them is the diagnosis for "this file has no 0:: line".
+
+/// The summary keeps every fact that separates a v1-only host from an unmounted unified
+/// hierarchy from an empty file, and drops every path.
+#[test]
+fn no_unified_line_reports_the_shape_of_the_file_not_its_paths() {
+    let real = concat!(
+        "12:freezer:/kubepods/burstable/pod4f8c1e2a-9d3b-11ee-b9d1-0242ac120002/\
+         3dc1f9a06b8e4a1c9f2b7d5e8a0c6413\n",
+        "11:memory:/user.slice/user-1000.slice\n",
+        "1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n",
+    );
+    let (line_count, controllers) = super::summarize_cgroup_controllers(real);
+    assert_eq!(line_count, 3);
+    assert_eq!(controllers, "12:freezer, 11:memory, 1:name=systemd");
+
+    let rendered = LeafError::NoUnifiedLine {
+        line_count,
+        controllers,
+    }
+    .to_string();
+    for identifier in [
+        "user-1000",
+        "session-3",
+        "pod4f8c1e2a",
+        "3dc1f9a06b8e4a1c9f2b7d5e8a0c6413",
+        "kubepods",
+    ] {
+        assert!(
+            !rendered.contains(identifier),
+            "{identifier:?} identifies the caller and must not reach an arbitrary sink; got \
+             {rendered:?}"
+        );
+    }
+    assert!(!rendered.contains('\n'), "one record, one line: {rendered:?}");
+    for kept in ["0::", "freezer", "memory", "name=systemd", "3"] {
+        assert!(rendered.contains(kept), "{kept:?} is the diagnosis; got {rendered:?}");
+    }
+}
+
+/// An empty `/proc/self/cgroup` is its own diagnosis and must still read as one.
+#[test]
+fn no_unified_line_summarizes_an_empty_file() {
+    let (line_count, controllers) = super::summarize_cgroup_controllers("");
+    assert_eq!(line_count, 0);
+    let rendered = LeafError::NoUnifiedLine {
+        line_count,
+        controllers,
+    }
+    .to_string();
+    assert!(rendered.contains('0'), "the line count is the fact here: {rendered:?}");
+}
+
+/// A line the kernel format does not explain is reported as unparseable, never quoted: an
+/// unrecognized line is exactly the case where cosca cannot know which part is a path.
+#[test]
+fn no_unified_line_never_quotes_a_line_it_could_not_parse() {
+    let (line_count, controllers) = super::summarize_cgroup_controllers("nonsense-with-no-colons\n");
+    assert_eq!(line_count, 1);
+    assert!(
+        !controllers.contains("nonsense"),
+        "an unparsed line's content must not be echoed: {controllers:?}"
+    );
 }

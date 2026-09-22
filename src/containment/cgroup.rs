@@ -63,6 +63,35 @@ pub(crate) fn cgroup_procs_contains(contents: &str, pid: u32) -> bool {
     false
 }
 
+/// Summarize the contents of `/proc/self/cgroup` for a degrade record: how many lines it had,
+/// and the `<hierarchy-id>:<controller-list>` prefix of each — never the paths.
+///
+/// A degrade record is handed to a sink cosca knows nothing about, and this file's paths are
+/// the caller's identity: the uid (`user-1000.slice`), the systemd session and scope ids, and
+/// under Kubernetes or Docker the pod UID and container id. None of that is the diagnosis. What
+/// separates "a v1-only host" from "the unified hierarchy is not mounted" from "the file was
+/// empty" is the line count and the controllers they named, which is exactly what comes back.
+///
+/// A line the documented `<id>:<controllers>:<path>` shape does not explain is reported as
+/// unparseable rather than quoted: an unrecognized line is precisely the case where cosca
+/// cannot know which part of it is a path.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn summarize_cgroup_controllers(proc_self_cgroup: &str) -> (usize, String) {
+    let mut controllers: Vec<&str> = Vec::new();
+    for line in proc_self_cgroup.lines() {
+        match line.match_indices(':').nth(1) {
+            Some((path_start, _)) => controllers.push(&line[..path_start]),
+            None => controllers.push("<unparseable line>"),
+        }
+    }
+    let rendered = if controllers.is_empty() {
+        "no controllers".to_string()
+    } else {
+        controllers.join(", ")
+    };
+    (controllers.len(), rendered)
+}
+
 /// Parse the `populated` field out of the contents of a cgroup v2 `cgroup.events` file
 /// (`populated 0`/`populated 1`, one `key value` pair per line, order not guaranteed).
 /// `None` means the file had no `populated` line, or an unrecognized value — the caller
@@ -109,11 +138,14 @@ pub(crate) enum LeafError {
     #[error("could not read /proc/self/cgroup: {0}")]
     ReadProcSelfCgroup(#[source] io::Error),
     /// `/proc/self/cgroup` has no `0::` line: a v1-only host, or no unified hierarchy.
+    ///
+    /// Carries a summary of the file, never the file. See [`summarize_cgroup_controllers`].
     #[error(
         "/proc/self/cgroup has no cgroup v2 unified (`0::`) line — a v1-only host, or the \
-         unified hierarchy is not mounted; contents: {0:?}"
+         unified hierarchy is not mounted; the file has {line_count} line(s), naming \
+         {controllers} (paths omitted — they identify the caller, not the fault)"
     )]
-    NoUnifiedLine(String),
+    NoUnifiedLine { line_count: usize, controllers: String },
     /// `mkdir` of the leaf failed — most often an undelegated slice the supervisor may not
     /// write to (`EACCES`/`EPERM`), or a read-only cgroupfs (`EROFS`).
     #[error("could not create the leaf cgroup {}: {source}", path.display())]
@@ -304,7 +336,7 @@ impl DegradeReason for LeafError {
     fn kind(&self) -> DegradeKind {
         match self {
             LeafError::ReadProcSelfCgroup(_) => DegradeKind::ReadProcSelfCgroup,
-            LeafError::NoUnifiedLine(_) => DegradeKind::NoUnifiedLine,
+            LeafError::NoUnifiedLine { .. } => DegradeKind::NoUnifiedLine,
             LeafError::CreateLeafDir { .. } => DegradeKind::CreateLeafDir,
             LeafError::KillUnsupported { .. } => DegradeKind::KillUnsupported,
             LeafError::OpenProcs { .. } => DegradeKind::OpenProcs,
@@ -809,7 +841,13 @@ impl Drop for CgroupLeaf {
 #[cfg(target_os = "linux")]
 pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
     let cgroup_file = fs::read_to_string("/proc/self/cgroup").map_err(LeafError::ReadProcSelfCgroup)?;
-    let rel_path = parse_v2_relative_path(&cgroup_file).ok_or_else(|| LeafError::NoUnifiedLine(cgroup_file.clone()))?;
+    let rel_path = parse_v2_relative_path(&cgroup_file).ok_or_else(|| {
+        let (line_count, controllers) = summarize_cgroup_controllers(&cgroup_file);
+        LeafError::NoUnifiedLine {
+            line_count,
+            controllers,
+        }
+    })?;
 
     create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))
 }
