@@ -576,10 +576,8 @@ fn create_leaf_under_reports_a_refused_mkdir() {
     );
     let rendered = err.to_string();
     assert!(rendered.contains("no-such-slice"), "path missing from {rendered:?}");
-    assert!(
-        rendered.contains("No such file or directory"),
-        "errno missing from {rendered:?}"
-    );
+    let reason = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    assert!(rendered.contains(&reason), "errno missing from {rendered:?}");
 }
 
 /// A writable directory with no `cgroup.kill` in the created leaf (i.e. not a cgroupfs, or a
@@ -764,8 +762,9 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
     let err = leaf
         .hard_kill()
         .expect_err("a refused cgroup.kill write must not read as success");
+    let reason = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
     assert!(
-        err.to_string().contains("directory"),
+        err.to_string().contains(&reason),
         "the kernel's own reason must reach the caller, got {err}"
     );
 
@@ -1150,7 +1149,8 @@ fn create_leaf_under_reports_an_unmappable_report_page_and_removes_the_leaf() {
         matches!(err, LeafError::MapReportPage(_)),
         "expected MapReportPage, got {err:?}"
     );
-    assert!(err.to_string().contains("Cannot allocate memory"), "got {err}");
+    let reason = std::io::Error::from_raw_os_error(libc::ENOMEM).to_string();
+    assert!(err.to_string().contains(&reason), "got {err}");
 
     let strays: Vec<_> = std::fs::read_dir(dir.path())
         .expect("read tempdir")
