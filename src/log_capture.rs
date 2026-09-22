@@ -17,7 +17,10 @@ impl log::Log for CaptureLog {
         true
     }
     fn log(&self, record: &log::Record<'_>) {
-        RECORDS.lock().unwrap().push((record.level(), record.args().to_string()));
+        RECORDS
+            .lock()
+            .unwrap()
+            .push((record.level(), record.args().to_string()));
     }
     fn flush(&self) {}
 }
