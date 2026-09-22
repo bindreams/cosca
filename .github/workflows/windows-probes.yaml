@@ -11,6 +11,8 @@
 #
 #     gh workflow run windows-probes.yaml [-f filter=<test-name substring>] [-f run_canary=false] \
 #         [-f elevating=true]
+#
+# `-f run_executing_probes=true` adds the `executing` job, which never runs any other way.
 name: windows-probes
 
 on:
@@ -52,6 +54,11 @@ on:
         default: true
       elevating:
         description: "Run tests/windows_shell_execute.rs, which ELEVATES and writes one volatile App Paths key in HKLM and one in HKCU"
+        type: boolean
+        required: false
+        default: false
+      run_executing_probes:
+        description: "Also run the probes that execute a batch file through ShellExecuteEx"
         type: boolean
         required: false
         default: false
@@ -155,3 +162,54 @@ jobs:
             exit 1
           fi
           printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
+
+  # These plant a `.bat` and hand it to `ShellExecuteEx`, so unlike the canary they EXECUTE code
+  # chosen by the path rules they measure, and the elevation probes create a throwaway local
+  # administrator and register a scheduled task. That is done deliberately, never as a side effect
+  # of a pull request or a schedule: dispatch with `run_executing_probes`. A GitHub-hosted runner is
+  # an ephemeral VM destroyed after the job — the only kind of host they may run on.
+  executing:
+    name: Executing probes (${{ matrix.runner }})
+    if: github.event_name == 'workflow_dispatch' && inputs.run_executing_probes
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      # These print what they measured rather than asserting; `--nocapture` is the point.
+      - name: Run shell-resolution probes
+        shell: bash
+        env:
+          FILTER: ${{ inputs.filter }}
+        run: >
+          cargo test --locked --target ${{ matrix.target }}
+          --test windows_shell_resolution
+          -- "${FILTER}" --ignored --nocapture --test-threads=1
+      # The elevation probes refuse to run without these two gates. `continue-on-error` keeps one
+      # unmeasurable probe from hiding the others' output, which is the whole product of this job.
+      - name: Run elevation-route probes
+        continue-on-error: true
+        shell: bash
+        env:
+          FILTER: ${{ inputs.filter }}
+          COSCA_PROBE_ALLOW_ACCOUNTS: "1"
+          COSCA_PROBE_ALLOW_STATE: "1"
+        run: >
+          cargo test --locked --target ${{ matrix.target }}
+          --test windows_elevation_routes
+          -- "${FILTER}" --ignored --nocapture --test-threads=1
+      # The runner is itself an administrator, so its own token shape is the control every
+      # elevation result is read against.
+      - name: Record the runner's own identity
+        if: always()
+        run: whoami /all
