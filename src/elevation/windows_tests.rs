@@ -410,8 +410,8 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
 
 /// A NUL-truncated path that only LOOKS like a batch file (`C:\tools\setup` + NUL + `.bat`): Win32
 /// launches `C:\tools\setup`, a different program than the caller named and no batch file at all.
-/// `reject_batch_path` reads that same truncated prefix and so passes the token through — the NUL
-/// check on `program` is the only refusal standing between it and an elevated `ShellExecuteEx`.
+/// Whichever gate refuses it must therefore say NUL and not CVE-2024-24576, or the caller is sent
+/// to audit a vector they do not carry while the wrong image still runs elevated.
 #[test]
 fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     use std::ffi::OsString;
@@ -432,8 +432,11 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
         "premise: the token's extension is misleading"
     );
     assert!(
-        crate::child::spawn::reject_batch_path(std::path::Path::new(&nul_bat)).is_ok(),
-        "premise: the batch gate reads `C:\\tools\\setup`, so nothing but the NUL check refuses this"
+        matches!(
+            crate::child::spawn::reject_batch_path(std::path::Path::new(&nul_bat)),
+            Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        ),
+        "premise: the shared gate refuses this as a NUL too, never as a batch file"
     );
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -462,8 +465,8 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
 }
 
 /// The mirror shape: `setup.bat` + NUL + `junk`, which Win32 truncates back to the real batch file
-/// `setup.bat`. Both gates refuse it, so what is pinned here is WHICH one wins — the caller's
-/// defect is the NUL, and being sent to audit batch escaping instead would hide it.
+/// `setup.bat`. Its extension is the one the batch rule could plausibly claim, so this pins that
+/// the caller is still told about the NUL — their actual defect — and not about batch escaping.
 #[test]
 fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
     use std::ffi::OsString;
@@ -476,11 +479,14 @@ fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
             .chain("junk".encode_utf16())
             .collect::<Vec<u16>>(),
     );
-    // The premise: the batch gate would also refuse this token, so the ordering is what decides
-    // the diagnosis. Without it the assertions below would be satisfied by either check.
+    // Premise: the shared gate refuses this token too, as a NUL — so an `Unsupported` arriving
+    // below could only be the batch rule jumping the NUL it is ordered behind.
     assert!(
-        crate::child::spawn::reject_batch_path(std::path::Path::new(&bat_nul)).is_err(),
-        "premise: the batch gate reads `C:\\tools\\setup.bat` and refuses it"
+        matches!(
+            crate::child::spawn::reject_batch_path(std::path::Path::new(&bat_nul)),
+            Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        ),
+        "premise: the shared gate refuses this as a NUL"
     );
     for elevated in [false, true] {
         let mut c = Command::new();

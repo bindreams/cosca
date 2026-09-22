@@ -473,14 +473,12 @@ fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<S
     Ok((program, c))
 }
 
-/// The prefix Win32 acts on: everything before the first interior NUL.
-///
-/// `CreateProcessW` and `PCWSTR` stop there, so the caller's whole token is not what gets loaded.
-/// Borrowed when there is no NUL, which is every ordinary path.
+/// The prefix Win32 acts on: everything before the first interior NUL, where `CreateProcessW` and
+/// `PCWSTR` stop. Equal (and borrowed) when there is no NUL, which is how [`reject_batch_path_on`]
+/// detects one without a platform-specific byte view at its own call site.
 ///
 /// Host-independent on purpose — it computes the same prefix everywhere, which is what lets a
-/// macOS run exercise the Win32 rule. Whether that prefix is AUTHORITATIVE is a separate question,
-/// answered by [`reject_batch_path_on`]'s `win32` argument: off Win32 nothing truncates.
+/// macOS run exercise the Win32 rule.
 fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
     use std::borrow::Cow;
     #[cfg(unix)]
@@ -501,36 +499,22 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
             None => Cow::Borrowed(prog),
         }
     }
-    // No portable byte view to split on, and nothing here truncates: the token IS its own prefix.
-    // `reject_batch_path_on` therefore finds prefix == token under `win32 == false` and returns
-    // `Ok`, leaving a NUL to std's own program conversion, which refuses it at spawn.
-    //
-    // Unreachable in any buildable configuration regardless: `crate::wait`'s `compile_error!`
-    // rejects every target that is not Linux, macOS or Windows.
+    // Unreachable in any buildable configuration: `crate::wait`'s `compile_error!` rejects every
+    // target that is not Linux, macOS or Windows. No portable byte view to split on either.
     #[cfg(not(any(unix, windows)))]
     {
         Cow::Borrowed(prog)
     }
 }
 
-/// Reject a `.bat`/`.cmd` program: cmd.exe batch escaping is a distinct, unimplemented vector
-/// (CVE-2024-24576 / BatBadBut). Shared by every backend — the std path (`build_std_command`), the
-/// raw one (`windows_raw::reject_batch_program`), and the elevated `ShellExecuteEx` launch.
+/// Reject a program token carrying an interior NUL, or naming a `.bat`/`.cmd`: Win32 silently
+/// truncates at the NUL (`PCWSTR` has no length), and cmd.exe batch escaping is a distinct,
+/// unimplemented vector (CVE-2024-24576 / BatBadBut). Shared by every backend — the std path
+/// (`build_std_command`), the raw one (`windows_raw::reject_batch_program`), and the elevated
+/// `ShellExecuteEx` launch.
 ///
-/// Keyed on the prefix Win32 would load, NOT on the caller's whole token, because `\0` is not a
-/// path separator and `Path::extension()` reads straight through it — reporting the INVERSE of
-/// the truth on both NUL/batch shapes:
-///
-/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, yet Win32 loads the real batch
-///   file `setup.bat`. Keying on the extension misses it.
-/// - `setup` + NUL + `.bat` → `extension() == "bat"`, yet Win32 loads `setup`, which is no batch
-///   file. Keying on the extension blames CVE-2024-24576 for a program that does not carry that
-///   vector, and interpolates a raw U+0000 into a message bound for logs and terminals.
-///
-/// Fixing that here rather than by ordering a NUL check in front of each caller is what makes the
-/// verdict uniform: the std backend — the DEFAULT Windows path — has no NUL check of its own.
-///
-/// Off Win32 this refuses only the NUL: see [`reject_batch_path_on`].
+/// The rule, and why each half is a fact about Win32, is in [`reject_batch_path_on`]; this asks it
+/// for the running host's verdict.
 pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
     reject_batch_path_on(prog, cfg!(windows))
 }
@@ -539,26 +523,41 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 /// it, so one host can ask for either verdict — the same reason `elevation::plan::Host` carries
 /// its `Os`. Both are pinned from any host by `spawn_tests`.
 ///
-/// `win32` decides BOTH halves of the rule, because both are facts about Win32 rather than about
-/// the request:
+/// An interior NUL is refused FIRST, under both verdicts, because `\0` is not a path separator and
+/// `Path::extension()` reads straight through it — reporting the INVERSE of what Win32 loads on
+/// each of the two NUL/batch shapes:
 ///
-/// - Win32 truncates at the NUL, so the prefix IS the program; and it routes a `.bat`/`.cmd`
-///   through cmd.exe, which is what CVE-2024-24576 needs. The batch rule reads that prefix.
-/// - Off Win32 nothing truncates and nothing reads the extension. A NUL makes the token name no
-///   file at all, so that is the honest verdict; a clean `deploy.bat` is an ordinary executable
-///   the host runs, so refusing it would report "not supported on windows" about a Linux or macOS
-///   host that runs it fine — and send its caller to audit a batch vector that cannot reach them.
+/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, yet Win32 loads the real batch
+///   file `setup.bat`.
+/// - `setup` + NUL + `.bat` → `extension() == "bat"`, yet Win32 loads `setup`, which is no batch
+///   file — so the batch refusal would blame CVE-2024-24576 for a program that does not carry
+///   that vector, and interpolate a raw U+0000 into a message bound for logs and terminals.
+///
+/// Refusing the NUL outright settles both shapes, and makes this gate SELF-SUFFICIENT rather than
+/// a rule each caller must order its own NUL check in front of — the std backend, the DEFAULT
+/// Windows path, has none to order. The reason given differs by verdict because the facts do: off
+/// Win32 nothing truncates, so the token simply names no file.
+///
+/// The batch half is `win32`-only, because it too is a fact about Win32 rather than the request:
+/// Win32 routes a `.bat`/`.cmd` through cmd.exe, which is what CVE-2024-24576 needs. Elsewhere a
+/// clean `deploy.bat` is an ordinary executable the host runs, so refusing it would report "not
+/// supported on windows" about a Linux or macOS host that runs it fine — and send its caller to
+/// audit a batch vector that cannot reach them.
 fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error> {
     let loaded = win32_prefix(prog);
+    if loaded.as_os_str() != prog.as_os_str() {
+        // A literal: interpolating the token would put a raw U+0000 into a message bound for logs
+        // and terminals, which is half of what this round is removing.
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            if win32 {
+                "the program path contains an embedded NUL, which Win32 would silently truncate"
+            } else {
+                "the program path contains an embedded NUL, so it names no file"
+            },
+        )));
+    }
     if !win32 {
-        if loaded.as_os_str() != prog.as_os_str() {
-            // A literal: interpolating the token would put a raw U+0000 into a message bound for
-            // logs and terminals, which is half of what this round is removing.
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "the program path contains an embedded NUL, so it names no file",
-            )));
-        }
         return Ok(());
     }
     if let Some(ext) = loaded.extension() {

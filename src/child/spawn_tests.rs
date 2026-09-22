@@ -269,19 +269,16 @@ fn on_posix(token: &std::ffi::OsStr) -> Result<(), Error> {
     super::reject_batch_path_on(std::path::Path::new(token), false)
 }
 
-/// `\0` is not a path separator, so `Path::extension()` reads straight through it — and on both
-/// NUL/batch shapes it reports the INVERSE of what Win32 loads:
+/// The Win32 verdict refuses an interior NUL too, on BOTH NUL/batch shapes — the derivation is in
+/// [`super::reject_batch_path_on`]'s doc. Neither may come back as the batch refusal: on
+/// `setup` + NUL + `.bat` Win32 loads `setup`, which carries no batch vector at all, and on
+/// `setup.bat` + NUL + `junk` the caller's defect is the NUL that made a `.bat`-suffixed token
+/// load a batch file.
 ///
-/// - `setup` + NUL + `.bat` → `extension() == "bat"`, but Win32 truncates to `setup`, which is no
-///   batch file. Keying on the extension blames CVE-2024-24576 for a program that does not carry
-///   that vector, and formats a raw U+0000 into a message bound for logs and terminals.
-/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, but Win32 truncates back to the
-///   real batch file `setup.bat`.
-///
-/// So the gate keys on the truncated prefix, which fixes both shapes for every backend at one
-/// site — including the std backend, which has no NUL check to order in front of it.
+/// Pinned on the gate itself because the gate is the std backend's ONLY NUL check: an `Ok` here is
+/// a token the crate hands to `std::process` for its internals to catch or not.
 #[test]
-fn the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token() {
+fn an_interior_nul_is_refused_on_the_win32_verdict_too() {
     let nul_then_bat = with_interior_nul("setup", ".bat");
     let bat_then_nul = with_interior_nul("setup.bat", "junk");
 
@@ -289,17 +286,15 @@ fn the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token() {
     assert_eq!(extension_of(&nul_then_bat), Some("bat".to_owned()));
     assert_ne!(extension_of(&bat_then_nul), Some("bat".to_owned()));
 
-    assert!(
-        on_win32(&nul_then_bat).is_ok(),
-        "`setup` is not a batch file; refusing it as one sends the caller to audit the wrong defect"
-    );
-
-    let op = unsupported_op(on_win32(&bat_then_nul));
-    assert!(
-        !op.contains('\0'),
-        "the refusal must not carry a raw NUL into logs: {op:?}"
-    );
-    assert!(op.contains("setup.bat"), "the refusal must name what Win32 loads: {op}");
+    for token in [&nul_then_bat, &bat_then_nul] {
+        // An `Ok`, or the `Unsupported` batch refusal, panics in the helper.
+        let msg = invalid_input_message(on_win32(token));
+        assert!(msg.contains("NUL"), "the refusal must name the NUL: {msg}");
+        assert!(
+            !msg.contains('\0'),
+            "the refusal must not carry a raw NUL into logs: {msg:?}"
+        );
+    }
 }
 
 /// The truncation is a WIN32 fact, so it decides nothing off Win32. On POSIX `x.bat` + NUL +
@@ -329,13 +324,14 @@ fn a_nul_bearing_program_is_diagnosed_as_a_nul_off_win32() {
 }
 
 /// The same token, the two platform verdicts, from one host: `win32` is data rather than a `cfg!`
-/// precisely so both are reachable here. Without this pair the POSIX arm could be "satisfied" by
-/// making the gate refuse NULs everywhere, which would take the Win32 diagnosis away again.
+/// precisely so both are reachable here. Both refuse the NUL, but each names its own reason — off
+/// Win32 nothing truncates, so citing the truncation would send a Linux caller to audit a platform
+/// they are not on.
 #[test]
-fn the_win32_and_posix_verdicts_differ_for_the_same_token() {
+fn each_verdict_gives_the_nul_refusal_its_own_reason() {
     let bat_then_nul = with_interior_nul("x.bat", "junk");
-    assert!(unsupported_op(on_win32(&bat_then_nul)).contains("x.bat"));
-    invalid_input_message(on_posix(&bat_then_nul));
+    assert!(invalid_input_message(on_win32(&bat_then_nul)).contains("truncate"));
+    assert!(!invalid_input_message(on_posix(&bat_then_nul)).contains("truncate"));
 }
 
 /// The WRAPPER, which none of the tests above reach: they spell `win32` out as data, so pinning
@@ -352,14 +348,13 @@ fn the_gate_wrapper_asks_for_this_hosts_verdict() {
 
     if cfg!(windows) {
         assert!(unsupported_op(via_host(&clean_bat)).contains("setup.bat"));
-        assert!(unsupported_op(via_host(&bat_then_nul)).contains("setup.bat"));
-        assert!(via_host(&nul_then_bat).is_ok(), "`setup` is no batch file");
     } else {
         assert!(via_host(&clean_bat).is_ok(), "no cmd.exe here to blame");
-        for token in [&bat_then_nul, &nul_then_bat] {
-            let msg = invalid_input_message(via_host(token));
-            assert!(msg.contains("NUL"), "the refusal must name the NUL: {msg}");
-        }
+    }
+    // The NUL verdict is the same either way; the clean `.bat` above is what the argument decides.
+    for token in [&bat_then_nul, &nul_then_bat] {
+        let msg = invalid_input_message(via_host(token));
+        assert!(msg.contains("NUL"), "the refusal must name the NUL: {msg}");
     }
 }
 

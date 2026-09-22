@@ -409,16 +409,12 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // already elevated — the exact "depends which path ran" divergence these checks exist to
     // remove. It also costs nothing: none of this depends on what the planner decides.
 
-    // `program`'s NUL check is a SECURITY CONTROL, and it is the ONLY one for every token whose
-    // truncated prefix is not a batch file: `C:\tools\setup` + NUL + `.bat` launches
-    // `C:\tools\setup` elevated, a different program than the caller named, and the batch gate
-    // below — which reads that same prefix — has nothing to say about it.
-    //
-    // It runs before EVERY other field's check, including the per-element argv loop, because it is
-    // the field that decides which image runs elevated: a request poisoning both would otherwise
-    // come back naming only `argument 1`. For the mirror shape `setup.bat` + NUL + `junk` the
-    // batch gate would also refuse, so what running first buys there is attribution — the caller's
-    // defect is the NUL, not batch escaping.
+    // Ahead of EVERY other field's check, including the per-element argv loop, because this is the
+    // field that decides which image runs ELEVATED: `C:\tools\setup` + NUL + `.bat` launches
+    // `C:\tools\setup`, a program the caller never named, and a request poisoning the program and
+    // an argument together would otherwise come back naming only `argument 1`. `reject_batch_path`
+    // below refuses an interior NUL too, but it runs after those fields, so this ordering is the
+    // elevated path's own.
     let file_w = wide_nul("program path", program.as_os_str())?;
 
     // Then the remaining fields, and only then the batch gate: a truncating argument is a defect

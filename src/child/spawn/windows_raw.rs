@@ -307,14 +307,10 @@ pub(crate) fn to_wide_nul(s: &OsStr) -> Vec<u16> {
 pub(crate) fn reject_batch_program(cmd: &Command) -> Result<(), Error> {
     let token = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     if let Some(prog) = token {
-        // NUL FIRST, for attribution. `reject_batch_path` keys on the prefix Win32 truncates to, so
-        // it decides both NUL/batch shapes correctly on its own — but on `C:\tools\setup.bat\0junk`
-        // it would report the batch vector, when the caller's defect is the NUL that made a
-        // `.bat`-suffixed token load a batch file in the first place.
-        //
-        // Neither refusal is the last line of defence here — resolution and the argv NUL checks
-        // below would also stop these tokens. What the ordering buys is a refusal that names the
-        // caller's actual defect instead of a downstream symptom.
+        // `reject_batch_path` refuses an interior NUL itself, ahead of its own batch rule (see its
+        // doc), so this check no longer decides the ORDER — it decides the WORDING. The raw
+        // backend names its fields "program token", "argument 0", "environment key"; the shared
+        // gate can only say "program path". `tests/raw_windows.rs` pins that vocabulary.
         resolve::ensure_no_nul_wide("program token", prog.as_os_str())?;
         reject_batch_path(&prog)?;
     }
