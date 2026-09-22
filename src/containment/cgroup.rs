@@ -696,8 +696,8 @@ impl CgroupLeaf {
     /// strongest mechanism was the one that broke `detach`'s "the tree keeps running", and it
     /// takes real state to keep it.
     ///
-    /// A disarmed `Drop` still tries the `rmdir` once, and still reports nothing: detach gives
-    /// up the kill, not the tidying.
+    /// A disarmed `Drop` still tries the `rmdir` once — detach gives up the kill, not the
+    /// tidying — and notes at `debug`, never `warn`, when the live tree keeps the leaf.
     pub(crate) fn disarm(&self) {
         self.armed.store(false, Ordering::Relaxed);
     }
