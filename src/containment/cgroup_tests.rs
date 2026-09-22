@@ -490,9 +490,10 @@ fn degrade_logs_the_reason_at_warn() {
         vec![log::Level::Warn],
         "a spawn that did not get the containment it asked for is news the first time"
     );
+    let records = crate::log_capture::records_since(mark, "cosca-degrade-probe-a41f");
     assert!(
-        crate::log_capture::contains_since(mark, "process group"),
-        "the degrade log must say what containment degraded TO"
+        records.iter().all(|record| record.contains("process group")),
+        "the degrade log must say what containment degraded TO: {records:?}"
     );
 }
 
