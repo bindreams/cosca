@@ -48,7 +48,12 @@ pub fn drain_and_remove_leaf(leaf: &std::path::Path) {
             break;
         }
         let mut fds = [PollFd::new(&events, PollFlags::PRI)];
-        poll(&mut fds, None).expect("poll cgroup.events");
+        // `poll` is never restarted after a signal handler, and a tokio runtime in this process
+        // handles SIGCHLD. An interrupted poll re-reads `populated` like any other wakeup.
+        match poll(&mut fds, None) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => panic!("poll cgroup.events: {e}"),
+        }
     }
     std::fs::remove_dir(leaf).expect("remove the drained leaf");
 }
