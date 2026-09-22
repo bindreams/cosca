@@ -450,8 +450,7 @@ fn is_batch_program_on_windows_refuses_every_stream_piece() {
 ///
 /// Deleting it would have been silent: with the disjunct present this property holds trivially.
 /// Asserted here so that the day `ntfs_stream_names` stops yielding the piece that holds the last
-/// dot — which is exactly round 1's first-piece-only version — the loss is a failure and not a
-/// quietly narrower gate.
+/// dot, the loss is a failure and not a quietly narrower gate.
 #[test]
 fn the_stream_reading_subsumes_the_shell_reading() {
     let mut missed = Vec::new();
@@ -482,8 +481,8 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         "x.bat ",
         "x.bat.",
         // `Path::file_name()` is `None` for these while `GetFullPathNameW` collapses them straight
-        // back to the batch file — round 1's bypass. `x.bat\y\.. ` is the variant that defeats the
-        // obvious fix: Rust parses `.. ` as `Normal`, not `ParentDir`.
+        // back to the batch file. `x.bat\y\.. ` is the variant that defeats the obvious fix: Rust
+        // parses `.. ` as `Normal`, not `ParentDir`.
         r"x.bat\y\..",
         "x.bat/y/..",
         r"C:\dir\x.bat\y\..",
