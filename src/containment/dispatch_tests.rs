@@ -591,21 +591,33 @@ fn a_failed_write_degrades_and_removes_the_leaf() {
 }
 
 /// Removing a leaf the child never entered must never write `cgroup.kill`, even when the leaf
-/// will not go away: whatever is in it, cosca did not put there.
+/// will not go away: whatever is in it, cosca did not put there. The leaf left behind is
+/// reported.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_degrade_never_kills_through_the_leaf() {
+    crate::log_capture::install();
     for report in [ChildReport::WriteFailed, ChildReport::NotReported] {
         let dir = tempfile::tempdir().expect("tempdir");
         // A `cgroup.procs` file makes the directory non-empty, so its `rmdir` fails.
         let leaf_path = leaf_listing_another_pid(dir.path());
 
+        let mark = crate::log_capture::mark();
         let (containment, _attached) = decide(&leaf_path, report);
 
         assert_eq!(containment, crate::containment::Containment::ProcessGroup);
         assert!(
             !leaf_path.join("cgroup.kill").exists(),
             "a degrade wrote cgroup.kill: it would kill a tree cosca had just been asked to contain"
+        );
+        let left_behind: Vec<String> = crate::log_capture::records_since(mark, &leaf_path.to_string_lossy())
+            .into_iter()
+            .filter(|record| record.contains("was not removed"))
+            .collect();
+        assert_eq!(
+            left_behind.len(),
+            1,
+            "the unremoved leaf is reported once: {left_behind:?}"
         );
     }
 }
