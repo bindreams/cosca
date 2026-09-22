@@ -932,11 +932,15 @@ fn verbatim_spelling(path: &str) -> String {
     }
 }
 
-/// Canary: a plain `x.bat.` or `x.bat ` IS `x.bat`, while a verbatim one is a distinct file.
+/// Canary: a plain `x.bat.` or `x.bat ` IS `x.bat`, while a verbatim one is a distinct file, and a
+/// slash in the verbatim marker makes the path plain.
 ///
 /// Plain: `GetFullPathNameW` hands std `…\x.bat`, which std tests for `.bat`/`.cmd` and so runs
 /// through `cmd.exe`, so a model of plain paths must trim trailing dots and spaces before reading
 /// the extension. Verbatim: `x.bat.` is a file of its own, which std tests as given.
+///
+/// Which spellings are verbatim is part of the fact. `\\?\` and the NT prefix `\??\` open the
+/// literal name; `//?/` and `\\?/`, a slash anywhere in the marker, open `x.bat` like a plain path.
 ///
 /// The `GetFullPathNameW` result of a verbatim spelling is printed, not asserted.
 ///
@@ -1001,21 +1005,28 @@ fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
             );
         }
     }
-    // Printed only, for now: which file do the other verbatim-looking spellings open?
+    // The other verbatim-looking spellings: a slash anywhere in the marker makes it plain, while
+    // the NT prefix `\??\` is as literal as `\\?\`.
     let forward = dir.replace('\\', "/");
     for name in LOOKALIKES {
-        for (tag, path) in [
-            ("//?/", format!("//?/{forward}/{name}")),
-            (r"\\?/", format!(r"\\?/{dir}\{name}")),
-            (r"\??\", format!(r"\??\{dir}\{name}")),
+        for (tag, path, want) in [
+            ("//?/", format!("//?/{forward}/{name}"), "x.bat"),
+            (r"\\?/", format!(r"\\?/{dir}\{name}"), "x.bat"),
+            (r"\??\", format!(r"\??\{dir}\{name}"), *name),
         ] {
-            match std::fs::read_to_string(&path) {
+            let body = std::fs::read_to_string(&path);
+            match &body {
                 Ok(body) => println!("  {tag:<5} {path:?} reads the file named {body:?}"),
                 Err(e) => println!(
                     "  {tag:<5} {path:?} read FAILED: {e} (raw_os_error={:?})",
                     e.raw_os_error()
                 ),
             }
+            facts.check(
+                body.as_deref().is_ok_and(|b| b == want),
+                &format!("{tag} {name:?} opens the file {want:?}"),
+                format_args!("{body:?}"),
+            );
         }
     }
     assert!(
