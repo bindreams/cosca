@@ -439,3 +439,144 @@ fn a_nul_refusal_names_the_field_that_carried_it() {
 fn debug_assert_no_nul_wide_panics_on_an_embedded_nul() {
     debug_assert_no_nul_wide("program image", OsStr::new("a\u{0}b"));
 }
+
+// Environment key identity =====
+
+fn wide(units: &[u16]) -> OsString {
+    OsString::from_wide(units)
+}
+
+/// Split a block into `(key, value)` entries. Splits at the LAST `=`, so a key that is itself `=`
+/// parses as long as values carry none.
+fn block_entries(block: &[u16]) -> Vec<(OsString, OsString)> {
+    block[..block.len() - 1]
+        .split(|&u| u == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let eq = entry.iter().rposition(|&u| u == u16::from(b'=')).unwrap();
+            (wide(&entry[..eq]), wide(&entry[eq + 1..]))
+        })
+        .collect()
+}
+
+/// Whether setting `b` over an inherited `a` replaces it (the same variable) or adds a second one.
+fn same_var(a: &OsStr, b: &OsStr) -> bool {
+    let block = build_env_block_from(&[(a.into(), "base".into())], &[EnvOp::Set(b.into(), "op".into())])
+        .unwrap()
+        .unwrap();
+    match block_entries(&block).len() {
+        1 => true,
+        2 => false,
+        n => panic!("{a:?} over {b:?} produced {n} entries"),
+    }
+}
+
+/// Windows folds one UTF-16 code unit to one, so a character whose full uppercase is longer, or
+/// lives in a surrogate pair, never names the same variable as that uppercase.
+#[test]
+fn full_case_mapping_does_not_merge_env_keys() {
+    for (a, b) in [("SS", "ß"), ("FI", "ﬁ"), ("I", "ı"), ("\u{10400}", "\u{10428}")] {
+        assert!(
+            !same_var(OsStr::new(a), OsStr::new(b)),
+            "{a:?} and {b:?} are distinct on Windows"
+        );
+    }
+}
+
+#[test]
+fn simple_case_pairs_are_the_same_env_key() {
+    for (a, b) in [("PATH", "path"), ("É", "é")] {
+        assert!(
+            same_var(OsStr::new(a), OsStr::new(b)),
+            "{a:?} and {b:?} are one variable"
+        );
+    }
+}
+
+/// An unpaired surrogate is its own code unit: it matches only itself, and does not stop the rest
+/// of the key from folding.
+#[test]
+fn unpaired_surrogates_in_env_keys_compare_by_code_unit() {
+    let hi = 0xD800;
+    let a = u16::from(b'a');
+    let upper_a = u16::from(b'A');
+    assert!(same_var(&wide(&[hi]), &wide(&[hi])));
+    assert!(!same_var(&wide(&[hi]), &wide(&[0xDC00])));
+    assert!(same_var(&wide(&[hi, a]), &wide(&[hi, upper_a])));
+}
+
+#[test]
+fn setting_eszett_keeps_an_inherited_ss() {
+    let block = build_env_block_from(
+        &[(OsString::from("SS"), OsString::from("inherited"))],
+        &[EnvOp::Set(OsString::from("ß"), OsString::from("set"))],
+    )
+    .unwrap()
+    .unwrap();
+    let mut got = block_entries(&block);
+    got.sort();
+    assert_eq!(got, [("SS".into(), "inherited".into()), ("ß".into(), "set".into())]);
+}
+
+/// The values of a cleared-then-set block, in block order, next to what std's `Command` holds for
+/// the same keys. `get_envs` iterates std's own `EnvKey` order, which is the order std writes its
+/// block in; values are indices, so both collisions and order are compared.
+fn block_order_vs_std(keys: &[OsString]) -> (Vec<OsString>, Vec<OsString>) {
+    let mut std_cmd = std::process::Command::new("unused");
+    std_cmd.env_clear();
+    let mut ops = vec![EnvOp::Clear];
+    for (i, key) in keys.iter().enumerate() {
+        let val = OsString::from(i.to_string());
+        std_cmd.env(key, &val);
+        ops.push(EnvOp::Set(key.clone(), val));
+    }
+    let block = build_env_block_from(&[], &ops).unwrap().unwrap();
+    let ours = block_entries(&block).into_iter().map(|(_, v)| v).collect();
+    let std = std_cmd.get_envs().map(|(_, v)| v.unwrap().to_os_string()).collect();
+    (ours, std)
+}
+
+/// `CreateProcessW` expects the block sorted case-insensitively by ordinal, locale-free; std sorts
+/// by `CompareStringOrdinal`, so the raw backend must produce the same order and the same merges.
+#[test]
+fn env_block_order_and_merges_match_std() {
+    let keys: Vec<OsString> = [
+        "T",
+        "ß",
+        "SS",
+        "sa",
+        "st",
+        "_x",
+        "a",
+        "Z",
+        "é",
+        "É",
+        "ﬁ",
+        "FI",
+        "ı",
+        "I",
+        "\u{10428}",
+        "\u{10400}",
+        "\u{FFFF}",
+    ]
+    .iter()
+    .map(OsString::from)
+    .chain([wide(&[0xD800]), wide(&[0xDC00, u16::from(b'a')])])
+    .collect();
+    let (ours, std) = block_order_vs_std(&keys);
+    assert_eq!(ours, std);
+}
+
+/// Every non-NUL code unit as a one-unit key: the raw backend and std agree on every merge and on
+/// the whole order.
+#[test]
+fn env_block_matches_std_over_every_code_unit() {
+    let keys: Vec<OsString> = (1..=u16::MAX).map(|u| wide(&[u])).collect();
+    let (ours, std) = block_order_vs_std(&keys);
+    assert_eq!(ours.len(), std.len());
+    assert!(
+        ours == std,
+        "first divergence at {:?}",
+        ours.iter().zip(&std).position(|(a, b)| a != b)
+    );
+}

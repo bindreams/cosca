@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 
+use super::env_key::EnvKey;
 use crate::command::EnvOp;
 use crate::error::Error;
 
@@ -134,16 +135,16 @@ fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
 }
 
 /// The `PATH` value the child will actually see, replaying `env_ops` over the ambient `PATH` —
-/// `Set`/`Remove` match the key case-insensitively (Windows env var names are), and `Clear` wipes
+/// `Set`/`Remove` match the key as [`EnvKey`] does (Windows' own case-insensitive rule), and `Clear` wipes
 /// it outright, mirroring [`build_env_block_from`]'s own base-then-ops replay exactly so the two
 /// never disagree about what the child's `PATH` ends up being.
 fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
-    let path_key = fold_key(OsStr::new("PATH"));
+    let path_key = EnvKey::new(OsStr::new("PATH"));
     let mut path = std::env::var_os("PATH");
     for op in env_ops {
         match op {
-            EnvOp::Set(key, val) if fold_key(key) == path_key => path = Some(val.clone()),
-            EnvOp::Remove(key) if fold_key(key) == path_key => path = None,
+            EnvOp::Set(key, val) if EnvKey::new(key) == path_key => path = Some(val.clone()),
+            EnvOp::Remove(key) if EnvKey::new(key) == path_key => path = None,
             EnvOp::Clear => path = None,
             _ => {}
         }
@@ -213,28 +214,28 @@ pub(crate) fn build_env_block(ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> 
 ///
 /// Returns `Ok(None)` when `ops` is empty — the child inherits the parent
 /// environment. Otherwise the block is a UTF-16 sequence of `KEY=VAL\0` entries
-/// sorted by their case-folded key and closed by a trailing `\0` (a
-/// double-NUL terminator). Keys collide case-insensitively (Windows env
-/// semantics), last write wins, and the last writer's key casing is emitted. An
-/// embedded NUL in any key or value is [`std::io::ErrorKind::InvalidInput`].
+/// in [`EnvKey`] order and closed by a trailing `\0` (a double-NUL terminator).
+/// Keys collide when [`EnvKey`] says they are equal, last write wins, and the
+/// last writer's key casing is emitted. An embedded NUL in any key or value is
+/// [`std::io::ErrorKind::InvalidInput`].
 pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> {
     if ops.is_empty() {
         return Ok(None);
     }
 
-    // Keyed by the case-folded key; the value keeps the original-case key so the
-    // emitted block preserves the caller's casing.
-    let mut vars: BTreeMap<Vec<u16>, (OsString, OsString)> = BTreeMap::new();
+    // The value keeps the original-case key so the emitted block preserves the
+    // caller's casing.
+    let mut vars: BTreeMap<EnvKey, (OsString, OsString)> = BTreeMap::new();
     for (key, val) in base {
-        vars.insert(fold_key(key), (key.clone(), val.clone()));
+        vars.insert(EnvKey::new(key), (key.clone(), val.clone()));
     }
     for op in ops {
         match op {
             EnvOp::Set(key, val) => {
-                vars.insert(fold_key(key), (key.clone(), val.clone()));
+                vars.insert(EnvKey::new(key), (key.clone(), val.clone()));
             }
             EnvOp::Remove(key) => {
-                vars.remove(&fold_key(key));
+                vars.remove(&EnvKey::new(key));
             }
             EnvOp::Clear => vars.clear(),
         }
@@ -293,26 +294,6 @@ pub(crate) fn debug_assert_no_nul_wide(what: &str, s: &OsStr) {
         !s.encode_wide().any(|unit| unit == 0),
         "the {what} contains an embedded NUL, which Win32 would silently truncate"
     );
-}
-
-/// Case-fold an environment key for case-insensitive comparison and sorting.
-///
-/// Uppercases each Unicode scalar of the UTF-16 encoding; unpaired surrogates
-/// (which have no case) pass through unchanged so distinct keys never collide.
-fn fold_key(key: &OsStr) -> Vec<u16> {
-    let mut folded = Vec::new();
-    for unit in char::decode_utf16(key.encode_wide()) {
-        match unit {
-            Ok(c) => {
-                let mut buf = [0u16; 2];
-                for upper in c.to_uppercase() {
-                    folded.extend_from_slice(upper.encode_utf16(&mut buf));
-                }
-            }
-            Err(e) => folded.push(e.unpaired_surrogate()),
-        }
-    }
-    folded
 }
 
 #[cfg(test)]

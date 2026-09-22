@@ -10,6 +10,9 @@
 #[path = "windows_raw/crt_fds.rs"]
 mod crt_fds;
 
+#[path = "windows_raw/env_key.rs"]
+mod env_key;
+
 // `pub(crate)`: the async raw backend (`crate::tokio::spawn::windows_raw`) reuses program/env/NUL
 // resolution verbatim.
 #[path = "windows_raw/resolve.rs"]
