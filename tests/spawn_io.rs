@@ -41,16 +41,17 @@ mod stderr_log {
     pub fn install() {
         INSTALLED.get_or_init(|| {
             log::set_logger(&StderrLog).expect("first logger in this test binary");
-            // `Warn` is every degrade reason and nothing else. The max level is global and set
-            // once per process, so anything broader also spills cosca's internal progress into
-            // whichever unrelated tests happen to run after the first install — a set decided
-            // by libtest's scheduling, not by any test.
+            // `Debug`, because a degrade reason is only reported at `warn` the FIRST time this
+            // process sees it — `cgroup::log_degrade` reports every repeat at `debug`. A
+            // narrower filter therefore keeps whichever test happened to degrade first and
+            // discards the rest: measured over the whole of this binary in an unprivileged
+            // container, `Warn` yielded 1 degrade record for 4 degrading tests, and
+            // `--nocapture` does not recover the other 3 — `log!` checks `max_level()` before
+            // any logger is reached, so they were never emitted to capture in the first place.
             //
-            // Caveat: `cgroup::log_degrade` warns once per reason and reports repeats at
-            // `debug`, so a SECOND test degrading for an already-warned reason has no reason
-            // beside its own failure under libtest's per-test capture. The cgroup lane runs
-            // `--nocapture`, where every record is printed in order and nothing is lost.
-            log::set_max_level(log::LevelFilter::Warn);
+            // `Debug` is the full set and costs nothing beyond it: this crate emits no `trace`
+            // records at all, and libtest prints a passing test's stderr nowhere.
+            log::set_max_level(log::LevelFilter::Debug);
         });
     }
 }

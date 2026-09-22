@@ -379,9 +379,12 @@ static WARNED: AtomicU32 = AtomicU32::new(0);
 /// `.contain()` spawn this process will ever make. The first report is a real reduction in the
 /// guarantee the caller asked for and warns; the ten-thousandth tells an embedder nothing new
 /// about something it cannot fix, and a log an embedder learns to filter out is worse than no
-/// log. Nothing is dropped: repeats still carry their own full text at `debug`, so a reader who
-/// turns the level up sees every degrading spawn, and a genuinely NEW condition warns whatever
-/// has degraded before it.
+/// log. A genuinely NEW condition warns whatever has degraded before it.
+///
+/// Repeats carry their own full text, so a process whose `log` max level admits `debug` keeps
+/// every degrading spawn on record. Below that they are gone, not merely hidden: `log!` tests
+/// `max_level()` before reaching any logger, so a `warn`-filtered process emits nothing for
+/// them and no amount of capturing downstream brings them back.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn log_degrade(reason: &dyn DegradeReason) {
     log_degrade_into(&WARNED, reason);
