@@ -1050,6 +1050,38 @@ fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
 }
 
 #[test]
+fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string() {
+    // ONE string must not parse under TWO separator sets. Reading a verbatim prefix with a
+    // `\`-only rule while the final component is split on `/` and `\` alike let the prefix swallow
+    // `srv/shr\a` whole: the final component came out empty, and `resolve` refused a path that
+    // names the file `a`. `PureWindowsPath` — this module's reference for what a path NAMES —
+    // reports `a` for every input below.
+    for (n, want) in [
+        (r"\\?\UNC\srv/shr\a", "a"),
+        (r"\\?\UNC\srv\shr/a", "a"),
+        (r"\\?\UNC\srv/shr/a", "a"),
+        (r"\\?\ns/a", "a"),
+        (r"\\?\GLOBALROOT/Device/X/tool.exe", "tool.exe"),
+    ] {
+        let got = final_component(OsStr::new(n), true);
+        assert_eq!(got, want.as_bytes(), "{n:?} -> {:?}", String::from_utf8_lossy(got));
+        assert!(!names_no_file(OsStr::new(n), true), "{n:?} names a file");
+    }
+    // The other half of the same rule, so widening the separator set cannot be "fixed" by dropping
+    // the prefix parse: a share root is still a root however its halves are spelt, and
+    // `PureWindowsPath` names nothing for any of these either.
+    for n in [
+        r"\\?\UNC\srv/shr",
+        r"\\?\UNC/srv/shr",
+        r"\\?\UNC\srv\shr",
+        r"\\?\ns",
+        r"\\?\GLOBALROOT",
+    ] {
+        assert!(names_no_file(OsStr::new(n), true), "{n:?} names no file");
+    }
+}
+
+#[test]
 fn a_prefix_only_located_name_never_grows_an_exe_candidate() {
     // `resolve` refuses these before `filename_candidates` runs; this pins the candidate rule
     // itself, which `takes_the_exe_fallback`'s own doc promises is defence in depth for any

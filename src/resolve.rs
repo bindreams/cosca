@@ -134,47 +134,55 @@ fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
 ///
 /// A prefix's own components are not filenames, so nothing may be appended to one: `\\server\share`
 /// is a share root exactly as `C:\` is a volume root. `Path::file_name` agrees — it is `None` for
-/// every prefix-only path — but only on a Windows HOST, which is why this is parsed byte-wise
-/// here, mirroring `std::path::Prefix`'s own rules: `/` stands in for `\` throughout the prefix,
-/// including a verbatim one's `UNC\` marker and drive colon, but NOT between the components that
-/// follow a verbatim prefix, where `std` takes the separator literally.
+/// every prefix-only path — but only on a Windows HOST, which is why this is parsed byte-wise here.
+///
+/// `/` and `\` separate components here exactly as they do in [`final_component`], so the whole
+/// string is read under ONE separator rule. `std` is deliberately not followed on this point:
+/// `parse_next_component(.., verbatim: true)` splits the components of a verbatim prefix on `\`
+/// alone, which would let the prefix swallow `srv/shr\a` in `\\?\UNC\srv/shr\a` and leave an empty
+/// final component — refusing a path that names the file `a`. `PureWindowsPath` is the reference
+/// (see [`names_no_file`]) and it normalises `/` to `\` everywhere.
+///
+/// Two `std` rules ARE followed, because they decide whether a prefix is present rather than how
+/// its components are split: the `\\?\` marker must be spelt with literal backslashes (a `/` among
+/// those four bytes means no verbatim prefix), and `\\server` with no share is no prefix at all.
 fn windows_prefix_len(bytes: &[u8]) -> usize {
     if !(bytes.len() >= 2 && is_sep(bytes[0], true) && is_sep(bytes[1], true)) {
         return if has_drive_prefix(bytes) { 2 } else { 0 };
     }
     // End offset of the component starting at `at`, exclusive of its separator.
-    let component = |at: usize, verbatim: bool| {
+    let component = |at: usize| {
         bytes[at..]
             .iter()
-            .position(|&b| if verbatim { b == b'\\' } else { is_sep(b, true) })
+            .position(|&b| is_sep(b, true))
             .map_or(bytes.len(), |i| at + i)
     };
     if bytes.len() >= 4 && bytes[2] == b'?' && is_sep(bytes[3], true) && !bytes[..4].contains(&b'/') {
         // `\\?\UNC\server\share`: server and share belong to the prefix, as they do without it.
         if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && is_sep(bytes[7], true) {
-            let server = component(8, true);
+            let server = component(8);
             if server >= bytes.len() {
                 return bytes.len();
             }
-            return component(server + 1, true);
+            return component(server + 1);
         }
-        // `\\?\C:` — a drive is recognised only EXACTLY here, matching `std`: `\\?\C:x` is the
-        // verbatim namespace `C:x`, not drive C.
+        // `\\?\C:` — a drive is recognised only EXACTLY here: `\\?\C:x` is the verbatim namespace
+        // `C:x`, not drive C. `PureWindowsPath` agrees (`\\?\C:a` names nothing), as does `std`.
         if has_drive_prefix(&bytes[4..]) && bytes.get(6).is_none_or(|&b| is_sep(b, true)) {
             return 6;
         }
-        return component(4, true);
+        return component(4);
     }
     if bytes.len() >= 4 && bytes[2] == b'.' && is_sep(bytes[3], true) {
-        return component(4, false); // `\\.\device`
+        return component(4); // `\\.\device`
     }
     // `\\server\share`. Missing either half is no prefix at all (`std` parses none), leaving the
     // ordinary final-component rule to answer — which refuses `\\` and `\\server\` anyway.
-    let server = component(2, false);
+    let server = component(2);
     if server == 2 || server >= bytes.len() {
         return 0;
     }
-    let share = component(server + 1, false);
+    let share = component(server + 1);
     if share == server + 1 {
         0
     } else {
