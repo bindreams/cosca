@@ -177,7 +177,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // the LAST pre_exec hook. Why ordering matters: pre_exec hooks run in
     // registration order in the forked child. The Linux cgroup self-placement
     // hook (registered inside `prepare`) writes "0" to a pre-opened cgroup.procs
-    // fd whose CLOEXEC is cleared (so it is inherited across fork). If
+    // fd (CLOEXEC, which is still open between fork and exec). If
     // command-fds' dup2 ran FIRST, it could dup2 the user's fd over the number
     // that cgroup.procs fd occupies — closing/replacing it — so the later cgroup
     // write would hit a closed/wrong fd (silent CgroupV2->ProcessGroup downgrade,

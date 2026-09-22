@@ -164,20 +164,6 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
-    /// `fcntl(F_GETFD)` on the `cgroup.procs` fd failed, so its FD_CLOEXEC state is unknown.
-    #[error("could not read the FD_CLOEXEC flag of {}: {source}", path.display())]
-    ReadCloexec {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    /// `fcntl(F_SETFD)` failed, so the fd would not survive into the child across `exec`.
-    #[error("could not clear FD_CLOEXEC on {}: {source}", path.display())]
-    ClearCloexec {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     /// The shared page the child reports its self-placement outcome through could not be
     /// mapped. Without it the child's own errno would be unobservable, so the leaf is not
     /// created half-instrumented.
@@ -318,8 +304,6 @@ pub(crate) enum DegradeKind {
     CreateLeafDir,
     KillUnsupported,
     OpenProcs,
-    ReadCloexec,
-    ClearCloexec,
     MapReportPage,
     PlacementConfirmed,
     PlacementAbsent,
@@ -340,8 +324,6 @@ impl DegradeReason for LeafError {
             LeafError::CreateLeafDir { .. } => DegradeKind::CreateLeafDir,
             LeafError::KillUnsupported { .. } => DegradeKind::KillUnsupported,
             LeafError::OpenProcs { .. } => DegradeKind::OpenProcs,
-            LeafError::ReadCloexec { .. } => DegradeKind::ReadCloexec,
-            LeafError::ClearCloexec { .. } => DegradeKind::ClearCloexec,
             LeafError::MapReportPage(_) => DegradeKind::MapReportPage,
         }
     }
@@ -650,7 +632,8 @@ impl ReportSlot {
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
     leaf_path: PathBuf,
-    /// Pre-opened `cgroup.procs` fd (O_CLOEXEC cleared) for the `pre_exec` write.
+    /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
+    /// between `fork` and `exec`, and no program this process starts may inherit it.
     procs_fd: RawFd,
     /// Where the forked child reports whether its self-placement write succeeded.
     report: ReportPage,
@@ -1016,8 +999,8 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         Err(e) => return Err(fail(&leaf_path, LeafError::MapReportPage(e))),
     };
 
-    // Open cgroup.procs for writing. O_CLOEXEC is set by default on Linux; clear
-    // it explicitly so the fd survives fork+exec into the child.
+    // Open cgroup.procs for writing. std opens it O_CLOEXEC, and it stays that way: the
+    // child's pre_exec write runs after fork and before exec, where the fd is still open.
     let procs_path = leaf_path.join("cgroup.procs");
     let procs_file: File = match OpenOptions::new().write(true).open(&procs_path) {
         Ok(f) => f,
@@ -1032,33 +1015,6 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         }
     };
     let procs_fd = procs_file.into_raw_fd();
-
-    // Safety: procs_fd is valid.
-    let flags = unsafe { libc::fcntl(procs_fd, libc::F_GETFD) };
-    if flags == -1 {
-        let source = io::Error::last_os_error();
-        // Safety: procs_fd is valid and owned here; closed exactly once on this path.
-        unsafe { libc::close(procs_fd) };
-        return Err(fail(
-            &leaf_path,
-            LeafError::ReadCloexec {
-                path: procs_path,
-                source,
-            },
-        ));
-    }
-    if unsafe { libc::fcntl(procs_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
-        let source = io::Error::last_os_error();
-        // Safety: as above.
-        unsafe { libc::close(procs_fd) };
-        return Err(fail(
-            &leaf_path,
-            LeafError::ClearCloexec {
-                path: procs_path,
-                source,
-            },
-        ));
-    }
 
     Ok(CgroupLeaf {
         leaf_path,

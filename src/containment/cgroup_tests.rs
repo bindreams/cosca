@@ -264,6 +264,43 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     );
 }
 
+/// The parent's `cgroup.procs` fd stays close-on-exec for the leaf's whole life. The child's
+/// `pre_exec` write needs it only between `fork` and `exec`, where a CLOEXEC fd is still open;
+/// any other program this process starts meanwhile must not inherit a writable `cgroup.procs`,
+/// through which it could move itself into the leaf and be killed with it.
+#[cfg(target_os = "linux")]
+#[test]
+fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    let leaf = super::try_create_leaf().unwrap_or_else(|e| {
+        panic!("COSCA_TEST_CGROUP is set but no usable delegated cgroup v2 leaf could be created ({e})")
+    });
+    // SAFETY: `procs_fd` is open for as long as `leaf` lives.
+    let flags = unsafe { libc::fcntl(leaf.procs_fd(), libc::F_GETFD) };
+    assert_ne!(flags, -1, "F_GETFD: {}", std::io::Error::last_os_error());
+    assert_ne!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "the parent-held cgroup.procs fd must be CLOEXEC"
+    );
+
+    // An unrelated program started while the leaf is alive lists its own open descriptors.
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", "ls -l /proc/$$/fd"])
+        .output()
+        .expect("run sh");
+    assert!(out.status.success(), "ls failed: {out:?}");
+    let fds = String::from_utf8_lossy(&out.stdout);
+    let procs = leaf.leaf_path.join("cgroup.procs");
+    assert!(
+        !fds.contains(&*procs.to_string_lossy()),
+        "an unrelated program inherited {}:\n{fds}",
+        procs.display()
+    );
+}
+
 // Degrade-reason reporting =====
 // The diagnostic types are pure data, so their formatting is tested on every host.
 
@@ -317,22 +354,6 @@ fn leaf_error_names_step_path_and_reason() {
             },
             &["cgroup.procs"],
             Some(reason(13)),
-        ),
-        (
-            LeafError::ReadCloexec {
-                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
-                source: std::io::Error::from_raw_os_error(9),
-            },
-            &["cgroup.procs", "FD_CLOEXEC"],
-            Some(reason(9)),
-        ),
-        (
-            LeafError::ClearCloexec {
-                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
-                source: std::io::Error::from_raw_os_error(9),
-            },
-            &["cgroup.procs", "FD_CLOEXEC"],
-            Some(reason(9)),
         ),
         (
             LeafError::MapReportPage(std::io::Error::from_raw_os_error(12)),
@@ -449,7 +470,7 @@ fn degrade_logs_the_reason_at_warn() {
 #[test]
 fn log_degrade_reports_through_a_sticky_process_wide_set() {
     crate::log_capture::install();
-    let reason = || LeafError::ClearCloexec {
+    let reason = || LeafError::OpenProcs {
         path: PathBuf::from("/sys/fs/cgroup/slice/cosca-process-wide-probe-d582/cgroup.procs"),
         source: std::io::Error::from_raw_os_error(9),
     };
@@ -795,14 +816,6 @@ fn every_degrade_reason_has_its_own_kind() {
         Box::new(LeafError::OpenProcs {
             path: PathBuf::from("/cg/leaf/cgroup.procs"),
             source: std::io::Error::from_raw_os_error(13),
-        }),
-        Box::new(LeafError::ReadCloexec {
-            path: PathBuf::from("/cg/leaf/cgroup.procs"),
-            source: std::io::Error::from_raw_os_error(9),
-        }),
-        Box::new(LeafError::ClearCloexec {
-            path: PathBuf::from("/cg/leaf/cgroup.procs"),
-            source: std::io::Error::from_raw_os_error(9),
         }),
         Box::new(LeafError::MapReportPage(std::io::Error::from_raw_os_error(12))),
         Box::new(Placement::Confirmed),

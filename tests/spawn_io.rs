@@ -492,9 +492,9 @@ fn unix_fd3_file_round_trips() {
 /// Regression: `.contain()` + `.fd(3, pipe_out())` on Linux must NOT let the
 /// cgroup self-placement clobber (or be clobbered by) the command-fds dup2.
 ///
-/// The cgroup `pre_exec` opens `cgroup.procs` with CLOEXEC cleared and writes
-/// "0" to it. command-fds installs its own `pre_exec` that dup2's the user's
-/// fd 3 onto child fd 3. If command-fds runs FIRST, its dup2 can land on the
+/// The cgroup `pre_exec` writes "0" to a pre-opened `cgroup.procs` fd.
+/// command-fds installs its own `pre_exec` that dup2's the user's fd 3 onto
+/// child fd 3. If command-fds runs FIRST, its dup2 can land on the
 /// same fd number the cgroup `procs_fd` occupies — silently downgrading
 /// containment OR writing the cgroup's "0" into the user's fd 3 (corruption).
 /// We assert the parent reads EXACTLY the child-written token (no inserted "0",
