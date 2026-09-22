@@ -220,6 +220,7 @@ use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
 use crate::child::proc_handle::ProcHandle;
+use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
 use crate::command::CommandInput;
 use crate::containment::Attachment;
@@ -250,25 +251,18 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
-/// `lpParameters` is additionally checked per argv ELEMENT by [`ensure_no_nul`] before the join,
-/// because by the time it is one string the refusal can no longer say which `args([..])` entry
-/// carried the NUL; the check here stays as the field's own, so removing that loop cannot open an
-/// unchecked sink.
+/// `lpParameters` is additionally checked per argv ELEMENT by [`ensure_no_nul_wide`] before the
+/// join, because by the time it is one string the refusal can no longer say which `args([..])`
+/// entry carried the NUL; the check here stays as the field's own, so removing that loop cannot
+/// open an unchecked sink.
+///
+/// The predicate and its message come from the raw `CreateProcessW` backend rather than being
+/// restated here. Two copies of one sentence is exactly how the wording drifted apart before —
+/// "elevated program path" against "program path" — over a defect neither backend describes
+/// differently.
 fn wide_nul(what: &str, s: &OsStr) -> Result<Vec<u16>, Error> {
-    ensure_no_nul(what, s)?;
+    ensure_no_nul_wide(what, s)?;
     Ok(s.encode_wide().chain(std::iter::once(0)).collect())
-}
-
-/// The refusal [`wide_nul`] carries, for a value checked before it becomes a field — an argv
-/// element, which `lpParameters` only reaches as part of one joined string.
-fn ensure_no_nul(what: &str, s: &OsStr) -> Result<(), Error> {
-    if s.encode_wide().any(|unit| unit == 0) {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("the elevated {what} contains an embedded NUL, which Win32 would silently truncate"),
-        )));
-    }
-    Ok(())
 }
 
 /// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
@@ -366,7 +360,7 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
 fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
     let mut tail_wide: Vec<Vec<u16>> = Vec::with_capacity(argv.len() - 1);
     for (i, a) in argv.iter().enumerate().skip(1) {
-        ensure_no_nul(&format!("argument {i}"), a)?;
+        ensure_no_nul_wide(&format!("argument {i}"), a)?;
         tail_wide.push(a.encode_wide().collect());
     }
     let tail_refs: Vec<&[u16]> = tail_wide.iter().map(|v| v.as_slice()).collect();

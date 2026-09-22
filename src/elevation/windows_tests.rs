@@ -411,6 +411,31 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
     }
 }
 
+/// One predicate, one sentence. The elevated path and the raw `CreateProcessW` backend refuse an
+/// interior NUL for the same reason on the same field, and restating it per path is what let
+/// "elevated program path" drift away from "program path" — a wording difference a caller reads as
+/// two different defects.
+#[test]
+fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
+    let token = nul_between(r"C:\tools\x.exe", "junk");
+
+    let mut c = Command::new();
+    c.args([token.clone()]).elevate();
+    let elevated = match super::plan_runas(&c, &win_host(false)) {
+        Err(Error::Io(e)) => e.to_string(),
+        other => panic!(
+            "a truncating program path must be refused, got {:?}",
+            other.map(|_| "Ok")
+        ),
+    };
+
+    let raw = crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide("program path", &token)
+        .expect_err("the raw backend refuses the same token")
+        .to_string();
+
+    assert_eq!(elevated, raw, "one defect, described two ways");
+}
+
 /// A `.bat`/`.cmd` SPELLED IN THE TOKEN must be refused here as on every other backend.
 /// `ShellExecuteEx`'s `runas` resolves the `batfile` association through `cmd.exe` and substitutes
 /// `lpParameters` into `%*` unescaped, while `join_wide` quotes only for whitespace — so an

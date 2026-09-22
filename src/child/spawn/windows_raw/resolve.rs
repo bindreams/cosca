@@ -128,11 +128,15 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
 
 /// Reject a string carrying an embedded NUL, which Win32 would silently truncate at.
 ///
-/// Serves every wide string the raw backend builds out of CALLER INPUT — the environment block,
-/// the program token, the working directory, each argv token, and the command line — so `what`
-/// names the offending field. Without it the refusal blames one caller's field for every other
-/// caller's defect, sending the reader to audit the wrong input. The one wide string that is not
-/// caller input is the resolved program image; see [`debug_assert_no_nul_wide`].
+/// Serves every wide string built out of CALLER INPUT on either Windows launch path: the raw
+/// backend's environment block, program token, working directory, argv tokens and command line,
+/// and the elevated `SHELLEXECUTEINFOW`'s fields (via `elevation::windows::wide_nul`). `what`
+/// names the offending field, so the refusal does not blame one caller's field for another's
+/// defect. Shared rather than restated per path — the predicate and the sentence are the same, and
+/// two copies of them drifted apart once already.
+///
+/// The one wide string that is not caller input is the resolved program image; see
+/// [`debug_assert_no_nul_wide`].
 pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
     if s.encode_wide().any(|unit| unit == 0) {
         return Err(Error::Io(std::io::Error::new(
