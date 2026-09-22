@@ -1,9 +1,9 @@
 //! Windows path-resolution canary: how Windows and `std::process` normalise path strings, checked
 //! on a real Windows runner.
 //!
-//! cosca's `.bat`/`.cmd` gate (CVE-2024-24576) carries a model of how Windows normalises a program
-//! path — trailing dots and spaces, `.`/`..`, verbatim `\\?\` prefixes, UNC and device roots,
-//! stream suffixes — and that model depends on facts like the ones measured here.
+//! cosca's `.bat`/`.cmd` gate (CVE-2024-24576) rests on a model of how Windows normalises path
+//! strings, and that model depends on platform facts like these: how trailing dots and spaces,
+//! `.`/`..`, verbatim `\\?\` prefixes, UNC and device roots and stream suffixes resolve.
 //! `windows-latest` is a floating label: a Windows build can change those facts with no commit
 //! here, so the `windows-probes` workflow runs this file on pull requests touching the code that
 //! depends on it, weekly, and on demand.
@@ -483,8 +483,8 @@ impl Disagreements {
     fn assert_none(self) {
         assert!(
             self.broken.is_empty(),
-            "{} no longer behaves as measured. Any code that models these facts (cosca's batch \
-             gate among it) must be re-derived from the new behaviour. Facts that changed:\n  {}",
+            "The measured behaviour of {} has changed. Any code that models these facts (cosca's \
+             batch gate among it) must be re-derived from the new behaviour. Facts that changed:\n  {}",
             self.subject,
             self.broken.join("\n  ")
         );
@@ -1293,6 +1293,78 @@ fn a_stream_suffix_stays_in_the_final_component() {
     facts.assert_none();
 }
 
+/// Canary: an INTERIOR segment loses a single trailing period and nothing else.
+///
+/// A trailing run of two or more periods is kept, and so are trailing spaces: interior `...` and
+/// `x ` are names, `x.` becomes `x`, `.. .` becomes `.. `. Both spellings, at one and two segments
+/// from the end, behave alike. This differs from the FINAL-component rule
+/// ([`a_final_dots_and_spaces_component_drops_out_and_pops_nothing`]), so a model of path
+/// normalisation needs both.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn an_interior_segment_loses_only_a_single_trailing_period() {
+    // (segment, what it becomes when not final)
+    const INTERIOR: &[(&str, &str)] = &[
+        ("x", "x"),
+        (".x", ".x"),
+        ("x.", "x"),
+        ("x..", "x.."),
+        ("x...", "x..."),
+        ("x....", "x...."),
+        ("x ", "x "),
+        ("x  ", "x  "),
+        ("x. ", "x. "),
+        ("x .", "x "),
+        ("...", "..."),
+        (".. .", ".. "),
+    ];
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let mut rows = Vec::new();
+    for (seg, kept) in INTERIOR {
+        for prefix in ["", r"\\?\"] {
+            for tail in [r"z.exe", r"mid\z.exe"] {
+                rows.push((
+                    format!(r"{prefix}C:\dir\{seg}\{tail}"),
+                    format!(r"{prefix}C:\dir\{kept}\{tail}"),
+                    "interior segment",
+                ));
+            }
+        }
+    }
+    check_resolutions(&rows, &mut facts, &mut failures);
+
+    // Printed only, for now: a kept interior segment popped by the `..` after it.
+    match std::env::current_dir() {
+        Ok(cwd) => println!("current directory: {cwd:?}"),
+        Err(e) => println!("could not read the current directory: {e}"),
+    }
+    for input in [
+        r"y\x.bat\...\..",
+        r"y\x.bat\ \..",
+        r"y\x.bat\.. .\..",
+        r"C:\dir\ \z.exe",
+        r"\\?\C:\dir\ \z.exe",
+    ] {
+        match full_path_name_parts(input) {
+            Ok((resolved, part)) => {
+                let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
+                println!(
+                    "  {input:?} -> {resolved:?}  file_part={part}  std_has_bat_extension={}",
+                    has_bat_extension(&resolved)
+                );
+            }
+            Err(why) => println!("  {why}"),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
 /// Segment shapes for [`which_segment_positions_get_trimmed`]. Every one is an ORDINARY name — `x`
 /// with something trailing — or a named control, so "was this segment trimmed?" has an
 /// unambiguous answer wherever it sits.
@@ -1331,6 +1403,8 @@ fn build(shape: &str, root: &str, seg: &str) -> String {
 
 /// Survey: which SEGMENT POSITIONS does `GetFullPathNameW` trim, and does the root's existence
 /// change the answer?
+///
+/// [`an_interior_segment_loses_only_a_single_trailing_period`] asserts the interior rows.
 ///
 /// Each case is also run under two sibling roots of EQUAL length, one created on disk and one not,
 /// so "does the directory have to exist?" is settled by comparing two strings rather than by

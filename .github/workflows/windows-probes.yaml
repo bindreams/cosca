@@ -1,9 +1,9 @@
 # Windows path-resolution canary.
 #
 # `tests/windows_path_resolution.rs` asserts how Windows and Rust's `std::process` normalise path
-# strings. cosca's batch gate (CVE-2024-24576) models that normalisation, and the model depends on
-# facts like these, so this workflow fails when Windows stops agreeing with the measurement. The
-# test file describes the platform only.
+# strings. cosca's batch gate (CVE-2024-24576) rests on a model of that normalisation, which
+# depends on facts like these, so this workflow fails when Windows stops agreeing with the
+# measurement. The test file describes the platform only.
 #
 # The probes resolve strings, write inside a temp directory of their own and launch only
 # `cosca_testbin_image`: nothing here runs a batch file. They are `#[ignore]`d, so only this
