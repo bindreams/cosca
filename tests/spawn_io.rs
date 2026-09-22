@@ -6,6 +6,44 @@ fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
+/// Route the library's `log` records to this test binary's stderr.
+///
+/// Without a logger installed, `log` drops every record on the floor — so a containment
+/// degrade explains itself into nothing and a failing `assert_eq!(…, CgroupV2)` is as
+/// undiagnosable from CI output as it was before the reason existed. libtest captures a
+/// failing test's stderr and prints it with the failure (and the CI cgroup step runs with
+/// `--nocapture`), so with this installed the reason lands directly above the assertion.
+///
+/// Linux-gated because its only callers are: the cgroup containment mechanism is the only one
+/// in this binary that can degrade silently.
+#[cfg(target_os = "linux")]
+mod stderr_log {
+    use std::sync::OnceLock;
+
+    struct StderrLog;
+
+    impl log::Log for StderrLog {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    /// Idempotent: `log::set_logger` is once-per-process, so every test that wants the
+    /// library's reasoning calls this and the first one wins.
+    pub fn install() {
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&StderrLog).expect("first logger in this test binary");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+}
+
 // Basics =====
 
 #[test]
@@ -455,6 +493,7 @@ fn unix_fd3_file_round_trips() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
+    stderr_log::install();
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
@@ -1058,6 +1097,7 @@ fn drop_kills_contained_tree() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
+    stderr_log::install();
     if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         // Unprovisioned: skip (not CI-cgroup environment). The live cgroup test
         // requires COSCA_TEST_CGROUP=1 and a delegated cgroup slice.
@@ -1093,6 +1133,7 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
+    stderr_log::install();
     if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         return; // unprovisioned: not a CI-cgroup environment.
     }
