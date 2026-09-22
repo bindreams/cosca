@@ -290,8 +290,15 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// dots-only server in `\\...\x.bat\y\..` and the root becomes `x.bat\y`, the pop is clamped
 /// away, and the gate judges `y` while Win32 resolves `\\...\x.bat`.
 ///
-/// A `\\.\` or `//?/` device path puts its root in the same two positions (.NET's `GetRootLength`
-/// counts `\\.\C:\` as the root of `\\.\C:\x`), so one rule covers both.
+/// # A device path's root is `\\.\` alone, and the gate's is one deeper
+///
+/// Measured on x64 and arm64 runners, `..` pops past the device name: `\\.\C:\x.bat\..` resolves
+/// to `\\.\C:`, `\\.\C:\..` and `\\.\x.bat\..` to `\\.\`, and `\\.\pipe\x.bat\..` to `\\.\pipe`.
+/// The gate still reads a `\\.\` or `//?/` path with the UNC rule above, so it keeps the device
+/// name where Win32 pops it. That can only move a verdict at the point Win32 pops the device name,
+/// and Win32 then lands on the bare `\\.\`, which is no batch file: `\\.\x.bat\..` is refused for
+/// a batch name Win32 does not reach, and `\\.\C:\..` is accepted though the gate refuses the bare
+/// `\\.\` it resolves to as naming no file. Neither admits a batch file.
 ///
 /// A literal `\\?\` never arrives: [`verbatim_refusal`] owns it.
 ///
@@ -311,8 +318,8 @@ pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interi
     // position a drive prefix can occupy.
     let mut stack: Vec<(&str, bool)> = Vec::new();
     let mut segments = text.split(['/', '\\']).enumerate();
-    // A UNC (or `\\.\` device) root: the two segments after the leading pair, taken by POSITION
-    // and never collapsed. `None` for a root with no share at all — `\\server` names nothing
+    // A UNC (or `\\.\` device, one component deeper than Win32's) root: the two segments after
+    // the leading pair, taken by POSITION and never collapsed. `None` for a root with no share at all — `\\server` names nothing
     // loadable.
     let root = if starts_with_two_separators(&text) {
         segments.nth(1).expect("two separators are two empty segments");

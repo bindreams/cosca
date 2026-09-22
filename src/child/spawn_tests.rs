@@ -529,9 +529,13 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         r"\\server",
         // The root is positional; see `win32_effective_file_name`.
         r"\\...\x.bat\y\..",
+        r"\\x.bat\y\..",
+        // A device path: `..` pops `y` and Win32 resolves `\\.\x.bat`.
         r"\\.\x.bat\y\..",
         "//?/x.bat/y/..",
-        r"\\x.bat\y\..",
+        // The gate's verdict, not Win32's: the gate never pops a device name, while Win32 resolves
+        // this to the bare `\\.\`, which is no batch file.
+        r"\\.\x.bat\..",
     ] {
         assert!(
             super::reject_batch_path_on(Path::new(probe), true).is_err(),
@@ -565,6 +569,12 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         r"\\server\share\..",
         r"\\server\share\x.bat\..",
         r"\\server\share\tool.exe",
+        // A device path pops back to its device name, measured: `\\.\C:` and `\\.\pipe`.
+        r"\\.\C:\x.bat\..",
+        r"\\.\pipe\x.bat\..",
+        // The gate's verdict, not Win32's: Win32 resolves this to the bare `\\.\`, which the gate
+        // refuses as naming no file when it is spelled that way.
+        r"\\.\C:\..",
     ] {
         assert!(
             super::reject_batch_path_on(Path::new(probe), true).is_ok(),
@@ -1489,10 +1499,17 @@ fn win32_effective_file_name_collapses_the_way_win32_resolves() {
         (r"\\...\x.bat\y\..", Some("x.bat")),
         (r"\\\x.bat\y\..", Some("x.bat")),
         (r"\\..\x.bat\y\..", Some("x.bat")),
-        // A device path's root sits in the same two positions.
+        // A device path where the gate and Win32 agree: `..` pops the component below the device
+        // name, and Win32 resolves `\\.\x.bat`, `\\.\C:` and `\\.\pipe` (measured).
         (r"\\.\x.bat\y\..", Some("x.bat")),
         ("//?/x.bat/y/..", Some("x.bat")),
+        (r"\\.\C:\x.bat\..", Some("C:")),
+        (r"\\.\pipe\x.bat\..", Some("pipe")),
         (r"\\.\C:\tool.exe", Some("tool.exe")),
+        // ...and where they do not: the gate never pops the device name, while Win32 pops it and
+        // resolves both to the bare `\\.\` (measured). The gate's names, not Win32's.
+        (r"\\.\x.bat\..", Some("x.bat")),
+        (r"\\.\C:\..", Some("C:")),
         // Collapsed onto the root, a batch-named SERVER is judged too — whether `..` inside the
         // root collapses is unmeasured, and if it does this is `\\x.bat`.
         (r"\\x.bat\y\..", Some("x.bat")),
