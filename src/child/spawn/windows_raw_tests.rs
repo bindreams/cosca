@@ -382,3 +382,73 @@ fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
     let image = image(&cmd).expect("argv[0] resolves").unwrap();
     assert!(image.is_absolute(), "the fallback must resolve too, got {image:?}");
 }
+
+// `program_token`: which string the gate judges when `executable()` is unset =====
+
+/// A command with no `executable()` that routes to the raw backend anyway, through the
+/// `fd >= 3` arm of `routes_to_raw_backend`. On this route `program_token` alone picks the string
+/// `reject_batch_program` judges, so a wrong pick skips the gate entirely.
+fn high_fd_command() -> Command {
+    let mut c = Command::new();
+    c.fd(3, crate::stdio::Stdio::pipe_out()).expect("fd 3");
+    c
+}
+
+/// The argv arm reads `argv.first()`. Probes put the batch name FIRST with clean names after it,
+/// and a clean name first with a batch name after it — a lone element cannot tell `first()` from
+/// `last()` or from "any".
+#[test]
+fn program_token_reads_the_first_argv_element() {
+    let mut refused = high_fd_command();
+    refused.args(["x.bat", "ordinary.exe", "tail.exe"]);
+    assert!(crate::child::spawn::routes_to_raw_backend(&refused));
+    assert_eq!(program_token(&refused), Some(PathBuf::from("x.bat")));
+    assert!(
+        matches!(reject_batch_program(&refused), Err(Error::Unsupported { .. })),
+        "argv[0] is a batch file"
+    );
+
+    let mut allowed = high_fd_command();
+    allowed.args(["ordinary.exe", "x.bat", "y.cmd"]);
+    assert_eq!(program_token(&allowed), Some(PathBuf::from("ordinary.exe")));
+    reject_batch_program(&allowed).expect("only argv[0] is the program");
+}
+
+/// The command-line arm reads `first_token_wide` — different extraction code from the argv arm,
+/// with quoting of its own. A whole-line read would judge `x.bat --flag` (no batch suffix) and let
+/// the first probe through; a last-token read would miss it the same way.
+#[test]
+fn program_token_reads_the_first_command_line_token() {
+    for (line, token) in [
+        ("x.bat --flag", "x.bat"),
+        (r#""C:\dir with space\x.bat" --flag"#, r"C:\dir with space\x.bat"),
+        (r"\\srv\x.bat\.. & calc", r"\\srv\x.bat\.."),
+    ] {
+        let mut c = high_fd_command();
+        c.commandline(line);
+        assert!(crate::child::spawn::routes_to_raw_backend(&c));
+        assert_eq!(program_token(&c), Some(PathBuf::from(token)), "{line:?}");
+        assert!(
+            matches!(reject_batch_program(&c), Err(Error::Unsupported { .. })),
+            "{line:?}: the first token is a batch file"
+        );
+    }
+
+    let mut allowed = high_fd_command();
+    allowed.commandline(r#"ordinary.exe x.bat "y.cmd""#);
+    assert_eq!(program_token(&allowed), Some(PathBuf::from("ordinary.exe")));
+    reject_batch_program(&allowed).expect("only the first token is the program");
+}
+
+/// End to end on the same route: `spawn()` must refuse before any child exists.
+#[test]
+fn a_high_fd_spawn_without_an_executable_is_gated_on_its_program_token() {
+    let mut by_argv = high_fd_command();
+    by_argv.args(["x.bat", "--flag"]);
+    let mut by_line = high_fd_command();
+    by_line.commandline("x.bat --flag");
+    for (via, mut c) in [("argv", by_argv), ("commandline", by_line)] {
+        let err = c.spawn().expect_err("a batch program token must be refused");
+        assert!(matches!(err, Error::Unsupported { .. }), "{via}: got {err:?}");
+    }
+}
