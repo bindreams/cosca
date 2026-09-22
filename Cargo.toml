@@ -102,6 +102,12 @@ path = "testbin/gui.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "cosca_testbin_image"
+path = "testbin/image_report.rs"
+test = false
+doc = false
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 

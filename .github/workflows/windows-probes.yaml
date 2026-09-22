@@ -1,14 +1,16 @@
 # Windows path-resolution canary.
 #
-# cosca's batch gate (CVE-2024-24576) predicts how Win32 normalises a program path — trailing dots
-# and spaces, `.`/`..`, verbatim `\\?\` prefixes — without resolving it.
-# `tests/windows_path_resolution.rs` asserts the platform facts that prediction rests on, so this
-# workflow fails when Windows stops agreeing with the model. That file says which fact backs which
-# part of the gate.
+# `tests/windows_path_resolution.rs` asserts how Windows and Rust's `std::process` normalise path
+# strings. cosca's batch gate (CVE-2024-24576) models that normalisation, and the model depends on
+# facts like these, so this workflow fails when Windows stops agreeing with the measurement. The
+# test file describes the platform only.
 #
 # The probes resolve strings, write inside a temp directory of their own and launch only
-# `cosca_testbin`: nothing here runs a batch file. They are `#[ignore]`d, so only this workflow runs
-# them.
+# `cosca_testbin_image`: nothing here runs a batch file. They are `#[ignore]`d, so only this
+# workflow runs them.
+#
+# GitHub disables a scheduled workflow after 60 days without repository activity; re-enable it
+# from the Actions tab.
 #
 # Run it by hand with:
 #
@@ -22,9 +24,17 @@ on:
       - "src/child/spawn.rs"
       - "src/child/spawn/batch_gate.rs"
       - "src/resolve.rs"
+      - "src/child/spawn/windows_raw.rs"
+      - "src/child/spawn/windows_raw/resolve.rs"
+      - "src/tokio/spawn/windows_raw.rs"
+      - "src/elevation/windows.rs"
       - "tests/windows_path_resolution.rs"
+      # The canary's payload is built from here.
+      - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
       - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/actions/setup-rust/**"
       - ".github/workflows/windows-probes.yaml"
   # `windows-latest` floats: a new Windows build can change the answer with no commit here.
   schedule:
@@ -56,6 +66,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
