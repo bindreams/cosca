@@ -1,7 +1,7 @@
-// Pure-parser tests for cgroup v2 path detection and cgroup.procs membership.
+// Pure-parser tests for cgroup v2 path detection and cgroup.events.
 // These run on any host (including Windows) with synthetic inputs — no filesystem access.
 
-use super::{cgroup_procs_contains, parse_populated, parse_v2_relative_path};
+use super::{parse_populated, parse_v2_relative_path};
 
 // parse_v2_relative_path tests =====
 
@@ -78,52 +78,6 @@ fn v2_line_not_first() {
 fn v2_no_trailing_newline() {
     let input = "0::/user.slice/user-1000.slice";
     assert_eq!(parse_v2_relative_path(input), Some("/user.slice/user-1000.slice"));
-}
-
-// cgroup_procs_contains tests -----
-
-/// Empty file contents — pid is absent.
-#[test]
-fn procs_empty_file() {
-    assert!(!cgroup_procs_contains("", 1234));
-}
-
-/// Single pid that matches.
-#[test]
-fn procs_single_match() {
-    assert!(cgroup_procs_contains("1234\n", 1234));
-}
-
-/// Single pid that does not match.
-#[test]
-fn procs_single_no_match() {
-    assert!(!cgroup_procs_contains("5678\n", 1234));
-}
-
-/// Multiple pids; target is present.
-#[test]
-fn procs_multiple_present() {
-    let contents = "100\n200\n1234\n300\n";
-    assert!(cgroup_procs_contains(contents, 1234));
-}
-
-/// Multiple pids; target is absent.
-#[test]
-fn procs_multiple_absent() {
-    let contents = "100\n200\n300\n";
-    assert!(!cgroup_procs_contains(contents, 1234));
-}
-
-/// Trailing newline at end of file — should not cause a false negative.
-#[test]
-fn procs_trailing_newline() {
-    assert!(cgroup_procs_contains("42\n", 42));
-}
-
-/// Whitespace around the pid (e.g. spaces) is trimmed.
-#[test]
-fn procs_whitespace_trimmed() {
-    assert!(cgroup_procs_contains("  99  \n", 99));
 }
 
 // parse_populated tests =====
@@ -275,11 +229,11 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         TreeDrain::MembersRemain,
         "both members are alive; must report MembersRemain"
     );
+    let procs = std::fs::read_to_string(leaf.leaf_path.join("cgroup.procs")).expect("read cgroup.procs");
     for (name, member, page) in [("a", &a, &page_a), ("b", &b, &page_b)] {
-        let placement = leaf.placement_of(member.id());
         assert!(
-            matches!(placement, super::Placement::Confirmed),
-            "member {name} must actually be placed in the leaf: {placement}"
+            procs.lines().any(|line| line.trim() == member.id().to_string()),
+            "member {name} must actually be placed in the leaf; cgroup.procs is {procs:?}"
         );
         assert_eq!(
             page.read(),

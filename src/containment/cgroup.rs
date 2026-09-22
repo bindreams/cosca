@@ -24,8 +24,8 @@
 //! are raw `libc::write` + `libc::close` — no allocation, no `format!`, no
 //! `String`.
 
-// parse_v2_relative_path and cgroup_procs_contains are pure (no OS deps) —
-// compiled on all platforms so their unit tests run on any host.
+// The parsers below are pure (no OS deps) — compiled on all platforms so their unit tests run
+// on any host.
 
 use std::fmt;
 use std::io;
@@ -46,21 +46,6 @@ pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
         }
     }
     None
-}
-
-/// Check whether `pid` appears in the contents of a `cgroup.procs` file.
-/// The file format is one pid per line (decimal, possibly with trailing
-/// whitespace/newline); blank lines are skipped.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn cgroup_procs_contains(contents: &str, pid: u32) -> bool {
-    for line in contents.lines() {
-        if let Ok(p) = line.trim().parse::<u32>() {
-            if p == pid {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Summarize the contents of `/proc/self/cgroup` for a degrade record: how many lines it had,
@@ -237,18 +222,17 @@ impl fmt::Display for PlacementReport {
     }
 }
 
-/// The parent-side verdict on whether the spawned child is a member of the leaf, carrying
-/// every fact the verdict was reached from.
+/// The parent-side verdict on whether the spawned child entered the leaf, carrying every fact
+/// the verdict was reached from.
 ///
-/// Membership is re-read from `cgroup.procs` after the spawn because the child's write can
-/// fail silently; when it reads back absent, "the write failed" and "the write succeeded and
-/// the child has since exited" are different diagnoses with different fixes, so both the
-/// child's own report and the child's current `/proc` state are captured here rather than
-/// collapsed into a bare `false`.
+/// The child's own report decides it. `cgroup.procs` lists only live tasks, so a placed child
+/// that has already exited reads back absent from it; the file is read only to diagnose a
+/// child that reported no successful write.
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum Placement {
-    /// `cgroup.procs` lists the child's pid: the leaf owns the tree.
+    /// The child's write to `cgroup.procs` succeeded: the leaf owns the tree, whether or not
+    /// the child is still alive to be listed.
     Confirmed,
     /// `cgroup.procs` is readable but does not list the child's pid.
     Absent {
@@ -660,7 +644,8 @@ impl ReportSlot {
 /// process-group mechanism.
 ///
 /// `Drop` closes the parent's `procs_fd` and removes the leaf directory,
-/// firing `cgroup.kill` first if the leaf is still occupied.
+/// firing `cgroup.kill` first if the leaf is still occupied — unless
+/// [`CgroupLeaf::remove_unentered`] consumed it.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
@@ -669,6 +654,9 @@ pub(crate) struct CgroupLeaf {
     procs_fd: RawFd,
     /// Where the forked child reports whether its self-placement write succeeded.
     report: ReportPage,
+    /// Whether `Drop` may write `cgroup.kill`. Cleared only by
+    /// [`CgroupLeaf::remove_unentered`].
+    may_hold_members: bool,
 }
 
 // Safety: RawFd is an integer. CgroupLeaf is not Clone; the fd is used only in
@@ -690,22 +678,33 @@ impl CgroupLeaf {
         self.leaf_path.join("cgroup.events")
     }
 
+    /// Remove a leaf its child never entered: close the fd and `rmdir`, never `cgroup.kill`.
+    ///
+    /// The child reported no successful write, so nothing it forks is in the leaf either.
+    /// Whatever keeps the `rmdir` from succeeding, cosca did not put there, and killing it would
+    /// kill a process cosca was never asked to contain.
+    pub(crate) fn remove_unentered(mut self) {
+        self.may_hold_members = false;
+    }
+
     /// A `Copy` handle to this leaf's placement-report slot, for capture by the `pre_exec`
     /// closure.
     pub(crate) fn placement_slot(&self) -> ReportSlot {
         self.report.slot()
     }
 
-    /// Whether `pid` is a member of this leaf, with every fact the verdict rests on.
+    /// Whether `pid` entered this leaf, with every fact the verdict rests on.
     ///
-    /// Used post-spawn (parent side): the `pre_exec` write can fail, so membership is
-    /// confirmed against the kernel rather than assumed. On a negative verdict the child's
-    /// own report and its current `/proc` state come back with it — see [`Placement`].
+    /// Used post-spawn (parent side). The child's own report is the verdict; only when it is
+    /// not `Placed` are `cgroup.procs` and the child's `/proc` state read, to diagnose why —
+    /// see [`Placement`].
     pub(crate) fn placement_of(&self, pid: u32) -> Placement {
-        let path = self.leaf_path.join("cgroup.procs");
         let report = self.report.read();
+        if report == PlacementReport::Placed {
+            return Placement::Confirmed;
+        }
+        let path = self.leaf_path.join("cgroup.procs");
         match fs::read_to_string(&path) {
-            Ok(procs) if cgroup_procs_contains(&procs, pid) => Placement::Confirmed,
             Ok(procs) => Placement::Absent {
                 pid,
                 path,
@@ -846,6 +845,7 @@ impl CgroupLeaf {
             leaf_path,
             procs_fd: -1,
             report: ReportPage::new().expect("map a placement-report page"),
+            may_hold_members: true,
         }
     }
 }
@@ -863,6 +863,15 @@ impl Drop for CgroupLeaf {
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
+        if !self.may_hold_members {
+            if !removed_after_drain(&first) {
+                warn_leaf_left_behind(
+                    &self.leaf_path,
+                    format_args!("rmdir failed ({first}); cgroup.kill not written: the child never entered it"),
+                );
+            }
+            return;
+        }
         let kill = self.hard_kill();
         let Err(second) = fs::remove_dir(&self.leaf_path) else {
             return;
@@ -872,17 +881,28 @@ impl Drop for CgroupLeaf {
         if removed_after_drain(&second) {
             return;
         }
-        log::warn!(
-            "cgroup leaf {} outlived its Drop: first rmdir failed ({first}), cgroup.kill {}, \
-             second rmdir failed ({second}); the leaf stays on this host until a cgroup manager \
-             reaps it",
-            self.leaf_path.display(),
-            match kill {
-                Ok(()) => "succeeded".to_string(),
-                Err(e) => format!("failed ({e})"),
-            }
+        warn_leaf_left_behind(
+            &self.leaf_path,
+            format_args!(
+                "first rmdir failed ({first}), cgroup.kill {}, second rmdir failed ({second})",
+                match kill {
+                    Ok(()) => "succeeded".to_string(),
+                    Err(e) => format!("failed ({e})"),
+                }
+            ),
         );
     }
+}
+
+/// Report a `cosca-*` leaf cosca failed to remove. Nothing revisits a leaf by name, so this
+/// record, made as it happens, is all a host accumulating them has to go on.
+#[cfg(target_os = "linux")]
+fn warn_leaf_left_behind(leaf_path: &Path, what_failed: fmt::Arguments<'_>) {
+    log::warn!(
+        "cgroup leaf {} was not removed: {what_failed}; it stays on this host until a cgroup \
+         manager reaps it",
+        leaf_path.display()
+    );
 }
 
 /// Test-only fault seams for the leaf-creation steps a temp directory cannot reach.
@@ -1044,6 +1064,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         leaf_path,
         procs_fd,
         report,
+        may_hold_members: true,
     })
 }
 

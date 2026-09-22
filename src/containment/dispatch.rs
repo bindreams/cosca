@@ -590,22 +590,21 @@ fn attach_tree(
 
                 // Strongest: cgroup v2 if available, else process group.
                 if let Some(leaf) = prepared.cgroup_leaf {
-                    // Verify placement: the pre_exec write can silently fail
-                    // (EBUSY — "no internal processes" rule when the supervisor
-                    // is itself an undelegated leaf). Read cgroup.procs to
-                    // confirm the child's pid is actually present.
+                    // The pre_exec write can fail (EBUSY — the "no internal processes" rule
+                    // when the supervisor is itself an undelegated leaf). The child's own
+                    // report of that write decides membership; re-reading cgroup.procs cannot,
+                    // because it lists only live tasks and a placed child may already have
+                    // exited.
                     match leaf.placement_of(raw_pid) {
                         crate::containment::cgroup::Placement::Confirmed => {
                             return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)))
                         }
-                        // Not a member — the leaf owns nothing; drop it (triggers rmdir) and
-                        // let the process group set pre-spawn be the real container. The
-                        // verdict carries the child's own report and its current state, so
-                        // "the write failed (errno)" and "the write succeeded and the child
-                        // then exited" are distinguishable from the log alone.
+                        // The child never entered the leaf, so nothing it forks did either. The
+                        // process group set pre-spawn is the real container; the leaf is
+                        // removed without writing cgroup.kill.
                         reason => {
                             crate::containment::cgroup::log_degrade(&reason);
-                            drop(leaf);
+                            leaf.remove_unentered();
                             return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
                         }
                     }

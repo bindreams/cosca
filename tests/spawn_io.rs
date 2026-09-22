@@ -1170,3 +1170,90 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
     assert_eq!(n, 0, "cgroup terminate must SIGTERM the grandchild, not just the root");
 }
+
+/// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
+/// inside `f` inherits the pin, so parent and child share that CPU.
+#[cfg(target_os = "linux")]
+fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: `cpu_set_t` is plain data; zeroed is a valid (empty) set.
+    let mut original: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    // SAFETY: pid 0 is the calling thread; `original` is a valid, writable set of `size` bytes.
+    assert_eq!(
+        unsafe { libc::sched_getaffinity(0, size, &mut original) },
+        0,
+        "read affinity"
+    );
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        // SAFETY: `cpu` is below CPU_SETSIZE, so it indexes inside the set.
+        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &original) })
+        .expect("this thread may run on at least one CPU");
+    // SAFETY: as above.
+    let mut pinned: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `cpu` is below CPU_SETSIZE.
+    unsafe { libc::CPU_SET(cpu, &mut pinned) };
+    // SAFETY: pid 0 is the calling thread; `pinned` is a valid set of `size` bytes.
+    assert_eq!(
+        unsafe { libc::sched_setaffinity(0, size, &pinned) },
+        0,
+        "pin to one CPU"
+    );
+    let result = f();
+    // SAFETY: as above, restoring the set read at entry.
+    assert_eq!(
+        unsafe { libc::sched_setaffinity(0, size, &original) },
+        0,
+        "restore affinity"
+    );
+    result
+}
+
+/// A contained `sh -c 'worker & exit 0'` keeps its worker, and the worker is in the leaf.
+///
+/// The root can exit before cosca looks at the leaf, and `cgroup.procs` lists only live tasks,
+/// so the root is then absent from it although the kernel accepted its placement. Parent and
+/// child share one CPU here, which makes that the common outcome rather than a rare one.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
+    use std::io::BufRead;
+
+    stderr_log::install();
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    // `sh` backgrounds the worker without waiting for its exec, so the root exits at once.
+    let mut cmd = Command::new();
+    cmd.executable("/bin/sh")
+        .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & exit 0"#, testbin(), &addr]);
+    cmd.contain();
+    let child = on_one_cpu(|| cmd.spawn()).expect("spawn");
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::CgroupV2,
+        "a root whose placement the kernel accepted is cgroup-contained, whether or not it is \
+         still alive to be listed"
+    );
+
+    let (worker, _) = listener.accept().expect("accept the worker");
+    let mut worker = std::io::BufReader::new(worker);
+    let mut hello = String::new();
+    worker.read_line(&mut hello).expect("read the worker's hello");
+    assert!(hello.starts_with('G'), "expected the worker's tag, got {hello:?}");
+    // Proof of life, after the spawn returned: a round trip only a live worker completes.
+    worker.get_mut().write_all(b"x").expect("write to the worker");
+    let mut echo = [0u8; 1];
+    worker
+        .read_exact(&mut echo)
+        .expect("the worker must still be alive to echo — cosca killed it at spawn time");
+    assert_eq!(&echo, b"x");
+
+    // The leaf owns the worker: its kill reaches it.
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    let mut buf = [0u8; 1];
+    let n = worker.read(&mut buf).expect("read the worker's control socket");
+    assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
+}
