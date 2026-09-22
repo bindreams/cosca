@@ -476,6 +476,10 @@ fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<S
 ///
 /// `CreateProcessW` and `PCWSTR` stop there, so the caller's whole token is not what gets loaded.
 /// Borrowed when there is no NUL, which is every ordinary path.
+///
+/// Host-independent on purpose — it computes the same prefix everywhere, which is what lets a
+/// macOS run exercise the Win32 rule. Whether that prefix is AUTHORITATIVE is a separate question,
+/// answered by [`reject_batch_path_on`]'s `win32` argument: off Win32 nothing truncates.
 fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
     use std::borrow::Cow;
     #[cfg(unix)]
@@ -496,8 +500,8 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
             None => Cow::Borrowed(prog),
         }
     }
-    // Neither family has Win32 to truncate anything, and neither has cmd.exe for the gate below
-    // to protect: the token is its own prefix.
+    // No portable byte view to split on, and nothing here truncates: the token is its own prefix.
+    // A NUL then falls through to std's own program conversion, which refuses it at spawn.
     #[cfg(not(any(unix, windows)))]
     {
         Cow::Borrowed(prog)
@@ -520,14 +524,36 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
 ///
 /// Fixing that here rather than by ordering a NUL check in front of each caller is what makes the
 /// verdict uniform: the std backend — the DEFAULT Windows path — has no NUL check of its own.
-/// Pinned on any host by `spawn_tests::the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token`.
 pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
-    let prog = win32_prefix(prog);
-    if let Some(ext) = prog.extension() {
+    reject_batch_path_on(prog, cfg!(windows))
+}
+
+/// PURE given `win32`: the gate's rule with the platform as DATA rather than a `cfg!` buried in
+/// it, so one host can ask for either verdict — the same reason `elevation::plan::Host` carries
+/// its `Os`. Both are pinned from any host by `spawn_tests`.
+///
+/// `win32` decides whether the truncated prefix is what runs:
+///
+/// - Win32 truncates at the NUL, so the prefix IS the program and the batch rule reads it.
+/// - Off Win32 nothing truncates. A NUL makes the token name no file at all, and there is no
+///   cmd.exe for CVE-2024-24576 to reach — so the honest verdict is the NUL, and judging the
+///   prefix would send a Linux or macOS caller to audit a batch vector that cannot affect them.
+///   That is the same misattribution the prefix rule removes on Windows, one platform over.
+fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error> {
+    let loaded = win32_prefix(prog);
+    if !win32 && loaded.as_os_str() != prog.as_os_str() {
+        // A literal: interpolating the token would put a raw U+0000 into a message bound for logs
+        // and terminals, which is half of what this round is removing.
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the program path contains an embedded NUL, so it names no file",
+        )));
+    }
+    if let Some(ext) = loaded.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {
             return Err(Error::Unsupported {
-                op: format!("running {}", prog.display()),
+                op: format!("running {}", loaded.display()),
                 platform: "windows",
                 detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
                          use .commandline() to pass an explicit, pre-escaped command line"

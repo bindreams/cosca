@@ -236,7 +236,7 @@ fn with_interior_nul(prefix: &str, suffix: &str) -> std::ffi::OsString {
     }
 }
 
-/// `Path::extension()` of `token` — the value [`super::reject_batch_path`] must NOT key on.
+/// `Path::extension()` of `token` — the value [`super::reject_batch_path_on`] must NOT key on.
 fn extension_of(token: &std::ffi::OsStr) -> Option<String> {
     std::path::Path::new(token)
         .extension()
@@ -249,6 +249,24 @@ fn unsupported_op<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
         Err(Error::Unsupported { op, .. }) => op,
         other => panic!("expected Unsupported, got {other:?}"),
     }
+}
+
+/// The `Display` of an `Io(InvalidInput)` refusal; panics on anything else.
+fn invalid_input_message<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+    match r {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => e.to_string(),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+}
+
+/// The gate under a Win32 verdict, spelled as a value so this host can ask for it.
+fn on_win32(token: &std::ffi::OsStr) -> Result<(), Error> {
+    super::reject_batch_path_on(std::path::Path::new(token), true)
+}
+
+/// The gate under a POSIX verdict, ditto.
+fn on_posix(token: &std::ffi::OsStr) -> Result<(), Error> {
+    super::reject_batch_path_on(std::path::Path::new(token), false)
 }
 
 /// `\0` is not a path separator, so `Path::extension()` reads straight through it — and on both
@@ -272,11 +290,11 @@ fn the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token() {
     assert_ne!(extension_of(&bat_then_nul), Some("bat".to_owned()));
 
     assert!(
-        super::reject_batch_path(std::path::Path::new(&nul_then_bat)).is_ok(),
+        on_win32(&nul_then_bat).is_ok(),
         "`setup` is not a batch file; refusing it as one sends the caller to audit the wrong defect"
     );
 
-    let op = unsupported_op(super::reject_batch_path(std::path::Path::new(&bat_then_nul)));
+    let op = unsupported_op(on_win32(&bat_then_nul));
     assert!(
         !op.contains('\0'),
         "the refusal must not carry a raw NUL into logs: {op:?}"
@@ -284,25 +302,77 @@ fn the_batch_gate_reads_the_prefix_win32_would_load_not_the_whole_token() {
     assert!(op.contains("setup.bat"), "the refusal must name what Win32 loads: {op}");
 }
 
-/// The std backend is the DEFAULT Windows path: `args([..])` with no `executable()` and no
-/// fd >= 3 is false for `routes_to_raw_backend`, so it reaches the batch gate through
-/// [`super::build_std_command`] with no NUL check of its own. The gate alone therefore has to get
-/// both NUL/batch shapes right here, and this drives the real entry point rather than the helper.
+/// The truncation is a WIN32 fact, so it decides nothing off Win32. On POSIX `x.bat` + NUL +
+/// `junk` names no file at all — there is nothing to truncate, no cmd.exe, and no CVE-2024-24576
+/// to audit — so the honest verdict is the NUL, and blaming batch escaping is the very
+/// misattribution the prefix rule exists to remove, one platform over.
 #[test]
-fn the_std_backend_refuses_a_program_win32_would_truncate_back_to_a_batch_file() {
+fn a_nul_bearing_program_is_diagnosed_as_a_nul_off_win32() {
+    for token in [
+        with_interior_nul("x.bat", "junk"),
+        with_interior_nul("x", ".bat"),
+        with_interior_nul("/usr/bin/ls", "junk"),
+    ] {
+        let msg = invalid_input_message(on_posix(&token));
+        for wrong in ["cmd.exe", "CVE-2024-24576", "windows", "Win32"] {
+            assert!(
+                !msg.contains(wrong),
+                "a POSIX refusal must not mention {wrong:?}: {msg}"
+            );
+        }
+        assert!(msg.contains("NUL"), "the refusal must name the NUL: {msg}");
+        assert!(
+            !msg.contains('\0'),
+            "the refusal must not carry a raw NUL into logs: {msg:?}"
+        );
+    }
+}
+
+/// The same token, the two platform verdicts, from one host: `win32` is data rather than a `cfg!`
+/// precisely so both are reachable here. Without this pair the POSIX arm could be "satisfied" by
+/// making the gate refuse NULs everywhere, which would take the Win32 diagnosis away again.
+#[test]
+fn the_win32_and_posix_verdicts_differ_for_the_same_token() {
+    let bat_then_nul = with_interior_nul("x.bat", "junk");
+    assert!(unsupported_op(on_win32(&bat_then_nul)).contains("x.bat"));
+    invalid_input_message(on_posix(&bat_then_nul));
+}
+
+/// A clean `.bat` is still refused on either platform: the verdict is a property of the REQUEST,
+/// not of the host, and the NUL arm above must not have swallowed the batch rule.
+#[test]
+fn a_clean_batch_program_is_refused_under_either_verdict() {
+    let token = std::ffi::OsString::from(r"C:\tools\setup.bat");
+    for r in [on_win32(&token), on_posix(&token)] {
+        assert!(unsupported_op(r).contains("setup.bat"));
+    }
+}
+
+/// The std backend is the DEFAULT Windows path: `args([..])` with no `executable()` and no
+/// fd >= 3 is false for `routes_to_raw_backend`, so it reaches the gate through
+/// [`super::build_std_command`] with no NUL check of its own.
+///
+/// Host-independent on purpose: what it pins is that the gate judges the token the CALLER named.
+/// Before this round it read `std::process::Command::get_program()`, and std's Unix constructor
+/// had already swapped a NUL-bearing program for a `<string-with-nul>` sentinel — so on this host
+/// the call returned `Ok` and the token reached `spawn`. Which refusal comes back is the platform
+/// verdict tested above; that one comes back at all is the wiring.
+#[test]
+fn the_std_backend_judges_the_program_token_the_caller_named() {
     let mut c = Command::new();
     c.args([with_interior_nul(r"C:\tools\setup.bat", "junk")]);
-    let op = unsupported_op(super::build_std_command(&c));
+    let err = super::build_std_command(&c).expect_err("a NUL-bearing program token must be refused");
+    let msg = err.to_string();
     assert!(
-        !op.contains('\0'),
-        "the refusal must not carry a raw NUL into logs: {op:?}"
+        !msg.contains('\0'),
+        "the refusal must not carry a raw NUL into logs: {msg:?}"
     );
 }
 
-/// The mirror shape on the same default path: the std backend must not tell the caller to audit
+/// The mirror shape on the same default path: the std backend must never tell the caller to audit
 /// batch escaping for `C:\tools\setup`, which is what Win32 would load and is not a batch file.
-/// Asserted as "not the batch refusal" rather than as an `Ok`, because on Windows std's own
-/// wide-string conversion refuses the interior NUL a step later.
+/// Asserted as "not the batch refusal" rather than as an `Ok`, because the token is still refused
+/// — as a NUL here, and by std's own wide-string conversion a step later on Windows.
 #[test]
 fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
     let mut c = Command::new();
