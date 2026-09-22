@@ -43,6 +43,15 @@ pub(crate) fn contains_since(mark: usize, marker: &str) -> bool {
     RECORDS.lock().unwrap()[mark..].iter().any(|(_, m)| m.contains(marker))
 }
 
+/// The text of every record emitted at or after `mark` that contains `marker`.
+pub(crate) fn records_since(mark: usize, marker: &str) -> Vec<String> {
+    RECORDS.lock().unwrap()[mark..]
+        .iter()
+        .filter(|(_, m)| m.contains(marker))
+        .map(|(_, m)| m.clone())
+        .collect()
+}
+
 /// The levels of every record emitted at or after `mark` that contains `marker`.
 ///
 /// A level is part of a log record's meaning, not decoration: it is what decides whether an

@@ -908,6 +908,7 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
         static FORCE_MAP_REPORT_PAGE_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Treat the NEXT created leaf as exposing `cgroup.kill`. Supplies the single fact a temp
@@ -935,6 +936,18 @@ pub(crate) mod fault {
     }
     pub(crate) fn map_report_page_failure_armed() -> bool {
         FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.get())
+    }
+
+    /// Put a directory inside the NEXT leaf whose creation fails, just before its unwind runs, so
+    /// that unwind's `rmdir` fails for real (`ENOTEMPTY`).
+    pub(crate) fn set_force_occupy_before_unwind(on: bool) {
+        FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_occupy_before_unwind() -> bool {
+        FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.replace(false))
+    }
+    pub(crate) fn occupy_before_unwind_armed() -> bool {
+        FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.get())
     }
 }
 
@@ -978,10 +991,21 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         source,
     })?;
 
-    // Every failure past this point removes the leaf it just created, so a degrade never
-    // leaves a stray `cosca-*` cgroup behind (issue #140).
+    // Every failure past this point removes the leaf it just created, and reports one it could
+    // not remove.
     let fail = |leaf_path: &Path, err: LeafError| -> LeafError {
-        let _ = fs::remove_dir(leaf_path);
+        #[cfg(test)]
+        if fault::take_force_occupy_before_unwind() {
+            fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
+        }
+        if let Err(e) = fs::remove_dir(leaf_path) {
+            if !removed_after_drain(&e) {
+                warn_leaf_left_behind(
+                    leaf_path,
+                    format_args!("rmdir failed ({e}) after its creation failed ({err})"),
+                );
+            }
+        }
         err
     };
 

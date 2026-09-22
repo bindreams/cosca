@@ -577,6 +577,40 @@ fn create_leaf_under_reports_a_missing_cgroup_kill() {
     assert!(strays.is_empty(), "a failed leaf creation left {strays:?} behind");
 }
 
+/// A degrade whose leaf cannot be removed says so, the way `Drop` does for a leaf it could not
+/// remove: a stray `cosca-*` cgroup stays on the host, and this record is all anyone will have.
+#[cfg(target_os = "linux")]
+#[test]
+fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().to_string_lossy().into_owned();
+    super::fault::set_force_occupy_before_unwind(true);
+
+    let mark = crate::log_capture::mark();
+    let err = match super::create_leaf_under(dir.path()) {
+        Err(e) => e,
+        Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
+    };
+    assert!(
+        !super::fault::occupy_before_unwind_armed(),
+        "the seam must be consumed by the unwind it stands in for"
+    );
+    assert!(matches!(err, LeafError::KillUnsupported { .. }), "got {err:?}");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &marker),
+        vec![log::Level::Warn],
+        "the unwind left a leaf behind and must say so"
+    );
+    let enotempty = std::io::Error::from_raw_os_error(libc::ENOTEMPTY).to_string();
+    assert!(
+        crate::log_capture::records_since(mark, &marker)
+            .iter()
+            .any(|record| record.contains(&enotempty)),
+        "the record must carry the kernel's reason"
+    );
+}
+
 /// A `cgroup.kill` the kernel cannot even look up is not a missing one: the errno is the
 /// diagnosis, and "the kernel is older than 5.14" would be a confident false cause.
 ///
