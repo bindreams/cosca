@@ -627,10 +627,9 @@ fn reject_batch_path_on_windows_refuses_a_path_that_names_no_file_of_its_own() {
 /// somewhere materially different — one says route through cmd.exe yourself, the other says name
 /// the executable — so handing out the wrong one is a bug even though the verdict is right.
 ///
-/// It was reachable while the gate took two readings of a dots-and-spaces component and returned
-/// whichever refused FIRST: `x.bat\c:\ ` had the elided reading name no file and the popped one
-/// name a batch file, and the caller got "name the executable". One measured reading leaves one
-/// reason per path, and this keeps it that way.
+/// The gate takes two readings of an interior dots-and-spaces segment, and one path can refuse
+/// for a different reason under each: `x.bat\...\..` names no file if the `...` drops out and
+/// `x.bat` if it is a name the `..` pops. The batch reason wins, because only it names the vector.
 #[test]
 fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
     use std::path::Path;
@@ -638,7 +637,13 @@ fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
         Err(Error::Unsupported { detail, .. }) => detail,
         other => panic!("{probe:?} must be refused, got {other:?}"),
     };
-    for probe in [r"x.bat\y\..", "x.bat", r"C:\bin\x.exe:p.bat", r"\\?\C:\x.bat"] {
+    for probe in [
+        r"x.bat\y\..",
+        "x.bat",
+        r"C:\bin\x.exe:p.bat",
+        r"\\?\C:\x.bat",
+        r"x.bat\...\..",
+    ] {
         assert!(
             detail(probe).contains("cmd.exe batch escaping is not implemented"),
             "{probe:?} reaches a batch file, so it must advise the cmd.exe route: {}",
