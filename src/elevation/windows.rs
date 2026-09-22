@@ -318,12 +318,20 @@ impl Drop for ComInit {
 /// The argv runas can work from at all. Split from [`elevated_program`] and [`elevated_params`] so
 /// the program's NUL check can sit between them — see [`plan_runas`].
 fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    let CommandInput::Argv(argv) = cmd.input() else {
-        return Err(Error::Unsupported {
-            op: "elevation of a commandline() command".into(),
-            platform: "windows",
-            detail: "runas elevation requires an argv command (set .args([...]))".into(),
-        });
+    // Matched variant by variant rather than through a catch-all `else`: `Empty` is not a
+    // `commandline()` command, and `Command::new().executable("x.exe").elevate()` told that it had
+    // elevated one is sent to audit a builder call its code never makes. It wants the same
+    // "no program" refusal the empty-argv case below already returns.
+    let argv: &[OsString] = match cmd.input() {
+        CommandInput::Argv(argv) => argv,
+        CommandInput::Empty => &[],
+        CommandInput::CommandLine(_) => {
+            return Err(Error::Unsupported {
+                op: "elevation of a commandline() command".into(),
+                platform: "windows",
+                detail: "runas elevation requires an argv command (set .args([...]))".into(),
+            })
+        }
     };
     if argv.is_empty() {
         return Err(Error::Unsupported {

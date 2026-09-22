@@ -144,6 +144,35 @@ fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
     }
 }
 
+/// An argv-less command is not a `commandline()` one. Both of these are reachable from the public
+/// builder and neither calls `.commandline()`, so naming it sends the caller to audit a line of
+/// their code that does not exist — and says nothing about the program they actually failed to set.
+#[test]
+fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
+    let mut by_executable = Command::new();
+    by_executable.executable("x.exe").elevate();
+
+    let mut bare = Command::new();
+    bare.elevate();
+
+    for (via, c) in [("executable() only", &by_executable), ("nothing at all", &bare)] {
+        match super::plan_runas(c, &win_host(false)) {
+            Err(e @ Error::Unsupported { .. }) => {
+                let msg = e.to_string();
+                assert!(!msg.contains("commandline"), "{via}: none was set, got {msg}");
+                assert!(
+                    msg.contains("empty command"),
+                    "{via}: the refusal must name the missing program, got {msg}"
+                );
+            }
+            other => panic!(
+                "{via}: an argv-less elevate() must be refused, got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+}
+
 /// The affirmative leg. Every other `plan_runas` test asserts a REFUSAL, so all of them would
 /// still pass against a seam that refused everything — and "no consent prompt ever happens" is not
 /// the property this file is pinning. A clean inherit-only request on an UNELEVATED host must
