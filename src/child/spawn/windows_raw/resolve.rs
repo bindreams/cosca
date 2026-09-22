@@ -183,7 +183,11 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// path. `ShellExecuteEx` cannot be trusted with one: a
 /// path-less `lpFile` IS searched — `PATHEXT` applied, `lpDirectory` consulted as a search
 /// location — which is how the elevated path reached the `.bat`/`.cmd` vector. Completing the
-/// name here first means `lpFile` is always absolute, and an absolute `lpFile` is taken verbatim.
+/// name here first makes `lpFile` absolute, which stops the directory search but NOT `PATHEXT`:
+/// `ShellExecuteEx` applies it to an absolute extensionless `lpFile` too, and a planted
+/// `setup.bat` outranks an existing `setup` (measured). The consent path therefore also refuses a
+/// completed name not ending in `.exe`/`.com` — see [`crate::resolve::reject_unloadable_image`],
+/// which also says what that leaves unmeasured.
 ///
 /// `GetFullPathNameW` is the right primitive rather than a hand-rolled join, on three counts
 /// documented by Win32 itself:

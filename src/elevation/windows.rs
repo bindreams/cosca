@@ -246,8 +246,8 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 /// closes the interior-NUL divergence between the elevated and unelevated paths. A separate,
 /// still-open divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse —
 /// both by an extension this gate never sees (PATHEXT completion of an extension-less token) and
-/// by other registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). See the
-/// batch gate below; neither is closed here.
+/// by other registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). Neither is
+/// closed here; see the batch gate and the image allowlist in [`plan_runas`].
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -367,8 +367,8 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     //
     // Completing the name ourselves is what keeps the two paths agreeing. `absolutise_exact` uses
     // the same base the loader does and performs no search, no extension guessing and no
-    // filesystem access, so the promise survives verbatim and `lpFile` is absolute — and an
-    // absolute `lpFile` is taken verbatim by `ShellExecuteEx`.
+    // filesystem access, so `lpFile` is absolute. Absolute stops `ShellExecuteEx`'s directory
+    // search but not its `PATHEXT`, which [`plan_runas`]'s image allowlist covers.
     //
     // A `Search` token is NOT resolved here yet: `executable()` on the elevated path still reaches
     // `ShellExecuteEx`'s own search unresolved. That is the pre-existing hole tracked as #135 and
@@ -478,9 +478,9 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     //
     // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE. It therefore does NOT
     // close the batch vector. Two of the open surfaces are `wide_nul`'s doc's to name — PATHEXT
-    // completion of an extension-less token, and the other registered `runas` associations. Each
-    // lands in a later PR: resolution makes the completion ours (`resolve_executable_in` never
-    // reads PATHEXT), and an extension allowlist covers the associations.
+    // completion of an extension-less token, and the other registered `runas` associations. On
+    // the consent path's `Exact` arm the image allowlist below the planner closes both for a name
+    // not ending in `.exe`/`.com`; the `Search` arm's land in a later PR.
     //
     // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
     // resolves the token as a path, so `setup.bat.`, `setup.bat ` and `C:\tools\.bat` all reach the
@@ -504,6 +504,13 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
             unreachable!("planner never yields ElevateMacosGui on a windows host")
         }
         Transition::ElevateWindows { .. } => {}
+    }
+
+    // Below the short-circuit: an already-elevated caller re-spawns through `CreateProcessW`,
+    // which assumes no default extension, so an extensionless image is not plantable there. The
+    // `Search` arm is not gated here yet.
+    if let Some(ExecutableSpec::Exact(_)) = cmd.executable_spec() {
+        crate::resolve::reject_unloadable_image(std::path::Path::new(&program), true)?;
     }
 
     Ok(RunasStep::Launch(Box::new(RunasLaunch {

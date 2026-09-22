@@ -1238,3 +1238,73 @@ fn a_name_with_a_stem_still_resolves() {
         assert!(got.is_ok(), "{n:?} has a stem and must resolve, got {got:?}");
     }
 }
+
+// ===== the elevated image allowlist =====
+
+/// The allowlist itself; see [`reject_unloadable_image`]'s doc for why only the name can be gated.
+#[test]
+fn an_image_without_a_loadable_extension_is_refused() {
+    for n in [
+        r"C:\dir\tool",
+        r"C:\dir\tool.bat",
+        r"C:\dir\tool.cmd",
+        r"C:\dir\tool.exe.bat",
+        r"C:\dir\tool.exe.",
+        r"C:\dir\tool.bin",
+    ] {
+        assert!(
+            reject_unloadable_image(Path::new(n), true).is_err(),
+            "{n:?} is not a loadable image name and must be refused"
+        );
+    }
+}
+
+/// An allowlist refuses every other registered association by construction; a denylist of script
+/// extensions would let these through.
+#[test]
+fn the_elevated_allowlist_also_refuses_the_wider_association_surface() {
+    for n in [
+        r"C:\dir\shortcut.lnk",
+        r"C:\dir\script.vbs",
+        r"C:\dir\script.ps1",
+        r"C:\dir\script.js",
+        r"C:\dir\page.hta",
+        r"C:\dir\installer.msi",
+    ] {
+        assert!(
+            reject_unloadable_image(Path::new(n), true).is_err(),
+            "{n:?} is a shell association, not a loadable image, and must be refused"
+        );
+    }
+}
+
+/// Negative control, case-insensitive. `.com` because `more.com`/`chcp.com`/`tree.com` ship in
+/// System32 as ordinary PEs.
+#[test]
+fn a_loadable_image_name_is_accepted() {
+    for n in [
+        r"C:\dir\tool.exe",
+        r"C:\dir\TOOL.EXE",
+        r"C:\dir\Tool.Exe",
+        r"C:\dir\more.com",
+        r"C:\dir\MORE.COM",
+        r"C:\dir\tool.bat.exe",
+    ] {
+        assert!(
+            reject_unloadable_image(Path::new(n), true).is_ok(),
+            "{n:?} is a loadable image name and must be accepted"
+        );
+    }
+}
+
+/// Kills dropping the `names_no_file` guard: without it the whole-string suffix test accepts a
+/// share root whose share happens to be named `*.exe`.
+#[test]
+fn a_prefix_ending_in_exe_is_not_an_image_name() {
+    for n in [r"\\server\share.exe", r"\\?\UNC\server\share.com"] {
+        assert!(
+            reject_unloadable_image(Path::new(n), true).is_err(),
+            "{n:?} names no file and must be refused"
+        );
+    }
+}

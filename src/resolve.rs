@@ -22,8 +22,9 @@
 //! `#[cfg_attr(not(windows), allow(dead_code))]` on this module tracks exactly that: the `allow`
 //! goes away once those paths route through [`resolve`] too.
 //! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
-//! up — `execvp` does not search a name containing a separator, and `ShellExecuteEx` does not
-//! search an absolute `lpFile` — but that wiring has not happened yet for either.
+//! up — `execvp` does not search a name containing a separator, and `ShellExecuteEx` skips its
+//! directory search for an absolute `lpFile` (though not `PATHEXT`; see
+//! [`reject_unloadable_image`]) — but that wiring has not happened yet for either.
 //!
 //! Classification is byte-level and parameterised by [`ResolveInput::windows`] rather than using
 //! `std::path`, whose parsing is host-specific — `Path::new("C:tool").prefix()` is `None` off
@@ -429,13 +430,66 @@ fn takes_the_exe_fallback(name: &OsStr, windows: bool) -> bool {
 ///
 /// Unlike its sibling classifiers this does NOT split off the final component first, and so takes
 /// no `windows` flag. Neither suffix contains a separator, so for every input that REACHES here
-/// the two readings coincide: [`resolve`] refuses a [`names_no_file`] name first, and only such a
-/// name can have its final component swallowed by a prefix (`\\server\share.exe` ends in `.exe`
-/// while its final component is empty). A future caller bypassing that refusal would get the
-/// whole-string answer; compare `final_component(name, windows)` instead if it needs the other.
+/// the two readings coincide: both callers ([`resolve`] and [`reject_unloadable_image`]) refuse a
+/// [`names_no_file`] name first, and only such a name can have its final component swallowed by a
+/// prefix (`\\server\share.exe` ends in `.exe` while its final component is empty). A future
+/// caller bypassing that refusal would get the whole-string answer; compare
+/// `final_component(name, windows)` instead if it needs the other.
 fn has_loadable_extension(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     ends_with_ignore_ascii_case(bytes, b".exe") || ends_with_ignore_ascii_case(bytes, b".com")
+}
+
+/// Refuse an image whose name does not end in `.exe`/`.com` — the ELEVATED path's allowlist.
+///
+/// `ShellExecuteEx` does not open `lpFile`, it RESOLVES it, and it applies `PATHEXT` even when
+/// `lpFile` is absolute. Measured on both CI architectures and on a real desktop: `PATHEXT`
+/// OUTRANKS AN EXISTING FILE, so an absolute `C:\dir\tool` with a planted `C:\dir\tool.bat`
+/// beside it runs the batch file even when `tool` is a real PE. From an unelevated caller that
+/// child runs at High integrity, and the consent dialog reads "Windows Command Processor",
+/// Microsoft Corporation (verified) — the batch resolves to its signed handler, so the bypass
+/// launders the one thing the user is being asked to judge.
+///
+/// Existence therefore cannot be the test; only the NAME can be. An ALLOWLIST rather than a
+/// denylist of script extensions, because `ShellExecuteEx` resolves any registered association:
+/// `.lnk`, `.vbs`, `.ps1`, `.js`, `.hta` and `.msi` are all refused here by construction, where
+/// a denylist would have to enumerate a registry the caller's machine controls. `.lnk` is the
+/// sharp case — a shortcut's target can be `cmd.exe /c ...`, elevating a program never named.
+///
+/// The allowlist closes the extensionless case only. Whether `ShellExecuteEx` also applies
+/// `PATHEXT` to an `lpFile` that already ends in `.exe` — a real `tool.exe` beside a planted
+/// `tool.exe.bat` — is unmeasured, and this rule makes no claim about it.
+///
+/// # Deliberately stricter than an unelevated spawn
+///
+/// `CreateProcessW` does NOT extend `lpApplicationName` ("no default extension is assumed"), so
+/// it loads an extensionless PE by absolute path quite safely; `ShellExecuteEx` does extend, so
+/// the same name is plantable there. The asymmetry is the platform's, and this rule follows it
+/// rather than papering over it: `.elevate()` refuses names an ordinary spawn accepts.
+/// `raw_executable("tool").elevate()` wants `tool.exe`.
+///
+/// Over-rejection is the safe direction and is taken where the two disagree: `tool.exe.` (trailing
+/// dot) resolves to `tool.exe` on Windows but is refused here, because a trailing dot does NOT
+/// suppress `PATHEXT` (measured) and reasoning about which spellings Windows silently trims is
+/// how the plantability bug got in.
+///
+/// [#147] would make this rule moot by calling `ShellExecuteEx` only on `current_exe()`, which is
+/// absolute and already ends in `.exe` — structurally immune. It does not invalidate the rule now.
+///
+/// [#147]: https://github.com/bindreams/cosca/issues/147
+pub(crate) fn reject_unloadable_image(program: &Path, windows: bool) -> Result<(), Error> {
+    // `names_no_file` first: it is what makes `has_loadable_extension`'s whole-string reading the
+    // final component's (see its doc).
+    if !names_no_file(program.as_os_str(), windows) && has_loadable_extension(program.as_os_str()) {
+        return Ok(());
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "elevation requires an image named .exe or .com, because ShellExecuteEx applies \
+             PATHEXT to it and a planted script would outrank it: {program:?}"
+        ),
+    )))
 }
 
 fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {

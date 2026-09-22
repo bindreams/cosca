@@ -243,6 +243,51 @@ fn elevated_exact_program_is_completed_to_an_absolute_path() {
     assert_eq!(p.file_name().unwrap(), std::ffi::OsStr::new("tool.exe"), "{program:?}");
 }
 
+/// The consent path's `Exact` arm applies [`crate::resolve::reject_unloadable_image`]: an absolute
+/// extensionless `lpFile` is still PATHEXT-completed by `ShellExecuteEx`. Relative too, since
+/// completion does not add an extension.
+#[test]
+fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
+    for n in [r"C:\tools\setup", "setup", r"C:\tools\setup.bat.exe.lnk"] {
+        let mut c = Command::new();
+        c.raw_executable(n).args([n]).elevate();
+        match super::plan_runas(&c, &win_host(false)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                assert!(
+                    e.to_string().contains("PATHEXT"),
+                    "{n:?}: the reason must be named: {e}"
+                );
+            }
+            other => panic!("{n:?}: expected Io(InvalidInput), got {:?}", other.map(|_| "Ok")),
+        }
+    }
+}
+
+/// An already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
+/// extension, so the allowlist is not applied there. Kills moving the gate above the short-circuit.
+#[test]
+fn an_extensionless_exact_program_is_not_refused_when_already_elevated() {
+    let mut c = Command::new();
+    c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
+    assert!(matches!(
+        super::plan_runas(&c, &win_host(true)),
+        Ok(super::RunasStep::AlreadyElevated)
+    ));
+}
+
+/// Negative control: a loadable image name still plans a launch.
+#[test]
+fn an_exact_exe_or_com_program_plans_a_launch() {
+    for n in [r"C:\tools\setup.exe", r"C:\tools\SETUP.COM", "setup.exe"] {
+        let mut c = Command::new();
+        c.raw_executable(n).args([n]).elevate();
+        assert!(
+            matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
+            "{n:?} must plan a launch"
+        );
+    }
+}
+
 // ===== creation-flag intents on the consent-prompt path =====
 
 /// `ShellExecuteEx` takes a show-command and no creation-flag word, so this is the only knob the

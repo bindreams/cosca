@@ -292,11 +292,13 @@ impl Command {
     /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
     /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
     ///
-    /// On Windows the contract holds on every spawn path, elevated or not. The elevated path
-    /// goes through `ShellExecuteEx`, whose `lpFile` **is** searched when it has no path
-    /// (`PATHEXT` applied, `lpDirectory` consulted), so cosca completes the name to an absolute
-    /// path first — using the same base and the same no-search, no-extension, no-existence-check
-    /// rules as above — rather than letting that search happen.
+    /// On Windows the elevated path goes through `ShellExecuteEx`, which searches a path-less
+    /// `lpFile` and applies `PATHEXT` even to an absolute one. cosca completes the name to an
+    /// absolute path first, by the same rules as above, and where a consent prompt is used refuses
+    /// it with [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
+    /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
+    /// `C:\tools\setup`. Whether `PATHEXT` is also applied to a name that already ends in `.exe`
+    /// is unmeasured.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
