@@ -549,6 +549,38 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     );
 }
 
+/// A disarmed leaf whose tree the caller KILLED is not left behind for a live detached tree: it
+/// is a leaf `cgroup.kill` had not yet drained when the handle dropped (`kill_on_drop(false)`,
+/// `kill_tree()`, no `wait_tree()`). It is reported as the leak it is, at `warn`, like every
+/// other leaf cosca fails to remove.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_tree_was_killed_warns_that_it_was_not_removed() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-killed-opted-out-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the still-dying tree");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    let leaf = entered_leaf_at(leaf_path);
+    leaf.disarm();
+    leaf.hard_kill().expect("kill the tree");
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+
+    let records = crate::log_capture::records_since(mark, "cosca-killed-opted-out-leaf");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-killed-opted-out-leaf"),
+        vec![log::Level::Warn],
+        "a killed tree's leaf that outlived its Drop is a leak, got {records:?}"
+    );
+    assert!(
+        records.iter().all(|r| !r.contains("detached")),
+        "the caller killed this tree; it was not left running, got {records:?}"
+    );
+}
+
 /// A disarmed leaf whose directory is already GONE leaves nothing behind, so `Drop` must not
 /// say it did. `rmdir` failing with `ENOENT` is proof of removal, not of survival — the armed
 /// path already reads it that way, and a detached leaf's one `rmdir` is the only reading it

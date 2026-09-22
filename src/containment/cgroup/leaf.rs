@@ -114,6 +114,9 @@ pub(crate) struct CgroupLeaf {
     /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
     /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
     armed: AtomicBool,
+    /// Whether [`hard_kill`](Self::hard_kill) wrote `cgroup.kill`. A disarmed `Drop` reads it to
+    /// tell a tree the caller killed, whose leaf has not drained yet, from one left running.
+    killed: AtomicBool,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -441,7 +444,10 @@ impl CgroupLeaf {
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
         match fs::write(&path, b"1") {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.killed.store(true, Ordering::Relaxed);
+                Ok(())
+            }
             Err(e) if removed_after_drain(&e) => {
                 log::debug!("cgroup.kill: leaf {} is already gone", path.display());
                 Ok(())
@@ -572,6 +578,7 @@ impl CgroupLeaf {
             cgroup_path: None,
             abandoned: false,
             armed: AtomicBool::new(true),
+            killed: AtomicBool::new(false),
         }
     }
 
@@ -623,20 +630,22 @@ impl Drop for CgroupLeaf {
             }
             return;
         }
-        // Detached (see `disarm`): the tree this leaf holds is meant to outlive the handle, so
-        // the `rmdir` that just failed is the whole of what Drop may do. The directory stays
-        // for as long as the tree does, and after that for good — the caller asked for the
-        // tree, and cosca has no way to come back for the leaf. Reported once, at `debug`: it
-        // is one more `cosca-*` on this host, but an intended one.
-        //
-        // Unless the leaf is GONE, which `ENOENT`/`ENODEV` prove ([`removed_after_drain`]) —
-        // nothing was left behind and there is nothing to report. The armed path reaches the
-        // same reading through its SECOND `rmdir`; a detached leaf's single one is the only
-        // reading it gets, so it must be made here.
+        // Opted out (see `disarm`): the single `rmdir` above is all Drop may do. An `ENOENT` or
+        // `ENODEV` from it proves the leaf is gone ([`removed_after_drain`]). Otherwise a tree
+        // the caller killed has not drained yet (`cgroup.kill` is asynchronous), and its leaf is
+        // a leak like any other; a tree left running keeps its leaf by request.
         if !self.armed.load(Ordering::Relaxed) {
-            if !removed_after_drain(&first) {
+            if removed_after_drain(&first) {
+                return;
+            }
+            if self.killed.load(Ordering::Relaxed) {
+                warn_leaf_left_behind(
+                    &self.leaf_path,
+                    format_args!("rmdir failed ({first}) before the killed tree drained; the handle opted out of teardown, so Drop did not retry"),
+                );
+            } else {
                 log::debug!(
-                    "cgroup leaf {} is left behind for a detached tree ({first})",
+                    "cgroup leaf {} is left behind for a tree that opted out of teardown ({first})",
                     self.leaf_path.display()
                 );
             }
@@ -1187,6 +1196,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         cgroup_path: None,
         abandoned: false,
         armed: AtomicBool::new(true),
+        killed: AtomicBool::new(false),
     })
 }
 
