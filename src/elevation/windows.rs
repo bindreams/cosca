@@ -243,10 +243,10 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 ///
 /// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
 /// closes the interior-NUL divergence between the elevated and unelevated paths. A separate,
-/// still-open divergence is `ShellExecuteEx` resolving OTHER registered associations (`.lnk`,
-/// `.vbs`/`.js`/`.wsf`, `.msc`, …) that `CreateProcessW` refuses outright — see the batch gate
-/// below for the one class of that surface handled so far; an allowlist for the rest lands in a
-/// later PR.
+/// still-open divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse —
+/// both by an extension this gate never sees (PATHEXT completion of an extension-less token) and
+/// by other registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). See the
+/// batch gate below; neither is closed here.
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -367,14 +367,24 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
     // error, so that error can never embed a raw NUL into a String that reaches logs/terminals.
     let file_w = wide_nul("program path", program.as_os_str())?;
 
-    // .bat/.cmd is the one association refused here, as on every other backend. `ShellExecuteEx`'s
-    // `runas` resolves the `batfile` association, which routes through `cmd.exe` and substitutes
-    // `lpParameters` into `%*` UNESCAPED — and `join_wide` quotes only for whitespace, never for
-    // cmd metacharacters, so `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED
-    // cmd.exe. That is CVE-2024-24576, which the raw and std backends both refuse outright.
-    // `ShellExecuteEx` can still resolve OTHER registered associations with a `runas` verb (`.lnk`,
-    // `.vbs`/`.js`/`.wsf`, `.msc`, …) that `CreateProcessW` refuses — a residual divergence an
-    // extension allowlist closes in a later PR, not this one.
+    // Refuse a `.bat`/`.cmd` SPELLED IN THE CALLER'S TOKEN. `ShellExecuteEx`'s `runas` resolves the
+    // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into `%*`
+    // UNESCAPED — and `join_wide` quotes only for whitespace, never for cmd metacharacters, so
+    // `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED cmd.exe. That is
+    // CVE-2024-24576, which the raw and std backends both refuse outright.
+    //
+    // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE. It therefore does NOT
+    // close the batch vector, and two surfaces stay open — one of them not an extension question at
+    // all:
+    //   - extension COMPLETION. `args(["setup", "a&calc"])` has no extension for `Path::extension`
+    //     to read, so it passes; with only `setup.bat` on PATH, `ShellExecuteEx` completes it via
+    //     PATHEXT and the same unescaped `%*` injection follows.
+    //   - other registered `runas` associations spelled outright (`.lnk`, `.vbs`/`.js`/`.wsf`,
+    //     `.msc`, …) that `CreateProcessW` refuses.
+    // An extension allowlist addresses only the second. The first is closed by RESOLUTION: resolving
+    // `program` to an absolute path before the call makes the completion ours, and the bare-name rule
+    // yields exactly one candidate (`setup.exe`), so a token that would have completed to `setup.bat`
+    // fails `NotFound` and never reaches `ShellExecuteEx`. Both land in later PRs, not this one.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
     // Refused for an interior NUL rather than silently truncated — see `wide_nul`. `params` is

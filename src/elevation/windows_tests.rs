@@ -217,9 +217,9 @@ fn elevation_accepts_no_window() {
 /// a different image loads, a different working directory applies, or the argument line is cut
 /// short. The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so
 /// leaving them unchecked here would make THIS divergence depend on whether `.elevate()` was
-/// called. A separate, still-open divergence — `ShellExecuteEx` resolving other registered
-/// associations (`.lnk`, `.vbs`, `.msc`, …) that `CreateProcessW` refuses — is closed by an
-/// allowlist in a later PR, not here.
+/// called. A separate, still-open divergence — `ShellExecuteEx` resolving a program
+/// `CreateProcessW` would refuse, whether by PATHEXT-completing an extension-less token or by
+/// another registered `runas` association (`.lnk`, `.vbs`, `.msc`, …) — is not closed here.
 ///
 /// Tested directly on the builder rather than through `ShellExecuteExW`, so it needs no UAC
 /// prompt and no elevated child.
@@ -339,10 +339,14 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
     }
 }
 
-/// `.bat`/`.cmd` must be refused here exactly as on every other backend. `ShellExecuteEx`'s
-/// `runas` resolves the `batfile` association through `cmd.exe` and substitutes `lpParameters`
-/// into `%*` unescaped, while `join_wide` quotes only for whitespace — so an argument like
-/// `a&calc` is command injection into an ELEVATED shell (CVE-2024-24576).
+/// A `.bat`/`.cmd` SPELLED IN THE TOKEN must be refused here as on every other backend.
+/// `ShellExecuteEx`'s `runas` resolves the `batfile` association through `cmd.exe` and substitutes
+/// `lpParameters` into `%*` unescaped, while `join_wide` quotes only for whitespace — so an
+/// argument like `a&calc` is command injection into an ELEVATED shell (CVE-2024-24576).
+///
+/// Scope, so this test is not read as proving more than it does: the gate keys on the caller's
+/// string, and `ShellExecuteEx` resolves the file. An extension-less `args(["setup", "a&calc"])`
+/// passes it and can still be PATHEXT-completed to `setup.bat` — see `launch_runas_with_host`.
 ///
 /// Privilege-independent for the same reason as the config gate: the already-elevated caller
 /// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
