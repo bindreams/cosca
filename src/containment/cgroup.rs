@@ -411,14 +411,25 @@ fn log_degrade_into(warned: &AtomicU32, reason: &dyn DegradeReason) -> log::Leve
         (kind as u32) < u32::BITS,
         "DegradeKind has outgrown the one-bit-per-kind set; widen WARNED"
     );
-    let bit = 1u32 << (kind as u32);
-    let level = if warned.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+    let level = report_level(warned, 1u32 << (kind as u32));
+    log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
+    level
+}
+
+/// `warn` the first time this process sets `bit` in `reported`, `debug` every time after.
+///
+/// The one place this module decides a level, so its two reporting channels — a degrade
+/// ([`log_degrade`]) and a leaf that outlived its `Drop` (see [`CgroupLeaf`]'s `Drop`) — cannot
+/// drift into opposite policies over conditions an embedder reads out of the same sink. Both
+/// are standing properties of a supervisor: the first report is news it can act on, and every
+/// one after it is the same news with a different path in it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn report_level(reported: &AtomicU32, bit: u32) -> log::Level {
+    if reported.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
         log::Level::Warn
     } else {
         log::Level::Debug
-    };
-    log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
-    level
+    }
 }
 
 // Everything below is Linux-only. =====
@@ -673,6 +684,11 @@ pub(crate) struct CgroupLeaf {
     /// Whether `Drop` may still fire `cgroup.kill`. Cleared by `disarm` — see it for why this
     /// is state rather than nothing.
     armed: AtomicBool,
+    /// The "a surviving leaf has already been reported at `warn`" set this leaf's `Drop`
+    /// reports against — the process-wide [`LEAF_SURVIVED`] in production. A test points its
+    /// leaf at a set of its own, so its level assertion neither depends on nor disturbs what
+    /// else in the binary has stranded a leaf first.
+    survival_reported: &'static AtomicU32,
 }
 
 // Safety: RawFd is an integer. CgroupLeaf is not Clone; the fd is used only in
@@ -884,8 +900,97 @@ impl CgroupLeaf {
             procs_fd: -1,
             report: ReportPage::new().expect("map a placement-report page"),
             armed: AtomicBool::new(true),
+            survival_reported: &LEAF_SURVIVED,
         }
     }
+
+    /// Point this leaf's `Drop` at a test-owned "already reported" set. Without it a level
+    /// assertion over a real `Drop` would depend on which test in this binary stranded a leaf
+    /// first, which is process-wide state two tests cannot both own.
+    pub(crate) fn report_survival_into_for_test(&mut self, set: &'static AtomicU32) {
+        self.survival_reported = set;
+    }
+}
+
+/// Whether this process has already reported a leaf that outlived its `Drop` at `warn`.
+/// One condition, so one bit — the set shape [`report_level`] takes, shared with
+/// [`log_degrade`]'s per-kind one.
+#[cfg(target_os = "linux")]
+static LEAF_SURVIVED: AtomicU32 = AtomicU32::new(0);
+
+/// The only bit in a [`LEAF_SURVIVED`]-shaped set. There is nothing to subdivide: the errno
+/// cannot tell the causes apart (see [`survival_facts`]) and every survivor is permanent, so
+/// no two of them are conditions an embedder could act on differently.
+#[cfg(target_os = "linux")]
+const LEAF_SURVIVED_BIT: u32 = 1;
+
+/// What a leaf that refused both of [`Drop`]'s `rmdir`s still holds: its descendant cgroups,
+/// and whether its members have all exited.
+///
+/// These are the two facts `EBUSY` does not carry. Measured on 6.12, cgroupfs answers `EBUSY`
+/// both for a leaf whose members have not all exited yet and for a leaf holding a descendant
+/// cgroup, and never `ENOTEMPTY` for either — so the errno alone cannot say which of two very
+/// different bugs a reader is looking at. A descendant cgroup survives `cgroup.kill`, which
+/// kills processes, not directories.
+///
+/// Every read here is on the failure path only, and each one that fails reports as unknown
+/// rather than as a guessed state.
+#[cfg(target_os = "linux")]
+fn survival_facts(leaf_path: &Path) -> String {
+    let descendants = match fs::read_dir(leaf_path) {
+        Ok(entries) => {
+            let names: Vec<String> = entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            if names.is_empty() {
+                "no descendant cgroup".to_string()
+            } else {
+                format!("descendant cgroups {names:?}, which cgroup.kill does not remove")
+            }
+        }
+        Err(e) => format!("descendants that could not be listed ({e})"),
+    };
+    let populated = match fs::read_to_string(leaf_path.join("cgroup.events")) {
+        Ok(contents) => match parse_populated(&contents) {
+            Some(true) => "populated 1 — not every member has exited".to_string(),
+            Some(false) => "populated 0 — every member has exited".to_string(),
+            None => "a cgroup.events with no populated field".to_string(),
+        },
+        Err(e) => format!("a cgroup.events that could not be read ({e})"),
+    };
+    format!("{descendants}, and reports {populated}")
+}
+
+/// Report a leaf that outlived its `Drop`, and return the level it was reported at.
+///
+/// `reported` is a parameter, not the hard-wired [`LEAF_SURVIVED`], for the reason
+/// [`log_degrade_into`]'s is: a test drives the first-then-repeat transition, and asserts the
+/// level of a real `Drop`, against its own state instead of racing every other test in the
+/// binary for the process-wide one.
+#[cfg(target_os = "linux")]
+fn log_leaf_survived(
+    reported: &AtomicU32,
+    leaf_path: &Path,
+    first: &io::Error,
+    kill: &Result<(), crate::error::Error>,
+    second: &io::Error,
+) -> log::Level {
+    let level = report_level(reported, LEAF_SURVIVED_BIT);
+    log::log!(
+        level,
+        "cgroup leaf {} outlived its Drop: first rmdir failed ({first}), cgroup.kill {}, \
+         second rmdir failed ({second}); the leaf holds {}; it stays on this host until \
+         something removes it (issue #140)",
+        leaf_path.display(),
+        match kill {
+            Ok(()) => "succeeded".to_string(),
+            Err(e) => format!("failed ({e})"),
+        },
+        survival_facts(leaf_path)
+    );
+    level
 }
 
 #[cfg(target_os = "linux")]
@@ -895,9 +1000,7 @@ impl Drop for CgroupLeaf {
         // Safety: we own this fd; it was created by try_create_leaf and never cloned.
         unsafe { libc::close(self.procs_fd) };
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
-        // to drain it, then retry. A leaf that outlives both attempts stays on this host until
-        // a cgroup manager reaps it, and a host accumulating stray `cosca-*` leaves is only
-        // diagnosable if each one says so as it happens (issue #140).
+        // to drain it, then retry.
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
@@ -929,16 +1032,31 @@ impl Drop for CgroupLeaf {
         if removed_after_drain(&second) {
             return;
         }
-        log::warn!(
-            "cgroup leaf {} outlived its Drop: first rmdir failed ({first}), cgroup.kill {}, \
-             second rmdir failed ({second}); the leaf stays on this host until a cgroup manager \
-             reaps it",
-            self.leaf_path.display(),
-            match kill {
-                Ok(()) => "succeeded".to_string(),
-                Err(e) => format!("failed ({e})"),
-            }
-        );
+        // Everything else is a permanent stray, and is reported — with what is holding it, and
+        // at the level `report_level` gives every standing condition: `warn` the first time
+        // this process strands a leaf, `debug` for each one after.
+        //
+        // The second `rmdir` fires immediately after `cgroup.kill`, with nothing synchronising
+        // on the kernel finishing the exits it has just triggered — and nothing may, since the
+        // kill is the caller's whole guarantee and waiting one out would make every teardown pay
+        // for a directory nobody reads. Losing that race is routine, and it is tempting to read
+        // it as self-clearing. It is not: `Drop` has now returned, cosca never revisits a leaf,
+        // and no cgroup manager knows a `cosca-*` leaf exists. The directory stays for the
+        // lifetime of the host. Issue #140's symptom — 103 stray `cosca-*` cgroups, all EMPTY —
+        // is that race's own residue, so it is precisely the case a reader must be shown.
+        //
+        // Nor could the errno grade it: measured on 6.12, cgroupfs answers `EBUSY` for a leaf
+        // whose members are still exiting AND for a leaf holding a descendant cgroup (which
+        // `cgroup.kill` does not remove), and `ENOTEMPTY` for neither. The facts that separate
+        // those go in the record, where a reader can act on them, instead of into a level that
+        // would hide one of them.
+        //
+        // What does grade it is what grades a degrade: whether the embedder has been told yet.
+        // This is the ORDINARY teardown path — every contained handle dropped over a live tree
+        // reaches it — so a `warn` per leaf is a `warn` per spawn, for a condition an embedder
+        // acts on once, which is the flood `log_degrade`'s own doc argues against. Every
+        // survivor is still on record with its own path; only the level stops repeating.
+        log_leaf_survived(self.survival_reported, &self.leaf_path, &first, &kill, &second);
     }
 }
 
@@ -1102,6 +1220,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         procs_fd,
         report,
         armed: AtomicBool::new(true),
+        survival_reported: &LEAF_SURVIVED,
     })
 }
 

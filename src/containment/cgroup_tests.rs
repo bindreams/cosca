@@ -737,29 +737,160 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
 }
 
 // Drop's leaf-removal reporting -----
-// `Drop` is the only place a leaf cosca could not remove is ever mentioned: it has returned by
-// the time anything could look, and nothing — cosca or a cgroup manager — revisits a `cosca-*`
-// leaf by name. A host accumulating them (issue #140) is diagnosable only if each one says so
-// as it happens.
+// A leaf that refuses both `rmdir`s stays on this host: `Drop` has returned, and nothing —
+// cosca or any cgroup manager — ever revisits a `cosca-*` leaf. Every survivor is therefore a
+// permanent stray, which is the accumulation issue #140 reports, so every survivor is reported
+// with the facts that separate the causes `EBUSY` alone cannot — under the same
+// first-is-news-then-debug policy every degrade reason gets.
 
-/// A leaf the host refuses to remove is reported through the real `Drop`. Real filesystem, any
-/// Linux host: a leaf directory holding a subdirectory refuses both `rmdir`s.
+/// A test-owned "already reported a survivor" set, leaked to `'static` so a leaf can point its
+/// `Drop` at it. The process-wide one is shared by every test in this binary; a level is a
+/// first-versus-repeat answer, so asserting one against shared state asserts the order libtest
+/// happened to schedule in.
+#[cfg(target_os = "linux")]
+fn own_survival_set() -> &'static std::sync::atomic::AtomicU32 {
+    Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+}
+
+/// A leaf the host refuses to remove is reported through the real `Drop`, and names what is
+/// holding it. Real filesystem, any Linux host: a leaf directory holding a subdirectory
+/// refuses both `rmdir`s (with `ENOTEMPTY` here rather than a real cgroupfs's `EBUSY` — the
+/// report does not branch on the errno, so it does not depend on which one this host gives).
 #[cfg(target_os = "linux")]
 #[test]
-fn drop_reports_a_leaf_it_could_not_remove() {
+fn drop_reports_a_surviving_leaf_and_names_what_holds_it() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-undeletable-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
 
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    leaf.report_survival_into_for_test(own_survival_set());
     let mark = crate::log_capture::mark();
-    drop(super::CgroupLeaf::for_test_at(leaf_path));
+    drop(leaf);
 
     assert_eq!(
         crate::log_capture::levels_since(mark, "cosca-undeletable-leaf"),
         vec![log::Level::Warn],
-        "a leaf that outlived its Drop is the whole of what issue #140 has to go on"
+        "a leaf that outlived its Drop stays on this host for good — issue #140's accumulation"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "occupant"),
+        "the record must name the descendant holding the leaf: it is the whole diagnosis, and \
+         the errno does not carry it"
+    );
+}
+
+/// The ORDINARY teardown path strands a leaf whenever the second `rmdir` loses its race with
+/// the kernel's exits, which is every contained handle dropped over a live tree. One `warn`
+/// per such spawn is the flood `log_degrade` refuses to emit for the same kind of standing
+/// condition; the second leaf and every one after it reports at `debug`, with its own path.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_supervisor_that_strands_leaf_after_leaf_warns_once() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reported = own_survival_set();
+
+    let mark = crate::log_capture::mark();
+    let mut levels = Vec::new();
+    for i in 0..3 {
+        let leaf_path = dir.path().join(format!("cosca-flood-probe-{i}"));
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+        let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+        leaf.report_survival_into_for_test(reported);
+        drop(leaf);
+        levels.extend(crate::log_capture::levels_since(
+            mark,
+            &format!("cosca-flood-probe-{i}"),
+        ));
+    }
+
+    assert_eq!(
+        levels,
+        vec![log::Level::Warn, log::Level::Debug, log::Level::Debug],
+        "an embedder acts once on 'this supervisor strands cgroup leaves'; every stray is \
+         still on record for a reader who turns the level up"
+    );
+}
+
+/// What the level DOES and does not depend on, across the whole errno space and both kill
+/// outcomes, on any Linux host and without a cgroupfs. The errno carries no discrimination —
+/// `EBUSY` is what a live leaf, a killed-not-yet-exited leaf and a leaf holding a descendant
+/// cgroup all produce — so grading by it would hide one of them behind another; what grades a
+/// report is whether this process has already made one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_surviving_leaf_is_graded_by_whether_one_was_reported_before_it_not_by_the_errno() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-level-probe");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+    for errno in [
+        libc::EBUSY,
+        libc::ENOTEMPTY,
+        libc::EACCES,
+        libc::EROFS,
+        libc::EPERM,
+        libc::EIO,
+    ] {
+        for kill_failed in [false, true] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            let kill = if kill_failed {
+                Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(libc::EACCES)))
+            } else {
+                Ok(())
+            };
+            let reported = std::sync::atomic::AtomicU32::new(0);
+            assert_eq!(
+                super::log_leaf_survived(&reported, &leaf_path, &e, &kill, &e),
+                log::Level::Warn,
+                "the first stray of this process is news whatever the errno ({errno}) and \
+                 whatever cgroup.kill did (failed: {kill_failed})"
+            );
+            assert_eq!(
+                super::log_leaf_survived(&reported, &leaf_path, &e, &kill, &e),
+                log::Level::Debug,
+                "the second is the same news with a different path in it (errno {errno}, \
+                 kill failed: {kill_failed})"
+            );
+        }
+    }
+}
+
+/// The facts the record carries in place of a verdict the errno cannot support: what the leaf
+/// holds, and whether its members have all exited.
+#[cfg(target_os = "linux")]
+#[test]
+fn survival_facts_name_the_descendants_and_the_populated_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let bare = dir.path().join("bare");
+    std::fs::create_dir(&bare).expect("create");
+    let rendered = super::survival_facts(&bare);
+    assert!(rendered.contains("no descendant cgroup"), "got {rendered:?}");
+    assert!(
+        rendered.contains("could not be read"),
+        "an absent cgroup.events is unknown, never a guessed state: got {rendered:?}"
+    );
+
+    let held = dir.path().join("held");
+    std::fs::create_dir(&held).expect("create");
+    std::fs::create_dir(held.join("sub")).expect("create a descendant");
+    std::fs::write(held.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("write events");
+    let rendered = super::survival_facts(&held);
+    assert!(rendered.contains("\"sub\""), "got {rendered:?}");
+    assert!(rendered.contains("populated 1"), "got {rendered:?}");
+
+    let drained = dir.path().join("drained");
+    std::fs::create_dir(&drained).expect("create");
+    std::fs::write(drained.join("cgroup.events"), "populated 0\n").expect("write events");
+    assert!(
+        super::survival_facts(&drained).contains("populated 0"),
+        "a drained leaf that still refuses rmdir is the permanent case, and must say so"
     );
 }
 
