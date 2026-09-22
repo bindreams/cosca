@@ -391,24 +391,50 @@ fn placement_report_renders_the_childs_errno() {
     assert!(PlacementReport::NotReported.to_string().contains("did not run"));
 }
 
-/// An absent child renders the pid, the leaf path, the file's actual contents and the child's
-/// own state — the four facts that separate "the write failed" from "the child already exited".
+/// A child whose write failed renders the pid, the leaf path, the file's actual contents, its
+/// errno and its state — and never claims a membership that never began.
 #[test]
 fn placement_absent_renders_every_observed_fact() {
     let absent = Placement::Absent {
         pid: 4242,
         path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.procs"),
         procs: String::new(),
-        report: PlacementReport::Placed,
+        report: PlacementReport::WriteFailed(16),
         child_state: Some('Z'),
     };
     let rendered = absent.to_string();
-    for needle in ["4242", "cosca-7-0/cgroup.procs", "empty", "succeeded", "zombie"] {
+    for needle in [
+        "4242",
+        "cosca-7-0/cgroup.procs",
+        "empty",
+        "errno 16",
+        "never entered",
+        "already exited",
+    ] {
         assert!(
             rendered.contains(needle),
             "absent placement renders as {rendered:?}, which does not mention {needle:?}"
         );
     }
+    assert!(
+        !rendered.contains("membership ended"),
+        "a child whose write failed was never a member: {rendered:?}"
+    );
+}
+
+/// A child whose `pre_exec` closure never ran made no write at all, and is reported as such.
+#[test]
+fn placement_absent_renders_a_child_that_reported_nothing() {
+    let rendered = Placement::Absent {
+        pid: 4242,
+        path: PathBuf::from("/cg/cgroup.procs"),
+        procs: String::new(),
+        report: PlacementReport::NotReported,
+        child_state: Some('S'),
+    }
+    .to_string();
+    assert!(rendered.contains("did not run"), "got {rendered:?}");
+    assert!(rendered.contains("never entered"), "got {rendered:?}");
 }
 
 /// A live child that is nonetheless not a member is a different diagnosis from a zombie one,

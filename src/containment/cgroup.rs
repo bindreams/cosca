@@ -237,8 +237,8 @@ pub(crate) enum Placement {
         /// The leaf's placement report — the outcome of the last self-placement write made
         /// through it, which for a production leaf is `pid`'s own.
         report: PlacementReport,
-        /// The child's `/proc/<pid>` state letter — `Z` means it had already exited, which
-        /// removes it from `cgroup.procs` whether or not the write ever succeeded.
+        /// The child's `/proc/<pid>` state letter, read BEFORE `procs`: `Z` means it had
+        /// exited before the file was read.
         child_state: Option<char>,
     },
     /// `cgroup.procs` could not be read at all, so membership is unknown rather than absent.
@@ -265,24 +265,31 @@ impl fmt::Display for Placement {
                 child_state,
             } => {
                 let listed = procs.trim();
-                write!(
-                    f,
-                    "the leaf cgroup was created but child {pid} is not listed in {} \
-                     (cgroup.procs is {}); {report}; {}",
-                    path.display(),
-                    if listed.is_empty() {
-                        "empty".to_string()
-                    } else {
-                        format!("{listed:?}")
-                    },
-                    match child_state {
-                        Some('Z') => "and the child is already a zombie — it exited before this \
-                                      check, so its membership ended before the check could see it"
-                            .to_string(),
-                        Some(state) => format!("and the child is still live (/proc state {state})"),
-                        None => "and the child's /proc state could not be read".to_string(),
-                    }
-                )
+                let listed = if listed.is_empty() {
+                    "empty".to_string()
+                } else {
+                    format!("{listed:?}")
+                };
+                // The state was read before `cgroup.procs`, so `Z` means the child had exited
+                // before the file was read.
+                let state = match child_state {
+                    Some('Z') => "it had already exited when cgroup.procs was read".to_string(),
+                    Some(state) => format!("it is still running (/proc state {state})"),
+                    None => "its /proc state could not be read".to_string(),
+                };
+                match report {
+                    PlacementReport::Placed => write!(
+                        f,
+                        "the leaf cgroup was created and child {pid}'s write into it succeeded, but \
+                         {} does not list it (cgroup.procs is {listed}); {state}",
+                        path.display()
+                    ),
+                    PlacementReport::NotReported | PlacementReport::WriteFailed(_) => write!(
+                        f,
+                        "child {pid} never entered the leaf cgroup: {report}; {} is {listed}; {state}",
+                        path.display()
+                    ),
+                }
             }
             Placement::Unreadable {
                 pid,
@@ -696,13 +703,14 @@ impl CgroupLeaf {
             return Placement::Confirmed;
         }
         let path = self.leaf_path.join("cgroup.procs");
+        let child_state = proc_state(pid);
         match fs::read_to_string(&path) {
             Ok(procs) => Placement::Absent {
                 pid,
                 path,
                 procs,
                 report,
-                child_state: proc_state(pid),
+                child_state,
             },
             Err(source) => Placement::Unreadable {
                 pid,
