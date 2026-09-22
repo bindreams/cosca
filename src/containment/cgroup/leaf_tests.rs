@@ -468,6 +468,93 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
     }
 }
 
+// detach's disarm -----
+// `detach()` promises the tree keeps running. `Child::drop` returns early on it, but the leaf
+// is a field of that `Child` and its own `Drop` still runs — so the promise is only kept if
+// `disarm` reaches the leaf.
+
+/// A test leaf at `leaf_path` whose verdict is taken, with the child reported `Placed`: an
+/// attached leaf whose `Drop` may kill.
+#[cfg(target_os = "linux")]
+pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containment::cgroup::CgroupLeaf {
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // SAFETY: the slot's channel lives as long as `leaf`.
+    unsafe { leaf.placement_slot().report_placed_for_test() };
+    // The verdict needs a live pid: this process's own stands in for the child.
+    leaf.take_placement(std::process::id())
+        .expect("decidable")
+        .expect("the child reported Placed");
+    leaf
+}
+
+/// A disarmed leaf never writes `cgroup.kill`, and leaves the occupied directory alone. The
+/// occupant stands in for the detached tree; a real leaf refuses both `rmdir`s while one runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-detached-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the detached tree");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
+    let mark = crate::log_capture::mark();
+    attached.disarm();
+    drop(attached);
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "a detached tree must not be killed: cgroup.kill must never be written"
+    );
+    assert!(leaf_path.is_dir(), "the detached tree's leaf must survive with it");
+    assert!(
+        !crate::log_capture::levels_since(mark, "cosca-detached-leaf").contains(&log::Level::Warn),
+        "a leaf left behind for a detached tree is what the caller asked for, not a leak"
+    );
+}
+
+/// The same leaf, left armed, DOES fire `cgroup.kill` — so the test above pins the disarm, not
+/// an inert path.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_leaf_still_kills_the_tree_on_drop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-armed-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    drop(entered_leaf_at(leaf_path.clone()));
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"1",
+        "an occupied leaf that was NOT detached must still be killed on Drop"
+    );
+}
+
+/// A disarmed leaf whose tree has already gone still removes the empty directory: detach gives
+/// up the KILL, not the tidying. Nothing else ever removes a `cosca-*` leaf.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-detached-empty-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+    let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
+    attached.disarm();
+    drop(attached);
+
+    assert!(
+        !leaf_path.exists(),
+        "an empty leaf is removable and nothing else will ever remove it"
+    );
+}
+
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
 /// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note

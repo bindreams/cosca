@@ -397,9 +397,13 @@ impl Child {
     }
 
     /// Consume the handle without killing or waiting for the child (opt out of
-    /// kill-on-drop). For Job Object containment, `disarm()` clears the
-    /// `KILL_ON_JOB_CLOSE` flag before the job handle is released, ensuring the
-    /// tree keeps running after `detach`.
+    /// kill-on-drop).
+    ///
+    /// Opting out of kill-on-drop is not by itself enough for every mechanism: a containment
+    /// resource whose own `Drop` kills has to be disarmed too, since it drops with this handle
+    /// whatever `kill_on_drop` says. `disarm()` does that — it clears `KILL_ON_JOB_CLOSE` on a
+    /// Job Object, and stops a cgroup leaf's `Drop` firing `cgroup.kill` — so the tree keeps
+    /// running after `detach` under every mechanism.
     pub fn detach(mut self) {
         self.attached.disarm();
         self.kill_on_drop = false;

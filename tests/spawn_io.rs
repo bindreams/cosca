@@ -1168,6 +1168,41 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     assert_eq!(n, 0, "cgroup terminate must SIGTERM the grandchild, not just the root");
 }
 
+/// `detach()` must NOT kill a cgroup-contained tree. Same contract, and the same proof, as
+/// `windows_detach_leaves_the_tree_running`: detach FIRST, then write to the grandchild's
+/// control socket. `CgroupLeaf::drop` runs whatever `kill_on_drop` says, and its first `rmdir`
+/// fails `EBUSY` over a live detached tree — so without a disarm it fires `cgroup.kill` and the
+/// write below fails with `BrokenPipe`.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_v2_detach_leaves_the_tree_running() {
+    stderr_log::install();
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    let (child, mut gc_stream) = spawn_contained_tree();
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::CgroupV2,
+        "expected CgroupV2 containment but got {:?}; \
+         is a delegated cgroup v2 slice available?",
+        child.containment()
+    );
+
+    child.detach();
+
+    gc_stream
+        .write_all(b"p")
+        .expect("grandchild control socket must accept write after detach (tree still alive)");
+
+    // The grandchild read its byte and exited voluntarily — a natural EOF, not a kill.
+    let mut buf = [0u8; 1];
+    let n = gc_stream
+        .read(&mut buf)
+        .expect("read grandchild control socket after detach");
+    assert_eq!(n, 0, "expected EOF after the grandchild exited voluntarily");
+}
+
 /// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
 /// inside `f` inherits the pin, so parent and child share that CPU.
 #[cfg(target_os = "linux")]

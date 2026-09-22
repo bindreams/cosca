@@ -56,8 +56,10 @@
 //!
 //! **Kill.** cosca kills through a leaf whenever it lacks proof of absence, and never when it has
 //! it: an occupant of a leaf that provably holds nothing of the child's is not cosca's to kill.
-//! A child cosca gives up on is also killed itself, through its pidfd and as the process group it
-//! leads, whatever the leaf's kill returned — it may have left the leaf, or never entered it.
+//! The one exception is a tree its caller opted out of teardown (`detach`, `kill_on_drop(false)`):
+//! that leaf is disarmed, and its `Drop` never kills. A child cosca gives up on is also killed
+//! itself, through its pidfd and as the process group it leads, whatever the leaf's kill returned
+//! — it may have left the leaf, or never entered it.
 //!
 //! **Ownership.** Until `spawn` returns, the child is this process's own unreaped child, and cosca
 //! is the only thing that may signal it (see `Command::contain`). It leads its own process group
