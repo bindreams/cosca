@@ -628,6 +628,15 @@ fn batch_refusal(prog: &std::path::Path) -> Error {
             .into(),
     }
 }
+const BATCH: &str = "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
+                     run it through cmd.exe yourself — .executable(\"cmd.exe\") plus a \
+                     .commandline() you have escaped for cmd.exe";
+const NO_FILE: &str = "the path names no file of its own, so which image loads is decided by \
+                       the current directory or PATH — and a .bat-named directory there makes \
+                       std::process substitute cmd.exe (CVE-2024-24576); name the executable";
+// A verbatim path resolves against nothing, so NO_FILE's reason does not apply to one.
+const VERBATIM_DOTDOT: &str = "a \\\\?\\ path is never normalised, so `..` is a literal file name \
+                               here — and no file may be called that; name the executable";
 
 /// Reject a program token carrying an interior NUL, or naming a `.bat`/`.cmd`: Win32 silently
 /// truncates at the NUL (`PCWSTR` has no length), and a batch file is refused for
@@ -643,17 +652,27 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 
 /// PURE given `win32`: the gate's rule with the platform as DATA rather than a `cfg!` buried in
 /// it, so one host can ask for either verdict — the same reason `elevation::plan::Host` carries
-/// its `Os`. Both are pinned from any host by `spawn_tests`.
+/// its `Os`. Both are pinned from any host by `spawn_tests`, which matters because the Windows
+/// branch — the whole `win32_effective_file_name` -> `is_batch_program` composition, where every
+/// subtlety lives — would otherwise be covered by the two Windows CI lanes alone. Reading `cfg!`
+/// here left it possible to revert this function to the `Path::extension()` rule it replaced and
+/// stay green on four of six.
 ///
-/// An interior NUL is refused FIRST, under both verdicts, because `\0` is not a path separator and
-/// `Path::extension()` reads straight through it — reporting the INVERSE of what Win32 loads on
-/// each of the two NUL/batch shapes:
+/// This gate is LIVE on the std path today, not merely a guard for some future backend. Rust's
+/// own `std::process` detects a `.bat`/`.cmd` program, swaps it for `cmd.exe` and builds a batch
+/// command line (`sys/process/windows.rs`'s `is_batch_file` -> `make_bat_command_line`), so
+/// anything slipping past here is handed to exactly the quoting layer cosca has not implemented.
+/// It goes live a second way once `ShellExecuteEx` is gated (#135), which has no such backstop.
 ///
-/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, yet Win32 loads the real batch
-///   file `setup.bat`.
-/// - `setup` + NUL + `.bat` → `extension() == "bat"`, yet Win32 loads `setup`, which is no batch
-///   file — so the batch refusal would blame CVE-2024-24576 for a program that does not carry
-///   that vector, and interpolate a raw U+0000 into a message bound for logs and terminals.
+/// An interior NUL is refused FIRST, under both verdicts, because `\0` is not a path separator
+/// and neither `Path::extension()` nor the component walk below stops at one — so the name tested
+/// is the INVERSE of what Win32 loads on each of the two NUL/batch shapes:
+///
+/// - `setup.bat` + NUL + `junk` → the effective name is `setup.bat\0junk`, yet Win32 loads the
+///   real batch file `setup.bat`.
+/// - `setup` + NUL + `.bat` → the effective name ends in `.bat`, yet Win32 loads `setup`, which is
+///   no batch file — so the batch refusal would blame CVE-2024-24576 for a program that does not
+///   carry that vector, and interpolate a raw U+0000 into a message bound for logs and terminals.
 ///
 /// Refusing the NUL outright settles both shapes, and makes this gate SELF-SUFFICIENT rather than
 /// a rule each caller must order its own NUL check in front of — the std backend, the DEFAULT
@@ -665,11 +684,26 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 /// clean `deploy.bat` is an ordinary executable the host runs, so refusing it would report "not
 /// supported on windows" about a Linux or macOS host that runs it fine — and send its caller to
 /// audit a batch vector that cannot reach them.
+///
+/// A path that resolves to NO NAME of its own is refused too, not accepted. std does not test the
+/// string it was given: it runs the program through `GetFullPathNameW` (or the PATH search) and
+/// applies `has_bat_extension` to the RESULT. A RELATIVE path that pops past its own first
+/// component does not vanish — Win32 goes on popping into the ancestors of the current directory,
+/// so with a cwd of `C:\w.bat` (a directory, which Windows permits) `x\..` resolves to `C:\w.bat`
+/// and std substitutes `cmd.exe`. That is the hole this refusal closes.
+///
+/// A ROOTED path never reaches the cwd at all, so it is refused for having the same shape rather
+/// than for the same danger — and what it clamps at depends on the root. A drive-rooted or
+/// drive-relative path clamps at a root with no name of its own (`C:\`, `\`), which is not a
+/// loadable image. A UNC path clamps at `\\server\share`, which DOES leave a named final
+/// component, and that name is judged like any other — see [`win32_effective_file_name`].
+///
+/// A verbatim (`\\?\`) path is judged by a rule of its own — see [`verbatim_refusal`].
 fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error> {
     let loaded = win32_prefix(prog);
     if loaded.as_os_str() != prog.as_os_str() {
         // A literal: interpolating the token would put a raw U+0000 into a message bound for logs
-        // and terminals, which is half of what this round is removing.
+        // and terminals, which is half of what this gate is removing.
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             if win32 {
@@ -682,16 +716,216 @@ fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error
     if !win32 {
         return Ok(());
     }
-    if let Some(ext) = loaded.extension() {
-        let ext = ext.to_string_lossy().to_ascii_lowercase();
-        if ext == "bat" || ext == "cmd" {
-            return Err(batch_refusal(&loaded));
+    // Past the early return `loaded` and `prog` are the same string, so the rest reads `prog`.
+    let text = prog.as_os_str().to_string_lossy();
+    // Only backslashes spell the verbatim prefix; `\\?\` and `//?/` are different paths to
+    // Win32, and only the first suppresses resolution.
+    let refusal = if text.starts_with(r"\\?\") {
+        verbatim_refusal(&text)
+    } else {
+        // The name Win32 will actually OPEN, not the one `Path::file_name()` reports: on
+        // Windows those differ for any path ending in a `..` component, and the difference is
+        // a live bypass.
+        match win32_effective_file_name(prog) {
+            Some(name) if is_batch_program(&name) => Some(BATCH),
+            Some(_) => None,
+            None => Some(NO_FILE),
         }
+    };
+    if let Some(detail) = refusal {
+        return Err(Error::Unsupported {
+            op: format!("running {}", prog.display()),
+            platform: "windows",
+            detail: detail.into(),
+        });
     }
     Ok(())
 }
 
 pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
+/// Whether a VERBATIM (`\\?\`) program reaches a batch file. std asks a different question of one
+/// than it asks of any other path, and this is that question.
+///
+/// For an ordinary program std runs the string through `GetFullPathNameW` and tests the RESULT;
+/// for a verbatim one it never makes that call, and `is_batch_file` is a literal test of the last
+/// four UTF-16 units of the string as given. So `\\?\C:\x.bat.` ends in `bat.`, cmd.exe is not
+/// substituted, and the image loads like any other — while the plain `C:\x.bat.` loses its
+/// trailing dot on the way through `GetFullPathNameW` and reaches the batch file. The prefix does
+/// not merely spell the same file differently; it selects a different resolution.
+///
+/// Measured on Windows runners, both architectures: `...`, `....`, `" "` and `"x "` are creatable,
+/// listable and openable through the prefix, and both `CreateProcessW` and `std::process` spawn
+/// them, while the plain spelling fails with access-denied. Refusing those refused a loadable
+/// executable, which is why this is not the component machinery below with the trimming disabled.
+///
+/// The one other refusal is `..`, which no collapse turns into a path operation here: it is a
+/// literal file name, and no file may be called that (measured: `ERROR_INVALID_NAME`). Other
+/// unloadable spellings — a trailing separator, a final `.` — are left to fail with the OS's own
+/// error, which says more about why than a security refusal would.
+fn verbatim_refusal(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    if lower.ends_with(".bat") || lower.ends_with(".cmd") {
+        return Some(BATCH);
+    }
+    // `/` is an ordinary filename character under the prefix, so only `\` separates.
+    let last = text.rsplit('\\').next().expect("rsplit yields at least one piece");
+    (last == "..").then_some(VERBATIM_DOTDOT)
+}
+
+/// Whether `file_name` names a batch script to Win32 — every stream piece, not just the name.
+///
+/// A name reaches a batch file if ANY piece [`ntfs_stream_names`] yields from it does. That
+/// covers both ways one can be spelled at once:
+///
+/// - **As the filesystem resolves it.** `x.bat:s` names `x.bat` through a data stream, and
+///   `x.bat ` / `x.bat.` reach it because Win32 strips trailing spaces and dots.
+/// - **As written.** `ShellExecuteEx` reads the handler off the last `.` anywhere in the string
+///   (`PathFindExtension`). std asks a differently-worded question with the same answer: it runs
+///   the program through `GetFullPathNameW` — or, for a verbatim `\\?\` path, takes it literally —
+///   and tests whether the result ENDS in `.bat`/`.cmd`, case-insensitively
+///   (`sys/process/windows.rs`'s `has_bat_extension`). So `x.exe:payload.bat` is a batch file that
+///   runs out of the alternate data stream — and it is refused as the PIECE `payload.bat`, not by
+///   any separate rule. Testing the whole string for a batch extension beside this adds no
+///   refusal; `the_stream_reading_subsumes_the_shell_reading` checks that exhaustively to six
+///   characters and keeps it true.
+///
+/// Reading only the piece before the FIRST separator loosens the gate, because the extension then
+/// comes from before the stream name.
+///
+/// Verbatim (`\\?\`) paths never reach here: nothing is trimmed or collapsed under that prefix,
+/// and std tests the string as given, so [`verbatim_refusal`] owns them. Off Win32 nothing reaches
+/// here at all — [`reject_batch_path_on`] returns before this, because a `.bat` is an ordinary
+/// executable to every other host.
+fn is_batch_program(file_name: &str) -> bool {
+    ntfs_stream_names(file_name).any(is_batch_by_shell)
+}
+
+/// The final component of `prog` as Win32 will resolve it, collapsing `.` and `..` and stripping
+/// the trailing dots and spaces Win32 removes from every component.
+///
+/// `Path::file_name()` is not good enough here, and the gap is exploitable. It returns `None` for
+/// any path whose last component is `..`, so `x.bat\y\..` slipped the gate untouched — while
+/// `GetFullPathNameW` collapses it straight back to `x.bat`, and `std::process` then detects the
+/// batch extension and hands the program to `cmd.exe`. The same file refused as `x.bat` was
+/// accepted spelled `x.bat\y\..`.
+///
+/// Special-casing `Component::ParentDir` would not close it either: `x.bat\y\.. ` has a final
+/// component Rust parses as `Normal(".. ")`, which Win32 strips to `..` and resolves identically.
+/// So the trailing-character stripping has to happen BEFORE the `.`/`..` test, which is the order
+/// Win32 itself uses.
+///
+/// A component that is only dots and spaces yet is neither `.` nor `..` (`...`, `.. .`, a lone
+/// space) trims away to nothing and DROPS OUT, popping nothing. Measured on a Windows runner:
+/// `GetFullPathNameW(r"x.bat\y\...")` is `…\x.bat\y\`, so `y` survives and the batch file stays
+/// covered.
+///
+/// `None` means the path named no file of its own: it was empty, was a bare root or drive prefix,
+/// or popped its own components away. That last case did NOT collapse to nothing — a relative
+/// path goes on popping into the ancestors of the current directory, so `x\..` resolves to
+/// whatever the cwd is and `.` resolves to the cwd itself, while a rooted one clamps at its root.
+/// The name is real, this gate just cannot see it, which is why [`reject_batch_path`] refuses
+/// `None` rather than accepting it. A data-stream spelling is not that — `x.bat:` names a file and
+/// comes back as one.
+///
+/// # The token, not the resolved path (#144)
+///
+/// This runs on the program token AS WRITTEN, so it has to predict what that string resolves to
+/// instead of resolving it. Two over-refusals are the price, both unchanged by the measurement
+/// above. A path that pops past its own first component lands somewhere only the cwd can name, so
+/// the gate refuses every one rather than guess. And a path whose final component drops out
+/// resolves to a name with a trailing separator — `x.bat\...` is `…\x.bat\`, which std's
+/// `has_bat_extension` does NOT read as a batch file — yet the gate judges the exposed `x.bat` and
+/// refuses. #144 moves resolution ahead of the gate, at which point both collapse into a suffix
+/// test on the resolved path and there is nothing left to predict.
+fn win32_effective_file_name(prog: &std::path::Path) -> Option<String> {
+    let text = prog.as_os_str().to_string_lossy();
+    // Each surviving component, paired with whether it is the path's FIRST segment — the only
+    // position a drive prefix can occupy.
+    let mut stack: Vec<(&str, bool)> = Vec::new();
+    for (position, segment) in text.split(['/', '\\']).enumerate() {
+        // A repeated separator, never a component.
+        if segment.is_empty() {
+            continue;
+        }
+        // Trailing spaces go first, so `.. ` is recognised as the parent-directory component it
+        // resolves to rather than as an ordinary file named `.. `.
+        let segment = segment.trim_end_matches(' ');
+        if segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            stack.pop();
+            continue;
+        }
+        // Ordinary component: Win32 drops trailing dots and spaces. Nothing left of it means a
+        // dots-and-spaces component, which drops out without popping.
+        let name = segment.trim_end_matches([' ', '.']);
+        if name.is_empty() {
+            continue;
+        }
+        stack.push((name, position == 0));
+    }
+    let (last, leading) = stack.pop()?;
+    // A BARE drive prefix names no file — and only the first segment can be one. Elsewhere a
+    // component ending in `:` is a data-stream spelling of a real file: `a:` is the file `a`, just
+    // as `x.exe:` is the file `x.exe`, and returning `None` for either made the gate refuse a
+    // loadable image over a one-character name. A UNC `\\server` yields `server`, which is a name
+    // like any other and simply is not a batch file.
+    if leading && is_drive_prefix(last) {
+        return None;
+    }
+    Some(last.to_string())
+}
+
+/// A bare `C:` — two bytes, a drive letter and a colon.
+fn is_drive_prefix(component: &str) -> bool {
+    matches!(component.as_bytes(), [d, b':'] if d.is_ascii_alphabetic())
+}
+
+/// Whether the shell would treat `name` as a batch file: the extension is everything after the
+/// LAST `.` anywhere in the name, matching `PathFindExtension` and std's own `has_bat_extension`
+/// (a case-insensitive `ends_with(".bat" | ".cmd")`, which is the same predicate).
+///
+/// Deliberately not `Path::extension()`, which differs in two ways that both matter. It returns
+/// `None` for a name that IS `.bat` (a leading dot with no other dot), and it stops at nothing —
+/// so `x.exe:payload.bat` reads as extension `exe:payload.bat` rather than the `bat` the shell
+/// acts on.
+fn is_batch_by_shell(name: &str) -> bool {
+    match name.rfind('.') {
+        Some(dot) => {
+            let ext = name[dot + 1..].to_ascii_lowercase();
+            ext == "bat" || ext == "cmd"
+        }
+        None => false,
+    }
+}
+
+/// The file name and every data-stream name inside a path component, each trimmed the way Win32
+/// trims a component.
+///
+/// Two normalisations, and the ORDER matters: split at the stream separators FIRST, then trim.
+/// Note `x.bat:s ` does NOT discriminate — it yields `x.bat` either way, because trim-then-split
+/// still splits. The witnesses are a trailing space or dot BEFORE the separator: `x.bat.:s`,
+/// `x.bat :s`, `x.bat. :s`. Split-then-trim yields `x.bat` for all three; trim-then-split leaves
+/// `x.bat.` / `x.bat ` / `x.bat. `, which the extension check then misses.
+///
+/// EVERY piece, not just the one before the first separator: taking only the first read
+/// `x.exe:payload.bat:` as the file `x.exe`, losing the batch name, while the same stream spelled
+/// `x.exe:payload.bat` was refused.
+///
+/// A leading `C:` is a drive, not a separator. Skipping it changes NO VERDICT — the only piece it
+/// suppresses is a bare drive letter, one character with no dot in it, which is never a batch
+/// name — and it is kept for the contract rather than the verdict: every piece this yields is a
+/// name Win32 would open, and a drive letter is not one. The skip WAS load-bearing when only the
+/// first piece was read, which is how `C:x.bat:s` came to be allowed while `x.bat:s` was refused.
+fn ntfs_stream_names(name: &str) -> impl Iterator<Item = &str> {
+    let rest = match name.get(..2) {
+        Some(prefix) if is_drive_prefix(prefix) => &name[2..],
+        _ => name,
+    };
+    rest.split(':').map(|part| part.trim_end_matches([' ', '.']))
+}
+
     for op in ops {
         match op {
             EnvOp::Set(k, v) => {
