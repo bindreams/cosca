@@ -345,8 +345,31 @@ pub(crate) fn launch_runas(cmd: &mut Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
 }
 
-/// PURE given `host` (the Windows gate seam): gate, plan, then ShellExecuteEx(runas).
-pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error> {
+/// The validated `SHELLEXECUTEINFOW` payload: every string field, NUL-terminated, plus the show
+/// command. Built only when a consent prompt is actually warranted.
+pub(crate) struct RunasLaunch {
+    file_w: Vec<u16>,
+    params_w: Vec<u16>,
+    dir_w: Option<Vec<u16>>,
+    verb_w: Vec<u16>,
+    show: windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD,
+}
+
+/// What the launch will do, decided with no effect whatsoever.
+pub(crate) enum RunasStep {
+    AlreadyElevated,
+    Launch(Box<RunasLaunch>),
+}
+
+/// PURE given `host` (the Windows gate seam): every config gate, every input check, and the
+/// planner decision — and NOTHING that touches the system.
+///
+/// Split out from the launch so the unit tests can drive it. They probe what happens when a check
+/// is removed, and a test that drove `launch_runas_with_host` instead would, on the unelevated
+/// leg of that hypothetical, fall through the planner and issue a REAL `ShellExecuteExW` with
+/// verb `runas` — raising a UAC prompt and elevating the probe program on the developer's own
+/// machine. Returning the decision instead makes that outcome unreachable from a test.
+pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error> {
     let req = cmd.elevation_request();
     let (backend, auth) = (req.backend, req.auth.clone());
     // Structural config gate FIRST — privilege-independent (before the short-circuit), so
@@ -400,7 +423,7 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
     let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
-        Transition::RunAsIs => return Ok(RunasOutcome::AlreadyElevated),
+        Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
         Transition::Reject { error } => return Err(error),
         Transition::ElevatePosix { .. } => unreachable!("planner never yields ElevatePosix on a windows host"),
         Transition::ElevateMacosGui { .. } => {
@@ -408,6 +431,30 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
         }
         Transition::ElevateWindows { .. } => {}
     }
+
+    Ok(RunasStep::Launch(Box::new(RunasLaunch {
+        file_w,
+        params_w,
+        dir_w: dir,
+        verb_w,
+        show: runas_show_command(cmd.flags_request()),
+    })))
+}
+
+/// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
+/// the child it launched. Everything that could refuse the request happened in [`plan_runas`].
+pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<RunasOutcome, Error> {
+    let launch = match plan_runas(cmd, host)? {
+        RunasStep::AlreadyElevated => return Ok(RunasOutcome::AlreadyElevated),
+        RunasStep::Launch(launch) => launch,
+    };
+    let RunasLaunch {
+        file_w,
+        params_w,
+        dir_w,
+        verb_w,
+        show,
+    } = *launch;
 
     let com = ComInit::init()?;
     // SAFETY: `info` is fully initialized with the correct cbSize; the wide buffers
@@ -419,8 +466,8 @@ pub(crate) fn launch_runas_with_host(cmd: &mut Command, host: &Host) -> Result<R
             lpVerb: PCWSTR(verb_w.as_ptr()),
             lpFile: PCWSTR(file_w.as_ptr()),
             lpParameters: PCWSTR(params_w.as_ptr()),
-            lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
-            nShow: runas_show_command(cmd.flags_request()).0,
+            lpDirectory: dir_w.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+            nShow: show.0,
             ..Default::default()
         };
         ShellExecuteExW(&mut info).map_err(|e| {

@@ -94,6 +94,10 @@ fn inherit_only_is_accepted() {
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
+/// A Windows-shaped host for the pure seam. Tests below drive [`super::plan_runas`] and never
+/// `launch_runas_with_host`: on an `elevated: false` host the latter's fall-through is a real
+/// `ShellExecuteExW(runas)`, so a probe that slipped past a check under test would raise a UAC
+/// prompt and elevate the probe program under a plain `cargo test`.
 fn win_host(elevated: bool) -> crate::elevation::plan::Host {
     crate::elevation::plan::Host {
         elevated,
@@ -113,7 +117,7 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
         c.args(["whoami"]).elevate();
         c.stdout(Stdio::pipe()).unwrap();
         assert!(
-            is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated))),
+            is_unsupported(super::plan_runas(&c, &win_host(elevated))),
             "piped elevated config must reject with elevated={elevated}"
         );
     }
@@ -124,11 +128,38 @@ fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
     for elevated in [false, true] {
         let mut c = Command::new();
         c.commandline("whoami").elevate();
-        assert!(is_unsupported(super::launch_runas_with_host(
-            &mut c,
-            &win_host(elevated)
-        )));
+        assert!(is_unsupported(super::plan_runas(&c, &win_host(elevated))));
     }
+}
+
+/// The affirmative leg. Every other `plan_runas` test asserts a REFUSAL, so all of them would
+/// still pass against a seam that refused everything — and "no consent prompt ever happens" is not
+/// the property this file is pinning. A clean inherit-only request on an UNELEVATED host must
+/// reach `Launch`, with every `SHELLEXECUTEINFOW` string built and NUL-terminated.
+#[test]
+fn a_clean_unelevated_request_plans_a_launch() {
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let mut c = Command::new();
+    c.args(["whoami", "/all"]).elevate();
+    let launch = match super::plan_runas(&c, &win_host(false)) {
+        Ok(super::RunasStep::Launch(launch)) => launch,
+        Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
+        Err(e) => panic!("a clean inherit-only request must not be refused: {e:?}"),
+    };
+    for (field, w) in [
+        ("lpVerb", &launch.verb_w),
+        ("lpFile", &launch.file_w),
+        ("lpParameters", &launch.params_w),
+    ] {
+        assert_eq!(w.last(), Some(&0), "{field} must be NUL-terminated: {w:?}");
+        assert!(w.len() > 1, "{field} must carry the value, not just its terminator");
+    }
+    assert_eq!(
+        launch.dir_w, None,
+        "no current_dir() was set, so lpDirectory stays null"
+    );
+    assert_eq!(launch.show, SW_SHOWNORMAL);
 }
 
 #[test]
@@ -138,8 +169,8 @@ fn already_elevated_inherit_only_is_run_as_is() {
     let mut c = Command::new();
     c.args(["whoami"]).elevate();
     assert!(matches!(
-        super::launch_runas_with_host(&mut c, &win_host(true)),
-        Ok(super::RunasOutcome::AlreadyElevated)
+        super::plan_runas(&c, &win_host(true)),
+        Ok(super::RunasStep::AlreadyElevated)
     ));
 }
 
@@ -266,15 +297,14 @@ fn wide_nul_accepts_an_ordinary_value_and_terminates_it() {
 
 /// THE WIRING of the fallible call sites, not the helper. `wide_nul` being correct is worthless
 /// if a field is built by an inline `encode_wide().chain(once(0))` instead — reverting any single
-/// call site to that leaves the helper's own tests green, so this drives `launch_runas_with_host`
-/// and pins that the truncating value is actually refused, AND blamed on the right field, where
-/// it is used.
+/// call site to that leaves the helper's own tests green, so this drives `plan_runas` and pins
+/// that the truncating value is actually refused, AND blamed on the right field, where it is used.
 ///
-/// Uses a program path that cannot exist, so a call site that ESCAPED the check would proceed to
-/// `ShellExecuteExW` and come back `Elevation { .. }` (file not found, no prompt) rather than
-/// `Io(InvalidInput)`. Both outcomes are errors — only the KIND distinguishes wired from unwired.
+/// A call site that ESCAPED the check comes back `Ok(Launch)`, which the fall-through arm below
+/// panics on. That is the whole reason this drives the pure seam: on `launch_runas_with_host` the
+/// same escape would hand the probe to `ShellExecuteExW` and raise a UAC prompt under `cargo test`.
 ///
-/// One leg per fallible field — `lpFile`, `lpParameters`, `lpDirectory`. `launch_runas_with_host`
+/// One leg per fallible field — `lpFile`, `lpParameters`, `lpDirectory`. `plan_runas`
 /// has a FOURTH `wide_nul(...)?` call site, `verb_w`, but its input is the literal `"runas"`,
 /// which can never contain a NUL, so it has no failing case and is untested here. A single-argv,
 /// no-cwd probe only reaches `lpFile`: with an empty joined parameter line and `cmd.cwd() ==
@@ -313,11 +343,11 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
         by_cwd.args([clean.clone()]).current_dir(&nul_path).elevate();
 
         for (field, needle, c) in [
-            ("lpFile", "program path", &mut by_program),
-            ("lpParameters", "argument line", &mut by_argument),
-            ("lpDirectory", "working directory", &mut by_cwd),
+            ("lpFile", "program path", &by_program),
+            ("lpParameters", "argument line", &by_argument),
+            ("lpDirectory", "working directory", &by_cwd),
         ] {
-            match super::launch_runas_with_host(c, &win_host(elevated)) {
+            match super::plan_runas(c, &win_host(elevated)) {
                 Err(Error::Io(e)) => {
                     assert_eq!(
                         e.kind(),
@@ -346,7 +376,7 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
 ///
 /// Scope, so this test is not read as proving more than it does: the gate keys on the caller's
 /// string, and `ShellExecuteEx` resolves the file. An extension-less `args(["setup", "a&calc"])`
-/// passes it and can still be PATHEXT-completed to `setup.bat` — see `launch_runas_with_host`.
+/// passes it and can still be PATHEXT-completed to `setup.bat` — see `plan_runas`.
 ///
 /// Privilege-independent for the same reason as the config gate: the already-elevated caller
 /// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
@@ -358,7 +388,7 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
             let mut c = Command::new();
             c.args([probe, "a&calc"]).elevate();
             assert!(
-                is_unsupported(super::launch_runas_with_host(&mut c, &win_host(elevated)).map(|_| ())),
+                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
                 "elevated={elevated}: {probe:?} must be refused before ShellExecuteEx hands it to cmd.exe"
             );
         }
@@ -395,7 +425,7 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     for elevated in [false, true] {
         let mut c = Command::new();
         c.args([nul_bat.clone()]).elevate();
-        match super::launch_runas_with_host(&mut c, &win_host(elevated)) {
+        match super::plan_runas(&c, &win_host(elevated)) {
             Err(Error::Io(e)) => {
                 assert_eq!(
                     e.kind(),
@@ -442,7 +472,7 @@ fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
     for elevated in [false, true] {
         let mut c = Command::new();
         c.args([bat_nul.clone(), OsString::from("a&calc")]).elevate();
-        match super::launch_runas_with_host(&mut c, &win_host(elevated)) {
+        match super::plan_runas(&c, &win_host(elevated)) {
             Err(Error::Io(e)) => {
                 assert_eq!(
                     e.kind(),
