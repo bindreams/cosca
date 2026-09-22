@@ -774,6 +774,20 @@ fn a_verbatim_path_is_judged_the_way_std_judges_one() {
             "{plain:?} still resolves to the batch file"
         );
     }
+    // The declared split `verbatim_refusal` documents: std hands `CreateProcessW` the same string
+    // for each pair, and until kernelbase is measured the plain spelling is refused and the
+    // prefixed one accepted.
+    for stream in [r"C:\x.bat:s", r"C:\x.bat:", r"C:\x.bat::$DATA"] {
+        assert!(
+            super::reject_batch_path_on(Path::new(stream), true).is_err(),
+            "{stream:?} is refused until kernelbase is measured"
+        );
+        let verbatim = format!(r"\\?\{stream}");
+        assert!(
+            super::reject_batch_path_on(Path::new(&verbatim), true).is_ok(),
+            "{verbatim:?} is accepted on std's literal test"
+        );
+    }
 }
 
 /// The POSIX half of the same gate, also with the platform forced: past the NUL check it refuses

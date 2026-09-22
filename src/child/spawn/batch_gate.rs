@@ -184,6 +184,21 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
 /// literal file name, and no file may be called that (measured: `ERROR_INVALID_NAME`). Other
 /// unloadable spellings — a trailing separator, a final `.` — are left to fail with the OS's own
 /// error, which says more about why than a security refusal would.
+///
+/// # The stream spellings rest on an unmeasured reading of kernelbase
+///
+/// `\\?\C:\x.bat:s`, `\\?\C:\x.bat:` and `\\?\C:\x.bat::$DATA` are ACCEPTED while their plain
+/// spellings are refused, yet std hands `CreateProcessW` the same string for each pair: each
+/// round-trips through `GetFullPathNameW`, so `to_user_path` strips the prefix. One of the two
+/// verdicts is wrong. std itself substitutes cmd.exe for neither, so the question is whether
+/// `CreateProcessW`, handed a data stream of a batch file, launches cmd.exe on its own. ReactOS's
+/// `CreateProcessInternalW` says no — it tests the last four characters of the name — which would
+/// make the plain refusal an over-refusal and this acceptance correct. Windows' own kernelbase is
+/// unmeasured, so the plain refusal stays. The measurement that settles it: on a Windows runner,
+/// write `x.bat` whose default stream and an `s` stream both hold a batch script that leaves a
+/// marker file, then spawn all six spellings, plain and prefixed, through both a direct
+/// `CreateProcessW` (which gets the prefix as written) and `std::process`, and record whether the marker appears or the call fails with
+/// `ERROR_BAD_EXE_FORMAT`. A marker means these acceptances are holes.
 fn verbatim_refusal(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
     if lower.ends_with(".bat") || lower.ends_with(".cmd") {
@@ -200,7 +215,12 @@ fn verbatim_refusal(text: &str) -> Option<&'static str> {
 /// covers both ways one can be spelled at once:
 ///
 /// - **As the filesystem resolves it.** `x.bat:s` names `x.bat` through a data stream, and
-///   `x.bat ` / `x.bat.` reach it because Win32 strips trailing spaces and dots.
+///   `x.bat ` / `x.bat.` reach it because Win32 strips trailing spaces and dots. The stream half is
+///   an over-refusal as far as std goes: `C:\x.bat:s`, `C:\x.bat:` and `C:\x.bat::$DATA` resolve
+///   to themselves, which `has_bat_extension` does not read as batch (measured), so std does not
+///   substitute cmd.exe. Whether `CreateProcessW` then launches cmd.exe for them itself is
+///   unmeasured; see [`verbatim_refusal`], whose prefixed spellings of the same strings are
+///   accepted.
 /// - **As written.** `ShellExecuteEx` reads the handler off the last `.` anywhere in the string
 ///   (`PathFindExtension`). std asks a differently-worded question with the same answer: it runs
 ///   the program through `GetFullPathNameW` — or, for a verbatim `\\?\` path, takes it literally —
