@@ -551,19 +551,25 @@ impl CgroupLeaf {
     }
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
-    /// Best-effort: already-empty leaves are silently fine.
-    pub(crate) fn hard_kill(&self) {
+    ///
+    /// `Ok` means the tree is dead: either the atomic kill fired, or the leaf was already gone
+    /// ([`removed_after_drain`]), which is itself proof every member had exited — `rmdir` on a
+    /// cgroup v2 leaf succeeds only once `populated` reads 0.
+    ///
+    /// Every other errno means the atomic kill did NOT happen — the tree may still be running
+    /// (a delegated subtree whose `cgroup.kill` stopped being writable after a privilege drop,
+    /// or a cgroupfs remounted `ro`). That is a teardown-mechanism failure and is returned, the
+    /// same way every sibling mechanism's is (`Attached::hard_kill`): a caller that reads
+    /// `Child::kill_tree() -> Ok(())` over a live tree has been told the opposite of the truth.
+    pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        if let Err(e) = fs::write(&path, b"1") {
-            // An already-removed leaf is the routine case (Drop ran, or the tree drained and
-            // a cgroup manager reaped the empty leaf) and is not a failure to kill anything.
-            // Any other errno means the atomic kill did NOT happen, which the caller reads as
-            // a completed teardown — say so rather than dropping it.
-            if e.raw_os_error() == Some(libc::ENOENT) {
+        match fs::write(&path, b"1") {
+            Ok(()) => Ok(()),
+            Err(e) if removed_after_drain(&e) => {
                 log::debug!("cgroup.kill: leaf {} is already gone", path.display());
-            } else {
-                log::warn!("cgroup.kill: could not kill the tree in {}: {e}", path.display());
+                Ok(())
             }
+            Err(e) => Err(crate::error::Error::Io(e)),
         }
     }
 
@@ -655,8 +661,17 @@ impl CgroupLeaf {
     /// usable ONLY for variant-level assertions, never for an operation that touches the
     /// fd or path.
     pub(crate) fn placeholder_for_test() -> CgroupLeaf {
+        CgroupLeaf::for_test_at(PathBuf::from("/nonexistent/cosca-cgroup-placeholder"))
+    }
+
+    /// Test-only leaf pointing at `leaf_path`, which a test shapes with ordinary files and
+    /// directories. Every operation that reads or writes the leaf path (`hard_kill`,
+    /// `placement_of`, `Drop`) then runs for real against the kernel's own errnos, on any
+    /// Linux host and without a cgroupfs. The fd is -1, so `close` is a no-op and nothing may
+    /// write through `procs_fd`.
+    pub(crate) fn for_test_at(leaf_path: PathBuf) -> CgroupLeaf {
         CgroupLeaf {
-            leaf_path: PathBuf::from("/nonexistent/cosca-cgroup-placeholder"),
+            leaf_path,
             procs_fd: -1,
             report: ReportPage::new().expect("map a placement-report page"),
         }

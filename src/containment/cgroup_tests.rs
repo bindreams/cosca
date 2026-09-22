@@ -597,3 +597,59 @@ fn placement_report_records_a_successful_write() {
     // SAFETY: the parent's own copy of the descriptor, closed exactly once.
     unsafe { libc::close(fd) };
 }
+
+// hard_kill outcome reporting -----
+// `cgroup.kill` is the whole of the CgroupV2 mechanism's teardown promise, so whether the write
+// landed is the caller's answer, not a detail. Real filesystem, no cgroupfs: a `cgroup.kill`
+// that is a DIRECTORY makes the kernel refuse the write with `EISDIR` on any Linux host, which
+// is the same shape as the production failures (`EACCES` after a privilege drop, `EROFS` on a
+// remounted cgroupfs) — a kill that did NOT happen.
+
+/// A `cgroup.kill` write the kernel refused must reach the caller through the public
+/// `Attached::hard_kill` arm, exactly as every sibling mechanism's failure does. Swallowing it
+/// makes `Child::kill_tree()` return `Ok(())` over a tree that is still running.
+#[cfg(target_os = "linux")]
+#[test]
+fn hard_kill_propagates_a_kill_the_kernel_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-refused-kill");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // A directory where the kernel expects a writable file: `write` fails with EISDIR.
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("create cgroup.kill as a directory");
+
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    let err = leaf
+        .hard_kill()
+        .expect_err("a refused cgroup.kill write must not read as success");
+    assert!(
+        err.to_string().contains("directory"),
+        "the kernel's own reason must reach the caller, got {err}"
+    );
+
+    let attached = crate::containment::Attached::Cgroup(leaf);
+    assert!(
+        attached.hard_kill().is_err(),
+        "Attached::Cgroup must propagate like every sibling arm; swallowing it makes \
+         kill_tree() report a completed teardown over a live tree"
+    );
+}
+
+/// An already-removed leaf is a COMPLETED teardown, not a failed kill: `rmdir` on a cgroup v2
+/// leaf succeeds only once the leaf is empty, so its absence is proof every member had already
+/// exited. It must stay `Ok`, and must not be narrated at `warn` — nothing was reduced.
+#[cfg(target_os = "linux")]
+#[test]
+fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+
+    let leaf = super::CgroupLeaf::placeholder_for_test();
+    leaf.hard_kill()
+        .expect("an already-removed leaf is a completed teardown, not a failure");
+
+    let levels = crate::log_capture::levels_since(mark, "cosca-cgroup-placeholder");
+    assert!(
+        !levels.contains(&log::Level::Warn),
+        "an already-gone leaf is routine and must not be reported at warn, got {levels:?}"
+    );
+}

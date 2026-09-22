@@ -113,10 +113,7 @@ impl Attached {
             #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid),
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => {
-                leaf.hard_kill();
-                Ok(())
-            }
+            Attached::Cgroup(leaf) => leaf.hard_kill(),
             #[cfg(windows)]
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
