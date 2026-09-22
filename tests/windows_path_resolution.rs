@@ -1,0 +1,1239 @@
+//! Windows path-resolution canary: the platform facts cosca's batch gate models, checked on a real
+//! Windows runner.
+//!
+//! `reject_batch_path` never resolves the program it judges. It PREDICTS what Win32 makes of the
+//! string — trailing dots and spaces, `.`/`..`, verbatim `\\?\` prefixes — and refuses anything
+//! that lands on a `.bat`/`.cmd` (CVE-2024-24576). Those predictions are only as good as the
+//! measurements behind them, and `windows-latest` is a floating label: a Windows build can change
+//! the answer with no commit here. The `windows-probes` workflow therefore runs this file on every
+//! pull request touching the gate, weekly, and on demand.
+//!
+//! # Two kinds of test
+//!
+//! **Canaries** assert a PLATFORM FACT the gate's model depends on and FAIL when Windows disagrees.
+//! They assert what Windows does, never whether cosca's verdict is right; each doc says which part
+//! of the model rests on its fact. A failure means the model describes a Windows that no longer
+//! exists — re-derive the gate from the new behaviour, do not loosen the assertion.
+//!
+//! **Surveys** only print. They map behaviour the model does not rely on, so a change there is
+//! information rather than a defect.
+//!
+//! Both fail if a measurement could not be taken, so an inconclusive run is never a silent pass,
+//! and each stamps its output with the OS build it ran on.
+//!
+//! # How to run it
+//!
+//! ```text
+//! cargo test --test windows_path_resolution -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! `#[ignore]`d so that an ordinary `cargo test` never mistakes a platform measurement for
+//! coverage of cosca. `GetFullPathNameW` reaches no disk; the file and spawn tests write only
+//! inside a `tempfile` directory of their own and launch only this crate's `cosca_testbin`.
+//! Nothing here runs a batch file or needs elevation, and nothing outlives the test.
+#![cfg(windows)]
+
+use std::sync::OnceLock;
+
+use windows::core::{PCWSTR, PWSTR};
+use windows::Wdk::System::SystemServices::RtlGetVersion;
+use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+use windows::Win32::Storage::FileSystem::GetFullPathNameW;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows::Win32::System::Threading::{
+    CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
+};
+
+// Measuring helpers =====
+
+fn wide(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+// Provenance =====
+
+/// The OS build a run measured: one line for stamping, one block for the top of the log.
+struct Platform {
+    summary: String,
+    detail: String,
+}
+
+/// A registry string under `HKLM`, or the Win32 error that stopped it being read.
+fn reg_sz(subkey: &str, value: &str) -> Result<String, String> {
+    use std::os::windows::ffi::OsStringExt;
+    let (subkey_w, value_w) = (wide(subkey), wide(value));
+    let mut bytes = 0u32;
+    // SAFETY: both name buffers are nul-terminated and outlive the call; passing no data buffer is
+    // the documented size-query form, which writes only `bytes`.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut bytes),
+        )
+    };
+    if rc.0 != 0 {
+        return Err(format!("RegGetValueW size query failed: error {}", rc.0));
+    }
+    let mut buf = vec![0u16; bytes as usize / 2 + 1];
+    let mut bytes_out = buf.len() as u32 * 2;
+    // SAFETY: as above, and `buf` is a live allocation of `bytes_out` bytes that the call writes
+    // at most that many bytes into.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut bytes_out),
+        )
+    };
+    if rc.0 != 0 {
+        return Err(format!("RegGetValueW failed: error {}", rc.0));
+    }
+    let units = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+    Ok(std::ffi::OsString::from_wide(&buf[..units])
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// A registry `REG_DWORD` under `HKLM`, or the Win32 error that stopped it being read.
+fn reg_dword(subkey: &str, value: &str) -> Result<u32, String> {
+    let (subkey_w, value_w) = (wide(subkey), wide(value));
+    let mut data = 0u32;
+    let mut bytes = size_of::<u32>() as u32;
+    // SAFETY: both name buffers are nul-terminated and outlive the call; `data` is a live
+    // four-byte out-parameter and `bytes` says so.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(std::ptr::addr_of_mut!(data).cast()),
+            Some(&mut bytes),
+        )
+    };
+    if rc.0 != 0 {
+        return Err(format!("RegGetValueW failed: error {}", rc.0));
+    }
+    Ok(data)
+}
+
+/// `Ok` rendered, `Err` rendered as the reason it is missing — for enrichment that must not sink
+/// the run if one image lacks a value.
+fn or_missing<T: std::fmt::Display>(v: Result<T, String>) -> String {
+    v.map_or_else(|why| format!("<absent: {why}>"), |v| v.to_string())
+}
+
+/// What `windows-latest` meant on THIS run.
+///
+/// The label floats: the image behind it is replaced every few weeks, so a measurement filed under
+/// the label alone stops being reproducible as soon as the label moves. `RtlGetVersion` is the
+/// version call Windows does not shim per application manifest, and `UBR` is the patch level it
+/// does not carry; together they are the full four-part build.
+fn measure_platform() -> Result<Platform, String> {
+    const KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a live, correctly sized out-parameter whose `dwOSVersionInfoSize` is set,
+    // which is the one precondition the call has.
+    let status = unsafe { RtlGetVersion(&mut info) };
+    if status.is_err() {
+        return Err(format!("RtlGetVersion failed: NTSTATUS {:#010x}", status.0));
+    }
+    let ubr = reg_dword(KEY, "UBR");
+    let build = match &ubr {
+        Ok(ubr) => format!(
+            "{}.{}.{}.{ubr}",
+            info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+        ),
+        Err(_) => format!(
+            "{}.{}.{}.?",
+            info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+        ),
+    };
+    let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "<unset>".to_string());
+    let summary = format!(
+        "{build} {} {} / {} / runner image {} {}",
+        or_missing(reg_sz(KEY, "DisplayVersion")),
+        or_missing(reg_sz(KEY, "EditionID")),
+        std::env::consts::ARCH,
+        env("ImageOS"),
+        env("ImageVersion"),
+    );
+    let detail = format!(
+        "\n\
+         ===== PLATFORM =========================================================\n\
+         This is what the floating label resolved to on this run. Quote THIS, not the label.\n\
+        \x20 OS build (RtlGetVersion + UBR) : {build}\n\
+        \x20 DisplayVersion                 : {}\n\
+        \x20 ProductName                    : {}\n\
+        \x20 EditionID                      : {}\n\
+        \x20 BuildLabEx                     : {}\n\
+        \x20 CSD version                    : {:?}\n\
+        \x20 process architecture           : {}\n\
+        \x20 PROCESSOR_ARCHITECTURE         : {}\n\
+        \x20 runner label / image           : {} / {} {}\n\
+        \x20 RUNNER_OS / RUNNER_ARCH        : {} / {}\n\
+         ========================================================================",
+        or_missing(reg_sz(KEY, "DisplayVersion")),
+        or_missing(reg_sz(KEY, "ProductName")),
+        or_missing(reg_sz(KEY, "EditionID")),
+        or_missing(reg_sz(KEY, "BuildLabEx")),
+        String::from_utf16_lossy(&info.szCSDVersion)
+            .trim_end_matches('\0')
+            .to_string(),
+        std::env::consts::ARCH,
+        env("PROCESSOR_ARCHITECTURE"),
+        env("RUNNER_NAME"),
+        env("ImageOS"),
+        env("ImageVersion"),
+        env("RUNNER_OS"),
+        env("RUNNER_ARCH"),
+    );
+    Ok(Platform { summary, detail })
+}
+
+static PLATFORM: OnceLock<Result<Platform, String>> = OnceLock::new();
+static DETAIL_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stamp this test's output with the OS build it is measuring.
+///
+/// The first caller prints the whole block, every later one a single line, so the detail sits at
+/// the top of the log exactly once however the tests are ordered. `swap` decides who "first" is,
+/// rather than a read-then-write that two threads could both win.
+fn announce_platform() -> Result<(), String> {
+    match PLATFORM.get_or_init(measure_platform) {
+        Ok(platform) => {
+            if DETAIL_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                println!("platform: {}", platform.summary);
+            } else {
+                println!("{}", platform.detail);
+            }
+            Ok(())
+        }
+        Err(why) => Err(format!(
+            "the OS build this run measured could not be identified, so no measurement here has \
+             provenance: {why}"
+        )),
+    }
+}
+
+/// `GetFullPathNameW(input)` as the resolved path plus its `lpFilePart`, or an error describing
+/// why no measurement was taken.
+///
+/// `lpFilePart` is the second half of the answer and not a decoration: Win32 sets it to the final
+/// component of the result, or to NULL when the result names a directory. So it says directly
+/// whether `C:\dir\...` came back still naming a file.
+fn full_path_name_parts(input: &str) -> Result<(String, Option<String>), String> {
+    use std::os::windows::ffi::OsStringExt;
+    let input_w = wide(input);
+    let mut buf = vec![0u16; 1024];
+    let mut file_part = PWSTR::null();
+    // SAFETY: `input_w` is nul-terminated and outlives the call; `buf` is a live, correctly sized
+    // slice and the function writes at most `buf.len()` units into it; `file_part` is a live
+    // out-pointer the function sets to an interior pointer of `buf`.
+    let len = unsafe { GetFullPathNameW(PCWSTR(input_w.as_ptr()), Some(&mut buf), Some(&mut file_part)) };
+    if len == 0 {
+        return Err(format!(
+            "GetFullPathNameW({input:?}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if len as usize >= buf.len() {
+        return Err(format!(
+            "GetFullPathNameW({input:?}) wants {len} units; the probe gave 1024"
+        ));
+    }
+    let resolved = std::ffi::OsString::from_wide(&buf[..len as usize])
+        .to_string_lossy()
+        .into_owned();
+    let part = if file_part.is_null() {
+        None
+    } else {
+        // SAFETY: on success Win32 points `file_part` into `buf` at the final component, which is
+        // nul-terminated inside the prefix it just wrote. `buf` is still alive.
+        Some(unsafe { file_part.to_string() }.map_err(|e| format!("lpFilePart of {input:?} is not UTF-16: {e}"))?)
+    };
+    Ok((resolved, part))
+}
+
+/// `GetFullPathNameW(input)`, resolved path only.
+fn full_path_name(input: &str) -> Result<String, String> {
+    full_path_name_parts(input).map(|(resolved, _)| resolved)
+}
+
+/// `GetFullPathNameW(input)` reported at the UTF-16 unit level.
+///
+/// A result that looks cut off — `\\?\C:` with no trailing separator, say — was cut off either by
+/// Win32 or by the probe, and a trimmed `String` cannot tell the two apart. So this reports the
+/// length Win32 returned, the length an independent size query says it should be, the raw units
+/// including the ones past the end of the answer, and where `lpFilePart` points inside the buffer.
+/// The buffer is poisoned first, so "Win32 wrote nothing here" is visible rather than inferred.
+fn full_path_name_raw(input: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+    const CAP: usize = 1024;
+    const POISON: u16 = 0xFEED;
+
+    let input_w = wide(input);
+    // The size query first, with no buffer at all: on success it returns the length INCLUDING the
+    // terminating nul, so it is a witness to the answer's length that the write call below cannot
+    // influence. A probe buffer too small to hold the answer cannot fake agreement between them.
+    // SAFETY: `input_w` is nul-terminated and outlives the call; passing no buffer is the
+    // documented size-query form, in which the function writes nothing.
+    let needed = unsafe { GetFullPathNameW(PCWSTR(input_w.as_ptr()), None, None) };
+    if needed == 0 {
+        return Err(format!(
+            "GetFullPathNameW({input:?}) size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut buf = vec![POISON; CAP];
+    let mut file_part = PWSTR::null();
+    // SAFETY: as above; `buf` is a live slice of `CAP` units that the call writes at most `CAP`
+    // units into, and `file_part` is a live out-pointer set to an interior pointer of `buf`.
+    let len = unsafe { GetFullPathNameW(PCWSTR(input_w.as_ptr()), Some(&mut buf), Some(&mut file_part)) };
+    if len == 0 {
+        return Err(format!(
+            "GetFullPathNameW({input:?}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if len as usize >= CAP {
+        return Err(format!(
+            "GetFullPathNameW({input:?}) wants {len} units; the probe gave {CAP}"
+        ));
+    }
+
+    let show = (len as usize + 4).min(CAP);
+    let units: Vec<String> = buf[..show]
+        .iter()
+        .enumerate()
+        .map(|(i, &u)| {
+            let value = match u {
+                0 => "NUL".to_string(),
+                POISON => "POISON".to_string(),
+                _ => char::from_u32(u32::from(u)).map_or_else(|| "?".to_string(), |c| format!("'{c}'")),
+            };
+            let end = if i == len as usize { "|len ends|" } else { "" };
+            format!("{end}{i}:{u:#06x}={value}")
+        })
+        .collect();
+
+    let mut out = String::new();
+    let w = &mut out;
+    writeln!(
+        w,
+        "  probe buffer            : {CAP} units, pre-filled with {POISON:#06x}"
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "  size query (no buffer)  : {needed} units = {} of text + 1 nul",
+        needed.saturating_sub(1)
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "  write call returned     : {len} units{}",
+        if len + 1 == needed {
+            " — agrees with the size query, so nothing was lost"
+        } else {
+            " — DISAGREES with the size query"
+        }
+    )
+    .unwrap();
+    writeln!(w, "  raw units               : {}", units.join(" ")).unwrap();
+    writeln!(
+        w,
+        "  unit at index {len:<10}: {:#06x} ({})",
+        buf[len as usize],
+        if buf[len as usize] == 0 {
+            "NUL — Win32 terminated the string exactly there"
+        } else {
+            "NOT nul — Win32 wrote past its own returned length"
+        }
+    )
+    .unwrap();
+
+    use std::os::windows::ffi::OsStringExt;
+    let resolved = std::ffi::OsString::from_wide(&buf[..len as usize])
+        .to_string_lossy()
+        .into_owned();
+    writeln!(w, "  resolved string         : {resolved:?}").unwrap();
+    writeln!(w, "  ends with a separator   : {}", resolved.ends_with('\\')).unwrap();
+
+    if file_part.is_null() {
+        writeln!(
+            w,
+            "  lpFilePart              : NULL — Win32 says the result names a directory"
+        )
+        .unwrap();
+    } else {
+        let base = buf.as_ptr() as usize;
+        let at = file_part.0 as usize;
+        if at < base || at >= base + CAP * 2 {
+            writeln!(
+                w,
+                "  lpFilePart              : {at:#x}, OUTSIDE the probe buffer ({base:#x}..{:#x})",
+                base + CAP * 2
+            )
+            .unwrap();
+        } else {
+            // SAFETY: the pointer is inside `buf`, which Win32 nul-terminated within the prefix it
+            // wrote, and `buf` is still alive.
+            let text =
+                unsafe { file_part.to_string() }.map_err(|e| format!("lpFilePart of {input:?} is not UTF-16: {e}"))?;
+            writeln!(
+                w,
+                "  lpFilePart              : inside the buffer at unit offset {} of {len}, reads {text:?}",
+                (at - base) / 2
+            )
+            .unwrap();
+        }
+    }
+    Ok(out)
+}
+
+/// std's `has_bat_extension`, verbatim: a case-insensitive `ends_with` of `.bat` or `.cmd` on the
+/// RESOLVED path. This is the predicate that decides whether `std::process` swaps in `cmd.exe`.
+fn has_bat_extension(resolved: &str) -> bool {
+    let lower = resolved.to_ascii_lowercase();
+    lower.ends_with(".bat") || lower.ends_with(".cmd")
+}
+
+/// The final components under test, each only dots and/or spaces or ending in one, with whether a
+/// VERBATIM spelling can hold a file of that name. `.` and `..` cannot: they fail
+/// `ERROR_INVALID_NAME` even under `\\?\`. `. ` rides along because under the prefix it is a
+/// different literal name from `.`, not a spelling of it.
+const WEIRD_NAMES: &[(&str, &str, bool)] = &[
+    ("...", "three dots", true),
+    ("....", "four dots", true),
+    (" ", "a single space", true),
+    ("x ", "an ordinary name with a trailing space", true),
+    ("..", "the parent-directory component, spelled as a literal name", false),
+    (".", "the self component, spelled as a literal name", false),
+    (". ", "the self component plus a space: a different literal name", true),
+];
+
+/// `ERROR_INVALID_NAME`: "The filename, directory name, or volume label syntax is incorrect."
+const ERROR_INVALID_NAME: i32 = 123;
+
+/// Platform facts a canary found Windows no longer agrees with. Distinct from a measurement that
+/// could not be taken: that is a broken probe, this is a changed platform.
+#[derive(Default)]
+struct Disagreements(Vec<String>);
+
+impl Disagreements {
+    /// Record `fact` as broken unless `holds`, with what was measured instead.
+    fn check(&mut self, holds: bool, fact: &str, measured: impl std::fmt::Display) {
+        if !holds {
+            self.0.push(format!("{fact} — measured {measured}"));
+        }
+    }
+
+    /// Fail the test if any fact disagreed. Call after the measurement-failure assert, so a broken
+    /// probe is reported as one rather than as a platform change.
+    fn assert_none(self) {
+        assert!(
+            self.0.is_empty(),
+            "Windows no longer behaves as the batch gate's path model assumes; re-derive the gate \
+             from the new behaviour:\n  {}",
+            self.0.join("\n  ")
+        );
+    }
+}
+
+/// A `Result` rendered for the log: `ok` or the OS error behind it.
+fn outcome<T>(r: &std::io::Result<T>) -> String {
+    match r {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("FAILED: {e} (raw_os_error={:?})", e.raw_os_error()),
+    }
+}
+
+/// Say which of a probe's inputs name a directory that is actually on disk.
+///
+/// `GetFullPathNameW` is documented as pure string manipulation and is expected not to care;
+/// stating it lets the record say so. [`which_segment_positions_get_trimmed`] measures it.
+fn report_roots(roots: &[&str]) {
+    println!("roots these inputs are built on (GetFullPathNameW should not care — stated so the record can say):");
+    for root in roots {
+        let path = std::path::Path::new(root);
+        println!("  {root:?}  exists={}  is_dir={}", path.exists(), path.is_dir());
+    }
+}
+
+/// Every name in `dir`, as `FindFirstFileW` reports it.
+fn listing(dir: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read_dir({dir:?}) failed: {e}"))? {
+        let entry = entry.map_err(|e| format!("read_dir({dir:?}) entry failed: {e}"))?;
+        names.push(format!("{:?}", entry.file_name()));
+    }
+    names.sort();
+    Ok(names)
+}
+
+// Probes =====
+
+/// Canary: a final component of only dots and spaces DROPS OUT and pops nothing, while `..` pops.
+///
+/// The gate's `win32_effective_file_name` walks the components the way Win32 does, and these are
+/// the rules it walks by. They are chosen so the two candidate readings of a dots-and-spaces
+/// component give OPPOSITE answers — dropping it leaves `y`, reading it as `..` leaves `x.bat` —
+/// and, since std tests the RESOLVED path, which one Win32 picks decides whether `cmd.exe` runs.
+/// `x.bat\y\..` is the bypass the gate exists for; `x\..\..` is why a path that pops past its own
+/// first component is refused (it lands in the current directory's ancestors, which the gate
+/// cannot see). The trailing separator on an elided result matters too: std's
+/// `has_bat_extension` does not read `…\x.bat\` as a batch file.
+///
+/// Relative inputs, so each is compared against the current directory `GetFullPathNameW` resolves
+/// them in.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
+    // (input, what follows the current directory in the result, why)
+    let probes = [
+        (r"x.bat\y\..", r"x.bat", "`..` pops `y`, exposing the batch file"),
+        (r"x.bat\y\.. ", r"x.bat\y\", "`.. ` is NOT `..`: it drops out"),
+        (r"x.bat\y\. ", r"x.bat\y\", "`. ` drops out"),
+        (r"x.bat\y\.. .", r"x.bat\y\", "drops out, so `y` survives"),
+        (r"x.bat\y\...", r"x.bat\y\", "drops out, so `y` survives"),
+        (r"x.bat\y\....", r"x.bat\y\", "drops out, so `y` survives"),
+        (r"x.bat\y\.. ..", r"x.bat\y\", "drops out, so `y` survives"),
+        (r"x.bat\y\ ", r"x.bat\y\", "drops out, so `y` survives"),
+        (
+            r"x.bat\...",
+            r"x.bat\",
+            "drops out, leaving a separator after the batch name",
+        ),
+        (
+            r"x.bat\y\...\z.exe",
+            r"x.bat\y\...\z.exe",
+            "an interior `...` is kept verbatim",
+        ),
+    ];
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let cwd = cwd
+                .to_str()
+                .expect("cwd is not UTF-8")
+                .trim_end_matches('\\')
+                .to_string();
+            println!("current directory: {cwd:?}");
+            for (probe, tail, why) in probes {
+                match full_path_name(probe) {
+                    Ok(resolved) => {
+                        println!(
+                            "{probe:?} -> {resolved:?}  batch_to_std={}  ({why})",
+                            has_bat_extension(&resolved)
+                        );
+                        let want = format!(r"{cwd}\{tail}");
+                        facts.check(
+                            resolved == want,
+                            &format!("{probe:?} resolves to {want:?} ({why})"),
+                            format_args!("{resolved:?}"),
+                        );
+                    }
+                    Err(why) => failures.push(why),
+                }
+            }
+            // Popping past the path's own first component continues into the cwd's ancestors.
+            const POP_PAST: &str = r"x\..\..";
+            match std::path::Path::new(&cwd).parent().and_then(|p| p.to_str()) {
+                Some(parent) => match full_path_name(POP_PAST) {
+                    Ok(resolved) => {
+                        println!("{POP_PAST:?} -> {resolved:?}  (pops past its own first component)");
+                        let want = parent.trim_end_matches('\\');
+                        let got = resolved.trim_end_matches('\\');
+                        facts.check(
+                            got == want,
+                            &format!("{POP_PAST:?} resolves to the cwd's parent {want:?}"),
+                            format_args!("{resolved:?}"),
+                        );
+                    }
+                    Err(why) => failures.push(why),
+                },
+                None => failures.push(format!("the current directory {cwd:?} has no parent to pop into")),
+            }
+        }
+        Err(e) => failures.push(format!(
+            "could not read the working directory these resolve against: {e}"
+        )),
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Canary: `GetFullPathNameW` strips a final dots-and-spaces component in BOTH spellings — the
+/// verbatim `\\?\` prefix does not stop it — and a trailing separator does.
+///
+/// The gate judges verbatim paths by a rule of its own (`verbatim_refusal`) on the literal string,
+/// because `\\?\C:\dir\...` OPENS the file `...` (see
+/// [`a_verbatim_dots_and_spaces_file_exists_and_loads`]) while `GetFullPathNameW` says it names
+/// `C:\dir\`. That split is what this pins: if Win32 began honouring the prefix here, the verbatim
+/// and plain readings would converge and the separate rule would need revisiting.
+///
+/// The trailing-separator rows are printed, not asserted: the gate does not rely on them.
+/// `C:\dir\x` must come back untouched, or the probe itself is broken.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
+    // (tail, note, stripped): `stripped` tails lose the whole final component without a trailing
+    // separator, in either spelling.
+    let tails = [
+        ("...", "three dots", true),
+        ("....", "four dots", true),
+        (". ", "`.` plus a space", true),
+        (" ", "a single space", true),
+        (".. .", "neither `.` nor `..`, but trims to `..`", true),
+        ("..", "the parent-directory component", false),
+        (".", "the self component", false),
+        ("x", "control: an ordinary name", false),
+    ];
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    report_roots(&[r"C:\dir", r"C:\"]);
+    for (tail, note, stripped) in tails {
+        println!("--- {tail:?}  ({note})");
+        for prefix in ["", r"\\?\"] {
+            for trailing_sep in ["", r"\"] {
+                let input = format!(r"{prefix}C:\dir\{tail}{trailing_sep}");
+                match full_path_name_parts(&input) {
+                    Ok((resolved, part)) => {
+                        let shown = part
+                            .as_ref()
+                            .map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
+                        let verdict = if resolved == input { "unchanged" } else { "REWRITTEN" };
+                        println!("  {input:?} -> {resolved:?}  file_part={shown}  [{verdict}]");
+                        if trailing_sep.is_empty() && stripped {
+                            let want = format!(r"{prefix}C:\dir\");
+                            facts.check(
+                                resolved == want && part.is_none(),
+                                &format!("{input:?} is stripped to the directory {want:?}"),
+                                format_args!("{resolved:?} with file_part={shown}"),
+                            );
+                        }
+                        if tail == "x" {
+                            facts.check(
+                                resolved == input,
+                                &format!("control {input:?} comes back unchanged"),
+                                format_args!("{resolved:?}"),
+                            );
+                        }
+                    }
+                    Err(why) => failures.push(why),
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Canary: through `\\?\`, a dots-and-spaces name is an ordinary file — except `.` and `..`,
+/// which fail `ERROR_INVALID_NAME`.
+///
+/// Both halves are `verbatim_refusal`'s rule. It refuses a verbatim final `..` because no file may
+/// be called that, and accepts `...`, `" "`, `"x "` and `". "` because each names a real file. If
+/// `..` became creatable the refusal would cost a real program; if the others stopped being
+/// creatable, accepting them would stop meaning anything.
+///
+/// The plain-spelling rows are printed, not asserted. Each (name, spelling) pair gets its OWN
+/// directory, so a listing can never be ambiguous about which attempt produced which entry.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn only_dot_and_dotdot_are_refused_as_verbatim_file_names() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
+    println!("temp root: {root:?}");
+
+    for (i, &(name, note, creatable)) in WEIRD_NAMES.iter().enumerate() {
+        for (tag, prefix) in [("plain", ""), ("verbatim", r"\\?\")] {
+            let case_dir = format!(r"{root}\case{i}_{tag}");
+            if let Err(e) = std::fs::create_dir(&case_dir) {
+                failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
+                continue;
+            }
+            let target = format!(r"{prefix}{case_dir}\{name}");
+            println!("--- create {target:?}  ({note}, {tag} spelling)");
+            let written = std::fs::write(&target, b"probe");
+            let created = written.is_ok();
+            if !prefix.is_empty() {
+                let code = written.as_ref().err().and_then(std::io::Error::raw_os_error);
+                let fact = if creatable {
+                    format!("{name:?} can be created through the verbatim spelling")
+                } else {
+                    format!(
+                        "{name:?} fails ERROR_INVALID_NAME ({ERROR_INVALID_NAME}) even through the verbatim spelling"
+                    )
+                };
+                facts.check(
+                    if creatable {
+                        created
+                    } else {
+                        code == Some(ERROR_INVALID_NAME)
+                    },
+                    &fact,
+                    outcome(&written),
+                );
+            }
+            println!("  write: {}", outcome(&written));
+
+            // Everything below is what the platform says about whatever that write produced —
+            // including nothing, which is itself an answer.
+            match full_path_name_parts(&target) {
+                Ok((resolved, part)) => {
+                    let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
+                    println!("  GetFullPathNameW -> {resolved:?}  file_part={part}");
+                }
+                Err(why) => failures.push(why),
+            }
+            match listing(&format!(r"\\?\{case_dir}")) {
+                Ok(names) => println!("  listing: {names:?}"),
+                Err(why) => failures.push(why),
+            }
+            let plain_back = format!(r"{case_dir}\{name}");
+            let verbatim_back = format!(r"\\?\{case_dir}\{name}");
+            println!(
+                "  open as plain    {plain_back:?}: {}",
+                outcome(&std::fs::File::open(&plain_back))
+            );
+            let reopened = std::fs::File::open(&verbatim_back);
+            println!("  open as verbatim {verbatim_back:?}: {}", outcome(&reopened));
+            if created && !prefix.is_empty() {
+                facts.check(
+                    reopened.is_ok(),
+                    &format!("{name:?}, created verbatim, opens back through the verbatim spelling"),
+                    outcome(&reopened),
+                );
+            }
+            // Remove through the verbatim spelling, the only one guaranteed to name the literal
+            // entry. A failure here leaves the ephemeral runner to clean up, but say so.
+            if created {
+                if let Err(e) = std::fs::remove_file(&verbatim_back) {
+                    println!("  CLEANUP: {verbatim_back:?} could not be removed: {e}");
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Canary: an image under a verbatim dots-and-spaces name LOADS through `std::process`.
+///
+/// This is what makes accepting those names in `verbatim_refusal` a choice with a cost: refusing
+/// them would refuse a loadable executable. `std::process` is the route cosca takes, so it is the
+/// one asserted; raw `CreateProcessW` and both plain spellings are printed alongside.
+///
+/// A copy of this crate's own `cosca_testbin` under each name. `argv0-report` makes the child name
+/// the image the loader actually mapped, so a spawn that ran a DIFFERENT file shows in the log.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
+    let source = env!("CARGO_BIN_EXE_cosca_testbin");
+    println!("temp root: {root:?}\nsource image: {source:?}");
+    let mut spawnable = 0usize;
+
+    for (i, &(name, note, creatable)) in WEIRD_NAMES.iter().enumerate() {
+        let case_dir = format!(r"{root}\case{i}");
+        if let Err(e) = std::fs::create_dir(&case_dir) {
+            failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
+            continue;
+        }
+        let verbatim = format!(r"\\?\{case_dir}\{name}");
+        let plain = format!(r"{case_dir}\{name}");
+        println!("--- {verbatim:?}  ({note})");
+        match std::fs::copy(source, &verbatim) {
+            Ok(_) => {}
+            Err(e) => {
+                // Not a missing measurement: a name that cannot hold an image answers the
+                // question for that name. [`only_dot_and_dotdot_are_refused_as_verbatim_file_names`]
+                // owns which names those are.
+                facts.check(!creatable, &format!("an image can be copied to verbatim {name:?}"), &e);
+                println!(
+                    "  copy: FAILED: {e} (raw_os_error={:?}) — nothing to spawn",
+                    e.raw_os_error()
+                );
+                continue;
+            }
+        }
+        spawnable += 1;
+        for (tag, program) in [("verbatim", &verbatim), ("plain", &plain)] {
+            let out = format!(r"\\?\{case_dir}\out_{tag}.txt");
+            match create_process(program, &out) {
+                Ok((code, captured)) => println!(
+                    "  CreateProcessW as {tag} {program:?}: ran, exit={code}, child said {:?}",
+                    captured.trim()
+                ),
+                Err(why) => println!("  CreateProcessW as {tag} {program:?}: {why}"),
+            }
+            // std::process is the route cosca actually takes, and it resolves the program itself
+            // before calling CreateProcessW — so it can disagree with the line above.
+            let ran = std::process::Command::new(program).arg("argv0-report").output();
+            match &ran {
+                Ok(o) => println!(
+                    "  std::process as {tag} {program:?}: ran, {:?}, child said {:?}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout).trim()
+                ),
+                Err(e) => println!(
+                    "  std::process as {tag} {program:?}: FAILED: {e} (raw_os_error={:?})",
+                    e.raw_os_error()
+                ),
+            }
+            if tag == "verbatim" {
+                facts.check(
+                    ran.as_ref().is_ok_and(|o| o.status.success()),
+                    &format!("std::process runs the image at verbatim {name:?}"),
+                    ran.as_ref()
+                        .map_or_else(|e| e.to_string(), |o| format!("{:?}", o.status)),
+                );
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&verbatim) {
+            println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
+        }
+    }
+    println!("names that could hold an image: {spawnable} of {}", WEIRD_NAMES.len());
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Canary: a plain `x.bat.` or `x.bat ` IS `x.bat`, while a verbatim one is a distinct file.
+///
+/// The first half is why the gate trims trailing dots and spaces off a plain final component
+/// before testing its extension: `GetFullPathNameW` hands std `…\x.bat`, which std then runs
+/// through `cmd.exe`. The second is why `verbatim_refusal` does not: under the prefix `x.bat.` is
+/// a file of its own, and std tests the verbatim string as given.
+///
+/// Each file holds its own name, so reading a spelling back says exactly which entry it reached.
+/// **Nothing here is executed**: the files are text, not images.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
+    const LOOKALIKES: &[&str] = &["x.bat.", "x.bat ", "x.bat"];
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::default();
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().to_str().expect("temp path is not UTF-8").to_string();
+    println!("temp dir: {dir:?}");
+
+    for name in LOOKALIKES {
+        let verbatim = format!(r"\\?\{dir}\{name}");
+        let written = std::fs::write(&verbatim, name.as_bytes());
+        println!("write {verbatim:?}: {}", outcome(&written));
+        if let Err(e) = written {
+            failures.push(format!("could not plant {verbatim:?}: {e}"));
+        }
+    }
+    match listing(&format!(r"\\?\{dir}")) {
+        Ok(names) => println!("listing: {names:?}"),
+        Err(why) => failures.push(why),
+    }
+    for name in LOOKALIKES {
+        println!("--- {name:?}");
+        for (verbatim, path) in [(false, format!(r"{dir}\{name}")), (true, format!(r"\\?\{dir}\{name}"))] {
+            let tag = if verbatim { "verbatim" } else { "plain   " };
+            match full_path_name(&path) {
+                // `std_has_bat_extension` is std's own `has_bat_extension` on the resolved name:
+                // true is what makes `std::process` swap in cmd.exe for a plain path.
+                Ok(resolved) => {
+                    println!(
+                        "  {tag} GetFullPathNameW -> {resolved:?}  std_has_bat_extension={}",
+                        has_bat_extension(&resolved)
+                    );
+                    if !verbatim {
+                        let want = format!(r"{dir}\x.bat");
+                        facts.check(
+                            resolved == want,
+                            &format!("plain {name:?} resolves to {want:?}"),
+                            format_args!("{resolved:?}"),
+                        );
+                    }
+                }
+                Err(why) => failures.push(why),
+            }
+            let body = std::fs::read_to_string(&path);
+            match &body {
+                Ok(body) => println!("  {tag} reads the file named {body:?}"),
+                Err(e) => println!("  {tag} read FAILED: {e} (raw_os_error={:?})", e.raw_os_error()),
+            }
+            let want = if verbatim { *name } else { "x.bat" };
+            facts.check(
+                body.as_deref().is_ok_and(|b| b == want),
+                &format!("{} {name:?} opens the file {want:?}", tag.trim_end()),
+                format_args!("{body:?}"),
+            );
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Segment shapes for [`which_segment_positions_get_trimmed`]. Every one is an ORDINARY name — `x`
+/// with something trailing — or a named control, so "was this segment trimmed?" has an
+/// unambiguous answer wherever it sits.
+const SEGMENTS: &[(&str, &str)] = &[
+    ("x", "control: nothing to trim"),
+    (".x", "control: the period is LEADING, not trailing"),
+    ("x.", "one trailing period"),
+    ("x..", "two trailing periods"),
+    (
+        "x...",
+        "three trailing periods — is the exemption about the segment or its position?",
+    ),
+    ("x....", "four trailing periods"),
+    ("x ", "one trailing space"),
+    ("x  ", "two trailing spaces"),
+    ("x. ", "period then space"),
+    ("x .", "space then period"),
+    (
+        "...",
+        "nothing but three periods: the documented exemption, for comparison",
+    ),
+    (".. .", "trims to `..` if trimmed at all"),
+];
+
+/// The positions a segment can occupy, as templates over `{root}` and `{seg}`.
+const POSITIONS: &[(&str, &str)] = &[
+    ("final, no sep", r"{root}\{seg}"),
+    ("final, +sep  ", r"{root}\{seg}\"),
+    ("interior x1  ", r"{root}\{seg}\z.exe"),
+    ("interior x2  ", r"{root}\{seg}\mid\z.exe"),
+];
+
+fn build(shape: &str, root: &str, seg: &str) -> String {
+    shape.replace("{root}", root).replace("{seg}", seg)
+}
+
+/// Survey: which SEGMENT POSITIONS does `GetFullPathNameW` trim, and does the root's existence
+/// change the answer?
+///
+/// The gate reads only the final component, so it does not depend on the interior rule this maps.
+///
+/// Each case is also run under two sibling roots of EQUAL length, one created on disk and one not,
+/// so "does the directory have to exist?" is settled by comparing two strings rather than by
+/// trusting the documentation's claim that this is pure string manipulation.
+#[test]
+#[ignore = "platform survey: needs a Windows runner; prints a measurement rather than asserting"]
+fn which_segment_positions_get_trimmed() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = tmp.path().to_str().expect("temp path is not UTF-8").to_string();
+    assert!(
+        !tmp.contains(r"\edir") && !tmp.contains(r"\ndir"),
+        "the temp root {tmp:?} already contains one of the substitution tokens, so the \
+         existing-versus-missing comparison below would be meaningless"
+    );
+    let root_e = format!(r"{tmp}\edir");
+    let root_n = format!(r"{tmp}\ndir");
+    std::fs::create_dir(&root_e).expect("create the root that exists");
+
+    report_roots(&[r"C:\dir", root_e.as_str(), root_n.as_str()]);
+    println!(
+        "each row resolves under {:?}; `root-existence` re-runs the SAME shape under {root_e:?} \
+         (created) and {root_n:?} (never created) and compares them after mapping one name onto \
+         the other",
+        r"C:\dir"
+    );
+
+    for (seg, note) in SEGMENTS {
+        println!("--- segment {seg:?}  ({note})");
+        for (position, shape) in POSITIONS {
+            for (spelling, prefix) in [("plain   ", ""), ("verbatim", r"\\?\")] {
+                let input = format!("{prefix}{}", build(shape, r"C:\dir", seg));
+                match full_path_name_parts(&input) {
+                    Ok((resolved, part)) => {
+                        let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
+                        let verdict = if resolved == input { "unchanged" } else { "REWRITTEN" };
+                        let existence = match cross_root(prefix, shape, seg, &root_e, &root_n) {
+                            Ok(v) => v,
+                            Err(why) => {
+                                failures.push(why);
+                                continue;
+                            }
+                        };
+                        println!(
+                            "  {position} {spelling} {input:?} -> {resolved:?}  file_part={part}  \
+                             [{verdict}]  root-existence: {existence}"
+                        );
+                    }
+                    Err(why) => failures.push(why),
+                }
+            }
+        }
+    }
+
+    // Relative shapes resolve against the working directory rather than a drive root, which is a
+    // third position again.
+    println!("--- relative shapes");
+    match std::env::current_dir() {
+        Ok(cwd) => println!(
+            "  resolved against the CWD {cwd:?}; `x.bat` there exists={}",
+            cwd.join("x.bat").exists()
+        ),
+        Err(e) => failures.push(format!(
+            "could not read the working directory these resolve against: {e}"
+        )),
+    }
+    for input in [
+        r"x.bat\y.\z.exe",
+        r"x.bat\y. \z.exe",
+        r"x.bat\y...\z.exe",
+        r"x.bat\y.",
+        r"x.bat\y. ",
+        r"x.bat\y...",
+        r"x.bat\y.\",
+        r"x.bat\y. \",
+        r"x.bat\y...\",
+    ] {
+        match full_path_name_parts(input) {
+            Ok((resolved, part)) => {
+                let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
+                println!("  {input:?} -> {resolved:?}  file_part={part}");
+            }
+            Err(why) => failures.push(why),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+}
+
+/// The same shape resolved under a root that exists and a root that does not, compared after
+/// mapping the missing root's name onto the existing one.
+///
+/// The two roots are siblings of equal length, so the mapping is a plain substring replacement and
+/// cannot itself introduce a difference. A case that pops above both roots produces text mentioning
+/// neither, which compares equal without any mapping at all — also correct.
+fn cross_root(prefix: &str, shape: &str, seg: &str, root_e: &str, root_n: &str) -> Result<String, String> {
+    let existing = full_path_name(&format!("{prefix}{}", build(shape, root_e, seg)))?;
+    let missing = full_path_name(&format!("{prefix}{}", build(shape, root_n, seg)))?;
+    if missing.replace(root_n, root_e) == existing {
+        Ok("identical".to_string())
+    } else {
+        Ok(format!("DIFFERS — exists: {existing:?}, missing: {missing:?}"))
+    }
+}
+
+/// Survey: is `\\?\C:\dir\..` -> `\\?\C:` a Win32 answer or a probe artefact?
+///
+/// It is the only result of [`a_final_dots_and_spaces_component_is_stripped_even_verbatim`] that
+/// is not a usable path — no trailing separator, and drive-relative under a prefix whose whole
+/// point is that nothing is relative. A trimmed `String` cannot say
+/// whether Win32 produced that or the probe cut it short, so this reports the raw UTF-16 units,
+/// the length Win32 returned, an independent size query, and where `lpFilePart` lands in the
+/// buffer.
+#[test]
+#[ignore = "platform survey: needs a Windows runner; prints a measurement rather than asserting"]
+fn the_verbatim_parent_result_is_raw_or_truncated() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    report_roots(&[r"C:\dir", r"C:\"]);
+    for (input, note) in [
+        (
+            r"\\?\C:\dir\..",
+            "the suspect: resolves to \"\\\\?\\C:\" with file_part \"C:\"",
+        ),
+        (
+            r"\\?\C:\dir\..\",
+            "the same input with a trailing separator, which resolves normally",
+        ),
+        (r"C:\dir\..", "control: the plain spelling of the suspect"),
+        (r"\\?\C:\dir\x", "control: an ordinary name comes back whole"),
+        (r"\\?\C:\..", "one level further up than the suspect"),
+    ] {
+        println!("--- {input:?}  ({note})");
+        match full_path_name_raw(input) {
+            Ok(report) => print!("{report}"),
+            Err(why) => failures.push(why),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+}
+
+/// Survey: `x<sp>`, start to finish, in ONE directory.
+///
+/// [`only_dot_and_dotdot_are_refused_as_verbatim_file_names`] gives each spelling its own
+/// directory; here every step touches the same one and says so, so the plain and verbatim `x<sp>`
+/// can be seen coexisting.
+#[test]
+#[ignore = "platform survey: needs a Windows runner; prints a measurement rather than asserting"]
+fn x_space_measured_in_a_single_directory() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().to_str().expect("temp path is not UTF-8").to_string();
+    println!("THE ONE DIRECTORY. Every step below reads or writes inside {dir:?} and nowhere else.");
+
+    let spellings = [
+        ("plain    x<sp>", format!(r"{dir}\x ")),
+        ("verbatim x<sp>", format!(r"\\?\{dir}\x ")),
+        ("plain    x", format!(r"{dir}\x")),
+        ("verbatim x", format!(r"\\?\{dir}\x")),
+    ];
+    let verbatim_dir = format!(r"\\?\{dir}");
+
+    let show_dir = |label: &str, failures: &mut Vec<String>| match listing(&verbatim_dir) {
+        Ok(names) => println!("  listing of {dir:?} {label}: {names:?}"),
+        Err(why) => failures.push(why),
+    };
+    let read_back = |label: &str| {
+        println!("  reading every spelling {label}:");
+        for (tag, path) in &spellings {
+            match std::fs::read_to_string(path) {
+                Ok(body) => println!("    {tag} {path:?} -> reads the file written as {body:?}"),
+                Err(e) => println!(
+                    "    {tag} {path:?} -> FAILED: {e} (raw_os_error={:?})",
+                    e.raw_os_error()
+                ),
+            }
+        }
+    };
+
+    println!("step 1: the directory starts empty");
+    show_dir("at step 1", &mut failures);
+
+    println!(r"step 2: create through the PLAIN spelling {:?}", spellings[0].1);
+    println!("  write: {}", outcome(&std::fs::write(&spellings[0].1, b"plain x<sp>")));
+    show_dir("after step 2", &mut failures);
+    read_back("after step 2");
+
+    println!(r"step 3: create through the VERBATIM spelling {:?}", spellings[1].1);
+    println!(
+        "  write: {}",
+        outcome(&std::fs::write(&spellings[1].1, b"verbatim x<sp>"))
+    );
+    show_dir("after step 3", &mut failures);
+    read_back("after step 3");
+
+    println!("step 4: what GetFullPathNameW makes of each spelling, with the files now on disk");
+    for (tag, path) in &spellings {
+        match full_path_name_parts(path) {
+            Ok((resolved, part)) => {
+                let part = part.map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
+                println!("  {tag} {path:?} -> {resolved:?}  file_part={part}");
+            }
+            Err(why) => failures.push(why),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+}
+
+/// `CreateProcessW(lpApplicationName = program)` running `argv0-report`, with stdout captured to
+/// `out_path`. `Err` is a spawn that did not happen, rendered with its Win32 error.
+fn create_process(program: &str, out_path: &str) -> Result<(u32, String), String> {
+    use std::os::windows::io::AsRawHandle;
+
+    let file = std::fs::File::create(out_path).map_err(|e| format!("could not open the capture file: {e}"))?;
+    let handle = HANDLE(file.as_raw_handle());
+    // SAFETY: `handle` is a live handle owned by `file` for the whole call.
+    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .map_err(|e| format!("could not make the capture handle inheritable: {e}"))?;
+
+    let program_w = wide(program);
+    let mut cmdline_w = wide(&format!("\"{program}\" argv0-report"));
+    let si = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdOutput: handle,
+        hStdError: handle,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    // SAFETY: both wide buffers are nul-terminated and outlive the call; `cmdline_w` is writable,
+    // as CreateProcessW requires; `si` and `pi` are live and correctly sized.
+    let spawned = unsafe {
+        CreateProcessW(
+            PCWSTR(program_w.as_ptr()),
+            Some(PWSTR(cmdline_w.as_mut_ptr())),
+            None,
+            None,
+            true,
+            CREATE_NO_WINDOW,
+            None,
+            None,
+            &si,
+            &mut pi,
+        )
+    };
+    if let Err(e) = spawned {
+        return Err(format!("did not spawn: {e} (HRESULT {:#010x})", e.code().0));
+    }
+
+    // SAFETY: `pi.hProcess` is the live handle CreateProcessW just handed us. INFINITE is not a
+    // chosen timeout — the child is this crate's own testbin and exits on its own.
+    unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+    let mut code = 0u32;
+    // SAFETY: the process has exited and `code` is a live out-parameter.
+    let got_code = unsafe { GetExitCodeProcess(pi.hProcess, &mut code) };
+    // SAFETY: both handles are owned by us and not used again.
+    unsafe {
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+    }
+    got_code.map_err(|e| format!("GetExitCodeProcess failed: {e}"))?;
+
+    drop(file);
+    let captured = std::fs::read_to_string(out_path).map_err(|e| format!("could not read the capture file: {e}"))?;
+    Ok((code, captured))
+}
