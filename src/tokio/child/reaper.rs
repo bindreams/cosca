@@ -31,9 +31,12 @@
 //!
 //! **At the bound, jobs queue rather than being released.** A queued job pins the process
 //! handle (or, on Unix, the zombie and its pid), the containment resource — a cgroup leaf, a
-//! job-object handle, or the marker fds — and the pipe and stdio handles. That is still the
-//! better trade: every worker being wedged means the reap could not have completed anyway, and
-//! the runtime's orphan handling would not have managed it either. Process exit with jobs still
+//! job-object handle, or the marker fds — and the pipe and stdio handles. A worker is wedged either
+//! on a root that will not exit, which no other thread could reap sooner, or, after the reap, on a
+//! cgroup leaf's drain: its release waits for the tree to be gone, which only a member stuck in
+//! uninterruptible I/O (D state) can delay. Such a worker holds up every job queued behind it.
+//! That is still the better trade than releasing those jobs, whose own releases would wait the
+//! same way on whichever thread ran them. Process exit with jobs still
 //! queued is benign, since the roots are already signalled and the OS reaps them.
 //!
 //! **Known limitation: this pool is not fork-safe.** `fork` duplicates only the calling thread,

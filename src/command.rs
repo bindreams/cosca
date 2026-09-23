@@ -490,7 +490,7 @@ impl Command {
     /// destructor is not something the caller can await or cancel — and hands the wait to reaper
     /// threads of its own, so the reap happens later and off this thread. Its cgroup leaf's wait
     /// happens there too, unless the drop releases the handle on the dropping thread: for a root
-    /// already reaped, or one it could not signal.
+    /// already reaped, one it could not signal, or when no reaper thread could be started.
     ///
     /// The async reap is **not** unconditional: a host too thread-starved to start the pool falls
     /// back to the runtime's orphan handling, and a process that forks without `exec` loses it
