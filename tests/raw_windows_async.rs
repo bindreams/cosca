@@ -86,7 +86,7 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
-    child.wait().await.unwrap();
+    assert!(child.wait().await.unwrap().success());
     assert_eq!(s, "argv-only-fd3");
 }
 
@@ -112,7 +112,7 @@ async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
-    child.wait().await.unwrap();
+    assert!(child.wait().await.unwrap().success());
     assert_eq!(s, "commandline-only-fd3");
 }
 

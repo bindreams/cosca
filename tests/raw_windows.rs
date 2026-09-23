@@ -358,7 +358,7 @@ fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut child = c.spawn().expect("raw spawn via the argv-only + fd>=3 route");
     let mut s = String::new();
     std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
-    child.wait().unwrap();
+    assert!(child.wait().unwrap().success());
     assert_eq!(s, "argv-only-fd3");
 }
 
@@ -384,7 +384,7 @@ fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut child = c.spawn().expect("raw spawn via the commandline + fd>=3 route");
     let mut s = String::new();
     std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
-    child.wait().unwrap();
+    assert!(child.wait().unwrap().success());
     assert_eq!(s, "commandline-only-fd3");
 }
 
