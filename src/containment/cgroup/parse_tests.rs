@@ -1,7 +1,7 @@
 // Pure-parser tests for cgroup v2 path detection and cgroup.events.
 // These run on any host (including Windows) with synthetic inputs — no filesystem access.
 
-use crate::containment::cgroup::{parse_populated, parse_proc_stat_state, parse_v2_relative_path};
+use crate::containment::cgroup::{mounted_on_cgroup, parse_populated, parse_proc_stat_state, parse_v2_relative_path};
 
 // parse_v2_relative_path tests =====
 
@@ -175,4 +175,48 @@ fn a_cgroup_path_is_inside_a_leaf_only_at_or_under_its_own_path() {
         crate::containment::cgroup::is_at_or_under("/cosca-7-0/x", "/cosca-7-0"),
         "a leaf under the root cgroup"
     );
+}
+
+// mounted_on_cgroup tests =====
+
+const CGROUP_MOUNT: &str = "1664 1663 0:27 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup rw,nsdelegate\n";
+
+/// A mount on the leaf, through the one cgroup2 mount.
+#[test]
+fn a_mount_on_the_leaf_is_found() {
+    let info = format!("{CGROUP_MOUNT}1700 1664 0:90 / /sys/fs/cgroup/ci/cosca-1-0 rw - tmpfs tmpfs rw\n");
+    assert!(mounted_on_cgroup(&info, "/ci/cosca-1-0"));
+}
+
+/// The same leaf reached through a second cgroup2 mount elsewhere, whose own root is a subtree.
+#[test]
+fn a_mount_on_the_leaf_through_another_cgroup_mount_is_found() {
+    let info = format!(
+        "{CGROUP_MOUNT}1680 1 0:27 /ci /mnt/cg rw - cgroup2 cgroup rw\n1700 1680 0:90 / /mnt/cg/cosca-1-0 rw - tmpfs tmpfs rw\n"
+    );
+    assert!(mounted_on_cgroup(&info, "/ci/cosca-1-0"));
+}
+
+/// Mounts on the parent, on a sibling, or on a name that only starts like the leaf's are not on it.
+#[test]
+fn a_mount_elsewhere_is_not_on_the_leaf() {
+    let info = format!(
+        "{CGROUP_MOUNT}1700 1664 0:90 / /sys/fs/cgroup/ci rw - tmpfs tmpfs rw\n\
+         1701 1664 0:91 / /sys/fs/cgroup/ci/cosca-1-00 rw - tmpfs tmpfs rw\n"
+    );
+    assert!(!mounted_on_cgroup(&info, "/ci/cosca-1-0"));
+}
+
+/// A mount whose parent is not a cgroup2 mount is on some other filesystem.
+#[test]
+fn a_mount_on_another_filesystem_is_not_on_the_leaf() {
+    let info = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n1700 1 0:90 / /ci/cosca-1-0 rw - tmpfs tmpfs rw\n";
+    assert!(!mounted_on_cgroup(info, "/ci/cosca-1-0"));
+}
+
+/// Mount points are octal-escaped in mountinfo: a space is `\040`.
+#[test]
+fn an_escaped_mount_point_is_unescaped() {
+    let info = format!("{CGROUP_MOUNT}1700 1664 0:90 / /sys/fs/cgroup/a\\040b/cosca-1-0 rw - tmpfs tmpfs rw\n");
+    assert!(mounted_on_cgroup(&info, "/a b/cosca-1-0"));
 }

@@ -164,3 +164,16 @@ impl FakeLeaf {
         Ok(())
     }
 }
+
+/// Remove a real leaf once it drains, for a test's cleanup after a failure. Blocks on the leaf's
+/// own drain watch.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.to_path_buf());
+    leaf.wait_drained(None).expect("wait for the drain");
+    match std::fs::remove_dir(leaf_path) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(e) => panic!("remove the leaf: {e}"),
+    }
+}

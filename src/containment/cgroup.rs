@@ -85,6 +85,12 @@ mod channel;
 pub(crate) use channel::*;
 
 #[cfg(target_os = "linux")]
+#[path = "cgroup/dir.rs"]
+mod dir;
+#[cfg(target_os = "linux")]
+pub(crate) use dir::*;
+
+#[cfg(target_os = "linux")]
 #[path = "cgroup/drain.rs"]
 mod drain;
 #[cfg(target_os = "linux")]

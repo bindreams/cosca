@@ -339,11 +339,12 @@ fn every_degrade_reason_has_its_own_kind() {
         | DegradeKind::CheckKill
         | DegradeKind::OpenProcs
         | DegradeKind::OpenReportChannel
+        | DegradeKind::WatchDrain
         | DegradeKind::PidfdUnavailable
         | DegradeKind::PlacementNotReported
         | DegradeKind::PlacementWriteFailed => (),
     };
-    const KINDS: usize = 10;
+    const KINDS: usize = 11;
 
     let reasons: Vec<Box<dyn DegradeReason>> = vec![
         Box::new(LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13))),
@@ -369,6 +370,10 @@ fn every_degrade_reason_has_its_own_kind() {
         Box::new(LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(
             libc::EMFILE,
         ))),
+        Box::new(LeafError::WatchDrain {
+            path: PathBuf::from("/cg/leaf/cgroup.events"),
+            source: std::io::Error::from_raw_os_error(libc::EMFILE),
+        }),
         Box::new(NotPlaced::Absent {
             pid: 1,
             path: PathBuf::from("/cg/leaf/cgroup.procs"),

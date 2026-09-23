@@ -361,17 +361,12 @@ async fn cgroup_wait_tree_drained(
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
 
-    use crate::containment::cgroup::DrainWatch;
     use crate::containment::TreeDrain;
 
-    let Some(watch) = DrainWatch::arm(leaf.path())? else {
+    let Some(watch) = leaf.drain_watch()? else {
         return Ok(TreeDrain::AllMembersExited);
     };
-    let interest = if watch.readiness() == rustix::event::PollFlags::PRI {
-        Interest::PRIORITY
-    } else {
-        Interest::READABLE
-    };
+    let interest = Interest::READABLE;
     let mut afd = AsyncFd::with_interest(watch, interest).map_err(Error::Io)?;
     loop {
         if !afd.get_mut().populated()? {

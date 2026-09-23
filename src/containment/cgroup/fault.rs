@@ -26,11 +26,22 @@ thread_local! {
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
 type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+
+/// Make the NEXT leaf creation's `cgroup.kill` lookup on this thread fail with `errno`: a lookup
+/// through the held leaf directory fails only on a real error, which a temp directory cannot
+/// produce. Take semantics.
+pub(crate) fn set_force_kill_check_errno(errno: i32) {
+    FORCE_KILL_CHECK_ERRNO.with(|f| f.set(Some(errno)));
+}
+pub(crate) fn take_force_kill_check_errno() -> Option<i32> {
+    FORCE_KILL_CHECK_ERRNO.with(|f| f.take())
+}
 
 /// Make the NEXT drain watch on this thread fail to create its inotify instance, as
 /// `fs.inotify.max_user_instances` would. Take semantics: assert [`take_force_inotify_failure`]

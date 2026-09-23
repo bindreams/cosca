@@ -12,24 +12,21 @@
 //! So the watch is one inotify instance holding two watches, both armed before the first read:
 //! `IN_MODIFY` on `cgroup.events`, which the kernel's notification work delivers once it runs
 //! (`kernfs_notify_workfn`; the watch keeps the file's inode cached, which that work needs), and
-//! `IN_DELETE` on the parent, for the leaf's own name.
+//! `IN_DELETE` on the parent, for the leaf's own name. Both bind to the held inodes, through
+//! `/proc/self/fd`, never to a path a mount could redirect.
 //!
-//! Creating an inotify instance can fail (`EMFILE` at `fs.inotify.max_user_instances`, 128 per
-//! user by default), as can adding a watch (`ENOSPC`). The watch then falls back to `POLLPRI` on
-//! `cgroup.events`, which is what the kernel offers without inotify. It never strands a leaf: it
-//! wakes on every notification that is delivered. It keeps the gap above: a third party removing
-//! the leaf within 10 ms of its previous notification leaves the wait blocked.
+//! An inotify instance counts against `fs.inotify.max_user_instances` (128 per user by default),
+//! and each watch against `fs.inotify.max_user_watches`. Arming one can therefore fail, and a
+//! failure is returned, never replaced by a weaker wait.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::path::Path;
 
-use rustix::event::PollFlags;
 use rustix::fs::inotify;
 
-use super::{read_populated, removed_after_drain};
+use super::{above_stdio, fd_path, read_populated, removed_after_drain, LeafDir};
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
@@ -37,43 +34,45 @@ use crate::error::Error;
 pub(crate) struct DrainWatch {
     /// The leaf's `cgroup.events`, read for `populated`.
     events: File,
-    wake: Wake,
+    /// The inotify instance: `IN_MODIFY` on `cgroup.events`, `IN_DELETE` on the parent.
+    fd: OwnedFd,
+    /// The parent's watch.
+    parent: i32,
+    /// The leaf's name in its parent.
+    name: OsString,
     /// Whether the leaf was seen removed.
     gone: bool,
     buf: String,
 }
 
-/// What wakes the wait.
-enum Wake {
-    /// `IN_MODIFY` on `cgroup.events`, and `IN_DELETE` of `name` on the parent.
-    Inotify { fd: OwnedFd, parent: i32, name: OsString },
-    /// No inotify: `POLLPRI` on `cgroup.events`.
-    Priority,
-}
-
 impl DrainWatch {
-    /// Arm a watch on the leaf at `leaf`, before anything is read. `None`: the leaf is already gone.
-    pub(crate) fn arm(leaf: &Path) -> Result<Option<DrainWatch>, Error> {
-        let events_path = leaf.join("cgroup.events");
-        let wake = match Wake::inotify(leaf, &events_path) {
-            Ok(Some(wake)) => wake,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                log::debug!(
-                    "cgroup leaf {}: no inotify watch ({e}); waiting on cgroup.events alone",
-                    leaf.display()
-                );
-                Wake::Priority
-            }
-        };
-        let events = match File::open(&events_path) {
-            Ok(f) => f,
+    /// Arm a watch on the leaf `dir`, before anything is read. `None`: the leaf is already gone.
+    pub(crate) fn arm(dir: &LeafDir) -> io::Result<Option<DrainWatch>> {
+        let events = match dir.open("cgroup.events", rustix::fs::OFlags::RDONLY) {
+            Ok(fd) => File::from(above_stdio(fd)?),
             Err(e) if removed_after_drain(&e) => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => return Err(e),
         };
+        #[cfg(test)]
+        if super::fault::take_force_inotify_failure() {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        let fd = above_stdio(inotify::init(
+            inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK,
+        )?)?;
+        let parent = inotify::add_watch(
+            &fd,
+            fd_path(dir.parent()),
+            inotify::WatchFlags::DELETE | inotify::WatchFlags::ONLYDIR,
+        )?;
+        inotify::add_watch(&fd, fd_path(events.as_fd()), inotify::WatchFlags::MODIFY)?;
+        // A removal between the open and the parent's watch is still seen: reads through `events`
+        // then fail with `ENODEV`.
         Ok(Some(DrainWatch {
             events,
-            wake,
+            fd,
+            parent,
+            name: dir.name().to_os_string(),
             gone: false,
             buf: String::new(),
         }))
@@ -87,29 +86,17 @@ impl DrainWatch {
         read_populated(&mut self.events, &mut self.buf)
     }
 
-    /// The readiness that means "look again" on [`as_raw_fd`](AsRawFd::as_raw_fd).
-    pub(crate) fn readiness(&self) -> PollFlags {
-        match self.wake {
-            Wake::Inotify { .. } => PollFlags::IN,
-            Wake::Priority => PollFlags::PRI,
-        }
-    }
-
-    /// Take in what made the fd ready, without blocking.
+    /// Take in what made the watch readable, without blocking.
     pub(crate) fn consume(&mut self) -> Result<(), Error> {
-        let Wake::Inotify { fd, parent, name } = &self.wake else {
-            // `populated`'s next read rearms kernfs's event count.
-            return Ok(());
-        };
         let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
-        let mut reader = inotify::Reader::new(fd, &mut buf);
+        let mut reader = inotify::Reader::new(&self.fd, &mut buf);
         loop {
             match reader.next() {
                 Ok(event) => {
                     let named_us = event
                         .file_name()
-                        .is_some_and(|n| n.to_bytes() == name.as_encoded_bytes());
-                    if event.wd() == *parent && event.events().contains(inotify::ReadFlags::DELETE) && named_us {
+                        .is_some_and(|n| n.to_bytes() == self.name.as_encoded_bytes());
+                    if event.wd() == self.parent && event.events().contains(inotify::ReadFlags::DELETE) && named_us {
                         self.gone = true;
                     }
                 }
@@ -123,7 +110,7 @@ impl DrainWatch {
     /// Block until the leaf drains or `deadline` passes (see [`crate::wait::remaining`]). No
     /// interval: each round is one `poll` for the caller's own remaining time.
     pub(crate) fn wait(&mut self, deadline: Option<Option<std::time::Instant>>) -> Result<TreeDrain, Error> {
-        use rustix::event::{poll, PollFd};
+        use rustix::event::{poll, PollFd, PollFlags};
 
         loop {
             if !self.populated()? {
@@ -139,7 +126,7 @@ impl DrainWatch {
             });
             #[cfg(test)]
             super::fault::notify_drain_blocking();
-            let mut fds = [PollFd::from_borrowed_fd(self.wait_fd(), self.readiness())];
+            let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
             match poll(&mut fds, ts.as_ref()) {
                 Ok(0) => return Ok(TreeDrain::MembersRemain),
                 Ok(_) => self.consume()?,
@@ -148,50 +135,16 @@ impl DrainWatch {
             }
         }
     }
-
-    fn wait_fd(&self) -> BorrowedFd<'_> {
-        match &self.wake {
-            Wake::Inotify { fd, .. } => fd.as_fd(),
-            Wake::Priority => self.events.as_fd(),
-        }
-    }
 }
 
 impl AsRawFd for DrainWatch {
     fn as_raw_fd(&self) -> RawFd {
-        self.wait_fd().as_raw_fd()
+        self.fd.as_raw_fd()
     }
 }
 
-impl Wake {
-    /// The inotify watch. `Ok(None)`: the leaf is already gone.
-    fn inotify(leaf: &Path, events_path: &Path) -> io::Result<Option<Wake>> {
-        #[cfg(test)]
-        if super::fault::take_force_inotify_failure() {
-            return Err(io::Error::from_raw_os_error(libc::EMFILE));
-        }
-        let (Some(parent_path), Some(name)) = (leaf.parent(), leaf.file_name()) else {
-            return Err(io::Error::other("a cgroup leaf path has a parent and a name"));
-        };
-        let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
-        let parent = match inotify::add_watch(
-            &fd,
-            parent_path,
-            inotify::WatchFlags::DELETE | inotify::WatchFlags::ONLYDIR,
-        ) {
-            Ok(wd) => wd,
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        match inotify::add_watch(&fd, events_path, inotify::WatchFlags::MODIFY) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
-        Ok(Some(Wake::Inotify {
-            fd,
-            parent,
-            name: name.to_os_string(),
-        }))
+impl AsFd for DrainWatch {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }

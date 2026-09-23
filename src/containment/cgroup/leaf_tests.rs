@@ -269,26 +269,15 @@ fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
 }
 
 /// A `cgroup.kill` the kernel cannot even look up is not a missing one: the errno is the
-/// diagnosis, and "the kernel is older than 5.14" would be a confident false cause.
-///
-/// The failing lookup is a path one component too long: the leaf itself fits in `PATH_MAX`,
-/// `<leaf>/cgroup.kill` does not, so the `stat` fails with `ENAMETOOLONG` for any uid.
+/// diagnosis, and "the kernel is older than 5.14" would be a confident false cause. The lookup is
+/// through the held leaf directory, where a temp directory yields only `ENOENT`, so the fault
+/// seam supplies the errno.
 #[cfg(target_os = "linux")]
 #[test]
 fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // The leaf is `<parent>/cosca-<pid>-<seq>`. Size `parent` so the leaf's length is 4084 plus
-    // the digits of `seq` — under PATH_MAX (4096, NUL included) for any seq below 10^11 — while
-    // the 12 bytes of "/cgroup.kill" push the lookup past it.
-    let pid_len = std::process::id().to_string().len();
-    let parent_len = 4084 - "/cosca-".len() - pid_len - "-".len();
-    let mut parent = dir.path().to_path_buf();
-    while parent.as_os_str().len() < parent_len {
-        let room = parent_len - parent.as_os_str().len() - 1;
-        parent.push("d".repeat(room.min(200)));
-    }
-    assert_eq!(parent.as_os_str().len(), parent_len, "the parent must be sized exactly");
-    std::fs::create_dir_all(&parent).expect("create the long parent");
+    let parent = dir.path().to_path_buf();
+    crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
 
     let err = match crate::containment::cgroup::create_leaf_under(&parent) {
         Err(e) => e,
@@ -298,7 +287,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
         matches!(err, LeafError::CheckKill { .. }),
         "expected CheckKill, got {err:?}"
     );
-    let reason = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).to_string();
+    let reason = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
     assert!(err.to_string().contains(&reason), "the errno is the diagnosis: {err}");
     let strays: Vec<_> = std::fs::read_dir(&parent)
         .expect("read the parent")
@@ -844,17 +833,16 @@ fn an_armed_drop_retries_an_rmdir_a_passing_child_cgroup_refused() {
 fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     assert_eq!(
-        super::remove_child_cgroups(&dir.path().join("cosca-gone")).expect("sweep"),
+        crate::containment::cgroup::LeafDir::open_for_test(&dir.path().join("cosca-gone"))
+            .remove_children()
+            .expect("sweep"),
         0
     );
 }
 
-/// Without an inotify instance — `fs.inotify.max_user_instances` reached — an armed `Drop` still
-/// waits for a real leaf to drain and removes it.
+/// A real leaf whose one member, a `sleep`, entered it. For the lane tests.
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-fn cgroup_an_armed_drop_without_inotify_still_removes_its_leaf() {
+fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process::Child) {
     use std::os::unix::process::CommandExt;
 
     assert!(
@@ -862,7 +850,6 @@ fn cgroup_an_armed_drop_without_inotify_still_removes_its_leaf() {
         "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
     );
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
-    let leaf_path = leaf.leaf_path.clone();
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
     let mut cmd = std::process::Command::new("sleep");
     cmd.arg("300");
@@ -871,22 +858,157 @@ fn cgroup_an_armed_drop_without_inotify_still_removes_its_leaf() {
     unsafe {
         cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
     }
-    let mut member = cmd.spawn().expect("spawn a member");
+    let member = cmd.spawn().expect("spawn a member");
     leaf.take_placement(member.id())
         .expect("decidable")
         .expect("the member entered the leaf");
+    (leaf, member)
+}
+
+/// Drop `leaf` on a thread of its own mount namespace, private to it, with a tmpfs mounted over
+/// `over`, and return the levels of the records its `Drop` made about `marker`. The mount is
+/// gone with the thread.
+#[cfg(target_os = "linux")]
+fn drop_under_a_mount(
+    leaf: crate::containment::cgroup::CgroupLeaf,
+    over: std::path::PathBuf,
+    marker: String,
+) -> Vec<log::Level> {
+    crate::log_capture::install();
+    std::thread::spawn(move || {
+        use std::ffi::CString;
+
+        let c = |s: &str| CString::new(s).expect("no NUL");
+        let over = CString::new(over.into_os_string().into_encoded_bytes()).expect("no NUL");
+        // SAFETY: plain syscalls on valid NUL-terminated strings. `unshare` gives this thread
+        // alone a mount namespace; making it private first keeps every mount below in it.
+        unsafe {
+            assert_eq!(
+                libc::unshare(libc::CLONE_NEWNS),
+                0,
+                "unshare: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                libc::mount(
+                    std::ptr::null(),
+                    c("/").as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null()
+                ),
+                0,
+                "make / private: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                libc::mount(
+                    c("tmpfs").as_ptr(),
+                    over.as_ptr(),
+                    c("tmpfs").as_ptr(),
+                    0,
+                    std::ptr::null()
+                ),
+                0,
+                "mount a tmpfs: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mark = crate::log_capture::mark();
+        drop(leaf);
+        crate::log_capture::levels_since(mark, &marker)
+    })
+    .join()
+    .expect("the dropping thread")
+}
+
+/// A mount over the leaf itself: `rmdir` of its name fails `EBUSY` in the VFS, before cgroupfs is
+/// asked. `Drop` kills the real tree through the held leaf, and reports the leaf it cannot remove
+/// rather than retrying forever.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (leaf, mut member) = entered_real_leaf();
+    let leaf_path = leaf.leaf_path.clone();
+    let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+
+    let levels = drop_under_a_mount(leaf, leaf_path.clone(), name);
+    let status = member.wait().expect("reap the member");
+    // Outside the dropping thread's namespace nothing is mounted over the leaf.
+    std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");
+
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the real tree must be killed");
+    assert_eq!(levels, vec![log::Level::Warn], "the leaf left behind is reported, once");
+}
+
+/// A mount over the leaf's parent: the leaf's path finds nothing, which says nothing about the
+/// leaf. `Drop` kills, drains and removes the real leaf through the held directories.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
+    let (leaf, mut member) = entered_real_leaf();
+    let leaf_path = leaf.leaf_path.clone();
+    let parent = leaf_path.parent().expect("a parent").to_path_buf();
+    let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+
+    let levels = drop_under_a_mount(leaf, parent, name);
+    let removed = !leaf_path.exists();
+    if !removed {
+        member.kill().expect("kill the member");
+    }
+    member.wait().expect("reap the member");
+    if !removed {
+        crate::containment::cgroup::test_support::remove_drained_leaf(&leaf_path);
+    }
+
+    assert!(removed, "the real leaf must be killed through and removed");
+    assert!(
+        !levels.contains(&log::Level::Warn),
+        "nothing was left behind, got {levels:?}"
+    );
+}
+
+/// Without an inotify instance — `fs.inotify.max_user_instances` reached — no leaf is created:
+/// the spawn degrades as for any other failed step, rather than leaving a leaf whose teardown
+/// could not be watched. The half-made leaf is removed.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
+    );
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+    let own = std::path::Path::new("/sys/fs/cgroup").join(
+        own.lines()
+            .find_map(|l| l.strip_prefix("0::/"))
+            .expect("a unified line"),
+    );
+    let before: Vec<_> = std::fs::read_dir(&own)
+        .expect("list")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
 
     crate::containment::cgroup::fault::set_force_inotify_failure(true);
-    drop(leaf);
+    let result = crate::containment::cgroup::try_create_leaf();
     let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
-    member.wait().expect("reap the member");
+    let after: Vec<_> = std::fs::read_dir(&own)
+        .expect("list")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
 
-    assert!(consumed, "the drop must have tried, and failed, to watch");
-    assert!(
-        !leaf_path.exists(),
-        "the drop must not strand the leaf: {}",
-        leaf_path.display()
-    );
+    assert!(consumed, "the creation must have tried, and failed, to watch");
+    match result {
+        Err(LeafError::WatchDrain { source, .. }) => assert_eq!(source.raw_os_error(), Some(libc::EMFILE)),
+        Err(e) => panic!("expected WatchDrain, got {e:?}"),
+        Ok(_) => panic!("a leaf whose drain cannot be watched must not be created"),
+    }
+    assert_eq!(before, after, "the half-made leaf must be removed");
 }
 
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some

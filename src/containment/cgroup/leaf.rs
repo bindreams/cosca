@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
@@ -94,8 +94,14 @@ fn proc_state(pid: u32) -> Option<char> {
 /// [`disarm`](Self::disarm)ed.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
-    /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`.
+    /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`, for reports.
+    /// Nothing is done through it: see [`LeafDir`].
     pub(super) leaf_path: PathBuf,
+    /// The leaf's directory and its parent, held from creation.
+    dir: LeafDir,
+    /// The leaf's drain watch, held from creation so that its teardown never lacks one. `None`
+    /// only for a test leaf with no `cgroup.events`, which reads as drained.
+    watch: Option<DrainWatch>,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
     /// between `fork` and `exec`, and no program this process starts may inherit it. Numbered
     /// 3 or above, so it never shares a number with the child's stdio. `None` once the
@@ -156,16 +162,11 @@ impl CgroupLeaf {
         self.armed.store(false, Ordering::Relaxed);
     }
 
-    /// The leaf's directory, for the async drain wait.
-    #[cfg(feature = "tokio")]
+    /// The leaf's directory, for a test that must find this leaf and no other. Its one user is the
+    /// tokio spawn's post-fork failure seam.
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn path(&self) -> &Path {
         &self.leaf_path
-    }
-
-    /// The leaf's `cgroup.events` path.
-    #[cfg(test)]
-    fn events_path(&self) -> PathBuf {
-        self.leaf_path.join("cgroup.events")
     }
 
     /// Remove a leaf that holds nothing of its child's: close the fd and `rmdir`, never
@@ -216,7 +217,7 @@ impl CgroupLeaf {
         };
         let path = self.leaf_path.join("cgroup.procs");
         let child_state = proc_state(pid);
-        Ok(Err(match fs::read_to_string(&path) {
+        Ok(Err(match self.dir.read("cgroup.procs") {
             Ok(procs) => NotPlaced::Absent {
                 pid,
                 path,
@@ -394,8 +395,7 @@ impl CgroupLeaf {
                 .map_err(|e| format!("cgroup.kill failed ({e})"))
                 .and_then(|()| {
                     // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
-                    self.wait_drained(None)
-                        .map(drop)
+                    self.block_until_drained()
                         .map_err(|e| format!("cgroup.kill succeeded, but its drain could not be watched ({e})"))
                 })
         });
@@ -438,14 +438,14 @@ impl CgroupLeaf {
     fn rmdir_leaf(&self) -> io::Result<()> {
         #[cfg(test)]
         fault::record_leaf_step(|| {
-            let events = fs::read_to_string(self.events_path()).unwrap_or_default();
+            let events = self.dir.read("cgroup.events").unwrap_or_default();
             format!("rmdir {}", events.lines().next().unwrap_or("(no cgroup.events)"))
         });
         #[cfg(test)]
         if let Some(result) = fault::run_rmdir_hook(&self.leaf_path) {
             return result;
         }
-        fs::remove_dir(&self.leaf_path)
+        self.dir.rmdir()
     }
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
@@ -461,7 +461,7 @@ impl CgroupLeaf {
     /// `Child::kill_tree() -> Ok(())` over a live tree has been told the opposite of the truth.
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        match fs::write(&path, b"1") {
+        match self.dir.write("cgroup.kill", b"1") {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());
@@ -486,10 +486,39 @@ impl CgroupLeaf {
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        match DrainWatch::arm(&self.leaf_path)? {
+        match self.drain_watch()? {
             None => Ok(crate::containment::TreeDrain::AllMembersExited),
             Some(mut watch) => watch.wait(deadline),
         }
+    }
+
+    /// Arm a new [`DrainWatch`] on this leaf, for a caller's own wait. `None`: the leaf is
+    /// already gone.
+    pub(crate) fn drain_watch(&self) -> Result<Option<DrainWatch>, crate::error::Error> {
+        DrainWatch::arm(&self.dir).map_err(crate::error::Error::Io)
+    }
+
+    /// Block until the leaf drains, on the watch held since creation.
+    fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
+        match self.watch.as_mut() {
+            Some(watch) => watch.wait(None).map(drop),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether something is mounted on the leaf, in this thread's mount namespace: its name no
+    /// longer resolves to it from the held parent, or its mount table lists a mount on it through
+    /// any cgroup2 mount (a namespace entered since creation sees mounts the held descriptors do
+    /// not). `is_local_mountpoint` in `vfs_rmdir` asks the same of this namespace (kernel v6.12).
+    fn mounted_on(&self) -> io::Result<bool> {
+        if !self.dir.name_resolves_here()? {
+            return Ok(true);
+        }
+        let Some(cgroup_path) = &self.cgroup_path else {
+            return Ok(false);
+        };
+        let mountinfo = fs::read_to_string("/proc/thread-self/mountinfo")?;
+        Ok(mounted_on_cgroup(&mountinfo, cgroup_path))
     }
 
     /// SIGTERM every pid currently listed in `cgroup.procs`.
@@ -507,7 +536,7 @@ impl CgroupLeaf {
     /// only to `hard_kill` via `cgroup.kill`.
     pub(crate) fn terminate(&self) -> io::Result<()> {
         let path = self.leaf_path.join("cgroup.procs");
-        let content = match fs::read_to_string(&path) {
+        let content = match self.dir.read("cgroup.procs") {
             Ok(c) => c,
             Err(e) if removed_after_drain(&e) => {
                 log::debug!("cgroup terminate: leaf {} is already gone", path.display());
@@ -544,7 +573,10 @@ impl CgroupLeaf {
     /// `take_placement`, `Drop`) then runs for real against the kernel's own errnos, on any
     /// Linux host and without a cgroupfs. It has no `cgroup.procs` fd.
     pub(crate) fn for_test_at(leaf_path: PathBuf) -> CgroupLeaf {
+        let dir = LeafDir::open_for_test(&leaf_path);
         CgroupLeaf {
+            watch: DrainWatch::arm(&dir).expect("arm a test leaf's drain watch"),
+            dir,
             leaf_path,
             procs_fd: None,
             report: Some(ReportChannel::new().expect("open a placement-report channel")),
@@ -729,23 +761,47 @@ impl CgroupLeaf {
                 }
             }
             killed = false;
-            if let Err(e) = self.wait_drained(None) {
+            if let Err(e) = self.block_until_drained() {
                 return warn_leaf_left_behind(
                     &self.leaf_path,
                     format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
                 );
             }
-            if let Err(e) = remove_child_cgroups(&self.leaf_path) {
+            if let Err(e) = self.dir.remove_children() {
                 return warn_leaf_left_behind(
                     &self.leaf_path,
                     format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
                 );
             }
-            match self.rmdir_leaf() {
+            let busy = match self.rmdir_leaf() {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => e,
                 Err(e) => return warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
+            };
+            // cgroupfs's `EBUSY` means a member or a child cgroup. The VFS gives the same errno,
+            // before cgroupfs is asked, for a directory something is mounted on: no round can
+            // clear that, so it ends the loop. Every other `EBUSY` is cgroupfs's, and a new round
+            // kills, drains and sweeps the real leaf before the next `rmdir`.
+            match self.mounted_on() {
+                Ok(false) => {}
+                Ok(true) => {
+                    return warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                            "rmdir failed ({busy}) {context}; something is mounted on it, so it cannot be \
+                             removed; its tree was killed"
+                        ),
+                    )
+                }
+                Err(e) => {
+                    return warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                        "rmdir failed ({busy}) {context}; whether something is mounted on it could not be read ({e})"
+                    ),
+                    )
+                }
             }
         }
     }
@@ -758,7 +814,7 @@ impl CgroupLeaf {
             Err(e) if removed_after_drain(&e) => return,
             Err(e) => e,
         };
-        let why = match remove_child_cgroups(&self.leaf_path) {
+        let why = match self.dir.remove_children() {
             Ok(removed) if removed > 0 => match self.rmdir_leaf() {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
@@ -945,41 +1001,6 @@ fn reap_in_background(child: ChildId) {
     }
 }
 
-/// Remove every child cgroup under `dir`, deepest first, and count those removed. A child that
-/// `rmdir` refuses as busy — something re-entered it — is left for the caller's next kill. A
-/// directory already gone has nothing left to remove.
-#[cfg(target_os = "linux")]
-fn remove_child_cgroups(dir: &Path) -> io::Result<usize> {
-    let mut removed = 0;
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if removed_after_drain(&e) => return Ok(0),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) if removed_after_drain(&e) => return Ok(removed),
-            Err(e) => return Err(e),
-        };
-        // A cgroup's own interface files are files; its child cgroups are its directories.
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => {}
-            Ok(_) => continue,
-            Err(e) if removed_after_drain(&e) => continue,
-            Err(e) => return Err(e),
-        }
-        let child = entry.path();
-        removed += remove_child_cgroups(&child)?;
-        match fs::remove_dir(&child) {
-            Ok(()) => removed += 1,
-            Err(e) if removed_after_drain(&e) || e.raw_os_error() == Some(libc::EBUSY) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(removed)
-}
-
 /// Report a `cosca-*` leaf cosca failed to remove. Nothing revisits a leaf by name, so this
 /// record, made as it happens, is all a host accumulating them has to go on.
 #[cfg(target_os = "linux")]
@@ -1029,7 +1050,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     let leaf_name = format!("cosca-{}-{}", unsafe { libc::getpid() }, seq);
     let leaf_path = current.join(&leaf_name);
 
-    fs::create_dir(&leaf_path).map_err(|source| LeafError::CreateLeafDir {
+    let dir = LeafDir::create(current, &leaf_name).map_err(|source| LeafError::CreateLeafDir {
         path: leaf_path.clone(),
         source,
     })?;
@@ -1041,7 +1062,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         if fault::take_force_occupy_before_unwind() {
             fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
         }
-        if let Err(e) = fs::remove_dir(leaf_path) {
+        if let Err(e) = dir.rmdir() {
             if !removed_after_drain(&e) {
                 warn_leaf_left_behind(
                     leaf_path,
@@ -1056,14 +1077,21 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     // fails is not an absent file, and is reported with its own errno.
     let kill_path = leaf_path.join("cgroup.kill");
     // Test-only fault seam: treat the leaf as kill-capable (take semantics — see `fault`).
+    let kill_exists = || match rustix::fs::statat(dir.dir(), "cgroup.kill", rustix::fs::AtFlags::empty()) {
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(e) => Err(io::Error::from(e)),
+    };
     #[cfg(test)]
     let kill_supported = if fault::take_force_kill_supported() {
         Ok(true)
+    } else if let Some(errno) = fault::take_force_kill_check_errno() {
+        Err(io::Error::from_raw_os_error(errno))
     } else {
-        kill_path.try_exists()
+        kill_exists()
     };
     #[cfg(not(test))]
-    let kill_supported = kill_path.try_exists();
+    let kill_supported = kill_exists();
     match kill_supported {
         Ok(true) => {}
         Ok(false) => {
@@ -1101,9 +1129,8 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     // `dup2`s into place before any pre_exec runs: the placement write would land in the
     // caller's stdio target instead, and report a placement that never happened.
     let procs_path = leaf_path.join("cgroup.procs");
-    let procs_fd = OpenOptions::new()
-        .write(true)
-        .open(&procs_path)
+    let procs_fd = dir
+        .open("cgroup.procs", rustix::fs::OFlags::WRONLY)
         .and_then(|file| Ok(rustix::io::fcntl_dupfd_cloexec(&file, 3)?));
     let procs_fd = match procs_fd {
         Ok(fd) => fd,
@@ -1118,8 +1145,33 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         }
     };
 
+    // Armed now, so that no teardown of this leaf can later find itself without a watch.
+    let watch = match DrainWatch::arm(&dir) {
+        Ok(Some(watch)) => watch,
+        Ok(None) => {
+            return Err(fail(
+                &leaf_path,
+                LeafError::WatchDrain {
+                    path: leaf_path.join("cgroup.events"),
+                    source: io::Error::from_raw_os_error(libc::ENOENT),
+                },
+            ))
+        }
+        Err(source) => {
+            return Err(fail(
+                &leaf_path,
+                LeafError::WatchDrain {
+                    path: leaf_path.join("cgroup.events"),
+                    source,
+                },
+            ))
+        }
+    };
+
     Ok(CgroupLeaf {
         leaf_path,
+        dir,
+        watch: Some(watch),
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,

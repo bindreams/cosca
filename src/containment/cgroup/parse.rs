@@ -98,3 +98,74 @@ pub(crate) fn parse_proc_stat_state(stat: &str) -> Option<char> {
 #[cfg(test)]
 #[path = "parse_tests.rs"]
 mod parse_tests;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Whether `mountinfo` (a `/proc/<pid>/mountinfo`) lists a mount whose mount point is the cgroup
+/// at `cgroup_path` (as `/proc/<pid>/cgroup` prints it), through any cgroup2 mount it lists.
+///
+/// The VFS refuses to `rmdir` a directory something is mounted on, with the `EBUSY` cgroupfs uses
+/// for a busy cgroup. A mount point is identified by the mount it sits in and a path in that
+/// mount; a cgroup2 mount's own root field gives the cgroup it exposes.
+pub(crate) fn mounted_on_cgroup(mountinfo: &str, cgroup_path: &str) -> bool {
+    struct Mount {
+        id: u64,
+        parent: u64,
+        root: String,
+        point: String,
+        cgroup2: bool,
+    }
+    let mounts: Vec<Mount> = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let id = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let _dev = fields.next()?;
+            let root = unescape(fields.next()?);
+            let point = unescape(fields.next()?);
+            let fstype = fields.skip_while(|f| *f != "-").nth(1)?;
+            Some(Mount {
+                id,
+                parent,
+                root,
+                point,
+                cgroup2: fstype == "cgroup2",
+            })
+        })
+        .collect();
+    mounts.iter().any(|m| {
+        mounts.iter().filter(|p| p.cgroup2 && p.id == m.parent).any(|p| {
+            let Some(within) = m.point.strip_prefix(p.point.trim_end_matches('/')) else {
+                return false;
+            };
+            if !within.starts_with('/') {
+                return false;
+            }
+            format!("{}{within}", p.root.trim_end_matches('/')) == cgroup_path
+        })
+    })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Undo mountinfo's octal escapes (`\040` for a space, and so on).
+fn unescape(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        match (bytes[i], octal) {
+            (b'\\', Some(d)) => {
+                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                i += 4;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
