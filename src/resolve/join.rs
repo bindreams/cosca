@@ -1,8 +1,9 @@
 //! Joining Windows paths as Win32 reads them: by [`path_type`](super::path_type), never by
 //! `PathBuf::join`, which parses a prefix with std's letter-only drive rule and so drops a digit
-//! drive's prefix for a rooted name. Every place cosca completes a Windows path uses these two
+//! drive's prefix for a rooted name. Every place cosca completes a Windows path uses these
 //! functions: the resolver's candidates and the raw backend's completed program and working
-//! directory.
+//! directory. A name made verbatim by a verbatim cwd takes [`concat`], so `GetFullPathNameW`
+//! collapses it with Win32's floor.
 //!
 //! Host-independent string operations, so they are exercised from any host.
 

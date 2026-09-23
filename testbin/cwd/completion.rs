@@ -80,16 +80,18 @@ fn set_drive_dir(drive: &str, value: Option<&str>) -> Result<(), String> {
     unsafe { SetEnvironmentVariableW(PCWSTR(name.as_ptr()), value) }.map_err(|e| format!("{e}"))
 }
 
-/// Whether `=<drive>` is set in this process's environment.
-fn has_drive_dir(drive: &str) -> bool {
-    std::env::vars_os().any(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(&format!("={drive}")))
+/// `=<drive>`'s value in this process's environment, or `unset`.
+fn drive_dir_value(drive: &str) -> String {
+    std::env::vars_os()
+        .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(&format!("={drive}")))
+        .map_or_else(|| "unset".to_owned(), |(_, v)| v.to_string_lossy().into_owned())
 }
 
 /// `drive-dir <base> <image-child>`: maps a free drive letter `X:` to `<d>`, holding `sub`,
 /// `exists\sub` and the file `afile`, and runs from `<d>` on another drive. For each value of
 /// `=X:`, set afresh before each route, it reports where cosca's raw backend runs a child given
-/// `current_dir("X:sub")`, what `GetFullPathNameW` makes of `X:sub` and whether the variable
-/// survives that, and where std runs the child.
+/// `current_dir("X:sub")`, what `GetFullPathNameW` makes of `X:sub` and the value it leaves in
+/// `=X:`, and where std runs the child.
 pub fn drive_dir(base: &str, image: &str) {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let d = canonical(base);
@@ -129,7 +131,7 @@ pub fn drive_dir(base: &str, image: &str) {
         println!("cosca_{label}={}", spawned(cosca_output(&mut raw), "cwd=", &render));
         set();
         println!("gfpn_{label}={}", render.apply(&gfpn(OsStr::new(&name))));
-        println!("kept_{label}={}", has_drive_dir(&drive) == value.is_some());
+        println!("after_{label}={}", render.apply(&drive_dir_value(&drive)));
         set();
         let std_run = std_output(std::process::Command::new(image).current_dir(&name));
         println!("std_{label}={}", spawned(std_run, "cwd=", &render));

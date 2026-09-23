@@ -209,6 +209,13 @@ fn a_relative_name_on_a_verbatim_unc_cwd_collapses_as_win32_does() {
     }
 }
 
+/// The same on a verbatim drive cwd, whose floor is after `\\?\`, not after the drive (measured).
+#[test]
+fn a_relative_name_on_a_verbatim_drive_cwd_collapses_as_win32_does() {
+    let got = complete_on(Path::new(r"..\..\t.exe"), || Ok(PathBuf::from(r"\\?\C:\d")), no_drive).unwrap();
+    assert_eq!(got.path, PathBuf::from(r"\\?\t.exe"));
+}
+
 /// On a verbatim cwd a rooted name is refused: Win32 completes it to `\\t.exe`, off the cwd's
 /// volume and share (measured by `tests/windows_process_cwd.rs`).
 #[test]
