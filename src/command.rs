@@ -282,8 +282,10 @@ impl Command {
     ///   needed and the file loaded and the directory run in are always the same. Under
     ///   [`elevate`](Self::elevate) a backend (`sudo`, `pkexec`, `osascript`) is another process,
     ///   so cosca completes the name to an absolute path against that directory first, reading
-    ///   this process's cwd once; a cwd with no path (an unsearchable ancestor, an unlinked
-    ///   directory) fails there. The file loaded is that one, but the backend may run it
+    ///   this process's cwd once. A cwd with no usable path (an unsearchable ancestor, an
+    ///   unlinked directory) fails the spawn: on macOS that reading fails, with an error saying
+    ///   why a path was needed; on Linux the reading succeeds and entering the path fails with a
+    ///   plain `PermissionDenied`. The file loaded is that one, but the backend may run it
     ///   elsewhere — see there. An already-root caller runs no backend and spawns as above.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
@@ -355,8 +357,9 @@ impl Command {
     ///
     /// Reads this process's cwd through `process_cwd` only for a relative `Exact` program with no
     /// absolute [`current_dir`](Self::current_dir), and then `cwd` is the absolute directory that
-    /// one reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given. A cwd
-    /// with no path fails with the read's own kind, saying why a path was needed.
+    /// one reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given. A
+    /// failed read keeps its kind and says why a path was needed; see
+    /// [`crate::resolve::exact::complete_posix`] for when a cwd with no path gets that far.
     // Off unix the only caller is the macOS elevation module, itself dead there.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn posix_launch(
