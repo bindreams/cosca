@@ -183,14 +183,10 @@ fn resolve_executable_env_remove_path_defeats_ambient_path() {
 // the PARENT's ambient directory, the exact directory this crate exists to stop trusting.
 #[test]
 fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
-    // No process-global `set_current_dir` here, deliberately: `resolve_executable`'s `Some(dir)`
-    // arm never reads `std::env::current_dir()` at all (see its match on `cmd_cwd`), so an
-    // explicit `cmd_cwd` needs no process-cwd mutation to prove it is honoured — mutating it
-    // anyway would only add this test to the process-global cwd race other tests in this binary
-    // must serialize against, for zero extra regression-catching power. The decoy below still
-    // proves the given cwd wins over the process's REAL (unmutated) cwd, which is a weaker but
-    // sufficient claim: it is wherever `cargo test` started this binary, almost certainly not
-    // `cmd_dir`.
+    // `resolve_executable`'s `Some(dir)` arm never reads `std::env::current_dir()` (see its match
+    // on `cmd_cwd`), so an explicit `cmd_cwd` needs no particular process cwd to prove it is
+    // honoured. The decoy below proves the given cwd wins over the process's real one, which is
+    // wherever `cargo test` started this binary, almost certainly not `cmd_dir`.
     let cmd_dir = tempfile::tempdir().unwrap();
     let want = std::fs::copy(
         std::env::current_exe().unwrap(),
@@ -734,12 +730,8 @@ fn resolution_searches_the_given_snapshot() {
 /// `lpDirectory`). Kills "replace the body with a passthrough".
 #[test]
 fn absolutise_exact_completes_a_bare_name_against_the_processes_cwd() {
-    // TWO unsynchronised reads of the process-global cwd — one inside `GetFullPathNameW`, one in
-    // the assertion — and five tests in this same binary call `set_current_dir`. libtest runs
-    // them in parallel, so without the lock a `set_current_dir` landing between the two reads
-    // fails this assertion for reasons unrelated to what it tests. Same pairing as its sibling
-    // above; see `crate::test_child::RestoreCwd`'s doc.
-    let _guard = crate::child::spawn::spawn_lock();
+    // Two readings of the process cwd — one inside `GetFullPathNameW`, one in the assertion —
+    // agree because no test in this binary moves it (`tests/no_chdir_guard.rs`).
     let got = absolutise_exact(Path::new("tool")).unwrap();
     assert_eq!(got, std::env::current_dir().unwrap().join("tool"), "{got:?}");
     assert!(got.is_absolute());
