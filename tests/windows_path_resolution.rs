@@ -825,19 +825,31 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
         let verbatim = format!(r"\\?\{case_dir}\{name}");
         let plain = format!(r"{case_dir}\{name}");
         println!("--- {verbatim:?}  ({note})");
-        match std::fs::copy(source, &verbatim) {
-            Ok(_) => {}
-            Err(e) => {
-                // Not a missing measurement: a name that cannot hold an image answers the
-                // question for that name. [`only_dot_and_dotdot_are_refused_as_verbatim_file_names`]
-                // owns which names those are.
-                facts.check(!creatable, &format!("an image can be copied to verbatim {name:?}"), &e);
-                println!(
-                    "  copy: FAILED: {e} (raw_os_error={:?}) — nothing to spawn",
-                    e.raw_os_error()
-                );
-                continue;
+        // Whether the name can hold an image is itself a fact, checked either way, so a platform
+        // change here is reported as one and never reaches the planted-count guard below.
+        // [`only_dot_and_dotdot_are_refused_as_verbatim_file_names`] owns which names those are.
+        let copied = std::fs::copy(source, &verbatim);
+        facts.check(
+            copied.is_ok() == creatable,
+            &format!(
+                "an image {} be copied to verbatim {name:?}",
+                if creatable { "can" } else { "cannot" }
+            ),
+            outcome(&copied),
+        );
+        if let Err(e) = &copied {
+            println!(
+                "  copy: FAILED: {e} (raw_os_error={:?}) — nothing to spawn",
+                e.raw_os_error()
+            );
+            continue;
+        }
+        if !creatable {
+            println!("  copy: succeeded where it should not — not spawned");
+            if let Err(e) = std::fs::remove_file(&verbatim) {
+                println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
             }
+            continue;
         }
         spawnable += 1;
         let planted = match file_identity(&verbatim) {
