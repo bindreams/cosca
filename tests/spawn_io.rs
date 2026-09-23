@@ -1281,6 +1281,10 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 ///
 /// A `Stdio::from_file` end is a dup numbered 3 or above, so it does not fill a gap first.
 ///
+/// Every case also runs with `pidfd_open` denied by a seccomp filter, where cosca cannot wait
+/// for the report: the child may then land on either side of its leaf, but cosca must report the
+/// side it is on.
+///
 /// Each case runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
 /// is process-wide, so in a binary with other tests running it would hand their next `open` the
 /// slot, and with 2 closed a failing assertion's message would go nowhere.
@@ -1294,21 +1298,26 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
         return; // unprovisioned: not a CI-cgroup environment.
     }
     if let Ok(slots) = std::env::var(CLOSED_SLOTS_ENV) {
-        return spawn_with_slots_closed(&parse_closed_slots(&slots));
+        let deny_pidfd = std::env::var_os(DENY_PIDFD_ENV).is_some();
+        return spawn_with_slots_closed(&parse_closed_slots(&slots), deny_pidfd);
     }
     // "" is the control: the same spawn with every slot open.
-    let failures: Vec<String> = ["", "0", "1", "2", "1,2", "0,1", "0,2", "0,1,2"]
+    let slot_cases = ["", "0", "1", "2", "1,2", "0,1", "0,2", "0,1,2"];
+    let failures: Vec<String> = [false, true]
         .into_iter()
-        .filter_map(|slots| {
-            let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
-                .env(CLOSED_SLOTS_ENV, slots)
-                .output()
-                .expect("run this test with the slots closed");
+        .flat_map(|deny| slot_cases.map(|slots| (slots, deny)))
+        .filter_map(|(slots, deny)| {
+            let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+            run.args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CLOSED_SLOTS_ENV, slots);
+            if deny {
+                run.env(DENY_PIDFD_ENV, "1");
+            }
+            let out = run.output().expect("run this test with the slots closed");
             let stdout = String::from_utf8_lossy(&out.stdout);
             (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
                 format!(
-                    "slots [{slots}]: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                    "slots [{slots}], pidfd denied: {deny}: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
                     out.status,
                     String::from_utf8_lossy(&out.stderr)
                 )
@@ -1323,6 +1332,60 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
 /// comma-separated, empty for none.
 #[cfg(target_os = "linux")]
 const CLOSED_SLOTS_ENV: &str = "COSCA_TEST_CLOSED_SLOTS";
+
+/// Set to deny `pidfd_open` in one case of
+/// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`].
+#[cfg(target_os = "linux")]
+const DENY_PIDFD_ENV: &str = "COSCA_TEST_DENY_PIDFD";
+
+/// Make `pidfd_open` fail with `EPERM` on the calling thread and every process it forks, as a
+/// seccomp-filtered container does.
+#[cfg(target_os = "linux")]
+fn deny_pidfd_open_on_this_thread() {
+    // `seccomp_data.nr`, the syscall number, is at offset 0.
+    let filter = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_pidfd_open as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // SAFETY: plain prctl calls; `program` and `filter` outlive the second, which copies them.
+    unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs");
+        assert_eq!(
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+            0,
+            "seccomp: {}",
+            std::io::Error::last_os_error()
+        );
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0);
+        assert_eq!(pidfd, -1, "pidfd_open must be denied");
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn parse_closed_slots(slots: &str) -> Vec<i32> {
@@ -1370,7 +1433,7 @@ fn wait_unpopulated(leaf: &std::path::Path) {
 /// spawn a contained `sh` with `slots` closed in this process and each wired to a file in the
 /// child, then check what cosca reports against where the child really is.
 #[cfg(target_os = "linux")]
-fn spawn_with_slots_closed(slots: &[i32]) {
+fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
     use std::io::{BufRead, Seek};
 
     const CONTENTS: &[u8] = b"untouched\n";
@@ -1392,6 +1455,9 @@ fn spawn_with_slots_closed(slots: &[i32]) {
             .expect("wire the slot to the file");
     }
     cmd.contain();
+    if deny_pidfd {
+        deny_pidfd_open_on_this_thread();
+    }
 
     // Everything this process needs open is opened above, so nothing fills the gaps but the
     // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
@@ -1421,6 +1487,8 @@ fn spawn_with_slots_closed(slots: &[i32]) {
     }
     let child = spawned.expect("spawn");
     let containment = child.containment();
+    // Printed once 0, 1 and 2 are back, for a caller counting outcomes across runs.
+    println!("closed-slots outcome: {containment:?}");
 
     let (worker, _) = listener.accept().expect("accept the worker");
     let mut worker = std::io::BufReader::new(worker);
@@ -1440,17 +1508,31 @@ fn spawn_with_slots_closed(slots: &[i32]) {
     let in_leaf = root_cgroup
         .strip_prefix(&leaf_prefix)
         .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
+    let expected = if deny_pidfd && slots.len() >= 2 {
+        // `spawn` can return before the report, which cannot be waited for: either side of the
+        // leaf is right, as long as it is reported.
+        (
+            if in_leaf {
+                cosca::Containment::CgroupV2
+            } else {
+                cosca::Containment::ProcessGroup
+            },
+            in_leaf,
+        )
+    } else {
+        (cosca::Containment::CgroupV2, true)
+    };
     assert_eq!(
         (containment, in_leaf),
-        (cosca::Containment::CgroupV2, true),
-        "slots {slots:?}: cosca reports {containment:?}, and the child is in {root_cgroup} (its \
-         leaf would be {leaf_prefix}<seq>)"
+        expected,
+        "slots {slots:?}, pidfd denied: {deny_pidfd}: cosca reports {containment:?}, and the \
+         child is in {root_cgroup} (its leaf would be {leaf_prefix}<seq>)"
     );
     let worker_cgroup = std::fs::read_to_string(format!("/proc/{worker_pid}/cgroup")).expect("worker cgroup");
     assert_eq!(
         unified_cgroup(&worker_cgroup),
         root_cgroup,
-        "the worker is in the root's leaf"
+        "the worker is in the root's cgroup"
     );
 
     let mut written = Vec::new();
@@ -1475,10 +1557,18 @@ fn spawn_with_slots_closed(slots: &[i32]) {
     assert_eq!(n, 0, "cgroup.kill must kill the worker");
 
     // The leaf is removed with the child: nothing is left behind once its members have exited.
-    let leaf = std::path::Path::new("/sys/fs/cgroup").join(root_cgroup.trim_start_matches('/'));
-    wait_unpopulated(&leaf);
+    let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+    if in_leaf {
+        wait_unpopulated(&own_dir.join(root_cgroup.rsplit('/').next().expect("a leaf name")));
+    }
     drop(child);
-    assert!(!leaf.exists(), "slots {slots:?}: {} was left behind", leaf.display());
+    let prefix = format!("cosca-{}-", std::process::id());
+    let left: Vec<String> = std::fs::read_dir(&own_dir)
+        .expect("list this process's cgroup")
+        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    assert!(left.is_empty(), "slots {slots:?}: {left:?} left behind");
 }
 
 /// Once a spawn has returned, the supervisor holds no descriptor for the child's leaf

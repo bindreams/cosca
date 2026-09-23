@@ -596,7 +596,8 @@ fn attach_tree(
                     // because it lists only live tasks and a placed child may already have
                     // exited. Taking the verdict waits for that report — `spawn` returning does
                     // not mean the child has made it — then releases the leaf's fd and pipe.
-                    match leaf.take_placement(raw_pid) {
+                    // An undecidable verdict fails the spawn: the child is already killed.
+                    match leaf.take_placement(raw_pid)? {
                         Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
                         // The child never entered the leaf, so nothing it forks did either. The
                         // process group set pre-spawn is the real container; the leaf is

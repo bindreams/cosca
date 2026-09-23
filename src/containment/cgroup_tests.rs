@@ -192,18 +192,18 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         )
     });
 
-    // Each member reports through its OWN pipe. The leaf's pipe carries one report for the whole
-    // leaf (see `ReportPipe`), so two members sharing it would read as whichever wrote first.
-    let spawn_member = |leaf: &super::CgroupLeaf, pipe: &super::ReportPipe| -> std::process::Child {
+    // Each member reports through its OWN channel. The leaf's channel carries one report for the whole
+    // leaf (see `ReportChannel`), so two members sharing it would read as whichever wrote first.
+    let spawn_member = |leaf: &super::CgroupLeaf, channel: &super::ReportChannel| -> std::process::Child {
         let procs_fd = leaf.procs_fd();
-        let slot = pipe.slot();
+        let slot = channel.slot();
         let mut cmd = Command::new("sleep");
         cmd.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
         // child; `procs_fd` is a valid, open, writable fd owned by `leaf` for the parent's whole
         // lifetime (fork gives the child its own fd-table entry pointing at the same underlying
         // open file description, and `place_self_in_cgroup_pre_exec` closes only that child-side
-        // copy) — exactly its own documented contract. `leaf` and `pipe` both outlive every
+        // copy) — exactly its own documented contract. `leaf` and `channel` both outlive every
         // member spawned through them in this test.
         unsafe {
             cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot));
@@ -211,10 +211,10 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         cmd.spawn().expect("spawn a real long-lived cgroup leaf member")
     };
 
-    let pipe_a = super::ReportPipe::new().expect("open member a's report pipe");
-    let pipe_b = super::ReportPipe::new().expect("open member b's report pipe");
-    let mut a = spawn_member(&leaf, &pipe_a);
-    let mut b = spawn_member(&leaf, &pipe_b);
+    let channel_a = super::ReportChannel::new().expect("open member a's report channel");
+    let channel_b = super::ReportChannel::new().expect("open member b's report channel");
+    let mut a = spawn_member(&leaf, &channel_a);
+    let mut b = spawn_member(&leaf, &channel_b);
 
     // A real bounded wait with both members alive: must report MembersRemain. The 250ms bound
     // is not a synchronization guess — it is the deadline `wait_drained` itself blocks on via a
@@ -229,13 +229,13 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         "both members are alive; must report MembersRemain"
     );
     let procs = std::fs::read_to_string(leaf.leaf_path.join("cgroup.procs")).expect("read cgroup.procs");
-    for (name, member, pipe) in [("a", &a, pipe_a), ("b", &b, pipe_b)] {
+    for (name, member, mut channel) in [("a", &a, channel_a), ("b", &b, channel_b)] {
         assert!(
             procs.lines().any(|line| line.trim() == member.id().to_string()),
             "member {name} must actually be placed in the leaf; cgroup.procs is {procs:?}"
         );
         assert_eq!(
-            pipe.wait(member.id()),
+            channel.wait(member.id()).expect("open a pidfd"),
             PlacementReport::Placed,
             "member {name}'s own report must survive the other member's spawn"
         );
@@ -363,7 +363,7 @@ fn leaf_error_names_step_path_and_reason() {
             Some(reason(13)),
         ),
         (
-            LeafError::OpenReportPipe(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(libc::EMFILE)),
             &["report"],
             Some(reason(libc::EMFILE)),
         ),
@@ -682,15 +682,15 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
 fn placement_report_crosses_fork_with_the_childs_errno() {
     use std::os::unix::process::CommandExt;
 
-    let fresh = super::ReportPipe::new().expect("open a report pipe");
+    let fresh = super::ReportChannel::new().expect("open a report channel");
     assert_eq!(
         fresh.report_for_test(),
         PlacementReport::NotReported,
-        "a fresh pipe must report nothing, not a fabricated success"
+        "a fresh channel must report nothing, not a fabricated success"
     );
 
-    let pipe = super::ReportPipe::new().expect("open the report pipe");
-    let slot = pipe.slot();
+    let mut channel = super::ReportChannel::new().expect("open the report channel");
+    let slot = channel.slot();
     let mut cmd = std::process::Command::new("/bin/true");
     // SAFETY: the closure runs between fork and exec; it performs only the documented
     // async-signal-safe operations (two writes and a close).
@@ -701,7 +701,7 @@ fn placement_report_crosses_fork_with_the_childs_errno() {
         });
     }
     let mut child = cmd.spawn().expect("spawn");
-    let report = pipe.wait(child.id());
+    let report = channel.wait(child.id()).expect("open a pidfd");
     let status = child.wait().expect("wait");
     assert!(status.success(), "the failed placement must not abort the spawn");
     assert_eq!(
@@ -718,8 +718,8 @@ fn placement_report_crosses_fork_with_the_childs_errno() {
 fn placement_report_records_a_successful_write() {
     use std::os::unix::process::CommandExt;
 
-    let pipe = super::ReportPipe::new().expect("open the report pipe");
-    let slot = pipe.slot();
+    let mut channel = super::ReportChannel::new().expect("open the report channel");
+    let slot = channel.slot();
     // /dev/null accepts any write, standing in for a writable cgroup.procs.
     let sink = std::fs::OpenOptions::new()
         .write(true)
@@ -736,7 +736,7 @@ fn placement_report_records_a_successful_write() {
         });
     }
     let mut child = cmd.spawn().expect("spawn");
-    assert_eq!(pipe.wait(child.id()), PlacementReport::Placed);
+    assert_eq!(channel.wait(child.id()).expect("open a pidfd"), PlacementReport::Placed);
     child.wait().expect("wait");
     // SAFETY: the parent's own copy of the descriptor, closed exactly once.
     unsafe { libc::close(fd) };
@@ -813,70 +813,70 @@ fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// `wait` returns a report the child writes after the wait began, not what the pipe held when
+/// `wait` returns a report the child writes after the wait began, not what the channel held when
 /// it was called: `spawn` can return before the child's `pre_exec` has run.
 ///
 /// Parent and child share one CPU, so the parent runs on into `wait` while the released child
 /// waits its turn to report.
 #[cfg(target_os = "linux")]
 #[test]
-fn report_pipe_wait_returns_a_report_written_after_it_was_called() {
+fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    let pipe = super::ReportPipe::new().expect("open the report pipe");
-    let slot = pipe.slot();
+    let mut channel = super::ReportChannel::new().expect("open the report channel");
+    let slot = channel.slot();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
     let (pid, report) = on_one_cpu(|| {
         let pid = fork_running(move || {
             block_on(gate);
-            // SAFETY: the pipe's write end is this child's inherited copy; its parent holds the
-            // read end.
+            // SAFETY: the channel's child end is this child's inherited copy; its parent holds
+            // its own end.
             unsafe { slot.report_placed_for_test() };
         });
         gate_write.write_all(b"x").expect("release the child");
-        (pid, pipe.wait(pid))
+        (pid, channel.wait(pid).expect("open a pidfd"))
     });
     assert_eq!(report, PlacementReport::Placed);
     reap(pid);
 }
 
 /// A child that exits without reporting reads as `NotReported` at once, even while another process
-/// still holds the write end: any process forked while the pipe is open inherits it, and one
-/// that never execs would otherwise hold off the pipe's EOF for as long as it runs.
+/// still holds the child's end: any process forked while the channel is open inherits it, and
+/// one that never execs would otherwise hold off the channel's EOF for as long as it runs.
 ///
 /// A regression hangs this test rather than failing it: the wait has no timeout by design.
 #[cfg(target_os = "linux")]
 #[test]
-fn report_pipe_wait_ends_at_the_childs_exit_while_another_process_holds_the_write_end() {
+fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_childs_end() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    let pipe = super::ReportPipe::new().expect("open the report pipe");
+    let mut channel = super::ReportChannel::new().expect("open the report channel");
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    // Inherits the write end, and keeps it until released through the gate.
+    // Inherits the child's end, and keeps it until released through the gate.
     let holder = fork_running(move || block_on(gate));
     let child = fork_running(|| {});
 
-    assert_eq!(pipe.wait(child), PlacementReport::NotReported);
+    assert_eq!(channel.wait(child).expect("open a pidfd"), PlacementReport::NotReported);
     reap(child);
     gate_write.write_all(b"x").expect("release the holder");
     reap(holder);
 }
 
-/// Both ends of the report pipe are close-on-exec, so no program this process starts inherits
+/// Both ends of the report channel are close-on-exec, so no program this process starts inherits
 /// either. (That they sit at fd 3 or above matters only with 0, 1 or 2 closed, which
 /// `tests/spawn_io.rs` covers in a process of its own.)
 #[cfg(target_os = "linux")]
 #[test]
-fn report_pipe_is_close_on_exec() {
+fn report_channel_is_close_on_exec() {
     use std::os::fd::AsRawFd;
 
-    let pipe = super::ReportPipe::new().expect("open the report pipe");
-    for (end, fd) in [("read", pipe.read.as_raw_fd()), ("write", pipe.slot().fd)] {
-        // SAFETY: `fd` is open for as long as `pipe` lives.
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    for (end, fd) in [("parent's", channel.read.as_raw_fd()), ("child's", channel.slot().fd)] {
+        // SAFETY: `fd` is open for as long as `channel` lives.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert_ne!(flags, -1, "F_GETFD: {}", std::io::Error::last_os_error());
         assert_ne!(flags & libc::FD_CLOEXEC, 0, "the {end} end must be close-on-exec");
@@ -979,8 +979,8 @@ fn drop_kills_only_through_a_leaf_its_child_entered() {
         (PlacementReport::WriteFailed(libc::EBADF), false),
         (PlacementReport::Placed, true),
     ];
-    // Before the verdict `Drop` reads the report from the pipe; after it, from what the verdict
-    // recorded when it released the pipe.
+    // Before the verdict `Drop` reads the report from the channel; after it, from what the
+    // verdict recorded when it released the channel.
     for ((report, kills), verdict_taken) in cases.into_iter().flat_map(|case| [(case, false), (case, true)]) {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-drop-kill-leaf");
@@ -991,15 +991,19 @@ fn drop_kills_only_through_a_leaf_its_child_entered() {
         match report {
             PlacementReport::NotReported => {}
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
-            // no-op. The slot's pipe lives as long as `leaf`.
+            // no-op. The slot's channel lives as long as `leaf`.
             PlacementReport::WriteFailed(_) => {
                 let _ = unsafe { super::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
             }
-            // SAFETY: the slot's pipe lives as long as `leaf`.
+            // SAFETY: the slot's channel lives as long as `leaf`.
             PlacementReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
         }
         if verdict_taken {
-            assert_eq!(leaf.take_placement(4242).is_ok(), kills);
+            // The verdict needs a live pid: this process's own stands in for the child.
+            assert_eq!(
+                leaf.take_placement(std::process::id()).expect("decidable").is_ok(),
+                kills
+            );
             assert!(!leaf.holds_spawn_resources());
         }
         let mark = crate::log_capture::mark();
@@ -1087,11 +1091,11 @@ fn a_newly_seen_degrade_reason_still_warns() {
     let mark = crate::log_capture::mark();
     super::log_degrade_into(
         &warned,
-        &LeafError::OpenReportPipe(std::io::Error::from_raw_os_error(libc::EMFILE)),
+        &LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(libc::EMFILE)),
     );
 
     assert_eq!(
-        crate::log_capture::levels_since(mark, "placement-report pipe"),
+        crate::log_capture::levels_since(mark, "placement-report channel"),
         vec![log::Level::Warn],
         "a second, different reason is a second thing the embedder has not been told"
     );
@@ -1172,7 +1176,7 @@ fn every_degrade_reason_has_its_own_kind() {
             path: PathBuf::from("/cg/leaf/cgroup.procs"),
             source: std::io::Error::from_raw_os_error(13),
         }),
-        Box::new(LeafError::OpenReportPipe(std::io::Error::from_raw_os_error(
+        Box::new(LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(
             libc::EMFILE,
         ))),
         Box::new(NotPlaced::Absent {
@@ -1325,26 +1329,26 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
     );
 }
 
-/// A report pipe that cannot be opened is its own degrade reason, and unwinds the leaf too.
-/// `OpenReportPipe` is a condition that did not exist before the placement report did, so the
+/// A report channel that cannot be opened is its own degrade reason, and unwinds the leaf too.
+/// `OpenReportChannel` is a condition that did not exist before the placement report did, so the
 /// step it names, and the fact it leaves nothing behind, are both worth pinning.
 #[cfg(target_os = "linux")]
 #[test]
-fn create_leaf_under_reports_an_unopenable_report_pipe_and_removes_the_leaf() {
+fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     super::fault::set_force_kill_supported(true);
-    super::fault::set_force_report_pipe_failure(true);
+    super::fault::set_force_report_channel_failure(true);
     let err = match super::create_leaf_under(dir.path()) {
         Err(e) => e,
-        Ok(_) => panic!("the report pipe could not be opened; leaf creation must fail"),
+        Ok(_) => panic!("the report channel could not be opened; leaf creation must fail"),
     };
     assert!(
-        !super::fault::report_pipe_failure_armed(),
-        "the seam must be consumed by the pipe it fails"
+        !super::fault::report_channel_failure_armed(),
+        "the seam must be consumed by the channel it fails"
     );
     assert!(
-        matches!(err, LeafError::OpenReportPipe(_)),
-        "expected OpenReportPipe, got {err:?}"
+        matches!(err, LeafError::OpenReportChannel(_)),
+        "expected OpenReportChannel, got {err:?}"
     );
     let reason = std::io::Error::from_raw_os_error(libc::EMFILE).to_string();
     assert!(err.to_string().contains(&reason), "got {err}");
@@ -1353,7 +1357,7 @@ fn create_leaf_under_reports_an_unopenable_report_pipe_and_removes_the_leaf() {
         .expect("read tempdir")
         .map(|e| e.expect("entry").file_name())
         .collect();
-    assert!(strays.is_empty(), "a failed pipe left {strays:?} behind");
+    assert!(strays.is_empty(), "a failed channel left {strays:?} behind");
 }
 
 /// A `cgroup.procs` that cannot be read is reported with the read's own error.
@@ -1365,14 +1369,14 @@ fn take_placement_reports_an_unreadable_cgroup_procs() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
 
     let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
-    match leaf.take_placement(4242) {
+    match leaf.take_placement(std::process::id()).expect("decidable") {
         Err(NotPlaced::Unreadable {
             pid,
             path,
             source,
             report,
         }) => {
-            assert_eq!(pid, 4242);
+            assert_eq!(pid, std::process::id());
             assert_eq!(path, leaf_path.join("cgroup.procs"));
             assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
             assert_eq!(report, NotEntered::NotReported, "no child ever ran");
@@ -1405,7 +1409,7 @@ fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter()
     let waited = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
     assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
 
-    let verdict = leaf.take_placement(pid);
+    let verdict = leaf.take_placement(pid).expect("decidable");
     child.wait().expect("reap the child");
     match verdict {
         Err(NotPlaced::Absent {
@@ -1467,7 +1471,7 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
         child
     });
 
-    let verdict = leaf.take_placement(pid);
+    let verdict = leaf.take_placement(pid).expect("decidable");
     writer.join().expect("the writer").wait().expect("reap the child");
     match verdict {
         Err(NotPlaced::Absent { procs, child_state, .. }) => {
@@ -1479,5 +1483,188 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
         }
         Err(other) => panic!("a readable cgroup.procs must be quoted: {other}"),
         Ok(()) => panic!("no child reported a placement"),
+    }
+}
+
+// Deciding without a pidfd -----
+// `pidfd_open` can fail (a full fd table, a seccomp filter). Waiting on the report channel's EOF
+// instead could block forever, so the verdict closes the leaf or learns the child is in it.
+
+/// A leaf with no report and no member is removed, so the child can never enter it, and the spawn
+/// degrades once per errno — warned the first time, `debug` after.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
+    use super::{DegradeCondition, DegradeKind, DegradeReason};
+
+    crate::log_capture::install();
+    let warned = std::sync::Mutex::default();
+    let mut levels = Vec::new();
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-unwaitable");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+
+        super::fault::set_force_pidfd_failure(true);
+        let verdict = leaf.take_placement(std::process::id()).expect("decidable");
+        assert!(
+            !super::fault::pidfd_failure_armed(),
+            "the seam must be consumed by the wait"
+        );
+
+        let reason = match verdict {
+            Err(reason @ NotPlaced::Unwaitable { .. }) => reason,
+            other => panic!("expected Unwaitable, got {other:?}"),
+        };
+        assert_eq!(
+            reason.condition(),
+            DegradeCondition {
+                kind: DegradeKind::PidfdUnavailable,
+                errno: Some(libc::EMFILE),
+            }
+        );
+        assert!(!leaf_path.exists(), "the leaf must be closed to the child");
+        levels.push(super::log_degrade_into(&warned, &reason));
+    }
+    assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
+}
+
+/// A report already sent is final, pidfd or not, and the leaf is left alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_a_pidfd_a_report_already_sent_decides() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-sent");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    // SAFETY: the slot's channel lives as long as `leaf`.
+    unsafe { leaf.placement_slot().report_placed_for_test() };
+
+    super::fault::set_force_pidfd_failure(true);
+    assert!(matches!(leaf.take_placement(std::process::id()), Ok(Ok(()))));
+    assert!(leaf_path.exists(), "a placed child's leaf must not be removed");
+}
+
+/// A `Placed` that arrives after the report was checked, from a child whose tree has since
+/// exited: the leaf is gone, and the verdict is still the child's own report.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_a_pidfd_a_removed_leaf_reads_the_report_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-late");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut channel = leaf.report.take().expect("the channel");
+    // SAFETY: `channel` is open.
+    unsafe { channel.slot().report_placed_for_test() };
+
+    let source = std::io::Error::from_raw_os_error(libc::EMFILE);
+    let verdict = leaf.decide_unwaitable(std::process::id(), &mut channel, source);
+    assert!(matches!(verdict, Ok(Ok(()))), "got {verdict:?}");
+    assert!(leaf.entered);
+    assert!(!leaf_path.exists());
+}
+
+/// A leaf that can be neither waited on nor removed fails the spawn: its child is killed, which
+/// ends its chance to enter, and the leaf is killed through.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unremovable");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // `rmdir` fails with ENOTEMPTY: neither closed nor proven entered.
+    std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn");
+
+    super::fault::set_force_pidfd_failure(true);
+    let err = match leaf.take_placement(child.id()) {
+        Err(e) => e,
+        Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
+    };
+    assert!(err.to_string().contains("pidfd_open failed"), "got {err}");
+    assert_eq!(
+        child.wait().expect("reap the child").signal(),
+        Some(libc::SIGKILL),
+        "the child must be killed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(leaf_path.join("cgroup.kill")).expect("cgroup.kill written"),
+        "1"
+    );
+}
+
+/// A child already in its real leaf is contained, pidfd or not: `rmdir` refuses an occupied leaf
+/// with `EBUSY`, and the child's own `/proc/<pid>/cgroup` shows the leaf.
+#[cfg(target_os = "linux")]
+#[test]
+fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
+    use std::os::unix::process::CommandExt;
+
+    use crate::containment::TreeDrain;
+
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    let mut leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    // The member reports through a channel of its own, so the leaf's has nothing queued.
+    let own = super::ReportChannel::new().expect("open the member's channel");
+    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("300");
+    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
+    // on descriptors `leaf` and `own` keep open across the spawn.
+    unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let mut member = cmd.spawn().expect("spawn the member");
+
+    super::fault::set_force_pidfd_failure(true);
+    let verdict = leaf.take_placement(member.id());
+    assert!(matches!(verdict, Ok(Ok(()))), "got {verdict:?}");
+    assert!(leaf.leaf_path.exists(), "a contained child's leaf must not be removed");
+
+    leaf.hard_kill().expect("kill through the leaf");
+    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
+    member.wait().expect("reap the member");
+}
+
+/// A real leaf occupied by something other than the child can be neither waited on nor closed:
+/// the child is killed and the leaf killed through — the occupant with it.
+#[cfg(target_os = "linux")]
+#[test]
+fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_kills_through() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+        return; // unprovisioned: not a CI-cgroup environment.
+    }
+    let mut leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    let own = super::ReportChannel::new().expect("open the occupant's channel");
+    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("300");
+    // SAFETY: as in `cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained`.
+    unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let mut occupant = cmd.spawn().expect("spawn the occupant");
+    // The child whose verdict is taken never touches the leaf.
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn the child");
+
+    super::fault::set_force_pidfd_failure(true);
+    assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
+    for (name, process) in [("child", &mut child), ("occupant", &mut occupant)] {
+        assert_eq!(
+            process.wait().expect("reap").signal(),
+            Some(libc::SIGKILL),
+            "the {name} must be killed"
+        );
     }
 }

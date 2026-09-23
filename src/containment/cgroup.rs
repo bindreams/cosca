@@ -22,7 +22,7 @@
 //! `place_self_in_cgroup_pre_exec` is called inside a `pre_exec` closure
 //! (after `fork`, before `exec`). The only async-signal-safe operations there
 //! are raw `libc::write` + `libc::close` — no allocation, no `format!`, no
-//! `String`. Its outcome crosses back through a pipe (`ReportPipe`).
+//! `String`. Its outcome crosses back through a socket pair (`ReportChannel`).
 
 // The parsers below are pure (no OS deps) — compiled on all platforms so their unit tests run
 // on any host.
@@ -172,11 +172,11 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
-    /// The pipe the child reports its self-placement outcome through could not be opened, or
-    /// its write end moved to fd 3 or above. Without it the child's own report would be
+    /// The channel the child reports its self-placement outcome through could not be opened, or
+    /// its ends moved to fd 3 or above. Without it the child's own report would be
     /// unobservable, so the leaf is not created half-instrumented.
-    #[error("could not open the placement-report pipe shared with the forked child: {0}")]
-    OpenReportPipe(#[source] io::Error),
+    #[error("could not open the placement-report channel shared with the forked child: {0}")]
+    OpenReportChannel(#[source] io::Error),
 }
 
 /// What the child's own `pre_exec` self-placement write reported back to the parent.
@@ -184,11 +184,11 @@ pub(crate) enum LeafError {
 /// This is the one step whose reason lives entirely in the forked child: it runs after
 /// `fork`, in a copy-on-write address space, under async-signal-safety rules that forbid
 /// allocating or formatting anything. The child therefore reports a single word through a
-/// pipe (see [`ReportPipe`]), which this enum names.
+/// socket pair (see [`ReportChannel`]), which this enum names.
 ///
-/// The pipe belongs to the LEAF, not to a child. Production creates one leaf per spawn, so the
-/// distinction is invisible there; several children sharing one leaf would share one pipe, and
-/// the first report written would stand for all of them (see [`ReportPipe`]).
+/// The channel belongs to the LEAF, not to a child. Production creates one leaf per spawn, so the
+/// distinction is invisible there; several children sharing one leaf would share one channel, and
+/// the first report written would stand for all of them (see [`ReportChannel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum PlacementReport {
@@ -265,6 +265,13 @@ pub(crate) enum NotPlaced {
         /// As in [`NotPlaced::Absent`]: the leaf's report, not `pid`'s in general.
         report: NotEntered,
     },
+    /// The child's exit could not be watched, so its report could not be waited for, and the
+    /// leaf was removed before the child entered it: it never can.
+    Unwaitable {
+        pid: u32,
+        /// `pidfd_open`'s error.
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for NotPlaced {
@@ -306,6 +313,11 @@ impl fmt::Display for NotPlaced {
                 "child {pid} never entered the leaf cgroup: {report}; {} could not be read: {source}",
                 path.display()
             ),
+            NotPlaced::Unwaitable { pid, source } => write!(
+                f,
+                "child {pid}'s placement report cannot be waited for: pidfd_open failed: {source}; \
+                 the leaf cgroup was removed before the child entered it"
+            ),
         }
     }
 }
@@ -320,7 +332,8 @@ pub(crate) enum DegradeKind {
     KillUnsupported,
     CheckKill,
     OpenProcs,
-    OpenReportPipe,
+    OpenReportChannel,
+    PidfdUnavailable,
     PlacementNotReported,
     PlacementWriteFailed,
 }
@@ -354,7 +367,7 @@ impl DegradeReason for LeafError {
             LeafError::KillUnsupported { .. } => (DegradeKind::KillUnsupported, None),
             LeafError::CheckKill { source, .. } => (DegradeKind::CheckKill, Some(source)),
             LeafError::OpenProcs { source, .. } => (DegradeKind::OpenProcs, Some(source)),
-            LeafError::OpenReportPipe(e) => (DegradeKind::OpenReportPipe, Some(e)),
+            LeafError::OpenReportChannel(e) => (DegradeKind::OpenReportChannel, Some(e)),
         };
         DegradeCondition {
             kind,
@@ -366,7 +379,15 @@ impl DegradeReason for LeafError {
 impl DegradeReason for NotPlaced {
     /// The child's own report, never how `cgroup.procs` read: that is diagnosis, not cause.
     fn condition(&self) -> DegradeCondition {
-        let (NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. }) = self;
+        let (NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. }) = self else {
+            let NotPlaced::Unwaitable { source, .. } = self else {
+                unreachable!("every other variant carries a report")
+            };
+            return DegradeCondition {
+                kind: DegradeKind::PidfdUnavailable,
+                errno: source.raw_os_error(),
+            };
+        };
         match *report {
             NotEntered::NotReported => DegradeCondition {
                 kind: DegradeKind::PlacementNotReported,
@@ -516,12 +537,14 @@ fn proc_state(pid: u32) -> Option<char> {
 #[cfg(target_os = "linux")]
 const REPORT_PLACED: i32 = -1;
 
-/// The channel the forked child reports its self-placement outcome through: a pipe carrying one
-/// native-endian `i32`, the write's errno or [`REPORT_PLACED`].
+/// The channel the forked child reports its self-placement outcome through: a `SOCK_SEQPACKET`
+/// socket pair carrying one message, a native-endian `i32` — the write's errno or
+/// [`REPORT_PLACED`].
 ///
 /// `pre_exec` runs after `fork`, where async-signal-safety forbids allocating, formatting or
-/// locking, and nothing the child computes survives its `exec`. One `write(2)` of four bytes is
-/// all a report needs, and a pipe also tells the parent when the report is final.
+/// locking, and nothing the child computes survives its `exec`. One `send(2)` of four bytes is
+/// all a report needs. It is sent with `MSG_NOSIGNAL`: a parent that has stopped listening makes
+/// it fail with `EPIPE` instead of killing the child with `SIGPIPE`.
 ///
 /// # When the report is final
 /// Not when `spawn` returns. `std`'s Unix spawn returns once its own close-on-exec error channel
@@ -530,120 +553,141 @@ const REPORT_PLACED: i32 = -1;
 /// child's stdio for that slot into place, before any `pre_exec` runs, it closes that end, and
 /// `spawn` returns before the child has placed itself.
 ///
-/// [`ReportPipe::wait`] therefore waits for the child itself: for the report, or for the child's
-/// exit. The report is always written before `exec`, so a child that exits without one never ran
-/// its placement, and `NotReported` is then the truth. Its exit is watched through a pidfd, not
-/// the pipe's EOF: every process this one forks while the write end is open inherits it, so EOF
-/// would also wait for other threads' children to exec or exit.
+/// [`ReportChannel::wait`] therefore waits for the child itself: for the report, or for the
+/// child's exit, watched through a pidfd. The report is always sent before `exec`, so a child that
+/// exits without one never ran its placement, and `NotReported` is then the truth. The channel's
+/// EOF is no substitute for the pidfd: every process this one forks while the channel is open
+/// inherits the child's end, so EOF would also wait for other threads' children to exec or exit —
+/// and forever on one that never execs.
 ///
-/// The write end sits at fd 3 or above, where the child's stdio `dup2` cannot close it. The only
+/// Both ends sit at fd 3 or above. The child's stdio `dup2` cannot close its end there. The only
 /// later `dup2` is command-fds' mapping of fds 3 and up, whose hook the spawn registers after the
-/// placement hook: it can replace the write end only once the report is written.
+/// placement hook: it can replace the child's end only once the report is sent.
 ///
 /// The wait is no longer than the one `std` intends: the child reaches its report on `std`'s own
 /// path from `fork` to `exec`, all of which `spawn` normally waits out.
 ///
-/// **One report per pipe.** A caller that routes several children through one pipe reads the
-/// first report written, whoever wrote it.
+/// **One report per channel.** A caller that routes several children through one channel reads
+/// the first report sent, whoever sent it.
 ///
 /// # What this costs, and what it can cost a spawn
 /// Two fds per contained spawn in flight, held from the leaf's creation until `attach` takes the
-/// placement verdict; a live contained child costs the supervisor none. A pipe that cannot be
+/// placement verdict; a live contained child costs the supervisor none. A channel that cannot be
 /// opened (`EMFILE`, `ENFILE`) DEGRADES the spawn — it keeps its process group and loses the
-/// fork-proof kill — rather than failing it. `LeafError::OpenReportPipe` is what makes that audible.
+/// fork-proof kill — rather than failing it. `LeafError::OpenReportChannel` is what makes that
+/// audible.
 #[cfg(target_os = "linux")]
-pub(crate) struct ReportPipe {
-    read: io::PipeReader,
-    /// The parent's copy of the write end, at fd 3 or above. Closed before waiting.
+pub(crate) struct ReportChannel {
+    /// The parent's end.
+    read: OwnedFd,
+    /// The parent's copy of the child's end. Closed before waiting.
     write: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
-impl ReportPipe {
-    pub(crate) fn new() -> io::Result<ReportPipe> {
-        // Test-only fault seam: fail the pipe (take semantics — see `fault`).
+impl ReportChannel {
+    pub(crate) fn new() -> io::Result<ReportChannel> {
+        use rustix::net::{socketpair, AddressFamily, SocketFlags, SocketType};
+
+        // Test-only fault seam: fail the channel (take semantics — see `fault`).
         #[cfg(test)]
-        if fault::take_force_report_pipe_failure() {
+        if fault::take_force_report_channel_failure() {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));
         }
-        // Both ends close-on-exec: the child needs its write end only until `exec`, and no
-        // program this process starts may inherit either. Both at fd 3 or above: the write end so
-        // the child's stdio cannot replace it, and the read end so it takes no std slot this
-        // process left closed — that gap is the host's, not cosca's to fill.
-        let (read, write) = io::pipe()?;
-        let read = io::PipeReader::from(rustix::io::fcntl_dupfd_cloexec(&read, 3)?);
-        let write = rustix::io::fcntl_dupfd_cloexec(&write, 3)?;
-        Ok(ReportPipe {
-            read,
-            write: Some(write),
+        // Both ends close-on-exec: the child needs its end only until `exec`, and no program this
+        // process starts may inherit either. Both at fd 3 or above: the child's end so the child's
+        // stdio cannot replace it, and the parent's so it takes no std slot this process left
+        // closed — that gap is the host's, not cosca's to fill.
+        let (read, write) = socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)?;
+        Ok(ReportChannel {
+            read: rustix::io::fcntl_dupfd_cloexec(&read, 3)?,
+            write: Some(rustix::io::fcntl_dupfd_cloexec(&write, 3)?),
         })
     }
 
-    /// A `Copy` handle to the write end for capture by the `pre_exec` closure (which must not
-    /// capture the owning `ReportPipe`: the leaf keeps it).
+    /// A `Copy` handle to the child's end for capture by the `pre_exec` closure (which must not
+    /// capture the owning `ReportChannel`: the leaf keeps it).
     pub(crate) fn slot(&self) -> ReportSlot {
         ReportSlot {
             fd: self
                 .write
                 .as_ref()
-                .expect("the write end is open until the wait")
+                .expect("the child's end is open until the wait")
                 .as_raw_fd(),
         }
     }
 
-    /// Block until the report of `pid`, the child spawned with this pipe's slot, is final, and
-    /// return it. See [`ReportPipe`] for why `spawn` returning is not enough.
+    /// Block until the report of `pid`, the child spawned with this channel's slot, is final, and
+    /// return it. See [`ReportChannel`] for why `spawn` returning is not enough.
     ///
     /// `pid` must be this process's own unreaped child, so no other process can hold its number.
-    pub(crate) fn wait(mut self, pid: u32) -> PlacementReport {
+    ///
+    /// `Err` is `pidfd_open`'s: the child's exit cannot be watched, so only a report already
+    /// sent is final. Nothing blocks in that case; [`CgroupLeaf::take_placement`] decides without
+    /// the report.
+    pub(crate) fn wait(&mut self, pid: u32) -> Result<PlacementReport, io::Error> {
         use rustix::event::{poll, PollFd, PollFlags};
 
-        // The parent's own copy would otherwise keep the pipe open forever.
+        // The parent's own copy would otherwise keep the channel open forever.
         self.write = None;
         let pid = i32::try_from(pid)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
             .expect("a spawned child's pid is a positive i32");
-        // A child cgroup.kill can contain runs on a kernel with pidfds (5.3; cgroup.kill is 5.14),
-        // but the open can still fail: a full fd table, or a seccomp filter. Then only the pipe's
-        // EOF shows the child exited without a report.
-        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-            .inspect_err(|e| {
-                log::debug!("cgroup v2: pidfd_open({pid:?}) failed ({e}); waiting on the report pipe's EOF instead")
-            })
-            .ok();
-        let mut fds = vec![PollFd::new(&self.read, PollFlags::IN)];
-        fds.extend(pidfd.as_ref().map(|pidfd| PollFd::new(pidfd, PollFlags::IN)));
+        #[cfg(test)]
+        let pidfd = if fault::take_force_pidfd_failure() {
+            Err(rustix::io::Errno::MFILE)
+        } else {
+            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+        };
+        #[cfg(not(test))]
+        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty());
+        let pidfd = match pidfd {
+            Ok(pidfd) => pidfd,
+            Err(e) => {
+                debug_assert_ne!(
+                    e,
+                    rustix::io::Errno::SRCH,
+                    "{pid:?} is not an unreaped child of this process"
+                );
+                return match self.read_final() {
+                    PlacementReport::NotReported => Err(e.into()),
+                    sent => Ok(sent),
+                };
+            }
+        };
+        let mut fds = [
+            PollFd::new(&self.read, PollFlags::IN),
+            PollFd::new(&pidfd, PollFlags::IN),
+        ];
         // No timeout: the child reports or exits on its way to `exec`, like `std`'s own wait.
         loop {
             match poll(&mut fds, None) {
                 Ok(_) => break,
                 // `ENOMEM` is the kernel's transient shortage, not an answer.
                 Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
-                Err(e) => panic!("poll on the placement report pipe failed: {e}"),
+                Err(e) => panic!("poll on the placement report channel failed: {e}"),
             }
         }
-        self.read_final()
+        Ok(self.read_final())
     }
 
-    /// The report, read without blocking. The caller has established it is final: the child
-    /// reported, or can no longer report.
+    /// The report sent so far, read without blocking: final once the child has reported or can
+    /// no longer report.
     fn read_final(&mut self) -> PlacementReport {
-        use std::io::Read;
-
-        // A pipe write of 4 bytes is atomic (PIPE_BUF is at least 512): all of it or none.
-        let available = rustix::io::ioctl_fionread(&self.read).expect("FIONREAD on the report pipe");
-        if available == 0 {
+        let queued = rustix::io::ioctl_fionread(&self.read).expect("FIONREAD on the report channel");
+        if queued == 0 {
             return PlacementReport::NotReported;
         }
-        debug_assert!(
-            available >= 4,
-            "a report is written whole, but {available} bytes are queued"
-        );
         let mut report = [0u8; 4];
-        self.read
-            .read_exact(&mut report)
-            .expect("read a report that is already queued");
+        // A queued message makes this return at once. SOCK_SEQPACKET delivers it whole.
+        let read = loop {
+            match rustix::io::read(&self.read, &mut report) {
+                Err(rustix::io::Errno::INTR) => continue,
+                other => break other.expect("read a report that is already queued"),
+            }
+        };
+        debug_assert_eq!(read, report.len(), "a report is one 4-byte message");
         match i32::from_ne_bytes(report) {
             REPORT_PLACED => PlacementReport::Placed,
             errno => {
@@ -655,18 +699,18 @@ impl ReportPipe {
 }
 
 #[cfg(all(target_os = "linux", test))]
-impl ReportPipe {
-    /// The report of a child that has already been reaped, or of writes made in this process.
+impl ReportChannel {
+    /// The report of a child that has already been reaped, or of reports sent from this process.
     pub(crate) fn report_for_test(mut self) -> PlacementReport {
         self.write = None;
         self.read_final()
     }
 }
 
-/// The child-side half of a [`ReportPipe`]: the write end's number, with one async-signal-safe
-/// operation. Owns nothing — the parent's `ReportPipe` closes the pipe.
+/// The child-side half of a [`ReportChannel`]: its end's number, with one async-signal-safe
+/// operation. Owns nothing — the parent's `ReportChannel` closes the channel.
 ///
-/// The closure holding it can OUTLIVE the pipe: `attach` closes the pipe once the spawn has
+/// The closure holding it can OUTLIVE the channel: `attach` closes the channel once the spawn has
 /// returned, and on the spawn-FAILURE path `Prepared` (and with it the leaf) drops first — both
 /// before the `Command` that still owns the closure. The number is stale from then on, which is
 /// sound only because nothing ever invokes the closure again: each `Command` is spawned once.
@@ -678,24 +722,30 @@ pub(crate) struct ReportSlot {
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
-    /// Write the child's outcome. Async-signal-safe: one `write(2)`, no allocation.
+    /// Send the child's outcome. Async-signal-safe: one `send(2)`, no allocation.
     ///
     /// # Safety
-    /// The pipe's write end must still be open at this number, and its read end in the parent,
-    /// which holds from the leaf's creation until the parent has read the report.
+    /// The child's end must still be open at this number, which holds from the leaf's creation
+    /// until the parent has taken the verdict.
     unsafe fn report(self, value: i32) {
         let bytes = value.to_ne_bytes();
         loop {
             // Safety: `bytes` is a valid buffer; the caller guarantees the fd.
-            let written = unsafe { libc::write(self.fd, bytes.as_ptr().cast(), bytes.len()) };
+            let sent = unsafe { libc::send(self.fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };
             // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
-            if written == -1 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            let errno = if sent == -1 {
+                unsafe { *libc::__errno_location() }
+            } else {
+                0
+            };
+            if errno == libc::EINTR {
                 continue;
             }
-            // A 4-byte write into a pipe with room and a live reader is whole and cannot fail. A
-            // child that could not report would read as never placed, so fail loudly in debug.
+            // `EPIPE` is a parent that decided without this report (see
+            // `CgroupLeaf::take_placement`). Anything else is a report lost to a parent still
+            // waiting for it, which would read as never placed, so fail loudly in debug.
             #[cfg(debug_assertions)]
-            if written != bytes.len() as isize {
+            if sent != bytes.len() as isize && errno != libc::EPIPE {
                 // Safety: async-signal-safe.
                 unsafe { libc::abort() };
             }
@@ -711,7 +761,7 @@ impl ReportSlot {
     /// # Safety
     /// As [`ReportSlot::report`].
     pub(crate) unsafe fn report_placed_for_test(self) {
-        // Safety: the caller guarantees the pipe is open.
+        // Safety: the caller guarantees the channel is open.
         unsafe { self.report(REPORT_PLACED) };
     }
 }
@@ -725,7 +775,7 @@ impl ReportSlot {
 /// rule), the closure returns an error and the spawn falls back to the
 /// process-group mechanism.
 ///
-/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report pipe: the child
+/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report channel: the child
 /// needs them only until its `exec`.
 ///
 /// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill` and
@@ -741,7 +791,7 @@ pub(crate) struct CgroupLeaf {
     procs_fd: Option<OwnedFd>,
     /// Where the forked child reports whether its self-placement write succeeded. `None` once
     /// the placement verdict is taken.
-    report: Option<ReportPipe>,
+    report: Option<ReportChannel>,
     /// Whether the child reported entering the leaf, recorded when `report` is released.
     entered: bool,
 }
@@ -764,9 +814,9 @@ impl CgroupLeaf {
     /// report can still arrive: from `Drop`, which runs before the verdict only when the spawn
     /// failed, and `std` reaps a child whose spawn failed before returning the error.
     fn child_entered(&mut self) -> bool {
-        if let Some(mut pipe) = self.report.take() {
-            pipe.write = None;
-            self.entered = pipe.read_final() == PlacementReport::Placed;
+        if let Some(mut channel) = self.report.take() {
+            channel.write = None;
+            self.entered = channel.read_final() == PlacementReport::Placed;
         }
         self.entered
     }
@@ -796,26 +846,34 @@ impl CgroupLeaf {
     /// Whether `pid` entered this leaf: `Ok` when its own write into it succeeded.
     ///
     /// Used once, post-spawn (parent side). Blocks until the report is final — `spawn` returning
-    /// does not make it so (see [`ReportPipe`]). The child's report is the verdict: `cgroup.procs`
+    /// does not make it so (see [`ReportChannel`]) — or, when it cannot wait, decides without it
+    /// (see [`CgroupLeaf::decide_unwaitable`]). The child's report is the verdict: `cgroup.procs`
     /// lists only live tasks, so a placed child that has already exited reads back absent from
     /// it. Only a child that reported no successful write has `cgroup.procs` and its `/proc`
     /// state read, to diagnose why — see [`NotPlaced`].
     ///
-    /// Taking the verdict closes the `cgroup.procs` fd and the report pipe: nothing
+    /// Taking the verdict closes the `cgroup.procs` fd and the report channel: nothing
     /// needs either after the child's `exec`, and otherwise every live contained child would
-    /// hold one fd and one mapping in the supervisor.
-    pub(crate) fn take_placement(&mut self, pid: u32) -> Result<(), NotPlaced> {
-        let report = self.report.take().expect(RELEASED).wait(pid);
+    /// hold three fds in the supervisor.
+    ///
+    /// The outer `Err` is a spawn that must fail: membership could not be decided, so the child
+    /// was killed (see [`CgroupLeaf::decide_unwaitable`]).
+    pub(crate) fn take_placement(&mut self, pid: u32) -> Result<Result<(), NotPlaced>, crate::error::Error> {
+        let mut channel = self.report.take().expect(RELEASED);
         self.procs_fd = None;
+        let report = match channel.wait(pid) {
+            Ok(report) => report,
+            Err(source) => return self.decide_unwaitable(pid, &mut channel, source),
+        };
         self.entered = report == PlacementReport::Placed;
         let report = match report {
-            PlacementReport::Placed => return Ok(()),
+            PlacementReport::Placed => return Ok(Ok(())),
             PlacementReport::NotReported => NotEntered::NotReported,
             PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
         };
         let path = self.leaf_path.join("cgroup.procs");
         let child_state = proc_state(pid);
-        Err(match fs::read_to_string(&path) {
+        Ok(Err(match fs::read_to_string(&path) {
             Ok(procs) => NotPlaced::Absent {
                 pid,
                 path,
@@ -829,7 +887,89 @@ impl CgroupLeaf {
                 source,
                 report,
             },
-        })
+        }))
+    }
+
+    /// Decide membership for a child whose report has not arrived and cannot be waited for:
+    /// `pidfd_open` failed with `source`, and waiting on the channel's EOF could block forever
+    /// (see [`ReportChannel`]).
+    ///
+    /// The leaf is removed. `rmdir` succeeds only on a leaf with no live member, and a removed
+    /// leaf admits none: the child's later `cgroup.procs` write fails with `ENODEV`. So:
+    /// - removed, no `Placed` sent: the child is not in the leaf and never will be — degrade;
+    /// - removed, `Placed` sent: the child entered, and every member has since exited;
+    /// - `EBUSY` with the child's own `/proc/<pid>/cgroup` inside the leaf: it entered;
+    /// - anything else: the child may still enter a leaf cosca can neither wait on nor close.
+    ///   It is killed, then the leaf is killed through, and the spawn fails.
+    fn decide_unwaitable(
+        &mut self,
+        pid: u32,
+        channel: &mut ReportChannel,
+        source: io::Error,
+    ) -> Result<Result<(), NotPlaced>, crate::error::Error> {
+        let why = match fs::remove_dir(&self.leaf_path) {
+            Ok(()) => None,
+            Err(e) if removed_after_drain(&e) => None,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                if self.holds(pid) {
+                    log::debug!(
+                        "cgroup v2: pidfd_open failed ({source}), but child {pid} is already in its leaf {}",
+                        self.leaf_path.display()
+                    );
+                    self.entered = true;
+                    return Ok(Ok(()));
+                }
+                Some(format!("its leaf is occupied ({e}) but not by the child"))
+            }
+            Err(e) => Some(format!("its leaf could not be removed ({e})")),
+        };
+        let Some(why) = why else {
+            self.entered = channel.read_final() == PlacementReport::Placed;
+            return Ok(if self.entered {
+                Ok(())
+            } else {
+                Err(NotPlaced::Unwaitable { pid, source })
+            });
+        };
+        Err(self.abandon(pid, &format!("pidfd_open failed ({source}) and {why}")))
+    }
+
+    /// Whether `pid`'s own cgroup is this leaf or inside it.
+    fn holds(&self, pid: u32) -> bool {
+        let Some(leaf_name) = self.leaf_path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|text| parse_v2_relative_path(&text).map(|path| path.split('/').any(|part| part == leaf_name)))
+            .unwrap_or(false)
+    }
+
+    /// Fail a spawn whose membership cannot be decided: kill the child, which ends its chance to
+    /// enter the leaf, then kill through the leaf whatever the child brought into it.
+    fn abandon(&mut self, pid: u32, why: &str) -> crate::error::Error {
+        let child = Pid::from_raw(i32::try_from(pid).expect("a spawned child's pid is a positive i32"));
+        // `pid` is this process's own unreaped child, so no other process holds its number.
+        let _ = kill(child, Signal::SIGKILL);
+        // Its exit, not its reaping: the spawn's error path reaps it.
+        let flags = nix::sys::wait::WaitPidFlag::WEXITED | nix::sys::wait::WaitPidFlag::WNOWAIT;
+        while let Err(nix::errno::Errno::EINTR) = nix::sys::wait::waitid(nix::sys::wait::Id::Pid(child), flags) {}
+        // A member may still be in the leaf, so `Drop` must kill through it if it stays.
+        self.entered = true;
+        let kill = self.hard_kill();
+        // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
+        if kill.is_ok() {
+            let _ = self.wait_drained(None);
+        }
+        crate::error::Error::Containment {
+            detail: format!(
+                "cannot tell whether child {pid} entered its cgroup leaf: {why}; the child was killed{}",
+                match kill {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(", but killing through its leaf failed ({e})"),
+                }
+            ),
+        }
     }
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
@@ -954,12 +1094,12 @@ impl CgroupLeaf {
         CgroupLeaf {
             leaf_path,
             procs_fd: None,
-            report: Some(ReportPipe::new().expect("open a placement-report pipe")),
+            report: Some(ReportChannel::new().expect("open a placement-report channel")),
             entered: false,
         }
     }
 
-    /// Whether the leaf still holds its `cgroup.procs` fd or its report pipe.
+    /// Whether the leaf still holds its `cgroup.procs` fd or its report channel.
     pub(crate) fn holds_spawn_resources(&self) -> bool {
         self.procs_fd.is_some() || self.report.is_some()
     }
@@ -1028,13 +1168,14 @@ pub(crate) mod fault {
     use std::cell::Cell;
     thread_local! {
         static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
-        static FORCE_REPORT_PIPE_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
         static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Treat the NEXT created leaf as exposing `cgroup.kill`. Supplies the single fact a temp
     /// directory cannot, so every step AFTER the check — the `cgroup.procs` open, the report
-    /// pipe, and the unwind that removes the leaf — runs for real, against the kernel's own
+    /// channel, and the unwind that removes the leaf — runs for real, against the kernel's own
     /// errnos, on any Linux host.
     pub(crate) fn set_force_kill_supported(on: bool) {
         FORCE_KILL_SUPPORTED.with(|f| f.set(on));
@@ -1046,17 +1187,29 @@ pub(crate) mod fault {
         FORCE_KILL_SUPPORTED.with(|f| f.get())
     }
 
-    /// Fail the NEXT `ReportPipe::new` with `EMFILE` — the real exhaustion this pipe can hit,
+    /// Fail the NEXT `ReportChannel::new` with `EMFILE` — the real exhaustion this channel can hit,
     /// which no test may provoke for real: the fd limit is process-wide, and would fail every
     /// other test running in this binary.
-    pub(crate) fn set_force_report_pipe_failure(on: bool) {
-        FORCE_REPORT_PIPE_FAILURE.with(|f| f.set(on));
+    pub(crate) fn set_force_report_channel_failure(on: bool) {
+        FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.set(on));
     }
-    pub(crate) fn take_force_report_pipe_failure() -> bool {
-        FORCE_REPORT_PIPE_FAILURE.with(|f| f.replace(false))
+    pub(crate) fn take_force_report_channel_failure() -> bool {
+        FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.replace(false))
     }
-    pub(crate) fn report_pipe_failure_armed() -> bool {
-        FORCE_REPORT_PIPE_FAILURE.with(|f| f.get())
+    pub(crate) fn report_channel_failure_armed() -> bool {
+        FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.get())
+    }
+
+    /// Fail the NEXT `pidfd_open` of a report wait with `EMFILE`. The seccomp denial it also
+    /// stands for is exercised for real, in a process of its own, by `tests/spawn_io.rs`.
+    pub(crate) fn set_force_pidfd_failure(on: bool) {
+        FORCE_PIDFD_FAILURE.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_pidfd_failure() -> bool {
+        FORCE_PIDFD_FAILURE.with(|f| f.replace(false))
+    }
+    pub(crate) fn pidfd_failure_armed() -> bool {
+        FORCE_PIDFD_FAILURE.with(|f| f.get())
     }
 
     /// Put a directory inside the NEXT leaf whose creation fails, just before its unwind runs, so
@@ -1163,12 +1316,12 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         }
     }
 
-    // The report pipe is opened before the procs fd so a failure here unwinds nothing but
+    // The report channel is opened before the procs fd so a failure here unwinds nothing but
     // the directory: a leaf whose child could not report its placement outcome would reopen
     // exactly the silence this module is reporting its way out of.
-    let report = match ReportPipe::new() {
+    let report = match ReportChannel::new() {
         Ok(r) => r,
-        Err(e) => return Err(fail(&leaf_path, LeafError::OpenReportPipe(e))),
+        Err(e) => return Err(fail(&leaf_path, LeafError::OpenReportChannel(e))),
     };
 
     // Open cgroup.procs for writing, close-on-exec: the child's pre_exec write runs after fork
@@ -1220,7 +1373,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
 ///
 /// # Safety
 /// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
-/// open, writable fd in the child process, and `slot`'s pipe must still be open.
+/// open, writable fd in the child process, and `slot`'s channel must still be open.
 /// Async-signal-safe: raw `libc::write` + `libc::close`, no allocation, no format strings.
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
@@ -1241,7 +1394,7 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
         // `write(2)` only ever sets a positive errno, but a report of -1 means "placed", so a
         // nonsensical value is mapped to EIO rather than read back as a fabricated placement.
         let reported = if errno > 0 { errno } else { libc::EIO };
-        // Safety: the caller guarantees the slot's pipe is open.
+        // Safety: the caller guarantees the slot's channel is open.
         unsafe { slot.report(reported) };
         Err(io::Error::from_raw_os_error(errno))
     } else {

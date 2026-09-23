@@ -183,8 +183,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // write would hit a closed/wrong fd (silent CgroupV2->ProcessGroup downgrade,
     // or a stray "0" corrupting the user's fd). By running command-fds LAST, the
     // cgroup write+close happens while its fd is still valid; command-fds may then
-    // freely reuse the now-closed slot. The same holds for the pipe the child
-    // reports that write's outcome through (`cgroup::ReportPipe`). Net child order: std stdio
+    // freely reuse the now-closed slot. The same holds for the channel the child
+    // reports that write's outcome through (`cgroup::ReportChannel`). Net child order: std stdio
     // (0/1/2) -> the `raw_executable()` chdir (`build_std_command`'s `enter_in_child`) ->
     // containment pre_execs (cgroup placement / setsid) -> command-fds dup2 (last).
     //
