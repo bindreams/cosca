@@ -1221,35 +1221,15 @@ fn literal_rows(rows: &[(&str, &str, &'static str)]) -> Vec<Resolution> {
 /// So under a UNC root the share name is the floor: `\\srv\x.bat\y\..\..` is `\\srv\x.bat`, a
 /// batch-shaped name. Under `\\.\` the device name is an ordinary component: `\\.\C:\..\..\x.bat`
 /// is `\\.\x.bat`. `/` and `\` are interchangeable in the leading pair, so `//srv/…` and `\/srv\…`
-/// are UNC paths too. A `..` in the share slot is not popped: it IS the share name.
+/// are UNC paths too. Server and share are positional: a `..`, dots-only, empty or one-space
+/// segment in either slot is part of the root, not an operation on it, and neither slot is
+/// trimmed. `\\...\x.bat\y\..` is `\\...\x.bat`.
 ///
 /// String-level only: `GetFullPathNameW` contacts no server and opens no device.
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
 fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
     let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
-    // Printed only, until measured.
-    for input in [
-        r"\\...\x.bat\y\..",
-        r"\\...\x.bat\..",
-        r"\\...\x.bat\..\..\y",
-        r"\\..\x.bat\y\..",
-        r"\\..\x.bat\..",
-        r"\\\x.bat\y\..",
-        r"\\\x.bat\..",
-        r"\\\x.bat",
-        r"\\ \x.bat\y\..",
-        r"\\. \x.bat\y\..",
-        r"\\.. \x.bat\y\..",
-        r"//../x.bat/y/..",
-        r"//.../x.bat/y/..",
-        r"\\srv.\x.bat\y\..",
-    ] {
-        match full_path_name_parts(input) {
-            Ok((resolved, part)) => println!("  PENDING {input:?} -> {resolved:?}  file_part={part:?}"),
-            Err(why) => println!("  PENDING {why}"),
-        }
-    }
     let mut facts = Disagreements::default();
     let rows = literal_rows(&[
         (
@@ -1313,6 +1293,43 @@ fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
             r"\\.\C:\dir\x.bat",
             "a device path loses a trailing dot",
         ),
+        (
+            r"\\...\x.bat\y\..",
+            r"\\...\x.bat",
+            "a dots-only server is part of the root",
+        ),
+        (
+            r"\\...\x.bat\..",
+            r"\\...\x.bat",
+            "a dots-only server is part of the root",
+        ),
+        (
+            r"\\...\x.bat\..\..\y",
+            r"\\...\x.bat\y",
+            "a dots-only server is part of the root",
+        ),
+        (
+            r"\\..\x.bat\y\..",
+            r"\\..\x.bat",
+            "a `..` server is part of the root, not a pop",
+        ),
+        (
+            r"\\..\x.bat\..",
+            r"\\..\x.bat",
+            "a `..` server is part of the root, not a pop",
+        ),
+        (r"\\\x.bat\y\..", r"\\\x.bat", "an empty server is part of the root"),
+        (r"\\\x.bat\..", r"\\\x.bat", "an empty server is part of the root"),
+        (r"\\ \x.bat\y\..", r"\\ \x.bat", "a one-space server is kept as given"),
+        (
+            r"\\. \x.bat\y\..",
+            r"\\. \x.bat",
+            "`. ` is a server, not the device marker",
+        ),
+        (r"\\.. \x.bat\y\..", r"\\.. \x.bat", "a server keeps its trailing space"),
+        (r"\\srv.\x.bat\y\..", r"\\srv.\x.bat", "a server keeps its trailing dot"),
+        (r"//../x.bat/y/..", r"\\..\x.bat", "slash-spelled, a `..` server"),
+        (r"//.../x.bat/y/..", r"\\...\x.bat", "slash-spelled, a dots-only server"),
     ]);
     check_resolutions(&rows, &mut facts, &mut failures);
     assert!(
@@ -1378,34 +1395,18 @@ fn verbatim_marker_spellings_resolve_alike() {
     facts.assert_none();
 }
 
-/// Canary: a `:stream` suffix stays in the final component, and only a trailing dot or space is
-/// trimmed from it.
+/// Canary: a `:stream` suffix stays in the final component, and only a trailing dot or space at
+/// the END of that whole component is trimmed.
 ///
 /// So the resolved name ends in the stream name: `x.exe:payload.bat` resolves to a string std's
-/// `has_bat_extension` reads as a batch file, `x.bat:s` to one it does not. String-level only: no
-/// stream is created or opened.
+/// `has_bat_extension` reads as a batch file, `x.bat:s` to one it does not. `GetFullPathNameW` does
+/// not split at the separator before trimming: `x.bat.:s` and `x.bat :s` (one space) come back
+/// unchanged. String-level only: no stream is created or opened, so which file the file system
+/// would open for them is not measured here.
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
 fn a_stream_suffix_stays_in_the_final_component() {
     let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
-    // Printed only, until measured.
-    for input in [
-        r"x.bat.:s",
-        r"x.bat :s",
-        r"C:\dir\x.bat.:s",
-        r"C:\dir\x.bat :s",
-        r"C:\dir\x.bat. :s",
-        r"C:\dir\x.bat.:s.",
-        r"C:\dir\x.bat..:s",
-        r"C:\dir\x.bat.::$DATA",
-        r"C:\dir\x.exe.:p.bat",
-        r"\\?\C:\dir\x.bat.:s",
-    ] {
-        match full_path_name_parts(input) {
-            Ok((resolved, part)) => println!("  PENDING {input:?} -> {resolved:?}  file_part={part:?}"),
-            Err(why) => println!("  PENDING {why}"),
-        }
-    }
     let mut facts = Disagreements::default();
     let mut rows = literal_rows(&[
         (r"C:\dir\x.bat:s", r"C:\dir\x.bat:s", "kept as given"),
@@ -1441,6 +1442,38 @@ fn a_stream_suffix_stays_in_the_final_component() {
             r"\\?\C:\dir\x.exe:p.bat",
             "kept under the verbatim marker",
         ),
+        (
+            r"C:\dir\x.bat.:s",
+            r"C:\dir\x.bat.:s",
+            "a dot before the separator is kept",
+        ),
+        (
+            r"C:\dir\x.bat :s",
+            r"C:\dir\x.bat :s",
+            "a space before the separator is kept",
+        ),
+        (r"C:\dir\x.bat. :s", r"C:\dir\x.bat. :s", "both are kept"),
+        (r"C:\dir\x.bat..:s", r"C:\dir\x.bat..:s", "two dots are kept"),
+        (
+            r"C:\dir\x.bat.:s.",
+            r"C:\dir\x.bat.:s",
+            "only the end of the whole component is trimmed",
+        ),
+        (
+            r"C:\dir\x.bat.::$DATA",
+            r"C:\dir\x.bat.::$DATA",
+            "kept with a stream type",
+        ),
+        (
+            r"C:\dir\x.exe.:p.bat",
+            r"C:\dir\x.exe.:p.bat",
+            "a dot before a batch-named stream is kept",
+        ),
+        (
+            r"\\?\C:\dir\x.bat.:s",
+            r"\\?\C:\dir\x.bat.:s",
+            "kept under the verbatim marker",
+        ),
     ]);
     match std::env::current_dir() {
         Ok(cwd) => {
@@ -1451,6 +1484,12 @@ fn a_stream_suffix_stays_in_the_final_component() {
                 .to_string();
             println!("current directory: {cwd:?}");
             rows.push(("x.bat:s".to_string(), format!(r"{cwd}\x.bat:s"), "relative, kept"));
+            rows.push(("x.bat.:s".to_string(), format!(r"{cwd}\x.bat.:s"), "relative, dot kept"));
+            rows.push((
+                "x.bat :s".to_string(),
+                format!(r"{cwd}\x.bat :s"),
+                "relative, space kept",
+            ));
             rows.push((
                 "x.exe:payload.bat".to_string(),
                 format!(r"{cwd}\x.exe:payload.bat"),
