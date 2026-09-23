@@ -73,9 +73,9 @@ async fn async_fd3_pipe_in_feeds_child() {
 
 /// Async twin of the sync `argv_only_fd3_routes_through_the_raw_backend_and_works`: an argv-only
 /// tokio `Command` (no `.executable()`) that maps fd >= 3 still routes through the ASYNC raw
-/// backend. std has no way to hand a child fd >= 3 on Windows at all (see `routes_to_raw_backend`'s
-/// doc), so fd 3 actually delivering the marker bytes below is itself proof this went through the
-/// raw backend.
+/// backend. std has no way to hand a child fd >= 3 on Windows at all: `spawn_unelevated`'s fd >= 3
+/// collection loop is `#[cfg(unix)]`-gated (`src/child/spawn.rs`), so fd 3 actually delivering the
+/// marker bytes below is itself proof this went through the raw backend.
 #[tokio::test]
 async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut c = cosca::tokio::Command::new();
@@ -88,6 +88,32 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     r.read_to_string(&mut s).await.unwrap();
     child.wait().await.unwrap();
     assert_eq!(s, "argv-only-fd3");
+}
+
+/// Async twin of the sync `commandline_only_fd3_routes_through_the_raw_backend_and_works`: a tokio
+/// `Command` built with `.commandline(...)` instead of `.args(...)`, no `.executable()`, that maps
+/// fd >= 3 — exercising `program_token`'s `CommandLine` arm (`first_token_wide`) through the ASYNC
+/// raw backend, a different code path from the argv-only test above. Same proof shape: std has no
+/// way to hand a child fd >= 3 on Windows at all (`spawn_unelevated`'s fd >= 3 collection loop is
+/// `#[cfg(unix)]`-gated, `src/child/spawn.rs`), so fd 3 delivering the marker bytes below is itself
+/// proof this went through the raw backend via the `CommandLine` token.
+#[tokio::test]
+async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
+    let wide_args: Vec<Vec<u16>> = [common::testbin(), "write-fd", "3", "commandline-only-fd3"]
+        .iter()
+        .map(|a| a.encode_utf16().collect())
+        .collect();
+    let refs: Vec<&[u16]> = wide_args.iter().map(Vec::as_slice).collect();
+    let line = String::from_utf16(&cosca::quote::windows::join_wide(&refs)).unwrap();
+
+    let mut c = cosca::tokio::Command::new();
+    c.commandline(line).fd(3, cosca::Stdio::pipe_out()).unwrap();
+    let mut child = c.spawn().expect("raw spawn via the commandline + fd>=3 route");
+    let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
+    let mut s = String::new();
+    r.read_to_string(&mut s).await.unwrap();
+    child.wait().await.unwrap();
+    assert_eq!(s, "commandline-only-fd3");
 }
 
 // Async containment over the raw backend (Plan 12 Task 8) =====
