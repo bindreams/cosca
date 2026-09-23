@@ -33,9 +33,8 @@ async fn tokio_child_elevation_is_none_without_elevate() {
 }
 
 /// The async builder hand-mirrors the sync one and parity is not compiler-enforced (see this
-/// module's own doc). `raw_executable` was missing for exactly that reason: the async raw backend
-/// carried an `Exact` arm that no public async API could reach, so the "load exactly this file"
-/// contract silently did not exist on the tokio side.
+/// module's own doc), so a delegate can silently go missing. This test pins that `raw_executable`
+/// exists and forwards correctly.
 ///
 /// Asserted over the RECORDED spec rather than "a method was called", so it also pins that the
 /// delegate forwards to `raw_executable` and not to `executable`.
