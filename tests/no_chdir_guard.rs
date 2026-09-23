@@ -170,12 +170,6 @@ fn visit(dir: &Path, root: &Path, scanned: &mut usize, offenders: &mut Vec<Strin
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        // This guard's own source necessarily spells out the needle it looks for (in the
-        // allowlist and in `NEEDLE_FRAGMENTS` itself), so it must exclude itself rather than the
-        // pattern it is enforcing everywhere else.
-        if rel == "tests/no_chdir_guard.rs" {
-            continue;
-        }
         for (i, line) in text.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("//") {
