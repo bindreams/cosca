@@ -368,7 +368,8 @@ fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
 ///
 /// A trailing run of two or more periods is kept, and so are trailing spaces: interior `...`, `" "`
 /// and `x ` are names, `x.` becomes `x`, `.. .` becomes `.. `. Being names, a following `..` pops
-/// them: `y\x.bat\...\..` is `y\x.bat`. Both spellings, at one and two segments from the end,
+/// them: `y\x.bat\...\..` is `y\x.bat`. Every dots-and-spaces segment but `.` and `..` is such a
+/// name, ending in a period or a space alike, which is the reading the batch gate takes. Both spellings, at one and two segments from the end,
 /// behave alike. This differs from the FINAL-component rule
 /// ([`a_final_dots_and_spaces_component_drops_out_and_pops_nothing`]), so a model of path
 /// normalisation needs both.
@@ -388,8 +389,14 @@ fn an_interior_segment_loses_only_a_single_trailing_period() {
         ("x. ", "x. "),
         ("x .", "x "),
         ("...", "..."),
+        ("....", "...."),
         (".. .", ".. "),
+        (". .", ". "),
+        (" .", " "),
         (" ", " "),
+        ("  ", "  "),
+        (".. ", ".. "),
+        (". ", ". "),
     ];
     canary("Windows", |facts, failures| {
         let mut rows = Vec::new();
@@ -419,6 +426,10 @@ fn an_interior_segment_loses_only_a_single_trailing_period() {
                     (r"y\x.bat\...\..", "`...` is kept, then popped"),
                     (r"y\x.bat\ \..", "a lone space is kept, then popped"),
                     (r"y\x.bat\.. .\..", "`.. .` becomes the name `.. `, then popped"),
+                    (r"y\x.bat\....\..", "`....` is kept, then popped"),
+                    (r"y\x.bat\  \..", "two spaces are kept, then popped"),
+                    (r"y\x.bat\.. \..", "`.. ` is a name, not `..`, and is popped"),
+                    (r"y\x.bat\. \..", "`. ` is a name, not `.`, and is popped"),
                 ]
                 .map(|(input, why)| (input.to_string(), format!(r"{cwd}\y\x.bat"), why));
                 check_resolutions(&popped, facts, failures);
