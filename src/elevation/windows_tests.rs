@@ -213,23 +213,23 @@ fn a_clean_unelevated_request_plans_a_launch() {
     assert_eq!(launch.show, SW_SHOWNORMAL);
 }
 
-/// A `%` in `current_dir()` is refused, whatever the caller's privilege: whether the consent
-/// launch expands it in `lpDirectory` is unmeasured.
+/// A `%` in the working directory is refused at the consent launch: whether it expands `%` in
+/// `lpDirectory` is unmeasured. An already-elevated caller re-spawns through `CreateProcessW`,
+/// which expands nothing, so it is not held to this.
 #[test]
-fn a_percent_in_current_dir_is_refused() {
-    for elevated in [false, true] {
-        let mut c = Command::new();
-        c.args([r"C:\Windows\System32\whoami.exe"])
-            .current_dir(r"C:\work\%TEMP%")
-            .elevate();
-        match super::plan_runas(&c, &win_host(elevated)) {
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-            other => panic!(
-                "elevated={elevated}: expected Io(InvalidInput), got {:?}",
-                other.map(|_| "Ok")
-            ),
-        }
+fn a_percent_in_current_dir_is_refused_at_the_consent_launch() {
+    let mut c = Command::new();
+    c.args([r"C:\Windows\System32\whoami.exe"])
+        .current_dir(r"C:\work\%TEMP%")
+        .elevate();
+    match super::plan_runas(&c, &win_host(false)) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        other => panic!("expected Io(InvalidInput), got {:?}", other.map(|_| "Ok")),
     }
+    assert!(matches!(
+        super::plan_runas(&c, &win_host(true)),
+        Ok(super::RunasStep::AlreadyElevated)
+    ));
 }
 
 /// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
@@ -309,14 +309,16 @@ fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// The allowlist is part of `shell_file::reject_elevated_program`, which runs above the
-/// short-circuit, so an already-elevated caller gets the same refusal though it re-spawns through
-/// `CreateProcessW`, which assumes no default extension.
+/// The allowlist runs at the consent launch only: an already-elevated caller re-spawns through
+/// `CreateProcessW`, which assumes no default extension, so it is not held to it.
 #[test]
-fn an_extensionless_exact_program_is_refused_when_already_elevated_too() {
+fn an_extensionless_exact_program_is_not_refused_when_already_elevated() {
     let mut c = Command::new();
     c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
-    assert!(is_pathext_refusal(super::plan_runas(&c, &win_host(true)).map(|_| ())));
+    assert!(matches!(
+        super::plan_runas(&c, &win_host(true)),
+        Ok(super::RunasStep::AlreadyElevated)
+    ));
 }
 
 /// Negative control: a loadable image name still plans a launch.
@@ -729,65 +731,60 @@ fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_
     }
 }
 
-/// A token ShellExecuteEx would complete by lookup is refused: an extension-less one can become
-/// `setup.bat` (`PathResolveW` with `PRF_TRYPROGRAMEXTENSIONS`), and any other extension runs
-/// through its association.
+/// A token with no `.exe`/`.com` candidate is refused at the consent launch: an extensionless
+/// `lpFile` can become `setup.bat` (`PathResolveW` with `PRF_TRYPROGRAMEXTENSIONS`), and any other
+/// extension runs through its association. An extensionless NAME is resolved to `name.exe`
+/// instead; see `windows_lp_file_tests`.
 #[test]
 fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
-    for elevated in [false, true] {
-        for probe in [
-            r"C:\tools\setup",
-            "setup",
-            "setup.lnk",
-            "setup.msc",
-            r"C:\tools\setup.exe.",
-        ] {
-            let mut c = Command::new();
-            c.args([probe, "a&calc"]).elevate();
-            assert!(
-                is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
-                "elevated={elevated}: {probe:?} may be completed or dispatched by ShellExecuteEx"
-            );
-        }
+    for probe in ["setup.lnk", "setup.msc", r"C:\tools\setup.exe.", r"C:\tools\%X%"] {
+        let mut c = Command::new();
+        c.args([probe, "a&calc"]).elevate();
+        assert!(
+            is_pathext_refusal(super::plan_runas(&c, &win_host(false)).map(|_| ())),
+            "{probe:?} may be completed or dispatched by ShellExecuteEx"
+        );
     }
 }
 
-/// An elevated program that is not fully qualified is refused: a relative or bare token leaves
-/// ShellExecuteEx a lookup to make, App Paths included, which is unmeasured for the consent launch.
+/// No relative token reaches `ShellExecuteEx`: at the consent launch each is resolved to a fully
+/// qualified path or refused. A drive-relative one is refused on its shape; a relative or rooted
+/// one that names no file is `NotFound`.
 #[test]
-fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
-    for elevated in [false, true] {
-        for probe in ["whoami.exe", r"tools\setup.exe", r"\tools\setup.exe", "C:setup.exe"] {
-            let mut c = Command::new();
-            c.args([probe]).elevate();
-            assert!(
-                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
-                "elevated={elevated}: {probe:?} is not fully qualified"
-            );
+fn a_relative_program_is_resolved_or_refused_never_sent_relative() {
+    for (probe, kind) in [
+        ("C:setup.exe", std::io::ErrorKind::InvalidInput),
+        (r"cosca-missing\setup.exe", std::io::ErrorKind::NotFound),
+        (r"\cosca-missing\setup.exe", std::io::ErrorKind::NotFound),
+    ] {
+        let mut c = Command::new();
+        c.args([probe]).elevate();
+        match super::plan_runas(&c, &win_host(false)) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), kind, "{probe:?}: {e}"),
+            other => panic!("{probe:?}: expected Io({kind:?}), got {:?}", other.map(|_| "Ok")),
         }
     }
 }
 
-/// A token ShellExecuteEx rewrites before it opens it is refused, whatever it rewrites to: a
-/// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`. The quote is refused
-/// as a quote; the rest end in no `.exe`/`.com`.
+/// A token ShellExecuteEx would rewrite before opening it is refused at the consent launch,
+/// whatever it rewrites to: a quoted batch path, a percent-encoded `file:` URL and a `shell:` name
+/// all name no `.exe`/`.com` file. The quoted one is refused by whichever gate reads it first, the
+/// batch gate or the allowlist, so only the refusal is pinned.
 #[test]
 fn launch_runas_refuses_a_token_shell_execute_rewrites() {
-    for elevated in [false, true] {
+    let mut quoted = Command::new();
+    quoted.args([r#""C:\tools\setup.bat""#, "a&calc"]).elevate();
+    assert!(
+        super::plan_runas(&quoted, &win_host(false)).is_err(),
+        "a quoted batch path is refused"
+    );
+    for probe in ["file:///C:/tools/setup%2Ebat", "shell:startup"] {
         let mut c = Command::new();
-        c.args([r#""C:\tools\setup.bat""#, "a&calc"]).elevate();
+        c.args([probe, "a&calc"]).elevate();
         assert!(
-            is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
-            "elevated={elevated}: a quote is refused"
+            is_pathext_refusal(super::plan_runas(&c, &win_host(false)).map(|_| ())),
+            "{probe:?} is not a fully qualified image path"
         );
-        for probe in ["file:///C:/tools/setup%2Ebat", "shell:startup", r"C:\tools\%X%"] {
-            let mut c = Command::new();
-            c.args([probe, "a&calc"]).elevate();
-            assert!(
-                is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
-                "elevated={elevated}: {probe:?} is not a fully qualified image path without a quote"
-            );
-        }
     }
 }
 

@@ -19,7 +19,7 @@ fn assert_refused(c: &Command, process_cwd: &Path, what: &str) {
     };
     match super::plan_runas_with(c, &win_host(false), &dirs).map(|_| ()) {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => assert!(
-            e.to_string().contains("expands"),
+            e.to_string().contains("may not hold a %"),
             "{what}: the reason must be named: {e}"
         ),
         other => panic!("{what}: expected Io(InvalidInput), got {other:?}"),
@@ -106,7 +106,10 @@ fn fixture_a_percent_from_path() {
     // The real environment, which carries the `PATH` under test.
     match super::plan_runas(&c, &win_host(false)).map(|_| ()) {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            assert!(e.to_string().contains("expands"), "the reason must be named: {e}")
+            assert!(
+                e.to_string().contains("may not hold a %"),
+                "the reason must be named: {e}"
+            )
         }
         other => panic!("a % from a PATH entry: expected Io(InvalidInput), got {other:?}"),
     }
