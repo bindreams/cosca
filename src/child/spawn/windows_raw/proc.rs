@@ -221,7 +221,7 @@ pub(crate) fn create_process(
     app: Option<&[u16]>,
     cmdline: &mut [u16],
     si: &mut STARTUPINFOEXW,
-    env: &Option<Vec<u16>>,
+    env: Option<&[u16]>,
     cwd: &Option<Vec<u16>>,
     flags: u32,
 ) -> Result<(OwnedHandle, u32), Error> {
@@ -229,7 +229,7 @@ pub(crate) fn create_process(
     let mut pi = PROCESS_INFORMATION::default();
     let app = app.map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
     let cwd = cwd.as_ref().map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
-    let env_ptr = env.as_ref().map(|b| b.as_ptr() as *const core::ffi::c_void);
+    let env_ptr = env.map(|b| b.as_ptr() as *const core::ffi::c_void);
     // SAFETY: all pointers are valid for the call; `cmdline` is a mutable NUL-terminated buffer
     // `CreateProcessW` may edit in place; `&si.StartupInfo` is backed by the full `STARTUPINFOEXW`
     // (cb set above, EXTENDED_STARTUPINFO_PRESENT in `flags`).

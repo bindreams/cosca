@@ -286,6 +286,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
+            cmd.env_ops(),
         )?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
@@ -321,6 +322,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
+            cmd.env_ops(),
         )?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below

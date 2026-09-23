@@ -321,6 +321,7 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
         &crate::command::flags::FlagsRequest::default(),
         &[3, 4, 5, 6, 7, 8, 9, 10],
         false,
+        &[],
     )
     .expect("prepare is infallible off Windows");
     let marker = prepared.marker.as_ref().expect("a contained macOS root gets a marker");
@@ -354,6 +355,7 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
         &crate::command::flags::FlagsRequest::default(),
         &[],
         false,
+        &[],
     )
     .expect("prepare is infallible off Windows");
     assert!(prepared.marker.is_none(), "the forced failure must yield no marker");
@@ -374,6 +376,7 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
         &crate::command::flags::FlagsRequest::default(),
         &[],
         true,
+        &[],
     )
     .expect("prepare is infallible off Windows");
     assert!(

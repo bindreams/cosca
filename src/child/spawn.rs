@@ -205,6 +205,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
+            cmd.env_ops(),
         )?;
 
         // On Unix, hand n>=3 child ends to command-fds. This installs a pre_exec hook
@@ -240,6 +241,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
+            cmd.env_ops(),
         )?;
 
         // On Unix, hand n>=3 child ends to command-fds. See the macOS branch above for why
@@ -573,7 +575,7 @@ fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error
     Ok(())
 }
 
-fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
+pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
     for op in ops {
         match op {
             EnvOp::Set(k, v) => {

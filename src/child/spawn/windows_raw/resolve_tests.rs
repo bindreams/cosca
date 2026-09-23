@@ -2,6 +2,29 @@ use super::*;
 use crate::command::EnvOp;
 use std::ffi::OsString;
 
+/// Resolve against the PATH `ops` give a child of this process, as a spawn does.
+fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
+    let env = ChildEnv::capture(&EnvSnapshot::read().unwrap(), ops);
+    resolve_executable(exe, cmd_cwd, env.path())
+}
+
+/// A snapshot holding `base` in order.
+fn snapshot(base: &[(OsString, OsString)]) -> EnvSnapshot {
+    let mut block = Vec::new();
+    for (key, val) in base {
+        block.extend(key.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(val.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    EnvSnapshot::from_block(block)
+}
+
+fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Vec<u16>, Error> {
+    ChildEnv::capture(&snapshot(base), ops).into_block()
+}
+
 /// The name was accepted and searched, and nothing matched — `NotFound`, never a shape refusal.
 /// A bare `is_err()` cannot tell the two apart, which is how the kind drifted unnoticed before;
 /// see `crate::resolve`'s module doc for the rule.
@@ -23,7 +46,7 @@ fn assert_not_found(got: Result<PathBuf, Error>) {
 #[test]
 fn resolve_an_absolute_path_to_an_existing_image_yields_that_path() {
     let me = std::env::current_exe().unwrap();
-    assert_eq!(resolve_executable(&me, None, &[]).unwrap(), me);
+    assert_eq!(resolve_with(&me, None, &[]).unwrap(), me);
 }
 #[test]
 fn resolve_bare_name_is_not_taken_from_base_cwd() {
@@ -47,7 +70,7 @@ fn resolve_bare_extensionless_name_appends_exe() {
     // Pins the `.exe`-append rule only, not which directory supplies the match: `cmd` lives in
     // `System32`, so system-directory search (`crate::resolve::ResolveInput::system_dirs`) may
     // satisfy it before the ambient `PATH` is ever consulted.
-    let p = resolve_executable(std::path::Path::new("cmd"), None, &[]).unwrap();
+    let p = resolve_with(std::path::Path::new("cmd"), None, &[]).unwrap();
     assert!(
         p.is_absolute() && p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
         "{p:?}"
@@ -67,13 +90,13 @@ fn resolve_executable_honors_an_env_set_path_override() {
     let want = dir.path().join("sp_env_path.exe");
     // Positive control: with no env ops, the fabricated name is not on the ambient PATH at all, so
     // a pass below cannot be an accident of the ambient PATH already containing it.
-    assert_not_found(resolve_executable(std::path::Path::new("sp_env_path"), None, &[]));
+    assert_not_found(resolve_with(std::path::Path::new("sp_env_path"), None, &[]));
 
     let ops = [EnvOp::Set(
         OsString::from("PATH"),
         dir.path().as_os_str().to_os_string(),
     )];
-    let got = resolve_executable(std::path::Path::new("sp_env_path"), None, &ops);
+    let got = resolve_with(std::path::Path::new("sp_env_path"), None, &ops);
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 #[test]
@@ -87,7 +110,7 @@ fn resolve_executable_path_key_match_is_case_insensitive() {
         OsString::from("Path"),
         dir.path().as_os_str().to_os_string(),
     )];
-    let got = resolve_executable(std::path::Path::new("sp_env_path_ci"), None, &ops);
+    let got = resolve_with(std::path::Path::new("sp_env_path_ci"), None, &ops);
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 // A fabricated name, never "cmd" or another well-known system binary, is required by both tests
@@ -107,18 +130,17 @@ fn resolve_executable_env_clear_defeats_ambient_path() {
     )];
     // Positive control: with PATH pointed at the fabricated name's directory, it resolves — so a
     // failure below is really about env_clear, not merely that this name can never resolve.
-    assert!(resolve_executable(std::path::Path::new("sp_env_clear"), None, &set).is_ok());
+    assert!(resolve_with(std::path::Path::new("sp_env_clear"), None, &set).is_ok());
     // `Command::env_clear()` means the child sees NO environment at all, PATH included — the
     // resolver must not silently fall back to searching the PARENT's PATH once the child's own is
     // cleared.
     //
-    // `[Set(PATH, dir), Clear]`, not bare `[Clear]`: with `EnvOp::Clear => path = None` deleted from
-    // `effective_path_var` (silently absorbed by its `_ => {}` arm), a bare `[Clear]` leaves the
-    // AMBIENT `PATH` in force, which never happens to contain this fabricated tempdir — so `is_err()`
-    // held for the wrong reason. Setting PATH to a directory that WOULD resolve, then clearing it,
-    // means Clear must actually discard a PATH that works, mirroring the sibling
-    // `..._env_remove_path_defeats_ambient_path` test's shape below.
-    let got = resolve_executable(
+    // `[Set(PATH, dir), Clear]`, not bare `[Clear]`: if `Clear` stopped dropping the base, a bare
+    // `[Clear]` would leave the AMBIENT `PATH` in force, which never happens to contain this
+    // fabricated tempdir — so `is_err()` would hold for the wrong reason. Setting PATH to a
+    // directory that WOULD resolve, then clearing it, means Clear must actually discard a PATH that
+    // works, mirroring the sibling `..._env_remove_path_defeats_ambient_path` test's shape below.
+    let got = resolve_with(
         std::path::Path::new("sp_env_clear"),
         None,
         &[
@@ -137,11 +159,11 @@ fn resolve_executable_env_remove_path_defeats_ambient_path() {
         dir.path().as_os_str().to_os_string(),
     )];
     // Positive control, same reasoning as the env_clear test above.
-    assert!(resolve_executable(std::path::Path::new("sp_env_remove"), None, &set).is_ok());
+    assert!(resolve_with(std::path::Path::new("sp_env_remove"), None, &set).is_ok());
     // `EnvOp::Remove` on the just-`Set` key (case-folded, per `Command::env_remove`'s contract)
     // must take the child's PATH away again — the resolver must not keep searching a directory the
     // env ops explicitly removed.
-    let got = resolve_executable(
+    let got = resolve_with(
         std::path::Path::new("sp_env_remove"),
         None,
         &[
@@ -177,7 +199,7 @@ fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
     .unwrap();
 
     // Located name (contains a separator) — resolves against the given cwd with no PATH search.
-    let got = resolve_executable(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()), &[]);
+    let got = resolve_with(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()), &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
@@ -213,13 +235,16 @@ fn fixture_resolve_executable_falls_back_to_process_cwd() {
         want.is_file(),
         "the parent must have planted `sp_b1_fallback.exe` here: {want:?}"
     );
-    let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
+    let got = resolve_with(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
+/// No ops still passes an explicit block, never NULL: the child must get exactly the snapshot its
+/// image was resolved against, not whatever this process's environment is at `CreateProcessW`.
 #[test]
-fn empty_ops_inherit() {
-    assert!(build_env_block(&[]).unwrap().is_none());
+fn empty_ops_pass_the_snapshot_explicitly() {
+    let block = build_env_block_from(&[(OsString::from("A"), OsString::from("1"))], &[]).unwrap();
+    assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0\0");
 }
 #[test]
 fn set_sorts_ci_and_double_nul() {
@@ -230,7 +255,6 @@ fn set_sorts_ci_and_double_nul() {
             EnvOp::Set("alpha".into(), "2".into()),
         ],
     )
-    .unwrap()
     .unwrap();
     assert_eq!(&b[b.len() - 2..], &[0u16, 0u16]);
     let s = String::from_utf16(&b).unwrap();
@@ -242,7 +266,6 @@ fn remove_is_case_insensitive() {
         &[(OsString::from("SP_R"), OsString::from("x"))],
         &[EnvOp::Remove("sp_r".into())],
     )
-    .unwrap()
     .unwrap();
     assert!(!String::from_utf16(&b).unwrap().to_uppercase().contains("SP_R="));
 }
@@ -252,7 +275,6 @@ fn clear_then_set_yields_only_the_set_var() {
         &[(OsString::from("PATH"), OsString::from("x"))],
         &[EnvOp::Clear, EnvOp::Set("ONLYME".into(), "1".into())],
     )
-    .unwrap()
     .unwrap();
     let s = String::from_utf16(&b).unwrap();
     assert!(s.contains("ONLYME=1") && !s.to_uppercase().contains("PATH="));
@@ -329,11 +351,9 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
 }
 #[test]
 fn clear_only_yields_empty_double_nul_block() {
-    // An empty-but-present environment is a bare double-NUL, distinct from the
-    // `None` "inherit" signal — pins the leading-NUL push.
-    let b = build_env_block_from(&[(OsString::from("A"), OsString::from("1"))], &[EnvOp::Clear])
-        .unwrap()
-        .unwrap();
+    // An empty environment is a bare double-NUL, never a lone terminator — pins the leading-NUL
+    // push.
+    let b = build_env_block_from(&[(OsString::from("A"), OsString::from("1"))], &[EnvOp::Clear]).unwrap();
     assert_eq!(b, vec![0u16, 0u16]);
 }
 // ── real Windows system directories, end to end ─────────────────────────────────────
@@ -438,4 +458,262 @@ fn a_nul_refusal_names_the_field_that_carried_it() {
 #[should_panic(expected = "program image contains an embedded NUL")]
 fn debug_assert_no_nul_wide_panics_on_an_embedded_nul() {
     debug_assert_no_nul_wide("program image", OsStr::new("a\u{0}b"));
+}
+
+// Environment key identity =====
+
+fn wide(units: &[u16]) -> OsString {
+    OsString::from_wide(units)
+}
+
+/// Split a block into `(key, value)` entries. Splits at the LAST `=`, so a key that is itself `=`
+/// parses as long as values carry none.
+fn block_entries(block: &[u16]) -> Vec<(OsString, OsString)> {
+    block[..block.len() - 1]
+        .split(|&u| u == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let eq = entry.iter().rposition(|&u| u == u16::from(b'=')).unwrap();
+            (wide(&entry[..eq]), wide(&entry[eq + 1..]))
+        })
+        .collect()
+}
+
+/// Whether setting `b` over an inherited `a` replaces it (the same variable) or adds a second one.
+fn same_var(a: &OsStr, b: &OsStr) -> bool {
+    let block = build_env_block_from(&[(a.into(), "base".into())], &[EnvOp::Set(b.into(), "op".into())]).unwrap();
+    match block_entries(&block).len() {
+        1 => true,
+        2 => false,
+        n => panic!("{a:?} over {b:?} produced {n} entries"),
+    }
+}
+
+/// Windows folds one UTF-16 code unit to one, so a character whose full uppercase is longer, or
+/// lives in a surrogate pair, never names the same variable as that uppercase.
+#[test]
+fn full_case_mapping_does_not_merge_env_keys() {
+    for (a, b) in [("SS", "ß"), ("FI", "ﬁ"), ("I", "ı"), ("\u{10400}", "\u{10428}")] {
+        assert!(
+            !same_var(OsStr::new(a), OsStr::new(b)),
+            "{a:?} and {b:?} are distinct on Windows"
+        );
+    }
+}
+
+#[test]
+fn simple_case_pairs_are_the_same_env_key() {
+    for (a, b) in [("PATH", "path"), ("É", "é")] {
+        assert!(
+            same_var(OsStr::new(a), OsStr::new(b)),
+            "{a:?} and {b:?} are one variable"
+        );
+    }
+}
+
+/// An unpaired surrogate is its own code unit: it matches only itself, and does not stop the rest
+/// of the key from folding.
+#[test]
+fn unpaired_surrogates_in_env_keys_compare_by_code_unit() {
+    let hi = 0xD800;
+    let a = u16::from(b'a');
+    let upper_a = u16::from(b'A');
+    assert!(same_var(&wide(&[hi]), &wide(&[hi])));
+    assert!(!same_var(&wide(&[hi]), &wide(&[0xDC00])));
+    assert!(same_var(&wide(&[hi, a]), &wide(&[hi, upper_a])));
+}
+
+#[test]
+fn setting_eszett_keeps_an_inherited_ss() {
+    let block = build_env_block_from(
+        &[(OsString::from("SS"), OsString::from("inherited"))],
+        &[EnvOp::Set(OsString::from("ß"), OsString::from("set"))],
+    )
+    .unwrap();
+    let mut got = block_entries(&block);
+    got.sort();
+    assert_eq!(got, [("SS".into(), "inherited".into()), ("ß".into(), "set".into())]);
+}
+
+type Entries = Vec<(OsString, OsString)>;
+
+/// The raw block for `ops` over an empty base, next to what std's `Command` holds after the same
+/// ops. With nothing inherited, std's block is exactly `get_envs`' set entries, in std's own
+/// `EnvKey` order, which is the order std writes its block in. The raw side also takes its names
+/// from `get_envs`, so a comparison pins order, merges and values, not naming.
+fn block_vs_std(ops: &[EnvOp]) -> (Entries, Entries) {
+    let mut std_cmd = std::process::Command::new("unused");
+    crate::child::spawn::apply_env(&mut std_cmd, ops);
+    let ours = block_entries(&build_env_block_from(&[], ops).unwrap());
+    let std = std_cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_os_string(), v?.to_os_string())))
+        .collect();
+    (ours, std)
+}
+
+/// A cleared env followed by one `Set` per key, valued by its index.
+fn set_each(keys: &[OsString]) -> Vec<EnvOp> {
+    std::iter::once(EnvOp::Clear)
+        .chain(
+            keys.iter()
+                .enumerate()
+                .map(|(i, key)| EnvOp::Set(key.clone(), i.to_string().into())),
+        )
+        .collect()
+}
+
+/// `CreateProcessW` expects the block sorted case-insensitively by ordinal, locale-free; std sorts
+/// by `CompareStringOrdinal`, so the raw backend must produce the same order and the same merges.
+#[test]
+fn env_block_order_and_merges_match_std() {
+    let keys: Vec<OsString> = [
+        "T",
+        "ß",
+        "SS",
+        "sa",
+        "st",
+        "_x",
+        "a",
+        "Z",
+        "é",
+        "É",
+        "ﬁ",
+        "FI",
+        "ı",
+        "I",
+        "\u{10428}",
+        "\u{10400}",
+        "\u{FFFF}",
+    ]
+    .iter()
+    .map(OsString::from)
+    .chain([wide(&[0xD800]), wide(&[0xDC00, u16::from(b'a')])])
+    .collect();
+    let (ours, std) = block_vs_std(&set_each(&keys));
+    assert_eq!(ours, std);
+}
+
+/// Every non-NUL code unit as a one-unit key: the raw backend and std agree on every merge and on
+/// the whole order. The emitted names come from std's own `get_envs` on both sides here, so they
+/// are pinned end to end in `tests/windows_env_block.rs` instead.
+#[test]
+fn env_block_matches_std_over_every_code_unit() {
+    let keys: Vec<OsString> = (1..=u16::MAX).map(|u| wide(&[u])).collect();
+    let (ours, std) = block_vs_std(&set_each(&keys));
+    assert_eq!(ours.len(), std.len());
+    assert!(
+        ours == std,
+        "first divergence at {:?}",
+        ours.iter().zip(&std).position(|(a, b)| a != b)
+    );
+}
+
+/// Colliding keys emit the name `ChildEnv::capture`'s doc states, which is std's.
+#[test]
+fn colliding_keys_keep_std_casing() {
+    let set = |k: &str, v: &str| EnvOp::Set(k.into(), v.into());
+    let remove = |k: &str| EnvOp::Remove(k.into());
+    for (ops, name) in [
+        (vec![set("Path", "1"), set("PATH", "2")], "Path"),
+        (vec![remove("path"), set("PATH", "1")], "path"),
+        (vec![EnvOp::Clear, remove("path"), set("PATH", "1")], "PATH"),
+        (vec![set("a", "1"), EnvOp::Clear, set("A", "2")], "A"),
+        (vec![EnvOp::Clear, set("a", "1"), remove("A"), set("A", "2")], "A"),
+    ] {
+        let (ours, std) = block_vs_std(&ops);
+        assert_eq!(ours, std, "{ops:?}");
+        assert_eq!(ours.len(), 1, "{ops:?}");
+        assert_eq!(ours[0].0, name, "{ops:?}");
+    }
+}
+
+/// With no `Clear`, an inherited variable keeps its inherited name, even when removed and re-set.
+#[test]
+fn an_inherited_key_keeps_its_casing() {
+    let base = [(OsString::from("Path"), OsString::from("inherited"))];
+    for ops in [
+        vec![EnvOp::Set("PATH".into(), "x".into())],
+        vec![EnvOp::Remove("PATH".into()), EnvOp::Set("pAth".into(), "x".into())],
+    ] {
+        let block = build_env_block_from(&base, &ops).unwrap();
+        assert_eq!(block_entries(&block), [("Path".into(), "x".into())], "{ops:?}");
+    }
+}
+
+// One environment snapshot per spawn =====
+
+/// `CreateProcessW` keeps duplicate names as given, and `GetEnvironmentVariableW` returns the first.
+/// `path()`, which resolution searches, must be the `PATH` the child reads from its block.
+#[test]
+fn path_is_the_one_the_child_reads_from_its_block() {
+    let base = [
+        (OsString::from("PATH"), OsString::from("a")),
+        (OsString::from("Path"), OsString::from("b")),
+    ];
+    for (env, want) in [
+        (ChildEnv::inherit(&snapshot(&base)), "a"),
+        (ChildEnv::capture(&snapshot(&base), &[]), "b"),
+        (
+            ChildEnv::capture(&snapshot(&base), &[EnvOp::Set("K".into(), "1".into())]),
+            "b",
+        ),
+    ] {
+        let path = env.path().map(OsStr::to_os_string);
+        let block = EnvSnapshot::from_block(env.into_block().unwrap());
+        assert_eq!(path, block.var(OsStr::new("PATH")));
+        assert_eq!(path.as_deref(), Some(OsStr::new(want)));
+    }
+}
+
+/// Inheriting gives the child the snapshot byte for byte, as a std child inheriting a NULL block
+/// gets this process's: duplicates and entries with no `=` included.
+#[test]
+fn inherit_passes_the_snapshot_verbatim() {
+    let block: Vec<u16> = ["Path=a", "JUNK", "PATH=b", "=C:=C:\\x"]
+        .iter()
+        .flat_map(|e| e.encode_utf16().chain([0]))
+        .chain([0])
+        .collect();
+    let env = ChildEnv::inherit(&EnvSnapshot::from_block(block.clone()));
+    assert_eq!(env.into_block().unwrap(), block);
+}
+
+/// Capturing rebuilds even with no ops: a contained spawn's environment is always the snapshot
+/// as std's `capture` rebuilds it, since std cannot pass a block verbatim.
+#[test]
+fn capture_rebuilds_even_with_no_ops() {
+    let env = ChildEnv::capture(
+        &snapshot(&[("Path".into(), "a".into()), ("PATH".into(), "b".into())]),
+        &[],
+    );
+    assert_eq!(block_entries(&env.into_block().unwrap()), [("Path".into(), "b".into())]);
+}
+
+/// With ops the base is the snapshot parsed as `vars_os` parses it: `=`-less entries dropped,
+/// duplicates merged under their first name with their last value.
+#[test]
+fn ops_rebuild_from_the_snapshot_as_std_does() {
+    let block: Vec<u16> = ["Path=a", "JUNK", "PATH=b"]
+        .iter()
+        .flat_map(|e| e.encode_utf16().chain([0]))
+        .chain([0])
+        .collect();
+    let env = ChildEnv::capture(&EnvSnapshot::from_block(block), &[EnvOp::Set("K".into(), "1".into())]);
+    let got = block_entries(&env.into_block().unwrap());
+    assert_eq!(got, [("K".into(), "1".into()), ("Path".into(), "b".into())]);
+}
+
+/// Resolution searches the snapshot it is given, not a fresh read of this process's environment.
+#[test]
+fn resolution_searches_the_given_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_snapshot.exe")).unwrap();
+    let base = [(OsString::from("PATH"), dir.path().as_os_str().to_os_string())];
+    let env = ChildEnv::capture(&snapshot(&base), &[]);
+    let got = resolve_executable(Path::new("sp_snapshot"), None, env.path()).unwrap();
+    assert_eq!(
+        got.canonicalize().unwrap(),
+        dir.path().join("sp_snapshot.exe").canonicalize().unwrap()
+    );
 }
