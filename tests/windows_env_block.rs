@@ -103,12 +103,26 @@ fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
         parse_block(&out.stdout)
     };
     let std = run("std");
-    let want: Vec<OsString> = entries.iter().map(OsString::from).collect();
     assert_eq!(
-        std, want,
-        "std's child is the control: it must see the parent block verbatim"
+        std,
+        as_the_os_delivers(&entries),
+        "std's child is the control: it must see the parent block, plus only what the OS adds"
     );
     assert_eq!(run("raw"), std);
+}
+
+/// `entries` as a child receives them from the OS. On ARM64 Windows the OS prepends
+/// `PROCESSOR_ARCHITECTURE=ARM64` to a child's block that lacks it (measured on the windows/arm64
+/// lane, run 35811227749); on x64 it adds nothing (the windows/amd64 lane of the same run).
+fn as_the_os_delivers(entries: &[&str]) -> Vec<OsString> {
+    let mut want: Vec<OsString> = entries.iter().map(OsString::from).collect();
+    let has_arch = entries
+        .iter()
+        .any(|e| e.to_ascii_uppercase().starts_with("PROCESSOR_ARCHITECTURE="));
+    if cfg!(target_arch = "aarch64") && !has_arch {
+        want.insert(0, "PROCESSOR_ARCHITECTURE=ARM64".into());
+    }
+    want
 }
 
 /// What `CreateProcessW` accepts as a child's block, measured: which parent blocks can exist.
