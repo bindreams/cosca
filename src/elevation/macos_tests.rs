@@ -15,6 +15,16 @@ fn shell(program: &str, a: &[&str], cwd: Option<&str>) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+fn gate(c: &Command) -> Result<crate::elevation::Launch, Error> {
+    reject_structural_gui_config(c, std::env::current_dir)
+}
+
+/// [`build_rewrite`] alone, bypassing the gate.
+fn build(c: &mut Command, arg_max: Option<usize>) -> Result<(Command, crate::elevation::ElevationReport), Error> {
+    let launch = super::program_and_args(c, std::env::current_dir)?;
+    build_rewrite(c, launch, Path::new("/usr/bin/osascript"), arg_max)
+}
+
 fn gui_cmd() -> Command {
     let mut c = Command::new();
     c.args(["/usr/bin/id", "-u"])
@@ -23,7 +33,7 @@ fn gui_cmd() -> Command {
 }
 
 fn assert_rejected(c: &Command, needle: &str) {
-    match reject_structural_gui_config(c) {
+    match gate(c) {
         Err(Error::Unsupported { platform, detail, .. }) => {
             assert_eq!(platform, "macos");
             assert!(detail.contains(needle), "detail {detail:?} must mention {needle:?}");
@@ -193,7 +203,7 @@ fn a_plain_argv_command_is_accepted() {
     // `gui_cmd()` is default-constructed, so kill_on_drop is already `true`. This
     // pins that the default does NOT make the whole path unreachable.
     assert!(gui_cmd().kill_on_drop_flag(), "the builder default is assumed here");
-    assert!(reject_structural_gui_config(&gui_cmd()).is_ok());
+    assert!(gate(&gui_cmd()).is_ok());
 }
 
 #[test]
@@ -210,7 +220,7 @@ fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
     // `Path::is_absolute` gets both backwards on Windows.
     let mut ok = Command::new();
     ok.args(["/usr/bin/id"]).elevation_auth(crate::elevation::Auth::Gui);
-    assert!(reject_structural_gui_config(&ok).is_ok());
+    assert!(gate(&ok).is_ok());
 
     let mut windows_style = Command::new();
     windows_style
@@ -270,7 +280,7 @@ fn only_null_and_inherit_are_accepted_on_stdin() {
     for allowed in [crate::Stdio::null(), crate::Stdio::inherit()] {
         let mut ok = gui_cmd();
         ok.stdin(allowed).unwrap();
-        assert!(reject_structural_gui_config(&ok).is_ok());
+        assert!(gate(&ok).is_ok());
     }
 }
 
@@ -282,10 +292,7 @@ fn stdout_and_stderr_may_be_captured_because_they_carry_the_relay() {
     c.stdout(crate::Stdio::pipe()).unwrap();
     c.stderr(crate::Stdio::pipe()).unwrap();
     c.stdin(crate::Stdio::null()).unwrap();
-    assert!(
-        reject_structural_gui_config(&c).is_ok(),
-        "output()/read() must be usable"
-    );
+    assert!(gate(&c).is_ok(), "output()/read() must be usable");
 }
 
 #[test]
@@ -333,7 +340,7 @@ fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
     let mut c = Command::new();
     c.args([OsString::from_wide(&[0xD800])])
         .elevation_auth(crate::elevation::Auth::Gui);
-    let e = reject_structural_gui_config(&c).unwrap_err();
+    let e = gate(&c).unwrap_err();
     assert!(
         matches!(e, Error::Quote(ref q) if q.kind == QuoteErrorKind::NonUtf8),
         "{e}"
@@ -348,9 +355,9 @@ fn a_matching_executable_yields_that_program_and_the_remaining_args() {
     c.executable("/usr/bin/id")
         .args(["/usr/bin/id", "-u", "-r"])
         .elevation_auth(crate::elevation::Auth::Gui);
-    let (program, rest, _) = super::program_and_args(&c).expect("matching executable");
-    assert_eq!(program, OsString::from("/usr/bin/id"));
-    assert_eq!(rest, args(&["-u", "-r"]));
+    let launch = super::program_and_args(&c, std::env::current_dir).expect("matching executable");
+    assert_eq!(launch.program, OsString::from("/usr/bin/id"));
+    assert_eq!(launch.args, args(&["-u", "-r"]));
 }
 
 // ===== derived command =====
@@ -358,7 +365,7 @@ fn a_matching_executable_yields_that_program_and_the_remaining_args() {
 #[test]
 fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
     let mut c = gui_cmd();
-    let (derived, report) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let (derived, report) = build(&mut c, None).unwrap();
     let CommandInput::Argv(argv) = derived.input() else {
         panic!("derived command must be an argv");
     };
@@ -381,7 +388,7 @@ fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
 fn the_derived_command_carries_no_elevation_request() {
     // Otherwise spawning the derived command would re-enter the elevation branch.
     let mut c = gui_cmd();
-    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let (derived, _) = build(&mut c, None).unwrap();
     assert!(!derived.elevation_request().enabled);
 }
 
@@ -392,7 +399,7 @@ fn kill_on_drop_reaches_the_derived_command() {
     for requested in [true, false] {
         let mut c = gui_cmd();
         c.kill_on_drop(requested);
-        let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+        let (derived, _) = build(&mut c, None).unwrap();
         assert_eq!(derived.kill_on_drop_flag(), requested);
     }
 }
@@ -415,7 +422,7 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     let mut c = Command::new();
     c.args([LOUD]).elevation_auth(crate::elevation::Auth::Gui);
     c.kill_on_drop(true);
-    let _ = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let _ = build(&mut c, None).unwrap();
     assert!(
         crate::log_capture::contains_since(mark, LOUD),
         "a kill_on_drop child must be warned about, not silently orphaned"
@@ -426,7 +433,7 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     let mut quiet = Command::new();
     quiet.args([QUIET]).elevation_auth(crate::elevation::Auth::Gui);
     quiet.kill_on_drop(false);
-    let _ = build_rewrite(&mut quiet, Path::new("/usr/bin/osascript"), None).unwrap();
+    let _ = build(&mut quiet, None).unwrap();
     assert!(!crate::log_capture::contains_since(mark, QUIET));
 }
 
@@ -439,8 +446,8 @@ fn a_bare_exact_program_is_completed_rather_than_refused() {
         .args(["tool", "-u"])
         .current_dir("/work")
         .elevation_auth(crate::elevation::Auth::Gui);
-    assert!(reject_structural_gui_config(&c).is_ok());
-    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    assert!(gate(&c).is_ok());
+    let (derived, _) = build(&mut c, None).unwrap();
     let CommandInput::Argv(argv) = derived.input() else {
         unreachable!()
     };
@@ -453,33 +460,33 @@ fn a_bare_exact_program_is_completed_rather_than_refused() {
 
 /// With no `current_dir`, the payload must still run in the directory the program was completed
 /// against: root's shell starts wherever the trampoline puts it.
-#[cfg(unix)]
 #[test]
 fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_against() {
     let mut c = Command::new();
     c.raw_executable("tool")
         .args(["tool"])
         .elevation_auth(crate::elevation::Auth::Gui);
-    // Reads the process cwd, which other tests in this binary move under this lock.
-    let _guard = crate::child::spawn::spawn_lock();
-    let dir = std::env::current_dir().expect("cwd");
-    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let launch = reject_structural_gui_config(&c, || Ok("/proc-cwd".into())).unwrap();
+    let (derived, _) = build_rewrite(&mut c, launch, Path::new("/usr/bin/osascript"), None).unwrap();
     let CommandInput::Argv(argv) = derived.input() else {
         unreachable!()
     };
-    let d = dir.to_str().expect("a UTF-8 test cwd");
-    let want =
-        String::from_utf8(build_shell_command(OsStr::new(&format!("{d}/tool")), &[], Some(&dir)).unwrap()).unwrap();
-    assert!(want.starts_with("cd -- "), "{want}");
-    assert!(argv[2].to_str().unwrap().contains(&want), "{:?}", argv[2]);
-    assert_eq!(derived.cwd(), Some(dir.as_path()));
+    assert!(
+        argv[2]
+            .to_str()
+            .unwrap()
+            .contains("\"cd -- /proc-cwd && exec /proc-cwd/tool\""),
+        "{:?}",
+        argv[2]
+    );
+    assert_eq!(derived.cwd(), Some(Path::new("/proc-cwd")));
 }
 
 #[test]
 fn the_cwd_reaches_both_osascript_and_the_payload() {
     let mut c = gui_cmd();
     c.current_dir("/tmp");
-    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let (derived, _) = build(&mut c, None).unwrap();
     // Set on osascript so a bogus directory fails at spawn with a precise Io error…
     assert_eq!(derived.cwd(), Some(Path::new("/tmp")));
     let CommandInput::Argv(argv) = derived.input() else {
@@ -497,7 +504,7 @@ fn the_cwd_reaches_both_osascript_and_the_payload() {
 #[test]
 fn the_length_guard_is_enforced_through_the_rewrite() {
     let mut c = gui_cmd();
-    let e = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), Some(10)).unwrap_err();
+    let e = build(&mut c, Some(10)).unwrap_err();
     assert!(
         matches!(
             e,
@@ -518,7 +525,7 @@ fn the_rewrite_preserves_the_callers_argv_and_moves_its_fds() {
     let mut c = gui_cmd();
     c.stdout(crate::Stdio::pipe()).unwrap();
     let before = format!("{:?}", c.input());
-    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let (derived, _) = build(&mut c, None).unwrap();
     assert_eq!(format!("{:?}", c.input()), before, "argv must survive the rewrite");
     assert!(c.env_ops().is_empty());
     assert!(c.fds().is_empty(), "the caller's fds are moved, not copied");
@@ -724,7 +731,7 @@ fn a_relative_cwd_is_refused_before_the_process_cwd_is_read() {
         std::env::current_dir().is_err(),
         "precondition: the process cwd is unreadable"
     );
-    match reject_structural_gui_config(&c) {
+    match gate(&c) {
         Err(Error::Unsupported { op, .. }) => assert!(op.contains("relative current_dir()"), "{op}"),
         other => panic!("expected the relative-current_dir refusal, got {other:?}"),
     }

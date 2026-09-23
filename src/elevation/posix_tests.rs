@@ -979,6 +979,28 @@ mod rewrite_tests {
         }
     }
 
+    /// A second reading could differ from the first, loading the program from one directory and
+    /// running it in another — for every backend and privilege state.
+    #[test]
+    fn a_rewrite_reads_the_process_cwd_exactly_once() {
+        let mut gui = exact_tool(None);
+        gui.elevation_backend(Backend::Auto).elevation_auth(Auth::Gui);
+        let cases = [
+            (exact_tool(None), sudo_host()),
+            (exact_tool(None), elevated_sudo_host()),
+            (gui, macos_gui_host(false)),
+        ];
+        for (mut c, host) in cases {
+            let reads = std::cell::Cell::new(0);
+            let rw = super::super::rewrite_with_host_and_cwd(&mut c, &host, || {
+                reads.set(reads.get() + 1);
+                Ok(PathBuf::from("/proc-cwd"))
+            })
+            .expect("rewrite");
+            assert_eq!(reads.get(), 1, "{:?}", rw.report.map(|r| r.via));
+        }
+    }
+
     /// Negative control: a `Search` program's relative `current_dir` is passed through.
     #[test]
     fn an_elevated_search_programs_relative_cwd_is_passed_through() {

@@ -28,6 +28,17 @@ pub(crate) mod windows;
 #[cfg(unix)]
 #[doc(hidden)]
 pub use posix::controlling_terminal_present;
+
+/// What an elevation gate validated and the build then wraps: the program, its arguments, and the
+/// directory to run them in. Computed once per rewrite, so a `raw_executable()` program and its
+/// directory come from one reading of this process's cwd.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct Launch {
+    pub(crate) program: OsString,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) cwd: Option<PathBuf>,
+}
 pub use sanitize::EnvSanitizer;
 
 /// Is the CURRENT process already elevated (root on Unix, an elevated token on

@@ -341,13 +341,22 @@ impl Command {
     // Off unix the only caller is the macOS elevation module, itself dead there.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn posix_launch(&self) -> Result<PosixLaunch, Error> {
+        self.posix_launch_with(std::env::current_dir)
+    }
+
+    /// [`posix_launch`](Self::posix_launch), reading this process's cwd through `process_cwd`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn posix_launch_with(
+        &self,
+        process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+    ) -> Result<PosixLaunch, Error> {
         let as_given = |program| PosixLaunch {
             program,
             cwd: self.cwd().map(Path::to_path_buf),
         };
         match self.executable_spec() {
             Some(ExecutableSpec::Exact(p)) => {
-                let done = crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), std::env::current_dir)?;
+                let done = crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), process_cwd)?;
                 Ok(PosixLaunch {
                     program: Some(done.program),
                     cwd: done.child_cwd,

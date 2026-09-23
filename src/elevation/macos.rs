@@ -22,7 +22,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use super::{ElevatedStdio, ElevatedVia, ElevationReport};
+use super::{ElevatedStdio, ElevatedVia, ElevationReport, Launch};
 use crate::command::{Command, CommandInput};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
@@ -164,7 +164,10 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
 /// program comes back absolute, with the directory it was completed against
 /// ([`Command::posix_launch`]). `exec`ing the program sets argv[0] to its own path, so an
 /// argv[0] distinct from a set `executable()` cannot survive.
-pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>, Option<PathBuf>), Error> {
+pub(crate) fn program_and_args(
+    cmd: &Command,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Launch, Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
     // program set" with a message about re-quoting a command line.
@@ -202,20 +205,29 @@ pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>
                 .into(),
         ));
     }
-    let launch = cmd.posix_launch()?;
-    let program = launch.program.map_or_else(|| first.clone(), PathBuf::into_os_string);
-    Ok((program, argv[1..].to_vec(), launch.cwd))
+    let launch = cmd.posix_launch_with(process_cwd)?;
+    Ok(Launch {
+        program: launch.program.map_or_else(|| first.clone(), PathBuf::into_os_string),
+        args: argv[1..].to_vec(),
+        cwd: launch.cwd,
+    })
 }
 
 /// The honest capability matrix for macOS graphical elevation. Every rejection below
 /// is a thing Authorization Services genuinely cannot do — reported loudly rather
 /// than half-honored.
 ///
+/// Returns the [`Launch`] it validated, for [`build_rewrite`]; `process_cwd` is read at most once,
+/// and only after the relative-`current_dir` refusal.
+///
 /// Returns `Error::Unsupported { platform: "macos", .. }` for a capability mismatch,
 /// and `Error::Quote(NonUtf8)` for a program or directory with no byte form
 /// (reachable only off-unix, where an `OsStr` is WTF-16). Both are typed; neither is
 /// a panic.
-pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
+pub(crate) fn reject_structural_gui_config(
+    cmd: &Command,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Launch, Error> {
     // The caller's cwd is applied twice — to osascript, and as `cd --` inside the
     // script — and the trampoline does not carry a cwd across, so a RELATIVE path
     // resolves against two different bases and the two silently disagree. Absolute
@@ -233,11 +245,12 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
             ));
         }
     }
-    let (program, _, _) = program_and_args(cmd)?;
+    let launch = program_and_args(cmd, process_cwd)?;
+    let program = &launch.program;
     // root's /bin/sh resolves a bare name against ITS OWN PATH, so a relative
     // program would let the environment choose which binary runs as root. The crate
     // closes the same hole for its POSIX backends by carrying absolute paths.
-    if !is_posix_absolute(&program)? {
+    if !is_posix_absolute(program)? {
         return Err(unsupported(
             "macOS graphical elevation of a non-absolute program",
             format!(
@@ -293,7 +306,7 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
     // so rejecting it would reject every default-constructed command and make this
     // path unreachable. Its real reach (the osascript front-end only) is documented
     // on `ElevatedVia::MacosOsascript` instead.
-    Ok(())
+    Ok(launch)
 }
 
 /// Build the DERIVED command (`osascript -e <script>`) plus the report to attach to
@@ -301,12 +314,13 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
 /// 0-2 stdio is MOVED (`ResolvedStdio::File` is not `Clone`), matching the POSIX
 /// rewrite's contract.
 ///
-/// Precondition: [`reject_structural_gui_config`] has already passed, so the program
+/// Precondition: `launch` is what [`reject_structural_gui_config`] returned, so the program
 /// and cwd are absolute, and there are no env ops and no containment. `kill_on_drop`
 /// is NOT gated (see that function), so it is transferred like the POSIX rewrite
 /// transfers it.
 pub(crate) fn build_rewrite(
     cmd: &mut Command,
+    launch: Launch,
     osascript: &Path,
     arg_max: Option<usize>,
 ) -> Result<(Command, ElevationReport), Error> {
@@ -325,7 +339,7 @@ pub(crate) fn build_rewrite(
         cmd.fds().keys().all(|s| s.raw() < 3),
         "reject_structural_gui_config must reject fd >= 3 before build_rewrite"
     );
-    let (program, args, cwd) = program_and_args(cmd)?;
+    let Launch { program, args, cwd } = launch;
     let shell_command = build_shell_command(&program, &args, cwd.as_deref())?;
     let script = wrap_do_shell_script(&shell_command, arg_max)?;
 

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use super::plan::{BackendSet, Host, Os, Transition};
-use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Privilege, Secret};
+use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
 use crate::stdio::{Fd, Stdio};
@@ -436,7 +436,7 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
 /// program comes back absolute ([`Command::posix_launch`]), so the wrapper cannot search for it.
 /// An argv[0] distinct from a set `executable()` cannot survive the backend wrapper →
 /// `Unsupported`.
-fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>, Option<PathBuf>), Error> {
+fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<Launch, Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
     // program set" with a message about re-quoting a command line that was never set.
@@ -472,18 +472,28 @@ fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>, Option<Pa
                     .into(),
         });
     }
-    let launch = cmd.posix_launch()?;
-    let program = launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string);
-    Ok((program, argv[1..].to_vec(), launch.cwd))
+    let launch = cmd.posix_launch_with(process_cwd)?;
+    Ok(Launch {
+        program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
+        args: argv[1..].to_vec(),
+        cwd: launch.cwd,
+    })
 }
 
 /// Structural request-validation, evaluated against the REQUESTED backend so the verdict
 /// is privilege-independent. Run BEFORE the already-elevated short-circuit, so an
 /// already-elevated caller gets the same rejection. (Backend availability + NoTty are
 /// environmental and stay in the planner, after the short-circuit.)
-fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) -> Result<(), Error> {
+///
+/// Returns the [`Launch`] it validated, for the build to wrap.
+fn reject_structural_posix_config(
+    cmd: &Command,
+    backend: Backend,
+    auth: &Auth,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Launch, Error> {
     // commandline() / empty / distinct-argv0.
-    program_and_args(cmd)?;
+    let launch = program_and_args(cmd, process_cwd)?;
     if cmd.fds().keys().any(|f| f.raw() >= 3) {
         return Err(Error::Unsupported {
             op: "fd >= 3 on an elevated POSIX child".into(),
@@ -525,10 +535,10 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             detail: "Auth::Stdin consumes fd0 to feed sudo -S the password; do not also configure stdin".into(),
         });
     }
-    Ok(())
+    Ok(launch)
 }
 
-/// Transfer the caller's cwd (as [`program_and_args`] returned it, so it matches the program) /
+/// Transfer the caller's cwd (the [`Launch`]'s, so it matches the program) /
 /// containment / kill-on-drop onto the derived command.
 /// Does NOT suppress the fd marker — that is only correct for a real wrapper spawn
 /// (`ElevatePosix`), whose `closefrom` destroys it; `RunAsIs`'s derived command spawns the
@@ -554,6 +564,16 @@ pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
 /// `Command` `input`/`env_ops` are left untouched (non-destructive): the caller's fd 0-2
 /// stdio is MOVED into the derived command (`ResolvedStdio::File` is not `Clone`).
 pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
+    rewrite_with_host_and_cwd(cmd, host, std::env::current_dir)
+}
+
+/// [`rewrite_with_host`], reading this process's cwd through `process_cwd` — at most once, so
+/// the program and the directory it runs in cannot come from two different readings.
+pub(crate) fn rewrite_with_host_and_cwd(
+    cmd: &mut Command,
+    host: &Host,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PosixRewrite, Error> {
     let requested_backend = cmd.elevation_request().backend;
     let requested_auth = cmd.elevation_request().auth.clone();
 
@@ -565,17 +585,17 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
     // would break it: `plan()` yields `RunAsIs` under root, so the same request
     // would be accepted as root and rejected as a normal user.
     let macos_gui = super::plan::is_macos_gui_auto(host.os, requested_backend, &requested_auth);
-    if macos_gui {
-        super::macos::reject_structural_gui_config(cmd)?;
+    let launch = if macos_gui {
+        super::macos::reject_structural_gui_config(cmd, process_cwd)?
     } else {
-        reject_structural_posix_config(cmd, requested_backend, &requested_auth)?;
-    }
+        reject_structural_posix_config(cmd, requested_backend, &requested_auth, process_cwd)?
+    };
 
     match host.plan(Privilege::Elevated, requested_backend, requested_auth) {
         Transition::Reject { error } => Err(error),
         Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
         Transition::ElevateMacosGui { osascript, arg_max } => {
-            let (derived, report) = super::macos::build_rewrite(cmd, &osascript, arg_max)?;
+            let (derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
             Ok(PosixRewrite {
                 derived: Some(derived),
                 report: Some(report),
@@ -590,7 +610,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             // forwarded var never reaches the root child. Build a non-destructive derived
             // command (the ORIGINAL program + args, sanitized env, fds MOVED).
             let (kept, stripped) = cmd.elevation_request().sanitizer.apply(explicit_set_env(cmd.env_ops()));
-            let (program, args, cwd) = program_and_args(cmd)?;
+            let Launch { program, args, cwd } = launch;
             let mut argv = Vec::with_capacity(args.len() + 1);
             argv.push(program);
             argv.extend(args);
@@ -626,7 +646,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                             .into(),
                 });
             }
-            let (program, args, cwd) = program_and_args(cmd)?;
+            let Launch { program, args, cwd } = launch;
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
