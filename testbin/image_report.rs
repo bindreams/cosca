@@ -1,8 +1,9 @@
 //! Path-canary payload: report the file this process was loaded from, then exit 0.
 //!
 //! `tests/windows_path_resolution.rs` copies this image to odd names and spawns it, so its only
-//! job is to say which file ran. It ignores its arguments and depends on nothing else in the
-//! testbin, so a testbin change cannot fail the canary.
+//! job is to say which file ran. It depends on nothing else in the testbin, so a testbin change
+//! cannot fail the canary. Its one argument is optional: `--report-to <path>` writes the same lines
+//! to `<path>` as well, for a launch whose stdout cannot be read (`ShellExecuteEx`'s `runas`).
 //!
 //! Prints two lines:
 //! - `image=`: `QueryFullProcessImageNameW`, the file the image section was created from. This is
@@ -30,17 +31,23 @@ fn main() {
             &mut len,
         )
     };
-    match std::env::current_exe() {
-        Ok(p) => println!("module={}", p.display()),
-        Err(e) => println!("module-error={e}"),
-    }
-    match got {
-        Ok(()) => println!("image={}", String::from_utf16_lossy(&buf[..len as usize])),
-        Err(e) => {
-            println!("image-error={e}");
-            std::process::exit(2);
+    let module = match std::env::current_exe() {
+        Ok(p) => format!("module={}", p.display()),
+        Err(e) => format!("module-error={e}"),
+    };
+    let (image, code) = match got {
+        Ok(()) => (format!("image={}", String::from_utf16_lossy(&buf[..len as usize])), 0),
+        Err(e) => (format!("image-error={e}"), 2),
+    };
+    let report = format!("{module}\n{image}\n");
+    print!("{report}");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let [flag, path] = args.as_slice() {
+        if flag == "--report-to" {
+            std::fs::write(path, &report).expect("write the report file");
         }
     }
+    std::process::exit(code);
 }
 
 #[cfg(not(windows))]
