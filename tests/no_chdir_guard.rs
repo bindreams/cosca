@@ -17,22 +17,101 @@
 //! pattern this guard exists to push every other cwd-needing test toward, not an instance of the
 //! bug. A `set_current_dir` call anywhere else in `testbin/main.rs` — including a third one with
 //! different text — still fails this guard.
+//!
+//! The match itself is word-boundary, not substring: a bare identifier occurrence trips it, with
+//! no trailing `(` required, so an aliased import (`use ... as cd; cd(d)`), a `.map(...)`
+//! reference, and turbofish syntax all still get caught, alongside the non-std spellings
+//! (`libc`/`nix`/`rustix` `chdir`/`fchdir`, Win32 `SetCurrentDirectoryA`/`W`, `_wchdir`/`wchdir`).
+//! A line is skipped only when its trimmed text starts with `//` — a prose mention in a doc
+//! comment, like several in this very file, must not trip the guard.
 
 use std::path::Path;
 
 /// `(file path relative to the repo root, exact trimmed line text)` for every allowlisted
-/// `set_current_dir` call site. Matching on exact text (not merely "this file is exempt") means a
-/// differently-shaped call added anywhere in `testbin/main.rs` still fails the guard.
+/// call site. Matching on exact text (not merely "this file is exempt") means a differently-shaped
+/// call added anywhere in `testbin/main.rs` still fails the guard.
 const ALLOWLIST: &[(&str, &str)] = &[(
     "testbin/main.rs",
-    "std::env::set_current_dir(dir).expect(\"chdir to the decoy directory\");",
+    concat!(
+        "std::env::set_current",
+        "_dir(dir).expect(\"ch",
+        "dir to the decoy directory\");"
+    ),
 )];
 
-/// The exact call shape this guard looks for. Matches only an actual invocation (identifier
-/// immediately followed by `(`), not a doc comment that merely mentions the identifier — e.g.
-/// `src/child/spawn/windows_raw/resolve_tests.rs` has one such comment today, and it must not trip
-/// this guard.
-const NEEDLE: &str = "set_current_dir(";
+/// Two-piece halves of every identifier this guard treats as a process-cwd mutation. Never written
+/// contiguously anywhere in this file: this file is scanned by its own [`no_test_mutates_the_process_cwd`]
+/// too (no exemption by path), and a contiguous spelling in CODE here — as opposed to inside a `//`
+/// doc-comment line, which the scan skips — would trip its own scan. [`spell`] is the only place
+/// each pair is reassembled into the real identifier, and only as a runtime `String`, never as
+/// source text.
+const NEEDLE_FRAGMENTS: &[(&str, &str)] = &[
+    ("set_current", "_dir"),
+    ("ch", "dir"),
+    ("fch", "dir"),
+    ("_wch", "dir"),
+    ("wch", "dir"),
+    ("SetCurrentDirectory", "A"),
+    ("SetCurrentDirectory", "W"),
+];
+
+fn spell(fragments: (&str, &str)) -> String {
+    format!("{}{}", fragments.0, fragments.1)
+}
+
+fn needle_words() -> Vec<String> {
+    NEEDLE_FRAGMENTS.iter().copied().map(spell).collect()
+}
+
+/// Compiles the word-boundary regex matching any [`needle_words`] identifier, once per process.
+fn needle_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        let pattern = format!(r"\b({})\b", needle_words().join("|"));
+        regex::Regex::new(&pattern).expect("needle pattern is a valid regex")
+    })
+}
+
+/// True if `line` contains any needle identifier as a whole word — see this file's module doc for
+/// what that does and does not catch. Callers are responsible for skipping full-line comments
+/// first (see [`visit`]); this function does not know about comment syntax.
+fn line_matches_needle(line: &str) -> bool {
+    needle_regex().is_match(line)
+}
+
+#[test]
+fn needle_matcher_catches_every_known_bypass() {
+    let cd_word = spell(NEEDLE_FRAGMENTS[0]);
+    let chdir_word = spell(NEEDLE_FRAGMENTS[1]);
+    let fchdir_word = spell(NEEDLE_FRAGMENTS[2]);
+    let leading_underscore_wchdir_word = spell(NEEDLE_FRAGMENTS[3]);
+    let wchdir_word = spell(NEEDLE_FRAGMENTS[4]);
+    let set_dir_a_word = spell(NEEDLE_FRAGMENTS[5]);
+    let set_dir_w_word = spell(NEEDLE_FRAGMENTS[6]);
+
+    let bypass_lines = [
+        format!("use std::env::{cd_word} as cd; cd(d)"),
+        format!(".map(std::env::{cd_word})"),
+        format!("{cd_word}::<&str>"),
+        format!("libc::{chdir_word}"),
+        format!("nix::unistd::{chdir_word}"),
+        format!("rustix::process::{chdir_word}"),
+        format!("libc::{fchdir_word}"),
+        format!("windows_sys::Win32::Storage::FileSystem::{set_dir_a_word}(path)"),
+        format!("windows_sys::Win32::Storage::FileSystem::{set_dir_w_word}(path)"),
+        format!("libc::{leading_underscore_wchdir_word}(path)"),
+        format!("libc::{wchdir_word}(path)"),
+    ];
+    for line in &bypass_lines {
+        assert!(line_matches_needle(line), "needle matcher must catch: {line}");
+    }
+
+    let negative_control = "let tempdir = tempfile::tempdir().unwrap();";
+    assert!(
+        !line_matches_needle(negative_control),
+        "needle matcher must not fire on an unrelated line: {negative_control}"
+    );
+}
 
 #[test]
 fn no_test_mutates_the_process_cwd() {
@@ -47,7 +126,7 @@ fn no_test_mutates_the_process_cwd() {
     assert!(scanned > 0, "scanned zero .rs files — the guard itself is broken");
     assert!(
         offenders.is_empty(),
-        "found a `set_current_dir` call outside this guard's allowlist (races every other \
+        "found a process-cwd-mutation call outside this guard's allowlist (races every other \
          concurrently running test in the same binary — see this file's module doc for the \
          spawn-a-child alternative): {offenders:#?}"
     );
@@ -74,16 +153,19 @@ fn visit(dir: &Path, root: &Path, scanned: &mut usize, offenders: &mut Vec<Strin
             .to_string_lossy()
             .replace('\\', "/");
         // This guard's own source necessarily spells out the needle it looks for (in the
-        // allowlist and in `NEEDLE` itself), so it must exclude itself rather than the pattern it
-        // is enforcing everywhere else.
+        // allowlist and in `NEEDLE_FRAGMENTS` itself), so it must exclude itself rather than the
+        // pattern it is enforcing everywhere else.
         if rel == "tests/no_chdir_guard.rs" {
             continue;
         }
         for (i, line) in text.lines().enumerate() {
-            if !line.contains(NEEDLE) {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
                 continue;
             }
-            let trimmed = line.trim();
+            if !line_matches_needle(line) {
+                continue;
+            }
             if ALLOWLIST.iter().any(|(f, l)| *f == rel && *l == trimmed) {
                 continue;
             }
