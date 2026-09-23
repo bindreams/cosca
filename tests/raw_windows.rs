@@ -127,6 +127,37 @@ fn embedded_nul_in_cwd_is_rejected() {
     assert!(e.to_string().contains("working directory"), "{e}");
 }
 
+/// `current_dir("")` fails on both Windows backends, with different kinds: the raw backend refuses
+/// it as `NotFound`, and the std backend hands `""` to `CreateProcessW`. The raw backend takes a
+/// command with an `executable()`, a `raw_executable()` or a descriptor from 3 up, even one whose
+/// program is only its argv.
+#[test]
+fn an_empty_current_dir_fails_on_both_backends() {
+    let mut exe = cosca::Command::new();
+    exe.executable(common::testbin())
+        .commandline("x exit 0")
+        .current_dir("");
+    let mut raw_exe = cosca::Command::new();
+    raw_exe
+        .raw_executable(common::testbin())
+        .commandline("x exit 0")
+        .current_dir("");
+    let mut fd3 = cosca::Command::new();
+    fd3.args([common::testbin(), "exit", "0"]).current_dir("");
+    fd3.fd(3, cosca::Stdio::null()).unwrap();
+    let mut std_backend = cosca::Command::new();
+    std_backend.args([common::testbin(), "exit", "0"]).current_dir("");
+    let kind = |mut cmd: cosca::Command| match cmd.spawn() {
+        Err(cosca::error::Error::Io(e)) => e.kind(),
+        Err(other) => panic!("expected Io, got {other:?}"),
+        Ok(_) => panic!("an empty current_dir must fail"),
+    };
+    assert_eq!(kind(exe), std::io::ErrorKind::NotFound, "executable()");
+    assert_eq!(kind(raw_exe), std::io::ErrorKind::NotFound, "raw_executable()");
+    assert_eq!(kind(fd3), std::io::ErrorKind::NotFound, "argv with fd 3");
+    assert_eq!(kind(std_backend), std::io::ErrorKind::InvalidFilename, "std backend");
+}
+
 /// A `.bat`/`.cmd` reached via `executable()` is rejected BEFORE resolution (CVE-2024-24576): a
 /// batch program has cmd.exe escaping semantics the raw quoter does not implement.
 #[test]

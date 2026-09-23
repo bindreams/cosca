@@ -58,10 +58,12 @@ fn exe_name(base: &str) -> String {
 fn go(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::PathBuf, Error> {
     resolve(ResolveInput {
         program: Path::new(program),
-        cwd,
+        cwd: Some(cwd),
         system_dirs: &[],
         path_var: path,
         windows: HOST_WINDOWS,
+        loadable_only: false,
+        normalise: &as_written,
     })
 }
 
@@ -321,8 +323,9 @@ fn a_drive_relative_name_is_located_not_bare() {
     // A drive prefix is a WINDOWS notion: off Windows `C:tool` is an ordinary one-component
     // filename, and calling it located would stop it being searched for on `PATH` at all.
     assert_eq!(classify(OsStr::new("C:tool"), false), Shape::BareName);
-    // And it takes a drive LETTER: `1:tool` has none, so it is bare on either platform.
-    assert_eq!(classify(OsStr::new("1:tool"), true), Shape::BareName);
+    // Any one UTF-16 unit makes a drive, as `RtlDetermineDosPathNameType_U` reads it: `1:tool`
+    // is relative to drive `1`, so it is located on Windows too.
+    assert_eq!(classify(OsStr::new("1:tool"), true), Shape::Located);
     assert_eq!(classify(OsStr::new(r"dir\tool"), true), Shape::Located);
     assert_eq!(classify(OsStr::new("dir/tool"), true), Shape::Located);
     // Off Windows a backslash is an ordinary character and there are no drive prefixes.
@@ -384,10 +387,12 @@ fn a_name_with_a_separator_resolves_against_cwd() {
 fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::PathBuf, Error> {
     resolve(ResolveInput {
         program: Path::new(program),
-        cwd,
+        cwd: Some(cwd),
         system_dirs: &[],
         path_var: path,
         windows: true,
+        loadable_only: false,
+        normalise: &as_written,
     })
 }
 
@@ -649,6 +654,19 @@ fn fixture_relative_cwd_is_absolutised() {
     };
     let want = cwd.join("sub").join(exe_name("tool"));
     assert!(want.is_file(), "the parent must have planted `tool` here: {want:?}");
+    // On Windows the base is completed by the caller, as the raw backend does, before `resolve`.
+    #[cfg(windows)]
+    let got = {
+        use crate::child::spawn::windows_raw::{env_snapshot::EnvSnapshot, resolve};
+        let base = resolve::effective_cwd(
+            Some(Path::new("sub")),
+            &resolve::DriveDirs::new(&EnvSnapshot::read().unwrap()),
+            || std::env::current_dir().map_err(Error::Io),
+        )
+        .unwrap();
+        resolve::resolve_executable(Path::new("./tool"), Some(&base), None).unwrap()
+    };
+    #[cfg(not(windows))]
     let got = go("./tool", Path::new("sub"), None).unwrap();
     assert!(got.is_absolute(), "{got:?}");
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -738,10 +756,12 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
     let path = path_var_for(&[pathdir.path()], true);
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
-        cwd: cwd.path(),
+        cwd: Some(cwd.path()),
         system_dirs: &system_dirs,
         path_var: Some(&path),
         windows: true,
+        loadable_only: false,
+        normalise: &as_written,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -761,10 +781,12 @@ fn bare_name_only_on_path_still_resolves_from_path() {
     let path = path_var_for(&[pathdir.path()], true);
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
-        cwd: cwd.path(),
+        cwd: Some(cwd.path()),
         system_dirs: &system_dirs,
         path_var: Some(&path),
         windows: true,
+        loadable_only: false,
+        normalise: &as_written,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -785,10 +807,12 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
     let path = path_var_for(&[bin.path()], true);
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
-        cwd: cwd.path(),
+        cwd: Some(cwd.path()),
         system_dirs: &[],
         path_var: Some(&path),
         windows: true,
+        loadable_only: false,
+        normalise: &as_written,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -797,10 +821,12 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
     // silently succeed by, say, treating an empty slice as "search the cwd instead".
     let miss = resolve(ResolveInput {
         program: Path::new("tool"),
-        cwd: cwd.path(),
+        cwd: Some(cwd.path()),
         system_dirs: &[],
         path_var: None,
         windows: true,
+        loadable_only: false,
+        normalise: &as_written,
     });
     assert_not_found("tool", miss);
 }
@@ -823,10 +849,12 @@ fn posix_ignores_system_dirs_entirely() {
     let system_dirs = [sysdir.path().to_path_buf()];
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
-        cwd: cwd.path(),
+        cwd: Some(cwd.path()),
         system_dirs: &system_dirs,
         path_var: None,
         windows: false,
+        loadable_only: false,
+        normalise: &as_written,
     });
     assert_not_found("tool", got);
 }
@@ -942,7 +970,7 @@ fn a_drive_relative_name_is_refused_on_shape() {
     // loop fell through to the generic trailing error, which would have changed kind silently if
     // that filter ever did.
     let cwd = tempfile::tempdir().unwrap();
-    for n in ["C:tool", "D:sub/x", "C:tool.exe", r"Z:a\b"] {
+    for n in ["C:tool", "D:sub/x", "C:tool.exe", r"Z:a\b", "1:tool", "\u{e9}:tool"] {
         assert_refused_on_shape(n, go_win_path(n, cwd.path(), None));
     }
 }
@@ -953,11 +981,8 @@ fn an_accepted_name_that_is_simply_absent_is_not_found() {
     // each of these IS accepted, IS searched, and merely misses — a different disk (or `PATH`)
     // resolves any of them, so none may be reported as refused.
     let cwd = tempfile::tempdir().unwrap();
-    // `1:tool` is in the list on purpose: a drive prefix takes a LETTER, so this is an ordinary
-    // bare name that gets searched, not a drive-relative refusal.
     for n in [
         "tool",
-        "1:tool",
         // `std` recognises a verbatim drive whichever separator follows it, so this is
         // `\\?\C:` plus a path, not a bare prefix. Pins the parser against `std`'s own rule.
         r"\\?\C:/x",
@@ -1106,9 +1131,6 @@ fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
         r"\\?\C:",
         r"\\?\C:\",
         r"\\?\UNC\server\share",
-        // `std` matches the `UNC\` marker through the same `/`-for-`\` normalisation it applies
-        // to the rest of a prefix, so this is a share root too.
-        r"\\?\UNC/server\share",
         r"\\?\GLOBALROOT",
         r"\\.\pipe",
         r"\\",
@@ -1131,6 +1153,12 @@ fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string()
         (r"\\?\UNC\srv/shr/a", "a"),
         (r"\\?\ns/a", "a"),
         (r"\\?\GLOBALROOT/Device/X/tool.exe", "tool.exe"),
+        // `UNC` marks a UNC path only before `\`, as NT reads it, so these are the namespace
+        // `UNC` and the names after it, not a share root. std's `parse_prefix` rewrites `/` to `\`
+        // in the first eight bytes and would read a share root.
+        (r"\\?\UNC/srv\tool.exe", "tool.exe"),
+        (r"\\?\UNC/server\share", "share"),
+        (r"\\?\UNC/srv/shr", "shr"),
     ] {
         let got = final_component(OsStr::new(n), true);
         assert_eq!(got, want.as_bytes(), "{n:?} -> {:?}", String::from_utf8_lossy(got));
@@ -1138,11 +1166,12 @@ fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string()
     }
     // The other half of the same rule, so widening the separator set cannot be "fixed" by dropping
     // the prefix parse: a share root is still a root however its halves are spelt, and
-    // `PureWindowsPath` names nothing for any of these either.
+    // `PureWindowsPath` names nothing for any of these either. The marker is matched
+    // case-insensitively, as NT matches it.
     for n in [
         r"\\?\UNC\srv/shr",
-        r"\\?\UNC/srv/shr",
         r"\\?\UNC\srv\shr",
+        r"\\?\unc\srv\shr",
         r"\\?\ns",
         r"\\?\GLOBALROOT",
     ] {

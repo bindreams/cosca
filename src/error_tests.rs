@@ -167,3 +167,18 @@ fn unassessable_carries_no_source_when_there_is_no_os_error() {
     };
     assert!(std::error::Error::source(&e).is_none());
 }
+
+/// Context added to an OS error keeps the OS error as its `source`, so the code a caller branches
+/// on survives: several OS codes share one `ErrorKind`.
+#[test]
+fn io_context_keeps_the_os_error_as_its_source() {
+    // Access denied: `ERROR_ACCESS_DENIED` on Windows, `EACCES` elsewhere.
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let e = crate::error::io_context("could not check C:\\t.exe", std::io::Error::from_raw_os_error(code));
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().starts_with("could not check C:\\t.exe: "), "{e}");
+    let source = std::error::Error::source(e.get_ref().expect("a custom error"))
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the OS error is the source");
+    assert_eq!(source.raw_os_error(), Some(code));
+}

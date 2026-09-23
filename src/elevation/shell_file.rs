@@ -75,25 +75,21 @@ fn unsupported(program: &Path, detail: &str) -> Error {
     }
 }
 
-/// Refuse an elevated program that is not fully qualified: a drive and a root (`C:\`), or two
-/// leading separators (UNC, `\\?\`, `\\.\`). A relative or bare name leaves ShellExecuteEx a
-/// lookup to make — App Paths, `lpDirectory`, `PATH` — and whether the consent launch makes one is
+/// Refuse an elevated program that is not fully qualified: a drive and a root (`C:\`), or a UNC,
+/// verbatim or device prefix (`\\server\share`, `\\?\`, `\\.\`). A relative or bare name
+/// leaves ShellExecuteEx a lookup to make — App Paths, `lpDirectory`, `PATH` — and whether the consent launch makes one is
 /// unmeasured; an elevated caller's `exefile` launch finds nothing by a bare name (measured). A
 /// drive-relative (`C:x.exe`) or rooted (`\x.exe`) token would be resolved against a current
 /// directory, so it is refused too.
 fn reject_not_fully_qualified(program: &Path) -> Result<(), Error> {
-    let text = program.as_os_str().to_string_lossy();
-    let is_sep = |c: Option<char>| matches!(c, Some('\\' | '/'));
-    let drive_rooted =
-        crate::child::spawn::drive_prefix_len(&text).is_some_and(|len| is_sep(text[len..].chars().next()));
-    let mut chars = text.chars();
-    let two_separators = is_sep(chars.next()) && is_sep(chars.next());
-    if drive_rooted || two_separators {
+    // The resolver's classifier, which reads separators before a drive as Win32 does: `\:\x` is
+    // rooted, not drive `\`.
+    if crate::resolve::is_absolute_name(program.as_os_str(), true) {
         return Ok(());
     }
     Err(unsupported(
         program,
-        "an elevated program must be a fully qualified path (C:\\… or \\\\server\\…): a relative or bare \
+        "an elevated program must be a fully qualified path (C:\\… or \\\\server\\share\\…): a relative or bare \
          name leaves ShellExecuteEx a lookup to make, which could consult App Paths; resolve it first",
     ))
 }

@@ -247,7 +247,7 @@ pub(crate) fn create_process(
             &mut pi,
         )
     }
-    .map_err(|e| Error::Io(e.into()))?;
+    .map_err(|e| Error::Io(win32_io_error(e)))?;
     // SAFETY: `CreateProcessW` succeeded, so `hProcess` is a valid handle we now own.
     let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) };
     // SAFETY: `hThread` is owned and unneeded; close it. This runs under the spawn lock, so a
@@ -256,6 +256,18 @@ pub(crate) fn create_process(
         log::debug!("CloseHandle(hThread): {e:?}");
     }
     Ok((proc, pi.dwProcessId))
+}
+
+/// `e` as the `io::Error` std's spawn would report: a `HRESULT_FROM_WIN32` code unwrapped to its
+/// Win32 code, which `kind()` classifies. `windows`' own conversion keeps the HRESULT, which
+/// `kind()` does not.
+pub(crate) fn win32_io_error(e: windows::core::Error) -> io::Error {
+    let code = e.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        io::Error::from_raw_os_error(code as i32)
+    }
 }
 
 #[cfg(test)]

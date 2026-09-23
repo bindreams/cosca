@@ -1,6 +1,8 @@
+use std::os::windows::ffi::OsStrExt;
+
 use windows::Win32::System::Threading::{EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
 
-use super::{create_process, RawChild};
+use super::{create_process, win32_io_error, RawChild};
 
 fn spawn_long_lived_runas() -> RawChild {
     // A real, NON-elevated child wrapped with the runas flag. `ping -n 5 127.0.0.1` runs
@@ -36,4 +38,45 @@ fn runas_teardown_on_drop_returns_promptly() {
         child.try_wait().expect("try_wait").is_some(),
         "teardown must reap a killable runas child"
     );
+}
+
+/// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own
+/// spawn reports it, so `kind()` classifies it. Any other HRESULT is kept whole.
+#[test]
+fn win32_io_error_unwraps_a_win32_hresult() {
+    use windows::core::{Error, HRESULT};
+    let dir = win32_io_error(Error::from_hresult(HRESULT(0x8007_010Bu32 as i32)));
+    assert_eq!(dir.raw_os_error(), Some(267));
+    assert_eq!(dir.kind(), std::io::ErrorKind::NotADirectory);
+    let e_fail = win32_io_error(Error::from_hresult(HRESULT(0x8000_4005u32 as i32)));
+    assert_eq!(e_fail.raw_os_error(), Some(0x8000_4005u32 as i32));
+}
+
+/// `CreateProcessW` refusing a working directory surfaces `ERROR_DIRECTORY`, not its HRESULT.
+#[test]
+fn a_refused_cwd_is_reported_as_its_win32_code() {
+    let base = tempfile::tempdir().unwrap();
+    let missing: Vec<u16> = base
+        .path()
+        .join("missing")
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut cmdline: Vec<u16> = "cmd /c exit 0\0".encode_utf16().collect();
+    let mut si = STARTUPINFOEXW::default();
+    let err = create_process(
+        None,
+        &mut cmdline,
+        &mut si,
+        None,
+        &Some(missing),
+        EXTENDED_STARTUPINFO_PRESENT.0,
+    )
+    .expect_err("a missing cwd must be refused");
+    let crate::error::Error::Io(err) = err else {
+        panic!("expected Error::Io, got {err:?}");
+    };
+    assert_eq!(err.raw_os_error(), Some(267), "{err:?}");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err:?}");
 }

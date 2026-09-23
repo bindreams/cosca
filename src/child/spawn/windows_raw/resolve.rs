@@ -31,34 +31,79 @@ use crate::error::Error;
 
 // Program resolution =====
 
-/// Resolve `exe` against the CHILD's cwd and the CHILD's `PATH`.
+/// Resolve `exe` for the raw backend against `base`, the CHILD's directory, and the CHILD's `PATH`.
 ///
-/// `cmd_cwd` is `Command::cwd()` — the directory the child will actually run in. When it is
-/// `None` (no override was set), the child inherits the parent's cwd, so
-/// [`std::env::current_dir`] is the correct fallback. Seeding resolution from the parent's cwd
-/// UNCONDITIONALLY (ignoring a `Command::cwd()` override) would resolve `./helper` against the
-/// wrong directory: the doc on [`crate::resolve::ResolveInput::cwd`] promises the CHILD's
-/// directory, and that promise is also the documented escape hatch for reaching "the current
-/// directory explicitly" — reaching the parent's instead defeats it.
+/// `base` is fully qualified, or `None` for a name [`crate::resolve::needs_base`] says needs none.
+/// The raw backend passes its [`effective_cwd`], the same value it gives `CreateProcessW` as
+/// `lpCurrentDirectory`, so the file resolved and the directory run in come from one read of this
+/// process's state.
 ///
 /// `path` is the child's `PATH`, [`ChildEnv::path`] of the same [`ChildEnv`] whose
 /// [`ChildEnv::into_block`] the child is spawned with, so the directories searched here are the
 /// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
 /// promises — and no second read of this process's environment can disagree with the block.
+pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
+    resolve_executable_in(exe, base, &windows_system_dirs(), path, false)
+}
+
+/// A raw spawn's effective working directory: filled once per spawn, and the one value every later
+/// step uses — the base a program is resolved or completed against, and `lpCurrentDirectory`.
 ///
-/// Convenience wrapper over [`resolve_executable_in`] seeded from `cmd_cwd` (or
-/// [`std::env::current_dir`]), the real system directories, and the child's `PATH`.
-pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    let base_cwd;
-    let base_cwd: &Path = match cmd_cwd {
-        Some(dir) => dir,
-        None => {
-            base_cwd = std::env::current_dir()?;
-            &base_cwd
+/// - A `current_dir` is checked ([`check_current_dir`]), then completed as Win32 completes it
+///   ([`complete_on`]), with a drive's own directory from `drive_dirs`, the spawn's one reading of
+///   them. It must then be fully qualified, so `current_dir(r"\\server")` is refused.
+/// - With none, it is this process's cwd.
+///
+/// `process_cwd` is called at most once. Leaving `lpCurrentDirectory` null instead would have
+/// `CreateProcessW` read the cwd again, so a `set_current_dir` in between could load one
+/// directory's file and run the child in another.
+pub(crate) fn effective_cwd(
+    cmd_cwd: Option<&Path>,
+    drive_dirs: &DriveDirs<'_>,
+    process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
+) -> Result<PathBuf, Error> {
+    match cmd_cwd {
+        Some(dir) => {
+            check_current_dir(dir)?;
+            let done = complete_on(dir, process_cwd, |drive| Ok(drive_dirs.get(drive)))?;
+            reject_not_fully_qualified("working directory", &done.path)?;
+            Ok(done.path)
         }
-    };
-    let system_dirs = windows_system_dirs();
-    resolve_executable_in(exe, base_cwd, &system_dirs, path)
+        None => process_cwd(),
+    }
+}
+
+/// The checks the raw backend makes on a `current_dir` as written, before anything reads or
+/// completes it: no interior NUL, which Win32 would truncate at, and not empty. `""` names no
+/// directory, and completing it would silently yield this process's cwd; it is `NotFound`, as the
+/// POSIX spawn's `chdir("")` reports.
+///
+/// The std backend does not call this: a command with no `executable()`, no `raw_executable()` and
+/// no descriptor from 3 up (`routes_to_raw_backend`). std hands `""` to `CreateProcessW`, which
+/// fails it as `InvalidFilename`. `tests/raw_windows.rs` pins both kinds.
+pub(crate) fn check_current_dir(dir: &Path) -> Result<(), Error> {
+    ensure_no_nul_wide("working directory", dir.as_os_str())?;
+    if dir.as_os_str().is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "current_dir(\"\") names no directory",
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a completed field that is still not fully qualified: Win32 reads a path starting with two
+/// separators as UNC, and one naming no share (`\\tool.exe`) completes to itself, a path neither
+/// on a drive nor on a share. Judged by the resolver's classifier, not `Path::is_absolute`, which
+/// knows only letter drives.
+pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), Error> {
+    if crate::resolve::is_absolute_name(path.as_os_str(), true) {
+        return Ok(());
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("the {what} names no drive or share once completed: {path:?}"),
+    )))
 }
 
 /// The real system directories, in `CreateProcessW`'s NULL-`lpApplicationName` search order minus
@@ -173,15 +218,17 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 }
 
 /// Complete a possibly-relative program name into an absolute path the way the Win32 loader
-/// itself would — **without searching, appending an extension, or touching the filesystem**.
+/// itself would — **without searching or appending an extension**. The filesystem is touched only
+/// to ask whether a drive-relative name's `=Q:` directory exists, as `GetFullPathNameW` does
+/// ([`DriveDirs`]).
 ///
-/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`]. Only the
-/// elevated path loads its result, because the two Win32 sinks treat a relative name oppositely:
+/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and both Win32
+/// sinks get a completed name:
 ///
-/// - `CreateProcessW` completes a partial `lpApplicationName` itself ("the function uses the
+/// - `CreateProcessW` would complete a partial `lpApplicationName` itself ("the function uses the
 ///   current drive and current directory to complete the specification. The function will not
-///   use the search path"), so the raw backend hands it a relative value untouched, using this
-///   only for its refusals.
+///   use the search path"), but from its own, second read of the cwd. The raw backend completes it
+///   through [`absolutise_exact_on`] instead, from the one read its working directory comes from.
 /// - `ShellExecuteEx` SEARCHES a path-less `lpFile`, which is how the elevated path reached the
 ///   `.bat`/`.cmd` vector; completing the name here stops that search. The consent path also gates
 ///   the completed name against `.exe`/`.com` — see [`crate::resolve::reject_unloadable_image`]
@@ -200,11 +247,248 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 ///
 /// The current directory is process-global and can change between calls, so the elevated path
 /// consumes the relative name exactly once and everything downstream uses the absolute result —
-/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code. The raw
-/// backend's use is safe from that race: whether it names a file, and whether it names a batch
-/// file, depend only on the token's own final component, not on the directory it was completed
-/// against.
+/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
+    check_exact(program)?;
+    let full = full_path_name(program)?;
+    // AFTER: normalisation STRIPS trailing dots and spaces from the final component, so it can
+    // CREATE the shape the pre-check refuses. `C:\t\...` passes as written — `...` is neither
+    // empty nor `.`/`..` — and normalises to `C:\t\`, a directory, which would then be handed to
+    // `ShellExecuteEx` as `lpFile` under `runas`. Checking only the spelling refuses the spelling
+    // and not the shape.
+    reject_unnameable_program(&full)?;
+    Ok(full)
+}
+
+/// A path Win32 has completed, and whether this process's cwd went into it.
+pub(crate) struct Completed {
+    pub(crate) path: PathBuf,
+    /// Whether the cwd read was USED to build `path`, not merely fetched: a drive-relative path on
+    /// another drive fetches it to learn the current drive, then takes nothing from it.
+    pub(crate) used_cwd: bool,
+}
+
+/// Complete `path` as `GetFullPathNameW` would, with this process's cwd read through
+/// `process_cwd` (at most once) and another drive's own current directory through `drive_cwd`,
+/// instead of by `GetFullPathNameW` itself. `GetFullPathNameW` then only normalises a path that is
+/// already fully qualified, which reads neither. A path written verbatim (`\\?\`) is kept as written,
+/// and refused when `GetFullPathNameW` would rewrite it. One made verbatim by a verbatim cwd is
+/// normalised like any other, as Win32 completes a relative name against that cwd.
+///
+/// The path's type is [`crate::resolve::path_type`]'s, the one classifier the resolver uses too:
+///
+/// - [`Unc`](crate::resolve::PathType::Unc) or
+///   [`DriveAbsolute`](crate::resolve::PathType::DriveAbsolute): as written. Nothing is read.
+/// - [`DriveRelative`](crate::resolve::PathType::DriveRelative) (`C:x`): the cwd is read to learn
+///   the current drive. On that drive the rest is appended to the cwd. On another, it is appended
+///   to that drive's own directory as `drive_cwd` reports it ([`DriveDirs`] for a spawn), if fully
+///   qualified, else to the drive's root, and the cwd is not used.
+/// - [`Rooted`](crate::resolve::PathType::Rooted) (`\x`): appended to the cwd's drive or share.
+///   Refused on a verbatim cwd, where Win32 completes it off the cwd's volume (`\t.exe`,
+///   measured).
+/// - [`Relative`](crate::resolve::PathType::Relative): appended to the cwd. On a verbatim cwd it is
+///   appended as written, so `GetFullPathNameW` collapses its `..` with Win32's floor, after
+///   `\\?\UNC\` (measured), not std's.
+///
+/// Appended as units, never `Path::join`ed: `join` replaces its base when the rest parses a prefix
+/// of its own, so `C:D:\x` would become `D:\x` where Win32 reads `C:\cwd\D:\x`.
+pub(crate) fn complete_on(
+    path: &Path,
+    process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
+    drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
+) -> Result<Completed, Error> {
+    let anchored = anchor(path, process_cwd, drive_cwd)?;
+    // A path WRITTEN verbatim names what it spells, and is kept as written only when
+    // `GetFullPathNameW` leaves it alone. It does rewrite some (a trailing dot, measured), and
+    // whatever completes the child's `lpCurrentDirectory` may rewrite it the same way (ReactOS
+    // `CreateProcessInternalW` runs `GetFullPathNameW` on it), so a rewritten one is refused: the
+    // directory resolved against must be the one run in.
+    if is_verbatim(path) {
+        let normalised = full_path_name(&anchored.path)?;
+        if normalised != anchored.path {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the verbatim path {:?} would be rewritten to {normalised:?} where it is used as a \
+                     directory; spell it as that",
+                    anchored.path
+                ),
+            )));
+        }
+        return Ok(anchored);
+    }
+    Ok(Completed {
+        path: full_path_name(&anchored.path)?,
+        used_cwd: anchored.used_cwd,
+    })
+}
+
+/// [`complete_on`] without the final normalisation.
+fn anchor(
+    path: &Path,
+    process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
+    drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
+) -> Result<Completed, Error> {
+    use crate::resolve::{path_type, PathType};
+    let name = path.as_os_str();
+    let done = match path_type(name) {
+        PathType::Unc | PathType::DriveAbsolute => Completed {
+            path: path.to_path_buf(),
+            used_cwd: false,
+        },
+        PathType::DriveRelative => {
+            let (drive, rest) = crate::resolve::split_drive(name).expect("a drive-relative path has a drive");
+            let cwd = process_cwd()?;
+            // Case-insensitive by the OS's own table, as `RtlGetFullPathName_U` upcases both units,
+            // not by ASCII alone: a drive may be any unit.
+            let on_cwd_drive = crate::resolve::split_drive(cwd.as_os_str())
+                .is_some_and(|(d, _)| super::env_key::EnvKey::new(d) == super::env_key::EnvKey::new(drive));
+            if on_cwd_drive {
+                Completed {
+                    path: append(cwd.as_os_str(), rest),
+                    used_cwd: true,
+                }
+            } else {
+                let base = drive_cwd(drive)?
+                    .filter(|dir| crate::resolve::is_absolute_name(dir, true))
+                    .unwrap_or_else(|| {
+                        let mut root = drive.to_os_string();
+                        root.push("\\");
+                        root
+                    });
+                Completed {
+                    path: append(&base, rest),
+                    used_cwd: false,
+                }
+            }
+        }
+        PathType::Rooted | PathType::Relative => {
+            let cwd = process_cwd()?;
+            if crate::resolve::is_rooted_on_verbatim(name, Some(cwd.as_os_str())) {
+                return Err(crate::resolve::rooted_on_verbatim(path));
+            }
+            // On a verbatim cwd the name is joined as written: `GetFullPathNameW` then collapses it
+            // with Win32's floor, which `join` would already have applied as std's.
+            let path = if is_verbatim(&cwd) {
+                crate::resolve::join::concat(cwd.as_os_str(), name, "\\")
+            } else {
+                crate::resolve::join::join(cwd.as_os_str(), name, "\\")
+            };
+            Completed {
+                path: PathBuf::from(path),
+                used_cwd: true,
+            }
+        }
+    };
+    // `GetFullPathNameW` completes these two types without reading any process state.
+    debug_assert!(
+        matches!(
+            path_type(done.path.as_os_str()),
+            PathType::Unc | PathType::DriveAbsolute
+        ),
+        "{path:?} must anchor to a fully qualified path, got {:?}",
+        done.path
+    );
+    Ok(done)
+}
+
+/// `rest` after the directory `base`, by [`crate::resolve::join::append`].
+fn append(base: &OsStr, rest: &OsStr) -> PathBuf {
+    PathBuf::from(crate::resolve::join::append(base, rest, "\\"))
+}
+
+/// Each drive's own directory for one spawn, as `GetFullPathNameW` uses it: the `=Q:` value in the
+/// spawn's environment snapshot when it is fully qualified and names an existing directory, else
+/// none, so the drive's root is used (measured by `tests/windows_process_cwd.rs`; Wine uses any
+/// value, and notes the existence check as a Windows difference it does not model).
+///
+/// Each drive is probed at most once, so every step of one spawn completes against the same
+/// answer even if the directory appears or vanishes meanwhile.
+pub(crate) struct DriveDirs<'a> {
+    snapshot: &'a EnvSnapshot,
+    is_dir: fn(&Path) -> bool,
+    probed: std::cell::RefCell<Vec<(EnvKey, Option<OsString>)>>,
+}
+
+impl<'a> DriveDirs<'a> {
+    pub(crate) fn new(snapshot: &'a EnvSnapshot) -> Self {
+        Self::with_probe(snapshot, Path::is_dir)
+    }
+
+    /// [`DriveDirs::new`] with `is_dir` as the existence probe.
+    pub(crate) fn with_probe(snapshot: &'a EnvSnapshot, is_dir: fn(&Path) -> bool) -> Self {
+        Self {
+            snapshot,
+            is_dir,
+            probed: Default::default(),
+        }
+    }
+
+    /// `drive`'s own directory, or `None` for its root. Fully qualified before it is probed, so a
+    /// relative value never reads this process's cwd.
+    pub(crate) fn get(&self, drive: &OsStr) -> Option<OsString> {
+        let key = EnvKey::new(drive);
+        if let Some((_, dir)) = self.probed.borrow().iter().find(|(k, _)| *k == key) {
+            return dir.clone();
+        }
+        let dir = self
+            .snapshot
+            .var(&drive_cwd_var(drive))
+            .filter(|dir| crate::resolve::is_absolute_name(dir, true) && (self.is_dir)(Path::new(dir)));
+        self.probed.borrow_mut().push((key, dir.clone()));
+        dir
+    }
+}
+
+/// The name of the variable holding `drive`'s own current directory: `=Q:` for `Q:`.
+pub(crate) fn drive_cwd_var(drive: &OsStr) -> OsString {
+    let mut name = OsString::from("=");
+    name.push(drive);
+    name
+}
+
+/// [`absolutise_exact`], completed by [`complete_on`] against the spawn's effective cwd
+/// ([`effective_cwd`]) instead of by `GetFullPathNameW` reading this process's cwd itself, so the
+/// file loaded and the directory the child runs in come from the same value.
+pub(crate) fn absolutise_exact_on(
+    program: &Path,
+    process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
+    drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
+) -> Result<Completed, Error> {
+    let mut used_cwd = false;
+    let path = complete_exact(program, || {
+        let anchored = anchor(program, process_cwd, drive_cwd)?;
+        used_cwd = anchored.used_cwd;
+        Ok(anchored.path)
+    })?;
+    Ok(Completed { path, used_cwd })
+}
+
+/// Whether `path` is verbatim (`\\?\`), which Win32 passes to the filesystem unparsed.
+fn is_verbatim(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().starts_with(br"\\?\")
+}
+
+/// `GetFullPathNameW` on `path`.
+fn full_path_name(path: &Path) -> Result<PathBuf, Error> {
+    // `to_wide_nul` would truncate at an interior NUL, so `GetFullPathNameW` would complete a path
+    // the caller never named. Every caller NUL-checks, naming its field, first.
+    debug_assert_no_nul_wide("path to complete", path.as_os_str());
+    let wide = super::to_wide_nul(path.as_os_str());
+    grow_wide_buffer(|buf| unsafe {
+        // SAFETY: `wide` is NUL-terminated; `GetFullPathNameW` writes into the given buffer or
+        // reports the required length, both honoured by `wide_dir_buffer`. The `lpFilePart`
+        // out-param is optional and unused here.
+        GetFullPathNameW(PCWSTR(wide.as_ptr()), buf, None)
+    })
+    // The Win32 reason is preserved rather than flattened: unlike the system-directory queries,
+    // `GetFullPathNameW`'s failures are INPUT-dependent (`ERROR_INVALID_NAME`,
+    // `ERROR_FILENAME_EXCED_RANGE`), so the code is what tells a caller which path was bad.
+    .map_err(Error::Io)
+}
+
+/// The checks on a `raw_executable()` token as written, before it is completed.
+fn check_exact(program: &Path) -> Result<(), Error> {
     // FIRST, ahead of the shape check, so the refusal names the NUL, not a trailing separator Win32
     // would never see (`x` + NUL + `\`). `to_wide_nul` appends a terminator, and `PCWSTR` stops at
     // the FIRST NUL — so an interior NUL silently truncates the path Win32 sees.
@@ -218,22 +502,24 @@ pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
     // BEFORE: normalisation can also REMOVE the shape. `C:\t\.` normalises to `C:\t`, whose final
     // component `t` names a file, so only the spelling shows that the caller named a directory.
     reject_unnameable_program(program)?;
-    let wide = super::to_wide_nul(program.as_os_str());
-    let full = grow_wide_buffer(|buf| unsafe {
-        // SAFETY: `wide` is NUL-terminated; `GetFullPathNameW` writes into the given buffer or
-        // reports the required length, both honoured by `wide_dir_buffer`. The `lpFilePart`
-        // out-param is optional and unused here.
-        GetFullPathNameW(PCWSTR(wide.as_ptr()), buf, None)
-    })
-    // The Win32 reason is preserved rather than flattened: unlike the system-directory queries,
-    // `GetFullPathNameW`'s failures are INPUT-dependent (`ERROR_INVALID_NAME`,
-    // `ERROR_FILENAME_EXCED_RANGE`), so the code is what tells a caller which path was bad.
-    .map_err(Error::Io)?;
-    // AFTER: normalisation STRIPS trailing dots and spaces from the final component, so it can
-    // CREATE the shape the pre-check refuses. `C:\t\...` passes as written — `...` is neither
-    // empty nor `.`/`..` — and normalises to `C:\t\`, a directory, which would then be handed to
-    // `ShellExecuteEx` as `lpFile` under `runas`. Checking only the spelling refuses the spelling
-    // and not the shape.
+    Ok(())
+}
+
+/// [`absolutise_exact`]'s checks around `GetFullPathNameW`, applied to whatever `anchored` makes
+/// of `program` once the first checks pass. A token written verbatim is taken as written, as
+/// `CreateProcessW` loads it; one made verbatim by its base is normalised.
+fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Error>) -> Result<PathBuf, Error> {
+    check_exact(program)?;
+    let anchored = anchored()?;
+    // A token written verbatim is taken as written, as `std::path::absolute` takes one: the loader
+    // hands it to the filesystem unparsed, so `\\?\C:\t\tool.exe.` names that file, which
+    // normalising would turn into its sibling `tool.exe`. A verbatim base is not the caller's
+    // spelling: `tool.exe.` on `\\?\C:\d` is what Win32 completes it to, `\\?\C:\d\tool.exe`.
+    if is_verbatim(program) {
+        return Ok(anchored);
+    }
+    let full = full_path_name(&anchored)?;
+    // AFTER: as in `absolutise_exact`.
     reject_unnameable_program(&full)?;
     Ok(full)
 }
@@ -257,25 +543,32 @@ pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
 /// rather than an unrelated behaviour change: see [`crate::resolve::ResolveInput::system_dirs`]
 /// for the full monotonicity argument. Pass an empty slice to search `PATH` only.
 ///
+/// `loadable_only` is [`crate::resolve::ResolveInput::loadable_only`].
+///
 /// A drive-relative name such as `C:tool` is refused outright — `InvalidInput`, before any
 /// search — and is never loaded from `base_cwd`: resolving it would need drive C's own current
 /// directory, which cosca does not track. A name that names no file (`C:\`, `tools\dir\`,
 /// `...`, a bare `\\server\share`) is refused the same way.
 ///
-/// Visiting `base_cwd` first was the previous behaviour, and it was a
-/// binary-planting hazard: `executable("helper")` loaded a `helper.exe` dropped in
-/// whatever directory the process happened to sit in. Reach it explicitly with
-/// `./helper`, which contains a separator.
+/// On a verbatim (`\\?\`) `base_cwd`, a rooted name (`\bin\tool.exe`) is refused as
+/// `InvalidInput` too, since Win32 completes it to `\\bin\tool.exe`, off the base's volume
+/// (measured). Main, and the `std` backend, resolve it onto the base's own volume. So is a relative
+/// name whose `..` Win32 completes past a verbatim share, to a share root or no share at all.
 ///
-/// Existence is tested with [`Path::is_file`], not [`Path::exists`]: a directory
-/// is never a runnable program, so a same-named directory must not shadow the
-/// executable (which would end the search early and hand `CreateProcessW` an
-/// unlaunchable path with no fallback).
+/// Visiting `base_cwd` first is a binary-planting hazard: `executable("helper")` would load a
+/// `helper.exe` dropped in whatever directory the process happened to sit in. Reach it explicitly
+/// with `./helper`, which contains a separator.
+///
+/// Existence is tested through `crate::resolve`'s `is_execable`, which asks `std::fs::metadata`
+/// for a file, not just for something: a directory is never a runnable program, so a same-named
+/// directory must not shadow the executable (which would end the search early and hand
+/// `CreateProcessW` an unlaunchable path with no fallback).
 pub(crate) fn resolve_executable_in(
     exe: &Path,
-    base_cwd: &Path,
+    base_cwd: Option<&Path>,
     system_dirs: &[PathBuf],
     path: Option<&OsStr>,
+    loadable_only: bool,
 ) -> Result<PathBuf, Error> {
     crate::resolve::resolve(crate::resolve::ResolveInput {
         program: exe,
@@ -283,7 +576,22 @@ pub(crate) fn resolve_executable_in(
         system_dirs,
         path_var: path,
         windows: true,
+        loadable_only,
+        normalise: &normalise_candidate,
     })
+}
+
+/// [`crate::resolve::ResolveInput::normalise`]: `GetFullPathNameW`, as [`complete_exact`] completes
+/// a `raw_executable()` token on a verbatim cwd. An `executable()` name is not NUL-checked before
+/// the search, so a NUL here fails the candidate as `std::fs::metadata` would, not the assertion in
+/// [`full_path_name`].
+fn normalise_candidate(candidate: &Path) -> std::io::Result<PathBuf> {
+    let io = |e| match e {
+        Error::Io(e) => e,
+        other => std::io::Error::other(other.to_string()),
+    };
+    ensure_no_nul_wide("program candidate", candidate.as_os_str()).map_err(io)?;
+    full_path_name(candidate).map_err(io)
 }
 
 // Environment block =====
@@ -419,9 +727,10 @@ pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
 /// The one caller is `spawn_raw`'s image, and neither of the two ways that image is produced can
 /// carry a NUL by the time it arrives:
 ///
-/// - Resolved by [`resolve_executable`] — every one of its returns is gated on [`Path::is_file`],
-///   which goes through `fs::metadata` and so is false for any path Win32 cannot encode.
-/// - Passed through verbatim by `raw_executable()`'s `Exact` arm of `windows_raw::image_for` —
+/// - Resolved by [`resolve_executable`] — every one of its returns is gated on `fs::metadata`
+///   (through `crate::resolve`'s `is_execable`), which fails for any path Win32 cannot encode, so
+///   such a path is never returned.
+/// - Passed through verbatim by `raw_executable()`'s `Exact` arm of `windows_raw::target_with` —
 ///   caller input, but `reject_batch_program` runs FIRST in both raw backends and
 ///   [`ensure_no_nul_wide`]s that same token as the "program token".
 ///
@@ -439,3 +748,7 @@ pub(crate) fn debug_assert_no_nul_wide(what: &str, s: &OsStr) {
 #[cfg(test)]
 #[path = "resolve_tests.rs"]
 mod resolve_tests;
+
+#[cfg(test)]
+#[path = "absolutise_on_tests.rs"]
+mod absolutise_on_tests;
