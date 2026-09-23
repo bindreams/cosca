@@ -107,16 +107,31 @@ uv run scripts/devvm.py up windows-x64 --allow-elevation
 This sets `ConsentPromptBehaviorAdmin=0` (auto-approve, still logged, UAC still nominally
 on) — **opt-in only**, never the default, and the tool prints a note every time it's active.
 
-**Headless by default, and what that means for the actual UAC-prompt probe.** The guest
-boots with no display (`-display none`, vagrant-qemu's default) and is reached over
-WinRM/PowerShell remoting. A WinRM session is a network logon to a non-interactive session,
-not the interactive console session — so it can run a probe and inspect the _result_
-(`ShellExecuteExW`'s return value, the resulting process tree, event log entries) but it
-cannot itself render or click through the secure-desktop consent prompt. If a probe needs a
-human (or UI automation) to actually see and answer that prompt, give the guest a display —
-add e.g. `qe.other_default = %w(-parallel null -monitor none -vga std -display cocoa)` to
-the `qemu` provider block in the Windows Vagrantfile — and connect to the console, or RDP
-into the guest instead of using `devvm.py ssh`/`run`.
+**Headless by default, and how `run --unelevated` measures the real UAC path anyway.** The
+guest boots with no display (`-display none`, vagrant-qemu's default) and is normally reached
+over WinRM/PowerShell remoting. A WinRM session is a network logon in session 0 with (this
+box has `LocalAccountTokenFilterPolicy=1`) a full, unsplit High-integrity token — so a probe
+run over plain `devvm.py run`/`ssh` that calls `ShellExecuteExW("runas")` already has full
+rights and elevates trivially, measuring elevated-to-elevated, not the real desktop
+unelevated-user-clicks-through-UAC path this guest exists to probe.
+
+`devvm.py run <guest> --unelevated -- <cmd>` (Windows only) measures the real path instead,
+with no display or UI automation needed: `scripts/devvm/provision/windows-account-and-uac.ps1`
+configures the `vagrant` account to autolog in at boot, giving the guest a genuine active
+interactive (session 1, console) logon; `windows-run-unelevated.ps1` then runs the command via
+`schtasks /Create /IT /RL LIMITED`, which borrows that logon's actual filtered token at the
+LIMITED (non-elevated) run level even though the account is itself an Administrators member.
+Combined with `--allow-elevation` (`ConsentPromptBehaviorAdmin=0`), a `runas` child launched
+from that probe takes the consent path with no click required. Verify this is measuring what
+it claims to by checking `whoami /groups` inside the probe (expect `Mandatory Label\Medium
+Mandatory Level`) and inside a `runas`-elevated child of it (expect `...\High Mandatory
+Level`).
+
+If a probe genuinely needs a human (or UI automation) to see and answer the secure-desktop
+prompt itself — rather than just observing its outcome — give the guest a display instead: add
+e.g. `qe.other_default = %w(-parallel null -monitor none -vga std -display cocoa)` to the
+`qemu` provider block in the Windows Vagrantfile, and connect to the console, or RDP into the
+guest.
 
 **Measured timings on this host** (Apple Silicon Mac, so `windows-x64` runs under TCG
 cross-arch emulation; one-time data point on 2026-09-23, not a guarantee):
@@ -158,20 +173,35 @@ test` just works.
 
 ## State directories
 
-All _mutable, throwaway_ state — the per-guest QEMU disk overlay, Vagrant's machine
-metadata, the staged tree copy for Windows — lives under `.tmp/devvm/<guest>/` in this
-worktree (gitignored via the repo's existing `.tmp/` rule), never in your home directory.
-`devvm.py` arranges this by pointing `VAGRANT_DOTFILE_PATH` at
-`.tmp/devvm/<guest>/.vagrant` for every `vagrant` invocation it makes.
+The state this tool creates per-guest — the QEMU disk overlay, Vagrant's per-guest machine
+metadata, the staged tree copy — lives under `.tmp/devvm/<guest>/` in this worktree
+(gitignored via the repo's existing `.tmp/` rule). `devvm.py` arranges this by pointing
+`VAGRANT_DOTFILE_PATH` at `.tmp/devvm/<guest>/.vagrant` for every `vagrant` invocation it
+makes, and `devvm.py destroy` removes it — but only once `vagrant destroy` itself actually
+succeeds; if it fails (a stuck lock, a QEMU process it can't reach), `devvm.py` leaves
+`.tmp/devvm/<guest>/` in place instead of deleting state out from under a VM that may still
+be running, and exits non-zero so the failure isn't silent.
 
-**One exception, where Vagrant insists:** the downloaded box images themselves (several GB
-each) and installed Vagrant plugins live in Vagrant's global home,
-`~/.vagrant.d/{boxes,gems}`, same as any other Vagrant project on the machine. Vagrant ties
-plugin installation and box storage to the same `VAGRANT_HOME`; redirecting it per-project
-would mean reinstalling `vagrant-qemu` (and re-downloading every box) per worktree, which is
-worse than the alternative. Manage that cache directly with `vagrant box list` / `vagrant
-box remove <name>` when you're done with a box — `devvm.py destroy` does not touch it, only
-the per-guest disk overlay in `.tmp/`.
+**Not true home-dir isolation, though — Vagrant and vagrant-qemu keep their own state in
+`~/.vagrant.d/` regardless, same as any other Vagrant project on the machine, and `devvm.py`
+does not redirect or clean any of it:**
+
+- **Box images and plugins** (several GB each): `~/.vagrant.d/{boxes,gems}`. Vagrant ties
+  plugin installation and box storage to the same `VAGRANT_HOME`; redirecting it per-project
+  would mean reinstalling `vagrant-qemu` (and re-downloading every box) per worktree, which is
+  worse than the alternative. Manage this directly with `vagrant box list` / `vagrant box
+remove <name>` when you're done with a box.
+- **vagrant-qemu's own per-VM runtime files** — a QEMU pid file, its QMP monitor socket, and
+  an `options.yml` — under `~/.vagrant.d/tmp/vagrant-qemu/<id>/` while a guest is running.
+  `devvm.py destroy`/`vagrant destroy` clean up the VM they belong to; if `destroy` is ever
+  skipped, or fails partway (see above), these can be left behind.
+- **Vagrant's global machine index**, `~/.vagrant.d/data/machine-index/index` — a manifest of
+  every machine Vagrant knows about on this host, across all projects, not per-worktree state.
+
+None of this is huge (unlike the box images), but it means `rm -rf` on this worktree, or even
+`devvm.py destroy` for every guest, does not fully return `~/.vagrant.d/` to its pre-devvm
+state. If that matters, `vagrant global-status` lists every machine Vagrant's index knows
+about, including ones no longer backed by an actual `.tmp/devvm/` directory.
 
 **Disk is usually the constraint, not the tool.** Windows boxes run several GB; check `df -h`
 before `up`-ing a Windows guest, and don't keep more than one Windows box downloaded at a

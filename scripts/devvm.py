@@ -17,6 +17,7 @@ See scripts/README.md for prerequisites, guest details, and usage examples.
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import shlex
 import shutil
@@ -24,6 +25,11 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+# Last output line windows-account-and-uac.ps1 prints, telling devvm.py whether an
+# EnableLUA/autologon change it just made needs a reboot to take effect (see cmd_up).
+REBOOT_MARKER_TRUE = "DEVVM_REBOOT_REQUIRED=1"
+REBOOT_MARKER_FALSE = "DEVVM_REBOOT_REQUIRED=0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -94,6 +100,29 @@ def stage_dir(guest: Guest) -> Path:
     return STATE_DIR / guest.name / "tree"
 
 
+def auto_consent_state_path(guest: Guest) -> Path:
+    return STATE_DIR / guest.name / "auto_consent"
+
+
+def read_persisted_auto_consent(guest: Guest) -> bool:
+    """The auto-consent choice `up --allow-elevation` last made for this guest.
+
+    Persisted so that a later `sync` or plain `up` (with no --allow-elevation/--no-
+    allow-elevation flag) reuses the developer's actual choice instead of silently
+    defaulting to (and resetting the guest to) off.
+    """
+    path = auto_consent_state_path(guest)
+    if not path.exists():
+        return False
+    return path.read_text().strip() == "1"
+
+
+def write_persisted_auto_consent(guest: Guest, value: bool) -> None:
+    path = auto_consent_state_path(guest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("1" if value else "0")
+
+
 def require_available(guest: Guest) -> None:
     if not guest.available:
         print(f"error: guest '{guest.name}' is not available: {guest.unavailable_reason}", file=sys.stderr)
@@ -129,22 +158,83 @@ def run_vagrant(guest: Guest, args: list[str], *, auto_consent: bool = False, ch
     return result.returncode
 
 
-def stage_tree(guest: Guest) -> None:
-    """rsync a filtered copy of the working tree into .tmp/devvm/<guest>/tree.
+def run_vagrant_streaming(
+    guest: Guest, args: list[str], *, auto_consent: bool = False, check: bool = True
+) -> tuple[int, str]:
+    """Like run_vagrant, but also returns everything printed to stdout/stderr.
 
-    Used as the upload source for guests whose communicator can't rsync directly into the
-    guest (Windows/winrm). Linux/ssh guests rsync straight from REPO_ROOT and skip this.
+    Streams output live to this process's stdout as it arrives (important here: a Windows
+    `up` under TCG emulation can take over ten minutes, so a developer needs to see progress,
+    not silence followed by a wall of text at the end) while also accumulating it, so cmd_up
+    can scan for the DEVVM_REBOOT_REQUIRED marker windows-account-and-uac.ps1 prints. Reading
+    a subprocess's stdout line-by-line until the pipe closes is a blocking read on a real
+    completion event, not a timed poll.
+    """
+    require_tool("vagrant")
+    cwd = guest_dir(guest)
+    cmd = ["vagrant", *args]
+    print(f"+ (cd {cwd} && {shlex.join(cmd)})", file=sys.stderr)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=vagrant_env(guest, auto_consent=auto_consent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    lines = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        lines.append(line)
+    returncode = proc.wait()
+    if check and returncode != 0:
+        sys.exit(returncode)
+    return returncode, "".join(lines)
+
+
+def powershell_quote(value: str) -> str:
+    """Quote a single token as a PowerShell single-quoted string literal.
+
+    Single-quoted strings in PowerShell are taken verbatim except for `'`, which is escaped
+    by doubling. Used with the `&` call operator (`& 'cmd' 'arg one' 'arg two'`) so each
+    argument is passed through as a literal, not re-parsed/re-split by PowerShell.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def stage_tree(guest: Guest) -> None:
+    """rsync a copy of the working tree's git-TRACKED files into .tmp/devvm/<guest>/tree.
+
+    Every guest is served from this staged copy (not raw REPO_ROOT) so what lands in a guest
+    is exactly `git ls-files` — never untracked files (e.g. CLAUDE.local.md, .claude/) and
+    never a worktree's .git, which is a FILE (pointing at the parent repo's gitdir), not a
+    directory, so a plain rsync `--exclude=.git/` pattern silently fails to match it and
+    leaks it into the guest.
+
+    `git ls-files -z` / `rsync --from0` avoid whitespace/newline-in-filename hazards that a
+    plain newline-joined list would have.
     """
     require_tool("rsync")
+    require_tool("git")
     dest = stage_dir(guest)
     dest.mkdir(parents=True, exist_ok=True)
+
+    ls_files = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+    )
+    files_list = dest.parent / "tracked-files.list"
+    files_list.write_bytes(ls_files.stdout)
+
     cmd = [
         "rsync",
         "--archive",
         "--delete",
-        "--exclude=.git/",
-        "--exclude=target/",
-        "--exclude=.tmp/",
+        "--from0",
+        f"--files-from={files_list}",
         f"{REPO_ROOT}/",
         f"{dest}/",
     ]
@@ -181,6 +271,54 @@ def cmd_list(_args: argparse.Namespace) -> None:
         print(f"{guest.name:14s} {state:14s} {guest.box}  (communicator: {guest.communicator})")
 
 
+def run_windows_provision(guest: Guest, vagrant_args: list[str], *, auto_consent: bool) -> None:
+    """Run a `vagrant up`/`vagrant provision` on a winrm guest, and act on the
+    DEVVM_REBOOT_REQUIRED marker windows-account-and-uac.ps1 prints as its last output line:
+    trigger the named reboot-if-needed provisioner and re-verify, or fail loudly if the
+    marker is simply missing (a provisioner bug, not something to silently proceed past).
+    """
+    _, output = run_vagrant_streaming(guest, vagrant_args, auto_consent=auto_consent)
+    if REBOOT_MARKER_TRUE in output:
+        print(
+            "note: an EnableLUA or autologon change needs a reboot to take effect — "
+            "rebooting the guest now via Vagrant's own reboot-and-wait capability.",
+            file=sys.stderr,
+        )
+        run_vagrant(guest, ["provision", "--provision-with", "reboot-if-needed"])
+        verify_windows_account_settings(guest)
+    elif REBOOT_MARKER_FALSE not in output:
+        print(
+            "error: windows-account-and-uac.ps1 did not print a DEVVM_REBOOT_REQUIRED "
+            "marker — can't tell whether a reboot is needed, so refusing to guess. This is a "
+            "bug in the provisioner script, not something to silently proceed past.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def verify_windows_account_settings(guest: Guest) -> None:
+    """Post-reboot sanity check that EnableLUA and autologon actually took effect."""
+    check_cmd = (
+        '$lua = (Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion'
+        '\\Policies\\System" -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA; '
+        '$auto = (Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows NT'
+        '\\CurrentVersion\\Winlogon" -Name AutoAdminLogon -ErrorAction SilentlyContinue)'
+        ".AutoAdminLogon; "
+        'Write-Host "DEVVM_VERIFY_LUA=$lua"; '
+        'Write-Host "DEVVM_VERIFY_AUTOLOGON=$auto"'
+    )
+    _, output = run_vagrant_streaming(guest, ["winrm", "-c", check_cmd])
+    lua_ok = "DEVVM_VERIFY_LUA=1" in output
+    autologon_ok = "DEVVM_VERIFY_AUTOLOGON=1" in output
+    if not lua_ok or not autologon_ok:
+        print(
+            "error: post-reboot verification failed — EnableLUA/autologon did not take "
+            f"effect as expected (lua_ok={lua_ok}, autologon_ok={autologon_ok}). Output:\n{output}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_up(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
@@ -188,18 +326,33 @@ def cmd_up(args: argparse.Namespace) -> None:
     if args.allow_elevation and guest.communicator != "winrm":
         print("error: --allow-elevation only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
-    if args.allow_elevation:
+    if guest.communicator == "winrm":
+        # `--allow-elevation`/`--no-allow-elevation` explicitly sets and persists the choice;
+        # omitting the flag reuses whatever was last persisted (default off) instead of
+        # silently resetting it to off on every `up`.
+        if args.allow_elevation is None:
+            auto_consent = read_persisted_auto_consent(guest)
+        else:
+            auto_consent = args.allow_elevation
+            write_persisted_auto_consent(guest, auto_consent)
+    else:
+        auto_consent = False
+    if auto_consent:
         print(
             "note: auto-approve-consent is ON for this guest — ShellExecuteExW(\"runas\") will "
             "elevate without a UAC prompt. This is an opt-in probe-only mode; see "
             "scripts/README.md#windows-guests.",
             file=sys.stderr,
         )
+    # Every guest's synced folder (Linux: rsync synced_folder; Windows: "file" provisioner)
+    # sources from this staged, git-tracked-only copy — it must exist before `vagrant up`.
+    stage_tree(guest)
     if guest.communicator == "winrm":
-        # The Windows guest's "file" provisioner uploads this staged copy (see its
-        # Vagrantfile) — it must exist before the first `vagrant up --provision` runs it.
-        stage_tree(guest)
-    run_vagrant(guest, ["up", "--provider", "qemu", "--provision"], auto_consent=args.allow_elevation)
+        run_windows_provision(
+            guest, ["up", "--provider", "qemu", "--provision"], auto_consent=auto_consent
+        )
+    else:
+        run_vagrant(guest, ["up", "--provider", "qemu", "--provision"], auto_consent=auto_consent)
     if guest.communicator == "ssh":
         print(f"note: the read-only working tree is synced to {guest.tree_path_posix} — run `devvm.py sync {guest.name}` after local changes.")
     else:
@@ -212,11 +365,14 @@ def cmd_sync(args: argparse.Namespace) -> None:
     if not dotfile_dir(guest).exists():
         print(f"error: guest '{guest.name}' has not been brought up yet; run `devvm.py up {guest.name}` first", file=sys.stderr)
         sys.exit(1)
+    stage_tree(guest)
     if guest.communicator == "ssh":
         run_vagrant(guest, ["rsync"])
     else:
-        stage_tree(guest)
-        run_vagrant(guest, ["provision"])
+        # Reuse the persisted auto-consent choice (set by `up --allow-elevation`) rather than
+        # implicitly defaulting to off and silently resetting a guest that had it on.
+        auto_consent = read_persisted_auto_consent(guest)
+        run_windows_provision(guest, ["provision"], auto_consent=auto_consent)
 
 
 def cmd_ssh(args: argparse.Namespace) -> None:
@@ -237,6 +393,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     if not cmd_args:
         print("error: no command given; usage: devvm.py run <guest> -- <cmd...>", file=sys.stderr)
         sys.exit(1)
+    if args.unelevated and guest.communicator != "winrm":
+        print("error: --unelevated only applies to Windows guests", file=sys.stderr)
+        sys.exit(1)
 
     if guest.communicator == "ssh":
         # `vagrant ssh -c` runs a non-interactive, non-login shell, which doesn't source
@@ -247,16 +406,46 @@ def cmd_run(args: argparse.Namespace) -> None:
             f"cd {guest.tree_path_posix} && CARGO_TARGET_DIR=$HOME/cargo-target {shlex.join(cmd_args)}"
         )
         run_vagrant(guest, ["ssh", "-c", inner])
-    else:
-        # PowerShell over WinRM: cd into the read-only copy, point Cargo's build output at a
-        # writable directory outside it, then run the requested command.
-        user_cmd = " ".join(cmd_args)
-        inner = (
-            f"cd {guest.tree_path_posix}; "
-            f'$env:CARGO_TARGET_DIR = "$HOME\\cargo-target"; '
-            f"{user_cmd}"
-        )
+        return
+
+    # PowerShell over WinRM: cd into the read-only copy, point Cargo's build output at a
+    # writable directory outside it, then run the requested command.
+    #
+    # $ErrorActionPreference = "Stop" makes Set-Location's failure (e.g. the tree isn't
+    # there) a terminating error instead of a silently-ignored one, so a bad `cd` doesn't
+    # fall through into running the command in the wrong directory. Every token — command
+    # name included — is quoted as a PowerShell string literal and passed through the `&`
+    # call operator, so args with spaces/quotes/special characters aren't re-parsed or
+    # re-split by PowerShell the way a naive `" ".join(...)` would allow.
+    quoted_path = powershell_quote(guest.tree_path_posix)
+    quoted_cmd = " ".join(powershell_quote(part) for part in cmd_args)
+    inner = (
+        '$ErrorActionPreference = "Stop"; '
+        f"Set-Location -Path {quoted_path}; "
+        f'$env:CARGO_TARGET_DIR = "$HOME\\cargo-target"; '
+        f"& {quoted_cmd}"
+    )
+
+    if not args.unelevated:
+        # Direct WinRM: a network logon with a full, unfiltered High-integrity token on this
+        # box (LocalAccountTokenFilterPolicy=1) — fine for ordinary build/test commands, but
+        # NOT a stand-in for the real interactive unelevated-user UAC path; see --unelevated.
         run_vagrant(guest, ["winrm", "-c", inner])
+        return
+
+    # --unelevated: route the same command through windows-run-unelevated.ps1 (already
+    # present on the guest — it's part of the git-tracked tree staged/mirrored there), which
+    # runs it via a scheduled task borrowing the current interactive logon's real filtered
+    # token at LIMITED run level. Base64/UTF-16LE is exactly what PowerShell's own
+    # -EncodedCommand expects, and sidesteps re-quoting `inner` (which already contains
+    # nested quotes) through another two layers of shell (vagrant winrm -c, then schtasks).
+    encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
+    runner_path = f"{guest.tree_path_posix}/scripts/devvm/provision/windows-run-unelevated.ps1"
+    outer = (
+        f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)}; "
+        "exit $LASTEXITCODE"
+    )
+    run_vagrant(guest, ["winrm", "-c", outer])
 
 
 def cmd_halt(args: argparse.Namespace) -> None:
@@ -268,7 +457,16 @@ def cmd_halt(args: argparse.Namespace) -> None:
 def cmd_destroy(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
-    run_vagrant(guest, ["destroy", "-f"], check=False)
+    returncode = run_vagrant(guest, ["destroy", "-f"], check=False)
+    if returncode != 0:
+        print(
+            f"error: `vagrant destroy` failed (exit {returncode}) for guest '{guest.name}' — "
+            "leaving .tmp/devvm state in place rather than deleting it out from under a VM "
+            "that may still be running. Investigate (e.g. `vagrant status`, a stuck lock) "
+            "and re-run `destroy` once it's actually gone.",
+            file=sys.stderr,
+        )
+        sys.exit(returncode)
     guest_state = STATE_DIR / guest.name
     if guest_state.exists():
         shutil.rmtree(guest_state)
@@ -290,8 +488,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("guest", choices=GUESTS.keys())
     p.add_argument(
         "--allow-elevation",
-        action="store_true",
-        help="(Windows only) auto-approve UAC consent prompts, for unattended probe runs. Off by default.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="(Windows only) auto-approve UAC consent prompts, for unattended probe runs. Off "
+        "by default. Persisted per guest — omit the flag on a later `up`/`sync` to keep "
+        "reusing whatever was last set; pass --no-allow-elevation to explicitly turn it "
+        "back off.",
     )
     p.set_defaults(func=cmd_up)
 
@@ -305,6 +507,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="run one command in a guest, e.g.: devvm.py run linux-x64 -- cargo test")
     p.add_argument("guest", choices=GUESTS.keys())
+    p.add_argument(
+        "--unelevated",
+        action="store_true",
+        help="(Windows only) run via a scheduled task borrowing the current interactive "
+        "logon's real filtered (non-elevated) token, instead of WinRM's own full-rights "
+        "network-logon token — needed to measure the actual UAC/runas consent path.",
+    )
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run, prefixed with --")
     p.set_defaults(func=cmd_run)
 
@@ -320,8 +529,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = list(argv if argv is not None else sys.argv[1:])
+
+    # Special-case `run`: pull `--unelevated` and the trailing `-- <cmd...>` out ourselves
+    # before argparse ever sees them. argparse's `nargs=REMAINDER` (needed on `cmd` so
+    # arbitrary flags in the user's own command, e.g. `cargo test -- --nocapture`, pass
+    # through untouched) greedily swallows EVERY remaining token once positional-matching
+    # reaches it — including a devvm-own flag like `--unelevated` placed anywhere at or after
+    # `guest`, with or without a `--` separator; confirmed directly:
+    # `run windows-x64 --unelevated -- cargo test` left args.unelevated False, with `cmd`
+    # positional's REMAINDER eating `--unelevated` itself; only `run --unelevated windows-x64
+    # -- cargo test` parsed as intended. Handling this by hand sidesteps the quirk entirely
+    # and lets `--unelevated` appear on either side of `guest`.
+    unelevated = False
+    if argv[:1] == ["run"]:
+        rest = argv[1:]
+        if "--" in rest:
+            idx = rest.index("--")
+            head, cmd_tail = rest[:idx], rest[idx + 1 :]
+        else:
+            head, cmd_tail = rest, []
+        if "--unelevated" in head:
+            unelevated = True
+            head = [tok for tok in head if tok != "--unelevated"]
+        argv = ["run", *head]
+    else:
+        cmd_tail = None
+
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "run":
+        args.unelevated = unelevated
+        args.cmd = cmd_tail if cmd_tail is not None else []
     args.func(args)
 
 

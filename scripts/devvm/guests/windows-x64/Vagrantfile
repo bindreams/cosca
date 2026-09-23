@@ -32,8 +32,8 @@
 # cocoa)`) and connect to the console, or RDP into the guest.
 
 require_relative "../_shared/fix_macos_port_check"
+require_relative "../_shared/fix_qemu_loopback_only"
 
-REPO_ROOT = ENV.fetch("DEVVM_REPO_ROOT")
 STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 
 Vagrant.configure("2") do |config|
@@ -48,6 +48,24 @@ Vagrant.configure("2") do |config|
   config.vm.communicator = "winrm"
   config.winrm.username = "vagrant"
   config.winrm.password = "vagrant"
+
+  # The box's own embedded Vagrantfile declares forwarded ports "winrm" (guest+host 5985) and
+  # "rdp" (guest+host 3389) with no host_ip — measured directly (2026-09-23): redeclaring the
+  # same id with ONLY host_ip set, expecting Vagrant core to merge it against the box's
+  # existing host/guest values, does NOT work — `vagrant up` fails config validation
+  # ("Forwarded port definitions require a 'host' and 'guest' value", "Ports to forward must
+  # be 1 to 65535") for all three ids, including "winrm"/"rdp" which the box DOES declare.
+  # Whatever merge Vagrant core performs on same-id forwarded_port config, host_ip-only is not
+  # a valid partial update. Declaring host/guest explicitly here — matching the box's own
+  # values for winrm/rdp, and choosing 5986 for winrm-ssl (which the box doesn't declare at
+  # all) — sidesteps the merge question entirely. `auto_correct: true` matches the box's own
+  # declarations and lets Vagrant pick a different host port if this one's taken on a host
+  # already running another guest, rather than failing `up`. fix_qemu_loopback_only.rb above
+  # is defense-in-depth for all three regardless of how the host/guest/host_ip values here
+  # were arrived at.
+  config.vm.network "forwarded_port", id: "winrm", guest: 5985, host: 5985, host_ip: "127.0.0.1", auto_correct: true
+  config.vm.network "forwarded_port", id: "winrm-ssl", guest: 5986, host: 5986, host_ip: "127.0.0.1", auto_correct: true
+  config.vm.network "forwarded_port", id: "rdp", guest: 3389, host: 3389, host_ip: "127.0.0.1", auto_correct: true
 
   # A fresh install booting under TCG (cross-arch emulation) can be extremely slow — give it
   # a lot of room rather than fail a merely-slow-not-stuck boot.
@@ -68,12 +86,44 @@ Vagrant.configure("2") do |config|
   end
 
   # No live synced folder for Windows (no rsync binary on the box, and SMB needs a macOS
-  # File Sharing toggle + password prompt). Instead, `devvm.py sync` stages a filtered copy
-  # of the tree on the host (excluding .git/target/.tmp) and this "file" provisioner uploads
-  # it over WinRM — a one-shot copy, not a live mount, same "guest can't write back into the
-  # host tree" property the Linux guests get from rsync.
+  # File Sharing toggle + password prompt). Instead, `devvm.py sync` stages a git-tracked-only
+  # copy of the tree on the host (see stage_tree() in scripts/devvm.py), the "file"
+  # provisioner uploads it over WinRM into a scratch staging directory, and
+  # windows-mirror-tree.ps1 mirrors it into C:\cosca with robocopy /MIR — the WinRM upload
+  # alone is additive-only (never deletes), so without the mirror step a `devvm.py sync`
+  # after deleting a host file would leave it behind in the guest.
   config.vm.synced_folder ".", "/vagrant", disabled: true
-  config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca", run: "always"
+  config.vm.provision "shell", path: "../../provision/windows-clean-stage.ps1", privileged: true, run: "always"
+  config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca-stage", run: "always"
+  config.vm.provision "shell", path: "../../provision/windows-mirror-tree.ps1", privileged: true, run: "always"
   config.vm.provision "shell", path: "../../provision/windows-lock-tree.ps1", privileged: true, run: "always"
-  config.vm.provision "shell", path: "../../provision/windows-account-and-uac.ps1", privileged: true, run: "always"
+  # Vagrant's shell provisioner only sees the host env vars explicitly listed here (via
+  # `env:`) — DEVVM_WINDOWS_AUTO_CONSENT living in the host subprocess env that ran `vagrant`
+  # does NOT reach the guest on its own. This is what makes `devvm.py up --allow-elevation`
+  # actually take effect inside the guest.
+  config.vm.provision "shell",
+    path: "../../provision/windows-account-and-uac.ps1",
+    privileged: true,
+    run: "always",
+    env: { "DEVVM_WINDOWS_AUTO_CONSENT" => ENV.fetch("DEVVM_WINDOWS_AUTO_CONSENT", "0") }
+  # No `run: "always"` — matches linux-rust.sh's guests: devvm.py always passes `--provision`
+  # on `up` and always runs `vagrant provision` (not just `up`) for `sync`, so this runs on
+  # every provisioning pass either way; it doesn't need Vagrant's normal
+  # already-ran-on-this-machine skip overridden the way the staging/lock/account steps above
+  # do, since installing into $env:USERPROFILE\.cargo is independent of the C:\cosca tree
+  # those steps manage.
+  config.vm.provision "shell", path: "../../provision/windows-rust.ps1", privileged: false
+
+  # Named, run: "never" provisioner — only invoked explicitly by devvm.py (`vagrant provision
+  # --provision-with reboot-if-needed`) when windows-account-and-uac.ps1's last output line
+  # was DEVVM_REBOOT_REQUIRED=1 (an EnableLUA or autologon change that only takes effect at
+  # the next boot). Vagrant's own `reboot: true` shell-provisioner capability triggers
+  # unconditionally on every run of the provisioner block it's attached to regardless of the
+  # script's own logic, so a real reboot-only-when-something-changed policy has to live at
+  # this host-driven, two-phase level instead of inside a single always-run provisioner.
+  config.vm.provision "reboot-if-needed",
+    type: "shell",
+    inline: "exit 0",
+    reboot: true,
+    run: "never"
 end
