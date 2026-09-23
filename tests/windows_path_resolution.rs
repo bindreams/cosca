@@ -480,7 +480,23 @@ impl Disagreements {
             self.subject,
             self.broken.join("\n  ")
         );
+        mark_canary_passed();
     }
+}
+
+/// Record that this canary passed, as a file named after the test in `$COSCA_CANARY_MARKERS`
+/// when that is set. The workflow fails a run that leaves no marker, so a test-name filter that
+/// selects only surveys, or nothing, cannot pass having asserted nothing.
+fn mark_canary_passed() {
+    let Some(dir) = std::env::var_os("COSCA_CANARY_MARKERS") else {
+        return;
+    };
+    let name = std::thread::current()
+        .name()
+        .expect("libtest names each test's thread")
+        .to_string();
+    let path = std::path::Path::new(&dir).join(&name);
+    std::fs::write(&path, b"").unwrap_or_else(|e| panic!("could not write the canary marker {path:?}: {e}"));
 }
 
 /// A `Result` rendered for the log: `ok` or the OS error behind it.

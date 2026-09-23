@@ -71,11 +71,27 @@ jobs:
           targets: ${{ matrix.target }}
       # `--nocapture`: the surveys report only through stdout, and every canary prints what it
       # measured before asserting on it.
+      # Each canary that passes leaves a marker named after itself (`mark_canary_passed`).
       - name: Run path-resolution probes
         shell: bash
         env:
           FILTER: ${{ inputs.filter }}
-        run: >
-          cargo test --locked --target ${{ matrix.target }}
-          --test windows_path_resolution
-          -- "${FILTER}" --ignored --nocapture --test-threads=1
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
+        run: |
+          mkdir "$COSCA_CANARY_MARKERS"
+          cargo test --locked --target ${{ matrix.target }} \
+            --test windows_path_resolution \
+            -- "${FILTER}" --ignored --nocapture --test-threads=1
+      # A filter matching no test, or only surveys, would otherwise pass having asserted nothing.
+      - name: Require that a canary ran
+        shell: bash
+        env:
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
+        run: |
+          shopt -s nullglob
+          passed=("$COSCA_CANARY_MARKERS"/*)
+          if ((${#passed[@]} == 0)); then
+            echo "::error::no canary ran: the run asserted nothing about the platform"
+            exit 1
+          fi
+          printf 'canary passed: %s\n' "${passed[@]##*/}"
