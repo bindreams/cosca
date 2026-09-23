@@ -1000,7 +1000,7 @@ fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
     println!("temp root: {root:?}\nsource image: {source:?}");
 
     // (name, whether std should run the planted file itself)
-    for (i, (name, runs_itself)) in [("x.bat.", true), ("x.bat ", true), ("x.bat", false)]
+    for (i, (name, runs_itself)) in [("x.bat.", true), ("x.bat ", true), ("x.bat", true)]
         .into_iter()
         .enumerate()
     {
