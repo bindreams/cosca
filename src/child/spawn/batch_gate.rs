@@ -167,10 +167,9 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
 /// string. std does call `GetFullPathNameW` on a short `\\?\C:\…` program first (`to_user_path`,
 /// on the text after the prefix), but drops the prefix only when the result round-trips — and a
 /// string that round-trips reads the same under both tests. So `\\?\C:\x.bat.` keeps its prefix,
-/// ends in `bat.`, cmd.exe is not substituted, and the image loads like any other — while the plain
-/// `C:\x.bat.` loses its trailing dot on the way through `GetFullPathNameW` and reaches the batch
-/// file. The prefix does not merely spell the same file differently; it selects a different
-/// resolution.
+/// ends in `bat.`, and cmd.exe is not substituted — while the plain `C:\x.bat.` loses its trailing
+/// dot on the way through `GetFullPathNameW` and reaches the batch file. The prefix does not merely
+/// spell the same file differently; it selects a different resolution.
 ///
 /// std's `is_verbatim` also accepts `\??\`, which this gate does NOT route here: it walks `\??\…`
 /// as an ordinary rooted path. No verdict turns on that. A `\??\` string ending in `.bat`/`.cmd`
@@ -182,20 +181,23 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
 /// them, while the plain spelling fails with access-denied. Refusing those refused a loadable
 /// executable, which is why this is not the component machinery below with the trimming disabled.
 ///
-/// The other refusals are a data stream of a batch file, below, and `..`, which no collapse turns
-/// into a path operation here: it is a literal file name, and no file may be called that
-/// (measured: `ERROR_INVALID_NAME`). Other unloadable spellings — a trailing separator, a final `.` — are left to fail with the OS's own
-/// error, which says more about why than a security refusal would.
+/// The other refusals are a final component that trims or splits to a batch name, below, and `..`,
+/// which no collapse turns into a path operation here: it is a literal file name, and no file may
+/// be called that (measured: `ERROR_INVALID_NAME`). Other unloadable spellings — a trailing
+/// separator, a final `.` — are left to fail with the OS's own error, which says more about why
+/// than a security refusal would.
 ///
-/// # A data stream of a batch file is refused, conservatively
+/// # What trims or splits to a batch name is refused, conservatively
 ///
-/// A final component with a stream separator is judged by the plain rule, [`is_batch_program`],
-/// so `\\?\C:\x.bat:s`, `\\?\C:\x.bat:` and `\\?\C:\x.bat::$DATA` are refused as their plain
-/// spellings are. std hands `CreateProcessW` the same string for each pair — each round-trips
-/// through `GetFullPathNameW`, so `to_user_path` strips the prefix — and substitutes cmd.exe for
-/// neither. What is unmeasured is whether `CreateProcessW`, handed a data stream of a batch file,
+/// The final component is also judged by the plain rule, [`is_batch_program`], and so is the piece
+/// after its last `/`. That refuses `\\?\C:\x.bat.` and `\\?\C:\x.bat ` (one trailing space),
+/// which std's literal test passes: the stricter verdict wherever the two rules differ. It also
+/// refuses `\\?\C:\x.bat:s`, `\\?\C:\x.bat:` and `\\?\C:\x.bat::$DATA` as their plain
+/// spellings are. std hands `CreateProcessW` the same string for each stream pair — each
+/// round-trips through `GetFullPathNameW`, so `to_user_path` strips the prefix — and substitutes
+/// cmd.exe for neither. What is unmeasured is whether `CreateProcessW`, handed any of these names,
 /// launches cmd.exe on its own. ReactOS's `CreateProcessInternalW` says no (it tests the last four
-/// characters of the name), which would make both refusals over-refusals, but Windows' own
+/// characters of the name), which would make all of these refusals over-refusals, but Windows' own
 /// kernelbase may read the extension differently.
 ///
 /// The measurement that would license narrowing both: on a Windows runner, write `x.bat` whose
@@ -208,9 +210,11 @@ fn verbatim_refusal(text: &str) -> Option<&'static str> {
     if lower.ends_with(".bat") || lower.ends_with(".cmd") {
         return Some(BATCH);
     }
-    // `/` is an ordinary filename character under the prefix, so only `\` separates.
+    // `/` is an ordinary filename character under the prefix, so only `\` separates. The piece
+    // after the last `/` is judged as well, as the stricter reading.
     let last = text.rsplit('\\').next().expect("rsplit yields at least one piece");
-    if last.contains(':') && is_batch_program(last) {
+    let after_slash = last.rsplit('/').next().expect("rsplit yields at least one piece");
+    if is_batch_program(last) || is_batch_program(after_slash) {
         return Some(BATCH);
     }
     (last == "..").then_some(VERBATIM_DOTDOT)
@@ -240,9 +244,8 @@ fn verbatim_refusal(text: &str) -> Option<&'static str> {
 /// Reading only the piece before the FIRST separator loosens the gate, because the extension then
 /// comes from before the stream name.
 ///
-/// A verbatim (`\\?\`) path reaches here only for a final component with a stream separator:
-/// nothing else is trimmed or collapsed under that prefix, and std tests the string as given, so
-/// [`verbatim_refusal`] owns the rest. Off Win32 nothing reaches
+/// A verbatim (`\\?\`) path reaches here only through [`verbatim_refusal`], which judges its final
+/// component by this rule as a stricter reading than std's literal one. Off Win32 nothing reaches
 /// here at all — [`reject_batch_path_on`] returns before this, because a `.bat` is an ordinary
 /// executable to every other host.
 pub(super) fn is_batch_program(file_name: &str) -> bool {

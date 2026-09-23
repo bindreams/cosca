@@ -496,10 +496,10 @@ fn a_lone_surrogate_before_a_colon_is_a_drive_prefix() {
 /// The other half comes from std's source: for a verbatim program `is_batch_file` is a literal
 /// test of the last four UTF-16 units of the string, and the prefix comes off first only when
 /// `GetFullPathNameW` round-trips the rest unchanged. So `\\?\C:\x.bat.` keeps its prefix and
-/// ends in `bat.`, cmd.exe is not substituted, and the image
-/// loads like any other — while the plain `C:\x.bat.` has its trailing dot trimmed on the way
-/// through `GetFullPathNameW` and reaches the batch file. Same name, different resolution, so the
-/// gate must not give them the same verdict.
+/// ends in `bat.`, and cmd.exe is not substituted — while the plain `C:\x.bat.` has its trailing dot
+/// trimmed on the way through `GetFullPathNameW` and reaches the batch file. The gate refuses both
+/// all the same, as the stricter verdict; the names it must still accept are the ones only the
+/// prefix can reach.
 ///
 /// `..` is the one component that names nothing even here: no collapse happens, and the object
 /// manager rejects the literal name (measured: `ERROR_INVALID_NAME`). Refusing it costs nothing.
@@ -526,11 +526,17 @@ fn a_verbatim_path_is_judged_the_way_std_judges_one() {
             "{probe:?} names no file even verbatim"
         );
     }
+    // std's literal test passes these, and the image loads like any other; refused all the same,
+    // as the stricter verdict (see `a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece`).
+    for probe in [r"\\?\C:\x.bat.", r"\\?\C:\x.bat "] {
+        assert!(
+            super::reject_batch_path_on(Path::new(probe), true).is_err(),
+            "{probe:?} trims to a batch name"
+        );
+    }
     // Loadable, and measured to be: the prefix is how you spell a name Win32 cannot otherwise
     // reach, and std's literal test misses all of them.
     for probe in [
-        r"\\?\C:\x.bat.",
-        r"\\?\C:\x.bat ",
         r"\\?\C:\dir\....",
         r"\\?\C:\dir\...",
         r"\\?\C:\dir\ ",
@@ -1741,7 +1747,11 @@ fn the_oracle_reads_dots_and_spaces_on_its_own_terms() {
 }
 
 /// Normalisation leaves batch names `Path::extension()` cannot see: `.bat` is a bare name to it,
-/// and a data-stream piece hides behind `:`.
+/// and a data-stream piece hides behind `:`. Each is refused behind `\\?\` too, trailing dots and
+/// spaces included: that is the stricter of two verdicts, taken where this gate once disagreed with
+/// a suffix rule applied to every stream piece of the final component, each trimmed of trailing
+/// dots and spaces. std's literal verbatim test passes `\\?\C:\t\x.bat.`, so refusing it is an
+/// over-refusal as far as std goes; how kernelbase reads it is unmeasured.
 #[test]
 fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
     for p in [
@@ -1751,11 +1761,17 @@ fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
         r"C:\t\x.bat::$DATA",
         r"C:\t\x.bat.:s",
         r"C:\t\x.bat :s",
+        r"C:\t\x.bat.",
+        r"C:\t\x.bat ",
+        r"C:\t\x.cmd. .",
+        r"C:\t\a/x.bat.",
     ] {
-        assert_eq!(
-            unsupported_op(crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(p))),
-            format!("running {p}")
-        );
+        for probe in [p.to_string(), format!(r"\\?\{p}")] {
+            assert_eq!(
+                unsupported_op(super::reject_batch_path_on(std::path::Path::new(&probe), true)),
+                format!("running {probe}")
+            );
+        }
     }
     for p in [
         r"C:\t\setup.exe",
@@ -1763,10 +1779,12 @@ fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
         r"C:\t.bat\setup.exe",
         r"C:\t\batch",
     ] {
-        assert!(
-            crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(p)).is_ok(),
-            "{p}"
-        );
+        for probe in [p.to_string(), format!(r"\\?\{p}")] {
+            assert!(
+                super::reject_batch_path_on(std::path::Path::new(&probe), true).is_ok(),
+                "{probe}"
+            );
+        }
     }
 }
 
