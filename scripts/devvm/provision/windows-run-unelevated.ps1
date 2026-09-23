@@ -166,7 +166,10 @@ if ($output) {
     Write-Output $output
 }
 # Verified in-guest (2026-09-23, windows-x64): this exit code becomes powershell.exe's own
-# process exit code, which becomes `vagrant winrm -c`'s process exit code on the host, which
-# devvm.py propagates via sys.exit - end to end, a probe's real exit code reaches the
-# developer's shell.
+# process exit code, which reaches `vagrant winrm -c` on the host. But `vagrant winrm -c`
+# itself does not forward the value - measured directly with a remote command exiting
+# {0, 1, 2, 42, 255}: vagrant's own process exit code was 0 for the zero case and exactly 1
+# for every nonzero case. So only the zero-vs-nonzero distinction survives to devvm.py's
+# sys.exit, not the probe's actual exit code; do not rely on a specific nonzero value showing
+# up in the developer's shell.
 exit $exitCode

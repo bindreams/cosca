@@ -148,6 +148,11 @@ def vagrant_env(guest: Guest, *, auto_consent: bool = False) -> dict[str, str]:
 
 
 def run_vagrant(guest: Guest, args: list[str], *, auto_consent: bool = False, check: bool = True) -> int:
+    # For `vagrant winrm -c ...` specifically: measured directly (2026-09-23) by running a
+    # remote command that exited {0, 1, 2, 42, 255} in turn — `vagrant winrm`'s own process
+    # exit code was 0 for the zero case and exactly 1 for every nonzero case, never the
+    # remote value. So the returncode this function hands back (and sys.exit()s with) only
+    # preserves zero-vs-nonzero for WinRM guests, not the remote command's actual exit code.
     require_tool("vagrant")
     cwd = guest_dir(guest)
     cmd = ["vagrant", *args]
@@ -525,7 +530,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     # code, propagated through its named-pipe wait — see that script). The trailing
     # `exit $LASTEXITCODE` here is belt-and-suspenders, not dead code: a .ps1 invoked via `&`
     # does not by itself terminate the *calling* script's execution on a nonzero exit without
-    # this, it only sets $LASTEXITCODE for the calling script to act on.
+    # this, it only sets $LASTEXITCODE for the calling script to act on. That said, the exact
+    # value doesn't survive past this point either way: `run_vagrant`'s own `vagrant winrm -c`
+    # call below collapses every nonzero exit code to 1 (see its comment) — only success vs.
+    # failure reaches the caller, not which command in the chain failed or with what code.
     outer = (
         f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)} "
         f"-TimeoutSeconds {timeout}; "
