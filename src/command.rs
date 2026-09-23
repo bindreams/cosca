@@ -263,7 +263,9 @@ impl Command {
     /// backend (and this resolver) described above, so a bare or relative
     /// `executable` there is neither searched in `PATH` nor refused for a
     /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
-    /// unresolved.
+    /// unresolved. In particular, under [`elevate`](Self::elevate) on Windows a program with no
+    /// extension, or one other than `.exe`/`.com`, may be completed by `ShellExecuteEx` itself
+    /// (`PATHEXT`, file associations), so the file that runs need not be the one named.
     ///
     /// Nor does an elevated spawn refuse a `.bat`/`.cmd` that only Win32's normalisation
     /// exposes. The batch check reads the name as written, so `C:\t\setup.bat.` (trailing

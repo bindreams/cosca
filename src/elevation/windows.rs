@@ -441,7 +441,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // close the batch vector. Two of the open surfaces are `wide_nul`'s doc's to name — PATHEXT
     // completion of an extension-less token, and the other registered `runas` associations. On
     // the consent path's `Exact` arm the image allowlist below the planner closes both for a name
-    // not ending in `.exe`/`.com`; the `Search` arm's land in a later PR.
+    // not ending in `.exe`/`.com`. The `Search` arm's stay open in this tree: #146 closes them for
+    // every elevated token, `Search` included, by launching with `SEE_MASK_CLASSNAME`/`exefile`
+    // (no lookup, no PATHEXT) and requiring a fully qualified `.exe`/`.com` program, and #139 then
+    // restores bare names by resolving them first.
     //
     // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
     // resolves the token as a path, so `setup.bat.`, `setup.bat ` (one trailing space) and
@@ -467,7 +470,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 
     // Below the short-circuit: an already-elevated caller re-spawns through `CreateProcessW`,
     // which assumes no default extension, so an extensionless image is not plantable there. The
-    // `Search` arm is not gated here yet.
+    // `Search` arm is not gated here; see the batch gate's comment above for what closes it.
     if let Some(ExecutableSpec::Exact(_)) = cmd.executable_spec() {
         crate::resolve::reject_unloadable_image(std::path::Path::new(&program), true)?;
     }
