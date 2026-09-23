@@ -1,12 +1,12 @@
 name: Feature-powerset clippy
 description: >
   Installs cargo-hack and lints the full feature powerset with clippy, via
-  .github/scripts/clippy.sh --feature-powerset. Used on the windows/amd64 test
-  lane, which reaches `#[cfg(windows)]` code the ubuntu-only Lint job's
-  host-only, no-features prek hook never type-checks, and to catch
-  feature-gated dead_code that --all-features alone would miss. macOS
-  `cfg`-gated code and Linux's non-default features remain unlinted until
-  #163 extends this action's use to those lanes too.
+  .github/scripts/clippy.sh --feature-powerset. Used on the `lint` job (host,
+  covering Linux's non-default features the ubuntu-only prek hook's
+  no-features run never type-checks) and on the windows/amd64 and darwin/arm64
+  test lanes, which reach `#[cfg(windows)]` and `cfg(target_os = "macos")`
+  code the `lint` job's own ubuntu-only run never type-checks. Also catches
+  feature-gated dead_code that --all-features alone would miss.
 inputs:
   target:
     description: "Rust target triple to lint; empty lints the host target"
