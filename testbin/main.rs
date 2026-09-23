@@ -18,7 +18,6 @@ mod console_identity;
 #[path = "breakaway.rs"]
 mod breakaway;
 
-/// The `dump-env-block` and `spawn-dump-env-block` modes.
 #[cfg(windows)]
 #[path = "env_block.rs"]
 mod env_block;
