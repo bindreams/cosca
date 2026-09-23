@@ -216,10 +216,16 @@ pub(crate) fn build_env_block(ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> 
 /// environment. Otherwise the block is a UTF-16 sequence of `KEY=VAL\0` entries
 /// in [`EnvKey`] order and closed by a trailing `\0` (a double-NUL terminator).
 /// Keys collide when [`EnvKey`] says they are equal and the last write wins.
-/// The emitted name is std's: the inherited one if the variable is inherited
-/// and not removed, otherwise that of the first op naming it since the last
-/// `Clear` (a `Remove` counts, except after a `Clear`). This replays std's
-/// `CommandEnv` step for step, so both backends give a child the same block.
+///
+/// The emitted name is the one std's `CommandEnv::{set, remove, clear, capture}`
+/// produces, because this replays them step for step:
+/// - With no `Clear` in `ops`, a variable in `base` keeps its first name there,
+///   whatever ops removed or re-set it; any other variable takes the name of the
+///   first op that named it, a `Remove` included.
+/// - With a `Clear`, `base` and every op before the last `Clear` are dropped, and
+///   a `Remove` deletes the variable's entry, so the name is that of the first
+///   `Set` after both the last `Clear` and the variable's last `Remove`.
+///
 /// An embedded NUL in any key or value is [`std::io::ErrorKind::InvalidInput`].
 pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> {
     if ops.is_empty() {

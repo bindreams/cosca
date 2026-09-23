@@ -591,24 +591,26 @@ fn env_block_matches_std_over_every_code_unit() {
     );
 }
 
-/// When keys collide, std keeps the casing of the first op that named the variable since the last
-/// `Clear` (a `Remove` counts), and the raw backend must emit the same name.
+/// Colliding keys emit the name `build_env_block_from`'s doc states, which is std's.
 #[test]
 fn colliding_keys_keep_std_casing() {
     let set = |k: &str, v: &str| EnvOp::Set(k.into(), v.into());
     let remove = |k: &str| EnvOp::Remove(k.into());
-    for ops in [
-        vec![set("Path", "1"), set("PATH", "2")],
-        vec![remove("path"), set("PATH", "1")],
-        vec![EnvOp::Clear, remove("path"), set("PATH", "1")],
-        vec![set("a", "1"), EnvOp::Clear, set("A", "2")],
+    for (ops, name) in [
+        (vec![set("Path", "1"), set("PATH", "2")], "Path"),
+        (vec![remove("path"), set("PATH", "1")], "path"),
+        (vec![EnvOp::Clear, remove("path"), set("PATH", "1")], "PATH"),
+        (vec![set("a", "1"), EnvOp::Clear, set("A", "2")], "A"),
+        (vec![EnvOp::Clear, set("a", "1"), remove("A"), set("A", "2")], "A"),
     ] {
         let (ours, std) = block_vs_std(&ops);
         assert_eq!(ours, std, "{ops:?}");
+        assert_eq!(ours.len(), 1, "{ops:?}");
+        assert_eq!(ours[0].0, name, "{ops:?}");
     }
 }
 
-/// An inherited variable keeps its inherited name when an op overrides it, as std's capture does.
+/// With no `Clear`, an inherited variable keeps its inherited name, even when removed and re-set.
 #[test]
 fn an_inherited_key_keeps_its_casing() {
     let base = [(OsString::from("Path"), OsString::from("inherited"))];
