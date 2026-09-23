@@ -18,6 +18,8 @@ fn a_verbatim_base_is_normalised() {
         (r"\\?\C:\", "t.exe", r"\\?\C:\t.exe"),
         (r"\\?\C:\work\", "t.exe", r"\\?\C:\work\t.exe"),
         (r"\\?\UNC\srv\shr\d", r"..\..\t.exe", r"\\?\UNC\srv\shr\t.exe"),
+        // The marker is matched case-insensitively, as NT matches it, where std matches only `UNC`.
+        (r"\\?\unc\srv\shr\d", r"..\..\t.exe", r"\\?\unc\srv\shr\t.exe"),
         // The base is rebuilt from its components too: empty ones dropped.
         (r"\\?\C:\bin\\", "t.exe", r"\\?\C:\bin\t.exe"),
         (r"\\?\C:\bin\\x", "t.exe", r"\\?\C:\bin\x\t.exe"),

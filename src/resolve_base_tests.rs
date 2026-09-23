@@ -14,6 +14,9 @@ fn absolute_names_by_grammar() {
         (r"\\?\UNC\srv\shr", true, true),
         // A verbatim UNC path with no share names no share, as the plain `\\srv` does.
         (r"\\?\UNC\srv", true, false),
+        // The marker is matched case-insensitively, as NT matches it.
+        (r"\\?\Unc\srv", true, false),
+        (r"\\?\unc\srv\shr\tool", true, true),
         (r"\\?\UNC\srv\", true, false),
         (r"\\?\UNC\", true, false),
         (r"\\?\UNC\\shr", true, false),
@@ -165,6 +168,23 @@ fn path_types_as_win32_reads_them() {
         ("\u{1f600}:x", Relative),
     ] {
         assert_eq!(path_type(OsStr::new(name)), want, "{name:?}");
+    }
+}
+
+/// A lone surrogate is one UTF-16 unit, three WTF-8 bytes, so it is a drive like any other unit.
+#[test]
+fn a_lone_surrogate_is_a_drive() {
+    for (rest, want) in [
+        (&b":x"[..], PathType::DriveRelative),
+        (br":\x", PathType::DriveAbsolute),
+    ] {
+        // U+D800 in WTF-8, the encoding `OsStr` uses on Windows.
+        let bytes = [&[0xED, 0xA0, 0x80][..], rest].concat();
+        assert_eq!(drive_len(&bytes), Some(4), "{bytes:?}");
+        // SAFETY: WTF-8 bytes of an unpaired surrogate followed by ASCII, which is a valid `OsStr`
+        // encoding on Windows; any bytes are one elsewhere.
+        let name = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes) };
+        assert_eq!(path_type(name), want, "{bytes:?}");
     }
 }
 

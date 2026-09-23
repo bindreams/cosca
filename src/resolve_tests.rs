@@ -1164,8 +1164,15 @@ fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string()
     }
     // The other half of the same rule, so widening the separator set cannot be "fixed" by dropping
     // the prefix parse: a share root is still a root however its halves are spelt, and
-    // `PureWindowsPath` names nothing for any of these either.
-    for n in [r"\\?\UNC\srv/shr", r"\\?\UNC\srv\shr", r"\\?\ns", r"\\?\GLOBALROOT"] {
+    // `PureWindowsPath` names nothing for any of these either. The marker is matched
+    // case-insensitively, as NT matches it.
+    for n in [
+        r"\\?\UNC\srv/shr",
+        r"\\?\UNC\srv\shr",
+        r"\\?\unc\srv\shr",
+        r"\\?\ns",
+        r"\\?\GLOBALROOT",
+    ] {
         assert!(names_no_file(OsStr::new(n), true), "{n:?} names no file");
     }
 }
