@@ -463,6 +463,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.unelevated and guest.communicator != "winrm":
         print("error: --unelevated only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
+    if args.timeout is not None and not args.unelevated:
+        print("error: --timeout only applies to --unelevated", file=sys.stderr)
+        sys.exit(1)
+    timeout = args.timeout if args.timeout is not None else 3600
+    if timeout <= 0:
+        print(f"error: --timeout must be positive, got {timeout}", file=sys.stderr)
+        sys.exit(1)
 
     if guest.communicator == "ssh":
         # `vagrant ssh -c` runs a non-interactive, non-login shell, which doesn't source
@@ -478,19 +485,25 @@ def cmd_run(args: argparse.Namespace) -> None:
     # PowerShell over WinRM: cd into the read-only copy, point Cargo's build output at a
     # writable directory outside it, then run the requested command.
     #
-    # $ErrorActionPreference = "Stop" makes Set-Location's failure (e.g. the tree isn't
-    # there) a terminating error instead of a silently-ignored one, so a bad `cd` doesn't
-    # fall through into running the command in the wrong directory. Every token — command
+    # No script-wide $ErrorActionPreference = "Stop" here (deliberately, and unlike the
+    # previous version of this function): Windows PowerShell 5.1 sets $? to $false for a
+    # native command whenever ANYTHING reaches that command's real stderr stream, regardless
+    # of exit code — e.g. cargo's own normal build-progress lines. Under a script-wide Stop,
+    # that turns a successful `cargo build` into a terminating NativeCommandError. Instead,
+    # `-ErrorAction Stop` is scoped to just the `Set-Location` call, so a genuinely bad --dir
+    # path still fails loudly without that scope swallowing the native command's own stderr
+    # noise. The trailing `exit $LASTEXITCODE` makes this script's own process exit code
+    # reflect the native command's real exit code, independent of $?. Every token — command
     # name included — is quoted as a PowerShell string literal and passed through the `&`
     # call operator, so args with spaces/quotes/special characters aren't re-parsed or
     # re-split by PowerShell the way a naive `" ".join(...)` would allow.
     quoted_path = powershell_quote(guest.tree_path_posix)
     quoted_cmd = " ".join(powershell_quote(part) for part in cmd_args)
     inner = (
-        '$ErrorActionPreference = "Stop"; '
-        f"Set-Location -Path {quoted_path}; "
+        f"Set-Location -Path {quoted_path} -ErrorAction Stop; "
         f'$env:CARGO_TARGET_DIR = "$HOME\\cargo-target"; '
-        f"& {quoted_cmd}"
+        f"& {quoted_cmd}; "
+        "exit $LASTEXITCODE"
     )
 
     if not args.unelevated:
@@ -508,8 +521,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     # nested quotes) through another two layers of shell (vagrant winrm -c, then schtasks).
     encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
     runner_path = f"{guest.tree_path_posix}/scripts/devvm/provision/windows-run-unelevated.ps1"
+    # windows-run-unelevated.ps1 itself ends with `exit $exitCode` (the probe's real exit
+    # code, propagated through its named-pipe wait — see that script). The trailing
+    # `exit $LASTEXITCODE` here is belt-and-suspenders, not dead code: a .ps1 invoked via `&`
+    # does not by itself terminate the *calling* script's execution on a nonzero exit without
+    # this, it only sets $LASTEXITCODE for the calling script to act on.
     outer = (
-        f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)}; "
+        f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)} "
+        f"-TimeoutSeconds {timeout}; "
         "exit $LASTEXITCODE"
     )
     run_vagrant(guest, ["winrm", "-c", outer])
