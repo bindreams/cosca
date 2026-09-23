@@ -15,8 +15,9 @@ impl Drop for OwnedToken {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             // SAFETY: a token handle owned by this guard, closed exactly once.
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            if let Err(e) = unsafe { windows::Win32::Foundation::CloseHandle(self.0) } {
+                log::warn!("CloseHandle of an owned token failed: {e}");
+                debug_assert!(false, "CloseHandle of an owned token should not fail: {e}");
             }
         }
     }
@@ -217,7 +218,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
-use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+use windows::Win32::UI::Shell::{
+    ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
@@ -225,6 +228,7 @@ use crate::child::spawn::windows_raw::RawChild;
 use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
+use crate::elevation::shell_file;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
@@ -243,11 +247,10 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 ///   elevated program acts on.
 ///
 /// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
-/// closes the interior-NUL divergence between the elevated and unelevated paths. A separate
-/// divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse — both by an
-/// extension this gate never sees (PATHEXT completion of an extension-less token) and by other
-/// registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). Neither is closed
-/// here; the image allowlist in [`plan_runas`] closes both.
+/// closes the interior-NUL divergence between the elevated and unelevated paths. `ShellExecuteEx`
+/// RESOLVING a program `CreateProcessW` would refuse — completing an extension-less token, or
+/// dispatching `.lnk`, `.vbs`, `.msc`, … through an association — is closed by the gates in
+/// `plan_runas`, not here.
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -336,9 +339,9 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
     // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
     //
-    // A `Search` token is NOT resolved here: `executable()` on the elevated path reaches
-    // `ShellExecuteEx`'s own search unresolved, as `executable()`'s doc says, and
-    // [`plan_runas`]'s allowlist bounds what that search can pick.
+    // A `Search` token is passed as written, not resolved: [`plan_runas`] refuses it unless it is a
+    // fully qualified `.exe`/`.com` path (`shell_file::reject_elevated_program`), so
+    // `ShellExecuteEx` has no search to make.
     //
     // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
     // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the
@@ -376,6 +379,9 @@ pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
 /// command. Built only when a consent prompt is actually warranted.
 pub(crate) struct RunasLaunch {
     file_w: Vec<u16>,
+    /// `lpClass`, with `SEE_MASK_CLASSNAME`: always `exefile`, which has the `runas` verb and runs a
+    /// `.com` as well (measured; `comfile` has no `runas` verb).
+    class_w: Vec<u16>,
     params_w: Vec<u16>,
     dir_w: Option<Vec<u16>>,
     verb_w: Vec<u16>,
@@ -433,27 +439,28 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 
     // Refuse a `.bat`/`.cmd` spelled in the program `elevated_program` returned — the caller's
     // TOKEN, except on the `Exact` arm, where it is that token completed to an absolute path.
-    // (Completion only prefixes a directory and applies Win32's own normalisation, so it can add a
-    // `.bat` reading but never remove one; over-rejection is the safe direction here.) Why, in
-    // `crate::child::spawn::batch_refusal`; here the `runas` `batfile` association substitutes
-    // `lpParameters` into `%*` unescaped, so the injected command runs ELEVATED.
+    // `ShellExecuteEx`'s `runas` resolves the `batfile` association, which routes through `cmd.exe`
+    // and substitutes `lpParameters` into `%*` UNESCAPED — and `join_wide` quotes only for
+    // whitespace, never for cmd metacharacters, so `args(["setup.bat", "a&calc"])` is command
+    // injection into an ELEVATED cmd.exe. That is CVE-2024-24576, which the raw and std backends
+    // both refuse outright.
     //
-    // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE, so two surfaces
-    // get past it — PATHEXT completion of an extension-less token, and the other registered
-    // `runas` associations (see `wide_nul`'s doc). The image allowlist below the planner closes
-    // both on the consent path, for every arm.
-    //
-    // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
-    // resolves the token as a path, so `setup.bat.`, `setup.bat ` (one trailing space) and
-    // `C:\tools\.bat` all reach a batch file while `Path::extension()` reads `None` or something
-    // that is not `bat`. `reject_normalised_batch_path` refuses all three, as `image_for` does for
-    // the raw backend's unelevated `raw_executable()`. On the `Exact` arm `program` IS Win32's
-    // normalisation. On the others it is the token as written, and for a token the allowlist
-    // admits the two agree on the final component: one ending in `.exe`/`.com` has no trailing
-    // dot or space to strip. It is still the only batch gate that reads a stream piece
-    // (`setup.bat:.exe`).
-    crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
-    crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
+    // The batch gate judges the name Win32 resolves the token to — trailing dots and spaces, `..`
+    // collapse, drive and UNC and device roots, and data-stream pieces. The launch is `exefile`
+    // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on
+    // `lpFile`. Measured only for an ELEVATED caller, which cosca never launches from: no App
+    // Paths, no bare-name search, `%` literal. The consent route an unelevated caller takes is
+    // unmeasured, so the rest is conservative (see `shell_file`): a fully qualified `.exe`/`.com`
+    // path, which leaves no extensionless name for `PATHEXT` to complete (whether it applies to a
+    // name already ending in `.exe` is unmeasured on every route), with no `"` or `%`, and a
+    // `current_dir()` with no `%`. A relative or bare token is refused until the image is resolved
+    // before the launch.
+    let program_path = std::path::Path::new(&program);
+    crate::child::spawn::reject_batch_path(program_path)?;
+    shell_file::reject_elevated_program(program_path)?;
+    if let Some(dir) = cmd.cwd() {
+        shell_file::reject_percent_in_directory(dir)?;
+    }
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
@@ -465,13 +472,9 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
         Transition::ElevateWindows { .. } => {}
     }
 
-    // Every arm, since `ShellExecuteEx` applies PATHEXT to any `lpFile`. Below the short-circuit:
-    // an already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
-    // extension, so an extensionless image is not plantable there.
-    crate::resolve::reject_unloadable_image(std::path::Path::new(&program), true)?;
-
     Ok(RunasStep::Launch(Box::new(RunasLaunch {
         file_w,
+        class_w: wide_nul("class", OsStr::new("exefile"))?,
         params_w,
         dir_w: dir,
         verb_w,
@@ -488,6 +491,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     };
     let RunasLaunch {
         file_w,
+        class_w,
         params_w,
         dir_w,
         verb_w,
@@ -500,12 +504,13 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let proc: OwnedHandle = unsafe {
         let mut info = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_CLASSNAME,
             lpVerb: PCWSTR(verb_w.as_ptr()),
             lpFile: PCWSTR(file_w.as_ptr()),
             lpParameters: PCWSTR(params_w.as_ptr()),
             lpDirectory: dir_w.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
             nShow: show.0,
+            lpClass: PCWSTR(class_w.as_ptr()),
             ..Default::default()
         };
         ShellExecuteExW(&mut info).map_err(|e| {

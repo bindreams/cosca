@@ -382,10 +382,6 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
-    // std runs a batch file through cmd.exe after `GetFullPathNameW`, so `setup.bat.` and
-    // `C:\t\.bat` are batch files too; a `commandline()` tail would then reach cmd.exe unescaped.
-    #[cfg(windows)]
-    reject_normalised_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
     match cwd {
         Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,
@@ -551,144 +547,6 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
         cwd: cmd.cwd().map(std::path::Path::to_path_buf),
         enter: false,
     })
-}
-
-/// The prefix Win32 acts on: everything before the first interior NUL, where `CreateProcessW` and
-/// `PCWSTR` stop. Equal (and borrowed) when there is no NUL, which is how [`reject_batch_path_on`]
-/// detects one without a platform-specific byte view at its own call site.
-///
-/// Host-independent on purpose — it computes the same prefix everywhere, which is what lets a
-/// macOS run exercise the Win32 rule.
-fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
-    use std::borrow::Cow;
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = prog.as_os_str().as_bytes();
-        match bytes.iter().position(|&b| b == 0) {
-            Some(i) => Cow::Borrowed(std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..i]))),
-            None => Cow::Borrowed(prog),
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        let units: Vec<u16> = prog.as_os_str().encode_wide().collect();
-        match units.iter().position(|&u| u == 0) {
-            Some(i) => Cow::Owned(std::path::PathBuf::from(std::ffi::OsString::from_wide(&units[..i]))),
-            None => Cow::Borrowed(prog),
-        }
-    }
-    // Unreachable in any buildable configuration: `crate::wait`'s `compile_error!` rejects every
-    // target that is not Linux, macOS or Windows. No portable byte view to split on either.
-    #[cfg(not(any(unix, windows)))]
-    {
-        Cow::Borrowed(prog)
-    }
-}
-
-/// Refuse a program whose Win32-NORMALISED path — `GetFullPathNameW`'s result, which is what
-/// `CreateProcessW` loads — reaches a `.bat`/`.cmd`, for [`batch_refusal`]'s reason.
-///
-/// [`reject_batch_path`] reads `Path::extension()` of the token as written, which misses what
-/// normalisation exposes: `setup.bat.` and `setup.bat ` (one trailing space) become `setup.bat`,
-/// and `C:\t\.bat` has no extension to `Path` at all. This tests by suffix instead, as std's own
-/// `has_bat_extension` does, on every data-stream piece of the final component, each trimmed of
-/// trailing dots and spaces — so `x.bat::$DATA` is refused as its piece `x.bat`. Over-refusing a
-/// stream spelling is the safe direction.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn reject_normalised_batch_path(full: &std::path::Path) -> Result<(), Error> {
-    let text = full.as_os_str().to_string_lossy();
-    let name = text
-        .rsplit(['\\', '/'])
-        .next()
-        .expect("rsplit yields at least one piece");
-    let is_batch = |piece: &str| {
-        let piece = piece.trim_end_matches(['.', ' ']).to_ascii_lowercase();
-        piece.ends_with(".bat") || piece.ends_with(".cmd")
-    };
-    if name.split(':').any(is_batch) {
-        return Err(batch_refusal(full));
-    }
-    Ok(())
-}
-
-/// The refusal every batch gate returns, and the one statement of why.
-///
-/// Win32 runs a `.bat`/`.cmd` through `cmd.exe`, which re-parses the command line by rules of its
-/// own — its metacharacters (`&`, `|`, `^`, `%`) act even inside the quoting cosca writes for
-/// `CommandLineToArgvW`. So `args(["setup.bat", "a&calc"])` would also run `calc`. That is
-/// CVE-2024-24576 (BatBadBut); cosca refuses the file rather than implement cmd.exe escaping.
-fn batch_refusal(prog: &std::path::Path) -> Error {
-    Error::Unsupported {
-        op: format!("running {}", prog.display()),
-        platform: "windows",
-        detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
-                 use .commandline() to pass an explicit, pre-escaped command line"
-            .into(),
-    }
-}
-
-/// Reject a program token carrying an interior NUL, or naming a `.bat`/`.cmd`: Win32 silently
-/// truncates at the NUL (`PCWSTR` has no length), and a batch file is refused for
-/// [`batch_refusal`]'s reason. Shared by every backend — the std path
-/// (`build_std_command`), the raw one (`windows_raw::reject_batch_program`), and the elevated
-/// `ShellExecuteEx` launch.
-///
-/// The rule, and why each half is a fact about Win32, is in [`reject_batch_path_on`]; this asks it
-/// for the running host's verdict.
-pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
-    reject_batch_path_on(prog, cfg!(windows))
-}
-
-/// PURE given `win32`: the gate's rule with the platform as DATA rather than a `cfg!` buried in
-/// it, so one host can ask for either verdict — the same reason `elevation::plan::Host` carries
-/// its `Os`. Both are pinned from any host by `spawn_tests`.
-///
-/// An interior NUL is refused FIRST, under both verdicts, because `\0` is not a path separator and
-/// `Path::extension()` reads straight through it — reporting the INVERSE of what Win32 loads on
-/// each of the two NUL/batch shapes:
-///
-/// - `setup.bat` + NUL + `junk` → `extension() == "bat\0junk"`, yet Win32 loads the real batch
-///   file `setup.bat`.
-/// - `setup` + NUL + `.bat` → `extension() == "bat"`, yet Win32 loads `setup`, which is no batch
-///   file — so the batch refusal would blame CVE-2024-24576 for a program that does not carry
-///   that vector, and interpolate a raw U+0000 into a message bound for logs and terminals.
-///
-/// Refusing the NUL outright settles both shapes, and makes this gate SELF-SUFFICIENT rather than
-/// a rule each caller must order its own NUL check in front of — the std backend, the DEFAULT
-/// Windows path, has none to order. The reason given differs by verdict because the facts do: off
-/// Win32 nothing truncates, so the token simply names no file.
-///
-/// The batch half is `win32`-only, because it too is a fact about Win32 rather than the request:
-/// Win32 routes a `.bat`/`.cmd` through cmd.exe, which is what CVE-2024-24576 needs. Elsewhere a
-/// clean `deploy.bat` is an ordinary executable the host runs, so refusing it would report "not
-/// supported on windows" about a Linux or macOS host that runs it fine — and send its caller to
-/// audit a batch vector that cannot reach them.
-fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error> {
-    let loaded = win32_prefix(prog);
-    if loaded.as_os_str() != prog.as_os_str() {
-        // A literal: interpolating the token would put a raw U+0000 into a message bound for logs
-        // and terminals, which is half of what this round is removing.
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            if win32 {
-                "the program path contains an embedded NUL, which Win32 would silently truncate"
-            } else {
-                "the program path contains an embedded NUL, so it names no file"
-            },
-        )));
-    }
-    if !win32 {
-        return Ok(());
-    }
-    if let Some(ext) = loaded.extension() {
-        let ext = ext.to_string_lossy().to_ascii_lowercase();
-        if ext == "bat" || ext == "cmd" {
-            return Err(batch_refusal(&loaded));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
@@ -1230,6 +1088,11 @@ pub(crate) mod fault {
         );
     }
 }
+
+// The `.bat`/`.cmd` refusal every backend runs before it spawns.
+#[path = "spawn/batch_gate.rs"]
+mod batch_gate;
+pub(crate) use batch_gate::{drive_prefix_len, reject_batch_path};
 
 // Windows raw `CreateProcessW` spawn backend.
 #[cfg(windows)]

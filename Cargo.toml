@@ -51,15 +51,19 @@ regex = "1"
 # Integration tests cannot reach the crate's own dependencies, and `windows_path_resolution` calls
 # GetFullPathNameW, GetFileInformationByHandleEx, CreateProcessW, SetHandleInformation,
 # RtlGetVersion and RegGetValueW directly (the last two stamp each measurement with its OS build) to
-# MEASURE the platform rather than to use cosca.
+# MEASURE the platform rather than to use cosca; `windows_shell_execute` calls ShellExecuteExW from
+# an STA and writes one volatile App Paths key in HKLM and one in HKCU (see its module doc).
 windows = { version = "0.62", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(windows)'.dependencies]

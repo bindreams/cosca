@@ -1,14 +1,16 @@
 //! Path-canary payload: report the file this process was loaded from, then exit 0.
 //!
 //! `tests/windows_path_resolution.rs` copies this image to odd names and spawns it, so its only
-//! job is to say which file ran. It ignores its arguments and depends on nothing else in the
-//! testbin, so a testbin change cannot fail the canary.
+//! job is to say which file ran. It depends on nothing else in the testbin, so a testbin change
+//! cannot fail the canary. Its one argument is optional: `--report-to <path>` writes the same lines
+//! to `<path>` as well, for a launch whose stdout cannot be read (`ShellExecuteEx`'s `runas`).
 //!
-//! Prints two lines:
+//! Prints three lines:
 //! - `image=`: `QueryFullProcessImageNameW`, the file the image section was created from. This is
 //!   the proof of which file loaded.
 //! - `module=`: `std::env::current_exe` (`GetModuleFileNameW`), the name the loader recorded.
 //!   Printed for the record only: it is not guaranteed to name the same file.
+//! - `cwd=`: the current directory, which a `ShellExecuteEx` launch takes from `lpDirectory`.
 //!
 //! Exits 2 if `image=` could not be measured. A `[[bin]]` cannot be `cfg`-ed out, so off Windows
 //! it exits 1.
@@ -30,17 +32,27 @@ fn main() {
             &mut len,
         )
     };
-    match std::env::current_exe() {
-        Ok(p) => println!("module={}", p.display()),
-        Err(e) => println!("module-error={e}"),
-    }
-    match got {
-        Ok(()) => println!("image={}", String::from_utf16_lossy(&buf[..len as usize])),
-        Err(e) => {
-            println!("image-error={e}");
-            std::process::exit(2);
+    let module = match std::env::current_exe() {
+        Ok(p) => format!("module={}", p.display()),
+        Err(e) => format!("module-error={e}"),
+    };
+    let (image, code) = match got {
+        Ok(()) => (format!("image={}", String::from_utf16_lossy(&buf[..len as usize])), 0),
+        Err(e) => (format!("image-error={e}"), 2),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => format!("cwd={}", p.display()),
+        Err(e) => format!("cwd-error={e}"),
+    };
+    let report = format!("{module}\n{image}\n{cwd}\n");
+    print!("{report}");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let [flag, path] = args.as_slice() {
+        if flag == "--report-to" {
+            std::fs::write(path, &report).expect("write the report file");
         }
     }
+    std::process::exit(code);
 }
 
 #[cfg(not(windows))]

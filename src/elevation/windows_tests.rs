@@ -38,6 +38,11 @@ fn is_unsupported<T>(r: Result<T, Error>) -> bool {
     matches!(r, Err(Error::Unsupported { .. }))
 }
 
+/// `Io(InvalidInput)` naming `PATHEXT`: [`crate::resolve::reject_unloadable_image`]'s refusal.
+fn is_pathext_refusal<T>(r: Result<T, Error>) -> bool {
+    matches!(r, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput && e.to_string().contains("PATHEXT"))
+}
+
 /// The refusal's `detail`, for the tests that assert on the message and not only the variant.
 fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
     match r {
@@ -49,7 +54,7 @@ fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
 #[test]
 fn piped_stdio_is_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.stdout(Stdio::pipe()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 }
@@ -57,12 +62,12 @@ fn piped_stdio_is_unsupported() {
 #[test]
 fn null_and_merge_stdio_are_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.stdin(Stdio::null()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 
     let mut c2 = Command::new();
-    c2.args(["whoami"]).elevate();
+    c2.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c2.stderr(Stdio::merge(crate::stdio::Fd::STDOUT)).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
@@ -70,7 +75,7 @@ fn null_and_merge_stdio_are_unsupported() {
 #[test]
 fn high_fd_is_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.fd(3, Stdio::pipe_out()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 }
@@ -78,18 +83,18 @@ fn high_fd_is_unsupported() {
 #[test]
 fn env_and_contain_are_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().env("FOO", "bar");
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate().env("FOO", "bar");
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 
     let mut c2 = Command::new();
-    c2.args(["whoami"]).elevate().contain();
+    c2.args([r"C:\Windows\System32\whoami.exe"]).elevate().contain();
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
 
 #[test]
 fn inherit_only_is_accepted() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     c.stdout(Stdio::inherit()).unwrap();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
@@ -126,7 +131,7 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
     // already-elevated short-circuit, so the verdict is identical for elevated=false/true.
     for elevated in [false, true] {
         let mut c = Command::new();
-        c.args(["whoami"]).elevate();
+        c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
         c.stdout(Stdio::pipe()).unwrap();
         assert!(
             is_unsupported(super::plan_runas(&c, &win_host(elevated))),
@@ -182,12 +187,17 @@ fn a_clean_unelevated_request_plans_a_launch() {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let mut c = Command::new();
-    c.args(["whoami.exe", "/all"]).elevate();
+    c.args([r"C:\Windows\System32\whoami.exe", "/all"]).elevate();
     let launch = match super::plan_runas(&c, &win_host(false)) {
         Ok(super::RunasStep::Launch(launch)) => launch,
         Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
         Err(e) => panic!("a clean inherit-only request must not be refused: {e:?}"),
     };
+    assert_eq!(
+        launch.class_w,
+        "exefile\0".encode_utf16().collect::<Vec<u16>>(),
+        "the launch skips shell32's lookup by class"
+    );
     for (field, w) in [
         ("lpVerb", &launch.verb_w),
         ("lpFile", &launch.file_w),
@@ -203,12 +213,50 @@ fn a_clean_unelevated_request_plans_a_launch() {
     assert_eq!(launch.show, SW_SHOWNORMAL);
 }
 
+/// A `%` in `current_dir()` is refused, whatever the caller's privilege: whether the consent
+/// launch expands it in `lpDirectory` is unmeasured.
+#[test]
+fn a_percent_in_current_dir_is_refused() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([r"C:\Windows\System32\whoami.exe"])
+            .current_dir(r"C:\work\%TEMP%")
+            .elevate();
+        match super::plan_runas(&c, &win_host(elevated)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!(
+                "elevated={elevated}: expected Io(InvalidInput), got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
+}
+
+/// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
+#[test]
+fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
+    let mut c = Command::new();
+    c.args([r"C:\Windows\System32\whoami.exe"])
+        .current_dir(r"C:\Windows\Temp")
+        .elevate();
+    let launch = match super::plan_runas(&c, &win_host(false)) {
+        Ok(super::RunasStep::Launch(launch)) => launch,
+        Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
+        Err(e) => panic!("a clean request with a current_dir() must not be refused: {e:?}"),
+    };
+    assert_eq!(
+        launch.dir_w,
+        Some(r"C:\Windows\Temp".encode_utf16().chain([0]).collect::<Vec<u16>>()),
+        "lpDirectory is current_dir(), wide and NUL-terminated"
+    );
+}
+
 #[test]
 fn already_elevated_inherit_only_is_run_as_is() {
     // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
     // passes the gate and short-circuits (no ShellExecuteEx).
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
     assert!(matches!(
         super::plan_runas(&c, &win_host(true)),
         Ok(super::RunasStep::AlreadyElevated)
@@ -239,8 +287,9 @@ fn elevated_exact_program_is_completed_to_an_absolute_path() {
 }
 
 /// The consent path's `Exact` arm applies [`crate::resolve::reject_unloadable_image`]: an absolute
-/// extensionless `lpFile` is still PATHEXT-completed by `ShellExecuteEx`. Relative too, since
-/// completion does not add an extension.
+/// extensionless `lpFile` may still be PATHEXT-completed by `ShellExecuteEx` (measured without a
+/// class, unmeasured for the `exefile` consent launch). Relative too, since completion does not add
+/// an extension.
 #[test]
 fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
     for n in [r"C:\tools\setup", "setup", r"C:\tools\setup.bat.exe.lnk"] {
@@ -258,16 +307,14 @@ fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// An already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
-/// extension, so the allowlist is not applied there. Kills moving the gate above the short-circuit.
+/// The allowlist is part of `shell_file::reject_elevated_program`, which runs above the
+/// short-circuit, so an already-elevated caller gets the same refusal though it re-spawns through
+/// `CreateProcessW`, which assumes no default extension.
 #[test]
-fn an_extensionless_exact_program_is_not_refused_when_already_elevated() {
+fn an_extensionless_exact_program_is_refused_when_already_elevated_too() {
     let mut c = Command::new();
     c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
-    assert!(matches!(
-        super::plan_runas(&c, &win_host(true)),
-        Ok(super::RunasStep::AlreadyElevated)
-    ));
+    assert!(is_pathext_refusal(super::plan_runas(&c, &win_host(true)).map(|_| ())));
 }
 
 /// Negative control: a loadable image name still plans a launch.
@@ -284,8 +331,9 @@ fn an_exact_exe_or_com_program_plans_a_launch() {
 }
 
 /// The allowlist is the consent path's, not `raw_executable()`'s: an `executable()` or argv[0]
-/// token reaches `ShellExecuteEx` as written, so an extensionless one is PATHEXT-completed too,
-/// and a bare one is searched besides.
+/// token is passed to `ShellExecuteEx` as written, so an extensionless one could be
+/// PATHEXT-completed. The bare `whoami` is not fully qualified either; the allowlist refuses it
+/// first.
 #[test]
 fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     for (via, c) in search_commands(&[r"C:\tools\setup", "whoami"]) {
@@ -301,10 +349,11 @@ fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// Negative control for the `Search` and argv[0] arms.
+/// Negative control for the `Search` and argv[0] arms. Fully qualified: a bare `whoami.exe` is
+/// refused (see `launch_runas_refuses_a_program_that_is_not_fully_qualified`).
 #[test]
 fn a_search_exe_or_com_program_plans_a_launch() {
-    for (via, c) in search_commands(&[r"C:\tools\setup.exe", "whoami.exe", "WHOAMI.COM"]) {
+    for (via, c) in search_commands(&[r"C:\tools\setup.exe", r"C:\Windows\System32\WHOAMI.COM"]) {
         assert!(
             matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
             "{via} must plan a launch"
@@ -312,8 +361,8 @@ fn a_search_exe_or_com_program_plans_a_launch() {
     }
 }
 
-/// The normalised-batch gate applies to every arm, before the planner. On a token ending in
-/// `.exe`/`.com` it is the only batch gate that sees a stream piece.
+/// The batch gate applies to every arm, before the planner, and judges the name Win32 normalises
+/// the token to — a stream piece included, on a token ending in `.exe`/`.com`.
 #[test]
 fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privilege() {
     let probes = [
@@ -377,7 +426,9 @@ fn runas_shows_the_window_by_default() {
 #[test]
 fn elevation_rejects_raw_creation_flags() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().creation_flags(0x0000_0040);
+    c.args([r"C:\Windows\System32\whoami.exe"])
+        .elevate()
+        .creation_flags(0x0000_0040);
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
@@ -385,14 +436,14 @@ fn elevation_rejects_raw_creation_flags() {
 #[test]
 fn elevation_accepts_a_zero_creation_flags_word() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().creation_flags(0);
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate().creation_flags(0);
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
 #[test]
 fn elevation_rejects_detached() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().detached();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate().detached();
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
@@ -400,7 +451,9 @@ fn elevation_rejects_detached() {
 #[test]
 fn elevation_rejects_breakaway() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().breakaway_from_job();
+    c.args([r"C:\Windows\System32\whoami.exe"])
+        .elevate()
+        .breakaway_from_job();
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
@@ -411,7 +464,7 @@ fn elevation_rejects_breakaway() {
 #[test]
 fn elevation_accepts_no_window() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().no_window();
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate().no_window();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
@@ -576,7 +629,8 @@ fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
 ///
 /// Scope, so this test is not read as proving more than it does: the gate keys on the caller's
 /// string, and `ShellExecuteEx` resolves the file. An extension-less `args(["setup", "a&calc"])`
-/// passes it; `plan_runas`'s image allowlist is what refuses that one.
+/// passes it; `shell_file::reject_elevated_program` refuses that one, which is neither an
+/// `.exe`/`.com` nor fully qualified.
 ///
 /// Privilege-independent for the same reason as the config gate: the already-elevated caller
 /// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
@@ -608,6 +662,68 @@ fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_
             assert!(
                 detail.contains("CVE-2024-24576"),
                 "elevated={elevated}, {probe:?}: {detail}"
+            );
+        }
+    }
+}
+
+/// A token ShellExecuteEx would complete by lookup is refused: an extension-less one can become
+/// `setup.bat` (`PathResolveW` with `PRF_TRYPROGRAMEXTENSIONS`), and any other extension runs
+/// through its association.
+#[test]
+fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
+    for elevated in [false, true] {
+        for probe in [
+            r"C:\tools\setup",
+            "setup",
+            "setup.lnk",
+            "setup.msc",
+            r"C:\tools\setup.exe.",
+        ] {
+            let mut c = Command::new();
+            c.args([probe, "a&calc"]).elevate();
+            assert!(
+                is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                "elevated={elevated}: {probe:?} may be completed or dispatched by ShellExecuteEx"
+            );
+        }
+    }
+}
+
+/// An elevated program that is not fully qualified is refused: a relative or bare token leaves
+/// ShellExecuteEx a lookup to make, App Paths included, which is unmeasured for the consent launch.
+#[test]
+fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
+    for elevated in [false, true] {
+        for probe in ["whoami.exe", r"tools\setup.exe", r"\tools\setup.exe", "C:setup.exe"] {
+            let mut c = Command::new();
+            c.args([probe]).elevate();
+            assert!(
+                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                "elevated={elevated}: {probe:?} is not fully qualified"
+            );
+        }
+    }
+}
+
+/// A token ShellExecuteEx rewrites before it opens it is refused, whatever it rewrites to: a
+/// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`. The quote is refused
+/// as a quote; the rest end in no `.exe`/`.com`.
+#[test]
+fn launch_runas_refuses_a_token_shell_execute_rewrites() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([r#""C:\tools\setup.bat""#, "a&calc"]).elevate();
+        assert!(
+            is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+            "elevated={elevated}: a quote is refused"
+        );
+        for probe in ["file:///C:/tools/setup%2Ebat", "shell:startup", r"C:\tools\%X%"] {
+            let mut c = Command::new();
+            c.args([probe, "a&calc"]).elevate();
+            assert!(
+                is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                "elevated={elevated}: {probe:?} is not a fully qualified image path without a quote"
             );
         }
     }
@@ -800,4 +916,24 @@ fn a_poisoned_argument_is_named_before_the_batch_gate() {
             ),
         }
     }
+}
+
+/// A failed `CloseHandle` of an owned token is logged and asserted, as `identity::windows::close`
+/// does for a process handle. `0x3` is a handle that cannot be one: the kernel ignores a handle's
+/// low two bits, so this closes handle 0, which fails `ERROR_INVALID_HANDLE` without touching any
+/// real handle — and `is_invalid()` screens only 0 and -1.
+#[test]
+fn a_failed_token_close_is_logged() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let outcome = std::panic::catch_unwind(|| drop(super::OwnedToken(windows::Win32::Foundation::HANDLE(0x3 as _))));
+    assert_eq!(
+        outcome.is_err(),
+        cfg!(debug_assertions),
+        "the debug_assert fires in exactly the builds that keep it"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "CloseHandle of an owned token failed"),
+        "a failed token close must be logged"
+    );
 }

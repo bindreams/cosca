@@ -1,14 +1,16 @@
-# Windows path-resolution canary.
+# Windows path-resolution and ShellExecuteEx canaries.
 #
-# Runs the platform canaries in tests/windows_path_resolution.rs on real Windows runners; see that
-# file for what is asserted and why.
+# Runs the platform canaries in tests/windows_path_resolution.rs and the elevating ones in
+# tests/windows_shell_execute.rs on real Windows runners; see those files for what is asserted and
+# why.
 #
 # GitHub disables a scheduled workflow after 60 days without repository activity; re-enable it
 # from the Actions tab.
 #
 # Run it by hand with:
 #
-#     gh workflow run windows-probes.yaml [-f filter=<test-name substring>]
+#     gh workflow run windows-probes.yaml [-f filter=<test-name substring>] [-f run_canary=false] \
+#         [-f elevating=true]
 name: windows-probes
 
 on:
@@ -17,13 +19,16 @@ on:
     paths:
       - "src/child/spawn.rs"
       - "src/child/spawn/batch_gate.rs"
+      - "src/child/spawn/batch_gate/**"
       - "src/resolve.rs"
       - "src/child/spawn/windows_raw.rs"
       - "src/child/spawn/windows_raw/resolve.rs"
       - "src/tokio/spawn/windows_raw.rs"
       - "src/elevation/windows.rs"
+      - "src/elevation/shell_file.rs"
       - "tests/windows_path_resolution.rs"
       - "tests/windows_path_resolution/**"
+      - "tests/windows_shell_execute.rs"
       # The canary's payload is built from here.
       - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
@@ -40,6 +45,16 @@ on:
         description: "Test-name filter (blank runs every probe)"
         required: false
         default: ""
+      run_canary:
+        description: "Run tests/windows_path_resolution.rs"
+        type: boolean
+        required: false
+        default: true
+      elevating:
+        description: "Run tests/windows_shell_execute.rs, which ELEVATES and writes one volatile App Paths key in HKLM and one in HKCU"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -73,6 +88,7 @@ jobs:
       # measured before asserting on it.
       # Each canary that passes leaves a marker named after itself (`mark_canary_passed`).
       - name: Run path-resolution probes
+        if: github.event_name != 'workflow_dispatch' || inputs.run_canary
         shell: bash
         env:
           FILTER: ${{ inputs.filter }}
@@ -82,10 +98,27 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} \
             --test windows_path_resolution \
             -- "${FILTER}" --ignored --nocapture --test-threads=1
+      # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without
+      # a prompt, and register one volatile App Paths key in HKLM and one in HKCU, deleting each
+      # again; a volatile parent key they had to create can stay behind until the runner is gone.
+      # They run on every schedule and pull-request run too, so a change to that code, or a new
+      # Windows build, re-measures it. They measure an ELEVATED caller's launch, not the consent
+      # route cosca takes from an unelevated one, so the elevated path's rules do not rest on them.
+      - name: Run elevating probes
+        if: github.event_name != 'workflow_dispatch' || inputs.elevating
+        shell: bash
+        env:
+          FILTER: ${{ inputs.filter }}
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
+        run: |
+          mkdir "$COSCA_CANARY_MARKERS"
+          cargo test --locked --target ${{ matrix.target }} \
+            --test windows_shell_execute \
+            -- "${FILTER}" --ignored --nocapture --test-threads=1
       # A filter matching no test, or only surveys, would otherwise pass having asserted nothing.
       # Runs after a failure too, so the log shows which canaries passed.
       - name: Require that a canary ran
-        if: always()
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_canary)
         shell: bash
         env:
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
@@ -97,3 +130,16 @@ jobs:
             exit 1
           fi
           printf 'canary passed: %s\n' "${passed[@]##*/}"
+      - name: Require that an elevating probe ran
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.elevating)
+        shell: bash
+        env:
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
+        run: |
+          shopt -s nullglob
+          passed=("$COSCA_CANARY_MARKERS"/*)
+          if ((${#passed[@]} == 0)); then
+            echo "::error::no elevating probe ran: the run asserted nothing about ShellExecuteEx"
+            exit 1
+          fi
+          printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
