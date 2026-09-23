@@ -339,9 +339,9 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
     // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
     //
-    // A `Search` token is NOT resolved here: `executable()` on the elevated path reaches
-    // `ShellExecuteEx`'s own search unresolved, as `executable()`'s doc says, and
-    // [`plan_runas`]'s allowlist bounds what that search can pick.
+    // A `Search` token is passed as written, not resolved: [`plan_runas`] refuses it unless it is a
+    // fully qualified `.exe`/`.com` path (`shell_file::reject_elevated_program`), so
+    // `ShellExecuteEx` has no search to make.
     //
     // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
     // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the

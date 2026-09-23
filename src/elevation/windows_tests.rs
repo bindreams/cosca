@@ -331,8 +331,9 @@ fn an_exact_exe_or_com_program_plans_a_launch() {
 }
 
 /// The allowlist is the consent path's, not `raw_executable()`'s: an `executable()` or argv[0]
-/// token reaches `ShellExecuteEx` as written, so an extensionless one may be PATHEXT-completed too,
-/// and a bare one searched besides.
+/// token is passed to `ShellExecuteEx` as written, so an extensionless one could be
+/// PATHEXT-completed. The bare `whoami` is not fully qualified either; the allowlist refuses it
+/// first.
 #[test]
 fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     for (via, c) in search_commands(&[r"C:\tools\setup", "whoami"]) {
@@ -628,7 +629,8 @@ fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
 ///
 /// Scope, so this test is not read as proving more than it does: the gate keys on the caller's
 /// string, and `ShellExecuteEx` resolves the file. An extension-less `args(["setup", "a&calc"])`
-/// passes it; `plan_runas`'s image allowlist is what refuses that one.
+/// passes it; `shell_file::reject_elevated_program` refuses that one, which is neither an
+/// `.exe`/`.com` nor fully qualified.
 ///
 /// Privilege-independent for the same reason as the config gate: the already-elevated caller
 /// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
