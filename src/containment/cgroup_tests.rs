@@ -967,21 +967,27 @@ fn drop_reports_a_leaf_it_could_not_remove() {
     );
 }
 
-/// `Drop` writes `cgroup.kill` only through a leaf its child reported entering. A spawn that
-/// failed before the child's `pre_exec` ran (a missing `current_dir`), or whose write failed,
-/// put nothing there: whatever keeps the leaf from being removed, cosca did not put there.
+/// `Drop` writes `cgroup.kill` through an unremovable leaf unless the report proves the child
+/// never entered it (see the module's report contract). A final report other than `Placed` is
+/// that proof; nothing received, before the verdict, is not — the report may still be in flight.
 #[cfg(target_os = "linux")]
 #[test]
-fn drop_kills_only_through_a_leaf_its_child_entered() {
+fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
     crate::log_capture::install();
-    let cases = [
-        (PlacementReport::NotReported, false),
-        (PlacementReport::WriteFailed(libc::EBADF), false),
-        (PlacementReport::Placed, true),
+    let reports = [
+        PlacementReport::NotReported,
+        PlacementReport::WriteFailed(libc::EBADF),
+        PlacementReport::Placed,
     ];
     // Before the verdict `Drop` reads the report from the channel; after it, from what the
     // verdict recorded when it released the channel.
-    for ((report, kills), verdict_taken) in cases.into_iter().flat_map(|case| [(case, false), (case, true)]) {
+    for (report, verdict_taken) in reports.into_iter().flat_map(|report| [(report, false), (report, true)]) {
+        let kills = match report {
+            PlacementReport::Placed => true,
+            PlacementReport::WriteFailed(_) => false,
+            // Final once the verdict has waited for it; in flight before.
+            PlacementReport::NotReported => !verdict_taken,
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-drop-kill-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -1002,7 +1008,7 @@ fn drop_kills_only_through_a_leaf_its_child_entered() {
             // The verdict needs a live pid: this process's own stands in for the child.
             assert_eq!(
                 leaf.take_placement(std::process::id()).expect("decidable").is_ok(),
-                kills
+                report == PlacementReport::Placed
             );
             assert!(!leaf.holds_spawn_resources());
         }
@@ -1842,4 +1848,52 @@ fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
     let mut channel = leaf.report.take().expect("the channel");
     let err = leaf.abandon(reaped(), &mut channel, "the test cannot decide");
     assert!(err.to_string().contains("already reaped"), "got {err}");
+}
+
+/// A leaf dropped before its verdict, with no report received and nothing in it, is removed: a
+/// removed leaf admits no member, so the in-flight report cannot matter.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-in-flight-empty");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    drop(super::CgroupLeaf::for_test_at(leaf_path.clone()));
+    assert!(!leaf_path.exists(), "the leaf must be removed");
+}
+
+/// A real leaf dropped before its verdict — the tokio spawn's error path, where tokio loses a
+/// forked child — whose report is in flight but which is occupied: nothing proves the child is
+/// absent, so the leaf is killed through, and removed once drained.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    let leaf_path = leaf.leaf_path.clone();
+    // The member reports through a channel of its own, so the leaf's receives nothing: its
+    // report stays in flight.
+    let own = super::ReportChannel::new().expect("open the member's channel");
+    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("300");
+    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
+    // on descriptors `leaf` and `own` keep open across the spawn.
+    unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let mut member = cmd.spawn().expect("spawn the member");
+
+    drop(leaf);
+
+    assert_eq!(
+        member.wait().expect("reap the member").signal(),
+        Some(libc::SIGKILL),
+        "the occupant must be killed through the leaf"
+    );
+    assert!(!leaf_path.exists(), "the leaf must be removed");
 }

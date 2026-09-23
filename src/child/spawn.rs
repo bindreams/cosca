@@ -999,6 +999,40 @@ pub(crate) mod fault {
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        static FORGOTTEN_PID: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Fail the NEXT tokio spawn after its fork succeeded, the way tokio's own `build_child` can
+    /// (stdio registration, its pidfd reaper, its signal driver): the child is dropped neither
+    /// killed nor reaped, and the error returns while `Prepared` — with any cgroup leaf — drops.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn set_force_post_fork_failure(on: bool) {
+        FORCE_POST_FORK_FAIL.with(|f| f.set(on));
+    }
+
+    /// The pid of the child the last forced post-fork failure dropped. It is still this
+    /// process's unreaped child, so the caller may wait on it.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn take_forgotten_pid() -> Option<u32> {
+        FORGOTTEN_PID.with(|f| f.take())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn post_fork_failure(
+        spawned: Result<::tokio::process::Child, crate::error::Error>,
+    ) -> Result<::tokio::process::Child, crate::error::Error> {
+        if !FORCE_POST_FORK_FAIL.with(|f| f.replace(false)) {
+            return spawned;
+        }
+        let child = spawned?;
+        FORGOTTEN_PID.with(|f| f.set(child.id()));
+        std::mem::forget(child);
+        Err(crate::error::Error::Io(std::io::Error::other(
+            "forced post-fork spawn failure (test seam)",
+        )))
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {

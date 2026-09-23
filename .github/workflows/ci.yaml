@@ -201,7 +201,8 @@ jobs:
       # leaf. We move our shell into it and run only the cgroup-named tests there
       # (as root, single-threaded) — both the `spawn_io` integration binary and the
       # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
-      # coverage in src/containment/cgroup_tests.rs; its cgroup tests that cannot be a no-op
+      # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
+      # post-fork failure path; its cgroup tests that cannot be a no-op
       # are `#[ignore]`d, hence `--include-ignored`). With the marker set the tests
       # assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a
       # silent skip.
@@ -209,8 +210,8 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
-          cargo test --locked --features pty --target ${{ matrix.target }} --no-run
-          JSON=$(cargo test --locked --features pty --target ${{ matrix.target }} --no-run --message-format=json)
+          cargo test --locked --features pty,tokio --target ${{ matrix.target }} --no-run
+          JSON=$(cargo test --locked --features pty,tokio --target ${{ matrix.target }} --no-run --message-format=json)
           BIN=$(echo "$JSON" \
             | jq -r 'select(.profile.test == true and .target.name == "spawn_io") | .executable' \
             | grep -v '^null$' | grep . | head -n1)

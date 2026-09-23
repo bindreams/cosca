@@ -66,3 +66,55 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
     let status = c.spawn().expect("spawn").wait().await.expect("wait");
     assert_eq!(status.code(), Some(CWD_TOOL_EXIT));
 }
+
+/// tokio can fail a spawn after its fork succeeded (`build_child`: stdio registration, its pidfd
+/// reaper, its signal driver), dropping the child neither killed nor reaped. The spawn's cgroup
+/// leaf then drops with that child alive and possibly in it: it must be killed through, not left
+/// running in a leaked leaf.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf() {
+    use nix::sys::wait::{waitpid, WaitStatus};
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+    let own = crate::containment::cgroup::parse_v2_relative_path(&own).expect("a unified line");
+    let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+    let leaves = || -> Vec<String> {
+        let prefix = format!("cosca-{}-", std::process::id());
+        std::fs::read_dir(&own_dir)
+            .expect("list this process's cgroup")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    };
+    let before = leaves();
+
+    let mut cmd = blocker();
+    cmd.contain();
+    fault::set_force_post_fork_failure(true);
+    assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
+    let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+
+    // Still this process's unreaped child, so waiting on its pid is safe.
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    assert_eq!(
+        waitpid(pid, None).expect("reap the dropped child"),
+        WaitStatus::Signaled(pid, nix::sys::signal::Signal::SIGKILL, false),
+        "the child in the dropped leaf must be killed through it"
+    );
+    // An empty leaf `Drop` could not remove right after its kill is #140's exit lag, not this:
+    // no leaf of this spawn may still hold a live process.
+    for leaf in leaves().into_iter().filter(|leaf| !before.contains(leaf)) {
+        let events = std::fs::read_to_string(own_dir.join(&leaf).join("cgroup.events")).expect("read cgroup.events");
+        assert!(
+            events.lines().any(|line| line == "populated 0"),
+            "{leaf} still holds a process"
+        );
+        std::fs::remove_dir(own_dir.join(&leaf)).expect("remove the drained leaf");
+    }
+}

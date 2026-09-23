@@ -364,6 +364,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(windows)]
             let spawned =
                 spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+            #[cfg(all(test, target_os = "linux"))]
+            let spawned = crate::child::spawn::fault::post_fork_failure(spawned);
             spawned?
         };
         (prepared, c)

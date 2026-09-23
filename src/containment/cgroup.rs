@@ -848,16 +848,9 @@ impl CgroupLeaf {
         self.procs_fd.as_ref().expect(RELEASED).as_raw_fd()
     }
 
-    /// Whether the child reported entering this leaf.
-    ///
-    /// Before the verdict this reads the report without waiting, so it is only called once no
-    /// report can still arrive: from `Drop`, which runs before the verdict only when the spawn
-    /// failed, and `std` reaps a child whose spawn failed before returning the error.
-    fn child_entered(&mut self) -> bool {
-        if let Some(mut channel) = self.report.take() {
-            channel.write = None;
-            self.entered = channel.read_final() == PlacementReport::Placed;
-        }
+    /// Whether the child reported entering this leaf, once the verdict is taken.
+    fn child_entered(&self) -> bool {
+        debug_assert!(self.report.is_none(), "the verdict is not taken yet");
         self.entered
     }
 
@@ -873,7 +866,7 @@ impl CgroupLeaf {
     /// The child reported no successful write, so nothing it forks is in the leaf either.
     /// Whatever keeps the `rmdir` from succeeding, cosca did not put there, and killing it would
     /// kill a process cosca was never asked to contain.
-    pub(crate) fn remove_unentered(mut self) {
+    pub(crate) fn remove_unentered(self) {
         debug_assert!(!self.child_entered(), "remove_unentered on a leaf its child entered");
     }
 
@@ -1194,10 +1187,19 @@ impl CgroupLeaf {
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
         self.procs_fd = None;
+        // Before the verdict — a spawn that failed, maybe after its fork — the report is final
+        // only if it arrived: the child's pid is not known here to wait for it.
+        if let Some(mut channel) = self.report.take() {
+            channel.write = None;
+            match channel.read_final() {
+                PlacementReport::NotReported => return self.remove_with_report_in_flight(),
+                report => self.entered = report == PlacementReport::Placed,
+            }
+        }
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
-        // to drain it, then retry — but only if the child entered it: a spawn that failed before
-        // its pre_exec ran, or whose write failed, put nothing in the leaf. A leaf that outlives
-        // the removal is reported.
+        // to drain it, then retry — but only if the child entered it: a final report other than
+        // `Placed` proves nothing of the child's is there. A leaf that outlives the removal is
+        // reported.
         let Err(first) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
@@ -1229,6 +1231,37 @@ impl Drop for CgroupLeaf {
                 }
             ),
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CgroupLeaf {
+    /// Remove a leaf whose child's report is still in flight (see the module's report contract):
+    /// nothing proves the child absent, so an occupied leaf is killed through, drained, and
+    /// removed — again for as long as anything re-enters it before the removal lands. Once
+    /// removed, it admits no member, so the in-flight report no longer matters.
+    fn remove_with_report_in_flight(&mut self) {
+        loop {
+            let occupied = match fs::remove_dir(&self.leaf_path) {
+                Ok(()) => return,
+                Err(e) if removed_after_drain(&e) => return,
+                Err(e) => e,
+            };
+            let why = match self.hard_kill() {
+                // Every member was just sent SIGKILL, so the leaf drains.
+                Ok(()) if occupied.raw_os_error() == Some(libc::EBUSY) => match self.wait_drained(None) {
+                    Ok(_) => continue,
+                    Err(e) => format!("its drain could not be watched ({e})"),
+                },
+                // Not a leaf `rmdir` refuses for its members: killing again cannot remove it.
+                Ok(()) => "cgroup.kill succeeded".to_string(),
+                Err(e) => format!("cgroup.kill failed ({e})"),
+            };
+            return warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed ({occupied}) with the child's report in flight; {why}"),
+            );
+        }
     }
 }
 
