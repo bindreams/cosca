@@ -578,33 +578,47 @@ fn a_disarmed_leaf_whose_tree_was_killed_warns_that_it_was_not_removed() {
     );
 }
 
-/// The same for a tree the caller tore down with `terminate_tree()`: its leaf outliving the drop
-/// is a leak, not a tree left running.
+/// A SIGTERM is catchable, so `terminate_tree()` proves no teardown: a disarmed leaf whose tree
+/// ignored it is a live opted-out tree keeping its leaf, reported at `debug`, not a leak.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_disarmed_leaf_whose_tree_was_terminated_warns_that_it_was_not_removed() {
+fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-terminated-opted-out-leaf");
+    let leaf_path = dir.path().join("cosca-terminate-survivor-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
-    // SAFETY (in the child): `pause` is async-signal-safe; SIGTERM's default action ends it.
-    let member = fork_running(|| unsafe {
-        libc::pause();
+    let mut ready = [0 as std::os::fd::RawFd; 2];
+    // SAFETY: `ready` is a valid two-element array for `pipe` to fill.
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "pipe");
+    let member = fork_running(move || {
+        // SAFETY (in the child): `signal`, `write` and `pause` are async-signal-safe.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::write(ready[1], b"r".as_ptr().cast(), 1);
+            libc::pause();
+        }
     });
+    // SAFETY: the parent's copy of the write end, closed once.
+    unsafe { libc::close(ready[1]) };
+    block_on(ready[0]); // the member ignores SIGTERM from here on
+                        // SAFETY: the parent's copy of the read end, closed once.
+    unsafe { libc::close(ready[0]) };
     std::fs::write(leaf_path.join("cgroup.procs"), format!("{member}\n")).expect("list the member");
 
     let leaf = entered_leaf_at(leaf_path);
     leaf.disarm();
     leaf.terminate().expect("signal the tree");
-    reap(member);
     let mark = crate::log_capture::mark();
     drop(leaf);
+    // SAFETY: `member` is this process's own unreaped child.
+    unsafe { libc::kill(member as i32, libc::SIGKILL) };
+    reap(member);
 
-    let records = crate::log_capture::records_since(mark, "cosca-terminated-opted-out-leaf");
+    let records = crate::log_capture::records_since(mark, "cosca-terminate-survivor-leaf");
     assert_eq!(
-        crate::log_capture::levels_since(mark, "cosca-terminated-opted-out-leaf"),
-        vec![log::Level::Warn],
-        "a terminated tree's leaf that outlived its Drop is a leak, got {records:?}"
+        crate::log_capture::levels_since(mark, "cosca-terminate-survivor-leaf"),
+        vec![log::Level::Debug],
+        "a tree that survived SIGTERM is left running, not leaked, got {records:?}"
     );
 }
 

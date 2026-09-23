@@ -687,8 +687,8 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         // The opt-out/`detach()` contract: nothing is signalled. The leaf's own `Drop` still
-        // reports a leaf the tree occupies: at `debug` for a running tree, at `warn` for one torn
-        // down that has not drained.
+        // reports a leaf the tree occupies: at `debug` for a running tree, at `warn` for one killed
+        // that has not drained.
         if !self.kill_on_drop {
             return;
         }
