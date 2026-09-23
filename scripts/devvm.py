@@ -204,38 +204,58 @@ def powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def stage_tree(guest: Guest) -> None:
-    """rsync a copy of the working tree's git-TRACKED files into .tmp/devvm/<guest>/tree.
+def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None = None) -> None:
+    """Rebuild a fresh copy of the working tree's git-TRACKED files under dest (default:
+    .tmp/devvm/<guest>/tree).
 
-    Every guest is served from this staged copy (not raw REPO_ROOT) so what lands in a guest
+    Every guest is served from this staged copy (not raw repo_root) so what lands in a guest
     is exactly `git ls-files` — never untracked files (e.g. CLAUDE.local.md, .claude/) and
     never a worktree's .git, which is a FILE (pointing at the parent repo's gitdir), not a
     directory, so a plain rsync `--exclude=.git/` pattern silently fails to match it and
     leaks it into the guest.
+
+    dest is wiped and recreated on every call rather than rsync'd with `--delete`: measured
+    directly (rsync 3.5.1) that `--delete` combined with `--files-from` is a silent no-op for
+    removals — a file dropped from both the source tree and the files-list stays behind in an
+    already-populated dest. Wiping dest first sidesteps the interaction entirely, since there
+    is never anything stale left for a `--delete` flag to need to remove.
+
+    Filtered to files that still exist on disk: `git ls-files` can list a tracked path that
+    isn't actually present in the working tree (deleted-but-unstaged, or a sparse-checkout
+    skip-worktree entry) — feeding a missing path to `rsync --files-from` makes rsync exit 23
+    with a raw traceback instead of a clean sync. A tracked-but-absent path is a normal git
+    state, not a caller bug, so it's silently excluded rather than treated as an error.
 
     `git ls-files -z` / `rsync --from0` avoid whitespace/newline-in-filename hazards that a
     plain newline-joined list would have.
     """
     require_tool("rsync")
     require_tool("git")
-    dest = stage_dir(guest)
-    dest.mkdir(parents=True, exist_ok=True)
+    if dest is None:
+        dest = stage_dir(guest)
 
     ls_files = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
+        ["git", "-C", str(repo_root), "ls-files", "-z"],
         check=True,
         capture_output=True,
     )
+    tracked = [p for p in ls_files.stdout.split(b"\0") if p]
+    existing = [p for p in tracked if (repo_root / p.decode()).is_file()]
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
     files_list = dest.parent / "tracked-files.list"
-    files_list.write_bytes(ls_files.stdout)
+    files_list.write_bytes(b"\0".join(existing) + (b"\0" if existing else b""))
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
 
     cmd = [
         "rsync",
         "--archive",
-        "--delete",
         "--from0",
         f"--files-from={files_list}",
-        f"{REPO_ROOT}/",
+        f"{repo_root}/",
         f"{dest}/",
     ]
     print(f"+ {shlex.join(cmd)}", file=sys.stderr)
