@@ -18,6 +18,12 @@
 //! An inotify instance counts against `fs.inotify.max_user_instances` (128 per user by default),
 //! and each watch against `fs.inotify.max_user_watches`. Arming one can therefore fail, and a
 //! failure is returned, never replaced by a weaker wait.
+//!
+//! A leaf's watch is held for the leaf's life, and its parent watch queues an event for every
+//! sibling removed meanwhile, up to `fs.inotify.max_queued_events` (16384 by default) per
+//! instance, kernel memory the user is charged for. A full queue loses events after an
+//! `IN_Q_OVERFLOW`, which is harmless here: any event is only a reason to read `cgroup.events`
+//! again, a removed leaf reads as drained (`ENODEV`), and each wait empties the queue.
 
 use std::ffi::OsString;
 use std::fs::File;
