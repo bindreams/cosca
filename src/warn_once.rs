@@ -19,3 +19,7 @@ pub(crate) fn report_level<C: Ord>(seen: &Mutex<BTreeSet<C>>, condition: C) -> l
         log::Level::Debug
     }
 }
+
+#[cfg(test)]
+#[path = "warn_once_tests.rs"]
+mod warn_once_tests;
