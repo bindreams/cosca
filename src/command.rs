@@ -204,16 +204,21 @@ impl Command {
     /// `CreateProcessW`'s own documented search order with the current directory cut
     /// out, not a fresh rule, so a directory placed early on `PATH` (a dev toolchain
     /// install, a per-user app shim) still cannot shadow e.g. `System32\find.exe`.
-    /// Searching the current directory first was the previous behaviour and was a
-    /// binary-planting hazard: `executable("helper")` would load a `helper.exe` dropped
-    /// in whatever directory the process happened to sit in. Write `./helper` to reach
-    /// it explicitly.
+    /// Searching the current directory first is a binary-planting hazard: `executable("helper")`
+    /// would load a `helper.exe` dropped in whatever directory the process happened to sit in.
+    /// Write `./helper` to reach it explicitly.
     ///
     /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a
     /// descriptor >= 3 also routes an unelevated Windows spawn through the raw backend, so
     /// `Command::new().arg("sub/helper").fd(3, ..)` is resolved by everything described here —
     /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
     /// `executable` set at all.
+    ///
+    /// The directory resolved against is the one the child runs in. `current_dir`, or this
+    /// process's cwd when none is set, is read once and handed to `CreateProcessW` completed, so a
+    /// concurrent `set_current_dir` cannot load one directory's file and run the child in another.
+    /// A `current_dir` that is empty is [`std::io::ErrorKind::NotFound`]; one starting with two
+    /// separators that names no share (`\\server`) is [`std::io::ErrorKind::InvalidInput`].
     ///
     /// The `.exe` rule is a property of names that get SEARCHED, not of files that get
     /// LOADED, so it differs by shape. If the name's final path component already ends
@@ -259,8 +264,10 @@ impl Command {
     ///   its shape and nothing was searched for, so no filesystem result is being reported.
     ///   A drive-relative name such as `C:tool` is refused this way rather than loaded from
     ///   the working directory: resolving it would need drive C's own current directory,
-    ///   which cosca does not track. So is a name that names no file at all (`C:\`, `.`,
-    ///   `tools\dir\`, `\\server\share`).
+    ///   which cosca does not track. As in Win32, any one character before the `:` is a drive,
+    ///   so `1:tool` is refused too. So is a name that names no file at all (`C:\`, `.`,
+    ///   `tools\dir\`, `\\server\share`), and one starting with two separators that names no
+    ///   share (`\\tool.exe`), which Win32 reads as a UNC path rather than a file on this drive.
     /// - [`std::io::ErrorKind::NotFound`] — the name was acceptable, the search above ran,
     ///   and nothing matched.
     ///
@@ -302,11 +309,12 @@ impl Command {
     ///   partial `lpApplicationName` "using the current drive and current directory", and
     ///   `lpCurrentDirectory` (what [`current_dir`](Self::current_dir) sets) does not affect
     ///   image lookup at all. So `raw_executable("helper.exe").current_dir(r"D:\work")` loads
-    ///   `helper.exe` from wherever THIS process happens to sit, not from `D:\work`. Pass an
-    ///   absolute path if that distinction
-    ///   could ever matter — and note that a directory this process sits in may be writable by
-    ///   someone else, which is the binary-planting shape [`executable`](Self::executable)
-    ///   deliberately refuses to walk into.
+    ///   `helper.exe` from wherever THIS process happens to sit, not from `D:\work`. cosca
+    ///   completes the name itself, as `CreateProcessW` would, from the same one read of this
+    ///   process's cwd that `current_dir` is completed against, so the two cannot come from
+    ///   different directories. Pass an absolute path if that distinction could ever matter — and
+    ///   note that a directory this process sits in may be writable by someone else, which is the
+    ///   binary-planting shape [`executable`](Self::executable) deliberately refuses to walk into.
     /// - **POSIX:** the **child's** working directory — [`current_dir`](Self::current_dir) when
     ///   set (itself read against this process's directory if relative), else this process's. The
     ///   `chdir` happens before the exec, so that is where a relative path lands. A bare `tool`
@@ -652,7 +660,7 @@ impl Command {
     ///
     /// | Flag | Why reserved | Instead |
     /// | --- | --- | --- |
-    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none; a suspended-spawn window is being designed in [cosca#49](https://github.com/bindreams/cosca/issues/49) |
+    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none |
     /// | `CREATE_NEW_PROCESS_GROUP` | load-bearing for `CTRL_BREAK` delivery to the contained root | [`contain`](Self::contain) |
     /// | `CREATE_NEW_CONSOLE` | measured: the child gets its own *visible* console window, overriding a requested window suppression | none |
     /// | `CREATE_UNICODE_ENVIRONMENT` | both backends supply it structurally, so a caller can neither set nor clear it meaningfully | none |
