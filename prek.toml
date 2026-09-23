@@ -24,9 +24,9 @@ pass_filenames = false
 id = "cargo-clippy"
 name = "cargo clippy"
 # .github/scripts/clippy.sh is the single source of truth for this repo's
-# clippy policy (--all-targets --locked -- -D warnings); CI's clippy-powerset
-# composite action calls the same script with extra --target/--feature-powerset
-# flags. Called with neither here, so this hook stays a fast, host-only check.
+# clippy policy; CI's clippy-powerset composite action calls the same script
+# with extra --target/--feature-powerset flags. Called with neither here, so
+# this hook stays a fast, host-only check.
 entry = "bash .github/scripts/clippy.sh"
 language = "system"
 types = ["rust"]

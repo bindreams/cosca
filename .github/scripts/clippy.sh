@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Single source of truth for this repo's clippy policy: `--all-targets --locked
-# -- -D warnings`. Called both by the local prek hook (host target, no
-# `--feature-powerset` — stays fast) and by CI's clippy-powerset composite
-# action (extra `--target`/`--feature-powerset` for cross-target, cross-feature
-# coverage the host-only prek hook can't give).
+# Single source of truth for this repo's clippy policy. Called both by the
+# local prek hook (host target, no `--feature-powerset` — stays fast) and by
+# CI's clippy-powerset composite action (extra `--target`/`--feature-powerset`
+# for cross-target, cross-feature coverage the host-only prek hook can't give).
 #
 # Usage: clippy.sh [--target TRIPLE] [--feature-powerset]
 set -euo pipefail
