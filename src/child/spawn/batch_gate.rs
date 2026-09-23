@@ -471,3 +471,7 @@ pub(super) fn ntfs_stream_names(name: &str) -> impl Iterator<Item = &str> {
     };
     rest.split(':').map(|part| part.trim_end_matches([' ', '.']))
 }
+
+#[cfg(test)]
+#[path = "batch_gate_tests.rs"]
+mod batch_gate_tests;
