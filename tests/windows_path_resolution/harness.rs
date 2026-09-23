@@ -1,6 +1,7 @@
 //! How a canary records and reports the facts it checks.
 
 use crate::provenance::announce_platform;
+use crate::pure::marker_file_name;
 use crate::winapi::{full_path_name, has_bat_extension};
 
 /// Run a canary: stamp the OS build, run `body` with the facts it checks and the measurement
@@ -97,8 +98,8 @@ fn mark_canary_passed() {
     };
     let name = std::thread::current()
         .name()
-        .expect("libtest names each test's thread")
-        .to_string();
+        .map(marker_file_name)
+        .expect("libtest names each test's thread");
     let path = std::path::Path::new(&dir).join(&name);
     std::fs::write(&path, b"").unwrap_or_else(|e| panic!("could not write the canary marker {path:?}: {e}"));
 }

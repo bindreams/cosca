@@ -132,3 +132,12 @@ fn all_succeeded_reports_every_failed_step() {
         Err("query: e1; reap: e3".to_string())
     );
 }
+
+#[test]
+fn marker_file_name_is_a_valid_windows_file_name() {
+    assert_eq!(
+        marker_file_name("dots_and_spaces::a_final_component"),
+        "dots_and_spaces.a_final_component"
+    );
+    assert_eq!(marker_file_name("top_level"), "top_level");
+}
