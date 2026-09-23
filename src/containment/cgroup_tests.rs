@@ -2576,3 +2576,36 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
     assert!(err.contains("drain could not be watched"), "got {err}");
     child.wait().expect("reap the child");
 }
+
+/// An abandoned spawn's child exits from inside its hook, with `ABANDONED_EXIT`, rather than
+/// return an error to `std` — which would write its error record to the fd number its error
+/// channel had, a stdio slot once `std` returned early. A regression exits 0 here (the forked
+/// body's own `_exit`), or with `std`'s record nowhere to go.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_childs_hook_exits_instead_of_returning() {
+    use std::os::fd::IntoRawFd;
+
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let slot = channel.slot();
+    let (_procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
+    let procs_fd = procs_write.into_raw_fd();
+    // A forked copy of the channel's ends, so the parent's own shut below is the abandonment.
+    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
+    let gate = std::os::fd::AsRawFd::as_raw_fd(&gate_read);
+    let pid = fork_running(move || {
+        block_on(gate);
+        // SAFETY: this child's inherited copies of the channel's ends and the pipe.
+        let _ = unsafe { super::placement_hook(procs_fd, slot) };
+    });
+    // SAFETY: the parent's own copy, closed once.
+    unsafe { libc::close(procs_fd) };
+    let _ = channel.shut();
+    std::io::Write::write_all(&mut gate_write, b"x").expect("release the child");
+
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
+    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), super::ABANDONED_EXIT);
+}

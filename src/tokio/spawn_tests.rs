@@ -333,3 +333,98 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
         "the leaf must not reap a child tokio owns"
     );
 }
+
+/// An abandoned spawn's child writes nothing into its own stdio. With fds 1 and 2 closed, `std`'s
+/// error channel takes them, the child's stdio `dup2` closes its end, and `spawn` returns before
+/// the child's hook runs. The child is held at its hook until the spawn has been abandoned; an
+/// error it then returned to `std` would be written to that channel's fd number — by now the
+/// child's stderr.
+///
+/// Each case runs in a copy of this test binary: closing 1 and 2 is process-wide.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::{AsFd, AsRawFd};
+
+    const NAME: &str = "tokio::spawn::spawn_tests::cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio";
+    const INNER: &str = "COSCA_TEST_ABANDONED_STDIO_INNER";
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    if std::env::var_os(INNER).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+            .env(INNER, "1")
+            .output()
+            .expect("run the case");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut file = tempfile::tempfile().expect("tempfile");
+    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
+    runtime.block_on(async {
+        let mut cmd = blocker();
+        for slot in [1, 2] {
+            cmd.fd(
+                slot,
+                crate::stdio::Stdio::from_file(file.try_clone().expect("clone the file")),
+            )
+            .expect("wire the slot to the file");
+        }
+        cmd.contain();
+        // SAFETY: this process's own std slots, closed only across the spawn and restored from
+        // copies above 2 before anything else runs.
+        let saved: Vec<(i32, i32)> = [1, 2]
+            .into_iter()
+            .map(|slot| unsafe { (slot, libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3)) })
+            .collect();
+        for &(slot, _) in &saved {
+            // SAFETY: as above.
+            unsafe { libc::close(slot) };
+        }
+        // Inherited by the child, which waits on it at its hook; this thread's copy is cleared.
+        crate::containment::cgroup::fault::set_hook_gate(gate_read.as_raw_fd());
+        fault::set_force_post_fork_failure(true);
+        let spawned = cmd.spawn();
+        let _ = crate::containment::cgroup::fault::take_hook_gate();
+        for &(slot, saved) in &saved {
+            // SAFETY: as above.
+            unsafe {
+                libc::dup2(saved, slot);
+                libc::close(saved);
+            }
+        }
+        assert!(spawned.is_err(), "the forced failure must fail the spawn");
+        let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+        let _ = fault::take_forgotten_pid();
+        let _ = fault::take_forgotten_leaf();
+        // The spawn is abandoned: only now does the child's hook run.
+        gate_write.write_all(b"x").expect("release the child");
+        // Its exit, then its reap: it sent nothing, so nothing else reaps it.
+        let _ = rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        );
+    });
+    let mut written = Vec::new();
+    file.rewind().expect("rewind the file");
+    file.read_to_end(&mut written).expect("read the file");
+    assert!(
+        !written.windows(4).any(|w| w == b"NOEX"),
+        "std's error record reached the child's stdio: {written:?}"
+    );
+}

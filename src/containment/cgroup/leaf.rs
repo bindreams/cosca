@@ -1087,6 +1087,41 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     })
 }
 
+/// The status an abandoned spawn's child exits with, from inside its hook.
+#[cfg(target_os = "linux")]
+pub(crate) const ABANDONED_EXIT: i32 = 125;
+
+/// The placement hook a contained spawn registers: close the forked child's inherited copy of the
+/// parent's end, then place the child (see [`place_self_in_cgroup_pre_exec`]).
+///
+/// A spawn the parent abandoned makes the child `_exit` here, with [`ABANDONED_EXIT`], instead of
+/// returning an error to `std`. A child that never execs needs no error channel, and `std` would
+/// write its error record to the number its channel had — which, once `std`'s spawn returned
+/// early because two of fds 0–2 were closed, is one of the child's own stdio slots.
+///
+/// # Safety
+/// As [`place_self_in_cgroup_pre_exec`], in a forked child only.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
+    // Test-only fault seam: wait for the test's go-ahead (async-signal-safe: one `read`).
+    #[cfg(test)]
+    if let Some(gate) = fault::take_hook_gate() {
+        let mut byte = 0u8;
+        // Safety: a one-byte buffer on this frame; `gate` is this child's inherited copy.
+        while unsafe { libc::read(gate, (&raw mut byte).cast(), 1) } == -1
+            && unsafe { *libc::__errno_location() } == libc::EINTR
+        {}
+    }
+    // Safety: the caller's guarantee: this is the forked child.
+    unsafe { slot.close_parents_end() };
+    // Safety: the caller's guarantee.
+    match unsafe { place_self_in_cgroup_pre_exec(procs_fd, slot) } {
+        // Safety: `_exit` is async-signal-safe, and runs nothing of this process's.
+        Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => unsafe { libc::_exit(ABANDONED_EXIT) },
+        other => other,
+    }
+}
+
 /// Place the calling process into the pre-created cgroup leaf by writing `"0"`
 /// to `procs_fd`, then close the fd so it does not propagate to grandchildren.
 ///

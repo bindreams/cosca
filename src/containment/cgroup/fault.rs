@@ -1,5 +1,6 @@
 use std::cell::Cell;
 thread_local! {
+    static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
@@ -162,4 +163,13 @@ pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<()>) 
 }
 pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<()>> {
     BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
+}
+
+/// Hold the NEXT placement hook run by a child forked from this thread — which inherits the flag —
+/// until a byte arrives on `gate`, so a test can order the child's hook after the parent's act.
+pub(crate) fn set_hook_gate(gate: std::os::fd::RawFd) {
+    HOOK_GATE.with(|g| g.set(Some(gate)));
+}
+pub(crate) fn take_hook_gate() -> Option<std::os::fd::RawFd> {
+    HOOK_GATE.with(|g| g.take())
 }

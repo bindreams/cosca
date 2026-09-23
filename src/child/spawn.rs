@@ -1133,7 +1133,9 @@ pub(crate) mod fault {
         let pidfd = child
             .id()
             .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
-            .and_then(|pid| rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok());
+            .and_then(|pid| rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok())
+            // Above 2: a test may have 0, 1 or 2 closed across the spawn, and restore them.
+            .and_then(|pidfd| rustix::io::fcntl_dupfd_cloexec(&pidfd, 3).ok());
         FORGOTTEN_PIDFD.with(|f| *f.borrow_mut() = pidfd);
         std::mem::forget(child);
         Err(crate::error::Error::Io(std::io::Error::other(
