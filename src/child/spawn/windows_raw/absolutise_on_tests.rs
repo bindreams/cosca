@@ -270,27 +270,39 @@ fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
     let _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
 }
 
+/// What `GetFullPathNameW` makes of a verbatim path, as measured on both CI architectures: it
+/// normalises after the `\\?\` prefix as it does anywhere else.
+const VERBATIM_REWRITES: &[(&str, &str)] = &[
+    (r"\\?\C:\t\a", r"\\?\C:\t\a"),
+    (r"\\?\C:\t\a.", r"\\?\C:\t\a"),
+    (r"\\?\C:\t\x\..\y", r"\\?\C:\t\y"),
+    (r"\\?\C:\t\a ", r"\\?\C:\t\a"),
+];
+
+#[test]
+fn get_full_path_name_rewrites_a_verbatim_path_as_measured() {
+    for (path, want) in VERBATIM_REWRITES {
+        assert_eq!(
+            super::full_path_name(Path::new(path)).unwrap(),
+            PathBuf::from(want),
+            "{path:?}"
+        );
+    }
+}
+
 /// A verbatim `current_dir` is kept as written when `GetFullPathNameW` leaves it alone, and refused
 /// when it would rewrite it: whatever completes the child's `lpCurrentDirectory` may rewrite it the
-/// same way, and the directory resolved against must be the one run in. `GetFullPathNameW` does
-/// rewrite a verbatim trailing dot (measured on both CI architectures), so that case is pinned.
+/// same way, and the directory resolved against must be the one run in.
 #[test]
 fn a_verbatim_directory_is_kept_or_refused_never_rewritten() {
-    let dotted = Path::new(r"\\?\C:\t\a.");
-    assert_ne!(
-        super::full_path_name(dotted).unwrap(),
-        dotted,
-        "premise: a verbatim trailing dot is rewritten"
-    );
-    for path in [r"\\?\C:\t\a", r"\\?\C:\t\a.", r"\\?\C:\t\x\..\y", r"\\?\C:\t\a "] {
-        let rewritten = super::full_path_name(Path::new(path)).unwrap() != Path::new(path);
+    for (path, rewritten) in VERBATIM_REWRITES {
         match complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive) {
             Ok(got) => {
-                assert!(!rewritten, "{path:?} is rewritten, so it must be refused");
+                assert_eq!(path, rewritten, "{path:?} is rewritten, so it must be refused");
                 assert_eq!(got.path, PathBuf::from(path), "{path:?}");
             }
             Err(Error::Io(e)) => {
-                assert!(rewritten, "{path:?} is not rewritten, so it must be kept: {e}");
+                assert_ne!(path, rewritten, "{path:?} is not rewritten, so it must be kept: {e}");
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{path:?}: {e}");
             }
             Err(other) => panic!("{path:?}: {other:?}"),
@@ -298,17 +310,45 @@ fn a_verbatim_directory_is_kept_or_refused_never_rewritten() {
     }
 }
 
-/// A verbatim `raw_executable()` token is taken as written: `\\?\C:\t\tool.exe.` names that
-/// file, not its sibling `tool.exe`, and `...` is a file name there.
+/// The raw backend takes a verbatim `raw_executable()` token as written, as `CreateProcessW` loads
+/// it: `\\?\C:\t\tool.exe.` names that file, not its sibling `tool.exe`, and `...` is a file name
+/// there.
 #[test]
 fn a_verbatim_exact_token_is_taken_as_written() {
     for token in [r"\\?\C:\t\tool.exe.", r"\\?\C:\t\x\..\tool.exe", r"\\?\C:\t\..."] {
-        assert_eq!(
-            absolutise_exact(Path::new(token)).unwrap(),
-            PathBuf::from(token),
-            "{token:?}"
-        );
         let got = absolutise_exact_on(Path::new(token), || panic!("must not read the cwd"), no_drive).unwrap();
         assert_eq!(got.path, PathBuf::from(token), "{token:?}");
     }
+}
+
+/// The elevated path completes a verbatim token as main does: `GetFullPathNameW` on it, then the
+/// shape check on the result, which refuses a name normalised down to a directory.
+#[test]
+fn the_elevated_completion_normalises_a_verbatim_token() {
+    for (token, want) in [
+        (r"\\?\C:\t\tool.exe.", r"\\?\C:\t\tool.exe"),
+        (r"\\?\C:\t\x\..\tool.exe", r"\\?\C:\t\tool.exe"),
+    ] {
+        assert_eq!(
+            absolutise_exact(Path::new(token)).unwrap(),
+            PathBuf::from(want),
+            "{token:?}"
+        );
+    }
+    match absolutise_exact(Path::new(r"\\?\C:\t\...")) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+}
+
+/// A relative name completed against a verbatim PROCESS cwd is normalised, as Win32 completes it:
+/// the `\\?\` came from the base, not the caller, so what loads and where the child runs are what
+/// `CreateProcessW` would make of the name.
+#[test]
+fn a_relative_name_on_a_verbatim_process_cwd_is_normalised() {
+    let cwd = || Ok(PathBuf::from(r"\\?\C:\d"));
+    let got = absolutise_exact_on(Path::new("tool.exe."), cwd, no_drive).unwrap();
+    assert_eq!(got.path, PathBuf::from(r"\\?\C:\d\tool.exe"));
+    let got = super::effective_cwd(Some(Path::new("sub.")), &empty_env(), cwd).unwrap();
+    assert_eq!(got, PathBuf::from(r"\\?\C:\d\sub"));
 }
