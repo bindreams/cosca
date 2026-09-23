@@ -479,9 +479,12 @@ impl Command {
     /// child needs one.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the drop waits for the tree to be gone**
-    /// before it removes the tree's leaf. This is almost always instant: it stalls only while a
-    /// member is stuck in uninterruptible I/O (D state), and then the drop waits too. Under every
-    /// other mechanism descendants are killed, not waited for. To wait explicitly, call
+    /// before it removes the tree's leaf: it waits while any process remains in the leaf. That is
+    /// almost always instant, since every member was just sent `SIGKILL`. It lasts as long as a
+    /// member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
+    /// another party (the same uid, or root) moves into the leaf after the kill keeps running:
+    /// the kill reaches only the processes in the leaf when it is written. Under every other
+    /// mechanism descendants are killed, not waited for. To wait explicitly, call
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
     /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks

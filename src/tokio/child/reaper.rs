@@ -33,8 +33,9 @@
 //! handle (or, on Unix, the zombie and its pid), the containment resource — a cgroup leaf, a
 //! job-object handle, or the marker fds — and the pipe and stdio handles. A worker is wedged either
 //! on a root that will not exit, which no other thread could reap sooner, or, after the reap, on a
-//! cgroup leaf's drain: its release waits for the tree to be gone, which only a member stuck in
-//! uninterruptible I/O (D state) can delay. Such a worker holds up every job queued behind it.
+//! cgroup leaf's drain: its release waits while any process remains in the leaf — a member stuck
+//! in uninterruptible I/O (D state), or a process another party moved in after the kill. Such a
+//! worker holds up every job queued behind it.
 //! That is still the better trade than releasing those jobs, whose own releases would wait the
 //! same way on whichever thread ran them. Process exit with jobs still
 //! queued is benign, since the roots are already signalled and the OS reaps them.
