@@ -1,8 +1,7 @@
 //! Canaries that spawn the payload: which file loads, and whether std substitutes `cmd.exe`.
 
 use crate::dots_and_spaces::WEIRD_NAMES;
-use crate::harness::Disagreements;
-use crate::provenance::announce_platform;
+use crate::harness::canary;
 use crate::pure::verbatim_spelling;
 use crate::winapi::{outcome, wide};
 use windows::core::{PCWSTR, PWSTR};
@@ -35,135 +34,128 @@ use windows::Win32::System::Threading::{
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
 fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
-    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
-    let mut facts = Disagreements::about("Windows and Rust's std::process");
-    let root = tempfile::tempdir().expect("tempdir");
-    let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
-    let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
-    println!("temp root: {root:?}\nsource image: {source:?}");
-    let mut spawnable = 0usize;
+    canary("Windows and Rust's std::process", |facts, failures| {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
+        let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
+        println!("temp root: {root:?}\nsource image: {source:?}");
+        let mut spawnable = 0usize;
 
-    for (i, &(name, note, creatable)) in WEIRD_NAMES.iter().enumerate() {
-        let case_dir = format!(r"{root}\case{i}");
-        if let Err(e) = std::fs::create_dir(&case_dir) {
-            failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
-            continue;
-        }
-        let verbatim = format!(r"\\?\{case_dir}\{name}");
-        let plain = format!(r"{case_dir}\{name}");
-        println!("--- {verbatim:?}  ({note})");
-        // Whether the name can hold an image is itself a fact, checked either way, so a platform
-        // change here is reported as one and never reaches the planted-count guard below.
-        // `dots_and_spaces::only_dot_and_dotdot_are_refused_as_verbatim_file_names` owns which
-        // names those are.
-        let copied = std::fs::copy(source, &verbatim);
-        facts.check(
-            copied.is_ok() == creatable,
-            &format!(
-                "an image {} be copied to verbatim {name:?}",
-                if creatable { "can" } else { "cannot" }
-            ),
-            outcome(&copied),
-        );
-        if let Err(e) = &copied {
-            println!(
-                "  copy: FAILED: {e} (raw_os_error={:?}) — nothing to spawn",
-                e.raw_os_error()
+        for (i, &(name, note, creatable)) in WEIRD_NAMES.iter().enumerate() {
+            let case_dir = format!(r"{root}\case{i}");
+            if let Err(e) = std::fs::create_dir(&case_dir) {
+                failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
+                continue;
+            }
+            let verbatim = format!(r"\\?\{case_dir}\{name}");
+            let plain = format!(r"{case_dir}\{name}");
+            println!("--- {verbatim:?}  ({note})");
+            // Whether the name can hold an image is itself a fact, checked either way, so a
+            // platform change here is reported as one and never reaches the planted-count guard
+            // below. `dots_and_spaces::only_dot_and_dotdot_are_refused_as_verbatim_file_names` owns
+            // which names those are.
+            let copied = std::fs::copy(source, &verbatim);
+            facts.check(
+                copied.is_ok() == creatable,
+                &format!(
+                    "an image {} be copied to verbatim {name:?}",
+                    if creatable { "can" } else { "cannot" }
+                ),
+                outcome(&copied),
             );
-            continue;
-        }
-        if !creatable {
-            println!("  copy: succeeded where it should not — not spawned");
+            if let Err(e) = &copied {
+                println!(
+                    "  copy: FAILED: {e} (raw_os_error={:?}) — nothing to spawn",
+                    e.raw_os_error()
+                );
+                continue;
+            }
+            if !creatable {
+                println!("  copy: succeeded where it should not — not spawned");
+                if let Err(e) = std::fs::remove_file(&verbatim) {
+                    println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
+                }
+                continue;
+            }
+            spawnable += 1;
+            let planted = match file_identity(&verbatim) {
+                Ok(id) => id,
+                Err(why) => {
+                    failures.push(why);
+                    continue;
+                }
+            };
+            println!("  planted file identity: {planted:?}");
+            for (tag, program) in [("verbatim", &verbatim), ("plain", &plain)] {
+                let out = format!(r"\\?\{case_dir}\out_{tag}.txt");
+                match create_process(program, &out) {
+                    Ok((code, captured)) => {
+                        println!("  CreateProcessW as {tag} {program:?}: ran, exit={code}, child said {captured:?}")
+                    }
+                    Err(why) => println!("  CreateProcessW as {tag} {program:?}: {why}"),
+                }
+                // std::process is the route cosca actually takes, and it resolves the program
+                // itself before calling CreateProcessW — so it can disagree with the line above.
+                let ran = std::process::Command::new(program).output();
+                match &ran {
+                    Ok(o) => println!(
+                        "  std::process as {tag} {program:?}: ran, {:?}, child said {:?}",
+                        o.status,
+                        String::from_utf8_lossy(&o.stdout)
+                    ),
+                    Err(e) => println!(
+                        "  std::process as {tag} {program:?}: FAILED: {e} (raw_os_error={:?})",
+                        e.raw_os_error()
+                    ),
+                }
+                if tag != "verbatim" {
+                    continue;
+                }
+                let output = match ran {
+                    Ok(o) if o.status.success() => o,
+                    other => {
+                        facts.check(
+                            false,
+                            &format!("std::process runs the image at verbatim {name:?}"),
+                            other.map_or_else(|e| e.to_string(), |o| format!("{:?}", o.status)),
+                        );
+                        continue;
+                    }
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let Some(image) = stdout.lines().find_map(|l| l.strip_prefix("image=")) else {
+                    failures.push(format!("the payload at {verbatim:?} exited 0 without an image= line"));
+                    continue;
+                };
+                // An image path that cannot be opened is a broken probe, not a changed platform.
+                let loaded = match file_identity(&verbatim_spelling(image)) {
+                    Ok(id) => id,
+                    Err(why) => {
+                        failures.push(format!("the reported image {image:?}: {why}"));
+                        continue;
+                    }
+                };
+                println!("  image={image:?} opened verbatim has identity {loaded:?}");
+                facts.check(
+                    loaded == planted,
+                    &format!("std::process on verbatim {name:?} loads that file, not another"),
+                    format_args!("image={image:?} with identity {loaded:?}, planted {planted:?}"),
+                );
+            }
             if let Err(e) = std::fs::remove_file(&verbatim) {
                 println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
             }
-            continue;
         }
-        spawnable += 1;
-        let planted = match file_identity(&verbatim) {
-            Ok(id) => id,
-            Err(why) => {
-                failures.push(why);
-                continue;
-            }
-        };
-        println!("  planted file identity: {planted:?}");
-        for (tag, program) in [("verbatim", &verbatim), ("plain", &plain)] {
-            let out = format!(r"\\?\{case_dir}\out_{tag}.txt");
-            match create_process(program, &out) {
-                Ok((code, captured)) => {
-                    println!("  CreateProcessW as {tag} {program:?}: ran, exit={code}, child said {captured:?}")
-                }
-                Err(why) => println!("  CreateProcessW as {tag} {program:?}: {why}"),
-            }
-            // std::process is the route cosca actually takes, and it resolves the program itself
-            // before calling CreateProcessW — so it can disagree with the line above.
-            let ran = std::process::Command::new(program).output();
-            match &ran {
-                Ok(o) => println!(
-                    "  std::process as {tag} {program:?}: ran, {:?}, child said {:?}",
-                    o.status,
-                    String::from_utf8_lossy(&o.stdout)
-                ),
-                Err(e) => println!(
-                    "  std::process as {tag} {program:?}: FAILED: {e} (raw_os_error={:?})",
-                    e.raw_os_error()
-                ),
-            }
-            if tag != "verbatim" {
-                continue;
-            }
-            let output = match ran {
-                Ok(o) if o.status.success() => o,
-                other => {
-                    facts.check(
-                        false,
-                        &format!("std::process runs the image at verbatim {name:?}"),
-                        other.map_or_else(|e| e.to_string(), |o| format!("{:?}", o.status)),
-                    );
-                    continue;
-                }
-            };
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let Some(image) = stdout.lines().find_map(|l| l.strip_prefix("image=")) else {
-                failures.push(format!("the payload at {verbatim:?} exited 0 without an image= line"));
-                continue;
-            };
-            // An image path that cannot be opened is a broken probe, not a changed platform.
-            let loaded = match file_identity(&verbatim_spelling(image)) {
-                Ok(id) => id,
-                Err(why) => {
-                    failures.push(format!("the reported image {image:?}: {why}"));
-                    continue;
-                }
-            };
-            println!("  image={image:?} opened verbatim has identity {loaded:?}");
-            facts.check(
-                loaded == planted,
-                &format!("std::process on verbatim {name:?} loads that file, not another"),
-                format_args!("image={image:?} with identity {loaded:?}, planted {planted:?}"),
-            );
-        }
-        if let Err(e) = std::fs::remove_file(&verbatim) {
-            println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
-        }
-    }
-    println!("names that could hold an image: {spawnable} of {}", WEIRD_NAMES.len());
-    assert!(
-        failures.is_empty(),
-        "the measurement could not be taken: {}",
-        failures.join("; ")
-    );
-    // A creatable name that could not hold an image is a changed platform, reported here first.
-    facts.assert_none();
-    // Otherwise every creatable name was spawned; without this a run that planted nothing would
-    // measure nothing and pass.
-    let expected = WEIRD_NAMES.iter().filter(|&&(_, _, creatable)| creatable).count();
-    assert!(
-        expected > 0 && spawnable == expected,
-        "the measurement could not be taken: images were planted under {spawnable} names, not the \
-         {expected} that can hold one"
-    );
+        println!("names that could hold an image: {spawnable} of {}", WEIRD_NAMES.len());
+        // Every creatable name must have been spawned; without this a run that planted nothing
+        // would measure nothing and pass. A creatable name that could not hold an image is a broken
+        // fact, which the harness reports first.
+        let expected = WEIRD_NAMES.iter().filter(|&&(_, _, creatable)| creatable).count();
+        facts.require(
+            expected > 0 && spawnable == expected,
+            format!("images were planted under {spawnable} names, not the {expected} that can hold one"),
+        );
+    });
 }
 
 /// The volume serial number and 128-bit file ID of `path`: the file's identity, whatever the
@@ -203,58 +195,52 @@ pub(crate) fn file_identity(path: &str) -> Result<(u64, [u8; 16]), String> {
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
 fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
-    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
-    let mut facts = Disagreements::about("Rust's std::process");
-    let root = tempfile::tempdir().expect("tempdir");
-    let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
-    let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
-    println!("temp root: {root:?}\nsource image: {source:?}");
+    canary("Rust's std::process", |facts, failures| {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
+        let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
+        println!("temp root: {root:?}\nsource image: {source:?}");
 
-    // (name, whether std should run the planted file itself)
-    for (i, (name, runs_itself)) in [("x.bat.", true), ("x.bat ", true), ("x.bat", false)]
-        .into_iter()
-        .enumerate()
-    {
-        let case_dir = format!(r"{root}\case{i}");
-        if let Err(e) = std::fs::create_dir(&case_dir) {
-            failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
-            continue;
+        // (name, whether std should run the planted file itself)
+        for (i, (name, runs_itself)) in [("x.bat.", true), ("x.bat ", true), ("x.bat", false)]
+            .into_iter()
+            .enumerate()
+        {
+            let case_dir = format!(r"{root}\case{i}");
+            if let Err(e) = std::fs::create_dir(&case_dir) {
+                failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
+                continue;
+            }
+            let verbatim = format!(r"\\?\{case_dir}\{name}");
+            println!("--- {verbatim:?}");
+            if let Err(e) = std::fs::copy(source, &verbatim) {
+                failures.push(format!("could not plant the payload at {verbatim:?}: {e}"));
+                continue;
+            }
+            let planted = file_identity(&verbatim);
+            let image = suspended_image(&verbatim);
+            println!("  planted identity {planted:?}; std::process created {image:?}");
+            match (planted, image) {
+                (Ok(planted), Ok(image)) => match file_identity(&verbatim_spelling(&image)) {
+                    Ok(loaded) if runs_itself => facts.check(
+                        loaded == planted,
+                        &format!("std::process runs verbatim {name:?} itself, not through cmd.exe"),
+                        format_args!("image {image:?}"),
+                    ),
+                    Ok(loaded) => facts.check(
+                        loaded != planted && image.to_ascii_lowercase().ends_with(r"\cmd.exe"),
+                        &format!("std::process runs verbatim {name:?} through cmd.exe (the control)"),
+                        format_args!("image {image:?}"),
+                    ),
+                    Err(why) => failures.push(format!("the created image {image:?}: {why}")),
+                },
+                (planted, image) => failures.extend(planted.err().into_iter().chain(image.err())),
+            }
+            if let Err(e) = std::fs::remove_file(&verbatim) {
+                println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
+            }
         }
-        let verbatim = format!(r"\\?\{case_dir}\{name}");
-        println!("--- {verbatim:?}");
-        if let Err(e) = std::fs::copy(source, &verbatim) {
-            failures.push(format!("could not plant the payload at {verbatim:?}: {e}"));
-            continue;
-        }
-        let planted = file_identity(&verbatim);
-        let image = suspended_image(&verbatim);
-        println!("  planted identity {planted:?}; std::process created {image:?}");
-        match (planted, image) {
-            (Ok(planted), Ok(image)) => match file_identity(&verbatim_spelling(&image)) {
-                Ok(loaded) if runs_itself => facts.check(
-                    loaded == planted,
-                    &format!("std::process runs verbatim {name:?} itself, not through cmd.exe"),
-                    format_args!("image {image:?}"),
-                ),
-                Ok(loaded) => facts.check(
-                    loaded != planted && image.to_ascii_lowercase().ends_with(r"\cmd.exe"),
-                    &format!("std::process runs verbatim {name:?} through cmd.exe (the control)"),
-                    format_args!("image {image:?}"),
-                ),
-                Err(why) => failures.push(format!("the created image {image:?}: {why}")),
-            },
-            (planted, image) => failures.extend(planted.err().into_iter().chain(image.err())),
-        }
-        if let Err(e) = std::fs::remove_file(&verbatim) {
-            println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "the measurement could not be taken: {}",
-        failures.join("; ")
-    );
-    facts.assert_none();
+    });
 }
 
 /// Spawn `program` through `std::process` SUSPENDED, read the image the new process was created

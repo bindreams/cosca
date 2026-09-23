@@ -1,6 +1,23 @@
 //! How a canary records and reports the facts it checks.
 
+use crate::provenance::announce_platform;
 use crate::winapi::{full_path_name, has_bat_extension};
+
+/// Run a canary: stamp the OS build, run `body` with the facts it checks and the measurement
+/// failures it hits, then fail on a failure, on a broken fact, on no fact checked, or on an unmet
+/// coverage requirement, in that order. `subject` names what the facts are about.
+pub(crate) fn canary(subject: &'static str, body: impl FnOnce(&mut Disagreements, &mut Vec<String>)) {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::about(subject);
+    body(&mut facts, &mut failures);
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+    facts.assert_covered();
+}
 
 /// Platform facts a canary found no longer hold. Distinct from a measurement that could not be
 /// taken: that is a broken probe, this is a changed platform.
@@ -11,12 +28,9 @@ pub(crate) struct Disagreements {
     broken: Vec<String>,
     /// Facts checked so far, broken or not.
     checked: usize,
-}
-
-impl Default for Disagreements {
-    fn default() -> Self {
-        Self::about("Windows")
-    }
+    /// Coverage the canary required and did not get, checked after the facts: a platform change
+    /// that explains the shortfall is reported first.
+    unmet: Vec<String>,
 }
 
 impl Disagreements {
@@ -25,6 +39,7 @@ impl Disagreements {
             subject,
             broken: Vec::new(),
             checked: 0,
+            unmet: Vec::new(),
         }
     }
 
@@ -39,7 +54,22 @@ impl Disagreements {
     /// Fail the test if any fact disagreed, or if none was checked: a canary whose loops never ran
     /// has measured nothing. Call after the measurement-failure assert, so a broken probe is
     /// reported as one rather than as a platform change.
-    pub(crate) fn assert_none(self) {
+    /// Require `covered`, or report `shortfall` as a measurement that could not be taken.
+    pub(crate) fn require(&mut self, covered: bool, shortfall: String) {
+        if !covered {
+            self.unmet.push(shortfall);
+        }
+    }
+
+    fn assert_covered(&self) {
+        assert!(
+            self.unmet.is_empty(),
+            "the measurement could not be taken: {}",
+            self.unmet.join("; ")
+        );
+    }
+
+    fn assert_none(&self) {
         println!("facts checked: {}", self.checked);
         assert!(
             self.checked > 0,
