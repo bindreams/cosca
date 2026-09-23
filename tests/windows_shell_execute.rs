@@ -186,14 +186,10 @@ enum Failure {
 /// Launch `file` in `dir` through `ShellExecuteExW(verb)`, optionally as `class`, from a
 /// single-threaded COM apartment as cosca's own launch does, and return what the payload reported.
 ///
-/// Every launch in a test reuses `report`, so a previous launch's file that survives here would be
-/// read as this one's. Only its absence counts as cleared.
+/// `report` must be this launch's own path (see [`run`]), so no other launch's file can be read
+/// as this one's.
 fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<Report, Failure> {
-    match std::fs::remove_file(report) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Failure::Other(format!("could not clear the previous report: {e}"))),
-    }
+    debug_assert!(!report.exists(), "every launch reports to a fresh path: {report:?}");
     // SAFETY: paired with the `CoUninitialize` below on this thread.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
     if com.is_err() {
@@ -297,7 +293,8 @@ struct Layout {
     dir_path: PathBuf,
     b: PathBuf,
     c: PathBuf,
-    report: PathBuf,
+    /// How many launches [`run`] has made, which names the next one's report.
+    launches: std::cell::Cell<u32>,
 }
 
 fn layout() -> Layout {
@@ -329,7 +326,6 @@ fn layout() -> Layout {
     for copy in [&dir_a.join(APP), &b, &c, &dir_path.join("cosca_probe_p.exe")] {
         std::fs::copy(source, copy).expect("copy the payload");
     }
-    let report = root.path().join("report.txt");
     Layout {
         root,
         dir_a,
@@ -337,12 +333,16 @@ fn layout() -> Layout {
         dir_path,
         b,
         c,
-        report,
+        launches: std::cell::Cell::new(0),
     }
 }
 
 fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Option<&str>) -> Result<Report, Failure> {
-    let got = launch(verb, file, dir, class, &l.report);
+    // A report path of its own for every launch: a child no one waited for (a success without a
+    // handle) can then write only its own report, never a later launch's.
+    let n = l.launches.get();
+    l.launches.set(n + 1);
+    let got = launch(verb, file, dir, class, &l.root.path().join(format!("report-{n}.txt")));
     println!(
         "{label}: verb={verb} file={file:?} dir={} class={class:?} -> {got:?}",
         dir.display()
