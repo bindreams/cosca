@@ -269,9 +269,9 @@ impl Command {
     /// exposes. The batch check reads the name as written, so `C:\t\setup.bat.` (trailing
     /// dot), `C:\t\setup.bat ` (one trailing space) and `C:\t\.bat` pass it, and `.elevate()`
     /// can still run the batch file through `cmd.exe` with its arguments unescaped
-    /// ([CVE-2024-24576](https://nvd.nist.gov/vuln/detail/CVE-2024-24576)) — whether through `ShellExecuteEx` or, from an already-elevated
-    /// caller, through `CreateProcessW`. [`raw_executable`](Self::raw_executable) refuses
-    /// all three.
+    /// ([CVE-2024-24576](https://nvd.nist.gov/vuln/detail/CVE-2024-24576)) — whether through
+    /// `ShellExecuteEx` or, from an already-elevated caller, through `CreateProcessW`.
+    /// [`raw_executable`](Self::raw_executable) refuses all three.
     ///
     /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
     /// replaces the other.
@@ -339,8 +339,9 @@ impl Command {
     /// (`ShellExecuteEx`'s `lpFile`, `sudo`'s and `osascript`'s exec), and that program is the
     /// completed absolute path. So `raw_executable("tool").args(["tool"])` yields
     /// `argv[0] == "tool"` unelevated and the completed path under `.elevate()` — except from an
-    /// already-elevated caller, which runs no backend and spawns with argv verbatim. Handing the backend the relative name instead would let it search for the image,
-    /// which is the hazard the completion exists to remove.
+    /// already-elevated caller, which runs no backend and spawns with argv verbatim. Handing the
+    /// backend the relative name instead would let it search for the image, which is the hazard
+    /// the completion exists to remove.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
