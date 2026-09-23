@@ -900,7 +900,7 @@ impl CgroupLeaf {
     /// - removed, `Placed` sent: the child entered, and every member has since exited;
     /// - `EBUSY` with the child's own `/proc/<pid>/cgroup` inside the leaf: it entered;
     /// - anything else: the child may still enter a leaf cosca can neither wait on nor close.
-    ///   It is killed, then the leaf is killed through, and the spawn fails.
+    ///   It is killed and the spawn fails (see [`CgroupLeaf::abandon`]).
     fn decide_unwaitable(
         &mut self,
         pid: u32,
@@ -931,7 +931,7 @@ impl CgroupLeaf {
                 Err(NotPlaced::Unwaitable { pid, source })
             });
         };
-        Err(self.abandon(pid, &format!("pidfd_open failed ({source}) and {why}")))
+        Err(self.abandon(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
     }
 
     /// Whether `pid`'s own cgroup is this leaf or inside it.
@@ -946,27 +946,38 @@ impl CgroupLeaf {
     }
 
     /// Fail a spawn whose membership cannot be decided: kill the child, which ends its chance to
-    /// enter the leaf, then kill through the leaf whatever the child brought into it.
-    fn abandon(&mut self, pid: u32, why: &str) -> crate::error::Error {
+    /// enter the leaf and makes its report final.
+    ///
+    /// Only a `Placed` report lets anything of the child's into the leaf: the report is sent
+    /// before `exec`, so a child killed without sending it never ran a program that could fork. So
+    /// the leaf is killed through only then. Otherwise whatever occupies it is not cosca's, and a
+    /// degrade never kills.
+    fn abandon(&mut self, pid: u32, channel: &mut ReportChannel, why: &str) -> crate::error::Error {
         let child = Pid::from_raw(i32::try_from(pid).expect("a spawned child's pid is a positive i32"));
         // `pid` is this process's own unreaped child, so no other process holds its number.
         let _ = kill(child, Signal::SIGKILL);
         // Its exit, not its reaping: the spawn's error path reaps it.
         let flags = nix::sys::wait::WaitPidFlag::WEXITED | nix::sys::wait::WaitPidFlag::WNOWAIT;
         while let Err(nix::errno::Errno::EINTR) = nix::sys::wait::waitid(nix::sys::wait::Id::Pid(child), flags) {}
-        // A member may still be in the leaf, so `Drop` must kill through it if it stays.
-        self.entered = true;
-        let kill = self.hard_kill();
-        // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
-        if kill.is_ok() {
-            let _ = self.wait_drained(None);
-        }
+        // The child has exited, so its report is final.
+        self.entered = channel.read_final() == PlacementReport::Placed;
+        let kill = if self.entered {
+            let kill = self.hard_kill();
+            // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
+            if kill.is_ok() {
+                let _ = self.wait_drained(None);
+            }
+            Some(kill)
+        } else {
+            None
+        };
         crate::error::Error::Containment {
             detail: format!(
                 "cannot tell whether child {pid} entered its cgroup leaf: {why}; the child was killed{}",
                 match kill {
-                    Ok(()) => String::new(),
-                    Err(e) => format!(", but killing through its leaf failed ({e})"),
+                    None => ", and it had not entered the leaf".to_string(),
+                    Some(Ok(())) => ", and its leaf killed through".to_string(),
+                    Some(Err(e)) => format!(", but killing through its leaf failed ({e})"),
                 }
             ),
         }

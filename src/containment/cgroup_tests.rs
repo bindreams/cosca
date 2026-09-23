@@ -1567,38 +1567,51 @@ fn without_a_pidfd_a_removed_leaf_reads_the_report_again() {
 }
 
 /// A leaf that can be neither waited on nor removed fails the spawn: its child is killed, which
-/// ends its chance to enter, and the leaf is killed through.
+/// ends its chance to enter. The child's report is then final, and the leaf is killed through
+/// only if it says `Placed` — otherwise nothing in it came from the child.
 #[cfg(target_os = "linux")]
 #[test]
 fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
     use std::os::unix::process::ExitStatusExt;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-unremovable");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    // `rmdir` fails with ENOTEMPTY: neither closed nor proven entered.
-    std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
-    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("300")
-        .spawn()
-        .expect("spawn");
+    for placed in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-unremovable");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        // `rmdir` fails with ENOTEMPTY: neither closed nor proven entered.
+        std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
+        let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn");
 
-    super::fault::set_force_pidfd_failure(true);
-    let err = match leaf.take_placement(child.id()) {
-        Err(e) => e,
-        Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
-    };
-    assert!(err.to_string().contains("pidfd_open failed"), "got {err}");
-    assert_eq!(
-        child.wait().expect("reap the child").signal(),
-        Some(libc::SIGKILL),
-        "the child must be killed"
-    );
-    assert_eq!(
-        std::fs::read_to_string(leaf_path.join("cgroup.kill")).expect("cgroup.kill written"),
-        "1"
-    );
+        let err = if placed {
+            // A `Placed` the wait missed: sent after the check, as a child that just placed
+            // itself would.
+            let mut channel = leaf.report.take().expect("the channel");
+            // SAFETY: `channel` is open.
+            unsafe { channel.slot().report_placed_for_test() };
+            leaf.abandon(child.id(), &mut channel, "the test cannot decide")
+        } else {
+            super::fault::set_force_pidfd_failure(true);
+            match leaf.take_placement(child.id()) {
+                Err(e) => e,
+                Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
+            }
+        };
+        assert!(err.to_string().contains("the child was killed"), "got {err}");
+        assert_eq!(
+            child.wait().expect("reap the child").signal(),
+            Some(libc::SIGKILL),
+            "the child must be killed"
+        );
+        assert_eq!(
+            leaf_path.join("cgroup.kill").exists(),
+            placed,
+            "cgroup.kill must be written only for a child that reported Placed"
+        );
+    }
 }
 
 /// A child already in its real leaf is contained, pidfd or not: `rmdir` refuses an occupied leaf
@@ -1634,12 +1647,16 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     member.wait().expect("reap the member");
 }
 
-/// A real leaf occupied by something other than the child can be neither waited on nor closed:
-/// the child is killed and the leaf killed through — the occupant with it.
+/// A real leaf occupied by something other than the child can be neither waited on nor closed,
+/// so the spawn fails and its child is killed. Its report then proves it never entered, so
+/// nothing in the leaf is cosca's to kill: the occupant survives.
 #[cfg(target_os = "linux")]
 #[test]
-fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_kills_through() {
+fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it() {
+    use std::io::{Read, Write};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    use crate::containment::TreeDrain;
 
     if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         return; // unprovisioned: not a CI-cgroup environment.
@@ -1647,9 +1664,12 @@ fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_kills_through() {
     let mut leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let own = super::ReportChannel::new().expect("open the occupant's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("300");
-    // SAFETY: as in `cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained`.
+    // `cat` echoes, so a round trip through it proves it alive.
+    let mut cmd = std::process::Command::new("/bin/cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
+    // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
     let mut occupant = cmd.spawn().expect("spawn the occupant");
     // The child whose verdict is taken never touches the leaf.
@@ -1660,11 +1680,27 @@ fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_kills_through() {
 
     super::fault::set_force_pidfd_failure(true);
     assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
-    for (name, process) in [("child", &mut child), ("occupant", &mut occupant)] {
-        assert_eq!(
-            process.wait().expect("reap").signal(),
-            Some(libc::SIGKILL),
-            "the {name} must be killed"
-        );
-    }
+    assert_eq!(
+        child.wait().expect("reap the child").signal(),
+        Some(libc::SIGKILL),
+        "the child must be killed"
+    );
+    let mut echo = [0u8; 1];
+    occupant
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"x")
+        .expect("write to the occupant");
+    occupant
+        .stdout
+        .as_mut()
+        .expect("stdout")
+        .read_exact(&mut echo)
+        .expect("the occupant must still be alive to echo");
+    assert_eq!(&echo, b"x");
+
+    occupant.kill().expect("kill the occupant");
+    occupant.wait().expect("reap the occupant");
+    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
