@@ -122,15 +122,17 @@ fn needle_matcher_catches_every_known_bypass() {
 #[test]
 fn no_test_mutates_the_process_cwd() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut scanned = 0usize;
     let mut offenders = Vec::new();
     let mut allowlist_hits = vec![0usize; ALLOWLIST.len()];
 
     for dir in ["src", "tests", "testbin"] {
+        let mut scanned = 0usize;
         visit(&root.join(dir), root, &mut scanned, &mut offenders, &mut allowlist_hits);
+        assert!(
+            scanned > 0,
+            "scanned zero .rs files under `{dir}/` — the guard itself is broken"
+        );
     }
-
-    assert!(scanned > 0, "scanned zero .rs files — the guard itself is broken");
 
     for (i, (file, text, expected)) in ALLOWLIST.iter().enumerate() {
         let found = allowlist_hits[i];
