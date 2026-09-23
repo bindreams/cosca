@@ -1855,6 +1855,30 @@ fn an_abandoned_exchange_still_reads_what_was_sent_before_it() {
     );
 }
 
+/// A send landing after the abandonment read what was queued, but before the channel closed, must
+/// fail: a send that succeeded there would be discarded unread while its child went on to `exec`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_send_after_the_abandonment_read_fails_rather_than_go_unread() {
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let (end, slot) = childs_copy(&channel);
+    let outcome = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = outcome.clone();
+    super::fault::set_after_shut_read(move || {
+        // SAFETY: `end` keeps the child's end open for the call.
+        let sent = unsafe { slot.send_report(super::REPORT_PLACED) }.expect("send");
+        seen.set(Some(sent));
+        drop(end);
+    });
+    let received = channel.shut();
+    assert_eq!(received.report, None, "nothing was queued before the read");
+    assert_eq!(
+        outcome.get(),
+        Some(super::Delivery::Abandoned),
+        "a send in the window must see the abandonment"
+    );
+}
+
 /// A child held before its hook while the parent abandons the spawn never execs: released, its
 /// first send fails with no *proceed*, and it exits. Here "exits" is the hook's `Err`, which the
 /// forked child turns into its exit status; a regression would exit 0.

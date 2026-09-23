@@ -278,6 +278,9 @@ impl ReportChannel {
         rustix::net::shutdown(&self.read, rustix::net::Shutdown::Read)
             .expect("shut the placement report channel for reading");
         self.drain();
+        // Test-only fault seam: a child's send landing after the read, before the close.
+        #[cfg(test)]
+        fault::run_after_shut_read();
         self.received
     }
 }

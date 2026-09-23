@@ -1,5 +1,6 @@
 use std::cell::Cell;
 thread_local! {
+    static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static REAPED_ORPHANS: std::cell::RefCell<Vec<(u32, Option<i32>)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -132,4 +133,15 @@ pub(crate) fn set_force_child_pidfd_failure(on: bool) {
 }
 pub(crate) fn take_force_child_pidfd_failure() -> bool {
     FORCE_CHILD_PIDFD_FAILURE.with(|f| f.replace(false))
+}
+
+/// Run `hook` in the NEXT abandonment on this thread, after it has read what the child sent and
+/// before it closes the channel — the window a send must not slip through unread.
+pub(crate) fn set_after_shut_read(hook: impl FnOnce() + 'static) {
+    AFTER_SHUT_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn run_after_shut_read() {
+    if let Some(hook) = AFTER_SHUT_READ.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
 }
