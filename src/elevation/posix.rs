@@ -472,7 +472,7 @@ fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result
                     .into(),
         });
     }
-    let launch = cmd.posix_launch_with(process_cwd)?;
+    let launch = cmd.posix_launch(process_cwd)?;
     Ok(Launch {
         program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
         args: argv[1..].to_vec(),

@@ -364,10 +364,11 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
         program,
         mut std_cmd,
         cwd,
+        enter,
     } = match cmd.input() {
         CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
         CommandInput::Argv(argv) => {
-            let (Resolved { program, cwd }, rest) = resolve_program_argv(cmd, argv)?;
+            let (Resolved { program, cwd, enter }, rest) = resolve_program_argv(cmd, argv)?;
             let mut c = std::process::Command::new(&program);
             c.args(rest);
             // POSIX: when executable() overrides the loaded file, preserve the
@@ -383,6 +384,7 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
                 program,
                 std_cmd: c,
                 cwd,
+                enter,
             }
         }
         CommandInput::CommandLine(line) => build_from_commandline(cmd, line)?,
@@ -394,34 +396,77 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
-    if let Some(dir) = cwd {
-        std_cmd.current_dir(dir);
+    match cwd {
+        Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,
+        Some(dir) => {
+            std_cmd.current_dir(dir);
+        }
+        None => {}
     }
     Ok(std_cmd)
 }
 
-/// The program to load and the directory to run it in, taken together so that both come from one
-/// reading of this process's cwd (see `Command::posix_launch`).
+/// `chdir` to `dir` in the child, after std's own setup and just before its `execvp`, so a
+/// relative program is read against the directory the child runs in, both relative to the cwd it
+/// inherited (see `crate::resolve::exact::anchor_posix`). std runs `pre_exec` hooks after its own
+/// `chdir` and immediately before the exec, and a hook forces the fork/exec path over
+/// `posix_spawn`.
+#[cfg(unix)]
+fn enter_in_child(std_cmd: &mut std::process::Command, dir: &std::path::Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+    let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current_dir() contains an embedded NUL",
+        ))
+    })?;
+    // SAFETY: `chdir` is async-signal-safe, and `dir` is allocated before the fork and only read
+    // after it.
+    unsafe {
+        std_cmd.pre_exec(move || {
+            if libc::chdir(dir.as_ptr()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enter_in_child(_: &mut std::process::Command, _: &std::path::Path) -> Result<(), Error> {
+    unreachable!("only anchor_posix asks the child to enter its directory")
+}
+
+/// The program to load and the directory to run it in.
 struct Resolved {
     program: std::ffi::OsString,
     cwd: Option<std::path::PathBuf>,
+    /// The child enters `cwd` itself; see `crate::resolve::exact::Anchored::enter`.
+    enter: bool,
 }
 
 // Pick the executable file to load (`executable` overrides argv[0]/first-token). On POSIX an
-// `Exact` program arrives absolute (see `Command::posix_launch`); on Windows a set executable
-// never reaches this std path, routing to the raw backend instead.
+// `Exact` program arrives in a form no exec searches (see `crate::resolve::exact::anchor_posix`);
+// on Windows a set executable never reaches this std path, routing to the raw backend instead.
 fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<Resolved, Error> {
+    let as_given = |exe: Option<&std::path::Path>| Resolved {
+        program: exe.map_or(fallback, |p| p.as_os_str().to_os_string()),
+        cwd: cmd.cwd().map(std::path::Path::to_path_buf),
+        enter: false,
+    };
     #[cfg(unix)]
-    let crate::command::PosixLaunch { program: exe, cwd } = cmd.posix_launch()?;
-    #[cfg(not(unix))]
-    let (exe, cwd) = (
-        cmd.executable_path().map(std::path::Path::to_path_buf),
-        cmd.cwd().map(std::path::Path::to_path_buf),
-    );
-    Ok(Resolved {
-        program: exe.map_or(fallback, std::path::PathBuf::into_os_string),
-        cwd,
-    })
+    if let Some(crate::command::ExecutableSpec::Exact(p)) = cmd.executable_spec() {
+        let a = crate::resolve::exact::anchor_posix(p.as_os_str(), cmd.cwd())?;
+        return Ok(Resolved {
+            program: a.program.into_os_string(),
+            cwd: a.cwd,
+            enter: a.enter,
+        });
+    }
+    Ok(as_given(cmd.executable_path()))
 }
 
 // Program + the trailing args (argv mode). `executable` overrides the loaded
@@ -455,6 +500,7 @@ struct Launch {
     program: std::ffi::OsString,
     std_cmd: std::process::Command,
     cwd: Option<std::path::PathBuf>,
+    enter: bool,
 }
 
 #[cfg(unix)]
@@ -468,7 +514,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<La
     if argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
-    let Resolved { program, cwd } = resolve_program(cmd, argv[0].clone())?;
+    let Resolved { program, cwd, enter } = resolve_program(cmd, argv[0].clone())?;
     let mut c = std::process::Command::new(&program);
     // When executable() overrides the loaded file, argv[0] from the command
     // line is the user's intended name — preserve it via arg0().
@@ -481,6 +527,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<La
         program,
         std_cmd: c,
         cwd,
+        enter,
     })
 }
 
@@ -508,6 +555,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<La
         program,
         std_cmd: c,
         cwd: cmd.cwd().map(std::path::Path::to_path_buf),
+        enter: false,
     })
 }
 

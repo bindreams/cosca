@@ -76,89 +76,148 @@ fn a_bare_exact_name_with_a_commandline_loads_the_childs_cwd_file() {
     assert_eq!(exit_code(&mut c), Some(CWD_TOOL_EXIT));
 }
 
-// One reading of the process cwd =====
+// A working directory with no path =====
 
-/// A `tool` in `dir` that prints its working directory and exits with `code`.
-fn pwd_tool(dir: &std::path::Path, code: i32) {
+/// A `tool` in `dir` that exits with `code` if run in `dir` (it finds `./<marker>`), else with 3.
+fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).expect("mkdir");
+    std::fs::write(dir.join(marker), "").expect("write marker");
     let tool = dir.join("tool");
     // Under the lock for the reason `cwd_and_path_tools` gives.
     let _guard = crate::child::spawn::spawn_lock();
-    std::fs::write(&tool, format!("#!/bin/sh\npwd -P\nexit {code}\n")).expect("write tool");
+    std::fs::write(&tool, format!("#!/bin/sh\n[ -f ./{marker} ] || exit 3\nexit {code}\n")).expect("write tool");
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
 }
 
-/// Builds `c` with the process cwd at `a`, moves the process cwd to `b`, then forks: the window
-/// between cosca's reading of the cwd and the child's, forced rather than raced. Returns the
-/// child's exit code and working directory.
-///
-/// The lock is held across the RAW std fork, as every fork in this binary must be (see
-/// `cwd_and_path_tools`); cosca's own `spawn()`, which takes it itself, is never called under it.
-fn build_move_fork(c: &Command, a: &std::path::Path, b: &std::path::Path) -> (Option<i32>, std::path::PathBuf) {
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(a).expect("cd a");
-    let mut std_cmd = crate::child::spawn::build_std_command(c).expect("build");
-    std::env::set_current_dir(b).expect("cd b");
-    let out = std_cmd.stdout(std::process::Stdio::piped()).output().expect("spawn");
-    let pwd = String::from_utf8(out.stdout).expect("utf-8 pwd");
-    (out.status.code(), pwd.trim_end_matches('\n').into())
-}
+const FIXTURE_UNREACHABLE_CWD_TEST: &str =
+    "child::spawn::exact_posix_tests::fixture_spawn_exact_tool_in_an_unreachable_cwd";
+/// The fixture's own directory as a path, which it must fail to reach. Its presence also marks a
+/// deliberate re-exec rather than an ordinary suite run.
+const FIXTURE_UNREACHABLE_CWD_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD";
+/// The `current_dir()` the fixture sets, if any.
+const FIXTURE_CURRENT_DIR_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_CURRENT_DIR";
+/// The fixture's exit code when a precondition does not hold or cosca's spawn fails.
+const PRECONDITION_FAILED: i32 = 90;
+const SPAWN_FAILED: i32 = 91;
 
-/// A relative `current_dir` is pinned to the directory the program was completed against, so a
-/// cwd move before the fork cannot run A's `sub/tool` in B's `sub`.
+/// Inert in an ordinary suite run. Re-executed by [`spawn_exact_tool_in_an_unreachable_cwd`], it
+/// waits for one byte on stdin — sent once its directory's parent is unsearchable — then spawns
+/// `raw_executable("tool")` and exits with that child's code.
 #[test]
-fn a_relative_exact_program_and_relative_cwd_come_from_one_process_cwd_reading() {
-    let (a, b) = (
-        tempfile::tempdir().expect("tempdir"),
-        tempfile::tempdir().expect("tempdir"),
-    );
-    pwd_tool(&a.path().join("sub"), CWD_TOOL_EXIT);
-    pwd_tool(&b.path().join("sub"), PATH_TOOL_EXIT);
-    let mut c = Command::new();
-    c.raw_executable("tool").args(["tool"]).current_dir("sub");
-    let want = a.path().canonicalize().expect("canonicalize").join("sub");
-    assert_eq!(build_move_fork(&c, a.path(), b.path()), (Some(CWD_TOOL_EXIT), want));
-}
-
-/// With no `current_dir`, the child is run in the directory the program was completed against.
-#[test]
-fn a_relative_exact_program_without_a_cwd_runs_where_it_was_completed() {
-    let (a, b) = (
-        tempfile::tempdir().expect("tempdir"),
-        tempfile::tempdir().expect("tempdir"),
-    );
-    pwd_tool(a.path(), CWD_TOOL_EXIT);
-    pwd_tool(b.path(), PATH_TOOL_EXIT);
+fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
+    use std::io::Read;
+    let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
+        return;
+    };
+    let mut gate = [0u8; 1];
+    std::io::stdin().read_exact(&mut gate).expect("gate byte");
+    if std::fs::metadata(&own_path).is_ok() {
+        report(&format!("precondition: {own_path:?} is still reachable by path"));
+        std::process::exit(PRECONDITION_FAILED);
+    }
+    // The control: std runs `./tool` here.
+    let std_code = std::process::Command::new("./tool").status().map(|s| s.code());
+    if !matches!(std_code, Ok(Some(CWD_TOOL_EXIT))) {
+        report(&format!("precondition: std's ./tool gave {std_code:?}"));
+        std::process::exit(PRECONDITION_FAILED);
+    }
     let mut c = Command::new();
     c.raw_executable("tool").args(["tool"]);
-    let want = a.path().canonicalize().expect("canonicalize");
-    assert_eq!(build_move_fork(&c, a.path(), b.path()), (Some(CWD_TOOL_EXIT), want));
+    if let Some(dir) = std::env::var_os(FIXTURE_CURRENT_DIR_ENV) {
+        c.current_dir(dir);
+    }
+    let code = match c.spawn() {
+        Ok(child) => child.wait().expect("wait").code().unwrap_or(SPAWN_FAILED),
+        Err(e) => {
+            report(&format!("spawn: {e}"));
+            SPAWN_FAILED
+        }
+    };
+    std::process::exit(code);
 }
 
-/// The error kind of building and spawning `c` with `dir` as this process's cwd.
-///
-/// Holds `spawn_lock` across the cwd move and the std spawn, as [`build_move_fork`] does.
-fn spawn_error_kind_from(c: &Command, dir: &std::path::Path) -> Option<std::io::ErrorKind> {
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(dir).expect("cd");
-    let kind = |e: Error| match e {
-        Error::Io(e) => e.kind(),
-        other => panic!("expected Io, got {other:?}"),
-    };
-    match crate::child::spawn::build_std_command(c) {
-        Err(e) => Some(kind(e)),
-        Ok(mut std_cmd) => std_cmd.status().err().map(|e| kind(Error::Io(e))),
+/// Write to the real stderr: libtest captures `eprintln!`, and the fixture exits without
+/// returning, so a captured line would never be printed.
+fn report(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// Restores a directory's mode on drop, so the tempdir can be removed even after a panic.
+struct RestoreMode(std::path::PathBuf);
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
     }
 }
 
-/// `current_dir("")` fails `chdir` for a `Search` program; an `Exact` one must not run instead,
-/// even with a `tool` in the process cwd for the empty directory to be joined onto.
+/// Runs the fixture in `<root>/p/d` with `p` unsearchable, so its cwd has no path it can use —
+/// `getcwd` fails on macOS, and a `chdir` to the path fails everywhere. `d/tool` exits with
+/// [`CWD_TOOL_EXIT`] and `d/sub/tool` with [`PATH_TOOL_EXIT`], each only when run in its own
+/// directory. Returns the fixture's exit code and stderr.
+///
+/// The fixture's cwd is set by the spawner, so no process in this test moves its own.
+fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>) -> (Option<i32>, String) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("tempdir");
+    let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
+    marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
+    marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
+    let mut fixture = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    fixture
+        .args(["--test-threads=1", "--exact", FIXTURE_UNREACHABLE_CWD_TEST])
+        .env(FIXTURE_UNREACHABLE_CWD_ENV, &d)
+        .current_dir(&d)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = current_dir {
+        fixture.env(FIXTURE_CURRENT_DIR_ENV, dir);
+    }
+    let mut child = {
+        // Every fork in this binary holds it; see `cwd_and_path_tools`.
+        let _guard = crate::child::spawn::spawn_lock();
+        fixture.spawn().expect("spawn the fixture")
+    };
+    let _restore = RestoreMode(p.clone());
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"x")
+        .expect("release the fixture");
+    let out = child.wait_with_output().expect("wait");
+    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// A cwd with no usable path still runs a bare `raw_executable()`, as `./tool` does under std:
+/// the child resolves the name against the cwd it inherits, and is left in it.
+#[test]
+fn an_exact_program_runs_in_a_cwd_that_has_no_path() {
+    let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(None);
+    assert_eq!(code, Some(CWD_TOOL_EXIT), "{stderr}");
+}
+
+/// A relative `current_dir` is entered from the inherited cwd too, and the program is loaded from
+/// there: `sub/tool`, run in `sub`.
+#[test]
+fn a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path() {
+    let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(Some("sub"));
+    assert_eq!(code, Some(PATH_TOOL_EXIT), "{stderr}");
+}
+
+/// `current_dir("")` fails `chdir` for a `Search` program; an `Exact` one fails the same way.
 #[test]
 fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
     let (cwd, _on_path) = cwd_and_path_tools();
+    let kind = |c: &mut Command| match c.spawn() {
+        Err(Error::Io(e)) => e.kind(),
+        other => panic!("expected Io, got {other:?}"),
+    };
     let mut exact = Command::new();
     exact.raw_executable("tool").args(["tool"]).current_dir("");
     let mut search = Command::new();
@@ -166,9 +225,8 @@ fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
         .executable(cwd.path().join("tool"))
         .args([cwd.path().join("tool")])
         .current_dir("");
-    let want = spawn_error_kind_from(&search, cwd.path());
-    assert_eq!(want, Some(std::io::ErrorKind::NotFound));
-    assert_eq!(spawn_error_kind_from(&exact, cwd.path()), want);
+    assert_eq!(kind(&mut search), std::io::ErrorKind::NotFound);
+    assert_eq!(kind(&mut exact), std::io::ErrorKind::NotFound);
 }
 
 /// Negative control: a `Search` program is not completed by cosca, so a relative `current_dir`

@@ -1022,6 +1022,23 @@ mod rewrite_tests {
         );
     }
 
+    /// The backend runs in another process and needs a path; a cwd with none fails loudly, with the
+    /// OS's kind kept.
+    #[test]
+    fn an_elevated_exact_program_in_a_cwd_with_no_path_says_why() {
+        let r = super::super::rewrite_with_host_and_cwd(&mut exact_tool(None), &sudo_host(), || {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        match r {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(e.to_string().contains("working directory as a path"), "{e}");
+            }
+            Err(other) => panic!("expected Io, got {other}"),
+            Ok(_) => panic!("a cwd with no path cannot be handed to the backend"),
+        }
+    }
+
     /// Negative control: a `Search` program still reaches the wrapper as written.
     #[test]
     fn an_elevated_search_program_is_passed_as_written() {

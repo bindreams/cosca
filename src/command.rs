@@ -276,14 +276,14 @@ impl Command {
     ///   deliberately refuses to walk into.
     /// - **POSIX:** the **child's** working directory — [`current_dir`](Self::current_dir) when
     ///   set (itself read against this process's directory if relative), else this process's. The
-    ///   `chdir` happens before the exec, so that is where a relative path lands. cosca completes
-    ///   the name to an absolute path against that directory before any exec sees it, by pure
-    ///   join, so a bare `tool` means `./tool` and is never looked up on `PATH`, and `sudo`,
-    ///   `pkexec` or root's shell cannot look it up either. Where that directory came from this
-    ///   process's, the child is run in it by absolute path too, so a later
-    ///   [`std::env::set_current_dir`] cannot load the file from one directory and run it in
-    ///   another. Under [`elevate`](Self::elevate) the file loaded is still that one, but the
-    ///   backend may run it elsewhere — see there.
+    ///   `chdir` happens before the exec, so that is where a relative path lands. A bare `tool`
+    ///   is run as `./tool`, never looked up on `PATH`: the child enters its directory and reads
+    ///   the name there, both from the cwd it inherits, so no path to this process's cwd is ever
+    ///   needed and the file loaded and the directory run in are always the same. Under
+    ///   [`elevate`](Self::elevate) the backend is another process, so cosca completes the name to
+    ///   an absolute path against that directory first, reading this process's cwd once; a cwd
+    ///   with no path (an unsearchable ancestor, an unlinked directory) fails there. The file
+    ///   loaded is that one, but the backend may run it elsewhere — see there.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -337,26 +337,33 @@ impl Command {
         self.executable.as_ref()
     }
 
-    /// The program and working directory a POSIX exec sink is handed. An `Exact` program is
-    /// completed to an absolute path by [`crate::resolve::exact::complete_posix`] against the
-    /// child's working directory, so no sink can search for it; a `Search` one is as written.
-    /// `program` is `None` when neither setter was called.
+    /// The program and working directory a POSIX elevation backend is handed. An `Exact` program
+    /// is completed to an absolute path by [`crate::resolve::exact::complete_posix`] against the
+    /// child's working directory, so no backend can search for it; a `Search` one is as written.
+    /// `program` is `None` when neither setter was called. The unelevated spawn does not come
+    /// here: it needs no path (see [`crate::resolve::exact::anchor_posix`]).
     ///
-    /// Reads this process's cwd only for a relative `Exact` program with no absolute
-    /// [`current_dir`](Self::current_dir), and then `cwd` is the absolute directory that one
-    /// reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given.
+    /// Reads this process's cwd through `process_cwd` only for a relative `Exact` program with no
+    /// absolute [`current_dir`](Self::current_dir), and then `cwd` is the absolute directory that
+    /// one reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given. A cwd
+    /// with no path fails with the read's own kind, saying why a path was needed.
     // Off unix the only caller is the macOS elevation module, itself dead there.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn posix_launch(&self) -> Result<PosixLaunch, Error> {
-        self.posix_launch_with(std::env::current_dir)
-    }
-
-    /// [`posix_launch`](Self::posix_launch), reading this process's cwd through `process_cwd`.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn posix_launch_with(
+    pub(crate) fn posix_launch(
         &self,
         process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
     ) -> Result<PosixLaunch, Error> {
+        let process_cwd = || {
+            process_cwd().map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "elevating raw_executable() needs this process's working directory as a path, \
+                         and it cannot be read: {e}"
+                    ),
+                )
+            })
+        };
         let as_given = |program| PosixLaunch {
             program,
             cwd: self.cwd().map(Path::to_path_buf),

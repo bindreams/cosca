@@ -7,10 +7,11 @@
 //!
 //! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through
 //! [`resolve`]: "load exactly this file" is the absence of this module's SEARCH policy, not an
-//! application of it. Where a sink would search a relative name, it is completed to an absolute
-//! path instead, which searches nothing: on POSIX by [`exact::complete_posix`], on the Windows
-//! elevated path by `windows_raw::resolve::absolutise_exact` — see its doc for why
-//! `ShellExecuteEx` forces that step where `CreateProcessW` does not.
+//! application of it. Where a sink would search a relative name, it is put in a form no sink
+//! searches: on the unelevated POSIX spawn a `./`-anchored name ([`exact::anchor_posix`]), on the
+//! POSIX elevation backends an absolute path ([`exact::complete_posix`]), and on the Windows
+//! elevated path an absolute path from `windows_raw::resolve::absolutise_exact` — see its doc for
+//! why `ShellExecuteEx` forces that step where `CreateProcessW` does not.
 //!
 //! It does, however, share this module's naming CLASSIFIERS: every `Exact` arm refuses a program
 //! that names no file via [`names_no_file`], so the two axes cannot drift apart on what counts as

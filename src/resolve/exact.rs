@@ -1,13 +1,70 @@
-//! `raw_executable()` on POSIX: completing an `Exact` program to an absolute path, which is the
-//! opposite of searching for it.
+//! `raw_executable()` on POSIX: making an `Exact` program unsearchable, which is the opposite of
+//! searching for it. The unelevated spawn anchors it to the child's inherited cwd
+//! ([`anchor_posix`]); the elevation backends, which run in another process, need it completed to
+//! an absolute path ([`complete_posix`]).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 
+/// The unelevated spawn's form of an `Exact` program: one no `exec` will search, resolved by the
+/// child against the working directory it inherits at `fork` — **without reading this process's
+/// cwd, searching, appending anything, or touching the filesystem**.
+///
+/// An absolute program is left as is, and `child_cwd` goes to std as given. A relative one is
+/// prefixed with `./` unless it already contains a `/` (`execvp` searches only a name without
+/// one), and [`Anchored::enter`] is set: the sink must `chdir` to `child_cwd` in the child
+/// itself, just before the exec, rather than hand it to std, whose handling of a relative program
+/// with a `current_dir` its docs call "platform specific and unstable". The child then reads the
+/// name against the directory it is about to run in, both relative to the cwd it inherited, so
+/// the file loaded and the directory run in cannot come from two readings — and a cwd with no
+/// usable path (an unsearchable ancestor, an unlinked directory, one outside a chroot) works,
+/// as it does for `./tool` under std.
+///
+/// Refused with `InvalidInput` as [`complete_posix`] refuses.
+// Off unix the std spawn never has an `Exact` program: it routes to the raw backend.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn anchor_posix(program: &OsStr, child_cwd: Option<&Path>) -> Result<Anchored, Error> {
+    refuse_unnameable(program)?;
+    let cwd = child_cwd.map(Path::to_path_buf);
+    if is_absolute(program) {
+        return Ok(Anchored {
+            program: PathBuf::from(program),
+            cwd,
+            enter: false,
+        });
+    }
+    let program = if program.as_encoded_bytes().contains(&b'/') {
+        program.to_os_string()
+    } else {
+        join(OsStr::new("."), program)
+    };
+    Ok(Anchored {
+        program: PathBuf::from(program),
+        cwd,
+        enter: true,
+    })
+}
+
+/// [`anchor_posix`]'s answer.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct Anchored {
+    pub(crate) program: PathBuf,
+    /// `current_dir()` as given.
+    pub(crate) cwd: Option<PathBuf>,
+    /// Whether the child must `chdir` to `cwd` itself, right before the exec, instead of std.
+    pub(crate) enter: bool,
+}
+
 /// Complete an `Exact` program to an absolute path against the CHILD's working directory —
-/// **without searching, appending anything, or touching the filesystem**.
+/// **without searching, appending anything, or touching the filesystem**. For the elevation
+/// backends, which run the program in another process and so need a path.
+///
+/// Needs this process's cwd as a PATH when the program is relative and `child_cwd` is not
+/// absolute, so a cwd with no usable path — an unsearchable ancestor, an unlinked directory —
+/// fails here with `process_cwd`'s error, where the unelevated [`anchor_posix`] would succeed.
 ///
 /// The base is `child_cwd` (what `Command::current_dir` set; joined onto `process_cwd()` when
 /// itself relative), or `process_cwd()` when unset. That is the directory the child's own exec
@@ -18,11 +75,9 @@ use crate::error::Error;
 /// child would read this process's cwd again at `fork`, and a `set_current_dir` in between would
 /// load one directory's file while running in another.
 ///
-/// Absolute is the point. Every POSIX sink searches a name it is handed bare — `execvp` walks
-/// `PATH` for a name with no `/`, and `sudo`, `doas`, `pkexec`, `run0` and root's `/bin/sh` each
-/// do their own lookup — and none of them searches an absolute path. Completing first also takes
-/// std's own relative-program-plus-`current_dir` behaviour, which its docs call "platform
-/// specific and unstable", out of the question.
+/// Absolute is the point: `sudo`, `doas`, `pkexec`, `run0` and root's `/bin/sh` each look up a
+/// name they are handed bare, and none of them searches an absolute path. A `./` prefix would not
+/// do there — the backend reads it against a directory of its own choosing.
 ///
 /// POSIX grammar, byte-level, on every host: `/` is the only separator and a leading `/` the only
 /// absolute form, so the macOS elevation path — compiled and tested everywhere — gets one answer.
@@ -38,17 +93,7 @@ pub(crate) fn complete_posix(
     child_cwd: Option<&Path>,
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> Result<Completed, Error> {
-    if program.as_encoded_bytes().contains(&0) {
-        // A literal: interpolating the token would put a raw U+0000 into logs and terminals.
-        return Err(invalid_input(
-            "raw_executable() was given a path containing an embedded NUL, so it names no file".into(),
-        ));
-    }
-    if super::names_no_file(program, false) {
-        return Err(invalid_input(format!(
-            "raw_executable() was given a path that names no file: {program:?}"
-        )));
-    }
+    refuse_unnameable(program)?;
     let as_given = || child_cwd.map(Path::to_path_buf);
     if is_absolute(program) {
         return Ok(Completed {
@@ -77,6 +122,23 @@ pub(crate) fn complete_posix(
         program: PathBuf::from(join(&base, program)),
         child_cwd: Some(PathBuf::from(base)),
     })
+}
+
+/// The refusals both forms share: an interior NUL, which no exec argument can carry, and a name
+/// that [names no file](super::names_no_file).
+fn refuse_unnameable(program: &OsStr) -> Result<(), Error> {
+    if program.as_encoded_bytes().contains(&0) {
+        // A literal: interpolating the token would put a raw U+0000 into logs and terminals.
+        return Err(invalid_input(
+            "raw_executable() was given a path containing an embedded NUL, so it names no file".into(),
+        ));
+    }
+    if super::names_no_file(program, false) {
+        return Err(invalid_input(format!(
+            "raw_executable() was given a path that names no file: {program:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// [`complete_posix`]'s answer: the program to exec and the directory to run it in.

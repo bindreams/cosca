@@ -145,3 +145,37 @@ fn a_process_cwd_failure_is_reported() {
         other => panic!("expected the cwd error, got {other:?}"),
     }
 }
+
+/// A name with no `/` gets one, so `execvp` cannot search it; one with a `/` is already unsearched.
+#[test]
+fn a_relative_program_is_anchored_to_the_childs_cwd_without_reading_it() {
+    for (program, want) in [("tool", "./tool"), ("bin/tool", "bin/tool"), ("./tool", "./tool")] {
+        let got = anchor_posix(OsStr::new(program), Some(Path::new("sub"))).unwrap();
+        assert_eq!(
+            got,
+            Anchored {
+                program: PathBuf::from(want),
+                cwd: Some(PathBuf::from("sub")),
+                enter: true,
+            }
+        );
+    }
+}
+
+/// An absolute program needs no anchoring, so std is handed the cwd.
+#[test]
+fn an_absolute_program_is_not_anchored() {
+    let got = anchor_posix(OsStr::new("/usr/bin/id"), Some(Path::new("sub"))).unwrap();
+    assert!(!got.enter);
+    assert_eq!(got.program, Path::new("/usr/bin/id"));
+}
+
+#[test]
+fn anchoring_refuses_what_completion_refuses() {
+    for n in ["", ".", "dir/", "a\0b"] {
+        invalid_input_message(anchor_posix(OsStr::new(n), None).map(|a| Completed {
+            program: a.program,
+            child_cwd: a.cwd,
+        }));
+    }
+}

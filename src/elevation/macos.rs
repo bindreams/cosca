@@ -205,7 +205,7 @@ pub(crate) fn program_and_args(
                 .into(),
         ));
     }
-    let launch = cmd.posix_launch_with(process_cwd)?;
+    let launch = cmd.posix_launch(process_cwd)?;
     Ok(Launch {
         program: launch.program.map_or_else(|| first.clone(), PathBuf::into_os_string),
         args: argv[1..].to_vec(),
