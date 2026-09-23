@@ -423,9 +423,23 @@ fn starts_with_two_separators(text: &str) -> bool {
     matches!((chars.next(), chars.next()), (Some('\\' | '/'), Some('\\' | '/')))
 }
 
-/// A bare `C:` — two bytes, a drive letter and a colon.
+/// A bare drive prefix: one UTF-16 unit, then `:`, and nothing else.
 fn is_drive_prefix(component: &str) -> bool {
-    matches!(component.as_bytes(), [d, b':'] if d.is_ascii_alphabetic())
+    drive_prefix_len(component) == Some(component.len())
+}
+
+/// The byte length of the drive prefix `text` opens with, if any. Win32 asks only whether
+/// `Path[1]` is `:` (ReactOS `RtlDetermineDosPathNameType_Ustr`, Wine
+/// `RtlDetermineDosPathNameType_U`), so ANY one UTF-16 unit is a drive: `1:`, `é:`, and the U+FFFD
+/// a lone surrogate becomes through `to_string_lossy`. A character outside the BMP is two units,
+/// so `Path[1]` is its low surrogate and `𝒳:` is no drive.
+fn drive_prefix_len(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    let (_, drive) = chars.next()?;
+    let (colon, ':') = chars.next()? else {
+        return None;
+    };
+    (drive.len_utf16() == 1).then_some(colon + 1)
 }
 
 /// Whether the shell would treat `name` as a batch file: the extension is everything after the
@@ -459,15 +473,16 @@ pub(super) fn is_batch_by_shell(name: &str) -> bool {
 /// `x.exe:payload.bat:` as the file `x.exe`, losing the batch name, while the same stream spelled
 /// `x.exe:payload.bat` was refused.
 ///
-/// A leading `C:` is a drive, not a separator. Skipping it changes NO VERDICT — the only piece it
-/// suppresses is a bare drive letter, one character with no dot in it, which is never a batch
-/// name — and it is kept for the contract rather than the verdict: every piece this yields is a
-/// name Win32 would open, and a drive letter is not one. The skip WAS load-bearing when only the
-/// first piece was read, which is how `C:x.bat:s` came to be allowed while `x.bat:s` was refused.
+/// A leading drive prefix (`C:`, or any one UTF-16 unit and `:`; see [`drive_prefix_len`]) is a
+/// drive, not a separator. Skipping it changes NO VERDICT — the only piece it suppresses is one
+/// UTF-16 unit, which is never a batch name — and it is kept for the contract rather than the
+/// verdict: every piece this yields is a name Win32 would open, and a drive is not one. The skip
+/// WAS load-bearing when only the first piece was read, which is how `C:x.bat:s` came to be
+/// allowed while `x.bat:s` was refused.
 pub(super) fn ntfs_stream_names(name: &str) -> impl Iterator<Item = &str> {
-    let rest = match name.get(..2) {
-        Some(prefix) if is_drive_prefix(prefix) => &name[2..],
-        _ => name,
+    let rest = match drive_prefix_len(name) {
+        Some(len) => &name[len..],
+        None => name,
     };
     rest.split(':').map(|part| part.trim_end_matches([' ', '.']))
 }

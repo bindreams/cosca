@@ -19,16 +19,17 @@ fn ntfs_stream_names_splits_off_every_stream_then_trims_space_and_dot() {
         // EVERY piece, not just the first. Truncating at the first `:` reads `x.exe:payload.bat:`
         // as the file `x.exe` and loses the batch name entirely.
         ("x.exe:payload.bat:", vec!["x.exe", "payload.bat", ""]),
-        // A leading drive letter is a drive, not a stream separator, so it is not among the names
-        // yielded. No verdict rides on that today — a bare drive letter has no dot and so is never
+        // A leading drive prefix is a drive, not a stream separator, so it is not among the names
+        // yielded. No verdict rides on that today — a drive is one UTF-16 unit and so is never
         // a batch name — but it did when only the first piece was read, which is how `C:x.bat:s`
         // came to be allowed while `x.bat:s` was refused.
         ("C:x.bat:s", vec!["x.bat", "s"]),
         ("c:x.bat", vec!["x.bat"]),
         // Two letters before the colon is a file name, not a drive.
         ("ab:x.bat", vec!["ab", "x.bat"]),
-        // Two characters and a colon are not enough either: a drive prefix needs a drive LETTER.
-        (".:x.bat", vec!["", "x.bat"]),
+        // Any one UTF-16 unit before the colon is a drive, as `RtlDetermineDosPathNameType_U` has it.
+        (".:x.bat", vec!["x.bat"]),
+        ("é:x.bat", vec!["x.bat"]),
         // ORDER witnesses. `x.bat:s ` does NOT discriminate — both orders yield `x.bat`, because
         // trim-then-split still splits. These three do: trim-then-split would leave the trailing
         // character attached and the extension check would miss it.
@@ -380,7 +381,7 @@ fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
 /// A drive prefix is a prefix, so only the FIRST component can be one. Everywhere else `a:` is
 /// the file `a` opened through its unnamed data stream, exactly like `x.exe:`.
 ///
-/// Judging the shape alone — two bytes, a letter and a colon — made the verdict depend on how
+/// Judging the shape alone — one unit and a colon — made the verdict depend on how
 /// long the name happens to be: `C:\bin\a:` was refused as "names no file" while `C:\bin\x.exe:`,
 /// the same spelling of the same thing, was accepted.
 #[test]
@@ -401,12 +402,6 @@ fn a_drive_prefix_is_one_only_at_the_front_of_the_path() {
             "{probe:?} names a file and must stay spawnable"
         );
     }
-    // Two bytes and a colon, and the first is not a drive letter: a file either way. Pins the
-    // letter test itself, which nothing else reaches.
-    assert!(
-        super::reject_batch_path_on(Path::new(".:"), true).is_ok(),
-        "`.:` names a file"
-    );
     // The relaxation must not reach a batch name hiding in that position.
     for probe in [r"C:\bin\a.bat:", r"C:\bin\x.exe:p.bat"] {
         assert!(
@@ -414,6 +409,75 @@ fn a_drive_prefix_is_one_only_at_the_front_of_the_path() {
             "{probe:?} still reaches a batch file"
         );
     }
+}
+
+/// A drive prefix is ANY one UTF-16 unit followed by `:`, not only a letter.
+///
+/// `RtlDetermineDosPathNameType_U` tests nothing but `Path[1] == ':'` (ReactOS
+/// `RtlDetermineDosPathNameType_Ustr`, Wine `RtlDetermineDosPathNameType_U`), and
+/// `RtlGetFullPathName_U` then resolves the rest against that drive's current directory, or its
+/// root. So `1:..` pops a current directory exactly as `C:..` does, and names a file this gate
+/// cannot see. A character outside the BMP is two units, so `Path[1]` is its low surrogate and the
+/// path is plain-relative: `𝒳:..` names the file `𝒳` through an empty stream.
+#[test]
+fn any_one_utf16_unit_before_a_colon_is_a_drive_prefix() {
+    use std::path::Path;
+    for probe in [
+        "1:",
+        "1:.",
+        "1:..",
+        r"1:\",
+        r"1:\x.bat\..",
+        "é:",
+        "é:..",
+        ".:",
+        "::",
+        // A lone surrogate reaches the gate as U+FFFD, one unit, through `to_string_lossy`.
+        "\u{FFFD}:..",
+    ] {
+        assert!(
+            super::reject_batch_path_on(Path::new(probe), true).is_err(),
+            "{probe:?} is drive-relative and names no file"
+        );
+    }
+    for probe in ["é:x.bat", r"1:\x.bat", "1:x.bat:s", r"\\.\é:\..\x.bat"] {
+        assert!(
+            super::reject_batch_path_on(Path::new(probe), true).is_err(),
+            "{probe:?} reaches a batch file"
+        );
+    }
+    for probe in [
+        "𝒳:..",
+        "𝒳:",
+        r"x\1:",
+        r"x\é:..",
+        r"\\.\é:",
+        r"1:\tool.exe",
+        r"é:\tool.exe",
+    ] {
+        assert!(
+            super::reject_batch_path_on(Path::new(probe), true).is_ok(),
+            "{probe:?} names a file that is no batch file"
+        );
+    }
+    assert_eq!(
+        super::ntfs_stream_names("é:x.bat:s").collect::<Vec<_>>(),
+        ["x.bat", "s"]
+    );
+    assert_eq!(super::ntfs_stream_names("𝒳:x").collect::<Vec<_>>(), ["𝒳", "x"]);
+}
+
+/// The same with a real lone surrogate, which only a Windows `OsStr` can carry.
+#[cfg(windows)]
+#[test]
+fn a_lone_surrogate_before_a_colon_is_a_drive_prefix() {
+    use std::os::windows::ffi::OsStringExt;
+    let wide: Vec<u16> = [0xD800].into_iter().chain(":..".encode_utf16()).collect();
+    let probe = std::ffi::OsString::from_wide(&wide);
+    assert!(
+        super::reject_batch_path_on(std::path::Path::new(&probe), true).is_err(),
+        "a lone surrogate is one unit, so this is drive-relative and names no file"
+    );
 }
 
 /// A verbatim `\\?\` path is judged by std's verbatim rule, which is not std's rule for any
@@ -1226,6 +1290,10 @@ enum Comp {
     /// position, the only one a drive prefix can occupy. Anywhere else it is an ordinary name
     /// carrying an unnamed data stream.
     DrivePrefix,
+    /// A drive prefix and `..` in one component: `1:..`. In the FIRST position it is that drive's
+    /// current directory popped once — somewhere only the per-drive cwd can name, and so nothing
+    /// this oracle can see. Anywhere else it trims to `1:`, an ordinary name.
+    DriveUp,
     /// `?`: an ordinary name, except right after the leading `\\`, where like `.` it marks a
     /// device root.
     QuestionMark,
@@ -1255,13 +1323,26 @@ const COMPONENTS: [(&str, Comp); 18] = [
     ("?", Comp::QuestionMark),
 ];
 
+/// Drive prefixes that are not an ASCII letter, which Win32 reads as drives all the same:
+/// `RtlDetermineDosPathNameType_U` asks only whether `Path[1]` is `:`. `\u{FFFD}` is what a lone
+/// surrogate becomes through `to_string_lossy`, and so what the gate sees of one on Windows. `𝒳`
+/// is two UTF-16 units, so `𝒳:` is no drive.
+const DRIVE_SPELLINGS: [(&str, Comp); 6] = [
+    ("1:", Comp::DrivePrefix),
+    ("é:", Comp::DrivePrefix),
+    ("\u{FFFD}:", Comp::DrivePrefix),
+    ("1:..", Comp::DriveUp),
+    ("é:..", Comp::DriveUp),
+    ("𝒳:", Comp::Name { batch: false }),
+];
+
 /// A component read as a ROOT segment of a UNC path, where Win32 takes it by position and never
 /// interprets it: the only question left is whether its name is a batch file, and whether it has a
 /// name at all once trimmed.
 fn as_root_name(comp: Comp) -> Option<bool> {
     match comp {
         Comp::Name { batch } => Some(batch),
-        Comp::DrivePrefix | Comp::QuestionMark => Some(false),
+        Comp::DrivePrefix | Comp::DriveUp | Comp::QuestionMark => Some(false),
         Comp::Empty | Comp::Skip | Comp::Pop | Comp::Dots => None,
     }
 }
@@ -1311,7 +1392,10 @@ fn oracle_landing(rest: &[Comp], root: Root, dots_named: bool) -> Landing {
             // A drive prefix is a prefix only at the very front; elsewhere it is a stream spelling
             // of a file named `C`, which is not a batch name.
             Comp::DrivePrefix if i == 0 && root == Root::Plain => stack.push(Entry::Drive),
-            Comp::DrivePrefix | Comp::QuestionMark => stack.push(Entry::Name(false)),
+            // Popped at once: nothing of it survives, and an empty stack under a plain root is
+            // the unseeable cwd.
+            Comp::DriveUp if i == 0 && root == Root::Plain => {}
+            Comp::DrivePrefix | Comp::DriveUp | Comp::QuestionMark => stack.push(Entry::Name(false)),
             Comp::Name { batch } => stack.push(Entry::Name(*batch)),
         }
     }
@@ -1419,87 +1503,98 @@ struct Tally {
     verbatim_holes: Vec<String>,
 }
 
-/// Every path of `min_depth..=max_depth` components over [`COMPONENTS`], under both separators,
-/// judged by the gate and by [`oracle_refuses`].
-fn compare_gate_with_oracle(min_depth: u32, max_depth: u32) -> Tally {
+/// Every path of `min_depth..=max_depth` components over `vocab`, under both separators, judged
+/// by the gate and by [`oracle_refuses`].
+fn compare_gate_with_oracle(vocab: &[(&'static str, Comp)], min_depth: u32, max_depth: u32) -> Tally {
     let mut tally = Tally::default();
-    let mut texts: Vec<&str> = Vec::new();
-    let mut kinds: Vec<Comp> = Vec::new();
     for sep in ["\\", "/"] {
         for depth in min_depth..=max_depth {
-            for mut index in 0..COMPONENTS.len().pow(depth) {
-                texts.clear();
-                kinds.clear();
-                for _ in 0..depth {
-                    let (text, kind) = COMPONENTS[index % COMPONENTS.len()];
-                    texts.push(text);
-                    kinds.push(kind);
-                    index /= COMPONENTS.len();
-                }
-                let probe = texts.join(sep);
-                let path = std::path::Path::new(&probe);
-                let want = oracle_refuses(&kinds);
-                let got = super::reject_batch_path_on(path, true).is_err();
-                tally.probes += 1;
-                if the_extension_rule_this_replaced(path) && !got {
-                    tally.newly_accepted.push(probe.clone());
-                }
-                // The verbatim axis: std tests a `\\?\` program as the literal string, so a batch
-                // suffix is exactly what it substitutes cmd.exe for.
-                let verbatim = format!(r"\\?\{probe}");
-                let verbatim_path = std::path::Path::new(&verbatim);
-                let verbatim_got = super::reject_batch_path_on(verbatim_path, true).is_err();
-                let lower = verbatim.to_ascii_lowercase();
-                if (lower.ends_with(".bat") || lower.ends_with(".cmd")) && !verbatim_got {
-                    tally.verbatim_holes.push(verbatim.clone());
-                }
-                if verbatim_extension_rule_this_replaced(&verbatim) && !verbatim_got {
-                    tally.newly_accepted.push(verbatim);
-                }
-                // `?` after a leading `\\` spells std's verbatim prefix itself: std tests the
-                // literal string, and so does this.
-                if probe.starts_with(r"\\?\") {
-                    let lower = probe.to_ascii_lowercase();
-                    if (lower.ends_with(".bat") || lower.ends_with(".cmd")) && !got {
-                        tally.verbatim_holes.push(probe);
-                    }
-                    continue;
-                }
-                match (want, got) {
-                    (true, false) => tally.holes.push(probe),
-                    (false, true) if declared_unc_over_refusal(&kinds) => {
-                        tally.declared_over_refusals += 1;
-                    }
-                    (false, true) => tally.undeclared_over_refusals.push(probe),
-                    (_, true) => tally.refused += 1,
-                    (_, false) => tally.accepted += 1,
-                }
+            for index in 0..vocab.len().pow(depth) {
+                let path = nth_path(vocab, depth, index);
+                judge(&mut tally, &path, sep);
             }
         }
     }
     tally
 }
 
-/// Exhaustive over COMPONENTS: every path up to five components deep over [`COMPONENTS`], under
-/// both separators, checked against a resolver that works from the component list instead of the
-/// string.
-///
-/// This is the envelope the character-level test cannot reach. Its shortest interesting probe,
-/// `.bat\a\..`, is nine characters; enumerating that many characters over a twelve-character
-/// alphabet is 12^9 — over five billion probes — and the spellings that have actually bypassed
-/// this gate all live out there. Five components is the least that reaches a UNC pop:
-/// `\\srv\x.bat\..` is `["", "", "srv", "x.bat", ".."]`.
-///
-/// Every probe is judged a second time behind `\\?\`, where no oracle is needed: std's verbatim
-/// test is a literal suffix check, so a `.bat`/`.cmd` suffix must be refused and nothing else is
-/// asserted.
-///
-/// Exact agreement but for one declared over-refusal: the gate is allowed to refuse a directory
-/// and is not allowed to refuse `y\x.bat\..`, which loads `y`. Carries the no-regression property
-/// at this length as well — nothing the rule it replaced refused may come out accepted.
-#[test]
-fn the_gate_agrees_with_a_component_level_resolver() {
-    let mut tally = compare_gate_with_oracle(1, 5);
+/// Like [`compare_gate_with_oracle`] at one depth, with each of `slotted` inserted at `slot`.
+fn compare_gate_with_oracle_slotted(
+    vocab: &[(&'static str, Comp)],
+    depth: u32,
+    slot: usize,
+    slotted: &[(&'static str, Comp)],
+) -> Tally {
+    let mut tally = Tally::default();
+    for sep in ["\\", "/"] {
+        for index in 0..vocab.len().pow(depth) {
+            for extra in slotted {
+                let mut path = nth_path(vocab, depth, index);
+                path.insert(slot, *extra);
+                judge(&mut tally, &path, sep);
+            }
+        }
+    }
+    tally
+}
+
+/// The `index`th path of `depth` components over `vocab`.
+fn nth_path(vocab: &[(&'static str, Comp)], depth: u32, mut index: usize) -> Vec<(&'static str, Comp)> {
+    (0..depth)
+        .map(|_| {
+            let component = vocab[index % vocab.len()];
+            index /= vocab.len();
+            component
+        })
+        .collect()
+}
+
+/// Judge one path, joined with `sep`, by the gate and by [`oracle_refuses`], into `tally`.
+fn judge(tally: &mut Tally, path: &[(&str, Comp)], sep: &str) {
+    let texts: Vec<&str> = path.iter().map(|(text, _)| *text).collect();
+    let kinds: Vec<Comp> = path.iter().map(|(_, kind)| *kind).collect();
+    let probe = texts.join(sep);
+    let path = std::path::Path::new(&probe);
+    let want = oracle_refuses(&kinds);
+    let got = super::reject_batch_path_on(path, true).is_err();
+    tally.probes += 1;
+    if the_extension_rule_this_replaced(path) && !got {
+        tally.newly_accepted.push(probe.clone());
+    }
+    // The verbatim axis: std tests a `\\?\` program as the literal string, so a batch suffix is
+    // exactly what it substitutes cmd.exe for.
+    let verbatim = format!(r"\\?\{probe}");
+    let verbatim_path = std::path::Path::new(&verbatim);
+    let verbatim_got = super::reject_batch_path_on(verbatim_path, true).is_err();
+    let lower = verbatim.to_ascii_lowercase();
+    if (lower.ends_with(".bat") || lower.ends_with(".cmd")) && !verbatim_got {
+        tally.verbatim_holes.push(verbatim.clone());
+    }
+    if verbatim_extension_rule_this_replaced(&verbatim) && !verbatim_got {
+        tally.newly_accepted.push(verbatim);
+    }
+    // `?` after a leading `\\` spells std's verbatim prefix itself: std tests the literal string,
+    // and so does this.
+    if probe.starts_with(r"\\?\") {
+        let lower = probe.to_ascii_lowercase();
+        if (lower.ends_with(".bat") || lower.ends_with(".cmd")) && !got {
+            tally.verbatim_holes.push(probe);
+        }
+        return;
+    }
+    match (want, got) {
+        (true, false) => tally.holes.push(probe),
+        (false, true) if declared_unc_over_refusal(&kinds) => {
+            tally.declared_over_refusals += 1;
+        }
+        (false, true) => tally.undeclared_over_refusals.push(probe),
+        (_, true) => tally.refused += 1,
+        (_, false) => tally.accepted += 1,
+    }
+}
+
+/// Assert `tally` found no disagreement, and that it saw both verdicts.
+fn assert_agreement(mut tally: Tally) -> Tally {
     // Truncated: a broken gate disagrees on tens of thousands of probes and the list is unreadable.
     tally.holes.truncate(20);
     tally.undeclared_over_refusals.truncate(20);
@@ -1526,12 +1621,44 @@ fn the_gate_agrees_with_a_component_level_resolver() {
         "refused before, accepted now"
     );
     // A generator that emitted only refusals (or only acceptances) would agree with a gate that
-    // had lost the other answer entirely, and would say nothing while doing it — and one that
-    // never reached the declared over-refusal would never have exercised a UNC root collapse.
-    assert!(
-        tally.refused > 1000 && tally.accepted > 1000 && tally.declared_over_refusals > 0,
-        "{tally:?}"
-    );
+    // had lost the other answer entirely, and would say nothing while doing it.
+    assert!(tally.refused > 1000 && tally.accepted > 1000, "{tally:?}");
+    tally
+}
+
+/// Exhaustive over COMPONENTS: every path up to five components deep over [`COMPONENTS`], under
+/// both separators, checked against a resolver that works from the component list instead of the
+/// string.
+///
+/// This is the envelope the character-level test cannot reach. Its shortest interesting probe,
+/// `.bat\a\..`, is nine characters; enumerating that many characters over a twelve-character
+/// alphabet is 12^9 — over five billion probes — and the spellings that have actually bypassed
+/// this gate all live out there. Five components is the least that reaches a UNC pop:
+/// `\\srv\x.bat\..` is `["", "", "srv", "x.bat", ".."]`.
+///
+/// Every probe is judged a second time behind `\\?\`, where no oracle is needed: std's verbatim
+/// test is a literal suffix check, so a `.bat`/`.cmd` suffix must be refused and nothing else is
+/// asserted.
+///
+/// Exact agreement but for one declared over-refusal: the gate is allowed to refuse a directory
+/// and is not allowed to refuse `y\x.bat\..`, which loads `y`. Carries the no-regression property
+/// at this length as well — nothing the rule it replaced refused may come out accepted.
+#[test]
+fn the_gate_agrees_with_a_component_level_resolver() {
+    let tally = assert_agreement(compare_gate_with_oracle(&COMPONENTS, 1, 5));
+    // One that never reached the declared over-refusal would never have exercised a UNC root
+    // collapse.
+    assert!(tally.declared_over_refusals > 0, "{tally:?}");
+}
+
+/// The same comparison over [`COMPONENTS`] plus [`DRIVE_SPELLINGS`]: every path up to four
+/// components, and at five a drive spelling in the share or device slot (`\\.\1:\..` is
+/// `["", "", ".", "1:", ".."]`). Adding them to the depth-five run above would triple its cost.
+#[test]
+fn the_gate_agrees_on_every_drive_spelling() {
+    let vocab: Vec<(&str, Comp)> = COMPONENTS.iter().chain(&DRIVE_SPELLINGS).copied().collect();
+    assert_agreement(compare_gate_with_oracle(&vocab, 1, 4));
+    assert_agreement(compare_gate_with_oracle_slotted(&COMPONENTS, 4, 3, &DRIVE_SPELLINGS));
 }
 
 /// The oracle's UNC model, pinned on the rows the gate once got wrong: an oracle without it
