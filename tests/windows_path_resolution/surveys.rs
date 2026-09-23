@@ -56,11 +56,8 @@ fn which_segment_positions_get_trimmed() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let tmp = tmp.path().to_str().expect("temp path is not UTF-8").to_string();
-    assert!(
-        !tmp.contains(r"\edir") && !tmp.contains(r"\ndir"),
-        "the temp root {tmp:?} already contains one of the substitution tokens, so the \
-         existing-versus-missing comparison below would be meaningless"
-    );
+    // Distinct siblings of equal length, so neither full root occurs inside the other and
+    // `compare_across_roots` can map one onto the other.
     let root_e = format!(r"{tmp}\edir");
     let root_n = format!(r"{tmp}\ndir");
     std::fs::create_dir(&root_e).expect("create the root that exists");
