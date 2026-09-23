@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Registry::{
@@ -239,13 +239,24 @@ fn launch_in_apartment(
         ));
     }
     // The child is `cosca_testbin_image`, which exits on its own once it has written the report.
+    // Its exit is the only thing ordering that write before the read below, so a failed wait is a
+    // failed measurement.
     // SAFETY: `hProcess` is a live process handle owned here, closed once below.
-    let _ = unsafe { WaitForSingleObject(sei.hProcess, INFINITE) };
+    let waited = unsafe { WaitForSingleObject(sei.hProcess, INFINITE) };
     let mut code = 0u32;
-    // SAFETY: as above.
-    let _ = unsafe { GetExitCodeProcess(sei.hProcess, &mut code) };
+    let exited = if waited == WAIT_OBJECT_0 {
+        // SAFETY: as above.
+        unsafe { GetExitCodeProcess(sei.hProcess, &mut code) }
+            .map_err(|e| Failure::Other(format!("GetExitCodeProcess: {e}")))
+    } else {
+        Err(Failure::Other(format!(
+            "WaitForSingleObject returned {waited:?} ({}), so the child may not have exited",
+            std::io::Error::last_os_error()
+        )))
+    };
     // SAFETY: as above.
     let _ = unsafe { CloseHandle(sei.hProcess) };
+    exited?;
     let body = std::fs::read_to_string(report).map_err(|e| Failure::Other(format!("exit {code}, no report: {e}")))?;
     let line = |prefix: &str| body.lines().find_map(|l| l.strip_prefix(prefix).map(str::to_string));
     match (line("image="), line("cwd=")) {
