@@ -287,8 +287,9 @@ fn elevated_exact_program_is_completed_to_an_absolute_path() {
 }
 
 /// The consent path's `Exact` arm applies [`crate::resolve::reject_unloadable_image`]: an absolute
-/// extensionless `lpFile` is still PATHEXT-completed by `ShellExecuteEx`. Relative too, since
-/// completion does not add an extension.
+/// extensionless `lpFile` may still be PATHEXT-completed by `ShellExecuteEx` (measured without a
+/// class, unmeasured for the `exefile` consent launch). Relative too, since completion does not add
+/// an extension.
 #[test]
 fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
     for n in [r"C:\tools\setup", "setup", r"C:\tools\setup.bat.exe.lnk"] {
@@ -330,8 +331,8 @@ fn an_exact_exe_or_com_program_plans_a_launch() {
 }
 
 /// The allowlist is the consent path's, not `raw_executable()`'s: an `executable()` or argv[0]
-/// token reaches `ShellExecuteEx` as written, so an extensionless one is PATHEXT-completed too,
-/// and a bare one is searched besides.
+/// token reaches `ShellExecuteEx` as written, so an extensionless one may be PATHEXT-completed too,
+/// and a bare one searched besides.
 #[test]
 fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     for (via, c) in search_commands(&[r"C:\tools\setup", "whoami"]) {

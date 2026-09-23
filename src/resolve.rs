@@ -457,6 +457,11 @@ fn has_loadable_extension(name: &OsStr) -> bool {
 /// a denylist would have to enumerate a registry the caller's machine controls. `.lnk` is the
 /// sharp case — a shortcut's target can be `cmd.exe /c ...`, elevating a program never named.
 ///
+/// Those measurements are of a launch without a class. cosca launches as `exefile`
+/// (`SEE_MASK_CLASSNAME`), and whether that launch applies `PATHEXT` on the consent route an
+/// unelevated caller takes is unmeasured. This rule does not depend on the answer: a name ending
+/// in `.exe`/`.com` leaves no default extension to add either way.
+///
 /// The allowlist closes the extensionless case only. Whether `ShellExecuteEx` also applies
 /// `PATHEXT` to an `lpFile` that already ends in `.exe` — a real `tool.exe` beside a planted
 /// `tool.exe.bat` — is unmeasured, and this rule makes no claim about it.
@@ -482,8 +487,8 @@ pub(crate) fn reject_unloadable_image(program: &Path, windows: bool) -> Result<(
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
-            "elevation requires an image named .exe or .com, because ShellExecuteEx applies \
-             PATHEXT to it and a planted script would outrank it: {program:?}"
+            "elevation requires an image named .exe or .com, because ShellExecuteEx may apply \
+             PATHEXT to any other name and a planted script would then outrank it: {program:?}"
         ),
     )))
 }

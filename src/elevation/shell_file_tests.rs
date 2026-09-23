@@ -61,9 +61,10 @@ fn a_fully_qualified_image_path_passes() {
     }
 }
 
-/// ShellExecuteEx completes an extension-less token by lookup (`PathResolveW` with
-/// `PRF_TRYPROGRAMEXTENSIONS`, `PathFileExistsDefExtW`), trying `.bat` and `.cmd` among others, so
-/// the elevated path takes only a token that already names an image. The rule is
+/// ShellExecuteEx without a class completes an extension-less token by lookup (`PathResolveW` with
+/// `PRF_TRYPROGRAMEXTENSIONS`, `PathFileExistsDefExtW`), trying `.bat` and `.cmd` among others, and
+/// whether the `exefile` launch does on the consent route is unmeasured, so the elevated path takes
+/// only a token that already names an image. The rule is
 /// [`crate::resolve::reject_unloadable_image`]'s, so it refuses with `InvalidInput` and names
 /// `PATHEXT`, ahead of the fully-qualified rule.
 #[test]

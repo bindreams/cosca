@@ -333,8 +333,9 @@ impl Command {
     ///
     /// # Elevation
     ///
-    /// On Windows the elevated path goes through `ShellExecuteEx`, which searches a path-less
-    /// `lpFile` and applies `PATHEXT` even to an absolute one. cosca completes the name to an
+    /// On Windows the elevated path goes through `ShellExecuteEx`, which can search a path-less
+    /// `lpFile` and apply `PATHEXT` even to an absolute one (measured without a class; for cosca's
+    /// `exefile` launch on the consent route it is unmeasured). cosca completes the name to an
     /// absolute path first, by the same rules as above, and refuses it with
     /// [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
     /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
