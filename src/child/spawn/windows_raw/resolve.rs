@@ -181,7 +181,7 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// - `CreateProcessW` completes a partial `lpApplicationName` itself ("the function uses the
 ///   current drive and current directory to complete the specification. The function will not
 ///   use the search path"), so the raw backend hands it a relative value untouched, using this
-///   only for its refusals and its batch gate.
+///   only for its refusals.
 /// - `ShellExecuteEx` SEARCHES a path-less `lpFile`, which is how the elevated path reached the
 ///   `.bat`/`.cmd` vector; completing the name here stops that search. The consent path also gates
 ///   the completed name against `.exe`/`.com` — see [`crate::resolve::reject_unloadable_image`]

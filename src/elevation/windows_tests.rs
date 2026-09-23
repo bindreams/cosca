@@ -355,8 +355,8 @@ fn a_search_exe_or_com_program_plans_a_launch() {
     }
 }
 
-/// The normalised-batch gate applies to every arm, before the planner. On a token ending in
-/// `.exe`/`.com` it is the only batch gate that sees a stream piece.
+/// The batch gate applies to every arm, before the planner, and judges the name Win32 normalises
+/// the token to — a stream piece included, on a token ending in `.exe`/`.com`.
 #[test]
 fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privilege() {
     let probes = [

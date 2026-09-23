@@ -333,27 +333,24 @@ fn image_for_rejects_an_exact_program_that_names_no_file() {
 }
 
 #[test]
-fn image_for_checks_an_exact_program_normalised_but_passes_it_as_written() {
-    // The post-check reads Win32's normalisation; what reaches `lpApplicationName` must still be
-    // the caller's token, relative and with its trailing dot, for the loader to complete.
+fn image_for_passes_an_exact_program_as_written() {
+    // `absolutise_exact` reads Win32's normalisation; what reaches `lpApplicationName` must still
+    // be the caller's token, relative and with its trailing dot, for the loader to complete.
     let mut cmd = Command::new();
     cmd.raw_executable(r"t\tool.").args(["tool"]);
     assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(r"t\tool.")));
 }
 
 /// `CreateProcessW` loads the name Win32 normalises the token to, so a batch file reached only
-/// through normalisation is refused as a plainly-spelled one is.
+/// through normalisation is refused as a plainly-spelled one is — by the token gate, the raw
+/// backend's one batch check, which judges that name.
 #[test]
-fn image_for_refuses_an_exact_batch_reached_through_win32_normalisation() {
+fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
     // Trailing dot; one trailing space; a file named `.bat`, which has no extension to `Path`.
     for n in ["setup.bat.", "setup.bat ", r"C:\t\.bat"] {
         let mut cmd = Command::new();
         cmd.raw_executable(n).args(["tool"]);
-        assert!(
-            reject_batch_program(&cmd).is_ok(),
-            "premise: the token gate misses {n:?}, so image_for is the only refusal"
-        );
-        match image(&cmd) {
+        match reject_batch_program(&cmd) {
             Err(Error::Unsupported { platform, detail, .. }) => {
                 assert_eq!(platform, "windows");
                 assert!(detail.contains("CVE-2024-24576"), "{n:?}: {detail}");

@@ -439,10 +439,11 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 
     // Refuse a `.bat`/`.cmd` spelled in the program `elevated_program` returned — the caller's
     // TOKEN, except on the `Exact` arm, where it is that token completed to an absolute path.
-    // (Completion only prefixes a directory and applies Win32's own normalisation, so it can add a
-    // `.bat` reading but never remove one; over-rejection is the safe direction here.) Why, in
-    // `crate::child::spawn::batch_refusal`; here the `runas` `batfile` association substitutes
-    // `lpParameters` into `%*` unescaped, so the injected command runs ELEVATED.
+    // `ShellExecuteEx`'s `runas` resolves the `batfile` association, which routes through `cmd.exe`
+    // and substitutes `lpParameters` into `%*` UNESCAPED — and `join_wide` quotes only for
+    // whitespace, never for cmd metacharacters, so `args(["setup.bat", "a&calc"])` is command
+    // injection into an ELEVATED cmd.exe. That is CVE-2024-24576, which the raw and std backends
+    // both refuse outright.
     //
     // The batch gate judges the name Win32 resolves the token to — trailing dots and spaces, `..`
     // collapse, drive and UNC and device roots, and data-stream pieces. The launch is `exefile`
@@ -454,7 +455,6 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // before the launch.
     let program_path = std::path::Path::new(&program);
     crate::child::spawn::reject_batch_path(program_path)?;
-    crate::child::spawn::reject_normalised_batch_path(program_path)?;
     shell_file::reject_elevated_program(program_path)?;
 
     match host.plan(Privilege::Elevated, backend, auth) {

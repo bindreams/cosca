@@ -330,28 +330,22 @@ pub(crate) fn spawn_step(
 ///   line's first token, and THAT is resolved, which is what keeps `lpApplicationName` non-NULL.
 ///   See [`app_name_wide`] for why NULL is a security boundary.
 ///
-/// Whichever arm produced it, the path the loader reaches must pass
-/// [`reject_normalised_batch_path`](crate::child::spawn::reject_normalised_batch_path).
+/// No arm is batch-checked here: [`reject_batch_program`] has judged the token by the name Win32
+/// normalises it to, and resolution only prefixes a directory and may append `.exe`, so it never
+/// turns a name the gate accepted into a `.bat`/`.cmd`.
 pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<PathBuf>, Error> {
-    // `(image, loaded)`: what `lpApplicationName` gets, and the path the loader reaches through it.
-    // They differ only for `Exact`, whose token the loader completes itself.
-    let (image, loaded) = match cmd.executable_spec() {
-        Some(ExecutableSpec::Search(p)) => {
-            let r = resolve::resolve_executable(p, cmd.cwd(), path)?;
-            (r.clone(), r)
+    let image = match cmd.executable_spec() {
+        Some(ExecutableSpec::Search(p)) => resolve::resolve_executable(p, cmd.cwd(), path)?,
+        // Completed only for its refusals: the loader completes the token itself.
+        Some(ExecutableSpec::Exact(p)) => {
+            resolve::absolutise_exact(p)?;
+            p.to_path_buf()
         }
-        Some(ExecutableSpec::Exact(p)) => (p.to_path_buf(), resolve::absolutise_exact(p)?),
         None => match program_token(cmd) {
-            Some(t) => {
-                let r = resolve::resolve_executable(&t, cmd.cwd(), path)?;
-                (r.clone(), r)
-            }
+            Some(t) => resolve::resolve_executable(&t, cmd.cwd(), path)?,
             None => return Ok(None),
         },
     };
-    // Every arm: resolution can land on `setup.bat.` or `.bat` as written, which
-    // `reject_batch_program`'s `Path::extension()` reading does not see as a batch file.
-    crate::child::spawn::reject_normalised_batch_path(&loaded)?;
     Ok(Some(image))
 }
 

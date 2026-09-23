@@ -382,10 +382,6 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
-    // std runs a batch file through cmd.exe after `GetFullPathNameW`, so `setup.bat.` and
-    // `C:\t\.bat` are batch files too; a `commandline()` tail would then reach cmd.exe unescaped.
-    #[cfg(windows)]
-    reject_normalised_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
     match cwd {
         Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,
@@ -551,48 +547,6 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
         cwd: cmd.cwd().map(std::path::Path::to_path_buf),
         enter: false,
     })
-}
-
-/// Refuse a program whose Win32-NORMALISED path — `GetFullPathNameW`'s result, which is what
-/// `CreateProcessW` loads — reaches a `.bat`/`.cmd`, for [`batch_refusal`]'s reason.
-///
-/// [`reject_batch_path`] reads `Path::extension()` of the token as written, which misses what
-/// normalisation exposes: `setup.bat.` and `setup.bat ` (one trailing space) become `setup.bat`,
-/// and `C:\t\.bat` has no extension to `Path` at all. This tests by suffix instead, as std's own
-/// `has_bat_extension` does, on every data-stream piece of the final component, each trimmed of
-/// trailing dots and spaces — so `x.bat::$DATA` is refused as its piece `x.bat`. Over-refusing a
-/// stream spelling is the safe direction.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn reject_normalised_batch_path(full: &std::path::Path) -> Result<(), Error> {
-    let text = full.as_os_str().to_string_lossy();
-    let name = text
-        .rsplit(['\\', '/'])
-        .next()
-        .expect("rsplit yields at least one piece");
-    let is_batch = |piece: &str| {
-        let piece = piece.trim_end_matches(['.', ' ']).to_ascii_lowercase();
-        piece.ends_with(".bat") || piece.ends_with(".cmd")
-    };
-    if name.split(':').any(is_batch) {
-        return Err(batch_refusal(full));
-    }
-    Ok(())
-}
-
-/// The refusal every batch gate returns, and the one statement of why.
-///
-/// Win32 runs a `.bat`/`.cmd` through `cmd.exe`, which re-parses the command line by rules of its
-/// own — its metacharacters (`&`, `|`, `^`, `%`) act even inside the quoting cosca writes for
-/// `CommandLineToArgvW`. So `args(["setup.bat", "a&calc"])` would also run `calc`. That is
-/// CVE-2024-24576 (BatBadBut); cosca refuses the file rather than implement cmd.exe escaping.
-fn batch_refusal(prog: &std::path::Path) -> Error {
-    Error::Unsupported {
-        op: format!("running {}", prog.display()),
-        platform: "windows",
-        detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
-                 use .commandline() to pass an explicit, pre-escaped command line"
-            .into(),
-    }
 }
 
 pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {

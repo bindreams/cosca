@@ -1803,7 +1803,10 @@ fn std_routed(args: &[&str], lines: &[&str]) -> Vec<(String, Command)> {
         out.push((format!("commandline({l:?})"), c));
     }
     for (via, c) in &out {
-        assert!(!crate::child::spawn::routes_to_raw_backend(c), "{via} must take the std route");
+        assert!(
+            !crate::child::spawn::routes_to_raw_backend(c),
+            "{via} must take the std route"
+        );
     }
     out
 }
