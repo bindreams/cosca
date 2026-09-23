@@ -71,6 +71,20 @@ fn install_ignore_break() {
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
 }
 
+/// `set_current_dir`s THIS process — never a spawned child — to `dir`. The one legitimate call
+/// site `clippy.toml`'s `disallowed-methods` exempts here: `cosca_testbin` is a freshly spawned,
+/// single-purpose PROCESS per invocation, never the shared multithreaded `cargo test` binary, so
+/// mutating its own cwd races nothing. Both `report-bare-argv0-cwd-spawn*` arms route through
+/// this one function so the `#[expect]` lives in exactly one place.
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "testbin is a dedicated single-purpose process per invocation; mutating its own cwd races no concurrent test — see this function's doc"
+)]
+fn chdir_this_process(dir: impl AsRef<std::path::Path>) {
+    std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+}
+
 /// Shared body of `control-echo-pid` and the grandchild arm of `spawn-orphan-escapee`'s
 /// relay: publish `<tag><pid>\n`, then echo each byte received. `Ok(0)`/`Interrupted` are the
 /// only expected outcomes besides a live echo; anything else is a genuine test-harness bug.
@@ -785,7 +799,7 @@ fn main() {
             // else, so a caller sees the real cause instead of a silent miscount.
             let dir = &args[2];
             let program = args[3].as_str();
-            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+            chdir_this_process(dir);
 
             let mut c = cosca::Command::new();
             c.args([program, "exit", "0"]).fd(3, cosca::Stdio::pipe_out()).unwrap();
@@ -814,7 +828,7 @@ fn main() {
             // process builds one just for this probe.
             let dir = &args[2];
             let program = args[3].clone();
-            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+            chdir_this_process(dir);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

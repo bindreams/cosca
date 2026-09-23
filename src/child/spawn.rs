@@ -406,6 +406,11 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
 /// documents `pre_exec` hooks as running in the child just before the exec, so the ordering is
 /// pinned. The cost is that a hook rules out `posix_spawn`, for these commands only.
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the pre_exec hook below runs in the forked child, between fork and exec, so it moves \
+              that child's cwd and never this process's — see this function's doc"
+)]
 fn enter_in_child(std_cmd: &mut std::process::Command, dir: &std::path::Path) -> Result<(), Error> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;

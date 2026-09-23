@@ -976,7 +976,8 @@ mod rewrite_tests {
     #[test]
     fn a_bare_exact_program_without_a_cwd_is_completed_against_the_process_cwd() {
         // Reads the process cwd twice (here and in the rewrite); no test in this binary moves it
-        // (`tests/no_chdir_guard.rs`), so both readings agree.
+        // (clippy's `disallowed-methods`, configured in `clippy.toml`, forbids it), so both
+        // readings agree.
         let rw = rewrite_with_host(&mut pkexec_tool(None), &every_backend_host()).expect("rewrite");
         let want = std::env::current_dir().unwrap().join("tool").into_os_string();
         assert!(derived_argv(&rw).contains(&want), "{:?}", derived_argv(&rw));

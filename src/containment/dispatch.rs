@@ -561,7 +561,16 @@ pub(crate) fn prepare(
     #[cfg(windows)]
     crate::containment::windows::clear_std_handle_inheritance();
 
-    #[allow(unreachable_code)]
+    // On `target_os = "linux"` only, every path through the `#[cfg(target_os = "linux")]` block
+    // above returns, so this expression is unreachable there — but it is the live tail expression
+    // on every other target.
+    #[cfg_attr(
+        target_os = "linux",
+        expect(
+            unreachable_code,
+            reason = "the linux block above returns on every path; see this expression's comment"
+        )
+    )]
     Ok(Prepared {
         mode,
         is_root,
