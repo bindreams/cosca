@@ -19,6 +19,7 @@ on:
     paths:
       - "src/child/spawn.rs"
       - "src/child/spawn/batch_gate.rs"
+      - "src/child/spawn/batch_gate/**"
       - "src/resolve.rs"
       - "src/child/spawn/windows_raw.rs"
       - "src/child/spawn/windows_raw/resolve.rs"
