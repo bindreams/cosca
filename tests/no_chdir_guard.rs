@@ -17,6 +17,9 @@
 //! two calls' identical text: matching by text alone would let a duplicate of an already-allowed
 //! line slip in uncounted, so each entry also carries the exact number of lines it may match.
 //!
+//! `testbin/long_cwd.rs`'s one call is the same exception: the `long-cwd-probe` mode moves its own
+//! process's cwd past `MAX_PATH` to measure spawning from there.
+//!
 //! `src/child/spawn.rs`'s one call is library code, not a test's: the `pre_exec` hook that enters
 //! a `raw_executable()` child's directory. It runs in the forked child, between `fork` and `exec`,
 //! so it moves that child's cwd and never this process's.
@@ -42,6 +45,11 @@ const ALLOWLIST: &[(&str, &str, usize)] = &[
             "dir to the decoy directory\");"
         ),
         2,
+    ),
+    (
+        "testbin/long_cwd.rs",
+        concat!("let r = std::env::set_current", "_dir(path);"),
+        1,
     ),
     (
         "src/child/spawn.rs",

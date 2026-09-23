@@ -5,11 +5,7 @@
 //! This is the one process that moves its own cwd: it is a separate process, spawned for it.
 
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-
-use windows::core::PCWSTR;
-use windows::Win32::System::Environment::SetCurrentDirectoryW;
 
 /// One report line per fact, `key=value`, in a fixed order.
 pub fn run(base: &str) {
@@ -65,12 +61,8 @@ fn long_dir(base: &Path) -> PathBuf {
 }
 
 fn set_cwd(path: &std::ffi::OsStr) -> Result<(), u32> {
-    let wide: Vec<u16> = path.encode_wide().chain([0]).collect();
-    // SAFETY: `wide` is NUL-terminated and outlives the call.
-    if unsafe { SetCurrentDirectoryW(PCWSTR(wide.as_ptr())) }.as_bool() {
-        return Ok(());
-    }
-    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) as u32)
+    let r = std::env::set_current_dir(path);
+    r.map_err(|e| e.raw_os_error().map_or(u32::MAX, |c| c as u32))
 }
 
 fn outcome(r: &Result<(), u32>) -> String {
