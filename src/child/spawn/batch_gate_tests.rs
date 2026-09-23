@@ -1121,7 +1121,7 @@ fn for_every_string(max_len: u32, mut probe: impl FnMut(&str)) {
     }
 }
 
-/// The gate this PR replaced, as a differential oracle — with the dot rule written out rather
+/// The gate this replaced, as a differential oracle — with the dot rule written out rather
 /// than delegated back to `Path::extension`, or both sides of property 2 below would be the same
 /// call and the comparison could not fail.
 ///
@@ -1496,7 +1496,7 @@ fn compare_gate_with_oracle(min_depth: u32, max_depth: u32) -> Tally {
 ///
 /// Exact agreement but for one declared over-refusal: the gate is allowed to refuse a directory
 /// and is not allowed to refuse `y\x.bat\..`, which loads `y`. Carries the no-regression property
-/// at this length as well — nothing the rule this PR replaced refused may come out accepted.
+/// at this length as well — nothing the rule it replaced refused may come out accepted.
 #[test]
 fn the_gate_agrees_with_a_component_level_resolver() {
     let mut tally = compare_gate_with_oracle(1, 5);

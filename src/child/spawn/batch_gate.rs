@@ -72,7 +72,7 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 /// own `std::process` detects a `.bat`/`.cmd` program, swaps it for `cmd.exe` and builds a batch
 /// command line (`sys/process/windows.rs`'s `is_batch_file` -> `make_bat_command_line`), so
 /// anything slipping past here is handed to exactly the quoting layer cosca has not implemented.
-/// It goes live a second way once `ShellExecuteEx` is gated (#135), which has no such backstop.
+/// It goes live a second way once `ShellExecuteEx` is gated, which has no such backstop.
 ///
 /// An interior NUL is refused FIRST, under both verdicts, because `\0` is not a path separator
 /// and neither `Path::extension()` nor the component walk below stops at one — so the name tested
@@ -312,7 +312,7 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// and `a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain`). Only the literal `\\?\`
 /// is verbatim to std, and it never arrives: [`verbatim_refusal`] owns it.
 ///
-/// # The token, not the resolved path (#144)
+/// # The token, not the resolved path
 ///
 /// This runs on the program token AS WRITTEN, so it has to predict what that string resolves to
 /// instead of resolving it. Two over-refusals are the price, both unchanged by the measurement
@@ -320,8 +320,8 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// the gate refuses every one rather than guess. And a path whose final component drops out
 /// resolves to a name with a trailing separator — `x.bat\...` is `…\x.bat\`, which std's
 /// `has_bat_extension` does NOT read as a batch file — yet the gate judges the exposed `x.bat` and
-/// refuses. #144 moves resolution ahead of the gate, at which point both collapse into a suffix
-/// test on the resolved path and there is nothing left to predict.
+/// refuses. Moving resolution ahead of the gate (planned) collapses both into a suffix test on the
+/// resolved path and leaves nothing left to predict.
 pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interior) -> Option<String> {
     let text = prog.as_os_str().to_string_lossy();
     // Each surviving component, paired with whether it is the path's FIRST segment — the only
