@@ -3,7 +3,7 @@
 //!
 //! Everything here is PURE — no `cfg!`, and no syscalls beyond reading this process's cwd for a
 //! relative `raw_executable()` with no absolute `current_dir()` (see
-//! [`Command::posix_launch`]) — so the whole module is compiled and unit-tested on every
+//! [`program_and_args`]) — so the whole module is compiled and unit-tested on every
 //! platform, exactly like [`super::plan`].
 //!
 //! # The two quoting layers
@@ -180,10 +180,8 @@ fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
 }
 
 /// Program + args + the directory to run them in, honoring `executable()`. A `raw_executable()`
-/// program comes back in the unelevated spawn's form (`./tool`), with the absolute directory it
-/// is read against ([`Command::posix_launch`], which is where `process_cwd` may be read): the
-/// script `cd`s there and then execs `./tool`, so the exec reads the name against the directory
-/// the `cd` entered.
+/// program comes back as [`crate::resolve::exact::enter_posix`] gives it: the absolute
+/// directory the script `cd`s to, reading `process_cwd` at most once, and the name to exec there.
 ///
 /// The directory itself is still a path, because root's shell starts wherever the trampoline
 /// puts it: a rename of one of its ancestors between this call and the `cd` — a window that spans
@@ -194,27 +192,23 @@ pub(crate) fn program_and_args(
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> Result<Launch, Error> {
     let argv = checked_argv(cmd)?;
-    let launch = cmd.posix_launch(process_cwd)?;
-    let program = match cmd.executable_spec() {
-        Some(crate::command::ExecutableSpec::Exact(p)) if launch.cwd.is_some() => {
-            let anchored = crate::resolve::exact::anchor_posix(p.as_os_str(), None)?.program;
-            // `./` in front of every relative name, not only a bare one: `-x/tool` would otherwise
-            // reach `exec` as an option (bash reads `-x`), whatever shell `/bin/sh` is.
-            if is_posix_absolute(anchored.as_os_str())? || anchored.as_os_str().as_encoded_bytes().starts_with(b"./") {
-                anchored
-            } else {
-                // Byte-level, like the rest of this module: the target grammar is `/bin/sh`'s.
-                let mut prefixed = OsString::from("./");
-                prefixed.push(anchored.as_os_str());
-                PathBuf::from(prefixed)
-            }
+    let as_given = || cmd.cwd().map(Path::to_path_buf);
+    let (program, cwd) = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) => {
+            let entered = crate::resolve::exact::enter_posix(
+                p.as_os_str(),
+                cmd.cwd(),
+                crate::command::explain_cwd_read(process_cwd),
+            )?;
+            (entered.program, entered.dir)
         }
-        _ => launch.program.unwrap_or_else(|| PathBuf::from(&argv[0])),
+        Some(crate::command::ExecutableSpec::Search(p)) => (p.clone(), as_given()),
+        None => (PathBuf::from(&argv[0]), as_given()),
     };
     Ok(Launch {
         program: program.into_os_string(),
         args: argv[1..].to_vec(),
-        cwd: launch.cwd,
+        cwd,
     })
 }
 

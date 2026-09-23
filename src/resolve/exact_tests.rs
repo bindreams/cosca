@@ -179,3 +179,29 @@ fn anchoring_refuses_what_completion_refuses() {
         }));
     }
 }
+
+/// For a shell that `cd`s by path and then execs: the absolute directory to enter, and the name
+/// to exec there, `./`-prefixed so no shell reads it as an option or searches `PATH` for it.
+#[test]
+fn a_program_to_run_after_entering_its_directory_is_dot_slash_anchored() {
+    let entered = |program: &str, cwd: Option<&str>| {
+        let reads = std::cell::Cell::new(0);
+        let got = enter_posix(OsStr::new(program), cwd.map(Path::new), || {
+            reads.set(reads.get() + 1);
+            Ok(PathBuf::from("/proc-cwd"))
+        })
+        .unwrap();
+        assert!(reads.get() <= 1, "{program} {cwd:?}");
+        (got.program, got.dir)
+    };
+    let p = PathBuf::from;
+    assert_eq!(entered("tool", None), (p("./tool"), Some(p("/proc-cwd"))));
+    assert_eq!(entered("-x/tool", Some("/work")), (p("./-x/tool"), Some(p("/work"))));
+    assert_eq!(
+        entered("bin/tool", Some("sub")),
+        (p("./bin/tool"), Some(p("/proc-cwd/sub")))
+    );
+    assert_eq!(entered("./tool", Some("/work")), (p("./tool"), Some(p("/work"))));
+    assert_eq!(entered("/usr/bin/id", Some("/w")), (p("/usr/bin/id"), Some(p("/w"))));
+    assert_eq!(entered("/usr/bin/id", None), (p("/usr/bin/id"), None));
+}

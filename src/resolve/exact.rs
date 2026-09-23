@@ -126,6 +126,47 @@ pub(crate) fn complete_posix(
     })
 }
 
+/// An `Exact` program for a shell that enters a directory by path and then execs — root's shell
+/// under `osascript`: the absolute directory to `cd` to, and the name to exec there.
+///
+/// The directory is [`complete_posix`]'s — `child_cwd` if absolute, else completed against one
+/// reading of `process_cwd` — and the name is the program as written, `./`-prefixed when
+/// relative: exec reads it against the directory the `cd` entered, and a `./` keeps any shell
+/// from searching `PATH` for it or reading `-x/tool` as an option. An absolute program is left
+/// as is, with `child_cwd` as given.
+pub(crate) fn enter_posix(
+    program: &OsStr,
+    child_cwd: Option<&Path>,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Entered, Error> {
+    let completed = complete_posix(program, child_cwd, process_cwd)?;
+    if is_absolute(program) {
+        return Ok(Entered {
+            program: completed.program,
+            dir: completed.child_cwd,
+        });
+    }
+    let bytes = program.as_encoded_bytes();
+    let program = if bytes.starts_with(b"./") {
+        program.to_os_string()
+    } else {
+        join(OsStr::new("."), program)
+    };
+    Ok(Entered {
+        program: PathBuf::from(program),
+        dir: completed.child_cwd,
+    })
+}
+
+/// [`enter_posix`]'s answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Entered {
+    /// Absolute, or `./`-prefixed and read against `dir`.
+    pub(crate) program: PathBuf,
+    /// Absolute whenever `program` is relative.
+    pub(crate) dir: Option<PathBuf>,
+}
+
 /// The refusals both forms share: an interior NUL, which no exec argument can carry, and a name
 /// that [names no file](super::names_no_file).
 pub(crate) fn refuse_unnameable(program: &OsStr) -> Result<(), Error> {

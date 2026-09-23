@@ -52,6 +52,15 @@ impl std::error::Error for CwdUnreadable {
     }
 }
 
+/// `process_cwd`, with a failure explained as [`CwdUnreadable`] and its own error kept as the
+/// source — for every elevation sink that needs this process's cwd as a path.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn explain_cwd_read(
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> impl FnOnce() -> std::io::Result<PathBuf> {
+    move || process_cwd().map_err(|e| std::io::Error::new(e.kind(), CwdUnreadable(e)))
+}
+
 /// [`Command::posix_launch`]'s answer.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct PosixLaunch {
@@ -397,7 +406,7 @@ impl Command {
         &self,
         process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
     ) -> Result<PosixLaunch, Error> {
-        let process_cwd = || process_cwd().map_err(|e| std::io::Error::new(e.kind(), CwdUnreadable(e)));
+        let process_cwd = explain_cwd_read(process_cwd);
         let as_given = |program| PosixLaunch {
             program,
             cwd: self.cwd().map(Path::to_path_buf),
