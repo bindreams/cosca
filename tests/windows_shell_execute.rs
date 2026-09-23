@@ -12,11 +12,15 @@
 //! batch file — and registers one volatile App Paths key in HKLM and then in HKCU, each deleted by
 //! a guard. Creating a volatile key also creates any missing parent volatile, and that parent is
 //! left behind; it goes at the next reboot, with the ephemeral runner.
+//!
+//! The tests share process-global state — the registry keys, `PATH`, one environment variable —
+//! so each holds [`serial`] for its whole body, whatever `--test-threads` says.
 #![cfg(windows)]
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
@@ -40,6 +44,12 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 const FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
 /// `ERROR_NO_ASSOCIATION` as an HRESULT: the class has no command for the verb (measured).
 const NO_ASSOCIATION: i32 = 0x8007_0483_u32 as i32;
+
+/// Serialize the tests in this file: see the module doc.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const APP: &str = "cosca_probe_a.exe";
 const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\cosca_probe_a.exe";
@@ -328,6 +338,7 @@ fn failed_with(got: &Result<Report, Failure>, hresult: i32) -> bool {
 #[test]
 #[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
 fn classname_runas_needs_a_full_path() {
+    let _serial = serial();
     let l = layout();
     let mut failures: Vec<String> = Vec::new();
     let mut check = |ok: bool, what: &str, got: &Result<Report, Failure>| {
@@ -416,6 +427,7 @@ fn classname_runas_needs_a_full_path() {
 #[test]
 #[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
 fn exefile_skips_the_app_paths_lookup() {
+    let _serial = serial();
     let l = layout();
     let app = OsStr::new(APP);
     let mut failures: Vec<String> = Vec::new();
