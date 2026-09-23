@@ -270,19 +270,31 @@ fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
     let _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
 }
 
-/// A verbatim path is taken as written. `GetFullPathNameW` leaves one alone too (measured here), so
-/// the directory a verbatim `current_dir` names is the one `CreateProcessW` runs the child in, which
-/// completes `lpCurrentDirectory` with it.
+/// A verbatim `current_dir` is kept as written when `GetFullPathNameW` leaves it alone, and refused
+/// when it would rewrite it: whatever completes the child's `lpCurrentDirectory` may rewrite it the
+/// same way, and the directory resolved against must be the one run in. `GetFullPathNameW` does
+/// rewrite a verbatim trailing dot (measured on both CI architectures), so that case is pinned.
 #[test]
-fn a_verbatim_path_is_completed_as_written() {
+fn a_verbatim_directory_is_kept_or_refused_never_rewritten() {
+    let dotted = Path::new(r"\\?\C:\t\a.");
+    assert_ne!(
+        super::full_path_name(dotted).unwrap(),
+        dotted,
+        "premise: a verbatim trailing dot is rewritten"
+    );
     for path in [r"\\?\C:\t\a", r"\\?\C:\t\a.", r"\\?\C:\t\x\..\y", r"\\?\C:\t\a "] {
-        assert_eq!(
-            super::full_path_name(Path::new(path)).unwrap(),
-            PathBuf::from(path),
-            "GetFullPathNameW rewrote {path:?}"
-        );
-        let got = complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive).unwrap();
-        assert_eq!(got.path, PathBuf::from(path), "{path:?}");
+        let rewritten = super::full_path_name(Path::new(path)).unwrap() != Path::new(path);
+        match complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive) {
+            Ok(got) => {
+                assert!(!rewritten, "{path:?} is rewritten, so it must be refused");
+                assert_eq!(got.path, PathBuf::from(path), "{path:?}");
+            }
+            Err(Error::Io(e)) => {
+                assert!(rewritten, "{path:?} is not rewritten, so it must be kept: {e}");
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{path:?}: {e}");
+            }
+            Err(other) => panic!("{path:?}: {other:?}"),
+        }
     }
 }
 

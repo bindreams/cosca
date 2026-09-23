@@ -259,7 +259,8 @@ pub(crate) struct Completed {
 /// Complete `path` as `GetFullPathNameW` would, with this process's cwd read through
 /// `process_cwd` (at most once) and another drive's own current directory through `drive_cwd`,
 /// instead of by `GetFullPathNameW` itself. `GetFullPathNameW` then only normalises a path that is
-/// already fully qualified, which reads neither; a verbatim (`\\?\`) path is not normalised at all.
+/// already fully qualified, which reads neither. A verbatim (`\\?\`) path is kept as written, and
+/// refused when `GetFullPathNameW` would rewrite it.
 ///
 /// The path's type is [`crate::resolve::path_type`]'s, the one classifier the resolver uses too:
 ///
@@ -280,9 +281,23 @@ pub(crate) fn complete_on(
     drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
 ) -> Result<Completed, Error> {
     let anchored = anchor(path, process_cwd, drive_cwd)?;
-    // A verbatim path is taken as written, as `std::path::absolute` takes one: Win32 passes it to
-    // the filesystem unparsed, so it names what it spells (`a.`, `a `, a literal `..`).
+    // A verbatim path names what it spells, and is kept as written only when `GetFullPathNameW`
+    // leaves it alone. It does rewrite some (a trailing dot, measured), and whatever completes the
+    // child's `lpCurrentDirectory` may rewrite it the same way (ReactOS `CreateProcessInternalW`
+    // runs `GetFullPathNameW` on it), so a rewritten one is refused: the directory resolved against
+    // must be the one run in.
     if is_verbatim(&anchored.path) {
+        let normalised = full_path_name(&anchored.path)?;
+        if normalised != anchored.path {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the verbatim path {:?} would be rewritten to {normalised:?} where it is used as a \
+                     directory; spell it as that",
+                    anchored.path
+                ),
+            )));
+        }
         return Ok(anchored);
     }
     Ok(Completed {
