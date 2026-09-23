@@ -63,6 +63,9 @@ jobs:
             arch: amd64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+            # This is the one Windows lane that also runs the feature-powerset
+            # Clippy step below; see there for why one arch stands in for both.
+            lint: true
           - os: windows
             arch: arm64
             runner: windows-11-arm
@@ -77,9 +80,9 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-          # clippy only on windows/amd64 (see the Clippy step below for why one
-          # Windows arch stands in for both).
-          components: ${{ matrix.os == 'windows' && matrix.arch == 'amd64' && 'clippy' || '' }}
+          # see Clippy (feature powerset) step below for why only this lane
+          # gets the component
+          components: ${{ matrix.lint && 'clippy' || '' }}
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
@@ -139,44 +142,23 @@ jobs:
       # backend) is otherwise never linted: the `lint` job only runs on
       # ubuntu-latest, so clippy never type-checks it against a Windows target.
       #
-      # --feature-powerset (via cargo-hack), not --all-features: a default-
-      # features-only build has real dead_code gaps --all-features alone never
-      # catches — measured: src/wait/windows.rs's block_until_exit_or_cancel
-      # carries `#[cfg_attr(not(feature = "tokio"), allow(dead_code))]`; delete
-      # it and clippy stays clean under --all-features but exits 101 under
-      # --no-default-features. This crate declares no `default` feature, so
-      # cargo-hack's powerset of {pty, serde, tokio} (8 combinations) already
-      # covers the no-feature case.
+      # --feature-powerset, not --all-features: this crate has real dead_code
+      # gaps that only a default-features-only build exposes, which
+      # --all-features alone never catches.
       #
-      # Placed after the test steps above, not right after Build: step order
-      # (not the `!cancelled()` gate below) is what keeps the earlier test
-      # steps' own results green if this step later fails — each step's
-      # conclusion is fixed when it finishes, and GitHub Actions runs steps
-      # in the order they're listed. `!cancelled()` instead lets this step
-      # still run and report its own result even if an earlier step in the
-      # job already failed; the job as a whole still fails regardless,
-      # because that earlier step keeps its own failing conclusion.
+      # Placed after the test steps, not right after Build, so a later clippy
+      # failure doesn't retroactively mark the test steps as failed.
       #
-      # Adds about 36s to the windows/amd64 leg (2s install + 34s clippy),
-      # measured against main (job 106991533545), which has no Windows
-      # clippy step at all.
-      #
-      # Runs on amd64 only, not arm64: nothing in this crate's Windows code is
-      # `cfg(target_arch = ...)`-gated (checked: no such attribute exists in the
-      # tree), so the two arches type-check and lint identically — confirmed by
-      # running this exact command against aarch64-pc-windows-msvc locally via
-      # `cargo xwin` and getting the same (clean) result. Linting both would
-      # double Windows runner-minutes for no additional coverage.
-      - name: Install cargo-hack
-        id: install-cargo-hack
-        if: ${{ !cancelled() && matrix.os == 'windows' && matrix.arch == 'amd64' }}
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack@0.6
-
+      # Runs on amd64 only, not arm64 (matrix.lint is set on this entry only):
+      # nothing in this crate's Windows code is `cfg(target_arch = ...)`-gated
+      # (checked: no such attribute exists in the tree), so the two arches
+      # type-check and lint identically. Linting both would double Windows
+      # runner-minutes for no additional coverage.
       - name: Clippy (feature powerset)
-        if: ${{ !cancelled() && steps.install-cargo-hack.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' }}
-        run: cargo hack clippy --locked --target ${{ matrix.target }} --all-targets --feature-powerset -- -D warnings
+        if: ${{ !cancelled() && matrix.lint }}
+        uses: ./.github/actions/clippy-powerset
+        with:
+          target: ${{ matrix.target }}
 
       # Release lane (debug_assertions off): exercises the calm-release arm of the
       # should_panic oracles in the macOS-gated kinfo_tests.rs.
