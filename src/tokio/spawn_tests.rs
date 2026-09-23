@@ -293,3 +293,43 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
+
+/// On the identity-failure path, a child tokio could not kill (`EPERM`) goes to tokio's orphan
+/// queue, which reaps it once it exits. The leaf, having taken its verdict first, answers only for
+/// the tree — its kill through the leaf — and never reaps that child as an abandoned spawn's,
+/// which would race tokio's reap for the same pid.
+///
+/// The leaf may be left behind: its `Drop` removes it right after `cgroup.kill`, without waiting
+/// for the kill to land — a known exit-lag gap, not this.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio() {
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let _ = crate::containment::cgroup::fault::take_reaped_orphans();
+    fault::set_force_identity_vanished(true);
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-identity-eperm-4c19",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let mut cmd = blocker();
+    cmd.contain();
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    err.expect("forced identity-vanish must make spawn return Err");
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    let _ = fault::take_captured();
+
+    assert_eq!(
+        crate::containment::cgroup::fault::take_reaped_orphans(),
+        Vec::new(),
+        "the leaf must not reap a child tokio owns"
+    );
+}

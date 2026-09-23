@@ -2296,6 +2296,42 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     assert!(reaped(&pidfd), "the child must be reaped once it exits");
 }
 
+/// An abandoned child is killed as the process group it leads: what it forked after `exec` is in
+/// that group, whether or not it is in the leaf. Here the leaf's own kill kills nothing (a
+/// directory, not a cgroup), so only the group kill can end the descendant, which holds the
+/// child's stdout: reading it to EOF proves both dead. A regression hangs this test on the read.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_is_killed_with_the_group_it_leads() {
+    use std::io::{BufRead, Read};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-group");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    let mut child = spawn_placing(
+        &leaf,
+        &["/bin/sh", "-c", "sleep 300 & echo forked; wait"],
+        false,
+        std::process::Stdio::piped(),
+    );
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read the child's line");
+    assert_eq!(
+        line, "forked\n",
+        "the descendant must exist before the spawn is abandoned"
+    );
+    drop(child);
+
+    drop(leaf);
+
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("read to EOF: every process holding stdout is dead");
+}
+
 /// A child cosca gives up on is killed as a group: between the last look at its report and the
 /// kill it can report, exec, and fork, and what it forks is in its process group, not the leaf.
 /// Each process in the tree holds the child's stdout, so reading it to EOF proves all are dead.
