@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS,
@@ -34,6 +35,11 @@ use windows::Win32::UI::Shell::{
     SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+/// `ERROR_FILE_NOT_FOUND` as the HRESULT `ShellExecuteExW` fails with (measured).
+const FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
+/// `ERROR_NO_ASSOCIATION` as an HRESULT: the class has no command for the verb (measured).
+const NO_ASSOCIATION: i32 = 0x8007_0483_u32 as i32;
 
 const APP: &str = "cosca_probe_a.exe";
 const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\cosca_probe_a.exe";
@@ -145,10 +151,42 @@ fn uac_policy(name: &str) -> String {
     }
 }
 
-/// Launch `file` in `dir` through `ShellExecuteExW(verb)`, optionally as `class`, and return the
-/// `image=` line the payload wrote, or why there is none.
-fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<String, String> {
+/// What a payload run reported: the image it was loaded from.
+#[derive(Debug)]
+struct Report {
+    image: String,
+}
+
+/// Why a launch produced no report.
+#[derive(Debug)]
+enum Failure {
+    /// `ShellExecuteExW` failed with this HRESULT.
+    Shell(i32),
+    Other(#[expect(dead_code, reason = "read through `Debug`, in failure messages")] String),
+}
+
+/// Launch `file` in `dir` through `ShellExecuteExW(verb)`, optionally as `class`, from a
+/// single-threaded COM apartment as cosca's own launch does, and return what the payload reported.
+fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<Report, Failure> {
     let _ = std::fs::remove_file(report);
+    // SAFETY: paired with the `CoUninitialize` below on this thread.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    if com.is_err() {
+        return Err(Failure::Other(format!("CoInitializeEx: {com:?}")));
+    }
+    let launched = launch_in_apartment(verb, file, dir, class, report);
+    // SAFETY: balances the successful `CoInitializeEx` above.
+    unsafe { CoUninitialize() };
+    launched
+}
+
+fn launch_in_apartment(
+    verb: &str,
+    file: &OsStr,
+    dir: &Path,
+    class: Option<&str>,
+    report: &Path,
+) -> Result<Report, Failure> {
     let verb = wide(OsStr::new(verb));
     let file_w = wide(file);
     let params = wide(OsStr::new(&format!("--report-to \"{}\"", report.display())));
@@ -169,9 +207,11 @@ fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Pa
         sei.lpClass = PCWSTR(class_w.as_ptr());
     }
     // SAFETY: every string field points at a NUL-terminated buffer that outlives the call.
-    unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| format!("ShellExecuteExW failed: {e}"))?;
+    unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| Failure::Shell(e.code().0))?;
     if sei.hProcess.is_invalid() {
-        return Err("ShellExecuteExW succeeded without a process handle".into());
+        return Err(Failure::Other(
+            "ShellExecuteExW succeeded without a process handle".into(),
+        ));
     }
     // The child is `cosca_testbin_image`, which exits on its own once it has written the report.
     // SAFETY: `hProcess` is a live process handle owned here, closed once below.
@@ -181,10 +221,12 @@ fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Pa
     let _ = unsafe { GetExitCodeProcess(sei.hProcess, &mut code) };
     // SAFETY: as above.
     let _ = unsafe { CloseHandle(sei.hProcess) };
-    let body = std::fs::read_to_string(report).map_err(|e| format!("exit {code}, no report: {e}"))?;
-    body.lines()
-        .find_map(|l| l.strip_prefix("image=").map(str::to_string))
-        .ok_or_else(|| format!("exit {code}, report without image=: {body:?}"))
+    let body = std::fs::read_to_string(report).map_err(|e| Failure::Other(format!("exit {code}, no report: {e}")))?;
+    let line = |prefix: &str| body.lines().find_map(|l| l.strip_prefix(prefix).map(str::to_string));
+    match line("image=") {
+        Some(image) => Ok(Report { image }),
+        _ => Err(Failure::Other(format!("exit {code}, incomplete report: {body:?}"))),
+    }
 }
 
 fn mark_passed() {
@@ -263,7 +305,7 @@ fn layout() -> Layout {
     }
 }
 
-fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Option<&str>) -> Result<String, String> {
+fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Option<&str>) -> Result<Report, Failure> {
     let got = launch(verb, file, dir, class, &l.report);
     println!(
         "{label}: verb={verb} file={file:?} dir={} class={class:?} -> {got:?}",
@@ -272,8 +314,12 @@ fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Opt
     got
 }
 
-fn ends_with(got: &Result<String, String>, path: &Path) -> bool {
-    got.as_deref().is_ok_and(|i| same_file(i, path))
+fn ends_with(got: &Result<Report, Failure>, path: &Path) -> bool {
+    got.as_ref().is_ok_and(|r| same_file(&r.image, path))
+}
+
+fn failed_with(got: &Result<Report, Failure>, hresult: i32) -> bool {
+    matches!(got, Err(Failure::Shell(code)) if *code == hresult)
 }
 
 /// Canary: with `SEE_MASK_CLASSNAME` and `lpClass = "exefile"`, `runas` runs a FULL path — an
@@ -284,7 +330,7 @@ fn ends_with(got: &Result<String, String>, path: &Path) -> bool {
 fn classname_runas_needs_a_full_path() {
     let l = layout();
     let mut failures: Vec<String> = Vec::new();
-    let mut check = |ok: bool, what: &str, got: &Result<String, String>| {
+    let mut check = |ok: bool, what: &str, got: &Result<Report, Failure>| {
         if !ok {
             failures.push(format!("{what}: {got:?}"));
         }
@@ -306,7 +352,7 @@ fn classname_runas_needs_a_full_path() {
         Some("exefile"),
     );
     check(
-        got.is_err(),
+        failed_with(&got, FILE_NOT_FOUND),
         "with exefile, a bare name is not found in lpDirectory",
         &got,
     );
@@ -336,7 +382,7 @@ fn classname_runas_needs_a_full_path() {
         &l.dir_empty,
         Some("comfile"),
     );
-    check(got.is_err(), "comfile has no runas verb", &got);
+    check(failed_with(&got, NO_ASSOCIATION), "comfile has no runas verb", &got);
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let mut new_path = OsString::from(l.dir_path.as_os_str());
@@ -353,7 +399,11 @@ fn classname_runas_needs_a_full_path() {
         "without a class, a bare name is found on PATH",
         &without,
     );
-    check(with.is_err(), "with exefile, a bare name is not found on PATH", &with);
+    check(
+        failed_with(&with, FILE_NOT_FOUND),
+        "with exefile, a bare name is not found on PATH",
+        &with,
+    );
 
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
@@ -384,8 +434,8 @@ fn exefile_skips_the_app_paths_lookup() {
                 failures.push(format!("{label} {verb} without a class should load b: {plain:?}"));
             }
             let classed = run(&l, label, verb, app, &l.dir_empty, Some("exefile"));
-            if ends_with(&classed, &l.b) {
-                failures.push(format!("{label} {verb} as exefile was redirected to b"));
+            if !failed_with(&classed, FILE_NOT_FOUND) {
+                failures.push(format!("{label} {verb} as exefile should find nothing: {classed:?}"));
             }
         }
         drop(key);
