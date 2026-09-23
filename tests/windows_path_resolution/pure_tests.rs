@@ -1,4 +1,5 @@
-//! Tests for `pure.rs`. Not `#[ignore]`d: they check the canary's own logic, not the platform.
+//! Tests for `pure.rs`, run on every host by `windows_path_logic`. They check the canary's own
+//! logic, not the platform.
 
 use super::pure::*;
 

@@ -28,19 +28,18 @@
 //! cargo test --test windows_path_resolution -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! `#[ignore]`d so that an ordinary `cargo test` never mistakes a platform measurement for
-//! coverage of cosca. Only `pure_tests`, which check the canary's own string logic, run by default. `GetFullPathNameW` works on the string alone and touches no disk or network,
-//! so UNC and device inputs here reach no server or device. The file and spawn tests write only
-//! inside a `tempfile` directory of their own and launch only `cosca_testbin_image`. Nothing here
-//! runs a batch file or needs elevation. Temp directories are removed on drop and planted files
+//! `#[ignore]`d so that an ordinary `cargo test` never mistakes a platform measurement for coverage
+//! of cosca. The canary's own string logic is tested by `windows_path_logic`, which runs by default
+//! on every host. `GetFullPathNameW` works on the string alone and touches no disk or network, so
+//! UNC and device inputs here reach no server or device. The file and spawn tests write only inside
+//! a `tempfile` directory of their own and launch only `cosca_testbin_image`. Nothing here runs a
+//! batch file or needs elevation. Temp directories are removed on drop and planted files
 //! explicitly, but a removal failure is only printed; whatever it leaves goes with the ephemeral
 //! runner.
 #![cfg(windows)]
 
 #[path = "windows_path_resolution/pure.rs"]
 mod pure;
-#[path = "windows_path_resolution/pure_tests.rs"]
-mod pure_tests;
 
 use std::sync::OnceLock;
 

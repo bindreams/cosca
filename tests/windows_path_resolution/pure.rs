@@ -1,4 +1,5 @@
-//! The canary's string and buffer logic, free of Win32 so it can be tested by ordinary `cargo test`.
+//! The canary's string and buffer logic, free of Win32 so `windows_path_logic` can test it on every
+//! host.
 
 /// `path` spelled so the file APIs take it literally: `\\?\` and `\??\` paths as given, a device
 /// path `\\.\X` as `\\?\X`, a UNC path under `\\?\UNC\`, anything else behind `\\?\`.
