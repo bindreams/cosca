@@ -228,7 +228,7 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
-            "$0" cgroup --nocapture --test-threads=1
+            "$0" cgroup --include-ignored --nocapture --test-threads=1
             exec "$1" cgroup --include-ignored --nocapture --test-threads=1
           ' "$BIN" "$LIB_BIN"
 

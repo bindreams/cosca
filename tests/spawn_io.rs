@@ -1103,20 +1103,19 @@ fn drop_kills_contained_tree() {
     }
 }
 
-// cgroup v2 integration test =====
-// Runs only on Linux, and only when the CI provisions a delegated cgroup
-// (COSCA_TEST_CGROUP=1). The env guard means this is a true no-op when
-// unprovisioned, but FAILS loudly when the marker is set but the cgroup is
-// unavailable (the test asserts CgroupV2, so it won't silently pass).
+// cgroup v2 integration tests =====
+// Linux only, and `#[ignore]`d: they need a delegated cgroup, which CI provisions and then runs
+// them with `--include-ignored` and COSCA_TEST_CGROUP=1. Run without the marker, each fails
+// loudly rather than pass having tested nothing.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        // Unprovisioned: skip (not CI-cgroup environment). The live cgroup test
-        // requires COSCA_TEST_CGROUP=1 and a delegated cgroup slice.
-        return;
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     // COSCA_TEST_CGROUP is set: a usable delegated cgroup must exist.
     // If try_create_leaf() returns None, containment falls back to ProcessGroup
     // and the assert below will fail loudly — that's intentional.
@@ -1141,16 +1140,16 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
 /// `terminate_tree` under cgroup v2 containment. Mirrors the kill_tree cgroup
 /// test but exercises the SIGTERM path (`CgroupLeaf::terminate` SIGTERMs every
 /// pid in cgroup.procs). The control-block grandchild has no SIGTERM handler so
-/// the default action kills it. Gated on COSCA_TEST_CGROUP — a true no-op
-/// when unprovisioned, but FAILS loudly (CgroupV2 assertion) when the marker is
-/// set without a usable delegated cgroup. Proof of death: grandchild socket EOF.
+/// the default action kills it. Proof of death: grandchild socket EOF.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(
         child.containment(),
@@ -1213,13 +1212,15 @@ fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
 /// child share one CPU here, which makes that the common outcome rather than a rare one.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     use std::io::BufRead;
 
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
     // `sh` backgrounds the worker without waiting for its exec, so the root exits at once.
@@ -1290,13 +1291,15 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 /// slot, and with 2 closed a failing assertion's message would go nowhere.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     const NAME: &str = "linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child";
 
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     if let Ok(slots) = std::env::var(CLOSED_SLOTS_ENV) {
         let deny_pidfd = std::env::var_os(DENY_PIDFD_ENV).is_some();
         return spawn_with_slots_closed(&parse_closed_slots(&slots), deny_pidfd);
@@ -1308,7 +1311,7 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
         .flat_map(|deny| slot_cases.map(|slots| (slots, deny)))
         .filter_map(|(slots, deny)| {
             let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-            run.args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            run.args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
                 .env(CLOSED_SLOTS_ENV, slots);
             if deny {
                 run.env(DENY_PIDFD_ENV, "1");
@@ -1634,11 +1637,13 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
 /// live child would spend the supervisor's fd limit on children it no longer needs it for.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
     stderr_log::install();
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
 
