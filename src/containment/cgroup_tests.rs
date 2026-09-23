@@ -1157,11 +1157,28 @@ fn each_placement_report_is_its_own_condition() {
     );
 }
 
-/// Every reason carries its OWN kind. Two reasons sharing one kind would make the second one
-/// ever seen silently arrive at `debug` — the exact silence this PR removes, reintroduced.
+/// Every reason carries its OWN kind, and every kind has a reason here. Two reasons sharing one
+/// kind would make the second one ever seen silently arrive at `debug` — the exact silence this
+/// PR removes, reintroduced.
 #[test]
 fn every_degrade_reason_has_its_own_kind() {
-    use super::DegradeReason;
+    use super::{DegradeKind, DegradeReason};
+
+    // Exhaustive, so a new kind does not compile until it is counted here and given a reason
+    // below.
+    let counted = |kind: DegradeKind| match kind {
+        DegradeKind::ReadProcSelfCgroup
+        | DegradeKind::NoUnifiedLine
+        | DegradeKind::CreateLeafDir
+        | DegradeKind::KillUnsupported
+        | DegradeKind::CheckKill
+        | DegradeKind::OpenProcs
+        | DegradeKind::OpenReportChannel
+        | DegradeKind::PidfdUnavailable
+        | DegradeKind::PlacementNotReported
+        | DegradeKind::PlacementWriteFailed => (),
+    };
+    const KINDS: usize = 10;
 
     let reasons: Vec<Box<dyn DegradeReason>> = vec![
         Box::new(LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13))),
@@ -1200,13 +1217,19 @@ fn every_degrade_reason_has_its_own_kind() {
             source: std::io::Error::from_raw_os_error(13),
             report: NotEntered::WriteFailed(16),
         }),
+        Box::new(NotPlaced::Unwaitable {
+            pid: 1,
+            source: std::io::Error::from_raw_os_error(libc::EMFILE),
+        }),
     ];
     let mut seen = Vec::new();
     for reason in &reasons {
         let kind = reason.condition().kind;
+        counted(kind);
         assert!(!seen.contains(&kind), "{kind:?} is claimed by two different reasons");
         seen.push(kind);
     }
+    assert_eq!(seen.len(), KINDS, "every kind needs a reason here: {seen:?}");
 }
 
 // /proc/self/cgroup summary -----
