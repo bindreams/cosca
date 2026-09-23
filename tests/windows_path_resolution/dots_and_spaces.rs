@@ -115,56 +115,52 @@ fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
 /// names `C:\dir\`. A model of verbatim paths has to read the literal string, not this result. If
 /// Win32 began honouring the prefix here, the two readings would converge.
 ///
-/// The trailing-separator rows are printed, not asserted. `C:\dir\x` must come back untouched, or
-/// the probe itself is broken.
+/// Every row is asserted, result and `lpFilePart` both, with the values measured identically on x64
+/// and arm64 (https://github.com/bindreams/cosca/actions/runs/35801867046). The verbatim result is
+/// the plain one behind `\\?\`, except for a final `..`: plain `C:\dir\..` is `C:\`, verbatim
+/// `\\?\C:\dir\..` is `\\?\C:` naming `C:`. `C:\dir\x` must come back untouched, or the probe
+/// itself is broken.
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
 fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
-    // (tail, note, stripped): `stripped` tails lose the whole final component without a trailing
-    // separator, in either spelling.
-    let tails = [
-        ("...", "three dots", true),
-        ("....", "four dots", true),
-        (". ", "`.` plus a space", true),
-        (" ", "a single space", true),
-        (".. .", "neither `.` nor `..`, but trims to `..`", true),
-        ("..", "the parent-directory component", false),
-        (".", "the self component", false),
-        ("x", "control: an ordinary name", false),
+    // (what follows `C:\dir\`, the plain result, its lpFilePart)
+    const MEASURED: &[(&str, &str, Option<&str>)] = &[
+        ("...", r"C:\dir\", None),
+        (r"...\", r"C:\dir\...\", None),
+        ("....", r"C:\dir\", None),
+        (r"....\", r"C:\dir\....\", None),
+        (". ", r"C:\dir\", None),
+        (r". \", r"C:\dir\. \", None),
+        (" ", r"C:\dir\", None),
+        (r" \", r"C:\dir\ \", None),
+        (".. .", r"C:\dir\", None),
+        (r".. .\", r"C:\dir\.. \", None),
+        ("..", r"C:\", None),
+        (r"..\", r"C:\", None),
+        (".", r"C:\dir", Some("dir")),
+        (r".\", r"C:\dir\", None),
+        ("x", r"C:\dir\x", Some("x")),
+        (r"x\", r"C:\dir\x\", None),
     ];
     canary("Windows", |facts, failures| {
         report_roots(&[r"C:\dir", r"C:\"]);
-        for (tail, note, stripped) in tails {
-            println!("--- {tail:?}  ({note})");
+        for &(tail, plain, plain_part) in MEASURED {
             for prefix in ["", r"\\?\"] {
-                for trailing_sep in ["", r"\"] {
-                    let input = format!(r"{prefix}C:\dir\{tail}{trailing_sep}");
-                    match full_path_name_parts(&input) {
-                        Ok((resolved, part)) => {
-                            let shown = part
-                                .as_ref()
-                                .map_or_else(|| "<none: names a directory>".to_string(), |p| format!("{p:?}"));
-                            let verdict = if resolved == input { "unchanged" } else { "REWRITTEN" };
-                            println!("  {input:?} -> {resolved:?}  file_part={shown}  [{verdict}]");
-                            if trailing_sep.is_empty() && stripped {
-                                let want = format!(r"{prefix}C:\dir\");
-                                facts.check(
-                                    resolved == want && part.is_none(),
-                                    &format!("{input:?} is stripped to the directory {want:?}"),
-                                    format_args!("{resolved:?} with file_part={shown}"),
-                                );
-                            }
-                            if tail == "x" {
-                                facts.check(
-                                    resolved == input,
-                                    &format!("control {input:?} comes back unchanged"),
-                                    format_args!("{resolved:?}"),
-                                );
-                            }
-                        }
-                        Err(why) if (trailing_sep.is_empty() && stripped) || tail == "x" => failures.push(why),
-                        Err(why) => println!("  {why}  [printed row: not asserted]"),
+                let input = format!(r"{prefix}C:\dir\{tail}");
+                let (want, want_part) = match (prefix, tail) {
+                    (r"\\?\", "..") => (r"\\?\C:".to_string(), Some("C:")),
+                    _ => (format!("{prefix}{plain}"), plain_part),
+                };
+                match full_path_name_parts(&input) {
+                    Ok((resolved, part)) => {
+                        println!("  {input:?} -> {resolved:?}  file_part={part:?}");
+                        facts.check(
+                            resolved == want && part.as_deref() == want_part,
+                            &format!("{input:?} resolves to {want:?} with file_part={want_part:?}"),
+                            format_args!("{resolved:?} with file_part={part:?}"),
+                        );
                     }
+                    Err(why) => failures.push(why),
                 }
             }
         }
