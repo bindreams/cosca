@@ -1,0 +1,47 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# devvm guest: linux-x64 — for cgroup v2 lanes, cross-arch-emulated (TCG) on an Apple
+# Silicon host, natively virtualized (KVM/HVF) on an x86-64 host.
+#
+# Not meant to be run directly with `vagrant up` in this directory — use
+# `scripts/devvm.py up linux-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_REPO_ROOT so
+# all state lands under .tmp/devvm/ in the worktree, never in the box's own directory.
+#
+# Box: generic/ubuntu2204, provider qemu, version pinned below. Built by roboxes/generic;
+# Ubuntu 22.04's systemd (249) defaults to the unified cgroup v2 hierarchy.
+
+require_relative "../_shared/fix_macos_port_check"
+
+REPO_ROOT = ENV.fetch("DEVVM_REPO_ROOT")
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "generic/ubuntu2204"
+  config.vm.box_version = "4.3.12"
+  # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
+  # host silently excludes it from "usable providers" and `up` fails with a misleading "box
+  # doesn't support requested provider" error, even though the box does publish a qemu
+  # provider — it's just for the wrong (host) architecture unless told otherwise. Harmless
+  # (a no-op match) on an actual x86-64 host.
+  config.vm.box_architecture = "amd64"
+  config.vm.hostname = "cosca-devvm-linux-x64"
+
+  config.vm.provider "qemu" do |qe|
+    qe.arch = "x86_64"
+    qe.memory = "4096"
+    qe.smp = "2"
+    # This host may already have unrelated VMs (this tool's or not) holding the default
+    # forwarded port; let Vagrant pick a free one instead of failing `up`.
+    qe.ssh_auto_correct = true
+  end
+
+  # A one-shot rsync push, not a live mount: the guest cannot write back into the host's
+  # source tree. Files land read-only (F444); directories stay writable (D755) so later
+  # `devvm.py sync` runs can still add/remove/replace files.
+  config.vm.synced_folder REPO_ROOT, "/home/vagrant/cosca",
+    type: "rsync",
+    rsync__exclude: [".git/", "target/", ".tmp/"],
+    rsync__args: ["--archive", "--delete", "--chmod=D755,F444"]
+
+  config.vm.provision "shell", path: "../../provision/linux-rust.sh", privileged: false
+end

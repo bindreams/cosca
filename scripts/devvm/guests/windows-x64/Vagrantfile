@@ -1,0 +1,79 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# devvm guest: windows-x64 — the production consent route (ShellExecuteExW("runas") from an
+# unelevated process). Cross-arch-emulated (TCG) on an Apple Silicon host, so first boot of
+# a fresh install can be very slow; see scripts/README.md#windows-guests for measured
+# timings and the "too slow" escape hatch.
+#
+# Not meant to be run directly with `vagrant up` in this directory — use
+# `scripts/devvm.py up windows-x64`, which sets VAGRANT_DOTFILE_PATH, DEVVM_REPO_ROOT and
+# DEVVM_STAGE_DIR so all state lands under .tmp/devvm/ in the worktree, never in the box's
+# own directory, and DEVVM_WINDOWS_AUTO_CONSENT so the UAC opt-in toggle only turns on when
+# `devvm.py up --allow-elevation` asked for it.
+#
+# Box: stromweld/windows-10, provider qemu, version pinned below. A "vanilla Windows 10"
+# box built with Bento (chef-io/bento) from Microsoft's free evaluation media — evaluation
+# Windows installs activate on a timer and expire (commonly 90 days for Windows 10
+# Enterprise eval); when this box's Windows install expires, `vagrant box update` /
+# repointing the version pin to a newer build is the fix, not disabling activation checks.
+#
+# UAC / account model: the box's default "vagrant" account is an ordinary Administrators
+# member, distinct from the built-in RID-500 Administrator (which Windows elevates without
+# a prompt) — see provision/windows-account-and-uac.ps1, which also verifies this on every
+# provision run rather than assuming it silently.
+#
+# This guest is headless by default (`-display none`, the vagrant-qemu default) - it can run
+# scripted probes and inspect their results (return codes, event logs, spawned process
+# trees), but a WinRM/PowerShell-remoting session is not the interactive console session, so
+# it cannot itself render or click through the secure-desktop UAC prompt. For a probe that
+# needs a human (or UI automation) to see the prompt, add a display to the `qemu` provider
+# block below (e.g. `qe.other_default = %w(-parallel null -monitor none -vga std -display
+# cocoa)`) and connect to the console, or RDP into the guest.
+
+require_relative "../_shared/fix_macos_port_check"
+
+REPO_ROOT = ENV.fetch("DEVVM_REPO_ROOT")
+STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "stromweld/windows-10"
+  config.vm.box_version = "202503.09.0"
+  # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
+  # host silently excludes it from "usable providers" and `up` fails with a misleading "box
+  # doesn't support requested provider" error, even though the box does publish a qemu
+  # provider — it's just for the wrong (host) architecture unless told otherwise.
+  config.vm.box_architecture = "amd64"
+  config.vm.guest = :windows
+  config.vm.communicator = "winrm"
+  config.winrm.username = "vagrant"
+  config.winrm.password = "vagrant"
+
+  # A fresh install booting under TCG (cross-arch emulation) can be extremely slow — give it
+  # a lot of room rather than fail a merely-slow-not-stuck boot.
+  config.vm.boot_timeout = 3600
+  config.winrm.timeout = 3600
+  config.vm.graceful_halt_timeout = 600
+
+  config.vm.provider "qemu" do |qe|
+    qe.arch = "x86_64"
+    qe.machine = "q35"
+    qe.cpu = "max"
+    qe.net_device = "virtio-net-pci"
+    qe.memory = "4096"
+    qe.smp = "2"
+    # This host may already have unrelated VMs (this tool's or not) holding the default
+    # forwarded port; let Vagrant pick a free one instead of failing `up`.
+    qe.ssh_auto_correct = true
+  end
+
+  # No live synced folder for Windows (no rsync binary on the box, and SMB needs a macOS
+  # File Sharing toggle + password prompt). Instead, `devvm.py sync` stages a filtered copy
+  # of the tree on the host (excluding .git/target/.tmp) and this "file" provisioner uploads
+  # it over WinRM — a one-shot copy, not a live mount, same "guest can't write back into the
+  # host tree" property the Linux guests get from rsync.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca", run: "always"
+  config.vm.provision "shell", path: "../../provision/windows-lock-tree.ps1", privileged: true, run: "always"
+  config.vm.provision "shell", path: "../../provision/windows-account-and-uac.ps1", privileged: true, run: "always"
+end
