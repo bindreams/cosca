@@ -243,6 +243,14 @@ impl Command {
     /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
     /// unresolved.
     ///
+    /// Nor does an elevated spawn refuse a `.bat`/`.cmd` that only Win32's normalisation
+    /// exposes. The batch check reads the name as written, so `C:\t\setup.bat.` (trailing
+    /// dot), `C:\t\setup.bat ` (one trailing space) and `C:\t\.bat` pass it, and `.elevate()`
+    /// can still run the batch file through `cmd.exe` with its arguments unescaped
+    /// (CVE-2024-24576) — whether through `ShellExecuteEx` or, from an already-elevated
+    /// caller, through `CreateProcessW`. [`raw_executable`](Self::raw_executable) refuses
+    /// all three.
+    ///
     /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
     /// replaces the other.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
