@@ -37,6 +37,24 @@ jobs:
         shell: bash
         run: bash .github/scripts/release-script-tests.sh
 
+      # The prek `cargo-clippy` hook above calls .github/scripts/clippy.sh with
+      # neither --target nor --feature-powerset (host, no features) — this crate
+      # declares no `default` feature, so the unix-only tokio/pty/serde code
+      # paths (and any feature-gated dead code among them) are never linted by
+      # the hook alone.
+      #
+      # Placed after the local-parity checks above, not right after checkout: a
+      # clippy failure there would skip every later step (their implicit
+      # `if: success()`), hiding `Test release helper scripts`'s result.
+      #
+      # `!cancelled()` is the one step in this job that overrides that implicit
+      # `success()`: it makes this step run even after an earlier step in the
+      # job has failed, so the lint result is always reported instead of being
+      # hidden behind an earlier failure.
+      - name: Clippy (feature powerset)
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/clippy-powerset
+
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
@@ -55,6 +73,9 @@ jobs:
             arch: arm64
             runner: macos-latest
             target: aarch64-apple-darwin
+            # This is the one darwin lane that also runs the feature-powerset
+            # Clippy step below; see there for why one arch stands in for both.
+            lint: true
           - os: darwin
             arch: amd64
             runner: macos-15
@@ -138,39 +159,43 @@ jobs:
               ;;
           esac
 
+      # Release lane (debug_assertions off): exercises the calm-release arm of the
+      # should_panic oracles in the macOS-gated kinfo_tests.rs.
+      - name: Unit tests (release — debug_assertions off)
+        if: matrix.os == 'darwin'
+        run: cargo test --locked --release --lib --target ${{ matrix.target }}
+
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
-      # backend) is otherwise never linted: the `lint` job only runs on
-      # ubuntu-latest, so clippy never type-checks it against a Windows target.
+      # backend) and `cfg(target_os = "macos")` code are otherwise never
+      # linted: the `lint` job only runs on ubuntu-latest, so clippy never
+      # type-checks either against a Windows or macOS target.
       #
       # --feature-powerset, not --all-features: this crate has real dead_code
       # gaps that only a default-features-only build exposes, which
       # --all-features alone never catches.
       #
-      # Placed after the test steps, not right after Build: a clippy failure
-      # there would skip every later step (their implicit `if: success()`),
-      # hiding test results.
+      # Placed after the test steps above (including the darwin-only release
+      # lane just above), not right after Build: a clippy failure there would
+      # skip every later step (their implicit `if: success()`), hiding test
+      # results.
       #
       # `!cancelled()` is the one step in this job that overrides that implicit
       # `success()`: it makes this step run even after an earlier step in the
       # job has failed, so the lint result is always reported instead of being
       # hidden behind an earlier failure.
       #
-      # Runs on amd64 only, not arm64 (matrix.lint is set on this entry only):
-      # nothing in this crate's Windows code is `cfg(target_arch = ...)`-gated
-      # (checked: no such attribute exists in the tree), so the two arches
-      # type-check and lint identically. Linting both would double Windows
-      # runner-minutes for no additional coverage.
+      # Runs once per OS (windows/amd64, darwin/arm64), not once per arch
+      # (matrix.lint is set on exactly these two entries): nothing in this
+      # crate's Windows or macOS code is `cfg(target_arch = ...)`-gated
+      # (checked: no such attribute exists in the tree), so within each OS the
+      # two arches type-check and lint identically. Linting every arch would
+      # double the Windows and macOS runner-minutes spent on lint for no
+      # additional coverage.
       - name: Clippy (feature powerset)
         if: ${{ !cancelled() && matrix.lint }}
         uses: ./.github/actions/clippy-powerset
         with:
           target: ${{ matrix.target }}
-
-      # Release lane (debug_assertions off): exercises the calm-release arm of the
-      # should_panic oracles in the macOS-gated kinfo_tests.rs.
-      - name: Unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin'
-        run: cargo test --locked --release --lib --target ${{ matrix.target }}
 
       # Live cgroup v2 containment tests are gated behind COSCA_TEST_CGROUP
       # (a no-op without it). They need a cgroup the supervisor may create child
