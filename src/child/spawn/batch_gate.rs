@@ -71,7 +71,7 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 
 /// PURE given `win32`: the gate's rule with the platform as DATA rather than a `cfg!` buried in
 /// it, so one host can ask for either verdict — the same reason `elevation::plan::Host` carries
-/// its `Os`. Both are pinned from any host by `spawn_tests`, which matters because the Windows
+/// its `Os`. Both are pinned from any host by `batch_gate_tests`, which matters because the Windows
 /// branch — the whole `win32_effective_file_name` -> `is_batch_program` composition, where every
 /// subtlety lives — would otherwise be covered by the two Windows CI lanes alone. Reading `cfg!`
 /// here would have let a regression back to the extension-based reading pass unnoticed off
