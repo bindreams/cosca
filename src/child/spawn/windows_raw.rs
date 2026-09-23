@@ -58,6 +58,9 @@ use crate::stdio::{Fd, ResolvedStdio};
 /// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
 /// through the MSVCRT `lpReserved2` table), contained (Job Object / TreeWalk) or uncontained.
 pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
+    // Test-only: witness that this backend actually ran, for the argv-only + fd >= 3 route, which
+    // has no argv[0]-independence signal of its own (see `raw_backend_observe`'s doc).
+    crate::child::spawn::raw_backend_observe::record_used_raw_backend();
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd)?;

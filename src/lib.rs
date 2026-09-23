@@ -34,6 +34,19 @@ pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     child::spawn::spawn_lock()
 }
 
+/// Test-only: did the LAST spawn on THIS thread actually run through the raw `CreateProcessW`
+/// backend (`child::spawn::raw_backend_observe`)? An argv-only command routed there purely via
+/// fd >= 3 has no argv[0]-independence signal to prove it (unlike an `executable()` leg — see
+/// `tests/windows_creation_flags.rs`), so this crate's OWN integration tests (`tests/*.rs`, a
+/// separate compilation unit that cannot name a `pub(crate)` item) need this instead. Take
+/// semantics: reading resets it. `#[doc(hidden)]`: not public API, present only for this crate's
+/// own `tests/` binaries to link against.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn test_take_used_raw_backend() -> bool {
+    child::spawn::raw_backend_observe::take_used_raw_backend()
+}
+
 mod command;
 // Off Windows only the `Exact` completion (`resolve::exact`) is consumed, so the lib build sees
 // the search policy as dead. The module is deliberately NOT cfg-gated: keeping it platform-independent is what makes
