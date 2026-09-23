@@ -11,10 +11,9 @@ use super::{drive_len, is_sep, path_type, windows_prefix_len, PathType};
 
 /// `rest` appended to the directory `base`, a separator `sep` between them.
 ///
-/// A verbatim (`\\?\`) base is normalised as std's `PathBuf::push` normalises one: `rest` is split
-/// on both separators, `.` dropped, `..` popped but never into the prefix and root, and each
-/// remaining component joined with `\`. Win32 passes a verbatim path through unparsed, so a `.`,
-/// `..` or `/` left in it would name nothing.
+/// A verbatim (`\\?\`) base is rebuilt as std's `PathBuf::push` rebuilds one; see
+/// `append_verbatim`. Win32 passes a verbatim path through unparsed, so a `.`, `..`, `/` or empty
+/// component left in it by a plain concatenation would name nothing.
 ///
 /// Any other base takes `rest` as units: Win32 reads the result itself. No separator follows a bare
 /// drive (`C:`), which is that drive's current directory, so the result stays drive-relative.
@@ -41,14 +40,12 @@ pub(crate) fn join(base: &OsStr, name: &OsStr, sep: &str) -> OsString {
     match path_type(name) {
         PathType::Rooted => {
             let bytes = base.as_encoded_bytes();
+            if is_verbatim(bytes) {
+                return append_verbatim(base, name);
+            }
             // SAFETY: a prefix ends at a boundary between whole WTF-8 substrings; see
             // `windows_prefix_len`.
             let prefix = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[..windows_prefix_len(bytes)]) };
-            if is_verbatim(bytes) {
-                let mut root = prefix.to_os_string();
-                root.push("\\");
-                return append_verbatim(&root, name);
-            }
             let mut out = prefix.to_os_string();
             out.push(name);
             out
@@ -62,32 +59,57 @@ fn is_verbatim(bytes: &[u8]) -> bool {
     bytes.starts_with(br"\\?\")
 }
 
-/// [`append`] on a verbatim base.
+/// One component of a verbatim path, as std's `Components` yields it.
+#[derive(Clone, Copy, PartialEq)]
+enum Part<'a> {
+    Cur,
+    Parent,
+    Normal(&'a [u8]),
+}
+
+/// [`append`] on a verbatim base, as std's `PathBuf::push` does it: the base's components (split on
+/// `\` alone after the prefix, empty ones dropped, `.` and `..` kept), then `rest`'s (split on both
+/// separators, `.` dropped; a leading separator clears back to the root; `..` pops only a normal
+/// component), rebuilt as the prefix, its root and the components joined with `\`. A verbatim prefix
+/// always has a root, so `\\?\C:` + `t` is `\\?\C:\t`.
 fn append_verbatim(base: &OsStr, rest: &OsStr) -> OsString {
     let bytes = base.as_encoded_bytes();
     let prefix = windows_prefix_len(bytes);
-    // Nothing at or before the root after the prefix is ever popped.
-    let floor = prefix + usize::from(bytes.get(prefix).is_some_and(|&b| is_sep(b, true)));
-    let mut out: Vec<u8> = bytes.to_vec();
-    for piece in rest.as_encoded_bytes().split(|&b| is_sep(b, true)) {
+    let mut parts: Vec<Part<'_>> = bytes[prefix..]
+        .split(|&b| b == b'\\')
+        .filter_map(|piece| match piece {
+            b"" => None,
+            b"." => Some(Part::Cur),
+            b".." => Some(Part::Parent),
+            piece => Some(Part::Normal(piece)),
+        })
+        .collect();
+    let rest = rest.as_encoded_bytes();
+    if rest.first().is_some_and(|&b| is_sep(b, true)) {
+        parts.clear();
+    }
+    for piece in rest.split(|&b| is_sep(b, true)) {
         match piece {
             b"" | b"." => {}
             b".." => {
-                while out.len() > floor && out.last().is_some_and(|&b| is_sep(b, true)) {
-                    out.pop();
-                }
-                match out[floor.min(out.len())..].iter().rposition(|&b| is_sep(b, true)) {
-                    Some(i) => out.truncate(floor + i),
-                    None => out.truncate(floor),
+                if let Some(Part::Normal(_)) = parts.last() {
+                    parts.pop();
                 }
             }
-            piece => {
-                if !out.last().is_some_and(|&b| is_sep(b, true)) {
-                    out.push(b'\\');
-                }
-                out.extend_from_slice(piece);
-            }
+            piece => parts.push(Part::Normal(piece)),
         }
+    }
+    let mut out: Vec<u8> = bytes[..prefix].to_vec();
+    out.push(b'\\');
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\\');
+        }
+        out.extend_from_slice(match part {
+            Part::Cur => b".",
+            Part::Parent => b"..",
+            Part::Normal(piece) => piece,
+        });
     }
     // SAFETY: built from whole WTF-8 substrings of `base` and `rest`, split and joined only at ASCII
     // separators.

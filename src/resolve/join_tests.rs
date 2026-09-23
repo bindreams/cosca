@@ -18,6 +18,15 @@ fn a_verbatim_base_is_normalised() {
         (r"\\?\C:\", "t.exe", r"\\?\C:\t.exe"),
         (r"\\?\C:\work\", "t.exe", r"\\?\C:\work\t.exe"),
         (r"\\?\UNC\srv\shr\d", r"..\..\t.exe", r"\\?\UNC\srv\shr\t.exe"),
+        // The base is rebuilt from its components too: empty ones dropped.
+        (r"\\?\C:\bin\\", "t.exe", r"\\?\C:\bin\t.exe"),
+        (r"\\?\C:\bin\\x", "t.exe", r"\\?\C:\bin\x\t.exe"),
+        (r"\\?\C:", "t.exe", r"\\?\C:\t.exe"),
+        // `..` pops only a normal component: a base's own `.` or `..` stays.
+        (r"\\?\C:\a\.\b", r"..\t.exe", r"\\?\C:\a\.\t.exe"),
+        (r"\\?\C:\a\..", r"..\t.exe", r"\\?\C:\a\..\t.exe"),
+        // After a verbatim prefix only `\` separates, so `a/b` is one component.
+        (r"\\?\C:\a/b", r"..\t.exe", r"\\?\C:\t.exe"),
     ] {
         assert_eq!(
             s(append(OsStr::new(base), OsStr::new(rest), "\\")),
@@ -62,5 +71,39 @@ fn a_name_joins_by_its_type() {
             want,
             "{base:?} + {name:?}"
         );
+    }
+}
+
+/// Held to std itself where std parses Windows paths: `PathBuf::push` on a verbatim base is the
+/// rule `append` claims to follow.
+#[cfg(windows)]
+#[test]
+fn a_verbatim_append_matches_std() {
+    for base in [
+        r"\\?\C:\work",
+        r"\\?\C:\bin\\",
+        r"\\?\C:",
+        r"\\?\C:\a\.\b",
+        r"\\?\C:\a\..",
+        r"\\?\C:\a/b",
+        r"\\?\UNC\srv\shr\d",
+    ] {
+        for rest in [
+            "t.exe",
+            "./t.exe",
+            "sub/../t.exe",
+            r"..\..\..\t.exe",
+            r"\t.exe",
+            "/t.exe",
+            r".\a\\b",
+        ] {
+            let mut want = std::path::PathBuf::from(base);
+            want.push(rest);
+            assert_eq!(
+                append(OsStr::new(base), OsStr::new(rest), "\\"),
+                want.into_os_string(),
+                "{base:?} + {rest:?}"
+            );
+        }
     }
 }
