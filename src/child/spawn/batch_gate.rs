@@ -105,8 +105,9 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 /// A ROOTED path never reaches the cwd at all, so it is refused for having the same shape rather
 /// than for the same danger — and what it clamps at depends on the root. A drive-rooted or
 /// drive-relative path clamps at a root with no name of its own (`C:\`, `\`), which is not a
-/// loadable image. A UNC path clamps at `\\server\share`, which DOES leave a named final
-/// component, and that name is judged like any other — see [`win32_effective_file_name`].
+/// loadable image, and nor does a device path, which clamps at `\\.\`. A UNC path clamps at
+/// `\\server\share`, which DOES leave a named final component, and that name is judged like any
+/// other — see [`win32_effective_file_name`].
 ///
 /// A verbatim (`\\?\`) path is judged by a rule of its own — see [`verbatim_refusal`].
 pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error> {
@@ -284,23 +285,27 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// does no I/O, so the share need not exist for that to happen.
 ///
 /// Server and share are POSITIONAL: Win32 takes the two segments after the `\\` without reading
-/// them, so a `.`, `..` or empty segment there is part of the root rather than an operation on it.
+/// them, so a `..`, dots-only or empty segment there is part of the root rather than an operation
+/// on it. A lone `.` or `?` in the server slot is the exception: that is a device root, below.
 /// That position has to be exact, not merely deep enough. A floor set one component too DEEP
 /// suppresses a pop Win32 performs, and the final name moves to a later component: skip the
 /// dots-only server in `\\...\x.bat\y\..` and the root becomes `x.bat\y`, the pop is clamped
 /// away, and the gate judges `y` while Win32 resolves `\\...\x.bat`.
 ///
-/// # A device path's root is `\\.\` alone, and the gate's is one deeper
+/// # A device root is `\\.\` alone, and `..` pops the device name
 ///
-/// Measured on x64 and arm64 runners, `..` pops past the device name: `\\.\C:\x.bat\..` resolves
-/// to `\\.\C:`, `\\.\C:\..` and `\\.\x.bat\..` to `\\.\`, and `\\.\pipe\x.bat\..` to `\\.\pipe`.
-/// The gate still reads a `\\.\` or `//?/` path with the UNC rule above, so it keeps the device
-/// name where Win32 pops it. That can only move a verdict at the point Win32 pops the device name,
-/// and Win32 then lands on the bare `\\.\`, which is no batch file: `\\.\x.bat\..` is refused for
-/// a batch name Win32 does not reach, and `\\.\C:\..` is accepted though the gate refuses the bare
-/// `\\.\` it resolves to as naming no file. Neither admits a batch file.
+/// A device path is not a UNC path with a `.` server. Measured on x64 and arm64 runners (the
+/// Windows path probe's `dotdot_stops_at_the_unc_share_but_not_at_a_device_name` canary):
+/// `\\.\C:\x.bat\..` resolves to `\\.\C:`, `\\.\C:\..` and `\\.\x.bat\y\..\..` to the bare
+/// `\\.\`, and `\\.\C:\..\..\x.bat` to `\\.\x.bat`. So the device name is an ordinary component —
+/// `\\.\C:` names `C:`, a device rather than a bare drive — and a path popped back to `\\.\`
+/// names no file, which is refused like any other.
 ///
-/// A literal `\\?\` never arrives: [`verbatim_refusal`] owns it.
+/// `?` in the same slot is the same root when any separator in the marker is a `/`: `//?/`,
+/// `\\?/`, `/\?\` and `\/?\` resolve like `\\?\` in `GetFullPathNameW`, and `//?/` and `\\?/` open
+/// `x.bat` through `x.bat.` like a plain path (measured, `verbatim_marker_spellings_resolve_alike`
+/// and `a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain`). Only the literal `\\?\`
+/// is verbatim to std, and it never arrives: [`verbatim_refusal`] owns it.
 ///
 /// # The token, not the resolved path (#144)
 ///
@@ -318,14 +323,19 @@ pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interi
     // position a drive prefix can occupy.
     let mut stack: Vec<(&str, bool)> = Vec::new();
     let mut segments = text.split(['/', '\\']).enumerate();
-    // A UNC (or `\\.\` device, one component deeper than Win32's) root: the two segments after
-    // the leading pair, taken by POSITION and never collapsed. `None` for a root with no share at all — `\\server` names nothing
-    // loadable.
+    // A UNC root: the two segments after the leading pair, taken by POSITION and never collapsed.
+    // `None` for a root with no share at all — `\\server` names nothing loadable. A device root
+    // (`.` or `?` in the server slot) is the leading three segments alone, so it leaves `root`
+    // `None` and everything after it on the walk.
     let root = if starts_with_two_separators(&text) {
         segments.nth(1).expect("two separators are two empty segments");
         let (_, server) = segments.next()?;
-        let (_, share) = segments.next()?;
-        Some((server, share))
+        if matches!(server, "." | "?") {
+            None
+        } else {
+            let (_, share) = segments.next()?;
+            Some((server, share))
+        }
     } else {
         None
     };

@@ -530,12 +530,23 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         // The root is positional; see `win32_effective_file_name`.
         r"\\...\x.bat\y\..",
         r"\\x.bat\y\..",
-        // A device path: `..` pops `y` and Win32 resolves `\\.\x.bat`.
+        // A device path, and the slash spellings of `\\?\` that are plain paths: only `\\.\` or
+        // `\\?\` is the root, and `..` pops the device name like any other component (measured).
         r"\\.\x.bat\y\..",
         "//?/x.bat/y/..",
-        // The gate's verdict, not Win32's: the gate never pops a device name, while Win32 resolves
-        // this to the bare `\\.\`, which is no batch file.
+        r"\\.\C:\..\..\x.bat",
+        "//?/C:/dir/x.bat.",
+        r"\\?/C:\dir\x.bat.",
+        "//?/C:/dir/x.bat/y/..",
+        // Popped past the device name, these resolve to the bare `\\.\` or `\\?\`, which names no
+        // file (measured).
         r"\\.\x.bat\..",
+        r"\\.\C:\..",
+        r"\\.\y\..",
+        r"\\.\x.bat\y\..\..",
+        "//./y/..",
+        "//?/C:/..",
+        r"\\?/C:\..",
     ] {
         assert!(
             super::reject_batch_path_on(Path::new(probe), true).is_err(),
@@ -569,12 +580,14 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         r"\\server\share\..",
         r"\\server\share\x.bat\..",
         r"\\server\share\tool.exe",
-        // A device path pops back to its device name, measured: `\\.\C:` and `\\.\pipe`.
+        // A device path pops back to its device name, measured: `\\.\C:` and `\\.\pipe`. The
+        // device name is an ordinary component, so `\\.\C:` names `C:`, not a bare drive.
         r"\\.\C:\x.bat\..",
         r"\\.\pipe\x.bat\..",
-        // The gate's verdict, not Win32's: Win32 resolves this to the bare `\\.\`, which the gate
-        // refuses as naming no file when it is spelled that way.
-        r"\\.\C:\..",
+        r"\\.\C:",
+        "//./C:/...",
+        r"\\.\C:\tool.exe",
+        "//?/C:/dir/tool.exe",
     ] {
         assert!(
             super::reject_batch_path_on(Path::new(probe), true).is_ok(),
@@ -660,7 +673,8 @@ fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
             detail(probe)
         );
     }
-    for probe in [r"x\..", ".", "C:"] {
+    // `\\.\x.bat\..` resolves to the bare `\\.\`: no file, and no batch file either.
+    for probe in [r"x\..", ".", "C:", r"\\.\x.bat\.."] {
         assert!(
             detail(probe).contains("names no file of its own"),
             "{probe:?} names no file, so it must advise naming the executable: {}",
@@ -1499,17 +1513,27 @@ fn win32_effective_file_name_collapses_the_way_win32_resolves() {
         (r"\\...\x.bat\y\..", Some("x.bat")),
         (r"\\\x.bat\y\..", Some("x.bat")),
         (r"\\..\x.bat\y\..", Some("x.bat")),
-        // A device path where the gate and Win32 agree: `..` pops the component below the device
-        // name, and Win32 resolves `\\.\x.bat`, `\\.\C:` and `\\.\pipe` (measured).
+        // A device path's root is `\\.\` alone, and `..` pops the device name (measured).
         (r"\\.\x.bat\y\..", Some("x.bat")),
-        ("//?/x.bat/y/..", Some("x.bat")),
         (r"\\.\C:\x.bat\..", Some("C:")),
         (r"\\.\pipe\x.bat\..", Some("pipe")),
+        (r"\\.\C:\..\..\x.bat", Some("x.bat")),
         (r"\\.\C:\tool.exe", Some("tool.exe")),
-        // ...and where they do not: the gate never pops the device name, while Win32 pops it and
-        // resolves both to the bare `\\.\` (measured). The gate's names, not Win32's.
-        (r"\\.\x.bat\..", Some("x.bat")),
-        (r"\\.\C:\..", Some("C:")),
+        (r"\\.\C:", Some("C:")),
+        ("//./C:/...", Some("C:")),
+        (r"\\.\x.bat\..", None),
+        (r"\\.\C:\..", None),
+        (r"\\.\y\..", None),
+        (r"\\.\x.bat\y\..\..", None),
+        (r"\\.\", None),
+        (r"\\.", None),
+        // The slash spellings of `\\?\` are device paths the same way (measured).
+        ("//?/x.bat/y/..", Some("x.bat")),
+        ("//?/C:/dir/x.bat/y/..", Some("x.bat")),
+        (r"\\?/C:\dir\x.bat.", Some("x.bat")),
+        (r"/\?\C:\dir\x.bat.", Some("x.bat")),
+        (r"\/?\C:\dir\x.bat.", Some("x.bat")),
+        ("//?/C:/..", None),
         // Collapsed onto the root, a batch-named SERVER is judged too — whether `..` inside the
         // root collapses is unmeasured, and if it does this is `\\x.bat`.
         (r"\\x.bat\y\..", Some("x.bat")),
@@ -1698,11 +1722,14 @@ enum Comp {
     /// position, the only one a drive prefix can occupy. Anywhere else it is an ordinary name
     /// carrying an unnamed data stream.
     DrivePrefix,
+    /// `?`: an ordinary name, except right after the leading `\\`, where like `.` it marks a
+    /// device root.
+    QuestionMark,
 }
 
 /// The vocabulary the component generator draws from: one entry per behaviour Win32 has, plus the
 /// spellings that have historically been read wrong.
-const COMPONENTS: [(&str, Comp); 17] = [
+const COMPONENTS: [(&str, Comp); 18] = [
     ("", Comp::Empty),
     (".", Comp::Skip),
     ("..", Comp::Pop),
@@ -1721,6 +1748,7 @@ const COMPONENTS: [(&str, Comp); 17] = [
     (".bat", Comp::Name { batch: true }),
     ("..bat", Comp::Name { batch: true }),
     ("C:", Comp::DrivePrefix),
+    ("?", Comp::QuestionMark),
 ];
 
 /// A component read as a ROOT segment of a UNC path, where Win32 takes it by position and never
@@ -1729,7 +1757,7 @@ const COMPONENTS: [(&str, Comp); 17] = [
 fn as_root_name(comp: Comp) -> Option<bool> {
     match comp {
         Comp::Name { batch } => Some(batch),
-        Comp::DrivePrefix => Some(false),
+        Comp::DrivePrefix | Comp::QuestionMark => Some(false),
         Comp::Empty | Comp::Skip | Comp::Pop | Comp::Dots => None,
     }
 }
@@ -1745,10 +1773,21 @@ enum Landing {
     UncRoot,
 }
 
-/// Walk `rest` (the components after any UNC root) as a stack, with interior [`Comp::Dots`] either
-/// dropped (`dots_named == false`) or kept as a name a later `..` pops. A FINAL run of them drops
-/// out under both — the measured case.
-fn oracle_landing(rest: &[Comp], unc: bool, dots_named: bool) -> Landing {
+/// The root a path opens with, as far as [`oracle_landing`] cares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Root {
+    /// None, a drive, or a single separator: a first-position drive prefix is a drive.
+    Plain,
+    /// `\\server\share`, which no `..` pops.
+    Unc,
+    /// `\\.\`, or a slash spelling of `\\?\`: nothing after it is part of the root.
+    Device,
+}
+
+/// Walk `rest` (the components after any UNC or device root) as a stack, with interior
+/// [`Comp::Dots`] either dropped (`dots_named == false`) or kept as a name a later `..` pops. A
+/// FINAL run of them drops out under both — the measured case.
+fn oracle_landing(rest: &[Comp], root: Root, dots_named: bool) -> Landing {
     #[derive(Clone, Copy)]
     enum Entry {
         Name(bool),
@@ -1767,8 +1806,8 @@ fn oracle_landing(rest: &[Comp], unc: bool, dots_named: bool) -> Landing {
             }
             // A drive prefix is a prefix only at the very front; elsewhere it is a stream spelling
             // of a file named `C`, which is not a batch name.
-            Comp::DrivePrefix if i == 0 && !unc => stack.push(Entry::Drive),
-            Comp::DrivePrefix => stack.push(Entry::Name(false)),
+            Comp::DrivePrefix if i == 0 && root == Root::Plain => stack.push(Entry::Drive),
+            Comp::DrivePrefix | Comp::QuestionMark => stack.push(Entry::Name(false)),
             Comp::Name { batch } => stack.push(Entry::Name(*batch)),
         }
     }
@@ -1779,7 +1818,7 @@ fn oracle_landing(rest: &[Comp], unc: bool, dots_named: bool) -> Landing {
         Some(Entry::Name(batch)) => Landing::Name(*batch),
         Some(Entry::Drive) => Landing::NoFile,
         Some(Entry::Dots) => unreachable!("trailing dots were just dropped"),
-        None if unc => Landing::UncRoot,
+        None if root == Root::Unc => Landing::UncRoot,
         None => Landing::NoFile,
     }
 }
@@ -1799,12 +1838,29 @@ fn oracle_landing(rest: &[Comp], unc: bool, dots_named: bool) -> Landing {
 /// `\\y\x.bat\..` exactly as the gate did, so their agreement proved only that one model was
 /// self-consistent.
 ///
-/// An interior [`Comp::Dots`] is unmeasured, so the truth here is "refuse if either reading
-/// reaches a batch file or no file": Win32 applies one of them, and this does not know which.
+/// A DEVICE root is `\\` followed by `.` or `?` and then a separator or the end: `\\.\` and the
+/// slash spellings of `\\?\` (measured: `//?/` and `\\?/` open files like plain paths). Only it is
+/// the root — measured, `\\.\C:\x.bat\..` resolves to `\\.\C:` and `\\.\C:\..` to the bare
+/// `\\.\` — so the device name is an ordinary component `..` pops, and popped to nothing the
+/// path names no file. The literal `\\?\` is std's verbatim prefix, which this oracle does not
+/// model; [`compare_gate_with_oracle`] judges those probes by std's literal test instead.
+///
+/// An interior [`Comp::Dots`] is measured as kept, but not yet asserted by the Windows probe, so
+/// the truth here is still "refuse if either reading reaches a batch file or no file" — the same
+/// hedge the gate takes.
 ///
 /// Agreement with an oracle hides whatever the two share. This one shares the classification in
 /// [`COMPONENTS`] and the "no final name refuses" rule, and nothing else.
 fn oracle_refuses(components: &[Comp]) -> bool {
+    if let [Comp::Empty, Comp::Empty, Comp::Skip | Comp::QuestionMark, rest @ ..] = components {
+        return [false, true]
+            .into_iter()
+            .any(|dots_named| match oracle_landing(rest, Root::Device, dots_named) {
+                Landing::Name(batch) => batch,
+                Landing::NoFile => true,
+                Landing::UncRoot => unreachable!("a device path has no UNC root"),
+            });
+    }
     let (root, rest) = match components {
         [Comp::Empty, Comp::Empty, rest @ ..] => match rest {
             [server, share, rest @ ..] => (Some((*server, *share)), rest),
@@ -1814,7 +1870,8 @@ fn oracle_refuses(components: &[Comp]) -> bool {
         _ => (None, components),
     };
     [false, true].into_iter().any(|dots_named| {
-        match oracle_landing(rest, root.is_some(), dots_named) {
+        let kind = if root.is_some() { Root::Unc } else { Root::Plain };
+        match oracle_landing(rest, kind, dots_named) {
             Landing::Name(batch) => batch,
             Landing::NoFile => true,
             // Collapsed onto `\\server\share`: the share is what std tests.
@@ -1837,7 +1894,7 @@ fn declared_unc_over_refusal(components: &[Comp]) -> bool {
     as_root_name(*server) == Some(true)
         && [false, true]
             .into_iter()
-            .any(|dots_named| oracle_landing(rest, true, dots_named) == Landing::UncRoot)
+            .any(|dots_named| oracle_landing(rest, Root::Unc, dots_named) == Landing::UncRoot)
 }
 
 /// The tally of one exhaustive comparison over [`COMPONENTS`].
@@ -1894,6 +1951,15 @@ fn compare_gate_with_oracle(min_depth: u32, max_depth: u32) -> Tally {
                 }
                 if verbatim_extension_rule_this_replaced(&verbatim) && !verbatim_got {
                     tally.newly_accepted.push(verbatim);
+                }
+                // `?` after a leading `\\` spells std's verbatim prefix itself: std tests the
+                // literal string, and so does this.
+                if probe.starts_with(r"\\?\") {
+                    let lower = probe.to_ascii_lowercase();
+                    if (lower.ends_with(".bat") || lower.ends_with(".cmd")) && !got {
+                        tally.verbatim_holes.push(probe);
+                    }
+                    continue;
                 }
                 match (want, got) {
                     (true, false) => tally.holes.push(probe),
@@ -1995,6 +2061,35 @@ fn the_oracle_models_a_unc_root_of_its_own() {
     ]));
     // `\y\x.bat\..` has ONE leading separator: a rooted path, not a UNC one.
     assert!(!oracle_refuses(&[e, name(false), name(true), Comp::Pop]));
+}
+
+/// The oracle's device root, pinned on the rows where a UNC-shaped root disagrees with the
+/// measured one: `..` pops the device name, and the bare `\\.\` names no file.
+#[test]
+fn the_oracle_models_a_device_root_of_its_own() {
+    let name = |batch| Comp::Name { batch };
+    let (e, dot, q) = (Comp::Empty, Comp::Skip, Comp::QuestionMark);
+    // `\\.\x.bat\..` and `\\.\y\..` resolve to `\\.\`.
+    assert!(oracle_refuses(&[e, e, dot, name(true), Comp::Pop]));
+    assert!(oracle_refuses(&[e, e, dot, name(false), Comp::Pop]));
+    // `\\.\C:\..`: the device name `C:` pops like any other.
+    assert!(oracle_refuses(&[e, e, dot, Comp::DrivePrefix, Comp::Pop]));
+    // `\\.\C:` names `C:`, a device, not a bare drive.
+    assert!(!oracle_refuses(&[e, e, dot, Comp::DrivePrefix]));
+    // `//?/C:/...` is a device path too, and the final `...` drops out.
+    assert!(!oracle_refuses(&[e, e, q, Comp::DrivePrefix, Comp::Dots]));
+    // `\\.\C:\..\..\x.bat`
+    assert!(oracle_refuses(&[
+        e,
+        e,
+        dot,
+        Comp::DrivePrefix,
+        Comp::Pop,
+        Comp::Pop,
+        name(true)
+    ]));
+    // `\\.\y\x.bat\..`
+    assert!(!oracle_refuses(&[e, e, dot, name(false), name(true), Comp::Pop]));
 }
 
 /// The oracle's reading of `.. ` and of an interior dots-and-spaces segment, pinned for the same
