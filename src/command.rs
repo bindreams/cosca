@@ -282,7 +282,8 @@ impl Command {
     ///   `pkexec` or root's shell cannot look it up either. Where that directory came from this
     ///   process's, the child is run in it by absolute path too, so a later
     ///   [`std::env::set_current_dir`] cannot load the file from one directory and run it in
-    ///   another.
+    ///   another. Under [`elevate`](Self::elevate) the file loaded is still that one, but the
+    ///   backend may run it elsewhere — see there.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -628,6 +629,14 @@ impl Command {
     /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +
     /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
     /// CHILD, never this process.
+    ///
+    /// On POSIX the backend, not cosca, decides the directory the child runs in:
+    /// [`current_dir`](Self::current_dir), or the one a relative
+    /// [`raw_executable`](Self::raw_executable) was completed against, is where the backend is
+    /// started. `pkexec` then switches to the target user's home, and a sudoers `runcwd` moves
+    /// `sudo`'s child the same way — measured: pkexec 0.105–127 and sudo 1.9.5–1.9.17 with
+    /// `runcwd=~` ran it in `/root`. The macOS graphical path states the directory in its own
+    /// script and is unaffected.
     pub fn elevate(&mut self) -> &mut Command {
         self.elevation.enabled = true;
         self
