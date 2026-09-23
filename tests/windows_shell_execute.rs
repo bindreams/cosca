@@ -9,7 +9,9 @@
 //! Dispatch-only: it ELEVATES, so it runs only when the `windows-probes` workflow is dispatched
 //! with `elevating=true`, on a runner whose process is already elevated (GitHub's Windows runners
 //! are), so `runas` raises no prompt. It launches only copies of `cosca_testbin_image` — never a
-//! batch file — and registers one volatile HKCU key, which a guard deletes.
+//! batch file — and registers one volatile App Paths key in HKLM and then in HKCU, each deleted by
+//! a guard. Creating a volatile key also creates any missing parent volatile, and that parent is
+//! left behind; it goes at the next reboot, with the ephemeral runner.
 #![cfg(windows)]
 
 use std::ffi::{OsStr, OsString};
@@ -22,7 +24,7 @@ use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVAT
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS,
-    REG_OPTION_NON_VOLATILE, REG_OPTION_VOLATILE, REG_SZ, RRF_RT_REG_DWORD,
+    REG_OPTION_VOLATILE, REG_SZ, RRF_RT_REG_DWORD,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
@@ -196,8 +198,16 @@ fn mark_passed() {
     std::fs::write(Path::new(&dir).join(name), b"").expect("write the canary marker");
 }
 
+/// Whether `image` is `want`, by file name: every payload copy has a name of its own, and the
+/// image path comes back long (`runneradmin`) where the temp path may be 8.3 (`RUNNER~1`).
 fn same_file(image: &str, want: &Path) -> bool {
-    image.eq_ignore_ascii_case(&want.display().to_string())
+    let want = want
+        .file_name()
+        .expect("a payload path has a file name")
+        .to_string_lossy();
+    Path::new(image)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&want))
 }
 
 /// The scratch layout both tests use: `a\cosca_probe_a.exe`, `b\cosca_probe_b.exe`,
@@ -350,32 +360,37 @@ fn classname_runas_needs_a_full_path() {
     mark_passed();
 }
 
-/// Survey: which App Paths registrations `ShellExecuteExW` consults for a bare name found nowhere
-/// else, by hive and by verb, with and without `exefile`. Prints only.
+/// Canary: `ShellExecuteExW` consults an HKLM App Paths registration for a bare name, for `runas`
+/// and `open` alike, and loads the registered image — but not when launched as `exefile`. An HKCU
+/// registration is not consulted at all; that is printed, not asserted.
 #[test]
 #[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
-fn app_paths_survey() {
+fn exefile_skips_the_app_paths_lookup() {
     let l = layout();
     let app = OsStr::new(APP);
+    let mut failures: Vec<String> = Vec::new();
     for (label, hive, options) in [
-        ("HKCU volatile", HKEY_CURRENT_USER, REG_OPTION_VOLATILE),
-        ("HKCU persistent", HKEY_CURRENT_USER, REG_OPTION_NON_VOLATILE),
-        ("HKLM volatile", HKEY_LOCAL_MACHINE, REG_OPTION_VOLATILE),
+        ("HKLM", HKEY_LOCAL_MACHINE, REG_OPTION_VOLATILE),
+        ("HKCU", HKEY_CURRENT_USER, REG_OPTION_VOLATILE),
     ] {
-        let key = match AppPathKey::register(hive, options, &l.b) {
-            Ok(key) => key,
-            Err(e) => {
-                println!("{label}: could not register: {e}");
-                continue;
-            }
-        };
+        let key = AppPathKey::register(hive, options, &l.b)
+            .unwrap_or_else(|e| panic!("the measurement could not be taken: {label}: {e}"));
         println!("--- {label}: {KEY} -> {}", l.b.display());
         for verb in ["runas", "open"] {
-            for class in [None, Some("exefile")] {
-                let got = run(&l, label, verb, app, &l.dir_empty, class);
-                println!("  => redirected to b: {}", ends_with(&got, &l.b));
+            let plain = run(&l, label, verb, app, &l.dir_empty, None);
+            let redirected = ends_with(&plain, &l.b);
+            println!("  => {label} {verb} redirected to b: {redirected}");
+            if label == "HKLM" && !redirected {
+                failures.push(format!("{label} {verb} without a class should load b: {plain:?}"));
+            }
+            let classed = run(&l, label, verb, app, &l.dir_empty, Some("exefile"));
+            if ends_with(&classed, &l.b) {
+                failures.push(format!("{label} {verb} as exefile was redirected to b"));
             }
         }
         drop(key);
     }
+    drop(l.root);
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+    mark_passed();
 }
