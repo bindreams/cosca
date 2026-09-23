@@ -243,7 +243,8 @@ impl Command {
     /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
     /// unresolved.
     ///
-    /// See [`raw_executable`](Self::raw_executable) for how the two setters combine.
+    /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
+    /// replaces the other.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Search(path.into()));
         self
@@ -285,9 +286,6 @@ impl Command {
     ///
     /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
     /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
-    ///
-    /// The two setters are alternatives on one field: calling either replaces the other, and the
-    /// last call wins.
     ///
     /// # Elevation
     ///
