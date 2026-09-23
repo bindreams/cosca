@@ -41,7 +41,7 @@ on:
         required: false
         default: ""
       elevating:
-        description: "Also run tests/windows_shell_execute.rs, which ELEVATES and writes one HKCU key"
+        description: "Also run tests/windows_shell_execute.rs, which ELEVATES and writes one volatile App Paths key in HKLM and one in HKCU"
         type: boolean
         required: false
         default: false
@@ -88,7 +88,9 @@ jobs:
             --test windows_path_resolution \
             -- "${FILTER}" --ignored --nocapture --test-threads=1
       # Dispatch-only: these elevate through ShellExecuteEx(runas), which a runner already elevated
-      # grants without a prompt, and register one volatile HKCU key they delete again.
+      # grants without a prompt, and register one volatile App Paths key in HKLM and one in HKCU,
+      # deleting each again; a volatile parent key they had to create can stay behind until the
+      # runner is gone.
       - name: Run elevating probes
         if: inputs.elevating
         shell: bash
