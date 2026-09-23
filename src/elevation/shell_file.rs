@@ -24,6 +24,9 @@ use crate::error::Error;
 ///   bare `x.exe:s`, a stream spelling the shell would read as a scheme.
 /// - **`shell:` or `::` at the front**: a shell namespace name (ReactOS parses it with
 ///   `SHParseDisplayName` and invokes the item), not a file path.
+/// - **`www` at the front**, in any case: when lookup finds nothing, Wine and ReactOS prefix the
+///   token with `http://` and launch that. The prefix alone decides, so a relative
+///   `wwwroot\setup.exe` is refused too.
 /// - **a `%` anywhere.** Wine runs `ExpandEnvironmentStringsW` over every `lpFile` that is not a
 ///   `file:` URL, with or without `SEE_MASK_DOENVSUBST` (which this crate does not set); ReactOS
 ///   expands only under that mask. Windows' own behaviour is unmeasured, so the wider reading wins.
@@ -35,6 +38,8 @@ pub(crate) fn reject_shell_rewrite(program: &Path) -> Result<(), Error> {
         Some("ShellExecuteEx may expand %VARIABLES% in lpFile before opening it, so the file it opens is not the one checked; name the executable")
     } else if text.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("shell:")) || text.starts_with("::") {
         Some("a shell namespace name is not a file path, and ShellExecuteEx invokes whatever item it names; name the executable")
+    } else if text.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("www")) {
+        Some("ShellExecuteEx relaunches an lpFile starting with `www` as an http:// URL when it finds no file; name the executable by a path that does not start with www")
     } else if has_scheme(&text) {
         Some("ShellExecuteEx reads a `scheme:` prefix as a URL and converts or dispatches it before opening anything; name the executable by a path")
     } else {

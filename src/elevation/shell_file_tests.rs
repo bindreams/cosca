@@ -62,6 +62,21 @@ fn a_percent_sign_is_refused() {
     }
 }
 
+/// When lookup fails, Wine and ReactOS turn an `lpFile` starting with `www` into `http://www…` and
+/// launch that. Refused on the prefix alone, relative paths such as `wwwroot\setup.exe` included.
+#[test]
+fn a_www_prefix_is_refused() {
+    for token in [
+        "www.example.exe",
+        "WWW.example.exe",
+        "Www",
+        r"wwwroot\setup.exe",
+        "wwwsetup.exe",
+    ] {
+        assert!(refused(token), "{token:?} may be relaunched as an http URL");
+    }
+}
+
 /// Ordinary paths, including every drive and stream spelling the batch gate judges, pass this
 /// check untouched: it refuses only what ShellExecuteEx rewrites.
 #[test]
@@ -79,7 +94,7 @@ fn a_plain_path_passes() {
         r"C:\tools\x.exe:s",
         r"1:\tools\setup.exe",
         r"é:setup.exe",
-        "www.example.exe",
+        r"tools\www.exe",
         "",
     ] {
         assert!(
