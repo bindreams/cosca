@@ -199,6 +199,37 @@ impl Error {
     }
 }
 
+/// `source` with `context` prepended to its message and kept as the new error's
+/// [`source`](std::error::Error::source), so its OS code survives: several codes share one
+/// [`std::io::ErrorKind`], and the code is what tells a caller which failure it was.
+pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        source.kind(),
+        IoContext {
+            context: context.into(),
+            source,
+        },
+    )
+}
+
+#[derive(Debug)]
+struct IoContext {
+    context: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for IoContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for IoContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 fn replay_io(e: &std::io::Error) -> std::io::Error {
     match e.raw_os_error() {

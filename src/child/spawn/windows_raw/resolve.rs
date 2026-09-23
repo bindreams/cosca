@@ -160,9 +160,9 @@ pub(crate) fn consent_system_dirs_from(
     windows: std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, Error> {
     let unknown = |what: &str, e: std::io::Error| {
-        Error::Io(std::io::Error::new(
-            e.kind(),
-            format!("could not determine {what} for the elevated program search: {e}"),
+        Error::Io(crate::error::io_context(
+            format!("could not determine {what} for the elevated program search"),
+            e,
         ))
     };
     let system = system.map_err(|e| unknown("System32", e))?;

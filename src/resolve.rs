@@ -933,9 +933,9 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
                 // let a later directory, perhaps one on `PATH` an attacker can write, supply the
                 // image the consent prompt names.
                 Err(e) if input.loadable_only => {
-                    return Err(Error::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("could not tell whether {joined:?} exists, so the search stops: {e}"),
+                    return Err(Error::Io(crate::error::io_context(
+                        format!("could not tell whether {joined:?} exists, so the search stops"),
+                        e,
                     )))
                 }
                 // An ordinary spawn goes on, so one unreadable `PATH` directory does not break
