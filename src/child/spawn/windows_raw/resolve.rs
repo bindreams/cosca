@@ -78,8 +78,9 @@ pub(crate) fn effective_cwd(
 /// directory, and completing it would silently yield this process's cwd; it is `NotFound`, as the
 /// POSIX spawn's `chdir("")` reports.
 ///
-/// The std backend (a command with no `executable()`) does not call this: std hands `""` to
-/// `CreateProcessW`, which fails it as `InvalidFilename`. `tests/raw_windows.rs` pins both kinds
+/// The std backend does not call this: a command with no `executable()`, no `raw_executable()` and
+/// no descriptor from 3 up (`routes_to_raw_backend`). std hands `""` to `CreateProcessW`, which
+/// fails it as `InvalidFilename`. `tests/raw_windows.rs` pins both kinds
 /// until #156 routes every Windows spawn through one backend.
 pub(crate) fn check_current_dir(dir: &Path) -> Result<(), Error> {
     ensure_no_nul_wide("working directory", dir.as_os_str())?;
