@@ -351,10 +351,11 @@ pub(crate) fn create_process(program: &str, out_path: &str) -> Result<(u32, Stri
             waited.0
         ))
     };
-    // SAFETY: both handles are owned by us and not used again.
-    unsafe {
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
+    for (what, handle) in [("thread", pi.hThread), ("process", pi.hProcess)] {
+        // SAFETY: the handle is owned by us and not used again.
+        if let Err(e) = unsafe { CloseHandle(handle) } {
+            println!("  CLEANUP: the child's {what} handle could not be closed: {e}");
+        }
     }
     got_code?;
 
