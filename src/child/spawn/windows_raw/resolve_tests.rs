@@ -188,9 +188,8 @@ fn resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given() {
 
     // `cmd_cwd: None` mirrors an unset `Command::cwd()` — the doc says that means "the parent's",
     // i.e. the real process cwd, so the `None` fallback must still reach it rather than resolving
-    // nothing. Exercising that fallback needs a process whose REAL cwd is `dir.path()`; that
-    // process must not be THIS one (every other test in this binary shares its cwd), so the check
-    // runs in a re-exec'd child instead — see `crate::test_child::run_fixture_with_cwd`.
+    // nothing. See `crate::resolve::resolve_tests::empty_path_elements_are_skipped`'s doc for why
+    // exercising that needs a re-exec'd child.
     crate::test_child::run_fixture_with_cwd(
         crate::test_child::fixture_path!(fixture_resolve_executable_falls_back_to_process_cwd),
         dir.path(),

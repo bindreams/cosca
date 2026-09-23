@@ -44,8 +44,7 @@ crossbeam-channel = { version = "0.5", optional = true }
 tempfile = "3"
 # A concrete format to pin the persisted wire form against.
 serde_json = "1"
-# Word-boundary matching for tests/no_chdir_guard.rs — a substring check misses aliased imports,
-# turbofish syntax and the several non-std chdir spellings (libc/nix/rustix, Win32) it must catch.
+# Word-boundary matching for tests/no_chdir_guard.rs's chdir-call scanner.
 regex = "1"
 
 [target.'cfg(windows)'.dev-dependencies]

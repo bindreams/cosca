@@ -627,10 +627,8 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
         std::fs::set_permissions(&want, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     // `resolve()` absolutises a relative `cwd` via `std::env::current_dir()` (see resolve.rs's own
-    // "applied twice" note) — there is no way to exercise that fallback without a process whose
-    // REAL cwd is `tmp.path()`. That process must not be THIS one (every other test in this binary
-    // shares its cwd), so the check runs in a re-exec'd child instead — see
-    // `crate::test_child::run_fixture_with_cwd`.
+    // "applied twice" note) — see `empty_path_elements_are_skipped`'s doc for why this runs in a
+    // re-exec'd child.
     crate::test_child::run_fixture_with_cwd(
         crate::test_child::fixture_path!(fixture_relative_cwd_is_absolutised),
         tmp.path(),
@@ -672,9 +670,8 @@ fn a_drive_relative_name_fails_closed() {
     // C's current directory has something to find; a tempdir under `%TEMP%`, as here, lives on the
     // runner's system drive, which is `C:` on every GitHub-hosted Windows runner this crate targets.
     touch(cwd.path(), "tool.exe");
-    // The refusal must hold even where the process's REAL cwd is `cwd.path()` — that process must
-    // not be THIS one (every other test in this binary shares its cwd), so the check runs in a
-    // re-exec'd child instead — see `crate::test_child::run_fixture_with_cwd`.
+    // The refusal must hold even where the process's REAL cwd is `cwd.path()` — see
+    // `empty_path_elements_are_skipped`'s doc for why this runs in a re-exec'd child.
     crate::test_child::run_fixture_with_cwd(
         crate::test_child::fixture_path!(fixture_drive_relative_name_fails_closed),
         cwd.path(),

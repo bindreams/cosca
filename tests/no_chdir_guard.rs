@@ -2,13 +2,10 @@
 //!
 //! `std::env::set_current_dir` mutates the WHOLE process's cwd — process-global state shared by
 //! every concurrently running `#[test]` in the same test binary. A test that calls it races every
-//! other cwd-sensitive test in that binary, which is exactly the class of bug
-//! `azhukova/tests-no-chdir` removed (four tests in `src/resolve_tests.rs`, one in
-//! `src/child/spawn/windows_raw/resolve_tests.rs`, all previously paired with a since-deleted
-//! `RestoreCwd` guard that admitted, in its own doc, that it did not cover program resolution).
-//! Each was rewritten to prove the same thing about a process's REAL cwd from a freshly spawned
-//! CHILD process instead — see `crate::test_child::run_fixture_with_cwd` (`Command::current_dir`
-//! on the spawned process, never `set_current_dir` on this one).
+//! other cwd-sensitive test in that binary. A test that needs to prove something about a
+//! process's REAL cwd does it from a freshly spawned CHILD process instead — see
+//! `crate::test_child::run_fixture_with_cwd` (`Command::current_dir` on the spawned process,
+//! never `set_current_dir` on this one).
 //!
 //! `testbin/main.rs`'s two `set_current_dir` calls are the one legitimate exception, and are
 //! allowlisted below by exact line text AND an exact expected count, rather than skipped by file:
@@ -30,11 +27,8 @@
 use std::path::Path;
 
 /// `(file path relative to the repo root, exact trimmed line text, exact expected match count)`
-/// for every allowlisted call site. Matching on exact text (not merely "this file is exempt")
-/// means a differently-shaped call added anywhere in `testbin/main.rs` still fails the guard;
-/// matching on an exact COUNT, not just presence, means a second occurrence of an
-/// already-allowlisted line sneaking in still fails it too — presence alone cannot tell "the one
-/// allowed line is still there" apart from "the one allowed line, plus an uncounted extra".
+/// for every allowlisted call site — see this file's module doc for why both the text and the
+/// count must match exactly.
 const ALLOWLIST: &[(&str, &str, usize)] = &[(
     "testbin/main.rs",
     concat!(
