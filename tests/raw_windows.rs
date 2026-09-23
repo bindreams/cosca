@@ -17,10 +17,9 @@ mod common;
 /// only that the mode works; the argv[0]≠exe behavior is proven later via `cosca::Command`.
 #[test]
 fn testbin_argv0_report_emits_argv0_and_image() {
-    let out = Command::new(common::testbin())
-        .args(["argv0-report"])
-        .output()
-        .expect("spawn");
+    let mut cmd = Command::new(common::testbin());
+    cmd.args(["argv0-report"]);
+    let out = common::output_locked(&mut cmd).expect("spawn");
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("argv0=") && s.contains("image="), "got: {s}");
 }
@@ -29,10 +28,9 @@ fn testbin_argv0_report_emits_argv0_and_image() {
 /// piped stdout proves the fd→`File` path reaches the intended handle.
 #[test]
 fn testbin_write_fd_writes_to_the_target_fd() {
-    let out = Command::new(common::testbin())
-        .args(["write-fd", "1", "hello-fd1"])
-        .output()
-        .expect("spawn");
+    let mut cmd = Command::new(common::testbin());
+    cmd.args(["write-fd", "1", "hello-fd1"]);
+    let out = common::output_locked(&mut cmd).expect("spawn");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello-fd1");
 }
 
@@ -41,12 +39,21 @@ fn testbin_write_fd_writes_to_the_target_fd() {
 /// end drops — a real close event, not a timer.
 #[test]
 fn testbin_read_fd_copies_the_source_fd_to_stdout() {
-    let mut child = Command::new(common::testbin())
-        .args(["read-fd", "0"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn");
+    let mut child = {
+        let _guard = cosca::test_spawn_lock();
+        Command::new(common::testbin())
+            .args(["read-fd", "0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn")
+        // Guard dropped here, before the stdin write and wait below: holding it any longer would
+        // serialize every cosca spawn in this binary against this one for no reason — the window
+        // this lock closes (std marking its child-side pipe handles inheritable and calling
+        // CreateProcessW with bInheritHandles=TRUE, while a concurrent cosca raw-backend spawn has
+        // its own child ends marked inheritable — see `spawn_lock`'s doc) ends inside `spawn()`,
+        // which closes std's child-side copies before returning.
+    };
     child
         .stdin
         .take()
@@ -62,10 +69,9 @@ fn testbin_read_fd_copies_the_source_fd_to_stdout() {
 /// piped stdout (fd 1) must classify as `isatty=0`.
 #[test]
 fn testbin_isatty_fd_reports_zero_for_a_pipe() {
-    let out = Command::new(common::testbin())
-        .args(["isatty-fd", "1"])
-        .output()
-        .expect("spawn");
+    let mut cmd = Command::new(common::testbin());
+    cmd.args(["isatty-fd", "1"]);
+    let out = common::output_locked(&mut cmd).expect("spawn");
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("isatty=0"), "got: {s}");
 }
@@ -336,6 +342,43 @@ fn oversized_fd_is_unsupported() {
         .spawn()
         .unwrap_err();
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
+}
+
+/// An argv-only command (no `.executable()`) that maps fd >= 3 still routes to the raw backend —
+/// `routes_to_raw_backend`'s OTHER trigger, independent of `executable()`. std has no way to hand a
+/// child fd >= 3 on Windows at all: `spawn_unelevated`'s fd >= 3 collection loop is
+/// `#[cfg(unix)]`-gated (`src/child/spawn.rs`), so fd 3 actually delivering the marker bytes below
+/// is itself proof this went through the raw backend.
+#[test]
+fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
+    let mut c = cosca::Command::new();
+    c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
+        .fd(3, cosca::Stdio::pipe_out())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn via the argv-only + fd>=3 route");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(s, "argv-only-fd3");
+}
+
+/// The `CommandLine` arm of `program_token` (no `.executable()`, built with `.commandline(...)`
+/// instead of `.args(...)`) that maps fd >= 3: a different code path from the argv-only test
+/// above — `program_token` re-derives its token via `first_token_wide` on this arm rather than
+/// reusing `Argv`'s `argv.first()` (see `program_token`'s doc in `src/child/spawn/windows_raw.rs`).
+/// Same proof shape as `argv_only_fd3_routes_through_the_raw_backend_and_works` (see its doc for
+/// why fd 3 delivery proves raw-backend routing).
+#[test]
+fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
+    let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
+
+    let mut c = cosca::Command::new();
+    c.commandline(line).fd(3, cosca::Stdio::pipe_out()).unwrap();
+    let mut child = c.spawn().expect("raw spawn via the commandline + fd>=3 route");
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(s, "commandline-only-fd3");
 }
 
 // Containment over the raw backend (Plan 12 Task 6) =====

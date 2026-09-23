@@ -140,6 +140,17 @@ pub fn report_field<'a>(report: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no field {key} in report: {report}"))
 }
 
+/// Build a `CreateProcessW`-style command line from plain args, the way the raw backend's own
+/// quoter would join them (`cosca::quote::windows::join_wide`). ONE definition for every test
+/// crate that needs a `.commandline(...)`-shaped string from argv-like input: two copies could
+/// drift apart and agree on the wrong quoting.
+#[cfg(windows)]
+pub fn commandline_from(args: &[&str]) -> String {
+    let wide_args: Vec<Vec<u16>> = args.iter().map(|a| a.encode_utf16().collect()).collect();
+    let refs: Vec<&[u16]> = wide_args.iter().map(Vec::as_slice).collect();
+    String::from_utf16(&cosca::quote::windows::join_wide(&refs)).unwrap()
+}
+
 /// The escaping `report-console-identity` applies to its `argv0` field, so a test can state its
 /// expectation in plain text. ONE definition for every test crate that asserts on that field: two
 /// copies could drift apart and agree on the wrong answer.
