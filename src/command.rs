@@ -309,10 +309,11 @@ impl Command {
     ///   administrator chose instead. `pkexec` and `run0` pick their own directory, so they are
     ///   handed an absolute path completed against this process's cwd (read once); a rename of an
     ///   ancestor during authentication can redirect it. `osascript`'s shell `cd`s to that
-    ///   absolute directory and runs `./tool` there. On those three a cwd with no usable path (an
-    ///   unsearchable ancestor, an unlinked directory) fails the spawn: on macOS that reading
-    ///   fails, with an error saying why a path was needed; on Linux the reading succeeds and
-    ///   entering the path fails with a plain `PermissionDenied`. The backend may still run the
+    ///   absolute directory and runs `./tool` there. On those three a cwd with no usable path fails
+    ///   the spawn. An unlinked directory fails the reading everywhere, with `NotFound` and an
+    ///   error saying why a path was needed. An unsearchable ancestor fails it on macOS, with
+    ///   `PermissionDenied` and the same explanation; on Linux the reading succeeds and entering
+    ///   the path fails later with a plain `PermissionDenied`. The backend may still run the
     ///   file elsewhere — see there. An already-root caller runs no backend and spawns as above.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.

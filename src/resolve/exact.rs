@@ -63,9 +63,9 @@ pub(crate) struct Anchored {
 /// backends, which run the program in another process and so need a path.
 ///
 /// Needs this process's cwd as a PATH when the program is relative and `child_cwd` is not
-/// absolute, so a cwd with no usable path — an unsearchable ancestor, an unlinked directory —
-/// fails where the unelevated [`anchor_posix`] would succeed. Where depends on the OS: macOS's
-/// `getcwd` fails, so this does, with `process_cwd`'s error; Linux's succeeds regardless of
+/// absolute, so a cwd with no usable path fails where the unelevated [`anchor_posix`] would
+/// succeed. An unlinked directory fails `process_cwd` on every OS (`ENOENT`), so this does. An
+/// unsearchable ancestor fails it on macOS (`EACCES`); Linux's `getcwd` succeeds regardless of
 /// ancestors' permissions, so the path is returned and entering it fails later, at spawn.
 ///
 /// The base is `child_cwd` (what `Command::current_dir` set; joined onto `process_cwd()` when

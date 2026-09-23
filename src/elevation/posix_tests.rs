@@ -1075,6 +1075,72 @@ mod rewrite_tests {
         super::super::rewrite_with_host_and_cwd(c, host, || Ok(PathBuf::from("/proc-cwd"))).expect("rewrite")
     }
 
+    /// Its presence marks a deliberate re-exec of [`fixture_elevated_exact_in_an_unlinked_cwd`].
+    const FIXTURE_UNLINKED_CWD_ENV: &str = "COSCA_FIXTURE_UNLINKED_CWD";
+
+    /// Inert in an ordinary suite run. Re-executed by
+    /// [`an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read`], it waits for one byte on
+    /// stdin — sent once its cwd has been removed — then rewrites for `pkexec`.
+    #[test]
+    fn fixture_elevated_exact_in_an_unlinked_cwd() {
+        use std::io::Read;
+        if std::env::var_os(FIXTURE_UNLINKED_CWD_ENV).is_none() {
+            return;
+        }
+        std::io::stdin().read_exact(&mut [0u8; 1]).expect("gate byte");
+        assert!(std::env::current_dir().is_err(), "precondition: the cwd is unlinked");
+        match rewrite_with_host(&mut pkexec_tool(None), &every_backend_host()) {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+                assert!(e.to_string().contains("working directory as a path"), "{e}");
+            }
+            Err(other) => panic!("expected Io(NotFound), got {other}"),
+            Ok(_) => panic!("an unlinked cwd has no path to hand pkexec"),
+        }
+    }
+
+    /// An unlinked cwd has no path on any OS: the read itself fails, with `NotFound`, where an
+    /// unsearchable ancestor fails it only on macOS. The cwd is removed from under a child this
+    /// test spawned in it, so this process's own cwd never moves.
+    #[test]
+    fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
+        use std::io::Write;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("gone");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let mut child = {
+            // Every fork in this binary holds it; see `crate::test_child::run_fixture_with_cwd`.
+            let _guard = crate::child::spawn::spawn_lock();
+            std::process::Command::new(std::env::current_exe().expect("current_exe"))
+                .args([
+                    "--test-threads=1",
+                    "--exact",
+                    crate::test_child::fixture_path!(fixture_elevated_exact_in_an_unlinked_cwd),
+                ])
+                .env(FIXTURE_UNLINKED_CWD_ENV, "1")
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the fixture")
+        };
+        std::fs::remove_dir(&dir).expect("rmdir the fixture's cwd");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"x")
+            .expect("release the fixture");
+        let out = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// `sudo` and `doas` keep the cwd they are started in, so they are handed `./tool` and started
     /// in the caller's directory: they read the name against that directory OBJECT after
     /// authenticating, and a rename of an ancestor during the prompt cannot swap the file.
