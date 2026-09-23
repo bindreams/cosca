@@ -190,6 +190,21 @@ fn replay_keeps_the_variant_message_and_os_code() {
             detail: "u".into(),
             source: Some(std::io::Error::from_raw_os_error(2)),
         },
+        Error::Unassessable {
+            detail: "u".into(),
+            source: None,
+        },
+        Error::Quote(QuoteError::new(3, QuoteErrorKind::UnterminatedDoubleQuote)),
+        Error::IdentityRecord {
+            kind: crate::error::RecordErrorKind::ForeignPlatform,
+            detail: "r".into(),
+            source: Some(std::io::Error::from_raw_os_error(2)),
+        },
+        Error::IdentityRecord {
+            kind: crate::error::RecordErrorKind::InvalidPid,
+            detail: "r".into(),
+            source: None,
+        },
     ];
     for e in cases {
         let r = e.replay();
@@ -199,11 +214,23 @@ fn replay_keeps_the_variant_message_and_os_code() {
             assert_eq!(a.raw_os_error(), b.raw_os_error());
             assert_eq!(a.kind(), b.kind());
         }
-        if let (Error::Unassessable { source: a, .. }, Error::Unassessable { source: b, .. }) = (&r, &e) {
+        let sources = match (&r, &e) {
+            (Error::Unassessable { source: a, .. }, Error::Unassessable { source: b, .. })
+            | (Error::IdentityRecord { source: a, .. }, Error::IdentityRecord { source: b, .. }) => Some((a, b)),
+            _ => None,
+        };
+        if let Some((a, b)) = sources {
+            assert_eq!(a.is_some(), b.is_some());
             assert_eq!(
                 a.as_ref().and_then(std::io::Error::raw_os_error),
                 b.as_ref().and_then(std::io::Error::raw_os_error)
             );
+        }
+        if let (Error::Quote(a), Error::Quote(b)) = (&r, &e) {
+            assert_eq!(a, b);
+        }
+        if let (Error::IdentityRecord { kind: a, .. }, Error::IdentityRecord { kind: b, .. }) = (&r, &e) {
+            assert_eq!(a, b);
         }
     }
 }
