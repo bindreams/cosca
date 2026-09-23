@@ -472,11 +472,6 @@ fn has_loadable_extension(name: &OsStr) -> bool {
 /// dot) resolves to `tool.exe` on Windows but is refused here, because a trailing dot does NOT
 /// suppress `PATHEXT` (measured) and reasoning about which spellings Windows silently trims is
 /// how the plantability bug got in.
-///
-/// [#147] would make this rule moot by calling `ShellExecuteEx` only on `current_exe()`, which is
-/// absolute and already ends in `.exe` — structurally immune. It does not invalidate the rule now.
-///
-/// [#147]: https://github.com/bindreams/cosca/issues/147
 pub(crate) fn reject_unloadable_image(program: &Path, windows: bool) -> Result<(), Error> {
     // `names_no_file` first: it is what makes `has_loadable_extension`'s whole-string reading the
     // final component's (see its doc).
