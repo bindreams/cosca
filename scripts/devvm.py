@@ -262,6 +262,53 @@ def stage_tree(guest: Guest, *, repo_root: Path = REPO_ROOT, dest: Path | None =
     subprocess.run(cmd, check=True)
 
 
+def parse_run_argv(rest: list[str]) -> tuple[list[str], bool, int | None, list[str]]:
+    """Split `run`'s own argv (everything after the literal "run" token) into
+    (head, unelevated, timeout, cmd_tail).
+
+    `head` is what's left for argparse to parse (in practice just the guest name, since both
+    devvm-own flags below are stripped out of it before argparse ever sees it); `unelevated`
+    is whether `--unelevated` appeared anywhere in `rest` before a `--` separator; `timeout` is
+    the integer following a `--timeout` token, if one appeared before `--`, else None;
+    `cmd_tail` is everything after the first literal `--`, verbatim (or `[]` if there is none).
+
+    This exists because argparse's `nargs=REMAINDER` (needed on `cmd` so arbitrary flags in
+    the user's own command, e.g. `cargo test -- --nocapture`, pass through untouched) greedily
+    swallows EVERY remaining token once positional-matching reaches it — including a devvm-own
+    flag like `--unelevated`/`--timeout` placed anywhere at or after `guest`, with or without a
+    `--` separator; confirmed directly: `run windows-x64 --unelevated -- cargo test` left
+    args.unelevated False, with `cmd`'s REMAINDER eating `--unelevated` itself. Extracting both
+    flags by hand, before argparse ever runs, sidesteps the quirk entirely and lets either flag
+    appear on either side of `guest`.
+    """
+    if "--" in rest:
+        idx = rest.index("--")
+        before, cmd_tail = rest[:idx], rest[idx + 1 :]
+    else:
+        before, cmd_tail = rest, []
+
+    head: list[str] = []
+    unelevated = False
+    timeout: int | None = None
+    i = 0
+    while i < len(before):
+        tok = before[i]
+        if tok == "--unelevated":
+            unelevated = True
+            i += 1
+        elif tok == "--timeout":
+            if i + 1 >= len(before):
+                print("devvm.py run: argument --timeout: expected one argument", file=sys.stderr)
+                sys.exit(2)
+            timeout = int(before[i + 1])
+            i += 2
+        else:
+            head.append(tok)
+            i += 1
+
+    return head, unelevated, timeout, cmd_tail
+
+
 # Subcommands ==========================================================================
 
 
@@ -534,6 +581,11 @@ def build_parser() -> argparse.ArgumentParser:
         "logon's real filtered (non-elevated) token, instead of WinRM's own full-rights "
         "network-logon token — needed to measure the actual UAC/runas consent path.",
     )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        help="Seconds to wait for an --unelevated command to finish (default 3600).",
+    )
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run, prefixed with --")
     p.set_defaults(func=cmd_run)
 
@@ -551,27 +603,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     argv = list(argv if argv is not None else sys.argv[1:])
 
-    # Special-case `run`: pull `--unelevated` and the trailing `-- <cmd...>` out ourselves
-    # before argparse ever sees them. argparse's `nargs=REMAINDER` (needed on `cmd` so
-    # arbitrary flags in the user's own command, e.g. `cargo test -- --nocapture`, pass
-    # through untouched) greedily swallows EVERY remaining token once positional-matching
-    # reaches it — including a devvm-own flag like `--unelevated` placed anywhere at or after
-    # `guest`, with or without a `--` separator; confirmed directly:
-    # `run windows-x64 --unelevated -- cargo test` left args.unelevated False, with `cmd`
-    # positional's REMAINDER eating `--unelevated` itself; only `run --unelevated windows-x64
-    # -- cargo test` parsed as intended. Handling this by hand sidesteps the quirk entirely
-    # and lets `--unelevated` appear on either side of `guest`.
+    # Special-case `run`: pull `--unelevated`, `--timeout`, and the trailing `-- <cmd...>` out
+    # ourselves before argparse ever sees them — see parse_run_argv's docstring for why.
     unelevated = False
+    timeout: int | None = None
     if argv[:1] == ["run"]:
-        rest = argv[1:]
-        if "--" in rest:
-            idx = rest.index("--")
-            head, cmd_tail = rest[:idx], rest[idx + 1 :]
-        else:
-            head, cmd_tail = rest, []
-        if "--unelevated" in head:
-            unelevated = True
-            head = [tok for tok in head if tok != "--unelevated"]
+        head, unelevated, timeout, cmd_tail = parse_run_argv(argv[1:])
         argv = ["run", *head]
     else:
         cmd_tail = None
@@ -580,6 +617,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "run":
         args.unelevated = unelevated
+        args.timeout = timeout
         args.cmd = cmd_tail if cmd_tail is not None else []
     args.func(args)
 

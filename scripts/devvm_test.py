@@ -73,5 +73,34 @@ class StageTreeTests(unittest.TestCase):
             self.assertFalse((dest / "b.txt").exists())
 
 
+class ParseRunArgvTests(unittest.TestCase):
+    def test_plain_guest_and_command(self) -> None:
+        head, unelevated, timeout, cmd_tail = devvm.parse_run_argv(["windows-x64", "--", "cargo", "build"])
+        self.assertEqual(head, ["windows-x64"])
+        self.assertFalse(unelevated)
+        self.assertIsNone(timeout)
+        self.assertEqual(cmd_tail, ["cargo", "build"])
+
+    def test_unelevated_flag_anywhere_is_extracted(self) -> None:
+        head, unelevated, _timeout, cmd_tail = devvm.parse_run_argv(["windows-x64", "--unelevated", "--", "whoami"])
+        self.assertTrue(unelevated)
+        self.assertNotIn("--unelevated", head)
+        self.assertEqual(cmd_tail, ["whoami"])
+
+    def test_timeout_flag_anywhere_is_extracted(self) -> None:
+        head, unelevated, timeout, cmd_tail = devvm.parse_run_argv(
+            ["windows-x64", "--timeout", "60", "--unelevated", "--", "whoami"]
+        )
+        self.assertEqual(timeout, 60)
+        self.assertNotIn("--timeout", head)
+        self.assertNotIn("60", head)
+        self.assertTrue(unelevated)
+        self.assertEqual(cmd_tail, ["whoami"])
+
+    def test_no_double_dash_means_empty_cmd_tail(self) -> None:
+        _head, _unelevated, _timeout, cmd_tail = devvm.parse_run_argv(["windows-x64"])
+        self.assertEqual(cmd_tail, [])
+
+
 if __name__ == "__main__":
     unittest.main()
