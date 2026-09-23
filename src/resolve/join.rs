@@ -35,6 +35,19 @@ pub(crate) fn append(base: &OsStr, rest: &OsStr, sep: &str) -> OsString {
     out
 }
 
+/// `rest` after the directory `base` as units, a separator `sep` between them unless `base` ends
+/// in one, and nothing else. On a verbatim base this is the string Win32 completes a relative name
+/// from: `GetFullPathNameW` then collapses its `.` and `..` with Win32's floor (after `\\?\UNC\`),
+/// where [`append`] would collapse them with std's (after the share).
+pub(crate) fn concat(base: &OsStr, rest: &OsStr, sep: &str) -> OsString {
+    let mut out = base.to_os_string();
+    if !base.as_encoded_bytes().last().is_some_and(|&b| is_sep(b, true)) {
+        out.push(sep);
+    }
+    out.push(rest);
+    out
+}
+
 /// `name` joined under the directory `base` by its [`PathType`]: a Rooted name keeps `base`'s
 /// drive or share, a Relative one is [`append`]ed, and anything else names its own location.
 pub(crate) fn join(base: &OsStr, name: &OsStr, sep: &str) -> OsString {

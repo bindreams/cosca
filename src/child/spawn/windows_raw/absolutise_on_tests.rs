@@ -101,9 +101,12 @@ fn a_relative_or_rooted_path_uses_one_read() {
 /// never this process's cwd. The cwd is read once, to learn the current drive, and not used.
 #[test]
 fn another_drives_relative_path_does_not_use_the_cwd() {
-    for (drive, want) in [(None, r"Q:\tool.exe"), (Some(r"Q:\qcwd"), r"Q:\qcwd\tool.exe")] {
+    let qcwd = tempfile::tempdir().unwrap();
+    let qcwd = qcwd.path().to_str().unwrap();
+    let under_qcwd = format!(r"{qcwd}\tool.exe");
+    for (drive, want) in [(None, r"Q:\tool.exe"), (Some(qcwd), under_qcwd.as_str())] {
         let reads = Cell::new(0);
-        let got = complete_on(Path::new("Q:tool.exe"), counted(r"C:\base", &reads), |d| {
+        let got = complete_on(Path::new("Q:tool.exe"), counted(r"D:\base", &reads), |d| {
             assert_eq!(d, "Q:");
             Ok(drive.map(OsString::from))
         })
@@ -150,24 +153,65 @@ fn a_digit_drive_takes_that_drives_directory() {
     assert!(!got.used_cwd);
 }
 
-/// A drive's `=X:` value is used only when fully qualified; anything else would leave the path
-/// for `GetFullPathNameW` to complete from process state, so the drive's root is used instead.
+/// A drive's `=X:` value is used only when it is fully qualified and names an existing directory,
+/// on any drive; otherwise the drive's root is, as `GetFullPathNameW` does (measured by
+/// `tests/windows_process_cwd.rs`).
 #[test]
-fn only_a_fully_qualified_drive_directory_is_used() {
+fn only_an_existing_fully_qualified_drive_directory_is_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().to_str().unwrap().to_owned();
+    let file = dir.path().join("afile");
+    std::fs::write(&file, b"x").unwrap();
+    let file = file.to_str().unwrap().to_owned();
+    let gone = format!(r"{existing}\gone");
+    let under_existing = format!(r"{existing}\tool.exe");
     for (value, want) in [
-        (r"Q:\qcwd", r"Q:\qcwd\tool.exe"),
-        (r"\\srv\shr\d", r"\\srv\shr\d\tool.exe"),
+        (existing.as_str(), under_existing.as_str()),
+        (gone.as_str(), r"Q:\tool.exe"),
+        (file.as_str(), r"Q:\tool.exe"),
         ("Q:rel", r"Q:\tool.exe"),
         ("rel", r"Q:\tool.exe"),
         (r"\rooted", r"Q:\tool.exe"),
     ] {
         let got = complete_on(
             Path::new("Q:tool.exe"),
-            || Ok(PathBuf::from(r"C:\base")),
+            || Ok(PathBuf::from(r"D:\base")),
             |_| Ok(Some(OsString::from(value))),
         )
         .unwrap();
         assert_eq!(got.path, PathBuf::from(want), "=Q:={value:?}");
+    }
+}
+
+/// On a verbatim cwd a relative name is joined as written and `GetFullPathNameW` collapses it,
+/// with Win32's floor: after `\\?\UNC\`, not after the share (measured by
+/// `tests/windows_process_cwd.rs`).
+#[test]
+fn a_relative_name_on_a_verbatim_unc_cwd_collapses_as_win32_does() {
+    for (name, want) in [
+        (r"..\t.exe", r"\\?\UNC\srv\shr\t.exe"),
+        (r"..\..\t.exe", r"\\?\UNC\srv\t.exe"),
+        (r"..\..\..\t.exe", r"\\?\UNC\t.exe"),
+    ] {
+        let got = complete_on(Path::new(name), || Ok(PathBuf::from(r"\\?\UNC\srv\shr\d")), no_drive).unwrap();
+        assert_eq!(got.path, PathBuf::from(want), "{name:?}");
+        let exact = absolutise_exact_on(Path::new(name), || Ok(PathBuf::from(r"\\?\UNC\srv\shr\d")), no_drive).unwrap();
+        assert_eq!(exact.path, PathBuf::from(want), "raw_executable {name:?}");
+    }
+}
+
+/// On a verbatim cwd a rooted name is refused: Win32 completes it to `\\t.exe`, off the cwd's
+/// volume and share (measured by `tests/windows_process_cwd.rs`).
+#[test]
+fn a_rooted_name_on_a_verbatim_cwd_is_refused() {
+    for cwd in [r"\\?\UNC\srv\shr\d", r"\\?\C:\d"] {
+        for complete in [complete_on, absolutise_exact_on] {
+            match complete(Path::new(r"\t.exe"), || Ok(PathBuf::from(cwd)), no_drive) {
+                Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{cwd:?}: {e}"),
+                Err(other) => panic!("{cwd:?}: expected Io, got {other:?}"),
+                Ok(done) => panic!("{cwd:?}: must be refused, got {:?}", done.path),
+            }
+        }
     }
 }
 

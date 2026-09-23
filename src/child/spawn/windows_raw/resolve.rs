@@ -279,10 +279,16 @@ pub(crate) struct Completed {
 ///   [`DriveAbsolute`](crate::resolve::PathType::DriveAbsolute): as written. Nothing is read.
 /// - [`DriveRelative`](crate::resolve::PathType::DriveRelative) (`C:x`): the cwd is read to learn
 ///   the current drive. On that drive the rest is appended to the cwd. On another, it is appended
-///   to that drive's own directory, the `=Q:` variable when it is fully qualified, else the drive's
-///   root (Wine `ntdll/path.c`, `RtlPathTypeDriveRelative`), and the cwd is not used.
+///   to that drive's own directory: the `=Q:` variable when it is fully qualified and names an
+///   existing directory, else the drive's root, and the cwd is not used. That is what
+///   `GetFullPathNameW` does (measured by `tests/windows_process_cwd.rs`); Wine uses any value, and
+///   notes the existence check as a Windows difference it does not model.
 /// - [`Rooted`](crate::resolve::PathType::Rooted) (`\x`): appended to the cwd's drive or share.
-/// - [`Relative`](crate::resolve::PathType::Relative): appended to the cwd.
+///   Refused on a verbatim cwd, where Win32 completes it off the cwd's volume (`\t.exe`,
+///   measured).
+/// - [`Relative`](crate::resolve::PathType::Relative): appended to the cwd. On a verbatim cwd it is
+///   appended as written, so `GetFullPathNameW` collapses its `..` with Win32's floor, after
+///   `\\?\UNC\` (measured), not std's.
 ///
 /// Appended as units, never `Path::join`ed: `join` replaces its base when the rest parses a prefix
 /// of its own, so `C:D:\x` would become `D:\x` where Win32 reads `C:\cwd\D:\x`.
@@ -344,7 +350,7 @@ fn anchor(
                 }
             } else {
                 let base = drive_cwd(drive)?
-                    .filter(|dir| crate::resolve::is_absolute_name(dir, true))
+                    .filter(|dir| crate::resolve::is_absolute_name(dir, true) && Path::new(dir).is_dir())
                     .unwrap_or_else(|| {
                         let mut root = drive.to_os_string();
                         root.push("\\");
@@ -356,10 +362,23 @@ fn anchor(
                 }
             }
         }
-        PathType::Rooted | PathType::Relative => Completed {
-            path: PathBuf::from(crate::resolve::join::join(process_cwd()?.as_os_str(), name, "\\")),
-            used_cwd: true,
-        },
+        PathType::Rooted | PathType::Relative => {
+            let cwd = process_cwd()?;
+            if crate::resolve::is_rooted_on_verbatim(name, Some(cwd.as_os_str())) {
+                return Err(crate::resolve::rooted_on_verbatim(path));
+            }
+            // On a verbatim cwd the name is joined as written: `GetFullPathNameW` then collapses it
+            // with Win32's floor, which `join` would already have applied as std's.
+            let path = if is_verbatim(&cwd) {
+                crate::resolve::join::concat(cwd.as_os_str(), name, "\\")
+            } else {
+                crate::resolve::join::join(cwd.as_os_str(), name, "\\")
+            };
+            Completed {
+                path: PathBuf::from(path),
+                used_cwd: true,
+            }
+        }
     };
     // `GetFullPathNameW` completes these two types without reading any process state.
     debug_assert!(

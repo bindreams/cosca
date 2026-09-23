@@ -455,6 +455,48 @@ fn a_candidate_made_verbatim_by_its_base_is_normalised() {
     assert_eq!(*seen.borrow(), [PathBuf::from(r"\\?\C:\d\sub.\tool.exe")]);
 }
 
+/// A name made verbatim by its base is joined as written, `..` included, so `normalise` collapses
+/// it with Win32's floor rather than std's: past a verbatim share, not at it.
+#[test]
+fn a_candidate_made_verbatim_by_its_base_is_joined_as_written() {
+    let seen = std::cell::RefCell::new(Vec::new());
+    let normalise = |p: &Path| {
+        seen.borrow_mut().push(p.to_path_buf());
+        Ok(p.to_path_buf())
+    };
+    let _ = resolve(ResolveInput {
+        program: Path::new(r"..\..\..\t.exe"),
+        cwd: Some(Path::new(r"\\?\UNC\srv\shr\d")),
+        system_dirs: &[],
+        path_var: None,
+        windows: true,
+        loadable_only: false,
+        normalise: &normalise,
+    });
+    assert_eq!(*seen.borrow(), [PathBuf::from(r"\\?\UNC\srv\shr\d\..\..\..\t.exe")]);
+}
+
+/// A rooted name on a verbatim base is refused: Win32 completes it off the base's volume.
+#[test]
+fn a_rooted_name_on_a_verbatim_base_is_refused() {
+    let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be probed") };
+    for cwd in [r"\\?\UNC\srv\shr\d", r"\\?\C:\d"] {
+        let got = resolve(ResolveInput {
+            program: Path::new(r"\t.exe"),
+            cwd: Some(Path::new(cwd)),
+            system_dirs: &[],
+            path_var: None,
+            windows: true,
+            loadable_only: false,
+            normalise: &never,
+        });
+        match got {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{cwd:?}: {e}"),
+            other => panic!("{cwd:?}: must be refused, got {other:?}"),
+        }
+    }
+}
+
 /// A name written verbatim, or joined onto a plain base, is probed as it stands.
 #[test]
 fn only_a_verbatim_base_makes_a_candidate_normalised() {

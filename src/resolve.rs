@@ -838,6 +838,23 @@ fn accepted(joined: &Path, windows: bool) -> bool {
     joined.is_absolute() || is_absolute_name(joined.as_os_str(), windows)
 }
 
+/// Whether `name` is rooted (`\x`) and `base` verbatim: a name Win32 completes off the base's
+/// volume, which [`resolve`] and the raw backend's completion both refuse.
+pub(crate) fn is_rooted_on_verbatim(name: &OsStr, base: Option<&OsStr>) -> bool {
+    path_type(name) == PathType::Rooted && base.is_some_and(|b| join::is_verbatim(b.as_encoded_bytes()))
+}
+
+/// The refusal for [`is_rooted_on_verbatim`].
+pub(crate) fn rooted_on_verbatim(name: &Path) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{name:?} is rooted, and Win32 completes a rooted name against a verbatim (\\\\?\\) \
+             directory to a path off that directory's volume; spell it in full"
+        ),
+    ))
+}
+
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     let name = input.program.as_os_str();
     // The base contract, reported at the call boundary rather than where the base is first used.
@@ -885,6 +902,11 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
                 input.program
             ),
         )));
+    }
+    // Win32 completes a rooted name against a verbatim directory off that directory's volume
+    // (`\\t.exe` on `\\?\UNC\srv\shr\d`, measured), so no file there could be the one it names.
+    if input.windows && is_rooted_on_verbatim(name, input.cwd.map(Path::as_os_str)) {
+        return Err(rooted_on_verbatim(input.program));
     }
     // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the
     // exact name the caller wrote, a searched one does not — see `filename_candidates`).
@@ -941,7 +963,18 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
 
     for dir in dirs {
         for candidate in &candidates {
-            let joined = join_candidate(&dir, candidate, input.windows);
+            let made_verbatim = input.windows
+                && shape == Shape::Located
+                && join::is_verbatim(dir.as_os_str().as_encoded_bytes())
+                && !join::is_verbatim(candidate.as_encoded_bytes());
+            // Only the cwd base is a directory the caller did not spell verbatim. A `PATH` or
+            // system directory is written verbatim by whoever set it, and is taken as written.
+            // A made-verbatim name is joined as written, for `normalise` to collapse as Win32 does.
+            let joined = if made_verbatim {
+                PathBuf::from(join::concat(dir.as_os_str(), candidate, "\\"))
+            } else {
+                join_candidate(&dir, candidate, input.windows)
+            };
             // Only a fully qualified `joined` is accepted — this is what actually keeps a relative
             // or empty `PATH` element from resolving through the current directory (an empty
             // element means "the current directory", and a relative one such as `.`/`tools`
@@ -952,12 +985,6 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             if !accepted(&joined, input.windows) {
                 continue;
             }
-            // Only the cwd base is a directory the caller did not spell verbatim. A `PATH` or
-            // system directory is written verbatim by whoever set it, and is taken as written.
-            let made_verbatim = input.windows
-                && shape == Shape::Located
-                && join::is_verbatim(dir.as_os_str().as_encoded_bytes())
-                && !join::is_verbatim(candidate.as_encoded_bytes());
             let probed = if made_verbatim {
                 (input.normalise)(&joined)
             } else {
