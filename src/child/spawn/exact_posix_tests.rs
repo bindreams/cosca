@@ -153,7 +153,10 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
 /// root fixture becomes [`UNPRIVILEGED`] first: the test is then the same one it is for any other
 /// user, rather than one that cannot set up its own precondition.
 fn drop_root() {
-    // SAFETY: plain credential syscalls on this single-threaded fixture process.
+    // SAFETY: plain credential calls with valid arguments. libtest runs this on a thread of its
+    // own, not the main one, which is fine: glibc and musl broadcast a set*id to every thread
+    // (setxid), and Darwin's credentials are per-process, so the whole fixture process drops
+    // together — and the spawn that must run unprivileged happens on this same thread anyway.
     unsafe {
         if libc::geteuid() != 0 {
             return;
