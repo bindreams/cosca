@@ -884,8 +884,7 @@ fn each_verdict_gives_the_nul_refusal_its_own_reason() {
 
 /// The WRAPPER, which none of the tests above reach: they spell `win32` out as data, so pinning
 /// [`super::reject_batch_path`]'s `cfg!(windows)` argument to `true` leaves every one of them
-/// green while POSIX callers get the Win32 diagnosis back — the regression this round already
-/// fixed once, in the gate the helper is only half of.
+/// green while POSIX callers get the Win32 diagnosis back.
 #[test]
 fn the_gate_wrapper_asks_for_this_hosts_verdict() {
     let bat_then_nul = with_interior_nul("setup.bat", "junk");
@@ -955,9 +954,6 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
 /// [`crate::child::spawn::build_std_command`] with no NUL check of its own.
 ///
 /// Host-independent on purpose: what it pins is that the gate judges the token the CALLER named.
-/// Before this round it read `std::process::Command::get_program()`, and std's Unix constructor
-/// had already swapped a NUL-bearing program for a `<string-with-nul>` sentinel — so on this host
-/// the call returned `Ok` and the token reached `spawn`.
 ///
 /// The KIND is asserted on every host, not just off Win32: this token's extension is the one the
 /// batch rule could plausibly claim, so an `.expect_err` alone would be satisfied on a Windows run
