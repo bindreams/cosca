@@ -1,6 +1,8 @@
 //! Embeds `testbin/long_path_aware.manifest` in `cosca_testbin_cwd`, and in no other binary.
 //!
-//! Test-only: the package excludes this file, so a dependent never builds it. `embed-manifest`
+//! Test-only. The published package excludes this file, so a crates.io dependent never runs it. A
+//! git or path dependent does, harmlessly: its only output is link arguments for
+//! `cosca_testbin_cwd`, a binary a dependent never builds. `embed-manifest`
 //! passes its `LINK.EXE` options to every `[[bin]]` (`rustc-link-arg-bins`), which would make each
 //! testbin long-path aware and change how it handles paths, so the same three options go to this
 //! one binary instead. Off MSVC the binary gets no manifest, and its tests' precondition check
