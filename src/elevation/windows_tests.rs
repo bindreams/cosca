@@ -208,6 +208,25 @@ fn a_clean_unelevated_request_plans_a_launch() {
     assert_eq!(launch.show, SW_SHOWNORMAL);
 }
 
+/// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
+#[test]
+fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
+    let mut c = Command::new();
+    c.args([r"C:\Windows\System32\whoami.exe"])
+        .current_dir(r"C:\Windows\Temp")
+        .elevate();
+    let launch = match super::plan_runas(&c, &win_host(false)) {
+        Ok(super::RunasStep::Launch(launch)) => launch,
+        Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
+        Err(e) => panic!("a clean request with a current_dir() must not be refused: {e:?}"),
+    };
+    assert_eq!(
+        launch.dir_w,
+        Some(r"C:\Windows\Temp".encode_utf16().chain([0]).collect::<Vec<u16>>()),
+        "lpDirectory is current_dir(), wide and NUL-terminated"
+    );
+}
+
 #[test]
 fn already_elevated_inherit_only_is_run_as_is() {
     // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
