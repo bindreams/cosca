@@ -9,7 +9,7 @@ repository = "https://github.com/bindreams/cosca"
 readme = "README.md"
 keywords = ["subprocess", "process", "spawn", "elevation", "cross-platform"]
 categories = ["os", "development-tools", "asynchronous"]
-exclude = ["/testbin", "/tests", "/.github", "/.claude", "/prek.toml"]
+exclude = ["/build.rs", "/testbin", "/tests", "/.github", "/.claude", "/prek.toml"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -114,6 +114,13 @@ doc = false
 [[bin]]
 name = "cosca_testbin_image"
 path = "testbin/image_report.rs"
+test = false
+doc = false
+
+# Long-path aware, by the manifest `build.rs` embeds in this binary alone.
+[[bin]]
+name = "cosca_testbin_cwd"
+path = "testbin/cwd.rs"
 test = false
 doc = false
 
