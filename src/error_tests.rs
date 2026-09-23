@@ -249,3 +249,18 @@ fn io_context_keeps_the_os_error_as_its_source() {
         .expect("the OS error is the source");
     assert_eq!(source.raw_os_error(), Some(code));
 }
+
+/// A replayed context error keeps its wrapped OS error, which is what the context exists to keep.
+#[test]
+fn replay_keeps_an_io_context_source() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let e = Error::Io(crate::error::io_context("ctx", std::io::Error::from_raw_os_error(code)));
+    let Error::Io(r) = e.replay() else {
+        panic!("replay keeps the variant")
+    };
+    assert_eq!(r.to_string(), e.to_string());
+    let source = std::error::Error::source(r.get_ref().expect("a custom error"))
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the OS error is still the source");
+    assert_eq!(source.raw_os_error(), Some(code));
+}

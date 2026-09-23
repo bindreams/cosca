@@ -232,6 +232,9 @@ impl std::error::Error for IoContext {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 fn replay_io(e: &std::io::Error) -> std::io::Error {
+    if let Some(ctx) = e.get_ref().and_then(|inner| inner.downcast_ref::<IoContext>()) {
+        return io_context(ctx.context.clone(), replay_io(&ctx.source));
+    }
     match e.raw_os_error() {
         Some(code) => std::io::Error::from_raw_os_error(code),
         None => std::io::Error::new(e.kind(), e.to_string()),
