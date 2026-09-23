@@ -160,10 +160,11 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
     Ok(script)
 }
 
-/// Program + args, honoring `executable()`; a `raw_executable()` program comes back absolute
+/// Program + args + the directory to run them in, honoring `executable()`; a `raw_executable()`
+/// program comes back absolute, with the directory it was completed against
 /// ([`Command::posix_launch`]). `exec`ing the program sets argv[0] to its own path, so an
 /// argv[0] distinct from a set `executable()` cannot survive.
-pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
+pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>, Option<PathBuf>), Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
     // program set" with a message about re-quoting a command line.
@@ -201,11 +202,9 @@ pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>
                 .into(),
         ));
     }
-    let program = cmd
-        .posix_launch()?
-        .program
-        .map_or_else(|| first.clone(), PathBuf::into_os_string);
-    Ok((program, argv[1..].to_vec()))
+    let launch = cmd.posix_launch()?;
+    let program = launch.program.map_or_else(|| first.clone(), PathBuf::into_os_string);
+    Ok((program, argv[1..].to_vec(), launch.cwd))
 }
 
 /// The honest capability matrix for macOS graphical elevation. Every rejection below
@@ -234,7 +233,7 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
             ));
         }
     }
-    let (program, _) = program_and_args(cmd)?;
+    let (program, _, _) = program_and_args(cmd)?;
     // root's /bin/sh resolves a bare name against ITS OWN PATH, so a relative
     // program would let the environment choose which binary runs as root. The crate
     // closes the same hole for its POSIX backends by carrying absolute paths.
@@ -326,8 +325,8 @@ pub(crate) fn build_rewrite(
         cmd.fds().keys().all(|s| s.raw() < 3),
         "reject_structural_gui_config must reject fd >= 3 before build_rewrite"
     );
-    let (program, args) = program_and_args(cmd)?;
-    let shell_command = build_shell_command(&program, &args, cmd.cwd())?;
+    let (program, args, cwd) = program_and_args(cmd)?;
+    let shell_command = build_shell_command(&program, &args, cwd.as_deref())?;
     let script = wrap_do_shell_script(&shell_command, arg_max)?;
 
     let mut derived = Command::new();
@@ -340,7 +339,7 @@ pub(crate) fn build_rewrite(
     // turns a bogus directory into a precise spawn-time `Io` error instead of an
     // opaque non-zero exit, and the script's `cd --` makes the payload's cwd
     // deterministic either way. The two name the same directory by construction.
-    if let Some(d) = cmd.cwd() {
+    if let Some(d) = cwd {
         derived.current_dir(d);
     }
     // kill_on_drop MUST be carried, exactly as `posix::transfer_process_attrs`

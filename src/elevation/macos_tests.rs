@@ -348,7 +348,7 @@ fn a_matching_executable_yields_that_program_and_the_remaining_args() {
     c.executable("/usr/bin/id")
         .args(["/usr/bin/id", "-u", "-r"])
         .elevation_auth(crate::elevation::Auth::Gui);
-    let (program, rest) = super::program_and_args(&c).expect("matching executable");
+    let (program, rest, _) = super::program_and_args(&c).expect("matching executable");
     assert_eq!(program, OsString::from("/usr/bin/id"));
     assert_eq!(rest, args(&["-u", "-r"]));
 }
@@ -449,6 +449,30 @@ fn a_bare_exact_program_is_completed_rather_than_refused() {
         "{:?}",
         argv[2]
     );
+}
+
+/// With no `current_dir`, the payload must still run in the directory the program was completed
+/// against: root's shell starts wherever the trampoline puts it.
+#[cfg(unix)]
+#[test]
+fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_against() {
+    let mut c = Command::new();
+    c.raw_executable("tool")
+        .args(["tool"])
+        .elevation_auth(crate::elevation::Auth::Gui);
+    // Reads the process cwd, which other tests in this binary move under this lock.
+    let _guard = crate::child::spawn::spawn_lock();
+    let dir = std::env::current_dir().expect("cwd");
+    let (derived, _) = build_rewrite(&mut c, Path::new("/usr/bin/osascript"), None).unwrap();
+    let CommandInput::Argv(argv) = derived.input() else {
+        unreachable!()
+    };
+    let d = dir.to_str().expect("a UTF-8 test cwd");
+    let want =
+        String::from_utf8(build_shell_command(OsStr::new(&format!("{d}/tool")), &[], Some(&dir)).unwrap()).unwrap();
+    assert!(want.starts_with("cd -- "), "{want}");
+    assert!(argv[2].to_str().unwrap().contains(&want), "{:?}", argv[2]);
+    assert_eq!(derived.cwd(), Some(dir.as_path()));
 }
 
 #[test]
