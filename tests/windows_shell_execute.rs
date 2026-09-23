@@ -58,6 +58,28 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// An environment variable set for a test's duration and restored on drop to exactly what it was,
+/// absent included.
+struct EnvVar(&'static str, Option<OsString>);
+
+impl EnvVar {
+    /// Set `name` to `value(previous)`.
+    fn set(name: &'static str, value: impl FnOnce(Option<&OsStr>) -> OsString) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value(previous.as_deref()));
+        Self(name, previous)
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(value) => std::env::set_var(self.0, value),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
 const APP: &str = "cosca_probe_a.exe";
 const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\cosca_probe_a.exe";
 
@@ -428,16 +450,19 @@ fn classname_runas_needs_a_full_path() {
     );
     check(failed_with(&got, NO_ASSOCIATION), "comfile has no runas verb", &got);
 
-    let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = OsString::from(l.dir_path.as_os_str());
-    new_path.push(";");
-    new_path.push(&old_path);
-    std::env::set_var("PATH", &new_path);
+    let path = EnvVar::set("PATH", |old| {
+        let mut new = OsString::from(l.dir_path.as_os_str());
+        if let Some(old) = old {
+            new.push(";");
+            new.push(old);
+        }
+        new
+    });
     let p_name = OsStr::new("cosca_probe_p.exe");
     let p = l.dir_path.join("cosca_probe_p.exe");
     let without = run(&l, "no class, on PATH", "runas", p_name, &l.dir_empty, None);
     let with = run(&l, "exefile, on PATH", "runas", p_name, &l.dir_empty, Some("exefile"));
-    std::env::set_var("PATH", &old_path);
+    drop(path);
     check(
         ends_with(&without, &p),
         "without a class, a bare name is found on PATH",
@@ -505,7 +530,7 @@ fn exefile_takes_percent_literally() {
         std::fs::create_dir(dir).expect("mkdir");
         std::fs::copy(source, dir.join("cosca_probe_pct.exe")).expect("copy the payload");
     }
-    std::env::set_var("COSCA_PROBE_PCT", "exp");
+    let pct = EnvVar::set("COSCA_PROBE_PCT", |_| "exp".into());
     let file = literal.join("cosca_probe_pct.exe");
     let by_file = run(
         &l,
@@ -524,7 +549,7 @@ fn exefile_takes_percent_literally() {
         &literal,
         Some("exefile"),
     );
-    std::env::remove_var("COSCA_PROBE_PCT");
+    drop(pct);
     let mut failures: Vec<String> = Vec::new();
     match &by_file {
         Ok(r)
