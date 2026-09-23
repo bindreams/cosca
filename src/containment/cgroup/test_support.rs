@@ -93,3 +93,74 @@ pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containme
         .expect("the child reported Placed");
     leaf
 }
+
+/// A temp-directory stand-in for a cgroup leaf, `<tempdir>/<name>`.
+///
+/// Its `cgroup.events` is a symlink to a file outside the leaf, so removing the leaf leaves that
+/// file, and every fd and watch on it, untouched: as removing a real leaf neither modifies its
+/// `cgroup.events` nor delivers any event on it. [`rmdir`](FakeLeaf::rmdir) answers as cgroupfs
+/// does, through [`fault::set_rmdir_hook`](super::fault::set_rmdir_hook).
+#[cfg(target_os = "linux")]
+pub(crate) struct FakeLeaf {
+    _dir: tempfile::TempDir,
+    /// The leaf directory.
+    pub(crate) leaf: std::path::PathBuf,
+    /// The file the leaf's `cgroup.events` resolves to.
+    pub(crate) events: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl FakeLeaf {
+    pub(crate) fn new(name: &str, populated: bool) -> FakeLeaf {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf = dir.path().join(name);
+        std::fs::create_dir(&leaf).expect("create the leaf");
+        let events = dir.path().join(format!("{name}.events"));
+        std::fs::write(&events, format!("populated {}\nfrozen 0\n", u8::from(populated))).expect("write cgroup.events");
+        std::os::unix::fs::symlink(&events, leaf.join("cgroup.events")).expect("link cgroup.events");
+        std::fs::write(leaf.join("cgroup.kill"), b"").expect("create cgroup.kill");
+        FakeLeaf {
+            _dir: dir,
+            leaf,
+            events,
+        }
+    }
+
+    /// Flip `populated` by rewriting its one digit in place: a truncating rewrite could be read
+    /// half-done, as an empty file.
+    pub(crate) fn set_populated(events: &std::path::Path, populated: bool) {
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(events)
+            .expect("open cgroup.events");
+        file.write_all_at(if populated { b"1" } else { b"0" }, "populated ".len() as u64)
+            .expect("flip populated");
+    }
+
+    pub(crate) fn is_populated(events: &std::path::Path) -> bool {
+        let contents = std::fs::read_to_string(events).expect("read cgroup.events");
+        contents.lines().any(|l| l.trim() == "populated 1")
+    }
+
+    /// What a third party's `rmdir` of the leaf does: the leaf is gone, its `cgroup.events` file
+    /// is untouched.
+    pub(crate) fn remove(leaf: &std::path::Path) {
+        for entry in std::fs::read_dir(leaf).expect("list the leaf") {
+            std::fs::remove_file(entry.expect("leaf entry").path()).expect("remove a leaf file");
+        }
+        std::fs::remove_dir(leaf).expect("remove the leaf");
+    }
+
+    /// cgroupfs's `rmdir`: `ENOENT` once gone, `EBUSY` while populated, else the leaf goes.
+    pub(crate) fn rmdir(leaf: &std::path::Path, events: &std::path::Path) -> std::io::Result<()> {
+        if !leaf.exists() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        if FakeLeaf::is_populated(events) {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        FakeLeaf::remove(leaf);
+        Ok(())
+    }
+}

@@ -25,6 +25,37 @@ thread_local! {
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
+}
+
+/// Replaces a leaf's `rmdir`, given the leaf's path.
+type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+
+/// Make the NEXT drain watch on this thread fail to create its inotify instance, as
+/// `fs.inotify.max_user_instances` would. Take semantics: assert [`take_force_inotify_failure`]
+/// returns `false` afterwards to prove it was consumed.
+pub(crate) fn set_force_inotify_failure(on: bool) {
+    FORCE_INOTIFY_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_inotify_failure() -> bool {
+    FORCE_INOTIFY_FAILURE.with(|f| f.replace(false))
+}
+
+/// Replace every leaf `rmdir` on this thread with `hook`, until [`take_rmdir_hook`]. A temp
+/// directory gives none of cgroupfs's `rmdir` answers, so a test supplies them.
+pub(crate) fn set_rmdir_hook(hook: impl FnMut(&std::path::Path) -> std::io::Result<()> + 'static) {
+    RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn take_rmdir_hook() {
+    RMDIR_HOOK.with(|h| h.borrow_mut().take());
+}
+/// Run the rmdir hook, if one is set.
+pub(crate) fn run_rmdir_hook(path: &std::path::Path) -> Option<std::io::Result<()>> {
+    let mut hook = RMDIR_HOOK.with(|h| h.borrow_mut().take())?;
+    let result = hook(path);
+    RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    Some(result)
 }
 
 /// Send on `notify` each time a leaf's drain wait on this thread is about to block: the watch is

@@ -686,43 +686,57 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
 }
 
 // An armed Drop's drain -----
+// Each test gives a fake leaf cgroupfs's `rmdir` answers through the rmdir hook, and drives it from
+// another thread that acts only once the drop's drain wait is about to block.
+
+/// Run `act` on another thread each time a drain wait on THIS thread is about to block, until the
+/// returned guard drops. `act` gets the number of the block, from 0.
+#[cfg(target_os = "linux")]
+fn on_each_drain_block(mut act: impl FnMut(usize) + Send + 'static) -> impl Drop {
+    struct Stop(Option<std::thread::JoinHandle<()>>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            // Dropping the only sender ends the actor's loop.
+            crate::containment::cgroup::fault::take_drain_blocking_notifier();
+            self.0.take().expect("actor").join().expect("actor thread");
+        }
+    }
+    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel();
+    let actor = std::thread::spawn(move || {
+        let mut n = 0;
+        while blocking_rx.recv().is_ok() {
+            act(n);
+            n += 1;
+        }
+    });
+    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
+    Stop(Some(actor))
+}
 
 /// An armed `Drop` that kills through its leaf removes it only once the leaf has drained: no
-/// `rmdir` after the `cgroup.kill` write sees `populated 1`. Another thread flips a fake
-/// `cgroup.events` to `populated 0` once the drop's wait is blocked, and only then.
+/// `rmdir` after the `cgroup.kill` write sees `populated 1`.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-draining-leaf");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let events = leaf_path.join("cgroup.events");
-    std::fs::write(&events, "populated 1\nfrozen 0\n").expect("write cgroup.events");
-    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
 
-    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel();
-    // Ends when the drop's notifier is taken, which drops the only sender. The flip rewrites the
-    // one byte that differs, in place: a truncating rewrite could be read half-done, as an empty
-    // file.
-    let flipper = std::thread::spawn(move || {
-        use std::os::unix::fs::FileExt as _;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&events)
-            .expect("open cgroup.events");
-        while blocking_rx.recv().is_ok() {
-            file.write_all_at(b"0", "populated ".len() as u64)
-                .expect("drain the fake leaf");
-        }
-    });
+    let fake = FakeLeaf::new("cosca-draining-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
 
-    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
-    crate::containment::cgroup::fault::record_leaf_steps();
-    drop(entered_leaf_at(leaf_path));
-    let steps = crate::containment::cgroup::fault::take_leaf_steps();
-    crate::containment::cgroup::fault::take_drain_blocking_notifier();
-    flipper.join().expect("flipper");
+    fault::record_leaf_steps();
+    drop(entered_leaf_at(fake.leaf.clone()));
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
 
+    assert!(
+        !fake.leaf.exists(),
+        "the drop must remove the drained leaf, got {steps:?}"
+    );
     let killed_at = steps
         .iter()
         .position(|s| s == "kill")
@@ -732,6 +746,146 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     assert!(
         after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
         "every rmdir after the kill must wait for the drain, got {steps:?}"
+    );
+}
+
+/// A drain wait wakes when the leaf is removed, even with no event on `cgroup.events`: removing a
+/// cgroup cancels a `populated` notification the kernel had postponed (see `DrainWatch`), so a
+/// third party can remove a drained leaf while the wait still reads it populated.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-removed-while-waited", true);
+    let waited = fake.leaf.clone();
+    let removed = fake.leaf.clone();
+    let waiter = std::thread::spawn(move || {
+        let _actor = on_each_drain_block(move |_| FakeLeaf::remove(&removed));
+        crate::containment::cgroup::CgroupLeaf::for_test_at(waited).wait_drained(None)
+    });
+
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait_drained"),
+        TreeDrain::AllMembersExited,
+        "a removed leaf holds no member"
+    );
+}
+
+/// The same for a `Drop` killing through its leaf: it wakes, finds the leaf gone, and reports
+/// nothing, since nothing was left behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_drop_whose_leaf_a_third_party_removes_reports_nothing() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::log_capture::install();
+    let fake = FakeLeaf::new("cosca-removed-under-drop", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let removed = fake.leaf.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::remove(&removed));
+
+    let mark = crate::log_capture::mark();
+    drop(entered_leaf_at(fake.leaf.clone()));
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    let records = crate::log_capture::records_since(mark, "cosca-removed-under-drop");
+    assert!(
+        !crate::log_capture::levels_since(mark, "cosca-removed-under-drop").contains(&log::Level::Warn),
+        "a leaf a third party removed was not left behind, got {records:?}"
+    );
+}
+
+/// An `rmdir` that fails `EBUSY` after the drain — a child cgroup a third party made and has
+/// since removed — is retried once the leaf is observed empty, not reported as left behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_drop_retries_an_rmdir_a_passing_child_cgroup_refused() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::log_capture::install();
+    let fake = FakeLeaf::new("cosca-passing-child", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    let mut drained_rmdirs = 0;
+    fault::set_rmdir_hook(move |_| {
+        if leaf.exists() && !FakeLeaf::is_populated(&events) {
+            drained_rmdirs += 1;
+            // The first rmdir after the drain meets the third party's child.
+            if drained_rmdirs == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+            }
+        }
+        FakeLeaf::rmdir(&leaf, &events)
+    });
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let mark = crate::log_capture::mark();
+    drop(entered_leaf_at(fake.leaf.clone()));
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    let records = crate::log_capture::records_since(mark, "cosca-passing-child");
+    assert!(!fake.leaf.exists(), "the leaf must be removed, got {records:?}");
+    assert!(
+        !crate::log_capture::levels_since(mark, "cosca-passing-child").contains(&log::Level::Warn),
+        "nothing was left behind, got {records:?}"
+    );
+}
+
+/// A child-cgroup sweep of a leaf that is already gone removes nothing, and is no failure.
+#[cfg(target_os = "linux")]
+#[test]
+fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        super::remove_child_cgroups(&dir.path().join("cosca-gone")).expect("sweep"),
+        0
+    );
+}
+
+/// Without an inotify instance — `fs.inotify.max_user_instances` reached — an armed `Drop` still
+/// waits for a real leaf to drain and removes it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_without_inotify_still_removes_its_leaf() {
+    use std::os::unix::process::CommandExt;
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
+    );
+    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf_path = leaf.leaf_path.clone();
+    let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("300");
+    // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
+    // closure runs between fork and exec, and `leaf` outlives the spawn.
+    unsafe {
+        cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+    }
+    let mut member = cmd.spawn().expect("spawn a member");
+    leaf.take_placement(member.id())
+        .expect("decidable")
+        .expect("the member entered the leaf");
+
+    crate::containment::cgroup::fault::set_force_inotify_failure(true);
+    drop(leaf);
+    let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
+    member.wait().expect("reap the member");
+
+    assert!(consumed, "the drop must have tried, and failed, to watch");
+    assert!(
+        !leaf_path.exists(),
+        "the drop must not strand the leaf: {}",
+        leaf_path.display()
     );
 }
 

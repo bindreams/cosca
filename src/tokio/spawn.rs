@@ -364,7 +364,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(all(test, target_os = "linux"))]
             let spawned = crate::child::spawn::fault::post_fork_failure(
                 spawned,
-                prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path_for_test()),
+                prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path()),
             );
             match spawned {
                 Ok(c) => c,

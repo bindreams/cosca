@@ -346,15 +346,13 @@ async fn wait_tree_drained_inner(
     .await
 }
 
-/// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), observed via
-/// `cgroup.events`'s `populated` key over a reactor-registered `AsyncFd` (`EPOLLPRI`, tokio's
-/// `Interest::PRIORITY`) — genuinely reactor-native, no polling interval anywhere, and
-/// cancellable (dropping the future deregisters the fd, same as every other Unix watch in this
-/// file). Mirrors `CgroupLeaf::wait_drained`'s sync loop exactly, including read-before-arm: the
-/// file is read BEFORE every `ready()` await, not only after, so a transition that already
-/// happened is observed on the read rather than requiring a fresh edge that may never fire
-/// again. `deadline` follows the crate's watch convention; each round awaits readiness for
-/// exactly the caller's own remaining time (`tokio::time::timeout`), never an invented interval.
+/// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), or until `deadline`.
+/// The async twin of `CgroupLeaf::wait_drained`: the same [`DrainWatch`], read before every await,
+/// with its fd registered with the reactor instead of `poll`ed. No interval anywhere; each round
+/// awaits readiness for exactly the caller's own remaining time, and dropping the future
+/// deregisters the fd.
+///
+/// [`DrainWatch`]: crate::containment::cgroup::DrainWatch
 #[cfg(target_os = "linux")]
 async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
@@ -363,41 +361,36 @@ async fn cgroup_wait_tree_drained(
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
 
+    use crate::containment::cgroup::DrainWatch;
     use crate::containment::TreeDrain;
 
-    use crate::containment::cgroup::{read_populated, removed_after_drain};
-
-    let file = match std::fs::File::open(leaf.events_path()) {
-        Ok(f) => f,
-        Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
-        Err(e) => return Err(Error::Io(e)),
+    let Some(watch) = DrainWatch::arm(leaf.path())? else {
+        return Ok(TreeDrain::AllMembersExited);
     };
-    let mut afd = AsyncFd::with_interest(file, Interest::PRIORITY).map_err(Error::Io)?;
-    let mut buf = String::new();
+    let interest = if watch.readiness() == rustix::event::PollFlags::PRI {
+        Interest::PRIORITY
+    } else {
+        Interest::READABLE
+    };
+    let mut afd = AsyncFd::with_interest(watch, interest).map_err(Error::Io)?;
     loop {
-        // Mirrors `CgroupLeaf::wait_drained`'s own leaf-removal race handling exactly (see its
-        // doc, and `read_populated`'s own): `rmdir` on this leaf — `Drop`'s own retry, or an
-        // external cgroup manager's cleanup of an already-empty leaf — can land between this
-        // loop's own `ready()` wakeup and its next read, and observing that removal is itself
-        // proof every member had already exited (rmdir cannot precede full drain), not a
-        // failure.
-        if !read_populated(afd.get_mut(), &mut buf)? {
+        if !afd.get_mut().populated()? {
             return Ok(TreeDrain::AllMembersExited);
         }
         let remaining = crate::wait::remaining(deadline);
         if remaining == Some(std::time::Duration::ZERO) {
             return Ok(TreeDrain::MembersRemain);
         }
+        #[cfg(test)]
+        crate::containment::cgroup::fault::notify_drain_blocking();
         let mut ready = match remaining {
-            None => afd.ready(Interest::PRIORITY).await.map_err(Error::Io)?,
-            Some(d) => match ::tokio::time::timeout(d, afd.ready(Interest::PRIORITY)).await {
+            None => afd.ready_mut(interest).await.map_err(Error::Io)?,
+            Some(d) => match ::tokio::time::timeout(d, afd.ready_mut(interest)).await {
                 Ok(r) => r.map_err(Error::Io)?,
                 Err(_elapsed) => return Ok(TreeDrain::MembersRemain),
             },
         };
-        // A regular file has no "would block" concept to drain — any readiness means a
-        // transition fired (possibly stale by the time we re-read, which the loop's own
-        // re-read handles); clear and re-await.
+        ready.get_inner_mut().consume()?;
         ready.clear_ready();
     }
 }

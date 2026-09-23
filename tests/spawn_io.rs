@@ -1574,35 +1574,6 @@ fn parse_closed_slots(slots: &str) -> Vec<i32> {
         .collect()
 }
 
-/// Block until the cgroup at `leaf` has no live member, on the kernel's `populated` edge.
-#[cfg(target_os = "linux")]
-fn wait_unpopulated(leaf: &std::path::Path) {
-    use std::io::Seek;
-    use std::os::fd::AsRawFd;
-
-    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open cgroup.events");
-    loop {
-        let mut text = String::new();
-        events.rewind().expect("rewind cgroup.events");
-        events.read_to_string(&mut text).expect("read cgroup.events");
-        if text.lines().any(|line| line == "populated 0") {
-            return;
-        }
-        let mut fd = libc::pollfd {
-            fd: events.as_raw_fd(),
-            events: libc::POLLPRI,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd; -1 blocks until the kernel reports a transition.
-        let ret = unsafe { libc::poll(&mut fd, 1, -1) };
-        assert!(
-            ret >= 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
-            "poll cgroup.events: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
 /// Spawn `cmd` with `slots` closed in this process across the spawn, and restore them.
 #[cfg(target_os = "linux")]
 fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
@@ -1791,7 +1762,7 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
     // The leaf is removed with the child: nothing is left behind once its members have exited.
     let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
     if in_leaf {
-        wait_unpopulated(&own_dir.join(root_cgroup.rsplit('/').next().expect("a leaf name")));
+        common::cgroup::wait_drained(&own_dir.join(root_cgroup.rsplit('/').next().expect("a leaf name")));
     }
     drop(child);
     let prefix = format!("cosca-{}-", std::process::id());

@@ -156,10 +156,15 @@ impl CgroupLeaf {
         self.armed.store(false, Ordering::Relaxed);
     }
 
-    /// The leaf's `cgroup.events` path — the drain edge. Both watches open it for themselves:
-    /// the sync one polls it directly, while the reactor-native async one cannot reuse that
-    /// `poll(2)` loop and registers the descriptor instead.
-    pub(crate) fn events_path(&self) -> PathBuf {
+    /// The leaf's directory, for the async drain wait.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn path(&self) -> &Path {
+        &self.leaf_path
+    }
+
+    /// The leaf's `cgroup.events` path.
+    #[cfg(test)]
+    fn events_path(&self) -> PathBuf {
         self.leaf_path.join("cgroup.events")
     }
 
@@ -436,6 +441,10 @@ impl CgroupLeaf {
             let events = fs::read_to_string(self.events_path()).unwrap_or_default();
             format!("rmdir {}", events.lines().next().unwrap_or("(no cgroup.events)"))
         });
+        #[cfg(test)]
+        if let Some(result) = fault::run_rmdir_hook(&self.leaf_path) {
+            return result;
+        }
         fs::remove_dir(&self.leaf_path)
     }
 
@@ -467,107 +476,19 @@ impl CgroupLeaf {
         }
     }
 
-    /// Block until every process in the leaf has EXITED (not reaped), observed via
-    /// `cgroup.events`'s `populated` key — the kernel flips it 1→0 exactly when the leaf's
-    /// last task exits, fork-proof (no cooperation from the tree, no re-enumeration race).
-    ///
-    /// Read-before-arm: `populated` is checked BEFORE every `poll`, not only after — a
-    /// transition that already happened (leaf drained between a caller's previous check and
-    /// this call) must be observed on the read, not require a fresh kernel edge that will
-    /// never fire again. `POLLPRI` fires on every transition (both 1→0 and 0→1), so an
-    /// intervening 0→1 (a leaf that reused-then-repopulated between reads) is also picked up
-    /// by looping back to re-read rather than trusting readiness to imply the value dropped.
-    ///
-    /// `deadline` follows the crate's watch convention (see [`crate::wait::remaining`]). No
-    /// interval is chosen anywhere in this path: every round blocks in one `poll(2)` call for
-    /// exactly the caller's own remaining time, and returns as soon as either the kernel
-    /// reports a transition or the deadline is reached.
-    ///
-    /// Leaf-removal race: `rmdir` on this leaf (`Drop`'s own retry, or an external cgroup
-    /// manager cleaning up an empty leaf — either succeeds only once `populated` has already
-    /// read 0) can land at any point after the last member exits, including between this
-    /// call's own `poll` waking on the 1→0 transition and its very next read. Once that
-    /// happens, `open`/`seek`/`read` on this leaf's `cgroup.events` fail (`ENOENT` for a fresh
-    /// `open` through the now-unlinked directory; `ENODEV` for a syscall through an fd that was
-    /// opened before removal, once the kernel deactivates the underlying kernfs node) — proof
-    /// the leaf is gone, which is itself proof every member had already exited (removal can
-    /// never precede full drain), not a failure. See [`removed_after_drain`].
+    /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
+    /// `populated` reads 0, or the leaf is removed — or until `deadline` (see
+    /// [`crate::wait::remaining`]). The wait is a [`DrainWatch`]: no interval, and it wakes on the
+    /// leaf's removal as well as on `populated`, since the kernel can cancel the one notification
+    /// a drain sends. A removed leaf holds nothing: `rmdir` succeeds only on a drained leaf
+    /// ([`removed_after_drain`]).
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        use rustix::event::{poll, PollFd, PollFlags};
-
-        use crate::containment::TreeDrain;
-        use crate::error::Error;
-
-        let mut file = match File::open(self.events_path()) {
-            Ok(f) => f,
-            Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
-            Err(e) => return Err(Error::Io(e)),
-        };
-        let mut buf = String::new();
-        loop {
-            if !read_populated(&mut file, &mut buf)? {
-                return Ok(TreeDrain::AllMembersExited);
-            }
-            let remaining = crate::wait::remaining(deadline);
-            if remaining == Some(std::time::Duration::ZERO) {
-                return Ok(TreeDrain::MembersRemain);
-            }
-            let ts = remaining.map(|d| rustix::event::Timespec {
-                tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
-                tv_nsec: d.subsec_nanos() as _,
-            });
-            let mut fds = [PollFd::new(&file, PollFlags::PRI)];
-            match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => return Ok(TreeDrain::MembersRemain), // genuinely timed out
-                Ok(_) => continue,                            // a transition fired — re-read
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(Error::Io(io::Error::from(e))),
-            }
-        }
-    }
-
-    /// Block until every process in the leaf has exited: `populated` reads 0, or the leaf is gone.
-    ///
-    /// No deadline and no interval: the wait is an inotify watch on `cgroup.events`, which the
-    /// kernel modifies when `populated` flips. The watch is armed before the first read, so a flip
-    /// between the two is seen on the read. Only a member stuck in uninterruptible sleep (D state)
-    /// keeps it waiting, since nothing can end that member sooner.
-    fn block_until_drained(&self) -> Result<(), crate::error::Error> {
-        use rustix::fs::inotify;
-
-        use crate::error::Error;
-
-        let path = self.events_path();
-        let watch = inotify::init(inotify::CreateFlags::CLOEXEC).map_err(|e| Error::Io(e.into()))?;
-        if let Err(e) = inotify::add_watch(&watch, &path, inotify::WatchFlags::MODIFY) {
-            let e = io::Error::from(e);
-            return if removed_after_drain(&e) {
-                Ok(())
-            } else {
-                Err(Error::Io(e))
-            };
-        }
-        let mut file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if removed_after_drain(&e) => return Ok(()),
-            Err(e) => return Err(Error::Io(e)),
-        };
-        let mut buf = String::new();
-        let mut events = [0u8; 1024];
-        loop {
-            if !read_populated(&mut file, &mut buf)? {
-                return Ok(());
-            }
-            #[cfg(test)]
-            fault::notify_drain_blocking();
-            // Any event is a reason to re-read; what it says does not matter.
-            match rustix::io::read(&watch, &mut events) {
-                Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                Err(e) => return Err(Error::Io(e.into())),
-            }
+        match DrainWatch::arm(&self.leaf_path)? {
+            None => Ok(crate::containment::TreeDrain::AllMembersExited),
+            Some(mut watch) => watch.wait(deadline),
         }
     }
 
@@ -635,13 +556,6 @@ impl CgroupLeaf {
         }
     }
 
-    /// The leaf's directory, for a test that must find this leaf and no other. Its one user is the
-    /// tokio spawn's post-fork failure seam.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn path_for_test(&self) -> &Path {
-        &self.leaf_path
-    }
-
     /// Whether the leaf still holds its `cgroup.procs` fd or its report channel.
     pub(crate) fn holds_spawn_resources(&self) -> bool {
         self.procs_fd.is_some() || self.report.is_some()
@@ -707,7 +621,7 @@ impl Drop for CgroupLeaf {
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
         // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(first, false, "after its handle's teardown");
+            self.drain_and_remove(false, "after its handle's teardown");
         }
     }
 }
@@ -792,75 +706,46 @@ impl CgroupLeaf {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
-            Err(occupied) => self.drain_and_remove(occupied, killed, context),
+            Err(_) => self.drain_and_remove(killed, context),
         }
     }
 
-    /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed with
-    /// `occupied`.
+    /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Every drain is waited for, however long it takes ([`block_until_drained`](Self::block_until_drained)).
-    /// `rmdir` gives the same `EBUSY` for a leaf holding a child cgroup as for a populated one, and
-    /// killing removes no directory. A drained round that removes nothing and finds the leaf not
-    /// re-entered has nothing left to wait for, so the leaf is reported rather than retried.
-    fn drain_and_remove(&mut self, mut occupied: io::Error, mut killed: bool, context: &str) {
+    /// Each round kills through the leaf, waits however long the drain takes (a [`DrainWatch`]),
+    /// removes the leaf's child cgroups, and retries the `rmdir`. cgroupfs refuses an `rmdir` with
+    /// `EBUSY` only while the leaf is populated or has a live child cgroup (`cgroup_destroy_locked`,
+    /// kernel v6.12), so an `EBUSY` after a round is something a third party did since — moved a
+    /// process in, or made a child cgroup — and the next round deals with it. Every other outcome
+    /// ends the loop: removed, or a failure reported as a leaf left behind.
+    fn drain_and_remove(&mut self, mut killed: bool, context: &str) {
         loop {
-            // A cgroup reports an occupied leaf as `EBUSY`; any other directory, as `ENOTEMPTY`.
-            if !matches!(occupied.raw_os_error(), Some(libc::EBUSY) | Some(libc::ENOTEMPTY)) {
-                return warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({occupied}) {context}"));
-            }
             if !killed {
                 if let Err(e) = self.hard_kill() {
                     return warn_leaf_left_behind(
                         &self.leaf_path,
-                        format_args!("rmdir failed ({occupied}) {context}; cgroup.kill failed ({e})"),
+                        format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
                     );
                 }
             }
             killed = false;
-            // Every member was just sent SIGKILL, so the leaf drains.
-            if let Err(e) = self.block_until_drained() {
+            if let Err(e) = self.wait_drained(None) {
                 return warn_leaf_left_behind(
                     &self.leaf_path,
-                    format_args!("rmdir failed ({occupied}) {context}; its drain could not be watched ({e})"),
+                    format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
                 );
             }
-            let swept = match remove_child_cgroups(&self.leaf_path) {
-                Ok(removed) => removed,
-                Err(e) => {
-                    return warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!("rmdir failed ({occupied}) {context}; a child cgroup could not be removed ({e})"),
-                    )
-                }
-            };
-            occupied = match self.rmdir_leaf() {
+            if let Err(e) = remove_child_cgroups(&self.leaf_path) {
+                return warn_leaf_left_behind(
+                    &self.leaf_path,
+                    format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
+                );
+            }
+            match self.rmdir_leaf() {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
-                Err(e) => e,
-            };
-            if swept > 0 {
-                continue;
-            }
-            // Nothing removed: progress only if a fresh sweep finds a new child cgroup, or
-            // something re-entered the leaf.
-            match (remove_child_cgroups(&self.leaf_path), self.repopulated()) {
-                (Ok(removed), _) if removed > 0 => continue,
-                (_, Ok(true)) => continue,
-                (_, Ok(false)) => {
-                    return warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!("rmdir failed ({occupied}) {context}; nothing was left to kill or remove"),
-                    )
-                }
-                (_, Err(e)) => {
-                    return warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!(
-                            "rmdir failed ({occupied}) {context}; whether it was re-entered could not be read ({e})"
-                        ),
-                    )
-                }
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(e) => return warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
             }
         }
     }
@@ -886,12 +771,6 @@ impl CgroupLeaf {
             &self.leaf_path,
             format_args!("rmdir failed ({first}) after its spawn was abandoned; {why}"),
         );
-    }
-
-    /// Whether the leaf has members again, read once from `cgroup.events`.
-    fn repopulated(&self) -> Result<bool, crate::error::Error> {
-        let mut file = File::open(self.events_path()).map_err(crate::error::Error::Io)?;
-        read_populated(&mut file, &mut String::new())
     }
 }
 
@@ -1067,15 +946,28 @@ fn reap_in_background(child: ChildId) {
 }
 
 /// Remove every child cgroup under `dir`, deepest first, and count those removed. A child that
-/// `rmdir` refuses as busy — something re-entered it — is left for the caller's next kill.
+/// `rmdir` refuses as busy — something re-entered it — is left for the caller's next kill. A
+/// directory already gone has nothing left to remove.
 #[cfg(target_os = "linux")]
 fn remove_child_cgroups(dir: &Path) -> io::Result<usize> {
     let mut removed = 0;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if removed_after_drain(&e) => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if removed_after_drain(&e) => return Ok(removed),
+            Err(e) => return Err(e),
+        };
         // A cgroup's own interface files are files; its child cgroups are its directories.
-        if !entry.file_type()?.is_dir() {
-            continue;
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if removed_after_drain(&e) => continue,
+            Err(e) => return Err(e),
         }
         let child = entry.path();
         removed += remove_child_cgroups(&child)?;
