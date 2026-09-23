@@ -267,15 +267,16 @@ pub(crate) fn is_absolute_name(program: &OsStr, windows: bool) -> bool {
 /// Whether `bytes` is a verbatim UNC prefix (`\\?\UNC\`) missing its server or share, which
 /// names no share as the plain `\\srv` does. [`windows_prefix_len`] counts such a prefix whole,
 /// since nothing may be appended to it either way.
+///
+/// Split on `\` alone, as [`join`] parses a verbatim prefix, so the path this admits is the one
+/// the join completes: `\\?\UNC\srv/shr` is server `srv/shr` with no share.
 fn is_verbatim_unc_without_share(bytes: &[u8]) -> bool {
-    let is_verbatim_unc = bytes.len() >= 8
-        && bytes[..4] == *br"\\?\"
-        && bytes[4..7].eq_ignore_ascii_case(b"UNC")
-        && is_sep(bytes[7], true);
+    let is_verbatim_unc =
+        bytes.len() >= 8 && bytes[..4] == *br"\\?\" && bytes[4..7].eq_ignore_ascii_case(b"UNC") && bytes[7] == b'\\';
     if !is_verbatim_unc {
         return false;
     }
-    let mut parts = bytes[8..].split(|&b| is_sep(b, true));
+    let mut parts = bytes[8..].split(|&b| b == b'\\');
     let server = parts.next().unwrap_or_default();
     let share = parts.next().unwrap_or_default();
     server.is_empty() || share.is_empty()

@@ -17,6 +17,9 @@ fn absolute_names_by_grammar() {
         (r"\\?\UNC\srv\", true, false),
         (r"\\?\UNC\", true, false),
         (r"\\?\UNC\\shr", true, false),
+        // After the verbatim marker only `\` separates, as the join reads it: `srv/shr` is the
+        // server, and there is no share.
+        (r"\\?\UNC\srv/shr", true, false),
         (r"\\srv", true, false),
         (r"\t\tool", true, false),
         ("C:tool", true, false),

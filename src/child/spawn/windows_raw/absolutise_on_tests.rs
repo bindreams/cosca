@@ -220,7 +220,7 @@ fn the_effective_cwd_without_a_current_dir_is_one_read() {
 fn the_effective_cwd_refuses_a_share_less_unc_current_dir() {
     // `\\srv\\x` is not among them: Win32 collapses the doubled separator (measured), so it names
     // the share root `\\srv\x`.
-    for dir in [r"\\server", "//server", r"\\?\UNC\srv", r"\\?\UNC\"] {
+    for dir in [r"\\server", "//server", r"\\?\UNC\srv", r"\\?\UNC\", r"\\?\UNC\srv/shr"] {
         match super::effective_cwd(Some(Path::new(dir)), &empty_env(), || {
             panic!("{dir:?} must not read the cwd")
         }) {
