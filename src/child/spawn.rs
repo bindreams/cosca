@@ -132,10 +132,7 @@ pub(crate) mod raw_backend_observe {
         USED_RAW_BACKEND.with(|f| f.set(true));
     }
     pub(crate) fn take_used_raw_backend() -> bool {
-        // THROWAWAY RED PROOF (revert before merge): stub out the read so the new argv-only
-        // fd>=3 raw-backend tests fail by construction, proving their assertion is not vacuous.
-        let _ = USED_RAW_BACKEND.with(|f| f.replace(false));
-        false
+        USED_RAW_BACKEND.with(|f| f.replace(false))
     }
 }
 
