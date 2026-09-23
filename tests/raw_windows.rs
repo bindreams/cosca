@@ -372,12 +372,7 @@ fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
 /// the `CommandLine` token.
 #[test]
 fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
-    let wide_args: Vec<Vec<u16>> = [common::testbin(), "write-fd", "3", "commandline-only-fd3"]
-        .iter()
-        .map(|a| a.encode_utf16().collect())
-        .collect();
-    let refs: Vec<&[u16]> = wide_args.iter().map(Vec::as_slice).collect();
-    let line = String::from_utf16(&cosca::quote::windows::join_wide(&refs)).unwrap();
+    let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
 
     let mut c = cosca::Command::new();
     c.commandline(line).fd(3, cosca::Stdio::pipe_out()).unwrap();
