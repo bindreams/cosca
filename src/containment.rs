@@ -307,7 +307,7 @@ pub(crate) mod treewalk;
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
 #[allow(unused_imports)]
-pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared};
+pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

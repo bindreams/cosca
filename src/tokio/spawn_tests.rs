@@ -182,12 +182,12 @@ fn the_unreachable_child_warning_is_once_per_errno() {
     let warned = std::sync::Mutex::default();
     let error = || Error::Io(std::io::Error::from_raw_os_error(libc::EMFILE));
     let levels: Vec<_> = (0..2)
-        .map(|_| super::warn_child_may_be_unreachable_into(&warned, &error()))
+        .map(|_| super::warn_after_fork_into(&warned, &error(), "it was left running"))
         .collect();
     assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
     let other = Error::Io(std::io::Error::from_raw_os_error(libc::ENOMEM));
     assert_eq!(
-        super::warn_child_may_be_unreachable_into(&warned, &other),
+        super::warn_after_fork_into(&warned, &other, "it was left running"),
         log::Level::Warn
     );
 }
@@ -348,7 +348,10 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
 /// error channel takes them, the child's stdio `dup2` closes its end, and `spawn` returns before
 /// the child's hook runs. The child is held at its hook until the spawn has been abandoned; an
 /// error it then returned to `std` would be written to that channel's fd number — by now the
-/// child's stderr.
+/// child's stderr. It exits with `ABANDONED_EXIT` instead.
+///
+/// It sent nothing before the abandonment, so nothing in cosca holds its pid: the spawn warns that
+/// it may be left unreaped, and the test reaps it through the seam's pidfd.
 ///
 /// Each case runs in a copy of this test binary: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
@@ -380,6 +383,8 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
         return;
     }
 
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -418,16 +423,30 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
                 libc::close(saved);
             }
         }
+        // The spawn is abandoned: only now does the child's hook run. Released before any assert:
+        // the child holds this process's stdout, and a child held forever would hang the outer run.
+        gate_write.write_all(b"x").expect("release the child");
         assert!(spawned.is_err(), "the forced failure must fail the spawn");
         let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
-        let _ = fault::take_forgotten_pid();
+        let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
         let _ = fault::take_forgotten_leaf();
-        // The spawn is abandoned: only now does the child's hook run.
-        gate_write.write_all(b"x").expect("release the child");
-        // Its exit, then its reap: it sent nothing, so nothing else reaps it.
-        let _ = rustix::process::waitid(
-            rustix::process::WaitId::PidFd(pidfd.as_fd()),
-            rustix::process::WaitIdOptions::EXITED,
+        let status = loop {
+            match rustix::process::waitid(
+                rustix::process::WaitId::PidFd(pidfd.as_fd()),
+                rustix::process::WaitIdOptions::EXITED,
+            ) {
+                Err(rustix::io::Errno::INTR) => continue,
+                other => break other.expect("reap the child").expect("it exited"),
+            }
+        };
+        assert!(
+            warned_for(mark, pid, "left unreaped"),
+            "the spawn must say its child may be left unreaped"
+        );
+        assert_eq!(
+            status.exit_status(),
+            Some(crate::containment::cgroup::ABANDONED_EXIT),
+            "the abandoned child must exit from its hook"
         );
     });
     let mut written = Vec::new();

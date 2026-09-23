@@ -594,9 +594,12 @@ impl Drop for CgroupLeaf {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Abandoned {
-    /// Nothing of the child's runs: it was killed, had already exited, or never reached cosca's
-    /// hook — so the abandoned exchange makes it exit before `exec`.
+    /// Nothing of the child's runs, and it is reaped or will be: it was killed, or had already
+    /// exited and been reaped.
     Ended,
+    /// The child sent nothing, so nothing names it: there may be none, or one that exits at its
+    /// first send, before `exec` and outside the leaf — but that nothing here holds the pid to reap.
+    MaybeUnreaped,
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
     /// signal, and its leaf does not hold it.
     OutOfReach,
@@ -606,7 +609,8 @@ pub(crate) enum Abandoned {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildFate {
-    /// Never sent its intent: it exits at its first send, never entering the leaf.
+    /// Never sent its intent: if it exists, it exits at its first send, never entering the leaf,
+    /// and nothing here can reap it.
     NeverReached,
     /// Already exited and reaped by whoever failed the spawn (std reaps the child of a spawn it
     /// failed).
@@ -647,7 +651,8 @@ impl CgroupLeaf {
             self.remove_holding_nothing();
         }
         match (fate, through_leaf) {
-            (ChildFate::NeverReached | ChildFate::Gone | ChildFate::Killed, _) => Abandoned::Ended,
+            (ChildFate::NeverReached, _) => Abandoned::MaybeUnreaped,
+            (ChildFate::Gone | ChildFate::Killed, _) => Abandoned::Ended,
             // `cgroup.kill` needs no credential, so a placed child is killed through its leaf.
             (ChildFate::Unkillable, Some(Ok(()))) => Abandoned::Ended,
             (ChildFate::Unkillable, _) => Abandoned::OutOfReach,

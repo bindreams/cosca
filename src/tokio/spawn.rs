@@ -313,9 +313,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         let c = match tcmd.spawn().map_err(Error::Io) {
             Ok(c) => c,
             Err(e) => {
-                if !prepared.abandon_before_verdict() {
-                    warn_child_may_be_unreachable(&e);
-                }
+                warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
                 return Err(e);
             }
         };
@@ -387,11 +385,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             match spawned {
                 Ok(c) => c,
                 Err(e) => {
-                    // Whatever tokio did with the child, the leaf's exchange says whether it is
-                    // ended or still running out of reach; without a leaf, nothing can tell.
-                    if !prepared.abandon_before_verdict() {
-                        warn_child_may_be_unreachable(&e);
-                    }
+                    // Whatever tokio did with the child, the leaf's exchange says what became of
+                    // it; without a leaf, nothing can tell.
+                    warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
                     return Err(e);
                 }
             }
@@ -464,23 +460,42 @@ pub(crate) mod windows_raw;
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
 
-/// Say that a failed tokio spawn may have left a forked child running out of reach.
+/// Say what a failed tokio spawn may have left behind of its child: nothing, a zombie nothing
+/// reaps, or a process nothing can reach.
 ///
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
-/// returning no pid. Only a cgroup leaf still reaches such a child, so a spawn without one says
-/// so. The error cannot tell a failure before the fork from one after it, hence "may". Once per
-/// errno at `warn`, then at `debug`, as a degraded containment is reported.
-fn warn_child_may_be_unreachable(error: &Error) {
-    static WARNED: std::sync::Mutex<std::collections::BTreeSet<Option<i32>>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    warn_child_may_be_unreachable_into(&WARNED, error);
+/// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
+/// told it who it is. The error cannot tell a failure before the fork from one after it, hence
+/// "may". Each is once per errno at `warn`, then at `debug`, as a degraded containment is
+/// reported.
+fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &Error) {
+    use crate::containment::AbandonedChild;
+
+    type Warned = std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>;
+    static UNREAPED: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    static UNREACHABLE: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let (warned, consequence) = match child {
+        AbandonedChild::Ended => return,
+        AbandonedChild::MaybeUnreaped => (
+            &UNREAPED,
+            "the child exits before `exec` but was left unreaped: it never reached the point where it \
+             names itself, so nothing holds its pid",
+        ),
+        AbandonedChild::MaybeUnreachable => (
+            &UNREACHABLE,
+            "the child was left running and nothing can reach it: only a cgroup v2 leaf is killed \
+             without the child's pid",
+        ),
+    };
+    warn_after_fork_into(warned, error, consequence);
 }
 
-/// [`warn_child_may_be_unreachable`] against an explicit "already warned" set, returning the
-/// level it chose.
-fn warn_child_may_be_unreachable_into(
+/// Say that if the failed spawn forked, `consequence` — against an explicit "already warned" set,
+/// returning the level it chose.
+fn warn_after_fork_into(
     warned: &std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>,
     error: &Error,
+    consequence: &str,
 ) -> log::Level {
     let errno = match error {
         Error::Io(e) => e.raw_os_error(),
@@ -489,8 +504,7 @@ fn warn_child_may_be_unreachable_into(
     let level = crate::warn_once::report_level(warned, errno);
     log::log!(
         level,
-        "tokio spawn failed ({error}); if it failed after forking, the child was left running and \
-         nothing can reach it: only a cgroup v2 leaf is killed without the child's pid"
+        "tokio spawn failed ({error}); if it failed after forking, {consequence}"
     );
     level
 }

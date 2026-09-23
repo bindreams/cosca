@@ -1463,6 +1463,24 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
 }
 
+/// A spawn abandoned before its child sent anything cannot tell whether it forked: a child that
+/// exists exits at its first send, but nothing holds its pid to reap it. That is not `Ended`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-silent");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+
+    assert_eq!(
+        leaf.abandon_before_verdict(),
+        crate::containment::cgroup::Abandoned::MaybeUnreaped
+    );
+    assert!(!leaf_path.exists(), "the empty leaf is removed");
+    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+}
+
 /// A child reaped between the check that it lives and the kill — only by a reaper the crate's
 /// contract forbids — is signalled through its handle, which now names nothing: no other process
 /// can be hit. The kill finds it gone, and nothing is reaped twice.

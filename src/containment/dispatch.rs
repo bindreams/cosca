@@ -53,16 +53,34 @@ impl Prepared {
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
-    /// can drop one it forked — and say whether that child is ended: `false` means it may be
-    /// running where nothing can reach it. Without a leaf nothing can tell, so `false`.
+    /// can drop one it forked — and say what became of that child. Without a leaf nothing can
+    /// tell, so [`AbandonedChild::MaybeUnreachable`].
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
-    pub(crate) fn abandon_before_verdict(&mut self) -> bool {
+    pub(crate) fn abandon_before_verdict(&mut self) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
-            return leaf.abandon_before_verdict() == crate::containment::cgroup::Abandoned::Ended;
+            use crate::containment::cgroup::Abandoned;
+            return match leaf.abandon_before_verdict() {
+                Abandoned::Ended => AbandonedChild::Ended,
+                Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
+                Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
+            };
         }
-        false
+        AbandonedChild::MaybeUnreachable
     }
+}
+
+/// What became of the child of a spawn that failed with no handle left on it (see
+/// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
+#[cfg_attr(not(all(target_os = "linux", feature = "tokio")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbandonedChild {
+    /// Nothing of it runs, and it is reaped or will be.
+    Ended,
+    /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
+    MaybeUnreaped,
+    /// If it was forked, it may be running where nothing can reach it.
+    MaybeUnreachable,
 }
 
 /// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the
