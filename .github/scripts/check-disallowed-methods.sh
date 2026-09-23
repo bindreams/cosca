@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Regression check for the root clippy.toml's disallowed-methods bans.
+# Regression check for the root clippy.toml's disallowed-methods bans (pipes, raw spawns, tokio
+# timers and process-cwd mutators).
 # Runs clippy on the standalone .github/fixtures/disallowed-methods crate, which calls every
 # banned path, against the REAL root clippy.toml (via CLIPPY_CONF_DIR, not a copy), and asserts a
 # clippy::disallowed_methods diagnostic for each path clippy.toml lists. Reads
@@ -35,6 +36,24 @@ expected_paths=(
     "tokio::time::Interval::reset_immediately"
     "tokio::time::Interval::reset_after"
     "tokio::time::Interval::reset_at"
+    "std::env::set_current_dir"
+    "libc::chdir"
+    "libc::fchdir"
+    "nix::unistd::chdir"
+    "nix::unistd::fchdir"
+    "rustix::process::chdir"
+    "rustix::process::fchdir"
+    "rustix::fs::Dir::chdir"
+)
+
+# Listed in clippy.toml but unreachable from the Linux host this script lints on: clippy skips a
+# path whose crate isn't linked for the target. They still count toward the list comparison below,
+# so a new ban cannot land unlisted; they are exempt only from the must-fire check.
+unverifiable_here=(
+    "windows::Win32::System::Environment::SetCurrentDirectoryA"
+    "windows::Win32::System::Environment::SetCurrentDirectoryW"
+    "windows_sys::Win32::System::Environment::SetCurrentDirectoryA"
+    "windows_sys::Win32::System::Environment::SetCurrentDirectoryW"
 )
 
 listed="$(python3 -c '
@@ -42,7 +61,7 @@ import sys, tomllib
 with open(sys.argv[1], "rb") as f:
     print("\n".join(e["path"] for e in tomllib.load(f)["disallowed-methods"]))
 ' "${repo_root}/clippy.toml" | LC_ALL=C sort)"
-expected="$(printf '%s\n' "${expected_paths[@]}" | LC_ALL=C sort)"
+expected="$(printf '%s\n' "${expected_paths[@]}" "${unverifiable_here[@]}" | LC_ALL=C sort)"
 if [[ "${listed}" != "${expected}" ]]; then
     echo "::error::clippy.toml's disallowed-methods and this script's expected_paths differ:" >&2
     diff <(echo "${listed}") <(echo "${expected}") >&2 || true

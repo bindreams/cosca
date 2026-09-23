@@ -103,3 +103,56 @@ fn calls_tokio_interval_reset_after(interval: &mut tokio::time::Interval) {
 fn calls_tokio_interval_reset_at(interval: &mut tokio::time::Interval) {
     interval.reset_at(tokio::time::Instant::now());
 }
+
+// Process-cwd mutators =====
+//
+// The `windows` and `windows_sys` `SetCurrentDirectory*` bans cannot be exercised here: clippy
+// skips a path whose crate isn't linked for the host target, and this fixture builds on Linux. The
+// check script lists them as unverifiable here rather than dropping them.
+
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_std_set_current_dir() {
+    let _ = std::env::set_current_dir("/");
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_libc_chdir() {
+    unsafe { libc::chdir(c"/".as_ptr()) };
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_libc_fchdir() {
+    unsafe { libc::fchdir(0) };
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_nix_chdir() {
+    let _ = nix::unistd::chdir("/");
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_nix_fchdir() {
+    let _ = nix::unistd::fchdir(std::io::stdin());
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_rustix_chdir() {
+    let _ = rustix::process::chdir("/");
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_rustix_fchdir() {
+    let _ = rustix::process::fchdir(std::io::stdin());
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_rustix_dir_chdir(dir: &rustix::fs::Dir) {
+    let _ = dir.chdir();
+}

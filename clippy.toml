@@ -18,8 +18,25 @@
 # std/tokio `Command::spawn/output/status` fork without holding spawn_lock. Library tests use
 # crate::test_spawn; `tests/` uses the wrappers in tests/common/locked.rs.
 #
-# Every path below needs a call in .github/fixtures/disallowed-methods (checked by
-# .github/scripts/check-disallowed-methods.sh).
+# Process-cwd mutators -----
+#
+# Every function in this crate's dependency graph that can change the OS process's *current*
+# working directory — as opposed to a `Command`'s spawn-time cwd, which is fine; see
+# `src/child/spawn.rs`'s, `testbin/main.rs`'s and `testbin/cwd.rs`'s
+# `#[expect(clippy::disallowed_methods)]` call sites for why those are the only legitimate callers. The process cwd is global state shared
+# by every concurrently running `#[test]` in the same test binary, so nothing in `src/`, `tests/`
+# or `testbin/` may call one of these outside a deliberately reviewed, `#[expect]`-annotated site.
+#
+# `allow-invalid = true` entries are not reachable under every target/feature combination this
+# crate is linted with (checked via `cargo clippy`/`cargo hack clippy`/`cargo xwin clippy` across
+# aarch64-apple-darwin, x86_64-unknown-linux-gnu and x86_64-pc-windows-msvc, `--feature-powerset`):
+# clippy silently skips a path whose crate isn't linked at all for the target being checked, but
+# warns "does not refer to a reachable function" for a path whose crate IS linked yet the specific
+# item is absent for that target/feature combination — `allow-invalid` suppresses only that second
+# case, once confirmed to be exactly that and not a typo.
+#
+# Every ban in this file is guarded by .github/scripts/check-disallowed-methods.sh: every path below needs a
+# call in .github/fixtures/disallowed-methods.
 disallowed-methods = [
     # Flag-less pipe constructors
     { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which a spawn can close with the opt-in tracked in cosca #248. Or use pipe2(O_CLOEXEC) where the platform has it." },
@@ -44,4 +61,17 @@ disallowed-methods = [
     { path = "tokio::time::Interval::reset_immediately", reason = "Re-arming an Interval bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
     { path = "tokio::time::Interval::reset_after", reason = "Re-arming an Interval derives the deadline from a duration, outside arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) with an instant from deadline_from (principle 13)." },
     { path = "tokio::time::Interval::reset_at", reason = "Re-arming an Interval bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
+    # Process-cwd mutators
+    { path = "std::env::set_current_dir", reason = "mutates the whole process's cwd; see this file's header" },
+    { path = "libc::chdir", reason = "raw chdir(2)/CRT _chdir wrapper; see this file's header" },
+    { path = "libc::fchdir", reason = "raw fchdir(2) wrapper, unix-only; see this file's header", allow-invalid = true },
+    { path = "nix::unistd::chdir", reason = "nix's chdir(2) wrapper; see this file's header" },
+    { path = "nix::unistd::fchdir", reason = "nix's fchdir(2) wrapper; see this file's header" },
+    { path = "rustix::process::chdir", reason = "rustix's chdir(2) wrapper; see this file's header", allow-invalid = true },
+    { path = "rustix::process::fchdir", reason = "rustix's fchdir(2) wrapper; see this file's header", allow-invalid = true },
+    { path = "rustix::fs::Dir::chdir", reason = "rustix's Dir-handle chdir, itself an fchdir(2) wrapper; see this file's header", allow-invalid = true },
+    { path = "windows::Win32::System::Environment::SetCurrentDirectoryA", reason = "Win32 ANSI SetCurrentDirectory; see this file's header" },
+    { path = "windows::Win32::System::Environment::SetCurrentDirectoryW", reason = "Win32 wide SetCurrentDirectory; see this file's header" },
+    { path = "windows_sys::Win32::System::Environment::SetCurrentDirectoryA", reason = "windows-sys ANSI SetCurrentDirectory; not reachable with this crate's currently-enabled windows-sys features (kept for defense-in-depth against a future dependency change) — see this file's header", allow-invalid = true },
+    { path = "windows_sys::Win32::System::Environment::SetCurrentDirectoryW", reason = "windows-sys wide SetCurrentDirectory; not reachable with this crate's currently-enabled windows-sys features (kept for defense-in-depth against a future dependency change) — see this file's header", allow-invalid = true },
 ]
