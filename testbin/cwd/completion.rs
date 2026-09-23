@@ -64,7 +64,11 @@ impl Drop for Subst {
                 PCWSTR(self.target.as_ptr()),
             )
         };
-        removed.expect("remove the drive mapping");
+        // Never a panic: this runs while unwinding too, and a second panic would abort before the
+        // report reaches the test.
+        if let Err(e) = removed {
+            eprintln!("could not remove the {} mapping: {e}", self.drive);
+        }
     }
 }
 
@@ -87,7 +91,8 @@ fn drive_dir_value(drive: &str) -> String {
         .map_or_else(|| "unset".to_owned(), |(_, v)| v.to_string_lossy().into_owned())
 }
 
-/// `drive-dir <base> <image-child>`: maps a free drive letter `X:` to `<d>`, holding `sub`,
+/// `drive-dir <base> <image-child>`: maps a free drive letter `X:` to `<d>` for the logon session
+/// (system-affecting, so its test runs on CI only), holding `sub`,
 /// `exists\sub` and the file `afile`, and runs from `<d>` on another drive. For each value of
 /// `=X:`, set afresh before each route, it reports where cosca's raw backend runs a child given
 /// `current_dir("X:sub")`, what `GetFullPathNameW` makes of `X:sub` and the value it leaves in
@@ -155,7 +160,8 @@ pub fn past_the_root(depth: usize, render: &Render) {
     println!("gfpn_up_past_root={}", render.apply(&gfpn(OsStr::new(&up))));
 }
 
-/// `verbatim-unc <base> <image-child>`: reaches `<d>` through the `\\localhost\<drive>$` share.
+/// `verbatim-unc <base> <image-child>`: reaches `<d>` through the `\\localhost\<drive>$` share,
+/// so it needs that administrative share served and an administrator's elevated token to open it.
 /// First, from a plain cwd, where cosca and std run a child given that directory as
 /// `current_dir`, plainly and verbatim. Then it enters the verbatim spelling itself and reports what
 /// `GetFullPathNameW` makes of a rooted name, of `..` runs reaching and passing the share, and of a

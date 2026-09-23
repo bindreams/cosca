@@ -107,6 +107,14 @@ jobs:
       - name: Run tests
         run: cargo test --locked --target ${{ matrix.target }}
 
+      # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
+      # logon session) is `#[ignore]`d everywhere else. This step opts in to exactly that test.
+      - name: Run the drive-mapping test (Windows)
+        if: matrix.os == 'windows'
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} --test windows_process_cwd --
+          --include-ignored --exact a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does
+
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Run tests (pty feature)
         run: cargo test --locked --features pty --target ${{ matrix.target }}

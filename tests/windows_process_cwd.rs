@@ -79,7 +79,11 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 /// Win32 does: cosca's raw backend runs the child where `GetFullPathNameW` and std do, for every
 /// shape of that variable. Only a fully qualified value naming an existing directory is used; any
 /// other falls back to the drive's root, and `GetFullPathNameW` then rewrites `=X:` to it.
+///
+/// System-affecting: the probe maps a drive letter (`DefineDosDeviceW`) for the whole logon
+/// session, so this runs only where CI opts in, with an exact filter (`.github/workflows/ci.yaml`).
 #[test]
+#[ignore = "system-affecting: maps a drive letter; runs on CI only"]
 fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does() {
     let report = probe("drive-dir", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
@@ -104,6 +108,10 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does() {
 
 /// A UNC `current_dir` runs the child there, plainly and verbatim; and against a verbatim UNC
 /// process cwd, `GetFullPathNameW` completes a rooted name and a `..` run as measured here.
+///
+/// Precondition, asserted rather than skipped: the machine serves its administrative share
+/// (`\\localhost\C$`) and this process's token may open it, which takes an administrator's
+/// elevated token. CI runners have both.
 #[test]
 fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does() {
     let report = probe("verbatim-unc", env!("CARGO_BIN_EXE_cosca_testbin_image"));
