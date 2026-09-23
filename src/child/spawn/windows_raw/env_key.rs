@@ -12,6 +12,10 @@ use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREAT
 /// themselves, and the order is the case-insensitive ordinal sort `CreateProcessW` expects of an
 /// environment block. The table is the OS's, so it is asked rather than modelled.
 ///
+/// This equals std for keys under 2^31 UTF-16 units. std passes longer lengths to
+/// `CompareStringOrdinal` with `as _`, which truncates them; this compares such keys in pieces and
+/// stays correct, deliberately.
+///
 /// The key keeps the name it was created with. A map insert of an equal key keeps the existing
 /// key, so a map keeps the first name it saw for each variable, as std's does.
 #[derive(Clone, Debug)]
