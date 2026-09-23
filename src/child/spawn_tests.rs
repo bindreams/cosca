@@ -175,6 +175,31 @@ fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     child.wait().expect("reap");
 }
 
+/// An environment key with an embedded NUL is refused before the process-global handle mutation
+/// too. The seam's wiring is proven by the positive leg of the test above.
+#[cfg(windows)]
+#[test]
+fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+
+    let mut refused = Command::new();
+    refused
+        .executable("cmd")
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .env("A\0B", "x");
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("an embedded NUL must be refused");
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "got {err:?}"
+    );
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+}
+
 /// The std-path counterpart of the test above. The std backend reaches the same process-global
 /// mutation through `containment::prepare`, which composes and validates the creation-flag word
 /// at its top — a separate ordering the raw backends' tests cannot see.

@@ -39,14 +39,14 @@ use crate::error::Error;
 /// directory, and that promise is also the documented escape hatch for reaching "the current
 /// directory explicitly" — reaching the parent's instead defeats it.
 ///
-/// `env` is the child's environment, the same [`ChildEnv`] whose [`ChildEnv::into_block`] the
-/// child is spawned with. `PATH` is read from it, so the directories searched here are the ones the
-/// CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc promises — and
-/// no second read of this process's environment can disagree with the block.
+/// `path` is the child's `PATH`, [`ChildEnv::path`] of the same [`ChildEnv`] whose
+/// [`ChildEnv::into_block`] the child is spawned with, so the directories searched here are the
+/// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
+/// promises — and no second read of this process's environment can disagree with the block.
 ///
 /// Convenience wrapper over [`resolve_executable_in`] seeded from `cmd_cwd` (or
 /// [`std::env::current_dir`]), the real system directories, and the child's `PATH`.
-pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env: &ChildEnv) -> Result<PathBuf, Error> {
+pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
     let base_cwd;
     let base_cwd: &Path = match cmd_cwd {
         Some(dir) => dir,
@@ -56,7 +56,7 @@ pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env: &Child
         }
     };
     let system_dirs = windows_system_dirs();
-    resolve_executable_in(exe, base_cwd, &system_dirs, env.path())
+    resolve_executable_in(exe, base_cwd, &system_dirs, path)
 }
 
 /// The real system directories, in `CreateProcessW`'s NULL-`lpApplicationName` search order minus

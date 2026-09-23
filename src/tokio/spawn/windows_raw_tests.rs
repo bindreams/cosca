@@ -95,3 +95,28 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     );
     child.wait().await.expect("reap");
 }
+
+/// The async twin of `a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance`.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+    use crate::error::Error;
+
+    let mut refused = Command::new();
+    refused
+        .executable("cmd")
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .env("A\0B", "x");
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("an embedded NUL must be refused");
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "got {err:?}"
+    );
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+}

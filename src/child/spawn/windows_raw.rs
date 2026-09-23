@@ -70,7 +70,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let program: Option<PathBuf> = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     let spawn_env = spawn_env(cmd)?;
     let image: Option<PathBuf> = program
-        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), &spawn_env.child_env))
+        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), spawn_env.path.as_deref()))
         .transpose()?;
     if let Some(p) = &image {
         resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
@@ -110,7 +110,6 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    let env_block = spawn_env.child_env.into_block()?;
     let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
@@ -158,7 +157,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
             &app_name,
             &mut cmdline,
             &mut si,
-            &env_block,
+            &spawn_env.block,
             &cwd_w,
             flags,
             *cmd.flags_request(),
@@ -239,7 +238,11 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 /// The environment-derived inputs of a raw spawn, all from ONE read of this process's environment,
 /// so resolution, the containment decision and the child's block cannot see different ones.
 pub(crate) struct SpawnEnv {
-    pub(crate) child_env: resolve::ChildEnv,
+    /// The child's `PATH`, which resolution searches.
+    pub(crate) path: Option<OsString>,
+    /// The child's finished block. Built here, so a refused environment (an embedded NUL) is
+    /// refused before the spawn mutates anything.
+    pub(crate) block: Vec<u16>,
     pub(crate) is_root: bool,
     pub(crate) marker_env: bool,
 }
@@ -253,8 +256,10 @@ pub(crate) fn spawn_env(cmd: &Command) -> Result<SpawnEnv, Error> {
     let is_root = !crate::containment::dispatch::is_nested(marker_present);
     let marker_env = crate::containment::dispatch::windows_contain_setup(&cmd.contain_request(), is_root).marker_env;
     let ops = child_ops(cmd.env_ops(), marker_env);
+    let child_env = resolve::ChildEnv::capture(&snapshot, &ops);
     Ok(SpawnEnv {
-        child_env: resolve::ChildEnv::capture(&snapshot, &ops),
+        path: child_env.path().map(OsStr::to_os_string),
+        block: child_env.into_block()?,
         is_root,
         marker_env,
     })

@@ -4,7 +4,8 @@ use std::ffi::OsString;
 
 /// Resolve against the PATH `ops` give a child of this process, as a spawn does.
 fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
-    resolve_executable(exe, cmd_cwd, &ChildEnv::capture(&EnvSnapshot::read().unwrap(), ops))
+    let env = ChildEnv::capture(&EnvSnapshot::read().unwrap(), ops);
+    resolve_executable(exe, cmd_cwd, env.path())
 }
 
 /// A snapshot holding `base` in order.
@@ -693,7 +694,7 @@ fn resolution_searches_the_given_snapshot() {
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_snapshot.exe")).unwrap();
     let base = [(OsString::from("PATH"), dir.path().as_os_str().to_os_string())];
     let env = ChildEnv::capture(&snapshot(&base), &[]);
-    let got = resolve_executable(Path::new("sp_snapshot"), None, &env).unwrap();
+    let got = resolve_executable(Path::new("sp_snapshot"), None, env.path()).unwrap();
     assert_eq!(
         got.canonicalize().unwrap(),
         dir.path().join("sp_snapshot.exe").canonicalize().unwrap()

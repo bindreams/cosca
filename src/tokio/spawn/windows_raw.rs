@@ -262,7 +262,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .or_else(|| sync_raw::program_token(cmd));
     let spawn_env = sync_raw::spawn_env(cmd)?;
     let image = program
-        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), &spawn_env.child_env))
+        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), spawn_env.path.as_deref()))
         .transpose()?;
     if let Some(p) = &image {
         sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
@@ -295,7 +295,6 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    let env_block = spawn_env.child_env.into_block()?;
     let cwd_w = cmd.cwd().map(|c| sync_raw::to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.
@@ -341,7 +340,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
             &app_name,
             &mut cmdline,
             &mut si,
-            &env_block,
+            &spawn_env.block,
             &cwd_w,
             flags,
             *cmd.flags_request(),
