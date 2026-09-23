@@ -97,6 +97,8 @@ const FIXTURE_UNREACHABLE_CWD_TEST: &str =
 const FIXTURE_UNREACHABLE_CWD_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD";
 /// The `current_dir()` the fixture sets, if any.
 const FIXTURE_CURRENT_DIR_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_CURRENT_DIR";
+/// When set, the fixture spawns through the already-elevated rewrite, as root's `.elevate()` does.
+const FIXTURE_ALREADY_ELEVATED_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_ALREADY_ELEVATED";
 /// The fixture's exit code when a precondition does not hold or cosca's spawn fails.
 const PRECONDITION_FAILED: i32 = 90;
 const SPAWN_FAILED: i32 = 91;
@@ -127,6 +129,15 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     if let Some(dir) = std::env::var_os(FIXTURE_CURRENT_DIR_ENV) {
         c.current_dir(dir);
     }
+    if std::env::var_os(FIXTURE_ALREADY_ELEVATED_ENV).is_some() {
+        c = match already_elevated(&mut c) {
+            Ok(derived) => derived,
+            Err(e) => {
+                report(&format!("rewrite: {e}"));
+                std::process::exit(SPAWN_FAILED);
+            }
+        };
+    }
     let code = match c.spawn() {
         Ok(child) => child.wait().expect("wait").code().unwrap_or(SPAWN_FAILED),
         Err(e) => {
@@ -135,6 +146,25 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
         }
     };
     std::process::exit(code);
+}
+
+/// The command `.elevate()` spawns from a process that is already root, on any host.
+fn already_elevated(c: &mut Command) -> Result<Command, Error> {
+    use crate::elevation::plan::{BackendSet, Host, Os};
+    c.elevation_backend(crate::elevation::Backend::Sudo)
+        .elevation_auth(crate::elevation::Auth::NonInteractive);
+    let host = Host {
+        elevated: true,
+        has_tty: false,
+        available: BackendSet {
+            sudo: Some("/usr/bin/sudo".into()),
+            ..BackendSet::default()
+        },
+        os: Os::Unix,
+        arg_max: None,
+    };
+    let rw = crate::elevation::posix::rewrite_with_host(c, &host)?;
+    Ok(rw.derived.expect("the already-elevated rewrite derives a command"))
 }
 
 /// Write to the real stderr: libtest captures `eprintln!`, and the fixture exits without
@@ -159,7 +189,7 @@ impl Drop for RestoreMode {
 /// directory. Returns the fixture's exit code and stderr.
 ///
 /// The fixture's cwd is set by the spawner, so no process in this test moves its own.
-fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>) -> (Option<i32>, String) {
+fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_elevated: bool) -> (Option<i32>, String) {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("tempdir");
@@ -176,6 +206,9 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>) -> (Option<
         .stderr(std::process::Stdio::piped());
     if let Some(dir) = current_dir {
         fixture.env(FIXTURE_CURRENT_DIR_ENV, dir);
+    }
+    if already_elevated {
+        fixture.env(FIXTURE_ALREADY_ELEVATED_ENV, "1");
     }
     let mut child = {
         // Every fork in this binary holds it; see `cwd_and_path_tools`.
@@ -198,15 +231,25 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>) -> (Option<
 /// the child resolves the name against the cwd it inherits, and is left in it.
 #[test]
 fn an_exact_program_runs_in_a_cwd_that_has_no_path() {
-    let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(None);
+    let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(None, false);
     assert_eq!(code, Some(CWD_TOOL_EXIT), "{stderr}");
+}
+
+/// An already-root `.elevate()` runs no backend, so it spawns as the unelevated path does and
+/// needs no path to the cwd either.
+#[test]
+fn an_already_elevated_exact_program_runs_in_a_cwd_that_has_no_path() {
+    for (dir, want) in [(None, CWD_TOOL_EXIT), (Some("sub"), PATH_TOOL_EXIT)] {
+        let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(dir, true);
+        assert_eq!(code, Some(want), "{dir:?}: {stderr}");
+    }
 }
 
 /// A relative `current_dir` is entered from the inherited cwd too, and the program is loaded from
 /// there: `sub/tool`, run in `sub`.
 #[test]
 fn a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path() {
-    let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(Some("sub"));
+    let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(Some("sub"), false);
     assert_eq!(code, Some(PATH_TOOL_EXIT), "{stderr}");
 }
 

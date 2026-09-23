@@ -934,9 +934,21 @@ mod rewrite_tests {
 
     /// `RunAsIs` spawns the program itself; it must be the completed one there too.
     #[test]
-    fn an_already_elevated_exact_program_is_completed_too() {
-        let rw = rewrite_with_host(&mut exact_tool(Some("/work")), &elevated_sudo_host()).expect("rewrite");
-        assert_eq!(derived_argv(&rw), [OsString::from("/work/tool"), "-x".into()]);
+    fn an_already_elevated_exact_program_is_spawned_as_an_unelevated_one_is() {
+        for cwd in [Some("/work"), Some("sub"), None] {
+            let rw = super::super::rewrite_with_host_and_cwd(&mut exact_tool(cwd), &elevated_sudo_host(), || {
+                panic!("no backend runs, so nothing needs this process's cwd as a path")
+            })
+            .expect("rewrite");
+            let derived = rw.derived.as_ref().expect("derived");
+            assert!(
+                matches!(derived.executable_spec(), Some(crate::command::ExecutableSpec::Exact(p)) if p == std::path::Path::new("tool")),
+                "{:?}",
+                derived.executable_spec()
+            );
+            assert_eq!(derived_argv(&rw), [OsString::from("tool"), "-x".into()]);
+            assert_eq!(derived.cwd(), cwd.map(std::path::Path::new));
+        }
     }
 
     #[test]
@@ -965,7 +977,7 @@ mod rewrite_tests {
         assert_eq!(Some(cwd), std::path::Path::new(program).parent(), "{program:?}");
     }
 
-    /// Wrapped and already-elevated alike, with a relative `current_dir` or none.
+    /// Under a wrapper, with a relative `current_dir` or none.
     #[test]
     fn an_elevated_exact_programs_cwd_is_the_directory_it_was_completed_against() {
         // Reads the process cwd, which other tests in this binary move or delete under this lock.
@@ -974,22 +986,16 @@ mod rewrite_tests {
             let rw = rewrite_with_host(&mut exact_tool(cwd), &sudo_host()).expect("rewrite");
             let a = derived_argv(&rw);
             assert_runs_where_completed(&rw, &a[a.len() - 2]);
-            let rw = rewrite_with_host(&mut exact_tool(cwd), &elevated_sudo_host()).expect("rewrite");
-            assert_runs_where_completed(&rw, &derived_argv(&rw)[0]);
         }
     }
 
     /// A second reading could differ from the first, loading the program from one directory and
-    /// running it in another — for every backend and privilege state.
+    /// running it in another — for every backend that needs a path.
     #[test]
     fn a_rewrite_reads_the_process_cwd_exactly_once() {
         let mut gui = exact_tool(None);
         gui.elevation_backend(Backend::Auto).elevation_auth(Auth::Gui);
-        let cases = [
-            (exact_tool(None), sudo_host()),
-            (exact_tool(None), elevated_sudo_host()),
-            (gui, macos_gui_host(false)),
-        ];
+        let cases = [(exact_tool(None), sudo_host()), (gui, macos_gui_host(false))];
         for (mut c, host) in cases {
             let reads = std::cell::Cell::new(0);
             let rw = super::super::rewrite_with_host_and_cwd(&mut c, &host, || {

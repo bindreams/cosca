@@ -160,14 +160,9 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
     Ok(script)
 }
 
-/// Program + args + the directory to run them in, honoring `executable()`; a `raw_executable()`
-/// program comes back absolute, with the directory it was completed against
-/// ([`Command::posix_launch`]). `exec`ing the program sets argv[0] to its own path, so an
-/// argv[0] distinct from a set `executable()` cannot survive.
-pub(crate) fn program_and_args(
-    cmd: &Command,
-    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> Result<Launch, Error> {
+/// The argv, refused unless it is one `do shell script` can exec. `exec`ing the program sets
+/// argv[0] to its own path, so an argv[0] distinct from a set `executable()` cannot survive.
+fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
     // program set" with a message about re-quoting a command line.
@@ -205,9 +200,20 @@ pub(crate) fn program_and_args(
                 .into(),
         ));
     }
+    Ok(argv)
+}
+
+/// Program + args + the directory to run them in, honoring `executable()`; a `raw_executable()`
+/// program comes back absolute, with the directory it was completed against
+/// ([`Command::posix_launch`]), which is where `process_cwd` may be read.
+pub(crate) fn program_and_args(
+    cmd: &Command,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Launch, Error> {
+    let argv = checked_argv(cmd)?;
     let launch = cmd.posix_launch(process_cwd)?;
     Ok(Launch {
-        program: launch.program.map_or_else(|| first.clone(), PathBuf::into_os_string),
+        program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
         args: argv[1..].to_vec(),
         cwd: launch.cwd,
     })
@@ -217,22 +223,16 @@ pub(crate) fn program_and_args(
 /// is a thing Authorization Services genuinely cannot do — reported loudly rather
 /// than half-honored.
 ///
-/// Returns the [`Launch`] it validated, for [`build_rewrite`]; `process_cwd` is read at most once,
-/// and only after the relative-`current_dir` refusal.
-///
 /// Returns `Error::Unsupported { platform: "macos", .. }` for a capability mismatch,
 /// and `Error::Quote(NonUtf8)` for a program or directory with no byte form
 /// (reachable only off-unix, where an `OsStr` is WTF-16). Both are typed; neither is
 /// a panic.
-pub(crate) fn reject_structural_gui_config(
-    cmd: &Command,
-    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> Result<Launch, Error> {
+/// Reads nothing: an already-root caller runs no osascript, and needs no path to its cwd.
+pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
     // The caller's cwd is applied twice — to osascript, and as `cd --` inside the
     // script — and the trampoline does not carry a cwd across, so a RELATIVE path
     // resolves against two different bases and the two silently disagree. Absolute
-    // makes them name the same directory. Checked before `program_and_args`, whose
-    // completion reads this process's cwd and could fail first with a less useful error.
+    // makes them name the same directory.
     if let Some(dir) = cmd.cwd() {
         if !is_posix_absolute(dir.as_os_str())? {
             return Err(unsupported(
@@ -245,19 +245,29 @@ pub(crate) fn reject_structural_gui_config(
             ));
         }
     }
-    let launch = program_and_args(cmd, process_cwd)?;
-    let program = &launch.program;
+    let argv = checked_argv(cmd)?;
+    // A `raw_executable()` program is completed to an absolute path at build time, so only its
+    // shape can be judged here.
+    let program = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) => {
+            crate::resolve::exact::refuse_unnameable(p.as_os_str())?;
+            None
+        }
+        _ => Some(cmd.executable_path().map_or(argv[0].as_os_str(), |p| p.as_os_str())),
+    };
     // root's /bin/sh resolves a bare name against ITS OWN PATH, so a relative
     // program would let the environment choose which binary runs as root. The crate
     // closes the same hole for its POSIX backends by carrying absolute paths.
-    if !is_posix_absolute(program)? {
-        return Err(unsupported(
-            "macOS graphical elevation of a non-absolute program",
-            format!(
-                "{program:?} would be resolved by the elevated shell's own PATH, not the caller's, \
-                 so the binary that runs as root is not the one you selected; pass an absolute path"
-            ),
-        ));
+    if let Some(program) = program {
+        if !is_posix_absolute(program)? {
+            return Err(unsupported(
+                "macOS graphical elevation of a non-absolute program",
+                format!(
+                    "{program:?} would be resolved by the elevated shell's own PATH, not the caller's, \
+                     so the binary that runs as root is not the one you selected; pass an absolute path"
+                ),
+            ));
+        }
     }
     for (&slot, resolved) in cmd.fds() {
         if slot.raw() >= 3 {
@@ -306,7 +316,7 @@ pub(crate) fn reject_structural_gui_config(
     // so rejecting it would reject every default-constructed command and make this
     // path unreachable. Its real reach (the osascript front-end only) is documented
     // on `ElevatedVia::MacosOsascript` instead.
-    Ok(launch)
+    Ok(())
 }
 
 /// Build the DERIVED command (`osascript -e <script>`) plus the report to attach to
@@ -314,8 +324,8 @@ pub(crate) fn reject_structural_gui_config(
 /// 0-2 stdio is MOVED (`ResolvedStdio::File` is not `Clone`), matching the POSIX
 /// rewrite's contract.
 ///
-/// Precondition: `launch` is what [`reject_structural_gui_config`] returned, so the program
-/// and cwd are absolute, and there are no env ops and no containment. `kill_on_drop`
+/// Precondition: [`reject_structural_gui_config`] passed and `launch` is [`program_and_args`]'s,
+/// so the program and cwd are absolute, and there are no env ops and no containment. `kill_on_drop`
 /// is NOT gated (see that function), so it is transferred like the POSIX rewrite
 /// transfers it.
 pub(crate) fn build_rewrite(

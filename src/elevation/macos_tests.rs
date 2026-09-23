@@ -15,8 +15,8 @@ fn shell(program: &str, a: &[&str], cwd: Option<&str>) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-fn gate(c: &Command) -> Result<crate::elevation::Launch, Error> {
-    reject_structural_gui_config(c, std::env::current_dir)
+fn gate(c: &Command) -> Result<(), Error> {
+    reject_structural_gui_config(c)
 }
 
 /// [`build_rewrite`] alone, bypassing the gate.
@@ -466,7 +466,8 @@ fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_aga
     c.raw_executable("tool")
         .args(["tool"])
         .elevation_auth(crate::elevation::Auth::Gui);
-    let launch = reject_structural_gui_config(&c, || Ok("/proc-cwd".into())).unwrap();
+    reject_structural_gui_config(&c).unwrap();
+    let launch = super::program_and_args(&c, || Ok("/proc-cwd".into())).unwrap();
     let (derived, _) = build_rewrite(&mut c, launch, Path::new("/usr/bin/osascript"), None).unwrap();
     let CommandInput::Argv(argv) = derived.input() else {
         unreachable!()
@@ -708,31 +709,4 @@ end timeout"
         !stderr.contains("-1712"),
         "the payload was cut short by the Apple event timeout: {stderr}"
     );
-}
-
-/// The relative-`current_dir` refusal is structural, so it is reported before the program is
-/// completed — and before an unreadable process cwd can fail that completion.
-///
-/// Unix only: Windows refuses to remove a directory that is a process's cwd.
-#[cfg(unix)]
-#[test]
-fn a_relative_cwd_is_refused_before_the_process_cwd_is_read() {
-    let mut c = Command::new();
-    c.raw_executable("tool")
-        .args(["tool"])
-        .current_dir("sub")
-        .elevation_auth(crate::elevation::Auth::Gui);
-    let gone = tempfile::tempdir().expect("tempdir");
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(gone.path()).expect("cd");
-    std::fs::remove_dir(gone.path()).expect("rmdir");
-    assert!(
-        std::env::current_dir().is_err(),
-        "precondition: the process cwd is unreadable"
-    );
-    match gate(&c) {
-        Err(Error::Unsupported { op, .. }) => assert!(op.contains("relative current_dir()"), "{op}"),
-        other => panic!("expected the relative-current_dir refusal, got {other:?}"),
-    }
 }

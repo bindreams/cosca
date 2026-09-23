@@ -432,11 +432,9 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
     map.into_iter().collect()
 }
 
-/// Program + args + the directory to run them in, honoring `executable()`; a `raw_executable()`
-/// program comes back absolute ([`Command::posix_launch`]), so the wrapper cannot search for it.
-/// An argv[0] distinct from a set `executable()` cannot survive the backend wrapper →
-/// `Unsupported`.
-fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<Launch, Error> {
+/// The argv, refused unless a backend can wrap it. An argv[0] distinct from a set `executable()`
+/// cannot survive the backend wrapper → `Unsupported`.
+fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
     // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
     // `Argv(vec![])`, so folding it into the commandline arm would answer "no
     // program set" with a message about re-quoting a command line that was never set.
@@ -472,6 +470,13 @@ fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result
                     .into(),
         });
     }
+    Ok(argv)
+}
+
+/// Program + args + the directory to run them in, for a backend; a `raw_executable()` program
+/// comes back absolute ([`Command::posix_launch`]), so the wrapper cannot search for it.
+fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<Launch, Error> {
+    let argv = checked_argv(cmd)?;
     let launch = cmd.posix_launch(process_cwd)?;
     Ok(Launch {
         program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
@@ -485,15 +490,13 @@ fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result
 /// already-elevated caller gets the same rejection. (Backend availability + NoTty are
 /// environmental and stay in the planner, after the short-circuit.)
 ///
-/// Returns the [`Launch`] it validated, for the build to wrap.
-fn reject_structural_posix_config(
-    cmd: &Command,
-    backend: Backend,
-    auth: &Auth,
-    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-) -> Result<Launch, Error> {
-    // commandline() / empty / distinct-argv0.
-    let launch = program_and_args(cmd, process_cwd)?;
+/// Reads nothing: an already-root caller runs no backend, and needs no path to its cwd.
+fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) -> Result<(), Error> {
+    // commandline() / empty / distinct-argv0, and a `raw_executable()` that names no file.
+    checked_argv(cmd)?;
+    if let Some(crate::command::ExecutableSpec::Exact(p)) = cmd.executable_spec() {
+        crate::resolve::exact::refuse_unnameable(p.as_os_str())?;
+    }
     if cmd.fds().keys().any(|f| f.raw() >= 3) {
         return Err(Error::Unsupported {
             op: "fd >= 3 on an elevated POSIX child".into(),
@@ -535,7 +538,7 @@ fn reject_structural_posix_config(
             detail: "Auth::Stdin consumes fd0 to feed sudo -S the password; do not also configure stdin".into(),
         });
     }
-    Ok(launch)
+    Ok(())
 }
 
 /// Transfer the caller's cwd (the [`Launch`]'s, so it matches the program) /
@@ -568,7 +571,8 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
 }
 
 /// [`rewrite_with_host`], reading this process's cwd through `process_cwd` — at most once, so
-/// the program and the directory it runs in cannot come from two different readings.
+/// the program and the directory it runs in cannot come from two different readings, and only
+/// for a backend, which runs in another process and so needs a path.
 pub(crate) fn rewrite_with_host_and_cwd(
     cmd: &mut Command,
     host: &Host,
@@ -585,16 +589,17 @@ pub(crate) fn rewrite_with_host_and_cwd(
     // would break it: `plan()` yields `RunAsIs` under root, so the same request
     // would be accepted as root and rejected as a normal user.
     let macos_gui = super::plan::is_macos_gui_auto(host.os, requested_backend, &requested_auth);
-    let launch = if macos_gui {
-        super::macos::reject_structural_gui_config(cmd, process_cwd)?
+    if macos_gui {
+        super::macos::reject_structural_gui_config(cmd)?;
     } else {
-        reject_structural_posix_config(cmd, requested_backend, &requested_auth, process_cwd)?
-    };
+        reject_structural_posix_config(cmd, requested_backend, &requested_auth)?;
+    }
 
     match host.plan(Privilege::Elevated, requested_backend, requested_auth) {
         Transition::Reject { error } => Err(error),
         Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
         Transition::ElevateMacosGui { osascript, arg_max } => {
+            let launch = super::macos::program_and_args(cmd, process_cwd)?;
             let (derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
             Ok(PosixRewrite {
                 derived: Some(derived),
@@ -608,17 +613,16 @@ pub(crate) fn rewrite_with_host_and_cwd(
         Transition::RunAsIs => {
             // Already elevated: no wrapper, but the sanitizer STILL runs so a dangerous
             // forwarded var never reaches the root child. Build a non-destructive derived
-            // command (the ORIGINAL program + args, sanitized env, fds MOVED).
+            // command (the ORIGINAL program, executable and args, sanitized env, fds MOVED).
+            // No backend runs, so the derived command spawns as an unelevated one does, and a
+            // `raw_executable()` needs no path to this process's cwd.
             let (kept, stripped) = cmd.elevation_request().sanitizer.apply(explicit_set_env(cmd.env_ops()));
-            let Launch { program, args, cwd } = launch;
-            let mut argv = Vec::with_capacity(args.len() + 1);
-            argv.push(program);
-            argv.extend(args);
             let env_ops: Vec<EnvOp> = kept.iter().map(|(k, v)| EnvOp::Set(k.clone(), v.clone())).collect();
             let mut derived = Command::new();
-            derived.set_input_argv(argv);
+            derived.set_input_argv(checked_argv(cmd)?.to_vec());
+            derived.set_executable_spec(cmd.executable_spec().cloned());
             derived.set_env_ops(env_ops);
-            transfer_process_attrs(&mut derived, cmd, cwd);
+            transfer_process_attrs(&mut derived, cmd, cmd.cwd().map(Path::to_path_buf));
             for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
                 derived.fds_mut().insert(slot, resolved);
             }
@@ -646,7 +650,7 @@ pub(crate) fn rewrite_with_host_and_cwd(
                             .into(),
                 });
             }
-            let Launch { program, args, cwd } = launch;
+            let Launch { program, args, cwd } = program_and_args(cmd, process_cwd)?;
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---

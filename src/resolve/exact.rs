@@ -126,7 +126,7 @@ pub(crate) fn complete_posix(
 
 /// The refusals both forms share: an interior NUL, which no exec argument can carry, and a name
 /// that [names no file](super::names_no_file).
-fn refuse_unnameable(program: &OsStr) -> Result<(), Error> {
+pub(crate) fn refuse_unnameable(program: &OsStr) -> Result<(), Error> {
     if program.as_encoded_bytes().contains(&0) {
         // A literal: interpolating the token would put a raw U+0000 into logs and terminals.
         return Err(invalid_input(

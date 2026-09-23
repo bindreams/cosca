@@ -280,10 +280,11 @@ impl Command {
     ///   is run as `./tool`, never looked up on `PATH`: the child enters its directory and reads
     ///   the name there, both from the cwd it inherits, so no path to this process's cwd is ever
     ///   needed and the file loaded and the directory run in are always the same. Under
-    ///   [`elevate`](Self::elevate) the backend is another process, so cosca completes the name to
-    ///   an absolute path against that directory first, reading this process's cwd once; a cwd
-    ///   with no path (an unsearchable ancestor, an unlinked directory) fails there. The file
-    ///   loaded is that one, but the backend may run it elsewhere — see there.
+    ///   [`elevate`](Self::elevate) a backend (`sudo`, `pkexec`, `osascript`) is another process,
+    ///   so cosca completes the name to an absolute path against that directory first, reading
+    ///   this process's cwd once; a cwd with no path (an unsearchable ancestor, an unlinked
+    ///   directory) fails there. The file loaded is that one, but the backend may run it
+    ///   elsewhere — see there. An already-root caller runs no backend and spawns as above.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -314,8 +315,7 @@ impl Command {
     /// (`ShellExecuteEx`'s `lpFile`, `sudo`'s and `osascript`'s exec), and that program is the
     /// completed absolute path. So `raw_executable("tool").args(["tool"])` yields
     /// `argv[0] == "tool"` unelevated and the completed path under `.elevate()` — except from an
-    /// already-elevated Windows caller, which re-spawns through `CreateProcessW` with argv
-    /// verbatim. Handing the backend the relative name instead would let it search for the image,
+    /// already-elevated caller, which runs no backend and spawns with argv verbatim. Handing the backend the relative name instead would let it search for the image,
     /// which is the hazard the completion exists to remove.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
@@ -339,6 +339,12 @@ impl Command {
     /// The path together with which setter recorded it.
     pub(crate) fn executable_spec(&self) -> Option<&ExecutableSpec> {
         self.executable.as_ref()
+    }
+
+    /// Carry another command's executable over whole, setter included.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn set_executable_spec(&mut self, spec: Option<ExecutableSpec>) {
+        self.executable = spec;
     }
 
     /// The program and working directory a POSIX elevation backend is handed. An `Exact` program
