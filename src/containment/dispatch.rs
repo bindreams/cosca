@@ -37,6 +37,32 @@ impl Prepared {
         #[cfg(not(windows))]
         return crate::graceful::GracefulMechanism::Process;
     }
+
+    /// End the placement exchange of a spawn that failed while the caller still holds its child
+    /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
+    /// never for the child the caller will reap. A no-op without a leaf, or once taken.
+    #[cfg_attr(not(any(test, feature = "tokio")), allow(dead_code))]
+    pub(crate) fn settle_verdict(&mut self, pid: u32) {
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
+            // The spawn fails either way; an undecidable verdict has already killed the child.
+            let _ = leaf.take_placement(pid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+
+    /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
+    /// can drop one it forked — and say whether that child is ended: `false` means it may be
+    /// running where nothing can reach it. Without a leaf nothing can tell, so `false`.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn abandon_before_verdict(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = self.cgroup_leaf.as_mut() {
+            return leaf.abandon_before_verdict() == crate::containment::cgroup::Abandoned::Ended;
+        }
+        false
+    }
 }
 
 /// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the

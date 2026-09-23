@@ -10,14 +10,25 @@ use super::*;
 #[cfg(target_os = "linux")]
 pub(super) const REPORT_PLACED: i32 = -1;
 
-/// The channel the forked child reports its self-placement outcome through: a `SOCK_SEQPACKET`
-/// socket pair carrying one message, a native-endian `i32` — the write's errno or
-/// [`REPORT_PLACED`].
+/// The tag of a child's intent message; its value is the child's pid.
+#[cfg(target_os = "linux")]
+const TAG_INTENT: i32 = 1;
+/// The tag of a child's report message; its value is [`REPORT_PLACED`] or the write's errno.
+#[cfg(target_os = "linux")]
+const TAG_REPORT: i32 = 2;
+/// The parent's one message: it has decided without the rest of the exchange.
+#[cfg(target_os = "linux")]
+const PROCEED: u8 = b'P';
+
+/// The channel of the placement exchange (see the module's contract): a `SOCK_SEQPACKET` socket
+/// pair. The child sends two messages of two native-endian `i32`s — its *intent* (with its pid,
+/// and its pidfd as `SCM_RIGHTS` when it can open one), then its *report* (the write's errno or
+/// [`REPORT_PLACED`]). The parent may send one byte back: *proceed*.
 ///
 /// `pre_exec` runs after `fork`, where async-signal-safety forbids allocating, formatting or
-/// locking, and nothing the child computes survives its `exec`. One `send(2)` of four bytes is
-/// all a report needs. It is sent with `MSG_NOSIGNAL`: a parent that has stopped listening makes
-/// it fail with `EPIPE` instead of killing the child with `SIGPIPE`.
+/// locking, and nothing the child computes survives its `exec`. A `sendmsg(2)` from a buffer on
+/// the stack is all a message needs. It is sent with `MSG_NOSIGNAL`: a parent that has stopped
+/// listening makes it fail with `EPIPE` instead of killing the child with `SIGPIPE`.
 ///
 /// # When the report is final
 /// Not when `spawn` returns. `std`'s Unix spawn returns once its own close-on-exec error channel
@@ -40,8 +51,8 @@ pub(super) const REPORT_PLACED: i32 = -1;
 /// The wait is no longer than the one `std` intends: the child reaches its report on `std`'s own
 /// path from `fork` to `exec`, all of which `spawn` normally waits out.
 ///
-/// **One report per channel.** A caller that routes several children through one channel reads
-/// the first report sent, whoever sent it.
+/// **One child per channel.** A caller that routes several children through one channel reads
+/// the last intent and the first report sent, whoever sent them.
 ///
 /// # What this costs, and what it can cost a spawn
 /// Two fds per contained spawn in flight, held from the leaf's creation until `attach` takes the
@@ -55,6 +66,28 @@ pub(crate) struct ReportChannel {
     pub(super) read: OwnedFd,
     /// The parent's copy of the child's end. Closed before waiting.
     pub(super) write: Option<OwnedFd>,
+    /// What the child has sent so far.
+    received: Received,
+}
+
+/// What the child has sent over a [`ReportChannel`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub(crate) struct Received {
+    /// Its report, once sent.
+    pub(crate) report: Option<PlacementReport>,
+    /// Its pid, once its intent is sent: it reached cosca's hook and may enter the leaf.
+    pub(crate) pid: Option<u32>,
+    /// The pidfd its intent carried, when it could open one.
+    pub(crate) pidfd: Option<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl Received {
+    /// The report, where nothing received reads as `NotReported`.
+    pub(crate) fn placement(&self) -> PlacementReport {
+        self.report.unwrap_or(PlacementReport::NotReported)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -75,6 +108,7 @@ impl ReportChannel {
         Ok(ReportChannel {
             read: rustix::io::fcntl_dupfd_cloexec(&read, 3)?,
             write: Some(rustix::io::fcntl_dupfd_cloexec(&write, 3)?),
+            received: Received::default(),
         })
     }
 
@@ -125,51 +159,126 @@ impl ReportChannel {
                     rustix::io::Errno::SRCH,
                     "{pid:?} is not an unreaped child of this process: something else reaped it"
                 );
-                return match self.read_final() {
-                    PlacementReport::NotReported => Err(e.into()),
-                    sent => Ok(sent),
-                };
+                self.drain();
+                return self.received.report.ok_or(e.into());
             }
         };
-        let mut fds = [
-            PollFd::new(&self.read, PollFlags::IN),
-            PollFd::new(&pidfd, PollFlags::IN),
-        ];
-        // No timeout: the child reports or exits on its way to `exec`, like `std`'s own wait.
         loop {
-            match poll(&mut fds, None) {
-                Ok(_) => break,
-                // `ENOMEM` is the kernel's transient shortage, not an answer.
-                Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
-                Err(e) => panic!("poll on the placement report channel failed: {e}"),
+            // An intent alone is not final: the report, or the child's exit, is.
+            let closed = self.drain();
+            if let Some(report) = self.received.report {
+                return Ok(report);
+            }
+            if closed {
+                return Ok(PlacementReport::NotReported);
+            }
+            let mut fds = [
+                PollFd::new(&self.read, PollFlags::IN),
+                PollFd::new(&pidfd, PollFlags::IN),
+            ];
+            #[cfg(test)]
+            fault::notify_wait_polling();
+            // No timeout: the child reports or exits on its way to `exec`, like `std`'s own wait.
+            loop {
+                match poll(&mut fds, None) {
+                    Ok(_) => break,
+                    // `ENOMEM` is the kernel's transient shortage, not an answer.
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
+                    Err(e) => panic!("poll on the placement report channel failed: {e}"),
+                }
+            }
+            if !fds[1].revents().is_empty() {
+                // The child has exited: whatever it sent is queued.
+                self.drain();
+                return Ok(self.received.placement());
             }
         }
-        Ok(self.read_final())
+    }
+
+    /// Read every message queued, without blocking, into what was received. `true` once the
+    /// channel can deliver no more: shut for reading, or every copy of the child's end closed.
+    fn drain(&mut self) -> bool {
+        use std::mem::MaybeUninit;
+
+        use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+
+        loop {
+            let mut message = [0u8; 8];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let received = recvmsg(
+                &self.read,
+                &mut [std::io::IoSliceMut::new(&mut message)],
+                &mut control,
+                RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+            );
+            let bytes = match received {
+                Ok(received) => received.bytes,
+                // `ENOMEM` is the kernel's transient shortage, not an answer.
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
+                Err(rustix::io::Errno::AGAIN) => return false,
+                Err(e) => panic!("recvmsg on the placement report channel failed: {e}"),
+            };
+            if bytes == 0 {
+                return true;
+            }
+            debug_assert_eq!(bytes, message.len(), "a message is two i32s");
+            let tag = i32::from_ne_bytes(message[..4].try_into().expect("four bytes"));
+            let value = i32::from_ne_bytes(message[4..].try_into().expect("four bytes"));
+            let mut pidfd = None;
+            for ancillary in control.drain() {
+                if let RecvAncillaryMessage::ScmRights(fds) = ancillary {
+                    for fd in fds {
+                        pidfd.get_or_insert(fd);
+                    }
+                }
+            }
+            match tag {
+                TAG_INTENT => {
+                    self.received.pid = u32::try_from(value).ok();
+                    self.received.pidfd = pidfd;
+                }
+                TAG_REPORT => {
+                    self.received.report.get_or_insert(match value {
+                        REPORT_PLACED => PlacementReport::Placed,
+                        errno => {
+                            debug_assert!(errno > 0, "a failed write reports its positive errno, got {errno}");
+                            PlacementReport::WriteFailed(errno)
+                        }
+                    });
+                }
+                tag => debug_assert!(false, "unknown placement message tag {tag}"),
+            }
+        }
     }
 
     /// The report sent so far, read without blocking: final once the child has reported or can
     /// no longer report.
     pub(super) fn read_final(&mut self) -> PlacementReport {
-        let queued = rustix::io::ioctl_fionread(&self.read).expect("FIONREAD on the report channel");
-        if queued == 0 {
-            return PlacementReport::NotReported;
-        }
-        let mut report = [0u8; 4];
-        // A queued message makes this return at once. SOCK_SEQPACKET delivers it whole.
-        let read = loop {
-            match rustix::io::read(&self.read, &mut report) {
-                Err(rustix::io::Errno::INTR) => continue,
-                other => break other.expect("read a report that is already queued"),
-            }
-        };
-        debug_assert_eq!(read, report.len(), "a report is one 4-byte message");
-        match i32::from_ne_bytes(report) {
-            REPORT_PLACED => PlacementReport::Placed,
-            errno => {
-                debug_assert!(errno > 0, "a failed write reports its positive errno, got {errno}");
-                PlacementReport::WriteFailed(errno)
-            }
-        }
+        self.drain();
+        self.received.placement()
+    }
+
+    /// End the exchange by deciding: send *proceed*, then close. A child whose send then fails
+    /// finds *proceed* queued, and carries on to `exec`.
+    pub(super) fn proceed(self) {
+        // Nothing to do if nobody holds the child's end any more.
+        let _ = rustix::net::send(
+            &self.read,
+            &[PROCEED],
+            rustix::net::SendFlags::NOSIGNAL | rustix::net::SendFlags::DONTWAIT,
+        );
+    }
+
+    /// End the exchange by abandoning it: shut the channel for reading, then read everything sent
+    /// before. Every later send fails with no *proceed* queued, and the child exits without
+    /// `exec` — so what this returns is all the child will ever have said.
+    pub(super) fn shut(mut self) -> Received {
+        self.write = None;
+        rustix::net::shutdown(&self.read, rustix::net::Shutdown::Read)
+            .expect("shut the placement report channel for reading");
+        self.drain();
+        self.received
     }
 }
 
@@ -182,8 +291,20 @@ impl ReportChannel {
     }
 }
 
-/// The child-side half of a [`ReportChannel`]: its end's number, with one async-signal-safe
-/// operation. Owns nothing — the parent's `ReportChannel` closes the channel.
+/// How a child's message fared.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// It was queued for the parent.
+    Queued,
+    /// The parent has decided without it: carry on.
+    Decided,
+    /// The parent has abandoned the spawn: exit without `exec`.
+    Abandoned,
+}
+
+/// The child-side half of a [`ReportChannel`]: its end's number, with async-signal-safe sends.
+/// Owns nothing — the parent's `ReportChannel` closes the channel.
 ///
 /// The closure holding it can OUTLIVE the channel: `attach` closes the channel once the spawn has
 /// returned, and on the spawn-FAILURE path `Prepared` (and with it the leaf) drops first — both
@@ -197,33 +318,117 @@ pub(crate) struct ReportSlot {
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
-    /// Send the child's outcome. Async-signal-safe: one `send(2)`, no allocation.
+    /// Send the intent: this process's pid, and a pidfd for it when one can be opened.
     ///
-    /// `EPIPE` is `Ok`: the parent closes its end before the report arrives only after deciding
-    /// without it (see [`CgroupLeaf::decide_unwaitable`]), and that decision already holds for
-    /// this child. Either the leaf was closed, so this child's placement failed with `ENODEV`;
-    /// or this child was found in the leaf; or it is being killed. Every other failure is `Err`.
+    /// # Safety
+    /// As [`ReportSlot::send`].
+    pub(super) unsafe fn send_intent(self) -> io::Result<Delivery> {
+        // Safety: async-signal-safe syscalls on this process's own pid.
+        let pid = unsafe { libc::getpid() };
+        #[cfg(test)]
+        let denied = fault::take_force_child_pidfd_failure();
+        #[cfg(not(test))]
+        let denied = false;
+        let pidfd = if denied {
+            -1
+        } else {
+            // Safety: as above; a pidfd is opened close-on-exec.
+            unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd }
+        };
+        // Safety: the caller's guarantee; `pidfd` is this process's own or -1.
+        let sent = unsafe { self.send(TAG_INTENT, pid, pidfd) };
+        if pidfd >= 0 {
+            // Safety: the descriptor opened above, closed once.
+            unsafe { libc::close(pidfd) };
+        }
+        sent
+    }
+
+    /// Send the report: [`REPORT_PLACED`] or the placement write's errno.
+    ///
+    /// # Safety
+    /// As [`ReportSlot::send`].
+    pub(super) unsafe fn send_report(self, value: i32) -> io::Result<Delivery> {
+        // Safety: the caller's guarantee.
+        unsafe { self.send(TAG_REPORT, value, -1) }
+    }
+
+    /// Send one message, with `pidfd` attached as `SCM_RIGHTS` unless it is -1. Async-signal-safe:
+    /// one `sendmsg(2)` from buffers on the stack, then at most one `recv(2)`.
+    ///
+    /// `EPIPE` means the parent has ended the exchange (see the module's contract): *proceed*
+    /// queued means it decided, and this child carries on; none means it abandoned the spawn.
     ///
     /// # Safety
     /// The child's end must still be open at this number, which holds from the leaf's creation
     /// until the parent has taken the verdict.
-    pub(super) unsafe fn report(self, value: i32) -> io::Result<()> {
-        let bytes = value.to_ne_bytes();
+    unsafe fn send(self, tag: i32, value: i32, pidfd: RawFd) -> io::Result<Delivery> {
+        #[repr(C, align(8))]
+        struct Control([u8; 64]);
+
+        let mut message = [0u8; 8];
+        message[..4].copy_from_slice(&tag.to_ne_bytes());
+        message[4..].copy_from_slice(&value.to_ne_bytes());
+        let mut iov = libc::iovec {
+            iov_base: message.as_mut_ptr().cast(),
+            iov_len: message.len(),
+        };
+        let mut control = Control([0; 64]);
+        // Safety: plain data; zeroed is a valid empty header.
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = &mut iov;
+        header.msg_iovlen = 1;
+        if pidfd >= 0 {
+            let fd_len = std::mem::size_of::<RawFd>() as libc::c_uint;
+            header.msg_control = control.0.as_mut_ptr().cast();
+            // Safety: arithmetic on a length.
+            header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_len) } as usize;
+            // Safety: `control` is aligned and large enough for one descriptor's header and data.
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&header);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as usize;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), pidfd);
+            }
+        }
         loop {
-            // Safety: `bytes` is a valid buffer; the caller guarantees the fd.
-            let sent = unsafe { libc::send(self.fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };
-            if sent == bytes.len() as isize {
-                return Ok(());
+            // Safety: every pointer in `header` is to this frame; the caller guarantees the fd.
+            let sent = unsafe { libc::sendmsg(self.fd, &header, libc::MSG_NOSIGNAL) };
+            if sent == message.len() as isize {
+                return Ok(Delivery::Queued);
             }
             // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
             let errno = unsafe { *libc::__errno_location() };
-            match (sent, errno) {
+            return match (sent, errno) {
                 (-1, libc::EINTR) => continue,
-                (-1, libc::EPIPE) => return Ok(()),
-                (-1, errno) => return Err(io::Error::from_raw_os_error(errno)),
+                // Safety: the caller's guarantee.
+                (-1, libc::EPIPE) => Ok(if unsafe { self.proceed_queued() } {
+                    Delivery::Decided
+                } else {
+                    Delivery::Abandoned
+                }),
+                (-1, errno) => Err(io::Error::from_raw_os_error(errno)),
                 // SOCK_SEQPACKET sends a message whole or not at all.
-                _ => return Err(io::Error::from_raw_os_error(libc::EMSGSIZE)),
+                _ => Err(io::Error::from_raw_os_error(libc::EMSGSIZE)),
+            };
+        }
+    }
+
+    /// Whether the parent left *proceed* for this child before closing its end.
+    ///
+    /// # Safety
+    /// As [`ReportSlot::send`].
+    unsafe fn proceed_queued(self) -> bool {
+        let mut byte = 0u8;
+        loop {
+            // Safety: a one-byte buffer on this frame; the caller guarantees the fd.
+            let got = unsafe { libc::recv(self.fd, (&raw mut byte).cast(), 1, libc::MSG_DONTWAIT) };
+            // Safety: as in `send`.
+            if got == -1 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
             }
+            return got == 1 && byte == PROCEED;
         }
     }
 }
@@ -233,9 +438,10 @@ impl ReportSlot {
     /// Report `Placed` without a `cgroup.procs` write, for tests of what cosca does with a report.
     ///
     /// # Safety
-    /// As [`ReportSlot::report`].
+    /// As [`ReportSlot::send`].
     pub(crate) unsafe fn report_placed_for_test(self) {
         // Safety: the caller guarantees the channel is open.
-        unsafe { self.report(REPORT_PLACED) }.expect("send the report");
+        let sent = unsafe { self.send_report(REPORT_PLACED) }.expect("send the report");
+        assert_eq!(sent, Delivery::Queued, "the parent must still be listening");
     }
 }

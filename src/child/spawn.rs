@@ -956,9 +956,11 @@ pub(crate) fn attach_or_fault(
     #[cfg(test)]
     if fault::force_attach_failure() {
         // Capture identity for the test to prove the child is reaped, then simulate an attach
-        // failure so `spawn` takes the attach-error teardown arm. `prepared` drops on return,
-        // releasing any containment scaffolding (trivial for the uncontained test children).
+        // failure so `spawn` takes the attach-error teardown arm. The caller still holds the
+        // child, so the verdict is taken before `prepared` drops, as a real attach takes it.
         fault::capture(ProcessId::of(pid));
+        let mut prepared = prepared;
+        prepared.settle_verdict(pid);
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
         return Err(Error::Containment {

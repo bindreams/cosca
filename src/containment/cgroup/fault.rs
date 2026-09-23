@@ -1,5 +1,7 @@
 use std::cell::Cell;
 thread_local! {
+    static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static REAPED_ORPHANS: std::cell::RefCell<Vec<(u32, Option<i32>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
     static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -57,7 +59,7 @@ pub(crate) fn pidfd_failure_armed() -> bool {
     FORCE_PIDFD_FAILURE.with(|f| f.get().is_some())
 }
 
-/// Deny the NEXT `abandon`'s signals with `EPERM`, as a child that exec'd a setuid program
+/// Deny the NEXT `fail_closed`'s signals with `EPERM`, as a child that exec'd a setuid program
 /// denies an unprivileged supervisor — which a root test lane cannot reproduce for real.
 pub(crate) fn set_force_signal_denied(on: bool) {
     FORCE_SIGNAL_DENIED.with(|f| f.set(on));
@@ -81,8 +83,8 @@ pub(crate) fn membership_unreadable_armed() -> bool {
     FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.get())
 }
 
-/// Replace the NEXT placement write's return value — 0, which no file this test can open
-/// returns for a one-byte write. Called in the test's own process, never after a fork.
+/// Make the NEXT placement write return `ret` without writing — 0, which no file a test can open
+/// returns for a one-byte write. A child forked from this thread inherits the flag and takes it.
 pub(crate) fn set_force_placement_write_result(ret: isize) {
     FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.set(Some(ret)));
 }
@@ -109,4 +111,25 @@ pub(crate) fn take_reaped_orphans() -> Vec<(u32, Option<i32>)> {
 }
 pub(crate) fn record_reaped_orphan(pid: u32, signal: Option<i32>) {
     REAPED_ORPHANS.with(|r| r.borrow_mut().push((pid, signal)));
+}
+
+/// Have the NEXT report wait on this thread signal `notify` just before it blocks — the one
+/// point a test can know the wait began before the report existed.
+pub(crate) fn set_wait_polling_notifier(notify: std::sync::mpsc::Sender<()>) {
+    WAIT_POLLING.with(|w| *w.borrow_mut() = Some(notify));
+}
+pub(crate) fn notify_wait_polling() {
+    if let Some(notify) = WAIT_POLLING.with(|w| w.borrow_mut().take()) {
+        let _ = notify.send(());
+    }
+}
+
+/// Have the NEXT intent sent on this thread — or in a child forked from it, which inherits the
+/// flag — go without a pidfd, as when `pidfd_open` is denied in the child.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_force_child_pidfd_failure(on: bool) {
+    FORCE_CHILD_PIDFD_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_child_pidfd_failure() -> bool {
+    FORCE_CHILD_PIDFD_FAILURE.with(|f| f.replace(false))
 }

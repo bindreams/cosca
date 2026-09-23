@@ -114,6 +114,8 @@ pub(crate) struct CgroupLeaf {
     /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
+    /// Whether the spawn was abandoned before its verdict: the leaf is already dealt with.
+    pub(super) abandoned: bool,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -122,6 +124,11 @@ const RELEASED: &str = "the leaf's spawn-side resources are released once its pl
 
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
+    /// Whether the placement verdict is still to be taken: the exchange has not ended.
+    pub(crate) fn holds_verdict_to_take(&self) -> bool {
+        self.report.is_some()
+    }
+
     /// Returns the raw `cgroup.procs` fd for capture in a `pre_exec` closure. Only before the
     /// placement verdict is taken.
     pub(crate) fn procs_fd(&self) -> RawFd {
@@ -178,8 +185,9 @@ impl CgroupLeaf {
         self.procs_fd = None;
         let report = match channel.wait(pid) {
             Ok(report) => report,
-            Err(source) => return self.decide_unwaitable(pid, &mut channel, source),
+            Err(source) => return self.decide_unwaitable(pid, channel, source),
         };
+        channel.proceed();
         self.entered = report == PlacementReport::Placed;
         let report = match report {
             PlacementReport::Placed => return Ok(Ok(())),
@@ -215,11 +223,14 @@ impl CgroupLeaf {
     /// - removed, `Placed` sent: the child entered, and every member has since exited;
     /// - `EBUSY` with the child's own `/proc/<pid>/cgroup` inside the leaf: it entered;
     /// - anything else: the child may still enter a leaf cosca can neither wait on nor close.
-    ///   It is killed and the spawn fails (see [`CgroupLeaf::abandon`]).
+    ///   It is killed and the spawn fails (see [`CgroupLeaf::fail_closed`]).
+    ///
+    /// Every outcome but the last is a decision, so the child is sent *proceed*: one whose report
+    /// then fails to send carries on to `exec` under the verdict.
     pub(super) fn decide_unwaitable(
         &mut self,
         pid: u32,
-        channel: &mut ReportChannel,
+        mut channel: ReportChannel,
         source: io::Error,
     ) -> Result<Result<(), NotPlaced>, crate::error::Error> {
         let why = match fs::remove_dir(&self.leaf_path) {
@@ -232,6 +243,7 @@ impl CgroupLeaf {
                         self.leaf_path.display()
                     );
                     self.entered = true;
+                    channel.proceed();
                     return Ok(Ok(()));
                 }
                 Ok(false) => Some(format!("its leaf is occupied ({e}) but not by the child")),
@@ -245,13 +257,14 @@ impl CgroupLeaf {
         };
         let Some(why) = why else {
             self.entered = channel.read_final() == PlacementReport::Placed;
+            channel.proceed();
             return Ok(if self.entered {
                 Ok(())
             } else {
                 Err(NotPlaced::Unwaitable { pid, source })
             });
         };
-        Err(self.abandon(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
+        Err(self.fail_closed(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
     }
 
     /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
@@ -284,7 +297,7 @@ impl CgroupLeaf {
     /// process-group id, while any task holds it, and the unreaped child does. A child something
     /// else already reaped is detected and never signalled; one reaped between that check and the
     /// kill — only possible when the precondition is broken — is not.
-    pub(super) fn abandon(&mut self, pid: u32, channel: &mut ReportChannel, why: &str) -> crate::error::Error {
+    pub(super) fn fail_closed(&mut self, pid: u32, mut channel: ReportChannel, why: &str) -> crate::error::Error {
         use nix::sys::wait::{waitid, Id, WaitPidFlag};
 
         let child = Pid::from_raw(i32::try_from(pid).expect("a spawned child's pid is a positive i32"));
@@ -513,6 +526,7 @@ impl CgroupLeaf {
             report: Some(ReportChannel::new().expect("open a placement-report channel")),
             entered: false,
             cgroup_path: None,
+            abandoned: false,
         }
     }
 
@@ -533,15 +547,12 @@ impl CgroupLeaf {
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
         self.procs_fd = None;
-        let pre_verdict = self.report.is_some();
-        // Before the verdict — a spawn that failed, maybe after its fork — the report is final
-        // only if it arrived: the child's pid is not known here to wait for it.
-        if let Some(mut channel) = self.report.take() {
-            channel.write = None;
-            match channel.read_final() {
-                PlacementReport::NotReported => return self.remove_with_report_in_flight(),
-                report => self.entered = report == PlacementReport::Placed,
-            }
+        // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
+        if self.report.is_some() {
+            self.abandon_before_verdict();
+        }
+        if self.abandoned {
+            return;
         }
         // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
         // to drain it, then retry — but only if the child entered it: a final report other than
@@ -559,11 +570,7 @@ impl Drop for CgroupLeaf {
             }
             return;
         }
-        let kill = if pre_verdict {
-            self.kill_through_before_verdict()
-        } else {
-            self.hard_kill()
-        };
+        let kill = self.hard_kill();
         let Err(second) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
@@ -585,88 +592,176 @@ impl Drop for CgroupLeaf {
     }
 }
 
+/// How an abandoned spawn's child ended up (see [`CgroupLeaf::abandon_before_verdict`]).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Abandoned {
+    /// Nothing of the child's runs: it was killed, had already exited, or never reached cosca's
+    /// hook — so the abandoned exchange makes it exit before `exec`.
+    Ended,
+    /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
+    /// signal, and its leaf does not hold it.
+    OutOfReach,
+}
+
+/// What became of the child itself when its spawn was abandoned.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildFate {
+    /// Never sent its intent: it exits at its first send, never entering the leaf.
+    NeverReached,
+    /// Already exited and reaped by whoever failed the spawn (std reaps the child of a spawn it
+    /// failed).
+    Gone,
+    /// Killed through its pidfd, with its process group, and reaped.
+    Killed,
+    /// Could not be killed: no pidfd, or the signal was refused.
+    Unkillable,
+}
+
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
-    /// Remove a leaf whose child's report is still in flight (see the module's report contract):
-    /// nothing proves the child absent, so an occupied leaf is killed through, drained, and
-    /// removed — again for as long as anything re-enters it before the removal lands. Once
-    /// removed, it admits no member, so the in-flight report no longer matters.
+    /// End the exchange of a spawn that failed before its verdict (see the module's contract),
+    /// and answer for its child: kill it and its group, kill through the leaf if it entered, reap
+    /// it if no handle owns it, and remove the leaf.
+    ///
+    /// Idempotent: the channel is taken once, and `Drop` does nothing after it.
+    ///
+    /// Only a spawn whose child no handle owns may reach this with the child unreaped: tokio drops
+    /// a child it forked and then failed to set up, neither killed nor reaped. A spawn path that
+    /// still holds its child takes the verdict first, and one whose child `std` reaped leaves
+    /// nothing to reap here.
+    pub(crate) fn abandon_before_verdict(&mut self) -> Abandoned {
+        let Some(channel) = self.report.take() else {
+            return Abandoned::Ended;
+        };
+        self.procs_fd = None;
+        self.abandoned = true;
+        let received = channel.shut();
+        self.entered = received.placement() == PlacementReport::Placed;
+        // The child first, by its pidfd and as its group, whatever the leaf's own kill does: it
+        // may have left the leaf, or never entered it.
+        let fate = end_child(&received);
+        let through_leaf = self.entered.then(|| self.hard_kill());
+        if self.entered {
+            self.remove_killing_through(through_leaf.as_ref().is_some_and(Result::is_ok));
+        } else {
+            self.remove_holding_nothing();
+        }
+        match (fate, through_leaf) {
+            (ChildFate::NeverReached | ChildFate::Gone | ChildFate::Killed, _) => Abandoned::Ended,
+            // `cgroup.kill` needs no credential, so a placed child is killed through its leaf.
+            (ChildFate::Unkillable, Some(Ok(()))) => Abandoned::Ended,
+            (ChildFate::Unkillable, _) => Abandoned::OutOfReach,
+        }
+    }
+
+    /// Remove an abandoned leaf its child entered: killed through, drained, its empty child
+    /// cgroups removed, and killed again for as long as anything re-enters it before the removal
+    /// lands. `killed` says whether the caller's own kill through it succeeded.
     ///
     /// `rmdir` gives the same `EBUSY` for a leaf holding a child cgroup as for a populated one,
-    /// and killing removes no directory. So a drained leaf's empty child cgroups are removed too,
-    /// and a leaf `rmdir` still refuses with nothing left to kill or remove is reported, not
-    /// retried.
-    fn remove_with_report_in_flight(&mut self) {
-        // Whether the last round killed, drained and removed no child cgroup: a refusal after
-        // that is progress only if something re-entered the leaf.
-        let mut stalled = false;
+    /// and killing removes no directory. A round that removes nothing is a stall unless a fresh
+    /// sweep — child cgroups may appear after the last one — or a re-entered leaf shows progress;
+    /// a stalled leaf is reported, not retried.
+    fn remove_killing_through(&mut self, mut killed: bool) {
         loop {
             let occupied = match fs::remove_dir(&self.leaf_path) {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
                 Err(e) => e,
             };
-            if stalled {
-                match self.repopulated() {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return warn_leaf_left_behind(
-                            &self.leaf_path,
-                            format_args!(
-                                "rmdir failed ({occupied}) with the child's report in flight; nothing \
-                                 was left to kill or remove"
-                            ),
-                        )
-                    }
-                    Err(e) => {
-                        return warn_leaf_left_behind(
-                            &self.leaf_path,
-                            format_args!(
-                                "rmdir failed ({occupied}) with the child's report in flight; whether \
-                                 it was re-entered could not be read ({e})"
-                            ),
-                        )
-                    }
+            if occupied.raw_os_error() != Some(libc::EBUSY) {
+                return warn_leaf_left_behind(
+                    &self.leaf_path,
+                    format_args!("rmdir failed ({occupied}) after its spawn was abandoned"),
+                );
+            }
+            if !killed {
+                if let Err(e) = self.hard_kill() {
+                    return warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                            "rmdir failed ({occupied}) after its spawn was abandoned; cgroup.kill failed ({e})"
+                        ),
+                    );
                 }
             }
-            let why = match self.kill_through_before_verdict() {
-                // Every member was just sent SIGKILL, so the leaf drains.
-                Ok(()) if occupied.raw_os_error() == Some(libc::EBUSY) => match self.wait_drained(None) {
-                    Ok(_) => match remove_child_cgroups(&self.leaf_path) {
-                        Ok(removed) => {
-                            stalled = removed == 0;
-                            continue;
-                        }
-                        Err(e) => format!("a child cgroup could not be removed ({e})"),
-                    },
-                    Err(e) => format!("its drain could not be watched ({e})"),
-                },
-                // Not a leaf `rmdir` refuses for its members: killing again cannot remove it.
-                Ok(()) => "cgroup.kill succeeded".to_string(),
-                Err(e) => format!("cgroup.kill failed ({e})"),
+            killed = false;
+            // Every member was just sent SIGKILL, so the leaf drains.
+            if let Err(e) = self.wait_drained(None) {
+                return warn_leaf_left_behind(
+                    &self.leaf_path,
+                    format_args!(
+                        "rmdir failed ({occupied}) after its spawn was abandoned; its drain could not be watched ({e})"
+                    ),
+                );
+            }
+            match remove_child_cgroups(&self.leaf_path) {
+                Ok(removed) if removed > 0 => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    return warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                            "rmdir failed ({occupied}) after its spawn was abandoned; a child cgroup could not be \
+                             removed ({e})"
+                        ),
+                    )
+                }
+            }
+            // Nothing removed: progress only if the retried `rmdir` lands, a fresh sweep finds a
+            // new child cgroup, or something re-entered the leaf.
+            let again = match fs::remove_dir(&self.leaf_path) {
+                Ok(()) => return,
+                Err(e) if removed_after_drain(&e) => return,
+                Err(e) => e,
             };
-            return warn_leaf_left_behind(
-                &self.leaf_path,
-                format_args!("rmdir failed ({occupied}) with the child's report in flight; {why}"),
-            );
+            match (remove_child_cgroups(&self.leaf_path), self.repopulated()) {
+                (Ok(removed), _) if removed > 0 => continue,
+                (_, Ok(true)) => continue,
+                (_, Ok(false)) => {
+                    return warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                            "rmdir failed ({again}) after its spawn was abandoned; nothing was left to kill or remove"
+                        ),
+                    )
+                }
+                (_, Err(e)) => {
+                    return warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                            "rmdir failed ({again}) after its spawn was abandoned; whether it was re-entered could \
+                             not be read ({e})"
+                        ),
+                    )
+                }
+            }
         }
     }
 
-    /// [`CgroupLeaf::hard_kill`] for a leaf dropped before its verdict, which also reaps every
-    /// member that is this process's own child.
-    ///
-    /// A leaf dropped before its verdict belongs to a spawn that failed, and no handle owns its
-    /// child any more: tokio drops a child it forked, then failed to set up, neither killed nor
-    /// reaped. Killed, it would stay a zombie. Its pid is not known here, so the members are read
-    /// from `cgroup.procs` before the kill and those `waitid` confirms are this process's
-    /// children — only the spawn's own child can be — are reaped once the kill has ended them.
-    fn kill_through_before_verdict(&self) -> Result<(), crate::error::Error> {
-        let orphans = own_children_in(&self.leaf_path.join("cgroup.procs"));
-        self.hard_kill()?;
-        for orphan in orphans {
-            reap_orphan(orphan);
-        }
-        Ok(())
+    /// Remove an abandoned leaf that holds nothing of its child's: never killed through — an
+    /// occupant is not cosca's — though its empty child cgroups are removed.
+    fn remove_holding_nothing(&mut self) {
+        let first = match fs::remove_dir(&self.leaf_path) {
+            Ok(()) => return,
+            Err(e) if removed_after_drain(&e) => return,
+            Err(e) => e,
+        };
+        let why = match remove_child_cgroups(&self.leaf_path) {
+            Ok(removed) if removed > 0 => match fs::remove_dir(&self.leaf_path) {
+                Ok(()) => return,
+                Err(e) if removed_after_drain(&e) => return,
+                Err(e) => format!("its child cgroups were removed, but rmdir failed again ({e})"),
+            },
+            Ok(_) => "cgroup.kill not written: nothing of the child's is in it".to_string(),
+            Err(e) => format!("a child cgroup could not be removed ({e})"),
+        };
+        warn_leaf_left_behind(
+            &self.leaf_path,
+            format_args!("rmdir failed ({first}) after its spawn was abandoned; {why}"),
+        );
     }
 
     /// Whether the leaf has members again, read once from `cgroup.events`.
@@ -676,59 +771,67 @@ impl CgroupLeaf {
     }
 }
 
-/// The members listed in `procs` that are this process's own unreaped children. An unreadable
-/// list names none: nothing can be reaped that cannot be named.
+/// Answer for an abandoned spawn's child, by the pidfd its intent carried: kill it and the group
+/// it leads, then reap it — it is killed directly, so the wait ends with its exit, and no handle
+/// owns it (see [`CgroupLeaf::abandon_before_verdict`]).
 #[cfg(target_os = "linux")]
-fn own_children_in(procs: &Path) -> Vec<Pid> {
-    use nix::sys::wait::{waitid, Id, WaitPidFlag};
+fn end_child(received: &Received) -> ChildFate {
+    use std::os::fd::AsFd;
 
-    let Ok(listed) = fs::read_to_string(procs) else {
-        return Vec::new();
+    use rustix::process::{pidfd_send_signal, waitid, WaitId, WaitIdOptions};
+
+    let Some(pidfd) = &received.pidfd else {
+        return if received.pid.is_some() {
+            ChildFate::Unkillable
+        } else {
+            ChildFate::NeverReached
+        };
     };
-    listed
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .map(Pid::from_raw)
-        .filter(|&pid| loop {
-            match waitid(
-                Id::Pid(pid),
-                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
-            ) {
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(_) => break false,
-                Ok(_) => break true,
-            }
-        })
-        .collect()
-}
-
-/// Reap `orphan`, this process's own child, which the caller has just sent SIGKILL — so the wait
-/// ends with its exit. `ECHILD` means something else already reaped it.
-#[cfg(target_os = "linux")]
-fn reap_orphan(orphan: Pid) {
-    use nix::sys::wait::waitpid;
-
+    // Still this process's unreaped child? Reaped means `std` failed the spawn and reaped it.
+    let unreaped = loop {
+        match waitid(
+            WaitId::PidFd(pidfd.as_fd()),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::CHILD) => break false,
+            _ => break true,
+        }
+    };
+    if !unreaped {
+        return ChildFate::Gone;
+    }
+    let killed = pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
+    // The group it leads: an unreaped leader pins the group's id, so this names its group alone.
+    if let Some(pid) = received.pid.and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = nix::sys::signal::killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    if let Err(e) = killed {
+        log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}); it is left running");
+        return ChildFate::Unkillable;
+    }
     let status = loop {
-        match waitpid(orphan, None) {
-            Err(nix::errno::Errno::EINTR) => continue,
+        match waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED) {
+            Err(rustix::io::Errno::INTR) => continue,
             other => break other,
         }
     };
     match status {
         Ok(status) => {
-            log::debug!("cgroup v2: reaped {orphan}, a child its failed spawn left behind: {status:?}");
+            log::debug!("cgroup v2: reaped an abandoned spawn's child: {status:?}");
             #[cfg(test)]
             fault::record_reaped_orphan(
-                orphan.as_raw() as u32,
-                match status {
-                    nix::sys::wait::WaitStatus::Signaled(_, signal, _) => Some(signal as i32),
-                    _ => None,
-                },
+                received.pid.unwrap_or(0),
+                status.and_then(|status| status.terminating_signal()),
             );
         }
-        Err(nix::errno::Errno::ECHILD) => {}
-        Err(e) => log::warn!("cgroup v2: could not reap {orphan}, a child its failed spawn left behind: {e}"),
+        // Nothing else may reap it: the child was unreaped a moment ago, and no handle owns it.
+        Err(e) => {
+            log::warn!("cgroup v2: could not reap an abandoned spawn's child: {e}");
+            debug_assert!(false, "an abandoned spawn's child could not be reaped: {e}");
+        }
     }
+    ChildFate::Killed
 }
 
 /// Remove every child cgroup under `dir`, deepest first, and count those removed. A child that
@@ -897,34 +1000,54 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         report: Some(report),
         entered: false,
         cgroup_path: None,
+        abandoned: false,
     })
 }
 
 /// Place the calling process into the pre-created cgroup leaf by writing `"0"`
 /// to `procs_fd`, then close the fd so it does not propagate to grandchildren.
 ///
-/// Called inside a `pre_exec` closure (post-fork, pre-exec), whose `Err` aborts the spawn.
+/// Called inside a `pre_exec` closure (post-fork, pre-exec), whose `Err` aborts the spawn. It is
+/// the child's half of the placement exchange (see the module's contract): it sends its intent,
+/// makes the write, and sends its report.
 ///
-/// The outcome — success, or the exact errno — is sent to `slot`, the only way it reaches the
-/// parent. A failed write (e.g. `EBUSY` when the supervisor's cgroup is itself a leaf — the "no
-/// internal processes" rule) returns `Ok`: the child proceeds in the process group already set
-/// up, and the parent degrades on the report. `Err` is a report that could not be sent: a parent
-/// still waiting for it would read a child that may be in its leaf as never placed, for the
-/// child's whole life, so the spawn fails instead (see [`ReportSlot::report`]).
+/// A failed write (e.g. `EBUSY` when the supervisor's cgroup is itself a leaf — the "no internal
+/// processes" rule) returns `Ok`: the child proceeds in the process group already set up, and the
+/// parent degrades on the report. So does a parent that decided without the exchange: the child
+/// then skips whatever of it is left. `Err` is a spawn the parent abandoned (`ECANCELED`), or a
+/// message that could not be sent: a parent still waiting for it would misread the child for its
+/// whole life, so the spawn fails instead.
 ///
 /// # Safety
 /// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
 /// open, writable fd in the child process, and `slot`'s channel must still be open.
-/// Async-signal-safe: raw `libc::write`, `libc::close` and `libc::send`, no allocation, no
-/// format strings.
+/// Async-signal-safe: raw `libc` syscalls, no allocation, no format strings.
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
     static ZERO: &[u8] = b"0";
-    // Safety: ZERO is a valid buffer; procs_fd is valid (caller guarantees).
-    let ret = unsafe { libc::write(procs_fd, ZERO.as_ptr().cast(), ZERO.len()) };
-    // Test-only fault seam: replace the write's return value (take semantics — see `fault`).
+    let abandoned = || io::Error::from_raw_os_error(libc::ECANCELED);
+    // The intent goes first, before the leaf is touched: a child the parent has abandoned never
+    // enters it.
+    // Safety: the caller guarantees the slot's channel is open.
+    let intent = unsafe { slot.send_intent() };
+    if !matches!(intent, Ok(Delivery::Queued)) {
+        // Safety: procs_fd is valid; close is async-signal-safe.
+        unsafe { libc::close(procs_fd) };
+        return match intent? {
+            Delivery::Abandoned => Err(abandoned()),
+            _ => Ok(()),
+        };
+    }
+    // Test-only fault seam: a write that returns this instead of writing (take semantics — see
+    // `fault`), so a failed placement leaves the child out of the leaf, as a real one does.
     #[cfg(test)]
-    let ret = fault::take_force_placement_write_result().unwrap_or(ret);
+    let forced = fault::take_force_placement_write_result();
+    // Safety: ZERO is a valid buffer; procs_fd is valid (caller guarantees).
+    let write = || unsafe { libc::write(procs_fd, ZERO.as_ptr().cast(), ZERO.len()) };
+    #[cfg(test)]
+    let ret = forced.unwrap_or_else(write);
+    #[cfg(not(test))]
+    let ret = write();
     // Read errno before `close`, which is free to clobber it.
     // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
     let errno = if ret == -1 {
@@ -945,5 +1068,8 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
         _ => libc::EIO,
     };
     // Safety: the caller guarantees the slot's channel is open.
-    unsafe { slot.report(report) }
+    match unsafe { slot.send_report(report) }? {
+        Delivery::Abandoned => Err(abandoned()),
+        Delivery::Queued | Delivery::Decided => Ok(()),
+    }
 }

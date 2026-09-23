@@ -778,48 +778,11 @@ fn block_on(gate: std::os::fd::RawFd) {
     unsafe { libc::read(gate, (&raw mut byte).cast(), 1) };
 }
 
-/// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
-/// inside `f` inherits the pin, so parent and child share that CPU.
-#[cfg(target_os = "linux")]
-fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
-    let size = std::mem::size_of::<libc::cpu_set_t>();
-    // SAFETY: `cpu_set_t` is plain data; zeroed is a valid (empty) set.
-    let mut original: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: pid 0 is the calling thread; `original` is a valid, writable set of `size` bytes.
-    assert_eq!(
-        unsafe { libc::sched_getaffinity(0, size, &mut original) },
-        0,
-        "read affinity"
-    );
-    let cpu = (0..libc::CPU_SETSIZE as usize)
-        // SAFETY: `cpu` is below CPU_SETSIZE, so it indexes inside the set.
-        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &original) })
-        .expect("this thread may run on at least one CPU");
-    // SAFETY: as above.
-    let mut pinned: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `cpu` is below CPU_SETSIZE.
-    unsafe { libc::CPU_SET(cpu, &mut pinned) };
-    // SAFETY: pid 0 is the calling thread; `pinned` is a valid set of `size` bytes.
-    assert_eq!(
-        unsafe { libc::sched_setaffinity(0, size, &pinned) },
-        0,
-        "pin to one CPU"
-    );
-    let result = f();
-    // SAFETY: as above, restoring the set read at entry.
-    assert_eq!(
-        unsafe { libc::sched_setaffinity(0, size, &original) },
-        0,
-        "restore affinity"
-    );
-    result
-}
-
 /// `wait` returns a report the child writes after the wait began, not what the channel held when
 /// it was called: `spawn` can return before the child's `pre_exec` has run.
 ///
-/// Parent and child share one CPU, so the parent runs on into `wait` while the released child
-/// waits its turn to report.
+/// Ordered by a primitive, not by timing: the child is held on a gate, the wait signals just
+/// before it blocks, and only then is the gate opened.
 #[cfg(target_os = "linux")]
 #[test]
 fn report_channel_wait_returns_a_report_written_after_it_was_called() {
@@ -830,17 +793,20 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     let slot = channel.slot();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    let (pid, report) = on_one_cpu(|| {
-        let pid = fork_running(move || {
-            block_on(gate);
-            // SAFETY: the channel's child end is this child's inherited copy; its parent holds
-            // its own end.
-            unsafe { slot.report_placed_for_test() };
-        });
-        gate_write.write_all(b"x").expect("release the child");
-        (pid, channel.wait(pid).expect("open a pidfd"))
+    let pid = fork_running(move || {
+        block_on(gate);
+        // SAFETY: the channel's child end is this child's inherited copy; its parent holds
+        // its own end.
+        let _ = unsafe { slot.send_report(super::REPORT_PLACED) };
     });
-    assert_eq!(report, PlacementReport::Placed);
+    let (polling_tx, polling_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        super::fault::set_wait_polling_notifier(polling_tx);
+        channel.wait(pid).expect("open a pidfd")
+    });
+    polling_rx.recv().expect("the wait reaches its poll with nothing sent");
+    gate_write.write_all(b"x").expect("release the child");
+    assert_eq!(waiter.join().expect("the waiting thread"), PlacementReport::Placed);
     reap(pid);
 }
 
@@ -957,7 +923,8 @@ fn drop_reports_a_leaf_it_could_not_remove() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-undeletable-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+    // A file, not a directory: `rmdir` refuses it, and no child-cgroup sweep removes it.
+    std::fs::write(leaf_path.join("occupant"), "").expect("make the leaf unremovable");
 
     let mark = crate::log_capture::mark();
     drop(super::CgroupLeaf::for_test_at(leaf_path));
@@ -969,9 +936,9 @@ fn drop_reports_a_leaf_it_could_not_remove() {
     );
 }
 
-/// `Drop` writes `cgroup.kill` through an unremovable leaf unless the report proves the child
-/// never entered it (see the module's report contract). A final report other than `Placed` is
-/// that proof; nothing received, before the verdict, is not — the report may still be in flight.
+/// `Drop` writes `cgroup.kill` through an unremovable leaf only when the child reported `Placed`
+/// (see the module's report contract). Before the verdict, `Drop` abandons the exchange first,
+/// which makes what was received final: nothing received then means the child never execs.
 #[cfg(target_os = "linux")]
 #[test]
 fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
@@ -984,16 +951,12 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
     // Before the verdict `Drop` reads the report from the channel; after it, from what the
     // verdict recorded when it released the channel.
     for (report, verdict_taken) in reports.into_iter().flat_map(|report| [(report, false), (report, true)]) {
-        let kills = match report {
-            PlacementReport::Placed => true,
-            PlacementReport::WriteFailed(_) => false,
-            // Final once the verdict has waited for it; in flight before.
-            PlacementReport::NotReported => !verdict_taken,
-        };
+        let kills = report == PlacementReport::Placed;
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-drop-kill-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
-        std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+        // A file, not a directory: `rmdir` refuses it, and no child-cgroup sweep removes it.
+        std::fs::write(leaf_path.join("occupant"), "").expect("make the leaf unremovable");
 
         let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
         match report {
@@ -1586,12 +1549,12 @@ fn without_a_pidfd_a_removed_leaf_reads_the_report_again() {
     let leaf_path = dir.path().join("cosca-late");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut channel = leaf.report.take().expect("the channel");
+    let channel = leaf.report.take().expect("the channel");
     // SAFETY: `channel` is open.
     unsafe { channel.slot().report_placed_for_test() };
 
     let source = std::io::Error::from_raw_os_error(libc::EMFILE);
-    let verdict = leaf.decide_unwaitable(std::process::id(), &mut channel, source);
+    let verdict = leaf.decide_unwaitable(std::process::id(), channel, source);
     assert!(matches!(verdict, Ok(Ok(()))), "got {verdict:?}");
     assert!(leaf.entered);
     assert!(!leaf_path.exists());
@@ -1620,10 +1583,10 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
         let err = if placed {
             // A `Placed` the wait missed: sent after the check, as a child that just placed
             // itself would.
-            let mut channel = leaf.report.take().expect("the channel");
+            let channel = leaf.report.take().expect("the channel");
             // SAFETY: `channel` is open.
             unsafe { channel.slot().report_placed_for_test() };
-            leaf.abandon(child.id(), &mut channel, "the test cannot decide")
+            leaf.fail_closed(child.id(), channel, "the test cannot decide")
         } else {
             super::fault::set_force_pidfd_failure(true);
             match leaf.take_placement(child.id()) {
@@ -1805,22 +1768,135 @@ fn placement_hook_fails_when_its_report_cannot_be_sent() {
     );
 }
 
-/// A parent that has already decided without the report closes its end. The report then fails
-/// with `EPIPE`, which must neither abort the spawn nor raise `SIGPIPE`.
+/// A copy of `channel`'s child end, standing in for the one a forked child inherits: the parent's
+/// own copy closes when the exchange ends, as it does in a real spawn.
+#[cfg(target_os = "linux")]
+fn childs_copy(channel: &super::ReportChannel) -> (std::os::fd::OwnedFd, super::ReportSlot) {
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    // SAFETY: the slot's descriptor is open for as long as `channel` lives, which spans this call.
+    let end = unsafe { BorrowedFd::borrow_raw(channel.slot().fd) }
+        .try_clone_to_owned()
+        .expect("dup the child's end");
+    let slot = super::ReportSlot { fd: end.as_raw_fd() };
+    (end, slot)
+}
+
+/// A parent that decided without the exchange sends *proceed* and closes its end: the child's
+/// send then fails with `EPIPE`, finds *proceed*, and carries on — without `SIGPIPE`, and without
+/// touching the leaf it no longer needs.
 #[cfg(target_os = "linux")]
 #[test]
-fn placement_hook_proceeds_when_the_parent_decided_without_the_report() {
-    use std::os::fd::AsRawFd;
+fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let (_end, slot) = childs_copy(&channel);
+    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
+    channel.proceed();
+    // SAFETY: the write end is open and closed by the hook; the child's end of the channel is
+    // still open in `slot`'s channel, whose parent end `proceed` closed.
+    let result =
+        unsafe { super::place_self_in_cgroup_pre_exec(std::os::fd::IntoRawFd::into_raw_fd(procs_write), slot) };
+    assert!(
+        result.is_ok(),
+        "a decided exchange must not abort the spawn: {result:?}"
+    );
+    assert_eq!(
+        std::io::read_to_string(procs_read).expect("read the pipe"),
+        "",
+        "no placement write"
+    );
+}
 
-    use rustix::net::{socketpair, AddressFamily, SocketFlags, SocketType};
+/// A parent that abandoned the spawn shut its end without *proceed*: the child's first send fails,
+/// and the hook fails the spawn with `ECANCELED` before touching the leaf — so the child exits
+/// instead of exec'ing.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_hook_fails_a_spawn_the_parent_abandoned_before_touching_the_leaf() {
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let (_end, slot) = childs_copy(&channel);
+    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
+    let received = channel.shut();
+    assert!(received.pid.is_none(), "nothing was sent before the shut");
+    // SAFETY: as above.
+    let result =
+        unsafe { super::place_self_in_cgroup_pre_exec(std::os::fd::IntoRawFd::into_raw_fd(procs_write), slot) };
+    assert_eq!(result.map_err(|e| e.raw_os_error()), Err(Some(libc::ECANCELED)));
+    assert_eq!(
+        std::io::read_to_string(procs_read).expect("read the pipe"),
+        "",
+        "no placement write"
+    );
+}
 
-    let (parent, child) =
-        socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None).expect("open a socket pair");
-    drop(parent);
-    let slot = super::ReportSlot { fd: child.as_raw_fd() };
-    // SAFETY: fd -1 is never writable; `child` is open for the call.
-    let result = unsafe { super::place_self_in_cgroup_pre_exec(-1, slot) };
-    assert!(result.is_ok(), "EPIPE must not abort the spawn: {result:?}");
+/// Everything the child sent before the parent abandoned the exchange is still read, pidfd
+/// included: the shut cuts off only what comes after.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_exchange_still_reads_what_was_sent_before_it() {
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let (_end, slot) = childs_copy(&channel);
+    // SAFETY: the channel is open.
+    unsafe {
+        assert_eq!(slot.send_intent().expect("send the intent"), super::Delivery::Queued);
+        assert_eq!(
+            slot.send_report(super::REPORT_PLACED).expect("send the report"),
+            super::Delivery::Queued
+        );
+    }
+    let received = channel.shut();
+    assert_eq!(received.pid, Some(std::process::id()));
+    assert!(received.pidfd.is_some(), "the intent carries a pidfd");
+    assert_eq!(received.placement(), PlacementReport::Placed);
+    // SAFETY: the child's end is still open in `slot`; the parent's end is shut for reading.
+    assert_eq!(
+        unsafe { slot.send_report(super::REPORT_PLACED) }.expect("send"),
+        super::Delivery::Abandoned
+    );
+}
+
+/// A child held before its hook while the parent abandons the spawn never execs: released, its
+/// first send fails with no *proceed*, and it exits. Here "exits" is the hook's `Err`, which the
+/// forked child turns into its exit status; a regression would exit 0.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let slot = channel.slot();
+    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
+    let procs_fd = procs_write.into_raw_fd();
+    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
+    let gate = gate_read.as_raw_fd();
+    let pid = fork_running(move || {
+        block_on(gate);
+        // SAFETY: this child's inherited copies of the channel's child end and the pipe.
+        if unsafe { super::place_self_in_cgroup_pre_exec(procs_fd, slot) }.is_err() {
+            // SAFETY: async-signal-safe.
+            unsafe { libc::_exit(42) }
+        }
+    });
+    // SAFETY: the parent's own copy, closed once; the child keeps its own.
+    unsafe { libc::close(procs_fd) };
+    let received = channel.shut();
+    assert!(received.pid.is_none(), "the child was held before its hook");
+    gate_write.write_all(b"x").expect("release the child");
+
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
+    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        42,
+        "the abandoned child must fail its hook, not exec"
+    );
+    assert_eq!(
+        std::io::read_to_string(procs_read).expect("read the pipe"),
+        "",
+        "no placement write"
+    );
 }
 
 /// Through a real spawn: an undeliverable report aborts it rather than exec'ing a child the
@@ -1887,7 +1963,7 @@ fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
     std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
     let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
     let mut channel = leaf.report.take().expect("the channel");
-    let err = leaf.abandon(grandchild, &mut channel, "the test cannot decide");
+    let err = leaf.fail_closed(grandchild, channel, "the test cannot decide");
     assert!(err.to_string().contains("not signalled"), "got {err}");
 
     let mut stdin = shell.stdin.take().expect("stdin");
@@ -1913,13 +1989,14 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
     assert!(!leaf_path.exists(), "the leaf must be removed");
 }
 
-/// A real leaf dropped before its verdict — the tokio spawn's error path, where tokio loses a
-/// forked child — whose report is in flight but which is occupied: nothing proves the child is
-/// absent, so the leaf is killed through, and removed once drained.
+/// A real leaf dropped before its verdict, occupied by a process that is not its child: the
+/// abandoned exchange received nothing, so nothing of the child's is there, and the occupant is
+/// not cosca's to kill. It survives — proven by an echo — and the leaf is reported, not killed.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
+fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child() {
+    use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
 
     assert!(
@@ -1928,28 +2005,76 @@ fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
     );
     let leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let leaf_path = leaf.leaf_path.clone();
-    // The member reports through a channel of its own, so the leaf's receives nothing: its
-    // report stays in flight.
-    let own = super::ReportChannel::new().expect("open the member's channel");
+    // The occupant reports through a channel of its own, so the leaf's receives nothing.
+    let own = super::ReportChannel::new().expect("open the occupant's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("300");
+    let mut cmd = std::process::Command::new("/bin/cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
     // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let member = cmd.spawn().expect("spawn the member");
+    let mut occupant = cmd.spawn().expect("spawn the occupant");
 
-    let pid = member.id();
     drop(leaf);
 
-    // A leaf dropped before its verdict reaps the members that are this process's children —
-    // no handle owns a failed spawn's child — so the member's own handle is never waited on.
+    let mut echo = [0u8; 1];
+    occupant
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"x")
+        .expect("write to the occupant");
+    occupant
+        .stdout
+        .as_mut()
+        .expect("stdout")
+        .read_exact(&mut echo)
+        .expect("the occupant must still be alive to echo");
+    assert_eq!(&echo, b"x");
+    assert!(leaf_path.exists(), "an occupied leaf is left, and reported");
+
+    occupant.kill().expect("kill the occupant");
+    occupant.wait().expect("reap the occupant");
+    std::fs::remove_dir(&leaf_path).expect("remove the emptied leaf");
+}
+
+/// An abandoned spawn's child is killed and reaped through the pidfd its intent carried, whatever
+/// `cgroup.kill` returns — it may have left the leaf. Here `cgroup.kill` is a directory, so the
+/// leaf's kill fails for real.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-kill-fails");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    let slot = leaf.placement_slot();
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("300").process_group(0);
+    // SAFETY: the closure runs between fork and exec; /dev/null stands in for cgroup.procs.
+    unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let child = cmd.spawn().expect("spawn");
+    let pid = child.id();
+    // SAFETY: the parent's own copy, closed once.
+    unsafe { libc::close(procs_fd) };
+    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
+    drop(child);
+
+    drop(leaf);
+
     assert!(
         super::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
-        "the occupant must be killed through the leaf, and reaped"
+        "the child must be killed by its pidfd and reaped"
     );
-    assert!(!leaf_path.exists(), "the leaf must be removed");
-    drop(member);
 }
 
 /// A child cosca gives up on is killed as a group: between the last look at its report and the
@@ -1958,7 +2083,7 @@ fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
 /// A regression hangs this test on the read.
 #[cfg(target_os = "linux")]
 #[test]
-fn abandon_kills_the_childs_whole_process_group() {
+fn fail_closed_kills_the_childs_whole_process_group() {
     use std::io::{BufRead, Read};
     use std::os::unix::process::CommandExt;
 
@@ -1991,12 +2116,12 @@ fn abandon_kills_the_childs_whole_process_group() {
     child.wait().expect("reap the child");
 }
 
-/// A child cosca may not signal — it exec'd a setuid program — cannot be waited out: `abandon`
+/// A child cosca may not signal — it exec'd a setuid program — cannot be waited out: `fail_closed`
 /// would block for that program's whole life. It exec'd, so its report is final: the spawn fails
 /// at once, and the child, which cosca could not kill, is left running.
 #[cfg(target_os = "linux")]
 #[test]
-fn abandon_does_not_wait_on_a_child_it_may_not_signal() {
+fn fail_closed_does_not_wait_on_a_child_it_may_not_signal() {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
 
@@ -2120,13 +2245,23 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
-    let leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
-    let leaf_path = leaf.leaf_path.clone();
-    std::fs::create_dir_all(leaf_path.join("nested").join("deeper")).expect("create child cgroups");
+    // Placed: killed through, drained, swept. Nothing received: swept without a kill.
+    for placed in [true, false] {
+        let leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
+        let leaf_path = leaf.leaf_path.clone();
+        std::fs::create_dir_all(leaf_path.join("nested").join("deeper")).expect("create child cgroups");
+        if placed {
+            // SAFETY: the slot's channel lives as long as `leaf`.
+            unsafe { leaf.placement_slot().report_placed_for_test() };
+        }
 
-    drop(leaf);
+        drop(leaf);
 
-    assert!(!leaf_path.exists(), "the leaf and its child cgroups must be removed");
+        assert!(
+            !leaf_path.exists(),
+            "placed: {placed}: the leaf and its child cgroups must be removed"
+        );
+    }
 }
 
 /// A child cosca may not signal, but whose report says `Placed`, is killed through its leaf — no
@@ -2134,7 +2269,7 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
 /// running.
 #[cfg(target_os = "linux")]
 #[test]
-fn abandon_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_placed() {
+fn fail_closed_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_placed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandon-eperm-placed");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -2143,12 +2278,12 @@ fn abandon_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_pla
         .arg("300")
         .spawn()
         .expect("spawn");
-    let mut channel = leaf.report.take().expect("the channel");
+    let channel = leaf.report.take().expect("the channel");
     // SAFETY: `channel` is open.
     unsafe { channel.slot().report_placed_for_test() };
 
     super::fault::set_force_signal_denied(true);
-    let err = leaf.abandon(child.id(), &mut channel, "the test cannot decide");
+    let err = leaf.fail_closed(child.id(), channel, "the test cannot decide");
     let err = err.to_string();
     assert!(err.contains("killed through its leaf"), "got {err}");
     assert!(!err.contains("left running"), "got {err}");
@@ -2161,12 +2296,12 @@ fn abandon_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_pla
     child.wait().expect("reap the child");
 }
 
-/// After killing through a placed child's leaf, a drain `abandon` cannot watch is reported, as
+/// After killing through a placed child's leaf, a drain `fail_closed` cannot watch is reported, as
 /// `Drop`'s own kill-and-drain reports it — never dropped. A `cgroup.events` that is a directory
 /// opens but cannot be read, so the watch fails for real.
 #[cfg(target_os = "linux")]
 #[test]
-fn abandon_reports_a_drain_it_could_not_watch() {
+fn fail_closed_reports_a_drain_it_could_not_watch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandon-unwatchable");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -2176,12 +2311,12 @@ fn abandon_reports_a_drain_it_could_not_watch() {
         .arg("300")
         .spawn()
         .expect("spawn");
-    let mut channel = leaf.report.take().expect("the channel");
+    let channel = leaf.report.take().expect("the channel");
     // SAFETY: `channel` is open.
     unsafe { channel.slot().report_placed_for_test() };
 
     let err = leaf
-        .abandon(child.id(), &mut channel, "the test cannot decide")
+        .fail_closed(child.id(), channel, "the test cannot decide")
         .to_string();
     assert!(err.contains("drain could not be watched"), "got {err}");
     child.wait().expect("reap the child");

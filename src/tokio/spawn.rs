@@ -278,9 +278,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (prepared, mut child) = {
+    let (mut prepared, mut child) = {
         let _guard = crate::child::spawn::spawn_lock();
-        let prepared = crate::containment::prepare(
+        let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
             cmd.flags_request(),
@@ -310,16 +310,21 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 .expect("child fd numbers are unique (BTreeMap keys)");
         }
 
-        let c = tcmd
-            .spawn()
-            .map_err(Error::Io)
-            .inspect_err(warn_child_may_be_unreachable)?;
+        let c = match tcmd.spawn().map_err(Error::Io) {
+            Ok(c) => c,
+            Err(e) => {
+                if !prepared.abandon_before_verdict() {
+                    warn_child_may_be_unreachable(&e);
+                }
+                return Err(e);
+            }
+        };
         drop(tcmd);
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (prepared, mut child) = {
-        let prepared = crate::containment::prepare(
+    let (mut prepared, mut child) = {
+        let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
             cmd.flags_request(),
@@ -379,15 +384,17 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 spawned,
                 prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path_for_test()),
             );
-            #[cfg(target_os = "linux")]
-            let reachable = prepared.cgroup_leaf.is_some();
-            #[cfg(not(target_os = "linux"))]
-            let reachable = false;
-            spawned.inspect_err(|e| {
-                if !reachable {
-                    warn_child_may_be_unreachable(e);
+            match spawned {
+                Ok(c) => c,
+                Err(e) => {
+                    // Whatever tokio did with the child, the leaf's exchange says whether it is
+                    // ended or still running out of reach; without a leaf, nothing can tell.
+                    if !prepared.abandon_before_verdict() {
+                        warn_child_may_be_unreachable(&e);
+                    }
+                    return Err(e);
                 }
-            })?
+            }
         };
         (prepared, c)
     };
@@ -401,6 +408,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process.
         other => {
+            // The verdict first: tokio owns this child, so the leaf must not answer for it as an
+            // abandoned spawn's, reaping a pid tokio's own reap is about to.
+            prepared.settle_verdict(pid);
             reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
             return Err(crate::child::spawn::spawn_identity_error(other));
         }

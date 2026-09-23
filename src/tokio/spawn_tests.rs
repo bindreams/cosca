@@ -188,3 +188,74 @@ fn the_unreachable_child_warning_is_once_per_errno() {
         log::Level::Warn
     );
 }
+
+/// A post-fork tokio failure warns exactly when the child may be running out of reach. Without a
+/// pidfd (denied here in the child through an inherited seam) cosca cannot kill the child itself,
+/// so only its leaf can: a placed child is killed through it — ended, no warning — while a child
+/// whose placement failed is outside it — out of reach, warned about.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() {
+    use crate::containment::cgroup::fault as cgroup_fault;
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    crate::log_capture::install();
+    for placed in [true, false] {
+        let mut cmd = blocker();
+        cmd.contain();
+        let mark = crate::log_capture::mark();
+        // Armed in this thread, inherited by the child it forks, which takes them.
+        cgroup_fault::set_force_child_pidfd_failure(true);
+        if !placed {
+            cgroup_fault::set_force_placement_write_result(0);
+        }
+        fault::set_force_post_fork_failure(true);
+        assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
+        // This thread's own copies were never taken.
+        cgroup_fault::set_force_child_pidfd_failure(false);
+        let _ = cgroup_fault::take_force_placement_write_result();
+        let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+        let _ = fault::take_forgotten_leaf();
+
+        assert_eq!(
+            crate::log_capture::contains_since(mark, "nothing can reach it"),
+            !placed,
+            "placed: {placed}: the warning must fire exactly when the child is out of reach"
+        );
+        // With no pidfd nothing reaped the child; it is still this process's unreaped child.
+        let pid = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
+    }
+}
+
+/// On the identity-failure path tokio still owns the child, and reaps it: the leaf takes its
+/// verdict first, so it never reaps that child as an abandoned spawn's — which would race tokio's
+/// own reap for the same pid.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let _ = crate::containment::cgroup::fault::take_reaped_orphans();
+    fault::set_force_identity_vanished(true);
+    let mut cmd = blocker();
+    cmd.contain();
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+
+    err.expect("forced identity-vanish must make spawn return Err");
+    assert_eq!(
+        crate::containment::cgroup::fault::take_reaped_orphans(),
+        Vec::new(),
+        "the leaf must not reap a child tokio owns"
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
