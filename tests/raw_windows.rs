@@ -48,9 +48,11 @@ fn testbin_read_fd_copies_the_source_fd_to_stdout() {
             .spawn()
             .expect("spawn")
         // Guard dropped here, before the stdin write and wait below: holding it any longer would
-        // serialize this test against every other raw spawn in this binary for no reason — the
-        // race window this lock closes (a concurrent fork transiently inheriting a live handle
-        // pre-exec) exists only up to `spawn()` returning.
+        // serialize every cosca spawn in this binary against this one for no reason — the window
+        // this lock closes (std marking its child-side pipe handles inheritable and calling
+        // CreateProcessW with bInheritHandles=TRUE, while a concurrent cosca raw-backend spawn has
+        // its own child ends marked inheritable — see `spawn_lock`'s doc) ends inside `spawn()`,
+        // which closes std's child-side copies before returning.
     };
     child
         .stdin
