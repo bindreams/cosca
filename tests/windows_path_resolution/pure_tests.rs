@@ -103,3 +103,19 @@ fn read_growing_follows_a_value_that_grows_between_calls() {
 fn read_growing_passes_other_errors_through() {
     assert_eq!(read_growing(|_, _| 2), Err(2));
 }
+
+#[test]
+fn payload_outcome_separates_the_payloads_own_error_from_other_exits() {
+    let ok = "module=C:\\m\nimage=C:\\t\\x \n";
+    assert_eq!(payload_outcome(Some(0), ok), PayloadOutcome::Image("C:\\t\\x "));
+    assert_eq!(payload_outcome(Some(0), "module=C:\\m\n"), PayloadOutcome::NoImageLine);
+    let err = "module=C:\\m\nimage-error=Access is denied.\n";
+    assert_eq!(
+        payload_outcome(Some(2), err),
+        PayloadOutcome::PayloadError("Access is denied.")
+    );
+    // Exit 2 without the signal, or the signal with another exit, is not the payload's own error.
+    assert_eq!(payload_outcome(Some(2), "module=C:\\m\n"), PayloadOutcome::OtherExit);
+    assert_eq!(payload_outcome(Some(1), err), PayloadOutcome::OtherExit);
+    assert_eq!(payload_outcome(None, ok), PayloadOutcome::OtherExit);
+}

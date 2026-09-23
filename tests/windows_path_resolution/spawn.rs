@@ -2,7 +2,7 @@
 
 use crate::dots_and_spaces::WEIRD_NAMES;
 use crate::harness::canary;
-use crate::pure::verbatim_spelling;
+use crate::pure::{payload_outcome, verbatim_spelling, PayloadOutcome};
 use crate::winapi::{outcome, wide};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0};
@@ -111,21 +111,37 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
                 if tag != "verbatim" {
                     continue;
                 }
-                let output = match ran {
-                    Ok(o) if o.status.success() => o,
-                    other => {
+                let (code, stdout) = match &ran {
+                    Ok(o) => (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned()),
+                    Err(e) => {
                         facts.check(
                             false,
                             &format!("std::process runs the image at verbatim {name:?}"),
-                            other.map_or_else(|e| e.to_string(), |o| format!("{:?}", o.status)),
+                            format_args!("spawn failed: {e}"),
                         );
                         continue;
                     }
                 };
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let Some(image) = stdout.lines().find_map(|l| l.strip_prefix("image=")) else {
-                    failures.push(format!("the payload at {verbatim:?} exited 0 without an image= line"));
-                    continue;
+                let image = match payload_outcome(code, &stdout) {
+                    PayloadOutcome::Image(image) => image,
+                    PayloadOutcome::PayloadError(why) => {
+                        failures.push(format!(
+                            "the payload at {verbatim:?} could not read its own image: {why}"
+                        ));
+                        continue;
+                    }
+                    PayloadOutcome::NoImageLine => {
+                        failures.push(format!("the payload at {verbatim:?} exited 0 without an image= line"));
+                        continue;
+                    }
+                    PayloadOutcome::OtherExit => {
+                        facts.check(
+                            false,
+                            &format!("std::process runs the image at verbatim {name:?}"),
+                            format_args!("exit code {code:?}"),
+                        );
+                        continue;
+                    }
                 };
                 // An image path that cannot be opened is a broken probe, not a changed platform.
                 let loaded = match file_identity(&verbatim_spelling(image)) {

@@ -109,3 +109,27 @@ pub fn read_growing(mut read: impl FnMut(&mut [u16], &mut u32) -> u32) -> Result
         }
     }
 }
+
+/// How a run of `cosca_testbin_image` (`testbin/image_report.rs`) ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PayloadOutcome<'a> {
+    /// Exit 0 with an `image=` line: the file the process was created from.
+    Image(&'a str),
+    /// The payload's own error signal, exit 2 with `image-error=`: it could not measure its image.
+    /// A broken probe, not a platform change.
+    PayloadError(&'a str),
+    /// Exit 0 without an `image=` line: the payload broke its contract.
+    NoImageLine,
+    /// Any other exit: whatever ran was not the payload doing its job.
+    OtherExit,
+}
+
+/// Classify a payload run from its exit code and stdout.
+pub fn payload_outcome(code: Option<i32>, stdout: &str) -> PayloadOutcome<'_> {
+    let line = |prefix: &str| stdout.lines().find_map(|l| l.strip_prefix(prefix));
+    match code {
+        Some(0) => line("image=").map_or(PayloadOutcome::NoImageLine, PayloadOutcome::Image),
+        Some(2) => line("image-error=").map_or(PayloadOutcome::OtherExit, PayloadOutcome::PayloadError),
+        _ => PayloadOutcome::OtherExit,
+    }
+}
