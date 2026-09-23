@@ -123,11 +123,12 @@ pub(crate) struct ResolveInput<'a> {
     /// It also makes the search fail closed on a candidate whose existence cannot be determined,
     /// where an ordinary search skips it with a warning: see [`resolve`].
     pub loadable_only: bool,
-    /// How Win32 completes a candidate that is verbatim (`\\?\`) only because its directory is:
+    /// How Win32 completes a located name that is verbatim (`\\?\`) only because the cwd base is:
     /// `GetFullPathNameW`, which the raw backend passes. Win32 normalises a name it completes
     /// against a verbatim cwd (`sub.\tool.exe` on `\\?\C:\d` is `\\?\C:\d\sub\tool.exe`), and
-    /// the candidate is probed and returned as that. A name written verbatim, or joined onto any
-    /// other directory, never reaches it. Windows only.
+    /// the candidate is probed and returned as that. Nothing else reaches it: a name written
+    /// verbatim, one joined onto a non-verbatim cwd, and every candidate of a `PATH` or system
+    /// directory search, whose directories are written verbatim by whoever set them. Windows only.
     pub normalise: &'a dyn Fn(&Path) -> std::io::Result<PathBuf>,
 }
 
@@ -944,7 +945,10 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             if !accepted(&joined, input.windows) {
                 continue;
             }
+            // Only the cwd base is a directory the caller did not spell verbatim. A `PATH` or
+            // system directory is written verbatim by whoever set it, and is taken as written.
             let made_verbatim = input.windows
+                && shape == Shape::Located
                 && join::is_verbatim(dir.as_os_str().as_encoded_bytes())
                 && !join::is_verbatim(candidate.as_encoded_bytes());
             let probed = if made_verbatim {

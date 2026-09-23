@@ -452,3 +452,24 @@ fn only_a_verbatim_base_makes_a_candidate_normalised() {
         }
     }
 }
+
+/// A verbatim `PATH` or system directory is written verbatim by whoever set it, so a candidate
+/// under it is probed as written: `\\?\C:\x\bin.` is the directory `bin.`, never `bin`.
+#[test]
+fn a_verbatim_search_directory_is_taken_as_written() {
+    let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be normalised") };
+    let system = [PathBuf::from(r"\\?\C:\a\..\b")];
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: None,
+        system_dirs: &system,
+        path_var: Some(OsStr::new(r"\\?\C:\x\bin.")),
+        windows: true,
+        loadable_only: false,
+        normalise: &never,
+    });
+    match got {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}"),
+        other => panic!("nothing is on disk there, got {other:?}"),
+    }
+}
