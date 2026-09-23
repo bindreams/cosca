@@ -676,8 +676,8 @@ impl ReportChannel {
             .and_then(rustix::process::Pid::from_raw)
             .expect("a spawned child's pid is a positive i32");
         #[cfg(test)]
-        let pidfd = if fault::take_force_pidfd_failure() {
-            Err(rustix::io::Errno::MFILE)
+        let pidfd = if let Some(errno) = fault::take_force_pidfd_failure() {
+            Err(errno)
         } else {
             rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
         };
@@ -1310,7 +1310,7 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
         static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
-        static FORCE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_PIDFD_FAILURE: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
         static FORCE_SIGNAL_DENIED: Cell<bool> = const { Cell::new(false) };
         static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
@@ -1345,13 +1345,21 @@ pub(crate) mod fault {
     /// Fail the NEXT `pidfd_open` of a report wait with `EMFILE`. The seccomp denial it also
     /// stands for is exercised for real, in a process of its own, by `tests/spawn_io.rs`.
     pub(crate) fn set_force_pidfd_failure(on: bool) {
-        FORCE_PIDFD_FAILURE.with(|f| f.set(on));
+        FORCE_PIDFD_FAILURE.with(|f| f.set(on.then_some(rustix::io::Errno::MFILE)));
     }
-    pub(crate) fn take_force_pidfd_failure() -> bool {
-        FORCE_PIDFD_FAILURE.with(|f| f.replace(false))
+    /// Fail the NEXT `pidfd_open` of a report wait with `errno` — `ESRCH` stands for a child
+    /// something else already reaped, whose pid a test must never obtain for real: it may
+    /// already be another process's. Release-only, like its one test: debug builds assert the
+    /// precondition this breaks.
+    #[cfg(not(debug_assertions))]
+    pub(crate) fn set_force_pidfd_errno(errno: rustix::io::Errno) {
+        FORCE_PIDFD_FAILURE.with(|f| f.set(Some(errno)));
+    }
+    pub(crate) fn take_force_pidfd_failure() -> Option<rustix::io::Errno> {
+        FORCE_PIDFD_FAILURE.with(|f| f.take())
     }
     pub(crate) fn pidfd_failure_armed() -> bool {
-        FORCE_PIDFD_FAILURE.with(|f| f.get())
+        FORCE_PIDFD_FAILURE.with(|f| f.get().is_some())
     }
 
     /// Deny the NEXT `abandon`'s signals with `EPERM`, as a child that exec'd a setuid program

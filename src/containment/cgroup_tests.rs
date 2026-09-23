@@ -1824,35 +1824,58 @@ fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
 
 /// A child that something else in this process already reaped — a `waitpid(-1)` reaper, or
 /// `SIGCHLD` set to `SIG_IGN` — breaks the verdict's precondition. In release the verdict still
-/// decides without a pidfd, and never signals the pid, which may by now be another process's.
+/// decides without a pidfd, and never signals a pid that is not this process's unreaped child.
 /// (Debug builds assert the precondition instead.)
+///
+/// No freed pid is ever obtained: a reaped pid may already be another process's. `pidfd_open`'s
+/// `ESRCH` is injected, and "not this process's child" is a live grandchild, which its own parent
+/// has not reaped, so its number cannot be reused.
 #[cfg(all(target_os = "linux", not(debug_assertions)))]
 #[test]
 fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
-    let reaped = || {
-        let mut child = std::process::Command::new("/bin/true").spawn().expect("spawn");
-        child.wait().expect("reap");
-        child.id()
-    };
+    use std::io::{BufRead, Read, Write};
 
     // `pidfd_open` fails with ESRCH: the leaf is closed, and the spawn degrades.
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-reaped");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
-    match leaf.take_placement(reaped()).expect("decidable") {
+    super::fault::set_force_pidfd_errno(rustix::io::Errno::SRCH);
+    match leaf.take_placement(std::process::id()).expect("decidable") {
         Err(NotPlaced::Unwaitable { source, .. }) => assert_eq!(source.raw_os_error(), Some(libc::ESRCH)),
         other => panic!("expected Unwaitable, got {other:?}"),
     }
     assert!(!leaf_path.exists(), "the leaf must be closed");
 
-    // Undecidable: the spawn fails, and the reaped pid is not signalled.
+    // A pid that is not this process's child is never signalled. `cat` reads the shell's stdin
+    // through fd 3: an asynchronous list's own stdin is /dev/null.
+    let mut shell = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec 3<&0; cat <&3 & echo $!; wait"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the shell");
+    let mut stdout = std::io::BufReader::new(shell.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read the grandchild's pid");
+    let grandchild: u32 = line.trim().parse().expect("a pid");
+
     std::fs::create_dir(&leaf_path).expect("recreate the leaf");
     std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
     let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
     let mut channel = leaf.report.take().expect("the channel");
-    let err = leaf.abandon(reaped(), &mut channel, "the test cannot decide");
-    assert!(err.to_string().contains("already reaped"), "got {err}");
+    let err = leaf.abandon(grandchild, &mut channel, "the test cannot decide");
+    assert!(err.to_string().contains("not signalled"), "got {err}");
+
+    let mut stdin = shell.stdin.take().expect("stdin");
+    stdin.write_all(b"x").expect("write to the grandchild");
+    let mut echo = [0u8; 1];
+    stdout
+        .read_exact(&mut echo)
+        .expect("the grandchild must be alive to echo: it must not have been signalled");
+    assert_eq!(&echo, b"x");
+    drop(stdin);
+    shell.wait().expect("reap the shell");
 }
 
 /// A leaf dropped before its verdict, with no report received and nothing in it, is removed: a
