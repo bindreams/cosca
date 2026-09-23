@@ -290,7 +290,14 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
-    remove_leftover_leaf(leaf);
+    // This `Drop` ran on this thread, and waits for the leaf to drain before removing it.
+    if let Some(leaf) = leaf {
+        assert!(
+            !leaf.exists(),
+            "Drop must remove the leaf once it drains: {}",
+            leaf.display()
+        );
+    }
 }
 
 #[tokio::test]
