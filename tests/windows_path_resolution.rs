@@ -32,7 +32,8 @@
 //! of cosca. The canary's own string logic is tested by `windows_path_logic`, which runs by default
 //! on every host. `GetFullPathNameW` works on the string alone and touches no disk or network, so
 //! UNC and device inputs here reach no server or device. The file and spawn tests write only inside
-//! a `tempfile` directory of their own and launch only `cosca_testbin_image`. Nothing here runs a
+//! a `tempfile` directory of their own and launch only `cosca_testbin_image`, except that one
+//! canary has std create `cmd.exe` SUSPENDED and terminates it before it runs. Nothing here runs a
 //! batch file or needs elevation. Temp directories are removed on drop and planted files
 //! explicitly, but a removal failure is only printed; whatever it leaves goes with the ephemeral
 //! runner.
@@ -52,8 +53,8 @@ use windows::Win32::Storage::FileSystem::{FileIdInfo, GetFileInformationByHandle
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, QueryFullProcessImageNameW, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_NAME_WIN32, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 // Measuring helpers =====
@@ -972,6 +973,112 @@ fn file_identity(path: &str) -> Result<(u64, [u8; 16]), String> {
     }
     .map_err(|e| format!("GetFileInformationByHandleEx({path:?}, FileIdInfo) failed: {e}"))?;
     Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+/// Canary: `std::process` hands a verbatim `x.bat.` or `x.bat ` (one trailing space) to
+/// `CreateProcessW` as given, while it runs a verbatim `x.bat` through `cmd.exe`.
+///
+/// This measures Rust's `std::process`, whose toolchain floats like the runner image. For a
+/// verbatim program std tests `.bat`/`.cmd` on the literal string when `GetFullPathNameW` would
+/// rewrite it, and `x.bat.`/`x.bat ` do not end in `.bat`. Were std to test the rewritten
+/// `…\x.bat` instead, it would substitute `cmd.exe`. The verbatim `x.bat` row is the control: it
+/// survives `GetFullPathNameW` unchanged, so std drops the prefix and does substitute `cmd.exe`,
+/// which shows that this probe sees a substitution when one happens.
+///
+/// **Nothing executes.** Each spawn is created suspended, its image is read from the new process
+/// with `QueryFullProcessImageNameW` and compared by file identity with the planted payload, and
+/// the process is terminated before its first instruction runs. So `cmd.exe`, when std picks it,
+/// never runs.
+#[test]
+#[ignore = "platform canary: needs a Windows runner"]
+fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
+    let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    let mut facts = Disagreements::about("Rust's std::process");
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
+    let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
+    println!("temp root: {root:?}\nsource image: {source:?}");
+
+    // (name, whether std should run the planted file itself)
+    for (i, (name, runs_itself)) in [("x.bat.", true), ("x.bat ", true), ("x.bat", false)]
+        .into_iter()
+        .enumerate()
+    {
+        let case_dir = format!(r"{root}\case{i}");
+        if let Err(e) = std::fs::create_dir(&case_dir) {
+            failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
+            continue;
+        }
+        let verbatim = format!(r"\\?\{case_dir}\{name}");
+        println!("--- {verbatim:?}");
+        if let Err(e) = std::fs::copy(source, &verbatim) {
+            failures.push(format!("could not plant the payload at {verbatim:?}: {e}"));
+            continue;
+        }
+        let planted = file_identity(&verbatim);
+        let image = suspended_image(&verbatim);
+        println!("  planted identity {planted:?}; std::process created {image:?}");
+        match (planted, image) {
+            (Ok(planted), Ok(image)) => match file_identity(&verbatim_spelling(&image)) {
+                Ok(loaded) if runs_itself => facts.check(
+                    loaded == planted,
+                    &format!("std::process runs verbatim {name:?} itself, not through cmd.exe"),
+                    format_args!("image {image:?}"),
+                ),
+                Ok(loaded) => facts.check(
+                    loaded != planted && image.to_ascii_lowercase().ends_with(r"\cmd.exe"),
+                    &format!("std::process runs verbatim {name:?} through cmd.exe (the control)"),
+                    format_args!("image {image:?}"),
+                ),
+                Err(why) => failures.push(format!("the created image {image:?}: {why}")),
+            },
+            (planted, image) => failures.extend(planted.err().into_iter().chain(image.err())),
+        }
+        if let Err(e) = std::fs::remove_file(&verbatim) {
+            println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the measurement could not be taken: {}",
+        failures.join("; ")
+    );
+    facts.assert_none();
+}
+
+/// Spawn `program` through `std::process` SUSPENDED, read the image the new process was created
+/// from, and terminate it before it runs. `Err` if any step fails.
+fn suspended_image(program: &str) -> Result<String, String> {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(program)
+        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("std::process could not spawn {program:?}: {e}"))?;
+    let mut buf = vec![0u16; 32 * 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: the process handle is owned by `child` and alive; `buf` is a live allocation of
+    // `len` units, which the call writes at most that many of.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            HANDLE(child.as_raw_handle()),
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    // Terminate and reap whatever happened above: the process must never be resumed.
+    let killed = child.kill();
+    let reaped = child.wait();
+    queried.map_err(|e| format!("QueryFullProcessImageNameW on the child of {program:?} failed: {e}"))?;
+    killed.map_err(|e| format!("could not terminate the suspended child of {program:?}: {e}"))?;
+    reaped.map_err(|e| format!("could not reap the child of {program:?}: {e}"))?;
+    Ok(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 /// Canary: a plain `x.bat.` or `x.bat ` IS `x.bat`, while a verbatim one is a distinct file, and a
