@@ -44,10 +44,8 @@ mod stderr_log {
             // `Debug`, because a degrade reason is only reported at `warn` the FIRST time this
             // process sees it — `cgroup::log_degrade` reports every repeat at `debug`. A
             // narrower filter therefore keeps whichever test happened to degrade first and
-            // discards the rest: measured over the whole of this binary in an unprivileged
-            // container, `Warn` yielded 1 degrade record for 4 degrading tests, and
-            // `--nocapture` does not recover the other 3 — `log!` checks `max_level()` before
-            // any logger is reached, so they were never emitted to capture in the first place.
+            // discards every repeat — `log!` checks `max_level()` before any logger is reached,
+            // so a filtered-out record is never emitted to capture in the first place.
             //
             // `Debug` is the full set and costs nothing beyond it: this crate emits no `trace`
             // records at all, and libtest prints a passing test's stderr nowhere.
