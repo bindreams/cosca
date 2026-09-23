@@ -301,14 +301,19 @@ impl Command {
     ///   `chdir` happens before the exec, so that is where a relative path lands. A bare `tool`
     ///   is run as `./tool`, never looked up on `PATH`: the child enters its directory and reads
     ///   the name there, both from the cwd it inherits, so no path to this process's cwd is ever
-    ///   needed and the file loaded and the directory run in are always the same. Under
-    ///   [`elevate`](Self::elevate) a backend (`sudo`, `pkexec`, `osascript`) is another process,
-    ///   so cosca completes the name to an absolute path against that directory first, reading
-    ///   this process's cwd once. A cwd with no usable path (an unsearchable ancestor, an
-    ///   unlinked directory) fails the spawn: on macOS that reading fails, with an error saying
-    ///   why a path was needed; on Linux the reading succeeds and entering the path fails with a
-    ///   plain `PermissionDenied`. The file loaded is that one, but the backend may run it
-    ///   elsewhere — see there. An already-root caller runs no backend and spawns as above.
+    ///   needed and the file loaded and the directory run in are always the same.
+    ///
+    ///   Under [`elevate`](Self::elevate), `sudo` and `doas` are handed `./tool` and started in
+    ///   that directory, so they too read the name against the directory itself, after
+    ///   authenticating — though a sudoers `runcwd` makes `sudo` read it in the directory the
+    ///   administrator chose instead. `pkexec` and `run0` pick their own directory, so they are
+    ///   handed an absolute path completed against this process's cwd (read once); a rename of an
+    ///   ancestor during authentication can redirect it. `osascript`'s shell `cd`s to that
+    ///   absolute directory and runs `./tool` there. On those three a cwd with no usable path (an
+    ///   unsearchable ancestor, an unlinked directory) fails the spawn: on macOS that reading
+    ///   fails, with an error saying why a path was needed; on Linux the reading succeeds and
+    ///   entering the path fails with a plain `PermissionDenied`. The backend may still run the
+    ///   file elsewhere — see there. An already-root caller runs no backend and spawns as above.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -336,12 +341,12 @@ impl Command {
     /// is unmeasured.
     ///
     /// Every elevation backend derives the child's `argv[0]` from the program it is handed
-    /// (`ShellExecuteEx`'s `lpFile`, `sudo`'s and `osascript`'s exec), and that program is the
-    /// completed absolute path. So `raw_executable("tool").args(["tool"])` yields
-    /// `argv[0] == "tool"` unelevated and the completed path under `.elevate()` — except from an
-    /// already-elevated caller, which runs no backend and spawns with argv verbatim. Handing the
-    /// backend the relative name instead would let it search for the image, which is the hazard
-    /// the completion exists to remove.
+    /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under
+    /// `sudo`, `doas` and `osascript`, and the completed absolute path under `pkexec`, `run0` and
+    /// `ShellExecuteEx`. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
+    /// only unelevated, or from an already-elevated caller, which runs no backend and spawns
+    /// with argv verbatim. Handing a backend the bare name instead would let it search for the
+    /// image.
     pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
         self.executable = Some(ExecutableSpec::Exact(path.into()));
         self

@@ -90,12 +90,12 @@ fn is_posix_absolute(s: &OsStr) -> Result<bool, Error> {
 /// short-circuits, and the payload never runs. That surfaces as a bare non-zero
 /// exit, since [`ElevatedStdio::OsascriptRelay`] never relays the payload's stderr.
 ///
-/// Precondition: `program` and `cwd` are POSIX-absolute — enforced by
-/// [`reject_structural_gui_config`].
+/// Precondition: `cwd` is POSIX-absolute, and so is `program` unless `cwd` is set — enforced by
+/// [`reject_structural_gui_config`] and [`program_and_args`].
 pub(crate) fn build_shell_command(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> Result<Vec<u8>, Error> {
     debug_assert!(
-        matches!(is_posix_absolute(program), Ok(true)),
-        "the structural gate must reject a non-absolute program before composition"
+        cwd.is_some() || matches!(is_posix_absolute(program), Ok(true)),
+        "a relative program needs the directory it is read against"
     );
     debug_assert!(
         cwd.is_none_or(|d| matches!(is_posix_absolute(d.as_os_str()), Ok(true))),
@@ -203,17 +203,30 @@ fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
     Ok(argv)
 }
 
-/// Program + args + the directory to run them in, honoring `executable()`; a `raw_executable()`
-/// program comes back absolute, with the directory it was completed against
-/// ([`Command::posix_launch`]), which is where `process_cwd` may be read.
+/// Program + args + the directory to run them in, honoring `executable()`. A `raw_executable()`
+/// program comes back in the unelevated spawn's form (`./tool`), with the absolute directory it
+/// is read against ([`Command::posix_launch`], which is where `process_cwd` may be read): the
+/// script `cd`s there and then execs `./tool`, so the exec reads the name against the directory
+/// the `cd` entered.
+///
+/// The directory itself is still a path, because root's shell starts wherever the trampoline
+/// puts it: a rename of one of its ancestors between this call and the `cd` — a window that spans
+/// authentication — moves both the file and the directory together. Nothing can change the file
+/// between the `cd` and the exec.
 pub(crate) fn program_and_args(
     cmd: &Command,
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> Result<Launch, Error> {
     let argv = checked_argv(cmd)?;
     let launch = cmd.posix_launch(process_cwd)?;
+    let program = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) if launch.cwd.is_some() => {
+            crate::resolve::exact::anchor_posix(p.as_os_str(), None)?.program
+        }
+        _ => launch.program.unwrap_or_else(|| PathBuf::from(&argv[0])),
+    };
     Ok(Launch {
-        program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
+        program: program.into_os_string(),
         args: argv[1..].to_vec(),
         cwd: launch.cwd,
     })

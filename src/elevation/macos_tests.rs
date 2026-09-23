@@ -437,8 +437,8 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     assert!(!crate::log_capture::contains_since(mark, QUIET));
 }
 
-/// A bare `raw_executable()` is completed against the (absolute) cwd before the gate sees it, so
-/// it is accepted, and root's shell is handed an absolute path it cannot search for.
+/// A bare `raw_executable()` is accepted, and root's shell enters its directory and runs it as
+/// `./tool`, which no shell searches.
 #[test]
 fn a_bare_exact_program_is_completed_rather_than_refused() {
     let mut c = Command::new();
@@ -452,7 +452,7 @@ fn a_bare_exact_program_is_completed_rather_than_refused() {
         unreachable!()
     };
     assert!(
-        argv[2].to_str().unwrap().contains("cd -- /work && exec /work/tool -u"),
+        argv[2].to_str().unwrap().contains("cd -- /work && exec ./tool -u"),
         "{:?}",
         argv[2]
     );
@@ -473,10 +473,7 @@ fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_aga
         unreachable!()
     };
     assert!(
-        argv[2]
-            .to_str()
-            .unwrap()
-            .contains("\"cd -- /proc-cwd && exec /proc-cwd/tool\""),
+        argv[2].to_str().unwrap().contains("\"cd -- /proc-cwd && exec ./tool\""),
         "{:?}",
         argv[2]
     );

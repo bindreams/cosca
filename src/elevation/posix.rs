@@ -473,8 +473,10 @@ fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
     Ok(argv)
 }
 
-/// Program + args + the directory to run them in, for a backend; a `raw_executable()` program
-/// comes back absolute ([`Command::posix_launch`]), so the wrapper cannot search for it.
+/// Program + args + the directory to run them in, for a backend that moves its cwd; a
+/// `raw_executable()` program comes back absolute ([`Command::posix_launch`]), so the wrapper
+/// cannot search for it. The path is re-resolved after authentication, so a rename of an ancestor
+/// during the prompt can still swap the file: these backends take no directory object.
 fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<Launch, Error> {
     let argv = checked_argv(cmd)?;
     let launch = cmd.posix_launch(process_cwd)?;
@@ -482,6 +484,54 @@ fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result
         program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
         args: argv[1..].to_vec(),
         cwd: launch.cwd,
+    })
+}
+
+/// Whether `backend` runs the program in the directory it was itself started in. The wrapper is
+/// then started in the caller's directory, and inherits it as a directory OBJECT, not a path.
+///
+/// Measured: `sudo` (1.9.13, 1.9.17) keeps it unless a sudoers `runcwd` moves it, `doas`
+/// (OpenDoas, Debian 12) keeps it, and `pkexec` always moves it to the target's home. `run0`,
+/// not measured, hands the service manager its directory as a `WorkingDirectory=` path, re-resolved
+/// after authentication, so it is treated like `pkexec`.
+fn keeps_cwd(backend: Backend) -> bool {
+    match backend {
+        Backend::Sudo | Backend::Doas => true,
+        Backend::Pkexec | Backend::Run0 => false,
+        Backend::Auto => unreachable!("the planner resolves Auto"),
+    }
+}
+
+/// Program + args + directory for a backend that [keeps its cwd](keeps_cwd): a
+/// `raw_executable()` program in the unelevated spawn's form ([`crate::resolve::exact::anchor_posix`]
+/// — `./tool`), and `current_dir()` as given, entered by the wrapper at `fork`. Reads nothing.
+///
+/// The backend reads `./tool` against the directory object it inherited, after authenticating,
+/// so a rename of an ancestor during the prompt cannot swap the file loaded; an absolute path
+/// would be re-resolved then. Measured under `sudo -S`, blocked on its password while an
+/// ancestor was renamed and another tree moved into its place: the absolute path ran the
+/// substitute, `./tool` the original.
+///
+/// A sudoers `runcwd` moves `sudo`'s child before the exec, and `./tool` is then read there —
+/// measured: `sudo: unable to execute ./tool: No such file or directory` under `runcwd=~`. That
+/// directory is the administrator's choice, as `secure_path` is for a bare name, so this never
+/// loads a file an unprivileged user placed; the absolute path, which would load the named file
+/// there, is the one a rename can swap.
+fn anchored_program_and_args(cmd: &Command) -> Result<Launch, Error> {
+    let argv = checked_argv(cmd)?;
+    let program = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) => {
+            crate::resolve::exact::anchor_posix(p.as_os_str(), cmd.cwd())?
+                .program
+                .into_os_string()
+        }
+        Some(crate::command::ExecutableSpec::Search(p)) => p.as_os_str().to_os_string(),
+        None => argv[0].clone(),
+    };
+    Ok(Launch {
+        program,
+        args: argv[1..].to_vec(),
+        cwd: cmd.cwd().map(Path::to_path_buf),
     })
 }
 
@@ -650,7 +700,11 @@ pub(crate) fn rewrite_with_host_and_cwd(
                             .into(),
                 });
             }
-            let Launch { program, args, cwd } = program_and_args(cmd, process_cwd)?;
+            let Launch { program, args, cwd } = if keeps_cwd(backend) {
+                anchored_program_and_args(cmd)?
+            } else {
+                program_and_args(cmd, process_cwd)?
+            };
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
