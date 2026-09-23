@@ -60,6 +60,29 @@ fn is_verbatim(bytes: &[u8]) -> bool {
     bytes.starts_with(br"\\?\")
 }
 
+/// The length of a verbatim path's prefix as std parses it, its components split on `\` alone:
+/// `\\?\UNC\server\share`, or else `\\?\` and one component (`C:` or a namespace). So `srv/shr` is
+/// one server name, where [`windows_prefix_len`] splits it for its own reasons. `UNC` is matched
+/// case-insensitively, as Win32 matches it, where std matches only `UNC`.
+fn verbatim_prefix_len(bytes: &[u8]) -> usize {
+    debug_assert!(is_verbatim(bytes), "{bytes:?} must be verbatim");
+    let end = |at: usize| {
+        bytes[at..]
+            .iter()
+            .position(|&b| b == b'\\')
+            .map_or(bytes.len(), |i| at + i)
+    };
+    if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && bytes[7] == b'\\' {
+        let server = end(8);
+        if server >= bytes.len() {
+            return bytes.len();
+        }
+        let share = end(server + 1);
+        return if share == server + 1 { server } else { share };
+    }
+    end(4)
+}
+
 /// One component of a verbatim path, as std's `Components` yields it.
 #[derive(Clone, Copy, PartialEq)]
 enum Part<'a> {
@@ -72,10 +95,10 @@ enum Part<'a> {
 /// `\` alone after the prefix, empty ones dropped, `.` and `..` kept), then `rest`'s (split on both
 /// separators, `.` dropped; a leading separator clears back to the root; `..` pops only a normal
 /// component), rebuilt as the prefix, its root and the components joined with `\`. A verbatim prefix
-/// always has a root, so `\\?\C:` + `t` is `\\?\C:\t`.
+/// always has a root, so `\\?\C:` + `t` is `\\?\C:\t`. The prefix is [`verbatim_prefix_len`]'s.
 fn append_verbatim(base: &OsStr, rest: &OsStr) -> OsString {
     let bytes = base.as_encoded_bytes();
-    let prefix = windows_prefix_len(bytes);
+    let prefix = verbatim_prefix_len(bytes);
     let mut parts: Vec<Part<'_>> = bytes[prefix..]
         .split(|&b| b == b'\\')
         .filter_map(|piece| match piece {

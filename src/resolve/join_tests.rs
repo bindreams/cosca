@@ -27,6 +27,10 @@ fn a_verbatim_base_is_normalised() {
         (r"\\?\C:\a\..", r"..\t.exe", r"\\?\C:\a\..\t.exe"),
         // After a verbatim prefix only `\` separates, so `a/b` is one component.
         (r"\\?\C:\a/b", r"..\t.exe", r"\\?\C:\t.exe"),
+        // The prefix's own components split on `\` alone too, as std parses them: server `srv/shr`,
+        // share `d`, and `C:/x` a verbatim namespace rather than drive C.
+        (r"\\?\UNC\srv/shr\d", r"..\t.exe", r"\\?\UNC\srv/shr\d\t.exe"),
+        (r"\\?\C:/x\y", r"..\t.exe", r"\\?\C:/x\t.exe"),
     ] {
         assert_eq!(
             s(append(OsStr::new(base), OsStr::new(rest), "\\")),
@@ -87,6 +91,8 @@ fn a_verbatim_append_matches_std() {
         r"\\?\C:\a\..",
         r"\\?\C:\a/b",
         r"\\?\UNC\srv\shr\d",
+        r"\\?\UNC\srv/shr\d",
+        r"\\?\C:/x\y",
     ] {
         for rest in [
             "t.exe",
