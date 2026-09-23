@@ -149,14 +149,20 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
             None
         }
     };
-    if let Some(detail) = refusal {
-        return Err(Error::Unsupported {
+    match refusal {
+        None => Ok(()),
+        Some(BATCH) => Err(Error::Unsupported {
             op: format!("running {}", prog.display()),
             platform: "windows",
-            detail: detail.into(),
-        });
+            detail: BATCH.into(),
+        }),
+        // Refused on its shape before any search, so `InvalidInput`, as `crate::resolve` refuses a
+        // name that names no file.
+        Some(detail) => Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{detail}: {prog:?}"),
+        ))),
     }
-    Ok(())
 }
 
 /// Whether a VERBATIM (`\\?\`) program reaches a batch file. std asks a different question of one

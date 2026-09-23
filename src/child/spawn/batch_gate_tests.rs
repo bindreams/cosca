@@ -367,19 +367,22 @@ fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
             detail(probe)
         );
     }
+    // A name that names no file is refused on its shape, before any search: `InvalidInput`, as
+    // `crate::resolve` refuses one.
+    let invalid = |probe: &str| invalid_input_message(super::reject_batch_path_on(Path::new(probe), true));
     // `\\.\x.bat\..` resolves to the bare `\\.\`: no file, and no batch file either.
-    for probe in [r"x\..", ".", "C:", r"\\.\x.bat\.."] {
+    for probe in [r"x\..", ".", "C:", r"\\.\x.bat\..", ""] {
         assert!(
-            detail(probe).contains("names no file of its own"),
+            invalid(probe).contains("names no file of its own"),
             "{probe:?} names no file, so it must advise naming the executable: {}",
-            detail(probe)
+            invalid(probe)
         );
     }
     // A verbatim path resolves against nothing, so the reason it names no file is its own.
     assert!(
-        detail(r"\\?\C:\dir\..").contains("never normalised"),
+        invalid(r"\\?\C:\dir\..").contains("never normalised"),
         "a verbatim `..` must not be explained by the current directory: {}",
-        detail(r"\\?\C:\dir\..")
+        invalid(r"\\?\C:\dir\..")
     );
 }
 

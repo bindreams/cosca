@@ -315,6 +315,27 @@ fn image_for_rejects_an_empty_exact_program() {
     }
 }
 
+/// End to end, the batch gate's token check runs first, and it refuses a name that names no file
+/// with the same `InvalidInput` `raw_executable()` and `executable()` document.
+#[test]
+fn a_spawn_of_a_program_that_names_no_file_is_invalid_input() {
+    for n in [r"C:\t\dir\", ".", "..", "C:", r"x\.."] {
+        let mut exact = Command::new();
+        exact.raw_executable(n).args(["tool"]);
+        let mut search = Command::new();
+        search.executable(n).args(["tool"]);
+        for (via, mut c) in [("raw_executable", exact), ("executable", search)] {
+            match c.spawn() {
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                other => panic!(
+                    "{via}({n:?}) names no file and must be Io(InvalidInput), got {:?}",
+                    other.map(|_| "a child")
+                ),
+            }
+        }
+    }
+}
+
 #[test]
 fn image_for_rejects_an_exact_program_that_names_no_file() {
     // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
