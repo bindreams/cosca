@@ -1227,6 +1227,8 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     cmd.executable("/bin/sh")
         .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & exit 0"#, testbin(), &addr]);
     cmd.contain();
+    // The pin makes the race this guards likely — the root exiting before cosca looks at the
+    // leaf — but orders nothing: the assertions below hold whichever side wins it.
     let child = on_one_cpu(|| cmd.spawn()).expect("spawn");
     assert_eq!(
         child.containment(),
@@ -1446,8 +1448,10 @@ fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca
         // SAFETY: as above.
         assert_eq!(unsafe { libc::close(slot) }, 0, "close({slot})");
     }
-    // One CPU for parent and child: the parent runs on while the child waits its turn, so a
-    // report read at `spawn`'s return would be read before the child made it.
+    // One CPU for parent and child makes it likely that `spawn` returns before the child has
+    // reported — the case a report read at `spawn`'s return would get wrong. It orders nothing:
+    // the verdict below compares cosca's answer with where the child really is, and holds
+    // whichever side runs first.
     let spawned = on_one_cpu(|| cmd.spawn());
     for &(slot, saved) in &saved {
         // SAFETY: `saved` is this process's own open descriptor, duplicated above.
