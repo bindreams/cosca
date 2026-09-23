@@ -199,7 +199,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // (a spawn racing this one via a path outside cosca's own spawn functions) that no local
     // code can close.
     #[cfg(target_os = "macos")]
-    let (prepared, mut child) = {
+    let (prepared, child) = {
         let _guard = spawn_lock();
         let prepared = crate::containment::prepare(
             &mut std_cmd,
@@ -236,7 +236,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (prepared, mut child) = {
+    let (prepared, child) = {
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
@@ -298,7 +298,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // Mirror the async spawn's error teardown: kill + reap the just-spawned child so a failed
         // attach never leaks a running/zombie process (std `Child::drop` neither kills nor reaps).
         Err(e) => {
-            kill_and_reap(&mut child);
+            teardown_unadopted(child);
             return Err(e);
         }
     };
@@ -315,7 +315,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // Same teardown for both arms (never leak the spawned child), different diagnosis:
         // an OS refusal is not a vanish.
         other => {
-            kill_and_reap(&mut child);
+            teardown_unadopted(child);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure.
@@ -973,26 +973,95 @@ pub(crate) fn attach_or_fault(
     )
 }
 
-/// Tear down a just-spawned child a failed spawn will not return: kill it, then reap it.
+/// Kill and reap a spawned child that an error path is abandoning before adoption, logging a
+/// failure of either at `warn` and `debug_assert`ing it.
 ///
-/// The wait is bounded only by the kill. A child that exec'd a setuid program refuses an
-/// unprivileged supervisor's signal (`EPERM`), and waiting for it would block for that program's
-/// whole life: it is left running instead, and reported. (`kill` on a child already exited but
-/// unreaped succeeds, so that is not a failure here.)
-fn kill_and_reap(child: &mut std::process::Child) {
-    if let Err(e) = child.kill() {
+/// A child that could not be killed is NOT waited for here: it may still be running — a setuid
+/// child such as `sudo` refuses our SIGKILL with EPERM — and a blocking `wait()` would hang the
+/// spawn for as long as it runs. If it has not exited, it is handed to [`reap_in_background`],
+/// which reaps it whenever it does, so it never lingers as a zombie. EPERM is the one kill failure
+/// that is not asserted, because it is reachable without any bug.
+fn teardown_unadopted(mut child: std::process::Child) {
+    // warn before any assert: `debug_assert` is compiled out in release, and a swallowed failure
+    // would otherwise leave no trace at all there.
+    if let Err(kill) = kill_unadopted(&mut child) {
         log::warn!(
-            "spawn teardown could not kill pid {} ({e}); it is left running, and not waited for",
+            "spawn teardown failed to kill pid {}: {kill}; reaping it in the background once it exits",
             child.id()
+        );
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            reap_in_background(child);
+        }
+        // After the handoff, so a debug build's panic cannot strand the child.
+        debug_assert!(
+            kill.kind() == std::io::ErrorKind::PermissionDenied,
+            "sync spawn teardown failed to kill child: {kill}"
         );
         return;
     }
-    if let Err(e) = child.wait() {
-        // warn first: `debug_assert` is compiled out in release, and a swallowed reap failure
-        // would otherwise leave no trace at all there.
-        log::warn!("spawn teardown failed to reap pid {}: {e}", child.id());
-        debug_assert!(false, "sync spawn teardown failed to reap child: {e}");
+    if let Err(reap) = reap_unadopted(&mut child) {
+        log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
+        debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
     }
+}
+
+/// Reap `child` on a detached thread once it exits on its own. The thread blocks on the child's
+/// exit, an event outside this process's control; nothing waits for the thread.
+fn reap_in_background(mut child: std::process::Child) {
+    #[cfg(test)]
+    let notify = fault::take_background_reap_notifier();
+    let pid = child.id();
+    let spawned = std::thread::Builder::new()
+        .name(format!("cosca-reap-{pid}"))
+        .spawn(move || {
+            let reaped = child.wait().map(drop);
+            if let Err(e) = &reaped {
+                log::warn!("background reap of pid {pid} failed: {e}");
+            }
+            #[cfg(test)]
+            if let Some(notify) = notify {
+                let _ = notify.send(reaped);
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start a thread to reap pid {pid}, which stays unreaped: {e}");
+    }
+}
+
+/// `child.kill()`, `Ok` for a child that has already exited on every platform, and forceable to
+/// fail by a test.
+///
+/// std returns `Ok` for an exited child on Windows (`TerminateProcess`'s `ACCESS_DENIED` is
+/// checked with `try_wait`) and, on Unix, for one it has already waited on. An exited child it has
+/// NOT waited on is left to `kill(2)`, whose answer for a zombie std does not promise — so an
+/// `Err` here is checked the same way Windows' is, and dropped if the child has exited.
+///
+/// The forced failure KILLS AND REAPS first, so the test that asks for it leaks nothing although
+/// the teardown then skips its own reap — unless it was set to leave the child alive.
+fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some((marker, kind, alive)) = fault::take_force_kill_failure() {
+        if !alive {
+            child.kill()?;
+            child.wait()?;
+        }
+        return Err(std::io::Error::new(kind, marker));
+    }
+    match child.kill() {
+        Err(_) if matches!(child.try_wait(), Ok(Some(_))) => Ok(()),
+        other => other,
+    }
+}
+
+/// `child.wait()`, which a test can force to fail. The forced failure still REAPS first, so the
+/// test that asks for it leaks nothing.
+fn reap_unadopted(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if let Some(marker) = fault::take_force_reap_failure() {
+        child.wait()?;
+        return Err(std::io::Error::other(marker));
+    }
+    child.wait()
 }
 
 /// Test-only fault injection + assertions for the spawn error-teardown paths, shared by both spawns.
@@ -1005,6 +1074,9 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
+        static FORCE_REAP_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
+        static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
@@ -1053,6 +1125,40 @@ pub(crate) mod fault {
     }
     pub(crate) fn force_attach_failure() -> bool {
         FORCE_ATTACH_FAIL.with(|f| f.get())
+    }
+    /// Make the next teardown reap on this thread fail with `marker` as its error. TAKE semantics:
+    /// the teardown consumes it, and a test that set it asserts it was consumed, so it cannot
+    /// outlive the spawn it was meant for.
+    pub(crate) fn set_force_reap_failure(marker: &'static str) {
+        FORCE_REAP_FAIL.with(|f| f.set(Some(marker)));
+    }
+    pub(crate) fn take_force_reap_failure() -> Option<&'static str> {
+        FORCE_REAP_FAIL.with(|f| f.take())
+    }
+    /// Make the next teardown kill on this thread fail with an error of `kind` carrying `marker`,
+    /// with the same TAKE semantics as [`set_force_reap_failure`].
+    pub(crate) fn set_force_kill_failure(marker: &'static str, kind: std::io::ErrorKind) {
+        FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, false))));
+    }
+    /// As [`set_force_kill_failure`] with an `Other` error, but the child is NOT killed first: it
+    /// is left running, as a child that refused the kill would be.
+    pub(crate) fn set_force_kill_failure_leaving_child_alive(marker: &'static str) {
+        set_force_kill_failure_leaving_child_alive_as(marker, std::io::ErrorKind::Other);
+    }
+    /// As [`set_force_kill_failure_leaving_child_alive`], failing with `kind`. Also consumed by the
+    /// async spawn's teardown (`crate::tokio::child::reap_now`).
+    pub(crate) fn set_force_kill_failure_leaving_child_alive_as(marker: &'static str, kind: std::io::ErrorKind) {
+        FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, true))));
+    }
+    /// Have the next background reap started on this thread report its outcome on `notify`.
+    pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<std::io::Result<()>>) {
+        BACKGROUND_REAP_NOTIFY.with(|f| f.set(Some(notify)));
+    }
+    pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<std::io::Result<()>>> {
+        BACKGROUND_REAP_NOTIFY.with(|f| f.take())
+    }
+    pub(crate) fn take_force_kill_failure() -> Option<(&'static str, std::io::ErrorKind, bool)> {
+        FORCE_KILL_FAIL.with(|f| f.take())
     }
     pub(crate) fn capture(id: crate::identity::Resolved<ProcessId>) {
         CAPTURED.with(|c| c.set(Some(id)));

@@ -50,6 +50,178 @@ fn attach_failure_reaps_the_spawned_child() {
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
+/// A reap that FAILS during teardown must leave a trace in a release build, where the
+/// `debug_assert` beside it is compiled out: a `log::warn!` naming the error. Both teardown arms —
+/// attach failure and unresolved identity — share the one teardown, and each is driven here.
+///
+/// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
+/// before, so a concurrent test's warning cannot satisfy this one.
+#[test]
+fn a_failed_teardown_reap_is_logged_on_both_arms() {
+    a_failed_teardown_step_is_logged_on_both_arms(
+        ["cosca-reap-fail-attach-7c1e", "cosca-reap-fail-identity-b93d"],
+        fault::set_force_reap_failure,
+        fault::take_force_reap_failure,
+    );
+}
+
+/// A KILL that fails is logged, and the teardown does NOT go on to a blocking reap: a child it
+/// could not kill may still be running (EPERM from a setuid child), and `wait()` would hang the
+/// spawn for as long as it runs. The reap fault is armed as a tripwire — left unconsumed, it proves
+/// the reap step was never reached. Any failure but EPERM is also `debug_assert`ed; EPERM is
+/// reachable without a bug.
+#[test]
+fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
+    use std::io::ErrorKind;
+    crate::log_capture::install();
+    let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
+    let cases = [
+        ("cosca-kill-fail-attach-4e02", ErrorKind::Other, true),
+        ("cosca-kill-eperm-attach-61c7", ErrorKind::PermissionDenied, false),
+        ("cosca-kill-fail-identity-d51a", ErrorKind::Other, true),
+        ("cosca-kill-eperm-identity-0a8b", ErrorKind::PermissionDenied, false),
+    ];
+    for (index, (marker, kind, asserted)) in cases.into_iter().enumerate() {
+        let force_arm = force_arms[index / 2];
+        let mark = crate::log_capture::mark();
+        force_arm(true);
+        fault::set_force_kill_failure(marker, kind);
+        fault::set_force_reap_failure("cosca-reap-tripwire-9f31");
+        let outcome = std::panic::catch_unwind(|| blocker().spawn().err());
+        force_arm(false);
+        assert_eq!(
+            fault::take_force_kill_failure(),
+            None,
+            "{marker}: the kill failure must be consumed"
+        );
+        assert_eq!(
+            fault::take_force_reap_failure(),
+            Some("cosca-reap-tripwire-9f31"),
+            "{marker}: a failed kill must not be followed by a blocking reap"
+        );
+        assert_eq!(
+            outcome.is_err(),
+            asserted && cfg!(debug_assertions),
+            "{marker}: the debug_assert fires for {kind:?} in exactly the builds that keep it"
+        );
+        if let Ok(err) = outcome {
+            err.expect("the forced arm must fail the spawn");
+        }
+        assert!(
+            crate::log_capture::contains_since(mark, marker),
+            "{marker}: a failed teardown kill must be logged"
+        );
+        fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    }
+}
+
+/// A child the teardown could not kill is not left a zombie: it is handed to a detached thread
+/// that reaps it once it exits on its own. Here it is blocked reading stdin, and exits when the
+/// failed spawn drops the pipe's parent end; the thread signals the reap on a channel.
+#[test]
+fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
+    use crate::stdio::Stdio;
+    let mut cmd = Command::new();
+    #[cfg(unix)]
+    cmd.args(["cat"]);
+    #[cfg(windows)]
+    cmd.args(["findstr", "x"]);
+    cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
+    let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    fault::set_force_attach_failure(true);
+    fault::set_force_kill_failure_leaving_child_alive("cosca-kill-fail-alive-3b7e");
+    fault::set_background_reap_notifier(reaped_tx);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || cmd.spawn().err()));
+    fault::set_force_attach_failure(false);
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    assert!(
+        fault::take_background_reap_notifier().is_none(),
+        "the teardown must take the notifier"
+    );
+    // `Other` is asserted in debug builds; the handoff must already have happened by then.
+    assert_eq!(outcome.is_err(), cfg!(debug_assertions));
+    // Blocks until the child exits and the thread has reaped it.
+    let reaped = reaped_rx.recv().expect("the reaper thread must report");
+    reaped.expect("the background wait must succeed");
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// Force one teardown step to fail with each marker, once per teardown arm, and check the failure
+/// is consumed, logged, `debug_assert`ed in exactly the builds that keep it, and leaks no child.
+fn a_failed_teardown_step_is_logged_on_both_arms(
+    markers: [&'static str; 2],
+    set_failure: fn(&'static str),
+    take_failure: fn() -> Option<&'static str>,
+) {
+    crate::log_capture::install();
+    let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
+    for (marker, force_arm) in markers.into_iter().zip(force_arms) {
+        let mark = crate::log_capture::mark();
+        force_arm(true);
+        set_failure(marker);
+        let outcome = std::panic::catch_unwind(|| blocker().spawn().err());
+        force_arm(false);
+        assert_eq!(
+            take_failure(),
+            None,
+            "{marker}: the teardown must consume the forced failure"
+        );
+        // Debug builds also trip the `debug_assert`; release builds must not panic at all.
+        assert_eq!(
+            outcome.is_err(),
+            cfg!(debug_assertions),
+            "{marker}: the debug_assert fires in exactly the builds that keep it"
+        );
+        if let Ok(err) = outcome {
+            err.expect("the forced arm must fail the spawn");
+        }
+        assert!(
+            crate::log_capture::contains_since(mark, marker),
+            "{marker}: a failed teardown step must be logged"
+        );
+        fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    }
+}
+
+/// A child that exited before the teardown's kill, and whose kill still failed — a setuid zombie
+/// keeps its credentials, so `kill(2)` refuses it with EPERM — is reaped, not left a zombie: an
+/// exited child is reaped at once, and one not yet exited is handed to the background reaper.
+/// Either way it ends reaped.
+#[test]
+fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
+    let mut cmd = Command::new();
+    #[cfg(unix)]
+    cmd.args(["true"]);
+    #[cfg(windows)]
+    cmd.args(["cmd", "/C", "exit 0"]);
+    let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    fault::set_force_attach_failure(true);
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-kill-eperm-exited-8e41",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_background_reap_notifier(reaped_tx);
+    let err = cmd.spawn().err();
+    fault::set_force_attach_failure(false);
+    err.expect("the forced arm must fail the spawn");
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    // Still set: the child had exited, so the teardown reaped it without the background reaper.
+    // Taken: it had not, and the reaper reports once it has.
+    if fault::take_background_reap_notifier().is_none() {
+        let reaped = reaped_rx.recv().expect("the reaper thread must report");
+        reaped.expect("the background wait must succeed");
+    }
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
 #[test]
 fn spawn_unelevated_runs_a_plain_child() {
     let mut c = crate::command::Command::new();

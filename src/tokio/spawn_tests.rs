@@ -118,3 +118,47 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
         std::fs::remove_dir(own_dir.join(&leaf)).expect("remove the drained leaf");
     }
 }
+
+/// A failed kill in the async spawn's error teardown is not waited on, and EPERM — a setuid
+/// child refusing SIGKILL — is not asserted, because it is reachable without a bug; any other
+/// kind is. The child is left alive, blocked on stdin, and exits when the failed spawn drops the
+/// pipe's parent end; tokio's own `Child` drop hands it to the runtime's orphan reaper.
+#[test]
+fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
+    use crate::stdio::Stdio;
+    use std::io::ErrorKind;
+    for (kind, asserted) in [(ErrorKind::PermissionDenied, false), (ErrorKind::Other, true)] {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let mut cmd = crate::tokio::Command::new();
+                #[cfg(unix)]
+                cmd.args(["cat"]);
+                #[cfg(windows)]
+                cmd.args(["findstr", "x"]);
+                cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
+                fault::set_force_attach_failure(true);
+                fault::set_force_kill_failure_leaving_child_alive_as("cosca-async-kill-fail-5d2c", kind);
+                let err = cmd.spawn().err();
+                fault::set_force_attach_failure(false);
+                err
+            })
+        }));
+        assert_eq!(
+            fault::take_force_kill_failure(),
+            None,
+            "{kind:?}: the kill failure must be consumed"
+        );
+        assert_eq!(
+            outcome.is_err(),
+            asserted && cfg!(debug_assertions),
+            "{kind:?}: the debug_assert fires in exactly the builds that keep it, and never for EPERM"
+        );
+        if let Ok(err) = outcome {
+            err.expect("the forced arm must fail the spawn");
+        }
+    }
+}
