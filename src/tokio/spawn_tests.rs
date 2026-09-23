@@ -148,3 +148,43 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         }
     }
 }
+
+/// A tokio spawn that fails with no cgroup leaf to kill through says a forked child may have been
+/// left running out of reach — tokio can drop a child it forked and return no pid. Here the seam
+/// forces that failure under a tree walk, which holds no leaf.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
+    crate::log_capture::install();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mark = crate::log_capture::mark();
+    fault::set_force_post_fork_failure(true);
+    assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
+    let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+    assert!(
+        crate::log_capture::contains_since(mark, "nothing can reach it"),
+        "the failure must say the child may be left running"
+    );
+
+    // The seam's child is still this process's unreaped child, so its pid is safe to signal.
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).expect("kill the dropped child");
+    nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
+}
+
+/// The warning is once per errno: the first failure at `warn`, every repeat at `debug`.
+#[test]
+fn the_unreachable_child_warning_is_once_per_errno() {
+    let warned = std::sync::Mutex::default();
+    let error = || Error::Io(std::io::Error::from_raw_os_error(libc::EMFILE));
+    let levels: Vec<_> = (0..2)
+        .map(|_| super::warn_child_may_be_unreachable_into(&warned, &error()))
+        .collect();
+    assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
+    let other = Error::Io(std::io::Error::from_raw_os_error(libc::ENOMEM));
+    assert_eq!(
+        super::warn_child_may_be_unreachable_into(&warned, &other),
+        log::Level::Warn
+    );
+}

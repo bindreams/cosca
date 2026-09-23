@@ -310,7 +310,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 .expect("child fd numbers are unique (BTreeMap keys)");
         }
 
-        let c = tcmd.spawn().map_err(Error::Io)?;
+        let c = tcmd
+            .spawn()
+            .map_err(Error::Io)
+            .inspect_err(warn_child_may_be_unreachable)?;
         drop(tcmd);
         (prepared, c)
     };
@@ -376,7 +379,15 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 spawned,
                 prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path_for_test()),
             );
-            spawned?
+            #[cfg(target_os = "linux")]
+            let reachable = prepared.cgroup_leaf.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let reachable = false;
+            spawned.inspect_err(|e| {
+                if !reachable {
+                    warn_child_may_be_unreachable(e);
+                }
+            })?
         };
         (prepared, c)
     };
@@ -442,3 +453,34 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+/// Say that a failed tokio spawn may have left a forked child running out of reach.
+///
+/// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
+/// returning no pid. Only a cgroup leaf still reaches such a child, so a spawn without one says
+/// so. The error cannot tell a failure before the fork from one after it, hence "may". Once per
+/// errno at `warn`, then at `debug`, as a degraded containment is reported.
+fn warn_child_may_be_unreachable(error: &Error) {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<Option<i32>>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    warn_child_may_be_unreachable_into(&WARNED, error);
+}
+
+/// [`warn_child_may_be_unreachable`] against an explicit "already warned" set, returning the
+/// level it chose.
+fn warn_child_may_be_unreachable_into(
+    warned: &std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>,
+    error: &Error,
+) -> log::Level {
+    let errno = match error {
+        Error::Io(e) => e.raw_os_error(),
+        _ => None,
+    };
+    let level = crate::containment::cgroup::report_level(warned, errno);
+    log::log!(
+        level,
+        "tokio spawn failed ({error}); if it failed after forking, the child was left running and \
+         nothing can reach it: only a cgroup v2 leaf is killed without the child's pid"
+    );
+    level
+}
