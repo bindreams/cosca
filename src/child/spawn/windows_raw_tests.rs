@@ -215,55 +215,77 @@ fn image_for_leaves_an_exact_program_completely_unresolved() {
     );
 }
 
-/// Load `cmd`'s image the way the raw backend does — `image_for` into `lpApplicationName`,
-/// `current_dir()` into `lpCurrentDirectory` — with `process_cwd` as this process's cwd, and wait.
-///
-/// Race-free: the cwd move, `image_for`'s reading and `CreateProcessW`'s completion all happen
-/// under `spawn_lock`, which every cwd-moving test in this binary holds (see
-/// [`crate::test_child::RestoreCwd`]), so none can interleave. `spawn_raw` is not used because it
-/// takes that lock itself. A reader outside the lock can observe the moved cwd, but the only file
-/// in it has a name no other test resolves.
-fn load_from(cmd: &Command, process_cwd: &Path) -> Result<std::process::ExitStatus, Error> {
-    let (proc, pid) = {
-        let _guard = crate::child::spawn::spawn_lock();
-        let _restore = crate::test_child::RestoreCwd::capture();
-        std::env::set_current_dir(process_cwd).expect("cd");
-        let app = app_name_wide(image_for(cmd)?.as_deref())?;
-        let mut line = raw_program_and_line(cmd)?;
-        line.push(0);
-        let dir = cmd.cwd().map(|d| to_wide_nul(d.as_os_str()));
-        let mut si = STARTUPINFOEXW::default();
-        let flags = windows::Win32::System::Threading::CREATE_NO_WINDOW.0;
-        super::proc::create_process(Some(&app), &mut line, &mut si, &None, &dir, flags)?
+/// The file [`fixture_load_exact_probe`] loads by relative name: a copy of this test binary.
+const PROBE: &str = "cosca_exact_cwd_probe.exe";
+const FIXTURE_LOAD_EXACT_PROBE_TEST: &str = "child::spawn::windows_raw::windows_raw_tests::fixture_load_exact_probe";
+/// The `current_dir()` [`fixture_load_exact_probe`] gives [`PROBE`]. Its presence also marks a
+/// deliberate re-exec rather than an ordinary suite run.
+const FIXTURE_LOAD_EXACT_PROBE_ENV: &str = "COSCA_FIXTURE_LOAD_EXACT_PROBE_CURRENT_DIR";
+/// [`fixture_load_exact_probe`]'s exit codes.
+const LOADED: i32 = 0;
+const FILE_NOT_FOUND: i32 = 20;
+const OTHER_FAILURE: i32 = 21;
+
+/// Inert in an ordinary suite run. Re-executed with [`FIXTURE_LOAD_EXACT_PROBE_ENV`] set, it
+/// spawns `raw_executable(PROBE)` with that `current_dir()` from whatever cwd its spawner gave it,
+/// and exits with [`LOADED`], [`FILE_NOT_FOUND`] or [`OTHER_FAILURE`]. The spawner sets the cwd,
+/// so no process in the test moves its own.
+#[test]
+fn fixture_load_exact_probe() {
+    let Some(current_dir) = std::env::var_os(FIXTURE_LOAD_EXACT_PROBE_ENV) else {
+        return;
     };
-    super::proc::RawChild::new(proc, pid).wait().map_err(Error::Io)
+    let mut c = Command::new();
+    // A filter that matches nothing, so the probe exits 0 without running a test.
+    c.raw_executable(PROBE)
+        .args([PROBE, "--exact", "__cosca_no_such_test__"])
+        .current_dir(current_dir);
+    c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
+    assert_eq!(image(&c).expect("image_for").as_deref(), Some(Path::new(PROBE)));
+    let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    let code = match c.spawn() {
+        Ok(child) if child.wait().expect("wait").success() => LOADED,
+        Err(Error::Io(e))
+            if e.raw_os_error() == Some(not_found.0 as i32)
+                || e.raw_os_error() == Some(windows::core::HRESULT::from_win32(not_found.0).0) =>
+        {
+            FILE_NOT_FOUND
+        }
+        _ => OTHER_FAILURE,
+    };
+    std::process::exit(code);
 }
 
-/// `lpCurrentDirectory` takes no part in image lookup: a relative `Exact` image loads from this
+/// [`fixture_load_exact_probe`]'s exit code when run with `process_cwd` as its cwd.
+fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
+    let mut c = Command::new();
+    c.executable(std::env::current_exe().expect("current_exe"))
+        .args(crate::test_child::fixture_argv(FIXTURE_LOAD_EXACT_PROBE_TEST))
+        .env(FIXTURE_LOAD_EXACT_PROBE_ENV, current_dir)
+        .current_dir(process_cwd);
+    // libtest writes its banner to fd 1 directly, past its own capture.
+    c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
+    c.spawn().expect("spawn the fixture").wait().expect("wait").code()
+}
+
+/// `lpCurrentDirectory` takes no part in image lookup: a relative `Exact` image loads from the
 /// process's cwd whatever `current_dir()` says. The Windows counterpart of the POSIX
 /// `a_relative_exact_program_and_relative_cwd_come_from_one_process_cwd_reading`, where the
 /// child's directory decides instead.
 #[test]
 fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
-    const PROBE: &str = "cosca_exact_cwd_probe.exe";
     let (with, without) = (
         tempfile::tempdir().expect("tempdir"),
         tempfile::tempdir().expect("tempdir"),
     );
-    // This test binary, run with a filter that matches nothing, exits 0.
     std::fs::copy(std::env::current_exe().expect("current_exe"), with.path().join(PROBE)).expect("copy");
-    let exact = |current_dir: &Path| {
-        let mut c = Command::new();
-        c.raw_executable(PROBE)
-            .args([PROBE, "--exact", "__cosca_no_such_test__"])
-            .current_dir(current_dir);
-        c
-    };
-    let loaded = load_from(&exact(without.path()), with.path()).expect("loaded from the process cwd");
-    assert!(loaded.success(), "{loaded:?}");
-    assert!(
-        load_from(&exact(with.path()), without.path()).is_err(),
-        "current_dir() holds the image but the process cwd does not, so nothing may load"
+    assert_eq!(load_exact_probe(with.path(), without.path()), Some(LOADED));
+    assert_eq!(
+        load_exact_probe(without.path(), with.path()),
+        Some(FILE_NOT_FOUND),
+        "current_dir() holds the image but the process cwd does not"
     );
 }
 
