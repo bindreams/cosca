@@ -12,7 +12,9 @@
 #     gh workflow run windows-probes.yaml [-f filter=<test-name substring>] [-f run_canary=false] \
 #         [-f elevating=true]
 #
-# `-f run_executing_probes=true` adds the `executing` job, which never runs any other way.
+# `-f run_executing_probes=true` adds the `executing` job, which never runs any other way; its tests
+# take their own `-f probe_filter=`. To run only those, add `-f run_canary=false -f elevating=false`:
+# the path-resolution job is then skipped too, rather than run with nothing to assert.
 name: windows-probes
 
 on:
@@ -44,7 +46,7 @@ on:
   workflow_dispatch:
     inputs:
       filter:
-        description: "Test-name filter (blank runs every probe)"
+        description: "Test-name filter for path-resolution and elevating probes (blank runs every probe)"
         required: false
         default: ""
       run_canary:
@@ -62,6 +64,10 @@ on:
         type: boolean
         required: false
         default: false
+      probe_filter:
+        description: "Executing-probe test-name filter (blank runs every executing probe)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -76,6 +82,9 @@ concurrency:
 jobs:
   path-resolution:
     name: Path canary (${{ matrix.runner }})
+    # Only a dispatch can opt out, and only by refusing both steps this job can run; pull requests
+    # and the schedule always run it.
+    if: github.event_name != 'workflow_dispatch' || inputs.run_canary || inputs.elevating
     strategy:
       fail-fast: false
       matrix:
@@ -190,7 +199,7 @@ jobs:
       - name: Run shell-resolution probes
         shell: bash
         env:
-          FILTER: ${{ inputs.filter }}
+          FILTER: ${{ inputs.probe_filter }}
         run: >
           cargo test --locked --target ${{ matrix.target }}
           --test windows_shell_resolution
@@ -201,7 +210,7 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          FILTER: ${{ inputs.filter }}
+          FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_ALLOW_ACCOUNTS: "1"
           COSCA_PROBE_ALLOW_STATE: "1"
         run: >
