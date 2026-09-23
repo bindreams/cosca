@@ -110,7 +110,7 @@ fn another_drives_relative_path_does_not_use_the_cwd() {
         .unwrap();
         assert_eq!(got.path, PathBuf::from(want));
         assert!(!got.used_cwd);
-        assert!(reads.get() <= 1);
+        assert_eq!(reads.get(), 1, "the cwd is read once, to learn the current drive");
     }
 }
 
@@ -180,17 +180,19 @@ fn empty_env() -> EnvSnapshot {
 /// its drive for a rooted or relative `current_dir`, and another drive takes its own directory.
 #[test]
 fn the_effective_cwd_completes_current_dir_as_win32_does() {
-    for (cmd_cwd, want) in [
-        (None, r"1:\x"),
-        (Some(r"\work"), r"1:\work"),
-        (Some("sub"), r"1:\x\sub"),
-        (Some("D:sub"), r"D:\sub"),
-        (Some(r"C:\abs"), r"C:\abs"),
+    // The cwd is read once for every shape that needs it, the drive-relative one to learn the
+    // current drive, and never for a drive-absolute one.
+    for (cmd_cwd, want, want_reads) in [
+        (None, r"1:\x", 1),
+        (Some(r"\work"), r"1:\work", 1),
+        (Some("sub"), r"1:\x\sub", 1),
+        (Some("D:sub"), r"D:\sub", 1),
+        (Some(r"C:\abs"), r"C:\abs", 0),
     ] {
         let reads = Cell::new(0);
         let got = super::effective_cwd(cmd_cwd.map(Path::new), &empty_env(), counted(r"1:\x", &reads)).unwrap();
         assert_eq!(got, PathBuf::from(want), "{cmd_cwd:?}");
-        assert!(reads.get() <= 1, "{cmd_cwd:?}");
+        assert_eq!(reads.get(), want_reads, "{cmd_cwd:?}");
     }
 }
 
