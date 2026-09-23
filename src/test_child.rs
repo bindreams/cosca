@@ -31,18 +31,21 @@
 /// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
 /// filter; this stdout check is the remaining backstop for whatever that still lets through.
 pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
-    let _guard = crate::child::spawn::spawn_lock();
-    // No `"cosca_unit_tests"` placeholder in slot 0: that convention belongs to [`fixture_argv`],
-    // whose own doc says it is for `cosca::Command`'s `args`, which is the **full** argv because
-    // `cosca::Command` never runs the platform's own arg0 convention. `std::process::Command`
-    // below already supplies its own argv[0] from `Command::new`'s program path, so repeating a
-    // placeholder here would only ride along as a harmless-but-stray extra positional filter.
-    let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["--test-threads=1", "--exact", fixture])
-        .env(marker_env, cwd)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn fixture child");
+    // No `"cosca_unit_tests"` placeholder in slot 0 (that's [`fixture_argv`]'s convention for
+    // `cosca::Command`, see its doc): `std::process::Command` below already supplies its own
+    // argv[0] from `Command::new`'s program path.
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--test-threads=1", "--exact", fixture])
+            .env(marker_env, cwd)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fixture child")
+    };
+    let output = child.wait_with_output().expect("wait for fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
