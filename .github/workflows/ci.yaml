@@ -63,6 +63,9 @@ jobs:
             arch: amd64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+            # This is the one Windows lane that also runs the feature-powerset
+            # Clippy step below; see there for why one arch stands in for both.
+            lint: true
           - os: windows
             arch: arm64
             runner: windows-11-arm
@@ -77,6 +80,9 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
+          # see Clippy (feature powerset) step below for why only this lane
+          # gets the component
+          components: ${{ matrix.lint && 'clippy' || '' }}
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
@@ -131,6 +137,34 @@ jobs:
               exit 1
               ;;
           esac
+
+      # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
+      # backend) is otherwise never linted: the `lint` job only runs on
+      # ubuntu-latest, so clippy never type-checks it against a Windows target.
+      #
+      # --feature-powerset, not --all-features: this crate has real dead_code
+      # gaps that only a default-features-only build exposes, which
+      # --all-features alone never catches.
+      #
+      # Placed after the test steps, not right after Build: a clippy failure
+      # there would skip every later step (their implicit `if: success()`),
+      # hiding test results.
+      #
+      # `!cancelled()` is the one step in this job that overrides that implicit
+      # `success()`: it makes this step run even after an earlier step in the
+      # job has failed, so the lint result is always reported instead of being
+      # hidden behind an earlier failure.
+      #
+      # Runs on amd64 only, not arm64 (matrix.lint is set on this entry only):
+      # nothing in this crate's Windows code is `cfg(target_arch = ...)`-gated
+      # (checked: no such attribute exists in the tree), so the two arches
+      # type-check and lint identically. Linting both would double Windows
+      # runner-minutes for no additional coverage.
+      - name: Clippy (feature powerset)
+        if: ${{ !cancelled() && matrix.lint }}
+        uses: ./.github/actions/clippy-powerset
+        with:
+          target: ${{ matrix.target }}
 
       # Release lane (debug_assertions off): exercises the calm-release arm of the
       # should_panic oracles in the macOS-gated kinfo_tests.rs.

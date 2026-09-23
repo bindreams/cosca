@@ -1,0 +1,35 @@
+name: Feature-powerset clippy
+description: >
+  Installs cargo-hack and lints the full feature powerset with clippy, via
+  .github/scripts/clippy.sh --feature-powerset. Used on the windows/amd64 test
+  lane, which reaches `#[cfg(windows)]` code the ubuntu-only Lint job's
+  host-only, no-features prek hook never type-checks, and to catch
+  feature-gated dead_code that --all-features alone would miss. macOS
+  `cfg`-gated code and Linux's non-default features remain unlinted until
+  #163 extends this action's use to those lanes too.
+inputs:
+  target:
+    description: "Rust target triple to lint; empty lints the host target"
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    # If this step fails, the Clippy step below is skipped by default step
+    # sequencing (no explicit outcome check needed) — the caller's own `if:`
+    # is what decides whether this whole action runs at all.
+    - name: Install cargo-hack
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-hack@0.6
+
+    - name: Clippy (feature powerset)
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        if [[ -n "$TARGET" ]]; then
+          .github/scripts/clippy.sh --feature-powerset --target "$TARGET"
+        else
+          .github/scripts/clippy.sh --feature-powerset
+        fi
