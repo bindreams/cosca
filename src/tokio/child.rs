@@ -120,6 +120,14 @@ impl Child {
         self.os.attached.honor_kill_on_drop(self.kill_on_drop);
     }
 
+    /// Kill the contained tree through its containment only, without the root's own kill that
+    /// [`kill_tree`](Self::kill_tree) adds. For a failed spawn, which kills and reaps the root
+    /// separately.
+    #[cfg(unix)]
+    pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
+        self.os.attached.hard_kill()
+    }
+
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
     /// a cleanup `kill` in the write-failure path already sees the elevated state.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {

@@ -436,22 +436,16 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     Ok(child)
 }
 
-/// Async twin of the sync `finish_elevated` (see there): on a failed password write, tear the
-/// tree down (through `kill_tree` when contained) and reap the root, never orphaning it.
-///
-/// The reap is blocking (`try_wait` cannot reap a just-killed child, so it would leak a zombie),
-/// and waits only on this kill.
+/// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking
+/// (`try_wait` cannot reap a just-killed child, so it would leak a zombie), and waits only on
+/// this kill.
 #[cfg(unix)]
 pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let teardown = if child.containment() == crate::containment::Containment::None {
-        child.kill()
-    } else {
-        child.kill_tree()
-    };
-    let kill_note = match teardown {
+    let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
+    let root_note = match child.kill() {
         Ok(()) => {
             child.wait_and_reap_blocking();
             "the elevated child was terminated".to_string()
@@ -463,7 +457,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {kill_note}"),
+        detail: format!("{write_err}; {root_note}{}", crate::child::spawn::tree_note(tree)),
     })
 }
 

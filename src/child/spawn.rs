@@ -82,22 +82,21 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 
 /// Finish a POSIX elevated spawn whose deferred password write returned `written`.
 ///
-/// On a failed write, do NOT orphan the running elevated child: tear its tree down and reap the
-/// root, folding the outcome into the error. A contained tree goes through `kill_tree`, so a
-/// descendant that forked before the failure dies with the root. A successful kill (SIGKILL,
-/// uncatchable) is followed by a BLOCKING wait to reap; a failed one (e.g. `Unkillable`) cannot
-/// be reaped, so fall back to a non-blocking `try_wait` and note it may still be running.
+/// On a failed write, do NOT orphan the running elevated child: kill its tree through its
+/// containment when it has one, so a descendant forked before the failure dies too, then kill
+/// and reap the root by its own handle, folding both outcomes into the error.
+///
+/// The reap follows the ROOT's kill alone. A tree kill can fail (a setuid member refusing the
+/// signal) while the root dies, and a killed root must be waited for, or it stays a zombie. A
+/// failed root kill (e.g. `Unkillable`) cannot be waited for, so it gets a non-blocking
+/// `try_wait` and the note that it may still be running.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let teardown = if child.containment() == crate::containment::Containment::None {
-        child.kill()
-    } else {
-        child.kill_tree()
-    };
-    let kill_note = match teardown {
+    let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
+    let root_note = match child.kill() {
         Ok(()) => {
             let _ = child.wait();
             "the elevated child was terminated".to_string()
@@ -109,8 +108,17 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     };
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {kill_note}"),
+        detail: format!("{write_err}; {root_note}{}", tree_note(tree)),
     })
+}
+
+/// The part of an elevated spawn's failure detail that reports its tree kill, if it failed.
+#[cfg(unix)]
+pub(crate) fn tree_note(tree: Option<Result<(), Error>>) -> String {
+    match tree {
+        Some(Err(e)) => format!("; its contained tree could not be killed ({e})"),
+        _ => String::new(),
+    }
 }
 
 /// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`

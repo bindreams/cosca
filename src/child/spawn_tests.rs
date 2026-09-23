@@ -631,3 +631,79 @@ fn a_failed_password_write_kills_the_contained_tree() {
         "the failed spawn must kill its tree through the leaf"
     );
 }
+
+/// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
+#[cfg(target_os = "linux")]
+fn reaped(pid: u32) -> bool {
+    let mut status = 0;
+    // SAFETY: a non-blocking query on a pid this process spawned; `status` is a valid int.
+    let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+    r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+}
+
+/// The error a failed password write returns.
+#[cfg(target_os = "linux")]
+fn failed_write() -> Result<(), Error> {
+    Err(Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: "forced password-write failure".into(),
+    })
+}
+
+/// A `Delegated` spawn has no tree teardown of its own, but its root is still this spawn's child:
+/// a failed password write kills and reaps it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::Delegated,
+        attached: crate::containment::Attached::Delegated,
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let mut cmd = blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let pid = child.id().pid();
+
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+
+    let reaped = reaped(pid);
+    if !reaped {
+        // SAFETY: `pid` is this process's own unreaped child; do not leak it past the test.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    assert!(reaped, "the root must be killed and reaped, got {err:?}");
+    assert!(err.to_string().contains("was terminated"), "got {err:?}");
+}
+
+/// A tree kill that fails does not stop the root's own kill and reap: the two are separate.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unkillable-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // A directory: writing `cgroup.kill` fails with EISDIR, as a refused kill would.
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let mut cmd = blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let pid = child.id().pid();
+
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+
+    assert!(reaped(pid), "the root was killed, so it must be reaped, got {err:?}");
+    let detail = err.to_string();
+    assert!(detail.contains("was terminated"), "the root was killed, got {detail}");
+    assert!(
+        detail.contains("its contained tree could not be killed"),
+        "the tree's failure is reported, got {detail}"
+    );
+}
