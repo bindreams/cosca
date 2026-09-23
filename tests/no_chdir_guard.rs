@@ -11,12 +11,14 @@
 //! on the spawned process, never `set_current_dir` on this one).
 //!
 //! `testbin/main.rs`'s two `set_current_dir` calls are the one legitimate exception, and are
-//! allowlisted below by exact line text rather than skipped by file: `testbin` is itself a
-//! freshly spawned, single-purpose PROCESS per invocation, never the shared multithreaded `cargo
-//! test` binary, so mutating ITS OWN cwd races nothing — it IS the "spawn a dedicated child"
-//! pattern this guard exists to push every other cwd-needing test toward, not an instance of the
-//! bug. A `set_current_dir` call anywhere else in `testbin/main.rs` — including a third one with
-//! different text — still fails this guard.
+//! allowlisted below by exact line text AND an exact expected count, rather than skipped by file:
+//! `testbin` is itself a freshly spawned, single-purpose PROCESS per invocation, never the shared
+//! multithreaded `cargo test` binary, so mutating ITS OWN cwd races nothing — it IS the "spawn a
+//! dedicated child" pattern this guard exists to push every other cwd-needing test toward, not an
+//! instance of the bug. A `set_current_dir` call anywhere else in `testbin/main.rs` — including a
+//! third one with different text — still fails this guard, and so does a THIRD occurrence of the
+//! two calls' identical text: matching by text alone would let a duplicate of an already-allowed
+//! line slip in uncounted, so each entry also carries the exact number of lines it may match.
 //!
 //! The match itself is word-boundary, not substring: a bare identifier occurrence trips it, with
 //! no trailing `(` required, so an aliased import (`use ... as cd; cd(d)`), a `.map(...)`
@@ -27,16 +29,20 @@
 
 use std::path::Path;
 
-/// `(file path relative to the repo root, exact trimmed line text)` for every allowlisted
-/// call site. Matching on exact text (not merely "this file is exempt") means a differently-shaped
-/// call added anywhere in `testbin/main.rs` still fails the guard.
-const ALLOWLIST: &[(&str, &str)] = &[(
+/// `(file path relative to the repo root, exact trimmed line text, exact expected match count)`
+/// for every allowlisted call site. Matching on exact text (not merely "this file is exempt")
+/// means a differently-shaped call added anywhere in `testbin/main.rs` still fails the guard;
+/// matching on an exact COUNT, not just presence, means a second occurrence of an
+/// already-allowlisted line sneaking in still fails it too — presence alone cannot tell "the one
+/// allowed line is still there" apart from "the one allowed line, plus an uncounted extra".
+const ALLOWLIST: &[(&str, &str, usize)] = &[(
     "testbin/main.rs",
     concat!(
         "std::env::set_current",
         "_dir(dir).expect(\"ch",
         "dir to the decoy directory\");"
     ),
+    2,
 )];
 
 /// Two-piece halves of every identifier this guard treats as a process-cwd mutation. Never written
@@ -118,28 +124,40 @@ fn no_test_mutates_the_process_cwd() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut scanned = 0usize;
     let mut offenders = Vec::new();
+    let mut allowlist_hits = vec![0usize; ALLOWLIST.len()];
 
     for dir in ["src", "tests", "testbin"] {
-        visit(&root.join(dir), root, &mut scanned, &mut offenders);
+        visit(&root.join(dir), root, &mut scanned, &mut offenders, &mut allowlist_hits);
     }
 
     assert!(scanned > 0, "scanned zero .rs files — the guard itself is broken");
+
+    for (i, (file, text, expected)) in ALLOWLIST.iter().enumerate() {
+        let found = allowlist_hits[i];
+        if found == 0 || found > *expected {
+            offenders.push(format!(
+                "allowlist entry {file}:{text:?} expects exactly {expected} match(es), found {found}"
+            ));
+        }
+    }
+
     assert!(
         offenders.is_empty(),
-        "found a process-cwd-mutation call outside this guard's allowlist (races every other \
-         concurrently running test in the same binary — see this file's module doc for the \
-         spawn-a-child alternative): {offenders:#?}"
+        "found a process-cwd-mutation call outside this guard's allowlist, or an allowlisted \
+         line's match count drifted from what is expected (races every other concurrently \
+         running test in the same binary — see this file's module doc for the spawn-a-child \
+         alternative): {offenders:#?}"
     );
 }
 
-fn visit(dir: &Path, root: &Path, scanned: &mut usize, offenders: &mut Vec<String>) {
+fn visit(dir: &Path, root: &Path, scanned: &mut usize, offenders: &mut Vec<String>, allowlist_hits: &mut [usize]) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for entry in entries {
         let entry = entry.expect("dir entry");
         let path = entry.path();
         let file_type = entry.file_type().expect("file_type");
         if file_type.is_dir() {
-            visit(&path, root, scanned, offenders);
+            visit(&path, root, scanned, offenders, allowlist_hits);
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -166,7 +184,8 @@ fn visit(dir: &Path, root: &Path, scanned: &mut usize, offenders: &mut Vec<Strin
             if !line_matches_needle(line) {
                 continue;
             }
-            if ALLOWLIST.iter().any(|(f, l)| *f == rel && *l == trimmed) {
+            if let Some(idx) = ALLOWLIST.iter().position(|(f, l, _)| *f == rel && *l == trimmed) {
+                allowlist_hits[idx] += 1;
                 continue;
             }
             offenders.push(format!("{rel}:{}: {trimmed}", i + 1));
