@@ -1429,6 +1429,78 @@ fn wait_unpopulated(leaf: &std::path::Path) {
     }
 }
 
+/// Spawn `cmd` with `slots` closed in this process across the spawn, and restore them.
+#[cfg(target_os = "linux")]
+fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
+    // Everything this process needs open is opened already, so nothing fills the gaps but the
+    // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
+    // SAFETY: each slot is one of this process's own std descriptors; it is closed only across
+    // the spawn and restored from its saved copy before anything else runs.
+    let saved: Vec<(i32, i32)> = slots
+        .iter()
+        .map(|&slot| unsafe {
+            let saved = libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3);
+            assert!(saved >= 3, "dup({slot}): {}", std::io::Error::last_os_error());
+            (slot, saved)
+        })
+        .collect();
+    for &(slot, _) in &saved {
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::close(slot) }, 0, "close({slot})");
+    }
+    // One CPU for parent and child: the parent runs on while the child waits its turn, so a
+    // report read at `spawn`'s return would be read before the child made it.
+    let spawned = on_one_cpu(|| cmd.spawn());
+    for &(slot, saved) in &saved {
+        // SAFETY: `saved` is this process's own open descriptor, duplicated above.
+        unsafe {
+            assert_eq!(libc::dup2(saved, slot), slot, "restore fd {slot}");
+            libc::close(saved);
+        }
+    }
+    spawned
+}
+
+/// Accept one connection on `listener`, or fail at once if the process `pid` — this process's
+/// child, whose tree is to connect — exits first. No timeout: one of the two always happens.
+#[cfg(target_os = "linux")]
+fn accept_while_alive(listener: &std::net::TcpListener, pid: u32) -> std::net::TcpStream {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: a plain syscall; its result is checked before use.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(pidfd >= 0, "pidfd_open({pid}): {}", std::io::Error::last_os_error());
+    // SAFETY: `pidfd` is a fresh descriptor this function owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    let mut fds = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: two valid pollfds; -1 blocks until one is ready.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ready >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "poll: {e}");
+    }
+    assert_ne!(
+        fds[0].revents & libc::POLLIN,
+        0,
+        "child {pid} exited before its tree connected"
+    );
+    listener.accept().expect("accept the worker").0
+}
+
 /// One case of [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`]:
 /// spawn a contained `sh` with `slots` closed in this process and each wired to a file in the
 /// child, then check what cosca reports against where the child really is.
@@ -1455,42 +1527,26 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
             .expect("wire the slot to the file");
     }
     cmd.contain();
-    if deny_pidfd {
-        deny_pidfd_open_on_this_thread();
-    }
 
-    // Everything this process needs open is opened above, so nothing fills the gaps but the
-    // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
-    // SAFETY: each slot is one of this process's own std descriptors; it is closed only across
-    // the spawn and restored from its saved copy before anything else runs.
-    let saved: Vec<(i32, i32)> = slots
-        .iter()
-        .map(|&slot| unsafe {
-            let saved = libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3);
-            assert!(saved >= 3, "dup({slot}): {}", std::io::Error::last_os_error());
-            (slot, saved)
-        })
-        .collect();
-    for &(slot, _) in &saved {
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::close(slot) }, 0, "close({slot})");
-    }
-    // One CPU for parent and child: the parent runs on while the child waits its turn, so a
-    // report read at `spawn`'s return would be read before the child made it.
-    let spawned = on_one_cpu(|| cmd.spawn());
-    for &(slot, saved) in &saved {
-        // SAFETY: `saved` is this process's own open descriptor, duplicated above.
-        unsafe {
-            assert_eq!(libc::dup2(saved, slot), slot, "restore fd {slot}");
-            libc::close(saved);
-        }
-    }
+    // The spawn runs on a thread of its own: a seccomp filter is per thread, so this one keeps
+    // the `pidfd_open` it needs to watch the child below.
+    let spawned = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                if deny_pidfd {
+                    deny_pidfd_open_on_this_thread();
+                }
+                spawn_with_std_slots_closed(&mut cmd, slots)
+            })
+            .join()
+            .expect("the spawning thread")
+    });
     let child = spawned.expect("spawn");
     let containment = child.containment();
     // Printed once 0, 1 and 2 are back, for a caller counting outcomes across runs.
     println!("closed-slots outcome: {containment:?}");
 
-    let (worker, _) = listener.accept().expect("accept the worker");
+    let worker = accept_while_alive(&listener, child.id().pid());
     let mut worker = std::io::BufReader::new(worker);
     let mut hello = String::new();
     worker.read_line(&mut hello).expect("read the worker's hello");
