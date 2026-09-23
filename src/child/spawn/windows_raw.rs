@@ -363,14 +363,16 @@ pub(crate) fn target_with(
         read = Some(cwd.clone());
         Ok(cwd)
     };
-    let cwd = resolve::effective_cwd(cmd.cwd(), &env.snapshot, &mut process_cwd)?;
+    // Each drive's own directory, probed at most once and shared likewise.
+    let drive_dirs = resolve::DriveDirs::new(&env.snapshot);
+    let cwd = resolve::effective_cwd(cmd.cwd(), &drive_dirs, &mut process_cwd)?;
     let path = env.path.as_deref();
     let image = match cmd.executable_spec() {
         Some(ExecutableSpec::Search(p)) => Some(resolve::resolve_executable(p, Some(&cwd), path)?),
         // Against this process's cwd, not `current_dir`: that is what `CreateProcessW` completes a
         // relative `lpApplicationName` against (see `Command::raw_executable`), from the same read.
         Some(ExecutableSpec::Exact(p)) => {
-            let drive_cwd = |drive: &OsStr| Ok(env.snapshot.var(&resolve::drive_cwd_var(drive)));
+            let drive_cwd = |drive: &OsStr| Ok(drive_dirs.get(drive));
             Some(resolve::absolutise_exact_on(p, &mut process_cwd, drive_cwd)?.path)
         }
         None => program_token(cmd)

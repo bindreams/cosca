@@ -50,8 +50,8 @@ pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&
 /// step uses — the base a program is resolved or completed against, and `lpCurrentDirectory`.
 ///
 /// - A `current_dir` is checked ([`check_current_dir`]), then completed as Win32 completes it
-///   ([`complete_on`]), with a drive's own directory (`=Q:`) read from `snapshot`, the spawn's one
-///   environment read. It must then be fully qualified, so `current_dir(r"\\server")` is refused.
+///   ([`complete_on`]), with a drive's own directory from `drive_dirs`, the spawn's one reading of
+///   them. It must then be fully qualified, so `current_dir(r"\\server")` is refused.
 /// - With none, it is this process's cwd.
 ///
 /// `process_cwd` is called at most once. Leaving `lpCurrentDirectory` null instead would have
@@ -59,13 +59,13 @@ pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&
 /// directory's file and run the child in another.
 pub(crate) fn effective_cwd(
     cmd_cwd: Option<&Path>,
-    snapshot: &super::env_snapshot::EnvSnapshot,
+    drive_dirs: &DriveDirs<'_>,
     process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
 ) -> Result<PathBuf, Error> {
     match cmd_cwd {
         Some(dir) => {
             check_current_dir(dir)?;
-            let done = complete_on(dir, process_cwd, |drive| Ok(snapshot.var(&drive_cwd_var(drive))))?;
+            let done = complete_on(dir, process_cwd, |drive| Ok(drive_dirs.get(drive)))?;
             reject_not_fully_qualified("working directory", &done.path)?;
             Ok(done.path)
         }
@@ -218,7 +218,9 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 }
 
 /// Complete a possibly-relative program name into an absolute path the way the Win32 loader
-/// itself would — **without searching, appending an extension, or touching the filesystem**.
+/// itself would — **without searching or appending an extension**. The filesystem is touched only
+/// to ask whether a drive-relative name's `=Q:` directory exists, as `GetFullPathNameW` does
+/// ([`DriveDirs`]).
 ///
 /// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], and both Win32
 /// sinks get a completed name:
@@ -279,10 +281,8 @@ pub(crate) struct Completed {
 ///   [`DriveAbsolute`](crate::resolve::PathType::DriveAbsolute): as written. Nothing is read.
 /// - [`DriveRelative`](crate::resolve::PathType::DriveRelative) (`C:x`): the cwd is read to learn
 ///   the current drive. On that drive the rest is appended to the cwd. On another, it is appended
-///   to that drive's own directory: the `=Q:` variable when it is fully qualified and names an
-///   existing directory, else the drive's root, and the cwd is not used. That is what
-///   `GetFullPathNameW` does (measured by `tests/windows_process_cwd.rs`); Wine uses any value, and
-///   notes the existence check as a Windows difference it does not model.
+///   to that drive's own directory as `drive_cwd` reports it ([`DriveDirs`] for a spawn), if fully
+///   qualified, else to the drive's root, and the cwd is not used.
 /// - [`Rooted`](crate::resolve::PathType::Rooted) (`\x`): appended to the cwd's drive or share.
 ///   Refused on a verbatim cwd, where Win32 completes it off the cwd's volume (`\t.exe`,
 ///   measured).
@@ -350,7 +350,7 @@ fn anchor(
                 }
             } else {
                 let base = drive_cwd(drive)?
-                    .filter(|dir| crate::resolve::is_absolute_name(dir, true) && Path::new(dir).is_dir())
+                    .filter(|dir| crate::resolve::is_absolute_name(dir, true))
                     .unwrap_or_else(|| {
                         let mut root = drive.to_os_string();
                         root.push("\\");
@@ -395,6 +395,49 @@ fn anchor(
 /// `rest` after the directory `base`, by [`crate::resolve::join::append`].
 fn append(base: &OsStr, rest: &OsStr) -> PathBuf {
     PathBuf::from(crate::resolve::join::append(base, rest, "\\"))
+}
+
+/// Each drive's own directory for one spawn, as `GetFullPathNameW` uses it: the `=Q:` value in the
+/// spawn's environment snapshot when it is fully qualified and names an existing directory, else
+/// none, so the drive's root is used (measured by `tests/windows_process_cwd.rs`; Wine uses any
+/// value, and notes the existence check as a Windows difference it does not model).
+///
+/// Each drive is probed at most once, so every step of one spawn completes against the same
+/// answer even if the directory appears or vanishes meanwhile.
+pub(crate) struct DriveDirs<'a> {
+    snapshot: &'a EnvSnapshot,
+    is_dir: fn(&Path) -> bool,
+    probed: std::cell::RefCell<Vec<(EnvKey, Option<OsString>)>>,
+}
+
+impl<'a> DriveDirs<'a> {
+    pub(crate) fn new(snapshot: &'a EnvSnapshot) -> Self {
+        Self::with_probe(snapshot, Path::is_dir)
+    }
+
+    /// [`DriveDirs::new`] with `is_dir` as the existence probe.
+    pub(crate) fn with_probe(snapshot: &'a EnvSnapshot, is_dir: fn(&Path) -> bool) -> Self {
+        Self {
+            snapshot,
+            is_dir,
+            probed: Default::default(),
+        }
+    }
+
+    /// `drive`'s own directory, or `None` for its root. Fully qualified before it is probed, so a
+    /// relative value never reads this process's cwd.
+    pub(crate) fn get(&self, drive: &OsStr) -> Option<OsString> {
+        let key = EnvKey::new(drive);
+        if let Some((_, dir)) = self.probed.borrow().iter().find(|(k, _)| *k == key) {
+            return dir.clone();
+        }
+        let dir = self
+            .snapshot
+            .var(&drive_cwd_var(drive))
+            .filter(|dir| crate::resolve::is_absolute_name(dir, true) && (self.is_dir)(Path::new(dir)));
+        self.probed.borrow_mut().push((key, dir.clone()));
+        dir
+    }
 }
 
 /// The name of the variable holding `drive`'s own current directory: `=Q:` for `Q:`.
@@ -506,6 +549,11 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 /// search — and is never loaded from `base_cwd`: resolving it would need drive C's own current
 /// directory, which cosca does not track. A name that names no file (`C:\`, `tools\dir\`,
 /// `...`, a bare `\\server\share`) is refused the same way.
+///
+/// On a verbatim (`\\?\`) `base_cwd`, a rooted name (`\bin\tool.exe`) is refused as
+/// `InvalidInput` too, since Win32 completes it to `\\bin\tool.exe`, off the base's volume
+/// (measured). Main, and the `std` backend, resolve it onto the base's own volume. So is a relative
+/// name whose `..` Win32 completes past a verbatim share, to a share root or no share at all.
 ///
 /// Visiting `base_cwd` first is a binary-planting hazard: `executable("helper")` would load a
 /// `helper.exe` dropped in whatever directory the process happened to sit in. Reach it explicitly

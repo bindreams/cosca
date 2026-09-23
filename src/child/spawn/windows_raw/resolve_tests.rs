@@ -7,7 +7,9 @@ use std::path::Path;
 fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
     let snapshot = EnvSnapshot::read().unwrap();
     let env = ChildEnv::capture(&snapshot, ops);
-    let base = effective_cwd(cmd_cwd, &snapshot, || std::env::current_dir().map_err(Error::Io))?;
+    let base = effective_cwd(cmd_cwd, &DriveDirs::new(&snapshot), || {
+        std::env::current_dir().map_err(Error::Io)
+    })?;
     resolve_executable(exe, Some(&base), env.path())
 }
 

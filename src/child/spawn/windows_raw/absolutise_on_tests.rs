@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::{absolutise_exact, absolutise_exact_on, complete_on, drive_cwd_var, Completed};
+use super::{absolutise_exact, absolutise_exact_on, complete_on, Completed, DriveDirs};
 use crate::child::spawn::windows_raw::env_snapshot::EnvSnapshot;
 use crate::error::Error;
 
@@ -14,9 +14,15 @@ fn no_drive(_: &std::ffi::OsStr) -> Result<Option<OsString>, Error> {
     Ok(None)
 }
 
-/// The real `=X:` variable, as `GetFullPathNameW` reads it.
+/// The real `=X:` directory, as `GetFullPathNameW` uses it.
 fn real_drive(drive: &std::ffi::OsStr) -> Result<Option<OsString>, Error> {
-    Ok(EnvSnapshot::read()?.var(&drive_cwd_var(drive)))
+    let snapshot = EnvSnapshot::read()?;
+    Ok(DriveDirs::new(&snapshot).get(drive))
+}
+
+/// A snapshot holding the one variable `var` (`NAME=value`).
+fn snapshot_with(var: &str) -> EnvSnapshot {
+    EnvSnapshot::from_block(format!("{var}\0\0").encode_utf16().collect())
 }
 
 fn letter_of(p: &Path) -> char {
@@ -153,8 +159,29 @@ fn a_digit_drive_takes_that_drives_directory() {
     assert!(!got.used_cwd);
 }
 
-/// A drive's `=X:` value is used only when it is fully qualified and names an existing directory,
-/// on any drive; otherwise the drive's root is, as `GetFullPathNameW` does (measured by
+/// `complete_on` uses a drive directory only when fully qualified; its reader answers whether one
+/// exists.
+#[test]
+fn a_drive_directory_is_used_only_when_fully_qualified() {
+    for (value, want) in [
+        (r"Q:\qcwd", r"Q:\qcwd\tool.exe"),
+        (r"\\srv\shr\d", r"\\srv\shr\d\tool.exe"),
+        ("Q:rel", r"Q:\tool.exe"),
+        ("rel", r"Q:\tool.exe"),
+        (r"\rooted", r"Q:\tool.exe"),
+    ] {
+        let got = complete_on(
+            Path::new("Q:tool.exe"),
+            || Ok(PathBuf::from(r"D:\base")),
+            |_| Ok(Some(OsString::from(value))),
+        )
+        .unwrap();
+        assert_eq!(got.path, PathBuf::from(want), "=Q:={value:?}");
+    }
+}
+
+/// A spawn uses a drive's `=X:` value only when it is fully qualified and names an existing
+/// directory, on any drive; otherwise the drive's root, as `GetFullPathNameW` does (measured by
 /// `tests/windows_process_cwd.rs`).
 #[test]
 fn only_an_existing_fully_qualified_drive_directory_is_used() {
@@ -173,14 +200,34 @@ fn only_an_existing_fully_qualified_drive_directory_is_used() {
         ("rel", r"Q:\tool.exe"),
         (r"\rooted", r"Q:\tool.exe"),
     ] {
-        let got = complete_on(
-            Path::new("Q:tool.exe"),
-            || Ok(PathBuf::from(r"D:\base")),
-            |_| Ok(Some(OsString::from(value))),
-        )
+        let snapshot = snapshot_with(&format!("=Q:={value}"));
+        let got = super::effective_cwd(Some(Path::new("Q:tool.exe")), &DriveDirs::new(&snapshot), || {
+            Ok(PathBuf::from(r"D:\base"))
+        })
         .unwrap();
-        assert_eq!(got.path, PathBuf::from(want), "=Q:={value:?}");
+        assert_eq!(got, PathBuf::from(want), "=Q:={value:?}");
     }
+}
+
+/// Each drive is probed once per spawn, however many steps ask, and however they spell it.
+#[test]
+fn a_drive_directory_is_probed_once() {
+    thread_local! {
+        static PROBES: Cell<usize> = const { Cell::new(0) };
+    }
+    fn probe(_: &Path) -> bool {
+        PROBES.with(|p| p.set(p.get() + 1));
+        true
+    }
+    let snapshot = snapshot_with(r"=Q:=Q:\qcwd");
+    let dirs = DriveDirs::with_probe(&snapshot, probe);
+    for drive in ["Q:", "q:", "Q:"] {
+        assert_eq!(dirs.get(drive.as_ref()), Some(OsString::from(r"Q:\qcwd")), "{drive}");
+    }
+    // A relative value is never probed: it would read this process's cwd.
+    let relative = snapshot_with("=R:=rel");
+    assert_eq!(DriveDirs::with_probe(&relative, probe).get("R:".as_ref()), None);
+    assert_eq!(PROBES.with(Cell::get), 1);
 }
 
 /// On a verbatim cwd a relative name is joined as written and `GetFullPathNameW` collapses it,
@@ -250,7 +297,12 @@ fn the_effective_cwd_completes_current_dir_as_win32_does() {
         (Some(r"C:\abs"), r"C:\abs", 0),
     ] {
         let reads = Cell::new(0);
-        let got = super::effective_cwd(cmd_cwd.map(Path::new), &empty_env(), counted(r"1:\x", &reads)).unwrap();
+        let got = super::effective_cwd(
+            cmd_cwd.map(Path::new),
+            &DriveDirs::new(&empty_env()),
+            counted(r"1:\x", &reads),
+        )
+        .unwrap();
         assert_eq!(got, PathBuf::from(want), "{cmd_cwd:?}");
         assert_eq!(reads.get(), want_reads, "{cmd_cwd:?}");
     }
@@ -262,9 +314,11 @@ fn the_effective_cwd_reads_a_drive_directory_from_the_given_snapshot() {
     let qcwd = tempfile::tempdir().unwrap();
     let qcwd = qcwd.path().to_str().unwrap();
     let block: Vec<u16> = format!("=Q:={qcwd}\0\0").encode_utf16().collect();
-    let got = super::effective_cwd(Some(Path::new("Q:sub")), &EnvSnapshot::from_block(block), || {
-        Ok(PathBuf::from(r"D:\x"))
-    })
+    let got = super::effective_cwd(
+        Some(Path::new("Q:sub")),
+        &DriveDirs::new(&EnvSnapshot::from_block(block)),
+        || Ok(PathBuf::from(r"D:\x")),
+    )
     .unwrap();
     assert_eq!(got, PathBuf::from(format!(r"{qcwd}\sub")));
 }
@@ -273,7 +327,7 @@ fn the_effective_cwd_reads_a_drive_directory_from_the_given_snapshot() {
 #[test]
 fn the_effective_cwd_without_a_current_dir_is_one_read() {
     let reads = Cell::new(0);
-    let got = super::effective_cwd(None, &empty_env(), counted(r"C:\x", &reads)).unwrap();
+    let got = super::effective_cwd(None, &DriveDirs::new(&empty_env()), counted(r"C:\x", &reads)).unwrap();
     assert_eq!(got, PathBuf::from(r"C:\x"));
     assert_eq!(reads.get(), 1);
 }
@@ -285,7 +339,7 @@ fn the_effective_cwd_refuses_a_share_less_unc_current_dir() {
     // `\\srv\\x` is not among them: Win32 collapses the doubled separator (measured), so it names
     // the share root `\\srv\x`.
     for dir in [r"\\server", "//server", r"\\?\UNC\srv", r"\\?\UNC\", r"\\?\UNC\srv/shr"] {
-        match super::effective_cwd(Some(Path::new(dir)), &empty_env(), || {
+        match super::effective_cwd(Some(Path::new(dir)), &DriveDirs::new(&empty_env()), || {
             panic!("{dir:?} must not read the cwd")
         }) {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{dir:?}: {e}"),
@@ -300,7 +354,7 @@ fn the_effective_cwd_refuses_a_share_less_unc_current_dir() {
 fn the_effective_cwd_refuses_a_nul_before_completing() {
     use std::os::windows::ffi::OsStringExt;
     let dir = OsString::from_wide(&"sub\0x".encode_utf16().collect::<Vec<u16>>());
-    match super::effective_cwd(Some(Path::new(&dir)), &empty_env(), || {
+    match super::effective_cwd(Some(Path::new(&dir)), &DriveDirs::new(&empty_env()), || {
         panic!("a NUL-bearing directory must not read the cwd")
     }) {
         Err(Error::Io(e)) => {
@@ -413,6 +467,6 @@ fn a_relative_name_on_a_verbatim_process_cwd_is_normalised() {
     let cwd = || Ok(PathBuf::from(r"\\?\C:\d"));
     let got = absolutise_exact_on(Path::new("tool.exe."), cwd, no_drive).unwrap();
     assert_eq!(got.path, PathBuf::from(r"\\?\C:\d\tool.exe"));
-    let got = super::effective_cwd(Some(Path::new("sub.")), &empty_env(), cwd).unwrap();
+    let got = super::effective_cwd(Some(Path::new("sub.")), &DriveDirs::new(&empty_env()), cwd).unwrap();
     assert_eq!(got, PathBuf::from(r"\\?\C:\d\sub"));
 }

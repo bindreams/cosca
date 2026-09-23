@@ -658,9 +658,11 @@ fn fixture_relative_cwd_is_absolutised() {
     #[cfg(windows)]
     let got = {
         use crate::child::spawn::windows_raw::{env_snapshot::EnvSnapshot, resolve};
-        let base = resolve::effective_cwd(Some(Path::new("sub")), &EnvSnapshot::read().unwrap(), || {
-            std::env::current_dir().map_err(Error::Io)
-        })
+        let base = resolve::effective_cwd(
+            Some(Path::new("sub")),
+            &resolve::DriveDirs::new(&EnvSnapshot::read().unwrap()),
+            || std::env::current_dir().map_err(Error::Io),
+        )
         .unwrap();
         resolve::resolve_executable(Path::new("./tool"), Some(&base), None).unwrap()
     };
