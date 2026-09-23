@@ -109,33 +109,6 @@ pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
     cmd.executable_path().is_some() || cmd.fds().keys().any(|slot| slot.raw() >= 3)
 }
 
-/// Test-only: did the LAST spawn on this thread actually run through the raw `CreateProcessW`
-/// backend? Thread-local (mirrors `containment::windows::observe`), so one test's spawn cannot
-/// see a signal left by some other, concurrently-running test's spawn on a different thread; take
-/// semantics, so reading resets it and a test cannot pass by observing a PRIOR spawn's leftover
-/// `true`.
-///
-/// An `executable()` leg can prove it reached this backend from the CHILD's own report — argv[0]
-/// independent of the loaded image, which only `CreateProcessW` can produce (see
-/// `tests/windows_creation_flags.rs`). An argv-only command routed here purely via fd >= 3 has no
-/// such signal: argv[0] IS the image either way. This is that case's proof, recorded at the two
-/// actual backend entry points (`child::spawn::windows_raw::spawn_raw`,
-/// `tokio::spawn::windows_raw::spawn_raw`) rather than at the routing decision, so it witnesses
-/// the backend actually running rather than a decision that could in principle not be acted on.
-#[cfg(windows)]
-pub(crate) mod raw_backend_observe {
-    use std::cell::Cell;
-    thread_local! {
-        static USED_RAW_BACKEND: Cell<bool> = const { Cell::new(false) };
-    }
-    pub(crate) fn record_used_raw_backend() {
-        USED_RAW_BACKEND.with(|f| f.set(true));
-    }
-    pub(crate) fn take_used_raw_backend() -> bool {
-        USED_RAW_BACKEND.with(|f| f.replace(false))
-    }
-}
-
 /// The non-elevated spawn core: resolve stdio, wire program/args, spawn, attach,
 /// read identity, adopt. Shared by the ordinary path and the elevation paths'
 /// already-elevated / derived-command continuations (which must spawn without

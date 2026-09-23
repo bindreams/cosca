@@ -73,13 +73,9 @@ async fn async_fd3_pipe_in_feeds_child() {
 
 /// Async twin of the sync `argv_only_fd3_routes_through_the_raw_backend_and_works`: an argv-only
 /// tokio `Command` (no `.executable()`) that maps fd >= 3 still routes through the ASYNC raw
-/// backend. This is a separate proof site from the sync twin, not a restatement of it —
-/// `tokio::spawn::windows_raw::spawn_raw` derives its own `program_token` fallback independently
-/// of the sync backend (see `async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd`
-/// below for the same routing shape, a different bug). No argv[0]-independence signal exists here
-/// either (argv[0] IS the image with no `.executable()` set), so this reads the same
-/// `#[doc(hidden)]` observe seam the sync twin does, then proves the fd >= 3 wiring works end to
-/// end over the async overlapped-pipe machinery.
+/// backend. std has no way to hand a child fd >= 3 on Windows at all (see `routes_to_raw_backend`'s
+/// doc), so fd 3 actually delivering the marker bytes below is itself proof this went through the
+/// raw backend.
 #[tokio::test]
 async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut c = cosca::tokio::Command::new();
@@ -87,10 +83,6 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
     let mut child = c.spawn().expect("raw spawn via the argv-only + fd>=3 route");
-    assert!(
-        cosca::test_take_used_raw_backend(),
-        "an argv-only tokio command mapping fd >= 3 must route through the async raw CreateProcessW backend"
-    );
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();

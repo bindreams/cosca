@@ -249,8 +249,6 @@ struct WaitObserver {
 /// arbitrary descriptors (fd >= 3) and containment — the full sync feature set. Reuses the sync
 /// backend's FFI (fd-table + HANDLE_LIST + containment decision + lock/close + error-teardown).
 pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
-    // Test-only: witness that this backend actually ran — see `raw_backend_observe`'s doc.
-    crate::child::spawn::raw_backend_observe::record_used_raw_backend();
     // Batch reject on the program token, resolve the executable, NUL-check, build the command line
     // — all shared verbatim with the sync raw backend.
     sync_raw::reject_batch_program(cmd)?;
