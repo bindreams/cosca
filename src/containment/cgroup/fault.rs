@@ -1,5 +1,6 @@
 use std::cell::Cell;
 thread_local! {
+    static REAPED_ORPHANS: std::cell::RefCell<Vec<(u32, Option<i32>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
     static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PIDFD_FAILURE: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
@@ -99,4 +100,13 @@ pub(crate) fn take_force_occupy_before_unwind() -> bool {
 }
 pub(crate) fn occupy_before_unwind_armed() -> bool {
     FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.get())
+}
+
+/// Every child a leaf dropped before its verdict reaped on this thread, with the signal that
+/// killed it, since the last call — taken, so each test sees only its own.
+pub(crate) fn take_reaped_orphans() -> Vec<(u32, Option<i32>)> {
+    REAPED_ORPHANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+pub(crate) fn record_reaped_orphan(pid: u32, signal: Option<i32>) {
+    REAPED_ORPHANS.with(|r| r.borrow_mut().push((pid, signal)));
 }

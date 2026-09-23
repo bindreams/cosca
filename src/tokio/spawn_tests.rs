@@ -75,8 +75,6 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 #[tokio::test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf() {
-    use nix::sys::wait::{waitpid, WaitStatus};
-
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
@@ -88,12 +86,11 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     let leaf = fault::take_forgotten_leaf().expect("the dropped spawn was contained in a leaf");
 
-    // Still this process's unreaped child, so waiting on its pid is safe.
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    assert_eq!(
-        waitpid(pid, None).expect("reap the dropped child"),
-        WaitStatus::Signaled(pid, nix::sys::signal::Signal::SIGKILL, false),
-        "the child in the dropped leaf must be killed through it"
+    // Nothing owns the child any more, so the dropped leaf must both kill and reap it.
+    let reaped = crate::containment::cgroup::fault::take_reaped_orphans();
+    assert!(
+        reaped.contains(&(pid, Some(libc::SIGKILL))),
+        "the child {pid} in the dropped leaf must be killed through it and reaped, got {reaped:?}"
     );
     // An empty leaf `Drop` could not remove right after its kill is a known exit-lag gap, not this:
     // no leaf of this spawn may still hold a live process.

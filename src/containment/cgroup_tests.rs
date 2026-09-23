@@ -1920,7 +1920,7 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::unix::process::CommandExt;
 
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
@@ -1937,16 +1937,19 @@ fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
     // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut member = cmd.spawn().expect("spawn the member");
+    let member = cmd.spawn().expect("spawn the member");
 
+    let pid = member.id();
     drop(leaf);
 
-    assert_eq!(
-        member.wait().expect("reap the member").signal(),
-        Some(libc::SIGKILL),
-        "the occupant must be killed through the leaf"
+    // A leaf dropped before its verdict reaps the members that are this process's children —
+    // no handle owns a failed spawn's child — so the member's own handle is never waited on.
+    assert!(
+        super::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
+        "the occupant must be killed through the leaf, and reaped"
     );
     assert!(!leaf_path.exists(), "the leaf must be removed");
+    drop(member);
 }
 
 /// A child cosca gives up on is killed as a group: between the last look at its report and the

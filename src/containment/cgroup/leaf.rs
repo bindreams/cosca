@@ -533,6 +533,7 @@ impl CgroupLeaf {
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
         self.procs_fd = None;
+        let pre_verdict = self.report.is_some();
         // Before the verdict — a spawn that failed, maybe after its fork — the report is final
         // only if it arrived: the child's pid is not known here to wait for it.
         if let Some(mut channel) = self.report.take() {
@@ -558,7 +559,11 @@ impl Drop for CgroupLeaf {
             }
             return;
         }
-        let kill = self.hard_kill();
+        let kill = if pre_verdict {
+            self.kill_through_before_verdict()
+        } else {
+            self.hard_kill()
+        };
         let Err(second) = fs::remove_dir(&self.leaf_path) else {
             return;
         };
@@ -624,7 +629,7 @@ impl CgroupLeaf {
                     }
                 }
             }
-            let why = match self.hard_kill() {
+            let why = match self.kill_through_before_verdict() {
                 // Every member was just sent SIGKILL, so the leaf drains.
                 Ok(()) if occupied.raw_os_error() == Some(libc::EBUSY) => match self.wait_drained(None) {
                     Ok(_) => match remove_child_cgroups(&self.leaf_path) {
@@ -647,10 +652,82 @@ impl CgroupLeaf {
         }
     }
 
+    /// [`CgroupLeaf::hard_kill`] for a leaf dropped before its verdict, which also reaps every
+    /// member that is this process's own child.
+    ///
+    /// A leaf dropped before its verdict belongs to a spawn that failed, and no handle owns its
+    /// child any more: tokio drops a child it forked, then failed to set up, neither killed nor
+    /// reaped. Killed, it would stay a zombie. Its pid is not known here, so the members are read
+    /// from `cgroup.procs` before the kill and those `waitid` confirms are this process's
+    /// children — only the spawn's own child can be — are reaped once the kill has ended them.
+    fn kill_through_before_verdict(&self) -> Result<(), crate::error::Error> {
+        let orphans = own_children_in(&self.leaf_path.join("cgroup.procs"));
+        self.hard_kill()?;
+        for orphan in orphans {
+            reap_orphan(orphan);
+        }
+        Ok(())
+    }
+
     /// Whether the leaf has members again, read once from `cgroup.events`.
     fn repopulated(&self) -> Result<bool, crate::error::Error> {
         let mut file = File::open(self.events_path()).map_err(crate::error::Error::Io)?;
         read_populated(&mut file, &mut String::new())
+    }
+}
+
+/// The members listed in `procs` that are this process's own unreaped children. An unreadable
+/// list names none: nothing can be reaped that cannot be named.
+#[cfg(target_os = "linux")]
+fn own_children_in(procs: &Path) -> Vec<Pid> {
+    use nix::sys::wait::{waitid, Id, WaitPidFlag};
+
+    let Ok(listed) = fs::read_to_string(procs) else {
+        return Vec::new();
+    };
+    listed
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .map(Pid::from_raw)
+        .filter(|&pid| loop {
+            match waitid(
+                Id::Pid(pid),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => break false,
+                Ok(_) => break true,
+            }
+        })
+        .collect()
+}
+
+/// Reap `orphan`, this process's own child, which the caller has just sent SIGKILL — so the wait
+/// ends with its exit. `ECHILD` means something else already reaped it.
+#[cfg(target_os = "linux")]
+fn reap_orphan(orphan: Pid) {
+    use nix::sys::wait::waitpid;
+
+    let status = loop {
+        match waitpid(orphan, None) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            other => break other,
+        }
+    };
+    match status {
+        Ok(status) => {
+            log::debug!("cgroup v2: reaped {orphan}, a child its failed spawn left behind: {status:?}");
+            #[cfg(test)]
+            fault::record_reaped_orphan(
+                orphan.as_raw() as u32,
+                match status {
+                    nix::sys::wait::WaitStatus::Signaled(_, signal, _) => Some(signal as i32),
+                    _ => None,
+                },
+            );
+        }
+        Err(nix::errno::Errno::ECHILD) => {}
+        Err(e) => log::warn!("cgroup v2: could not reap {orphan}, a child its failed spawn left behind: {e}"),
     }
 }
 
