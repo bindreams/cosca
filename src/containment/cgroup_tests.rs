@@ -1121,8 +1121,7 @@ fn each_placement_report_is_its_own_condition() {
 }
 
 /// Every reason carries its OWN kind, and every kind has a reason here. Two reasons sharing one
-/// kind would make the second one ever seen silently arrive at `debug` — the exact silence this
-/// PR removes, reintroduced.
+/// kind would make the second one ever seen silently arrive at `debug`.
 #[test]
 fn every_degrade_reason_has_its_own_kind() {
     use super::{DegradeKind, DegradeReason};

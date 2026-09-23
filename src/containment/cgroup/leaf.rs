@@ -83,14 +83,8 @@ fn proc_state(pid: u32) -> Option<char> {
     parse_proc_stat_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
-/// A live leaf sub-cgroup created for a single spawned process tree.
-///
-/// The `pre_exec` closure writes `"0"` to `procs_fd` to place the forked
-/// child into the leaf, then immediately closes the fd so it does not
-/// propagate to grandchildren. If the write fails (e.g. EBUSY — the
-/// supervisor's cgroup is itself a leaf, violating the "no internal processes"
-/// rule), the closure returns an error and the spawn falls back to the
-/// process-group mechanism.
+/// A live leaf sub-cgroup created for a single spawned process tree. See
+/// [`place_self_in_cgroup_pre_exec`] for the placement write's contract.
 ///
 /// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report channel: the child
 /// needs them only until its `exec`.
