@@ -594,8 +594,7 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
 }
 
 /// Refuse a program whose Win32-NORMALISED path — `GetFullPathNameW`'s result, which is what
-/// `CreateProcessW` loads — reaches a `.bat`/`.cmd`. The same [`Error::Unsupported`] as
-/// [`reject_batch_path`].
+/// `CreateProcessW` loads — reaches a `.bat`/`.cmd`, for [`batch_refusal`]'s reason.
 ///
 /// [`reject_batch_path`] reads `Path::extension()` of the token as written, which misses what
 /// normalisation exposes: `setup.bat.` and `setup.bat ` (one trailing space) become `setup.bat`,
@@ -620,7 +619,12 @@ pub(crate) fn reject_normalised_batch_path(full: &std::path::Path) -> Result<(),
     Ok(())
 }
 
-/// The CVE-2024-24576 refusal both batch gates return.
+/// The refusal every batch gate returns, and the one statement of why.
+///
+/// Win32 runs a `.bat`/`.cmd` through `cmd.exe`, which re-parses the command line by rules of its
+/// own — its metacharacters (`&`, `|`, `^`, `%`) act even inside the quoting cosca writes for
+/// `CommandLineToArgvW`. So `args(["setup.bat", "a&calc"])` would also run `calc`. That is
+/// CVE-2024-24576 (BatBadBut); cosca refuses the file rather than implement cmd.exe escaping.
 fn batch_refusal(prog: &std::path::Path) -> Error {
     Error::Unsupported {
         op: format!("running {}", prog.display()),
@@ -632,8 +636,8 @@ fn batch_refusal(prog: &std::path::Path) -> Error {
 }
 
 /// Reject a program token carrying an interior NUL, or naming a `.bat`/`.cmd`: Win32 silently
-/// truncates at the NUL (`PCWSTR` has no length), and cmd.exe batch escaping is a distinct,
-/// unimplemented vector (CVE-2024-24576 / BatBadBut). Shared by every backend — the std path
+/// truncates at the NUL (`PCWSTR` has no length), and a batch file is refused for
+/// [`batch_refusal`]'s reason. Shared by every backend — the std path
 /// (`build_std_command`), the raw one (`windows_raw::reject_batch_program`), and the elevated
 /// `ShellExecuteEx` launch.
 ///

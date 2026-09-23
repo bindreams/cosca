@@ -457,12 +457,9 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // Refuse a `.bat`/`.cmd` spelled in the program `elevated_program` returned — the caller's
     // TOKEN, except on the `Exact` arm, where it is that token completed to an absolute path.
     // (Completion only prefixes a directory and applies Win32's own normalisation, so it can add a
-    // `.bat` reading but never remove one; over-rejection is the safe direction here.)
-    // `ShellExecuteEx`'s `runas` resolves the
-    // `batfile` association, which routes through `cmd.exe` and substitutes `lpParameters` into `%*`
-    // UNESCAPED — and `join_wide` quotes only for whitespace, never for cmd metacharacters, so
-    // `args(["setup.bat", "a&calc"])` is command injection into an ELEVATED cmd.exe. That is
-    // CVE-2024-24576, which the raw and std backends both refuse outright.
+    // `.bat` reading but never remove one; over-rejection is the safe direction here.) Why, in
+    // `crate::child::spawn::batch_refusal`; here the `runas` `batfile` association substitutes
+    // `lpParameters` into `%*` unescaped, so the injected command runs ELEVATED.
     //
     // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE. It therefore does NOT
     // close the batch vector. Two of the open surfaces are `wide_nul`'s doc's to name — PATHEXT
