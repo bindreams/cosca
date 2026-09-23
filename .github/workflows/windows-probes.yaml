@@ -83,7 +83,9 @@ jobs:
             --test windows_path_resolution \
             -- "${FILTER}" --ignored --nocapture --test-threads=1
       # A filter matching no test, or only surveys, would otherwise pass having asserted nothing.
+      # Runs after a failure too, so the log shows which canaries passed.
       - name: Require that a canary ran
+        if: always()
         shell: bash
         env:
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers

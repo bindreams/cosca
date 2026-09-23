@@ -5,7 +5,8 @@ use crate::winapi::{full_path_name, has_bat_extension};
 
 /// Run a canary: stamp the OS build, run `body` with the facts it checks and the measurement
 /// failures it hits, then fail on a failure, on a broken fact, on no fact checked, or on an unmet
-/// coverage requirement, in that order. `subject` names what the facts are about.
+/// coverage requirement, in that order; only a canary that passes all of them is marked as passed.
+/// `subject` names what the facts are about.
 pub(crate) fn canary(subject: &'static str, body: impl FnOnce(&mut Disagreements, &mut Vec<String>)) {
     let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
     let mut facts = Disagreements::about(subject);
@@ -17,6 +18,8 @@ pub(crate) fn canary(subject: &'static str, body: impl FnOnce(&mut Disagreements
     );
     facts.assert_none();
     facts.assert_covered();
+    // Last, so no canary that fails any check above can leave a "passed" marker.
+    mark_canary_passed();
 }
 
 /// Platform facts a canary found no longer hold. Distinct from a measurement that could not be
@@ -82,14 +85,13 @@ impl Disagreements {
             self.subject,
             self.broken.join("\n  ")
         );
-        mark_canary_passed();
     }
 }
 
 /// Record that this canary passed, as a file named after the test in `$COSCA_CANARY_MARKERS`
 /// when that is set. The workflow fails a run that leaves no marker, so a test-name filter that
 /// selects only surveys, or nothing, cannot pass having asserted nothing.
-pub(crate) fn mark_canary_passed() {
+fn mark_canary_passed() {
     let Some(dir) = std::env::var_os("COSCA_CANARY_MARKERS") else {
         return;
     };
