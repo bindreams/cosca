@@ -1,8 +1,8 @@
 //! Unit tests for the sync spawn path: error-path teardown (driven by the shared `fault` seam,
 //! defined in `super` and also used by `src/tokio/spawn_tests.rs`), the elevation branch, and the
-//! Windows backend router. In the library (not `tests/`) because the seam is
-//! `pub(crate)`/`#[cfg(test)]` and only reachable from within the crate. The batch gate's tests
-//! are in `spawn/batch_gate_tests.rs`.
+//! Windows backend router, and that a refused spawn refuses before it touches our handle
+//! inheritance. In the library (not `tests/`) because the seam is `pub(crate)`/`#[cfg(test)]` and
+//! only reachable from within the crate. The batch gate's tests are in `spawn/batch_gate_tests.rs`.
 
 use super::fault;
 use crate::command::Command;
@@ -437,4 +437,113 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     file.rewind().expect("rewind the file");
     file.read_to_end(&mut written).expect("read the file");
     assert_eq!(written, b"", "nothing reached the child's stdio");
+}
+
+// ===== A refused spawn leaves our handle inheritance alone =====
+
+/// A refused spawn must not have mutated this process first. `clear_std_handle_inheritance` is a
+/// real, process-global, un-undone `SetHandleInformation` on our own std handles, so running it
+/// before the refusal would leave a disposition-less side effect behind.
+///
+/// The two legs differ by one bit and are one `#[test]` so their order is guaranteed; `cargo
+/// test` gives each test its own thread, so the thread-local seam starts clean. The positive leg
+/// is what stops the negative one passing on a seam that was never wired.
+///
+/// The real handle flags are deliberately NOT measured instead: the mutation is process-global
+/// and permanent, so any earlier contained spawn in this binary would already have made that
+/// observation meaningless.
+#[cfg(windows)]
+#[test]
+fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+
+    let mut refused = Command::new();
+    refused
+        .executable("cmd")
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+
+    let mut allowed = Command::new();
+    allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
+    let child = allowed
+        .spawn()
+        .expect("the same command without the reserved bit spawns");
+    assert!(
+        observe::take_inheritance_cleared(),
+        "the seam must record a real call, else the negative leg above proves nothing"
+    );
+    child.wait().expect("reap");
+}
+
+/// An environment key with an embedded NUL is refused before the process-global handle mutation
+/// too. The seam's wiring is proven by the positive leg of the test above.
+#[cfg(windows)]
+#[test]
+fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+
+    let mut refused = Command::new();
+    refused
+        .executable("cmd")
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .env("A\0B", "x");
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("an embedded NUL must be refused");
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "got {err:?}"
+    );
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+}
+
+/// The std-path counterpart of the test above. The std backend reaches the same process-global
+/// mutation through `containment::prepare`, which composes and validates the creation-flag word
+/// at its top — a separate ordering the raw backends' tests cannot see.
+///
+/// Argv-only and no `executable()`, asserted through `routes_to_raw_backend` so a future routing
+/// change cannot quietly turn this into a third raw-backend test.
+#[cfg(windows)]
+#[test]
+fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
+    use crate::containment::windows::observe;
+
+    let mut refused = Command::new();
+    refused
+        .args(["cmd", "/C", "exit 0"])
+        .contain()
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
+    assert!(
+        !crate::child::spawn::routes_to_raw_backend(&refused),
+        "this leg is only a std-path proof while the command stays off the raw backend"
+    );
+    observe::take_inheritance_cleared();
+    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        !observe::take_inheritance_cleared(),
+        "the refusal ran after the mutation it was supposed to precede"
+    );
+
+    let mut allowed = Command::new();
+    allowed.args(["cmd", "/C", "exit 0"]).contain();
+    let child = allowed
+        .spawn()
+        .expect("the same command without the reserved bit spawns");
+    assert!(
+        observe::take_inheritance_cleared(),
+        "the seam must record a real call, else the negative leg above proves nothing"
+    );
+    child.wait().expect("reap");
 }
