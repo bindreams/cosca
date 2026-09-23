@@ -1,6 +1,7 @@
 //! Test-only helper spawned by the crate's integration tests. std-only, with
-//! one exception: the `report-nested-kill-tree` mode uses the `cosca` crate
-//! to exercise the real nested-member `kill_tree` path. Behavior is selected by argv[1].
+//! two exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
+//! the real nested-member `kill_tree` path, and `spawn-dump-env-block`, to spawn through each
+//! Windows backend. Behavior is selected by argv[1].
 
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
@@ -16,6 +17,11 @@ mod console_identity;
 #[cfg(windows)]
 #[path = "breakaway.rs"]
 mod breakaway;
+
+/// The `dump-env-block` and `spawn-dump-env-block` modes.
+#[cfg(windows)]
+#[path = "env_block.rs"]
+mod env_block;
 
 /// Borrow a std stream's raw descriptor as an UNBUFFERED `File`. `ManuallyDrop` keeps the
 /// real descriptor open (a plain `File` drop would close it — double-close on exit).
@@ -975,6 +981,10 @@ fn main() {
             report_sock.write_all(line.as_bytes()).unwrap();
             report_sock.flush().unwrap();
         }
+        #[cfg(windows)]
+        "dump-env-block" => env_block::dump(),
+        #[cfg(windows)]
+        "spawn-dump-env-block" => env_block::spawn(&args[2], &args[3..]),
         #[cfg(windows)]
         "report-breakaway" => {
             breakaway::run(&args[2], &args[3], &args[4]);
