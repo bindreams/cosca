@@ -290,14 +290,14 @@ const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH
 
 /// A relative `PATH` element (`relbin`, `.`) names a directory under the cwd at detection time, and
 /// a backend found there would be exec-checked against one directory and run from another — or
-/// not found by path at all. The planted `relbin/sudo` sits in the fixture's real cwd, so skipping
-/// it is observable only if the element is refused rather than merely missed.
+/// not found by path at all. `relbin/sudo` and `./sudo` are planted in the fixture's real cwd, so
+/// skipping them is observable only if the element is refused rather than merely missed.
 #[cfg(unix)]
 #[test]
 fn relative_path_elements_are_never_resolved() {
     use std::os::unix::fs::PermissionsExt;
     let cwd = tempfile::tempdir().unwrap();
-    for dir in ["relbin", "abs"] {
+    for dir in ["relbin", "abs", "."] {
         let sudo = cwd.path().join(dir).join("sudo");
         std::fs::create_dir_all(sudo.parent().unwrap()).unwrap();
         std::fs::write(&sudo, b"#!/bin/sh\ntrue\n").unwrap();
