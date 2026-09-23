@@ -15,8 +15,9 @@ impl Drop for OwnedToken {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             // SAFETY: a token handle owned by this guard, closed exactly once.
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            if let Err(e) = unsafe { windows::Win32::Foundation::CloseHandle(self.0) } {
+                log::warn!("CloseHandle of an owned token failed: {e}");
+                debug_assert!(false, "CloseHandle of an owned token should not fail: {e}");
             }
         }
     }

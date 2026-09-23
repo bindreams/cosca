@@ -874,3 +874,23 @@ fn a_poisoned_argument_is_named_before_the_batch_gate() {
         }
     }
 }
+
+/// A failed `CloseHandle` of an owned token is logged and asserted, as `identity::windows::close`
+/// does for a process handle. `0x3` is a handle that cannot be one: the kernel ignores a handle's
+/// low two bits, so this closes handle 0, which fails `ERROR_INVALID_HANDLE` without touching any
+/// real handle — and `is_invalid()` screens only 0 and -1.
+#[test]
+fn a_failed_token_close_is_logged() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let outcome = std::panic::catch_unwind(|| drop(super::OwnedToken(windows::Win32::Foundation::HANDLE(0x3 as _))));
+    assert_eq!(
+        outcome.is_err(),
+        cfg!(debug_assertions),
+        "the debug_assert fires in exactly the builds that keep it"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "CloseHandle of an owned token failed"),
+        "a failed token close must be logged"
+    );
+}
