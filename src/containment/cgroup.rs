@@ -27,13 +27,26 @@
 //!
 //! # Placement reports: when one is final, and what cosca may kill
 //! Every decision about a leaf rests on these rules. `take_placement`, `decide_unwaitable`,
-//! `abandon` and `Drop` each apply them; none has a rule of its own.
+//! `fail_closed`, `abandon_before_verdict` and `Drop` each apply them; none has a rule of its own.
 //!
-//! **Final.** The child sends at most one report, before `exec`. A report is final once it has
-//! been received, or once the child can no longer send one: it has exited (seen through a pidfd
-//! or `waitid`), or the leaf is removed (a removed leaf admits no member, so the child's write
-//! fails). Until then the report is in flight, whatever `spawn` returned — std's `spawn` can
-//! return before the child has run any `pre_exec`. Nothing received is not "not entered".
+//! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying a pidfd for
+//! itself when it can open one, before it touches the leaf; then, after its `cgroup.procs` write,
+//! its *report* — `Placed` or the write's errno. It sends nothing else, and nothing after `exec`.
+//! The pidfd is the leaf's one source of truth about which process is its child: unlike a pid, it
+//! cannot come to name another process, whoever reaps the child.
+//!
+//! **One verdict.** The parent ends the exchange exactly once, by one of two acts:
+//! - *Decide.* `take_placement` reads the report — waiting for it, or for the child's exit — or
+//!   decides without it; then it sends *proceed* and closes the channel. A child whose send fails
+//!   because the parent has decided finds *proceed* queued, and carries on.
+//! - *Abandon.* A spawn that failed before its verdict shuts the channel for reading. Every
+//!   message sent before that is still read; every send after it fails with no *proceed* queued,
+//!   and the child exits without `exec`. After abandonment no child execs, in or out of a leaf.
+//!
+//! **Final.** After either act, what was received is all there will ever be. Before it, a report
+//! is final once received, or once the child has exited (seen through a pidfd or `waitid`) or
+//! the leaf is removed (a removed leaf admits no member). Otherwise it is in flight, whatever
+//! `spawn` returned — std's `spawn` can return before the child has run any `pre_exec`.
 //!
 //! **Absence.** Nothing of the child's is in the leaf only when there is proof of it:
 //! - a final report other than `Placed` — the child either never entered, or exited before
@@ -42,16 +55,16 @@
 //! - the leaf's own removal — `rmdir` succeeds only on a leaf with no live member.
 //!
 //! **Kill.** cosca kills through a leaf whenever it lacks proof of absence, and never when it has
-//! it: an occupant of a leaf that provably holds nothing of the child's is not cosca's to kill. So an
-//! occupied leaf whose report is still in flight is killed through, and then removed — killed
-//! again for as long as anything re-enters it before the removal lands.
+//! it: an occupant of a leaf that provably holds nothing of the child's is not cosca's to kill.
+//! A child cosca gives up on is also killed itself, through its pidfd and as the process group it
+//! leads, whatever the leaf's kill returned — it may have left the leaf, or never entered it.
 //!
 //! **Ownership.** Until `spawn` returns, the child is this process's own unreaped child, and cosca
 //! is the only thing that may signal it (see `Command::contain`). It leads its own process group
-//! (`process_group(0)`), and anything it forks after `exec` starts in that group. A child cosca
-//! gives up on is killed as a group: its descendants are its to answer for, in or out of the
-//! leaf. The group's id cannot name another group while the child is unreaped — a pid number is
-//! not reused while any task, a zombie leader or a group member, still holds it.
+//! (`process_group(0)`), and anything it forks after `exec` starts in that group. A process group's
+//! id cannot name another group while its leader is unreaped. cosca reaps a child only when no
+//! handle owns it — an abandoned spawn whose runtime dropped it — only through its pidfd, and only
+//! after signalling it directly: a wait on anything else could block, or reap another's child.
 
 #[path = "cgroup/parse.rs"]
 mod parse;
