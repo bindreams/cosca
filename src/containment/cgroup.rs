@@ -948,8 +948,8 @@ impl CgroupLeaf {
         let why = match fs::remove_dir(&self.leaf_path) {
             Ok(()) => None,
             Err(e) if removed_after_drain(&e) => None,
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                if self.holds(pid) {
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => match self.holds(pid) {
+                Ok(true) => {
                     log::debug!(
                         "cgroup v2: pidfd_open failed ({source}), but child {pid} is already in its leaf {}",
                         self.leaf_path.display()
@@ -957,8 +957,13 @@ impl CgroupLeaf {
                     self.entered = true;
                     return Ok(Ok(()));
                 }
-                Some(format!("its leaf is occupied ({e}) but not by the child"))
-            }
+                Ok(false) => Some(format!("its leaf is occupied ({e}) but not by the child")),
+                // Unknown membership is not absence: deciding "not the child" on it would leave a
+                // child that may be in the leaf unkilled. Undecided fails closed.
+                Err(read) => Some(format!(
+                    "its leaf is occupied ({e}) and the child's membership could not be read ({read})"
+                )),
+            },
             Err(e) => Some(format!("its leaf could not be removed ({e})")),
         };
         let Some(why) = why else {
@@ -972,16 +977,20 @@ impl CgroupLeaf {
         Err(self.abandon(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
     }
 
-    /// Whether `pid`'s own cgroup is this leaf or nested under it. A leaf with no known
-    /// unified-hierarchy path (a test leaf) holds nothing.
-    fn holds(&self, pid: u32) -> bool {
+    /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
+    /// A leaf with no known unified-hierarchy path (a test leaf) holds nothing.
+    fn holds(&self, pid: u32) -> io::Result<bool> {
         let Some(leaf) = &self.cgroup_path else {
-            return false;
+            return Ok(false);
         };
-        fs::read_to_string(format!("/proc/{pid}/cgroup"))
-            .ok()
-            .and_then(|text| parse_v2_relative_path(&text).map(|path| is_at_or_under(path, leaf)))
-            .unwrap_or(false)
+        #[cfg(test)]
+        if fault::take_force_membership_unreadable() {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+        let path = parse_v2_relative_path(&text)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
+        Ok(is_at_or_under(path, leaf))
     }
 
     /// Fail a spawn whose membership cannot be decided: kill the child as a group, which ends its
@@ -1312,6 +1321,7 @@ pub(crate) mod fault {
         static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
         static FORCE_PIDFD_FAILURE: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
         static FORCE_SIGNAL_DENIED: Cell<bool> = const { Cell::new(false) };
+        static FORCE_MEMBERSHIP_UNREADABLE: Cell<bool> = const { Cell::new(false) };
         static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1372,6 +1382,18 @@ pub(crate) mod fault {
     }
     pub(crate) fn signal_denied_armed() -> bool {
         FORCE_SIGNAL_DENIED.with(|f| f.get())
+    }
+
+    /// Fail the NEXT read of a child's `/proc/<pid>/cgroup` with `EACCES`, as a `hidepid` or
+    /// seccomp-restricted `/proc` can — which a root test lane cannot reproduce for its own child.
+    pub(crate) fn set_force_membership_unreadable(on: bool) {
+        FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_membership_unreadable() -> bool {
+        FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.replace(false))
+    }
+    pub(crate) fn membership_unreadable_armed() -> bool {
+        FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.get())
     }
 
     /// Put a directory inside the NEXT leaf whose creation fails, just before its unwind runs, so

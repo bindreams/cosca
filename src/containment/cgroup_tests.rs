@@ -2016,3 +2016,47 @@ fn abandon_does_not_wait_on_a_child_it_may_not_signal() {
     child.kill().expect("kill the child");
     child.wait().expect("reap the child");
 }
+
+/// An occupied leaf whose child's membership cannot be read is undecided, not "not the child":
+/// the spawn fails closed — its child killed — and the read's own error is the reason given.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    use crate::containment::TreeDrain;
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let mut leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    // The child reports through a channel of its own, so the leaf's has nothing queued.
+    let own = super::ReportChannel::new().expect("open the child's channel");
+    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("300").process_group(0);
+    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
+    // on descriptors `leaf` and `own` keep open across the spawn.
+    unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let mut child = cmd.spawn().expect("spawn the child");
+
+    super::fault::set_force_pidfd_failure(true);
+    super::fault::set_force_membership_unreadable(true);
+    let err = match leaf.take_placement(child.id()) {
+        Err(e) => e,
+        Ok(verdict) => panic!("an unreadable membership must fail closed, got {verdict:?}"),
+    };
+    assert!(
+        !super::fault::membership_unreadable_armed(),
+        "the seam must be consumed by the membership read"
+    );
+    assert!(err.to_string().contains("could not be read"), "got {err}");
+    assert_eq!(
+        child.wait().expect("reap the child").signal(),
+        Some(libc::SIGKILL),
+        "the child must be killed"
+    );
+    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
+}
