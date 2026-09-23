@@ -185,8 +185,15 @@ enum Failure {
 
 /// Launch `file` in `dir` through `ShellExecuteExW(verb)`, optionally as `class`, from a
 /// single-threaded COM apartment as cosca's own launch does, and return what the payload reported.
+///
+/// Every launch in a test reuses `report`, so a previous launch's file that survives here would be
+/// read as this one's. Only its absence counts as cleared.
 fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<Report, Failure> {
-    let _ = std::fs::remove_file(report);
+    match std::fs::remove_file(report) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Failure::Other(format!("could not clear the previous report: {e}"))),
+    }
     // SAFETY: paired with the `CoUninitialize` below on this thread.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
     if com.is_err() {
