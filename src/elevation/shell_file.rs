@@ -154,10 +154,14 @@ pub(crate) fn reject_app_path(program: &Path, registered: &[AppPath]) -> Result<
     Ok(())
 }
 
-/// Whether the text before the first `:` is two or more UTF-16 units with no separator in it.
+/// Whether the text before the first `:` is a non-empty run with no separator in it that is not a
+/// drive — two or more UTF-16 units, by the rule [`drive_prefix_len`] applies.
+///
+/// [`drive_prefix_len`]: crate::child::spawn::drive_prefix_len
 fn has_scheme(text: &str) -> bool {
-    text.split_once(':')
-        .is_some_and(|(scheme, _)| !scheme.contains(['\\', '/']) && scheme.encode_utf16().nth(1).is_some())
+    text.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty() && !scheme.contains(['\\', '/']) && crate::child::spawn::drive_prefix_len(text).is_none()
+    })
 }
 
 #[cfg(test)]

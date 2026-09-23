@@ -434,7 +434,7 @@ fn is_drive_prefix(component: &str) -> bool {
 /// `RtlDetermineDosPathNameType_U`), so ANY one UTF-16 unit is a drive: `1:`, `é:`, and the U+FFFD
 /// a lone surrogate becomes through `to_string_lossy`. A character outside the BMP is two units,
 /// so `Path[1]` is its low surrogate and `𝒳:` is no drive.
-fn drive_prefix_len(text: &str) -> Option<usize> {
+pub(crate) fn drive_prefix_len(text: &str) -> Option<usize> {
     let mut chars = text.char_indices();
     let (_, drive) = chars.next()?;
     let (colon, ':') = chars.next()? else {
