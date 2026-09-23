@@ -396,6 +396,10 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
+    // std runs a batch file through cmd.exe after `GetFullPathNameW`, so `setup.bat.` and
+    // `C:\t\.bat` are batch files too; a `commandline()` tail would then reach cmd.exe unescaped.
+    #[cfg(windows)]
+    reject_normalised_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
     match cwd {
         Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,

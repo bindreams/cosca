@@ -279,9 +279,9 @@ impl Command {
     /// `whoami.exe` is not. Whether `PATHEXT` is also applied to a name that already ends in
     /// `.exe` is unmeasured.
     ///
-    /// An elevated spawn also refuses a `.bat`/`.cmd` that only Win32's normalisation exposes,
-    /// such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one trailing space) and
-    /// `C:\t\.bat`, with [`Error::Unsupported`] (CVE-2024-24576).
+    /// Every Windows spawn, elevated or not, refuses a `.bat`/`.cmd` that only Win32's
+    /// normalisation exposes, such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one
+    /// trailing space) and `C:\t\.bat`, with [`Error::Unsupported`] (CVE-2024-24576).
     ///
     /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
     /// replaces the other.

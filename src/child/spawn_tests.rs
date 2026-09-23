@@ -335,6 +335,50 @@ fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
     }
 }
 
+/// Argv and command-line commands on the default std route (no `executable()`, no fd >= 3).
+#[cfg(windows)]
+fn std_routed(args: &[&str], lines: &[&str]) -> Vec<(String, Command)> {
+    let mut out = Vec::new();
+    for &n in args {
+        let mut c = Command::new();
+        c.args([n]);
+        out.push((format!("args([{n:?}])"), c));
+    }
+    for &l in lines {
+        let mut c = Command::new();
+        c.commandline(l);
+        out.push((format!("commandline({l:?})"), c));
+    }
+    for (via, c) in &out {
+        assert!(!super::routes_to_raw_backend(c), "{via} must take the std route");
+    }
+    out
+}
+
+/// std runs a batch file through cmd.exe once `GetFullPathNameW` has trimmed the name, and a
+/// `commandline()` tail reaches it unescaped, so these must be refused as they are on the raw route.
+#[cfg(windows)]
+#[test]
+fn the_std_route_refuses_a_batch_only_normalisation_exposes() {
+    // Trailing dot; one trailing space; a file named `.bat`.
+    for (via, c) in std_routed(&["x.bat.", "x.bat ", ".bat"], &["x.bat. a&b"]) {
+        match super::build_std_command(&c) {
+            Err(Error::Unsupported { .. }) => {}
+            other => panic!("{via}: expected Unsupported, got {:?}", other.map(|_| "a command")),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_std_route_accepts_an_exe_named_like_a_batch() {
+    for (via, c) in std_routed(&["x.bat.exe", "tool.exe"], &["x.bat.exe a&b"]) {
+        if let Err(e) = super::build_std_command(&c) {
+            panic!("{via}: {e:?}");
+        }
+    }
+}
+
 /// The Win32 verdict refuses an interior NUL too, on BOTH NUL/batch shapes — the derivation is in
 /// [`super::reject_batch_path_on`]'s doc. Neither may come back as the batch refusal: on
 /// `setup` + NUL + `.bat` Win32 loads `setup`, which carries no batch vector at all, and on
