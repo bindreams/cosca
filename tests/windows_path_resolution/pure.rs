@@ -133,3 +133,17 @@ pub fn payload_outcome(code: Option<i32>, stdout: &str) -> PayloadOutcome<'_> {
         _ => PayloadOutcome::OtherExit,
     }
 }
+
+/// `Ok` if every step succeeded, else one error naming every step that failed, so an early
+/// failure never hides a later one.
+pub fn all_succeeded(steps: impl IntoIterator<Item = (&'static str, Result<(), String>)>) -> Result<(), String> {
+    let failed: Vec<String> = steps
+        .into_iter()
+        .filter_map(|(step, r)| r.err().map(|e| format!("{step}: {e}")))
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}

@@ -119,3 +119,16 @@ fn payload_outcome_separates_the_payloads_own_error_from_other_exits() {
     assert_eq!(payload_outcome(Some(1), err), PayloadOutcome::OtherExit);
     assert_eq!(payload_outcome(None, ok), PayloadOutcome::OtherExit);
 }
+
+#[test]
+fn all_succeeded_reports_every_failed_step() {
+    assert_eq!(all_succeeded([("a", Ok(())), ("b", Ok(()))]), Ok(()));
+    assert_eq!(
+        all_succeeded([
+            ("query", Err("e1".into())),
+            ("kill", Ok(())),
+            ("reap", Err("e3".into()))
+        ]),
+        Err("query: e1; reap: e3".to_string())
+    );
+}

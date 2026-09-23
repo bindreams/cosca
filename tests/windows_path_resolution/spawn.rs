@@ -2,7 +2,7 @@
 
 use crate::dots_and_spaces::WEIRD_NAMES;
 use crate::harness::canary;
-use crate::pure::{payload_outcome, verbatim_spelling, PayloadOutcome};
+use crate::pure::{all_succeeded, payload_outcome, verbatim_spelling, PayloadOutcome};
 use crate::winapi::{outcome, wide};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0};
@@ -288,9 +288,14 @@ pub(crate) fn suspended_image(program: &str) -> Result<String, String> {
     // Terminate and reap whatever happened above: the process must never be resumed.
     let killed = child.kill();
     let reaped = child.wait();
-    queried.map_err(|e| format!("QueryFullProcessImageNameW on the child of {program:?} failed: {e}"))?;
-    killed.map_err(|e| format!("could not terminate the suspended child of {program:?}: {e}"))?;
-    reaped.map_err(|e| format!("could not reap the child of {program:?}: {e}"))?;
+    // All three are reported: a failed kill is what would let the child run, so it must never be
+    // hidden behind a failed query.
+    all_succeeded([
+        ("QueryFullProcessImageNameW", queried.map_err(|e| e.to_string())),
+        ("terminate", killed.map_err(|e| e.to_string())),
+        ("reap", reaped.map(drop).map_err(|e| e.to_string())),
+    ])
+    .map_err(|why| format!("the suspended child of {program:?}: {why}"))?;
     Ok(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
