@@ -983,32 +983,21 @@ fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
     );
-    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
-    let own = std::path::Path::new("/sys/fs/cgroup").join(
-        own.lines()
-            .find_map(|l| l.strip_prefix("0::/"))
-            .expect("a unified line"),
-    );
-    let before: Vec<_> = std::fs::read_dir(&own)
-        .expect("list")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
-
     crate::containment::cgroup::fault::set_force_inotify_failure(true);
     let result = crate::containment::cgroup::try_create_leaf();
     let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
-    let after: Vec<_> = std::fs::read_dir(&own)
-        .expect("list")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
 
     assert!(consumed, "the creation must have tried, and failed, to watch");
-    match result {
-        Err(LeafError::WatchDrain { source, .. }) => assert_eq!(source.raw_os_error(), Some(libc::EMFILE)),
+    // The error names the leaf it made, so the check needs no view of what else is in its parent.
+    let leaf = match result {
+        Err(LeafError::WatchDrain { source, path }) => {
+            assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
+            path.parent().expect("cgroup.events is in the leaf").to_path_buf()
+        }
         Err(e) => panic!("expected WatchDrain, got {e:?}"),
         Ok(_) => panic!("a leaf whose drain cannot be watched must not be created"),
-    }
-    assert_eq!(before, after, "the half-made leaf must be removed");
+    };
+    assert!(!leaf.exists(), "the half-made leaf must be removed: {}", leaf.display());
 }
 
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
