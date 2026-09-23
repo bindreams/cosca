@@ -314,18 +314,8 @@ impl Command {
     ///   the name there, both from the cwd it inherits, so no path to this process's cwd is ever
     ///   needed and the file loaded and the directory run in are always the same.
     ///
-    ///   Under [`elevate`](Self::elevate), `sudo` and `doas` are handed `./tool` and started in
-    ///   that directory, so they too read the name against the directory itself, after
-    ///   authenticating — though a sudoers `runcwd` makes `sudo` read it in the directory the
-    ///   administrator chose instead. `pkexec` and `run0` pick their own directory, so they are
-    ///   handed an absolute path completed against this process's cwd (read once); a rename of an
-    ///   ancestor during authentication can redirect it. `osascript`'s shell `cd`s to that
-    ///   absolute directory and runs `./tool` there. On those three a cwd with no usable path fails
-    ///   the spawn. An unlinked directory fails the reading everywhere, with `NotFound` and an
-    ///   error saying why a path was needed. An unsearchable ancestor fails it on macOS, with
-    ///   `PermissionDenied` and the same explanation; on Linux the reading succeeds and entering
-    ///   the path fails later with a plain `PermissionDenied`. The backend may still run the
-    ///   file elsewhere — see there. An already-root caller runs no backend and spawns as above.
+    ///   Under [`elevate`](Self::elevate), see that method's doc for which directory each
+    ///   backend runs in; the file loaded here is always the one the directory it names holds.
     ///
     /// [`executable`](Self::executable) resolves against the child's working directory on both.
     /// The divergence is inherited from the platform primitives, not chosen here.
@@ -680,13 +670,28 @@ impl Command {
     /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
     /// CHILD, never this process.
     ///
-    /// On POSIX the backend, not cosca, decides the directory the child runs in:
-    /// [`current_dir`](Self::current_dir), or the one a relative
-    /// [`raw_executable`](Self::raw_executable) was completed against, is where the backend is
-    /// started. `pkexec` then switches to the target user's home, and a sudoers `runcwd` moves
-    /// `sudo`'s child the same way — measured: pkexec 0.105–127 and sudo 1.9.5–1.9.17 with
-    /// `runcwd=~` ran it in `/root`. The macOS graphical path states the directory in its own
-    /// script and is unaffected.
+    /// On POSIX the backend, not cosca, decides the directory the child runs in. The backend is
+    /// started in [`current_dir`](Self::current_dir), or this process's cwd; `pkexec` then
+    /// switches to the target user's home, and a sudoers `runcwd` moves `sudo`'s child the same
+    /// way — measured: pkexec 0.105–127 and sudo 1.9.5–1.9.17 with `runcwd=~` ran it in `/root`.
+    ///
+    /// A relative [`raw_executable`](Self::raw_executable) reaches each backend in a form it
+    /// cannot search:
+    ///
+    /// - `sudo` and `doas` are handed `./tool` in the directory they are started in, and read it
+    ///   there after authenticating; under a sudoers `runcwd`, `./tool` is then not found.
+    /// - `pkexec` and `run0` pick their own directory, so they are handed an absolute path
+    ///   completed against this process's cwd (read once); a rename of an ancestor during
+    ///   authentication can redirect it.
+    /// - `osascript`'s shell `cd -P`s to that absolute directory and runs `./tool` there, so this
+    ///   path runs the child in the directory whatever the trampoline does.
+    ///
+    /// On the three that need a path, a cwd with no usable path fails the spawn. An unlinked
+    /// directory fails the reading everywhere, with `NotFound` and an error saying why a path was
+    /// needed. An unsearchable ancestor fails it on macOS, with `PermissionDenied` and the same
+    /// explanation; on Linux the reading succeeds and entering the path fails later with a plain
+    /// `PermissionDenied`. An already-root caller runs no backend and spawns as it would
+    /// unelevated.
     pub fn elevate(&mut self) -> &mut Command {
         self.elevation.enabled = true;
         self
