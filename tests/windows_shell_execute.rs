@@ -6,12 +6,12 @@
 //! image for anything, a batch file included. `SEE_MASK_CLASSNAME` sends shell32 straight to the
 //! class's verb command instead (`SHELL_execute_class`). This measures both on a real runner.
 //!
-//! Dispatch-only: it ELEVATES, so it runs only when the `windows-probes` workflow is dispatched
-//! with `elevating=true`, on a runner whose process is already elevated (GitHub's Windows runners
-//! are), so `runas` raises no prompt. It launches only copies of `cosca_testbin_image` — never a
-//! batch file — and registers one volatile App Paths key in HKLM and then in HKCU, each deleted by
-//! a guard. Creating a volatile key also creates any missing parent volatile, and that parent is
-//! left behind; it goes at the next reboot, with the ephemeral runner.
+//! It ELEVATES, so the `windows-probes` workflow runs it in a step of its own, on a runner whose
+//! process is already elevated (GitHub's Windows runners are), so `runas` raises no prompt. It
+//! launches only copies of `cosca_testbin_image` — never a batch file — and registers one volatile
+//! App Paths key in HKLM and then one in HKCU, each deleted by a guard. Creating a volatile key also
+//! creates any missing parent volatile, and that parent is left behind (seen on arm64, whose HKCU
+//! has no `App Paths` key); it goes at the next reboot, with the ephemeral runner.
 //!
 //! The tests share process-global state — the registry keys, `PATH`, one environment variable —
 //! so each holds [`serial`] for its whole body, whatever `--test-threads` says.
