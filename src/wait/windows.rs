@@ -118,6 +118,7 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
 /// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
 /// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`;
 /// `None` = unbounded.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
 pub(crate) fn block_until_exit_or_cancel(
     id: ProcessId,
     grace: Option<Duration>,
