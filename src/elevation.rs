@@ -21,6 +21,8 @@ pub(crate) mod plan;
 #[path = "elevation/posix.rs"]
 pub(crate) mod posix;
 pub(crate) mod sanitize;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod shell_file;
 #[cfg(windows)]
 #[path = "elevation/windows.rs"]
 pub(crate) mod windows;

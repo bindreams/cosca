@@ -438,18 +438,20 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // `crate::child::spawn::batch_refusal`; here the `runas` `batfile` association substitutes
     // `lpParameters` into `%*` unescaped, so the injected command runs ELEVATED.
     //
-    // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE, so two surfaces
-    // get past it — PATHEXT completion of an extension-less token, and the other registered
-    // `runas` associations (see `wide_nul`'s doc). The image allowlist below the planner closes
-    // both on the consent path, for every arm.
+    // The batch gate reads the caller's STRING, so a token `ShellExecuteEx` REWRITES before opening
+    // is refused first: quoted, a URL (`file:` is percent-decoded), a `shell:`/`::{CLSID}` name, or
+    // one holding a `%`. See `shell_file`. On what is left, the gate judges the name Win32 resolves
+    // the token to — trailing dots and spaces, `..` collapse, drive and UNC and device roots, and
+    // data-stream pieces.
     //
-    // The third is token NORMALIZATION before the load, and the gate below does close it: it
-    // judges the name Win32 resolves the token to rather than `Path::extension()`, so trailing dots
-    // and spaces (`setup.bat.`, `setup.bat `), a leading-dot name (`C:\tools\.bat`), `..` collapse
-    // (`setup.bat\x\..`), a batch-named UNC share, and a data-stream piece (`x.exe:p.bat`,
-    // `x.bat:s`, with or without `\\?\`) are all refused. What stays open is only what
-    // ShellExecuteEx finds by LOOKUP rather than by reading the token — the two surfaces above,
-    // plus an App Paths registration of a bare name.
+    // What stays open is what `ShellExecuteEx` finds by LOOKUP rather than by reading the token,
+    // which `wide_nul`'s doc also names: default-extension completion of a token without one
+    // (`PathFileExistsDefExtW`/`PathResolveW` try `.bat` and `.cmd`, for a path with a directory
+    // too), an App Paths registration of a bare name, and the other registered `runas`
+    // associations. Each lands in a later PR: resolution makes the completion ours
+    // (`resolve_executable_in` never reads PATHEXT), and an extension allowlist covers the
+    // associations.
+    crate::elevation::shell_file::reject_shell_rewrite(std::path::Path::new(&program))?;
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
     crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
 

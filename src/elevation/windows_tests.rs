@@ -613,6 +613,27 @@ fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_
     }
 }
 
+/// A token ShellExecuteEx rewrites before it opens it is refused, whatever it rewrites to: a
+/// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`.
+#[test]
+fn launch_runas_refuses_a_token_shell_execute_rewrites() {
+    for elevated in [false, true] {
+        for probe in [
+            r#""C:\tools\setup.bat""#,
+            "file:///C:/tools/setup%2Ebat",
+            "shell:startup",
+            r"C:\tools\%X%",
+        ] {
+            let mut c = Command::new();
+            c.args([probe, "a&calc"]).elevate();
+            assert!(
+                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                "elevated={elevated}: {probe:?} is rewritten by ShellExecuteEx before it is opened"
+            );
+        }
+    }
+}
+
 /// A NUL-truncated path that only LOOKS like a batch file (`C:\tools\setup` + NUL + `.bat`): Win32
 /// launches `C:\tools\setup`, a different program than the caller named and no batch file at all.
 /// Whichever gate refuses it must therefore say NUL and not CVE-2024-24576, or the caller is sent
