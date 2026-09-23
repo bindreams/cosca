@@ -148,9 +148,18 @@ jobs:
       # cargo-hack's powerset of {pty, serde, tokio} (8 combinations) already
       # covers the no-feature case.
       #
-      # Placed after the test steps above (not right after Build), gated on
-      # `!cancelled()`: a lint failure here used to short-circuit the job
-      # before any test ran. Now tests always get to report, lint or no lint.
+      # Placed after the test steps above, not right after Build: step order
+      # (not the `!cancelled()` gate below) is what keeps the earlier test
+      # steps' own results green if this step later fails — each step's
+      # conclusion is fixed when it finishes, and GitHub Actions runs steps
+      # in the order they're listed. `!cancelled()` instead lets this step
+      # still run and report its own result even if an earlier step in the
+      # job already failed; the job as a whole still fails regardless,
+      # because that earlier step keeps its own failing conclusion.
+      #
+      # Adds about 36s to the windows/amd64 leg (2s install + 34s clippy),
+      # measured against main (job 106991533545), which has no Windows
+      # clippy step at all.
       #
       # Runs on amd64 only, not arm64: nothing in this crate's Windows code is
       # `cfg(target_arch = ...)`-gated (checked: no such attribute exists in the
@@ -159,13 +168,14 @@ jobs:
       # `cargo xwin` and getting the same (clean) result. Linting both would
       # double Windows runner-minutes for no additional coverage.
       - name: Install cargo-hack
+        id: install-cargo-hack
         if: ${{ !cancelled() && matrix.os == 'windows' && matrix.arch == 'amd64' }}
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-hack
+          tool: cargo-hack@0.6
 
       - name: Clippy (feature powerset)
-        if: ${{ !cancelled() && matrix.os == 'windows' && matrix.arch == 'amd64' }}
+        if: ${{ !cancelled() && steps.install-cargo-hack.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' }}
         run: cargo hack clippy --locked --target ${{ matrix.target }} --all-targets --feature-powerset -- -D warnings
 
       # Release lane (debug_assertions off): exercises the calm-release arm of the
