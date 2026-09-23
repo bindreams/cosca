@@ -150,12 +150,11 @@ fn oracle_landing(rest: &[Comp], root: Root) -> Landing {
 /// are known here by construction, while `win32_effective_file_name` has to recover them from the
 /// joined string, and that re-parse is where every bypass in this gate's history has lived.
 ///
-/// A UNC ROOT is modelled here on its own terms, not borrowed from the gate. Two leading
+/// A UNC ROOT is modelled here on its own terms, not borrowed from the gate: two leading
 /// [`Comp::Empty`] are the `\\`; the next two components are server and share, by position, and no
-/// `..` pops below them — the path then resolves to `\\server\share`, whose share is the final
-/// name. Without that model this oracle treated every rooted path as rootless and ACCEPTED
-/// `\\y\x.bat\..` exactly as the gate did, so their agreement proved only that one model was
-/// self-consistent.
+/// `..` pops below them — the path resolves to `\\server\share`, whose share is the final name.
+/// Modelling the root independently is what makes agreement with the gate meaningful rather than
+/// two implementations sharing one mistake.
 ///
 /// A DEVICE root is `\\` followed by `.` or `?` and then a separator or the end: `\\.\` and the
 /// slash spellings of `\\?\` (measured: `//?/` and `\\?/` open files like plain paths). Only it is

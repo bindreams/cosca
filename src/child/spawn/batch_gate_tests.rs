@@ -5,7 +5,8 @@
 use crate::command::Command;
 use crate::error::Error;
 
-/// Why `is_batch_program` no longer spells out the as-written reading beside the stream reading.
+/// Why `is_batch_program` does not spell out the as-written reading beside the stream reading: the
+/// stream reading subsumes it.
 ///
 /// If `is_batch_by_shell` fires on a name, the LAST piece `ntfs_stream_names` yields from it
 /// carries the same final dot and the same extension, so the stream reading fires too:
