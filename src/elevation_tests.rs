@@ -153,10 +153,17 @@ fn is_elevated_matches_effective_uid_ground_truth() {
     assert_eq!(super::is_elevated(), euid0, "is_elevated disagreed with geteuid()==0");
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+#[test]
+fn detect_reports_linux() {
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
+    assert_eq!(h.os, super::plan::Os::Linux);
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 #[test]
 fn detect_reports_unix_os() {
-    let h = super::plan::Host::detect();
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
     assert_eq!(h.os, super::plan::Os::Unix);
 }
 
@@ -165,7 +172,7 @@ fn detect_reports_unix_os() {
 #[cfg(target_os = "macos")]
 #[test]
 fn detect_reports_macos() {
-    let h = super::plan::Host::detect();
+    let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
     assert_eq!(h.os, super::plan::Os::MacOs);
     assert!(
         h.available.osascript.is_some(),

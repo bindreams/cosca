@@ -22,6 +22,82 @@ mod breakaway;
 #[path = "env_block.rs"]
 mod env_block;
 
+/// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
+/// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
+/// test sees which inode was exec'd), the arguments, and, for a launch, whether its program
+/// exists (`F_OK`, all pkexec checks of an absolute program), whether this caller could run it
+/// (`X_OK`), and the directory it runs in. `--version` prints `real/version`. Never elevates.
+#[cfg(target_os = "linux")]
+fn fake_pkexec(args: &[String]) {
+    let exe = std::fs::read_link("/proc/self/exe").expect("/proc/self/exe");
+    let real_dir = exe.parent().expect("real/");
+    let mut line = format!("argv0={} exe={} args={}", args[0], exe.display(), args[1..].join(" "));
+    if args.get(1).map(String::as_str) == Some("--version") {
+        print!(
+            "{}",
+            std::fs::read_to_string(real_dir.join("version")).expect("real/version")
+        );
+    } else {
+        let program = std::ffi::CString::new(args.last().expect("a program").as_str()).expect("no NUL");
+        // SAFETY: a valid NUL-terminated path; read-only permission queries.
+        let (f_ok, x_ok) = unsafe {
+            (
+                libc::access(program.as_ptr(), libc::F_OK) == 0,
+                libc::access(program.as_ptr(), libc::X_OK) == 0,
+            )
+        };
+        let cwd = std::fs::read_link("/proc/self/cwd").expect("/proc/self/cwd");
+        line.push_str(&format!(" f_ok={f_ok} x_ok={x_ok} cwd={}", cwd.display()));
+    }
+    let log = real_dir.parent().expect("the temp root").join("pkexec.log");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .expect("open the log");
+    writeln!(f, "{line}").expect("append to the log");
+}
+
+/// If root, become the `uid:gid` the test names in `COSCA_TEST_DROP_TO`: one the test checked this
+/// user namespace maps. `setgroups` is skipped where the namespace denies it
+/// (`/proc/self/setgroups` reads `deny`), leaving the supplementary groups root had. Runs
+/// single-threaded, before anything else in the mode.
+#[cfg(unix)]
+fn drop_root() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let target = std::env::var("COSCA_TEST_DROP_TO").expect("a root testbin needs COSCA_TEST_DROP_TO=uid:gid");
+    let (uid, gid) = target.split_once(':').expect("COSCA_TEST_DROP_TO is uid:gid");
+    let uid: libc::uid_t = uid.parse().expect("uid");
+    let gid: libc::gid_t = gid.parse().expect("gid");
+    let setgroups_denied = std::fs::read_to_string("/proc/self/setgroups").is_ok_and(|s| s.trim() == "deny");
+    // SAFETY: plain credential syscalls on this single-threaded process; each result is checked.
+    unsafe {
+        if !setgroups_denied {
+            assert_eq!(
+                libc::setgroups(0, std::ptr::null()),
+                0,
+                "setgroups: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(
+            libc::setgid(gid),
+            0,
+            "setgid({gid}): {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::setuid(uid),
+            0,
+            "setuid({uid}): {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(libc::geteuid(), 0, "still root after setuid");
+    }
+}
+
 /// Borrow a std stream's raw descriptor as an UNBUFFERED `File`. `ManuallyDrop` keeps the
 /// real descriptor open (a plain `File` drop would close it — double-close on exit).
 /// Callers must pass one of this process's std descriptors, which live for the whole run.
@@ -91,6 +167,11 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "linux")]
+    if std::fs::read_link("/proc/self/exe").is_ok_and(|exe| exe.file_name() == Some("pkexec-impl".as_ref())) {
+        fake_pkexec(&args);
+        return;
+    }
     let mode = args.get(1).map(String::as_str).unwrap_or("");
     match mode {
         "argv0" => {
@@ -1227,6 +1308,27 @@ fn main() {
         }
         "is-elevated-report" => {
             println!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });
+        }
+        // `tests/elevation_pkexec_version.rs`: a `Backend::Pkexec` + `Auth::Gui` spawn of
+        // `/bin/true`, from a non-root uid, reported as `OK` or `UNSUPPORTED <detail>`. The test
+        // gives this process a `PATH` holding only a fake pkexec.
+        #[cfg(unix)]
+        "elevate-pkexec-report" => {
+            drop_root();
+            // `elevate-pkexec-report <raw_executable> [<current_dir>]`.
+            let mut c = cosca::Command::new();
+            c.raw_executable(&args[2]).args([&args[2]]);
+            if let Some(dir) = args.get(3) {
+                c.current_dir(dir);
+            }
+            c.elevation_backend(cosca::elevation::Backend::Pkexec)
+                .elevation_auth(cosca::elevation::Auth::Gui);
+            match c.output() {
+                Ok(o) if o.status.success() => println!("OK"),
+                Ok(o) => println!("EXIT {:?}", o.status),
+                Err(cosca::error::Error::Unsupported { detail, .. }) => println!("UNSUPPORTED {detail}"),
+                Err(e) => println!("ERROR {e}"),
+            }
         }
         #[cfg(unix)]
         "controlling-terminal" => {

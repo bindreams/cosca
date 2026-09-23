@@ -26,6 +26,8 @@ fn win_host(elevated: bool) -> Host {
         available: BackendSet::default(),
         os: Os::Windows,
         arg_max: None,
+        pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
     }
 }
 
@@ -44,8 +46,10 @@ fn unix_host(available: BackendSet, elevated: bool, has_tty: bool) -> Host {
         elevated,
         has_tty,
         available,
-        os: Os::Unix,
+        os: Os::Linux,
         arg_max: None,
+        pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
     }
 }
 
@@ -142,6 +146,8 @@ fn windows_unprivileged_elevates_via_uac() {
         available: BackendSet::default(),
         os: Os::Windows,
         arg_max: None,
+        pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
     };
     assert!(matches!(
         h.plan(Privilege::Elevated, Backend::Auto, Auth::Interactive),
@@ -281,6 +287,53 @@ fn pkexec_with_gui_is_accepted() {
     ));
 }
 
+/// cosca launches pkexec through Linux's `/proc`, so a non-Linux Unix refuses it up front, naming
+/// that, whatever pkexec's version.
+#[test]
+fn pkexec_off_linux_is_refused_naming_linux() {
+    for elevated in [false, true] {
+        let h = Host {
+            os: Os::Unix,
+            ..unix_host(all_backends(), elevated, true)
+        };
+        match reject_error(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui)) {
+            Error::Unsupported { detail, .. } => {
+                assert!(detail.contains("Linux"), "{detail}");
+                assert!(!detail.contains("121"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+}
+
+/// A pkexec found on PATH whose real file could not be found is reported as that, not as missing.
+#[test]
+fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
+    let mut h = unix_host(
+        BackendSet {
+            pkexec: None,
+            ..all_backends()
+        },
+        false,
+        true,
+    );
+    h.pkexec_version = crate::elevation::pkexec::PkexecVersion::Unresolved {
+        path: "/opt/bin/pkexec".into(),
+        error: "Too many levels of symbolic links (os error 40)".into(),
+    };
+    match reject_error(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui)) {
+        Error::Elevation {
+            kind: ElevationErrorKind::BackendUnavailable,
+            detail,
+        } => {
+            assert!(detail.contains("/opt/bin/pkexec"), "{detail}");
+            assert!(detail.contains("Too many levels of symbolic links"), "{detail}");
+            assert!(!detail.contains("not on PATH"), "{detail}");
+        }
+        other => panic!("expected BackendUnavailable, got {other:?}"),
+    }
+}
+
 /// A macOS host: sudo exists, pkexec/run0/doas do not, osascript does.
 fn macos_host(elevated: bool, has_tty: bool) -> Host {
     Host {
@@ -295,6 +348,8 @@ fn macos_host(elevated: bool, has_tty: bool) -> Host {
         },
         os: Os::MacOs,
         arg_max: Some(1_048_576),
+        pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
     }
 }
 

@@ -16,6 +16,9 @@ use zeroize::Zeroize;
 // test-only, exactly like the `command.rs` accessors it calls.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod macos;
+// Pure, and a `Host` field everywhere; only the unix rewrite reads it.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) mod pkexec;
 pub(crate) mod plan;
 #[cfg(unix)]
 #[path = "elevation/posix.rs"]
@@ -122,6 +125,13 @@ pub enum Backend {
     Run0,
     Sudo,
     Doas,
+    /// Requires Linux and polkit 121 or later (`pkexec --keep-cwd`); an older pkexec takes the flag
+    /// for the program name. A spawn that would launch pkexec — `Auth::Gui`, not already root —
+    /// first runs `pkexec --version` and refuses one it cannot show to be 121 or later with
+    /// [`crate::error::Error::Unsupported`]. The pkexec on `PATH` is opened once, and both that
+    /// check and the launch exec the opened file (`/proc/self/fd/N`), so a pkexec replaced in
+    /// between is never run. A relative `raw_executable()` is refused: pkexec runs a relative
+    /// program only if the caller itself can execute it, so pass an absolute path.
     Pkexec,
 }
 

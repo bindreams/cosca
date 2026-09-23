@@ -17,10 +17,11 @@ use crate::error::{ElevationErrorKind, Error};
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
-    /// Every POSIX host EXCEPT macOS — Linux, the BSDs, illumos. Deliberately not
-    /// named `Linux`: nothing keyed off it is Linux-specific, and a Linux-shaped
-    /// name would invite gating genuinely Linux-only behavior on it.
+    /// Every POSIX host except macOS and Linux — the BSDs, illumos. Planned as Linux is, except
+    /// for what needs Linux itself.
     Unix,
+    /// Linux: a Unix whose `/proc` cosca launches pkexec through ([`Backend::Pkexec`]).
+    Linux,
     MacOs,
     Windows,
 }
@@ -77,6 +78,18 @@ pub struct Host {
     /// Only the macOS graphical path reads it; it lives here because the planner
     /// is plain data.
     pub arg_max: Option<usize>,
+    /// What [`BackendSet::pkexec`]'s `--version` said, or why a pkexec on `PATH` was not stored
+    /// ([`super::pkexec::PkexecVersion::Unresolved`]); asked only for a request that launches pkexec
+    /// — `Backend::Pkexec` with `Auth::Gui`, from a non-root caller, on Linux.
+    // Read only by the POSIX rewrite.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub pkexec_version: super::pkexec::PkexecVersion,
+    /// [`BackendSet::pkexec`], opened by detection: the version probe and the launch both exec this
+    /// descriptor's file (`/proc/self/fd/N`), so a file renamed over the path between them is
+    /// never run. `Some` exactly for a request that launches pkexec, when its file was opened.
+    // Read only by the POSIX rewrite.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub pkexec_pin: Option<std::sync::Arc<std::fs::File>>,
 }
 
 /// The planner's decision. Not `PartialEq` — `Reject` wraps a non-comparable
@@ -109,23 +122,29 @@ pub enum Transition {
 }
 
 impl Host {
-    pub fn detect() -> Host {
+    /// The facts for a request naming `backend` and `auth`, which decide whether `pkexec` is asked
+    /// its version.
+    pub fn detect(backend: Backend, auth: &Auth) -> Host {
         #[cfg(unix)]
         {
-            super::posix::detect()
+            super::posix::detect(backend, auth)
         }
         #[cfg(windows)]
         {
+            let _ = (backend, auth);
             super::windows::detect()
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = (backend, auth);
             Host {
                 elevated: false,
                 has_tty: false,
                 available: BackendSet::default(),
                 os: Os::Unix,
                 arg_max: None,
+                pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+                pkexec_pin: None,
             }
         }
     }
@@ -162,7 +181,7 @@ impl Host {
                     ),
                 }
             }
-            Os::MacOs | Os::Unix => self.resolve_posix(backend, auth),
+            Os::MacOs | Os::Unix | Os::Linux => self.resolve_posix(backend, auth),
         }
     }
 
@@ -180,7 +199,12 @@ impl Host {
             explicit => match self.available.path(explicit) {
                 Some(p) => (explicit, p.to_path_buf()),
                 None => {
-                    return reject_backend_unavailable(&format!("forced backend {explicit:?} is not on PATH"));
+                    let unresolved = (explicit == Backend::Pkexec)
+                        .then(|| self.pkexec_version.unresolved())
+                        .flatten();
+                    return reject_backend_unavailable(
+                        &unresolved.unwrap_or_else(|| format!("forced backend {explicit:?} is not on PATH")),
+                    );
                 }
             },
         };
@@ -203,6 +227,33 @@ impl Host {
             auth,
         }
     }
+}
+
+/// Whether a request launches pkexec: whether [`Host::plan`], on `os` with a pkexec on `PATH`,
+/// yields `ElevatePosix` for it. Detection opens and probes pkexec only then, and asks the planner
+/// itself rather than restating its rules.
+// Only the POSIX detection calls it.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: bool) -> bool {
+    let host = Host {
+        elevated,
+        has_tty: true,
+        available: BackendSet {
+            pkexec: Some(PathBuf::from("pkexec")),
+            ..BackendSet::default()
+        },
+        os,
+        arg_max: None,
+        pkexec_version: super::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
+    };
+    matches!(
+        host.plan(Privilege::Elevated, backend, auth.clone()),
+        Transition::ElevatePosix {
+            backend: Backend::Pkexec,
+            ..
+        }
+    )
 }
 
 fn reject_backend_unavailable(detail: &str) -> Transition {
@@ -249,6 +300,13 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSe
         if let Some(detail) = impossible {
             return unsupported(format!("Backend::{backend:?}"), detail);
         }
+    }
+    if os == Os::Unix && backend == Backend::Pkexec {
+        return unsupported(
+            "Backend::Pkexec".into(),
+            "cosca launches pkexec through Linux's /proc/self/fd, so that the pkexec it checked is the one \
+             it runs; pkexec elevation needs Linux, so use sudo or doas here",
+        );
     }
     if matches!(auth, Auth::Gui) {
         if os == Os::MacOs {
