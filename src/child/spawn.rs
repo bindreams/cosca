@@ -360,7 +360,7 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
     // Program + args via the `quote` model.
-    let Launch {
+    let StdLaunch {
         program,
         mut std_cmd,
         cwd,
@@ -380,7 +380,7 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
                 use std::os::unix::process::CommandExt;
                 c.arg0(argv.first().map_or(exe.as_os_str(), std::ffi::OsString::as_os_str));
             }
-            Launch {
+            StdLaunch {
                 program,
                 std_cmd: c,
                 cwd,
@@ -496,7 +496,7 @@ fn resolve_program_argv<'a>(
 
 /// The resolved program token alongside the `std::process::Command` built from it and the
 /// directory to run it in.
-struct Launch {
+struct StdLaunch {
     program: std::ffi::OsString,
     std_cmd: std::process::Command,
     cwd: Option<std::path::PathBuf>,
@@ -504,7 +504,7 @@ struct Launch {
 }
 
 #[cfg(unix)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<Launch, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdLaunch, Error> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let words = crate::quote::posix::split(line.as_bytes())?;
@@ -523,7 +523,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<La
         c.arg0(&argv[0]);
     }
     c.args(&argv[1..]);
-    Ok(Launch {
+    Ok(StdLaunch {
         program,
         std_cmd: c,
         cwd,
@@ -532,7 +532,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<La
 }
 
 #[cfg(windows)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<Launch, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdLaunch, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
@@ -551,7 +551,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<La
     let program = std::ffi::OsString::from_wide(&first);
     let mut c = std::process::Command::new(&program);
     c.raw_arg(std::ffi::OsString::from_wide(&rest)); // args only — program is prepended by std
-    Ok(Launch {
+    Ok(StdLaunch {
         program,
         std_cmd: c,
         cwd: cmd.cwd().map(std::path::Path::to_path_buf),
