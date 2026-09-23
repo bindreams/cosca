@@ -581,6 +581,36 @@ fn a_disarmed_leaf_whose_tree_was_killed_warns_that_it_was_not_removed() {
     );
 }
 
+/// The same for a tree the caller tore down with `terminate_tree()`: its leaf outliving the drop
+/// is a leak, not a tree left running.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_tree_was_terminated_warns_that_it_was_not_removed() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-terminated-opted-out-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // SAFETY (in the child): `pause` is async-signal-safe; SIGTERM's default action ends it.
+    let member = fork_running(|| unsafe {
+        libc::pause();
+    });
+    std::fs::write(leaf_path.join("cgroup.procs"), format!("{member}\n")).expect("list the member");
+
+    let leaf = entered_leaf_at(leaf_path);
+    leaf.disarm();
+    leaf.terminate().expect("signal the tree");
+    reap(member);
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+
+    let records = crate::log_capture::records_since(mark, "cosca-terminated-opted-out-leaf");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-terminated-opted-out-leaf"),
+        vec![log::Level::Warn],
+        "a terminated tree's leaf that outlived its Drop is a leak, got {records:?}"
+    );
+}
+
 /// A disarmed leaf whose directory is already GONE leaves nothing behind, so `Drop` must not
 /// say it did. `rmdir` failing with `ENOENT` is proof of removal, not of survival — the armed
 /// path already reads it that way, and a detached leaf's one `rmdir` is the only reading it
