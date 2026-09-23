@@ -1792,12 +1792,36 @@ fn childs_copy(channel: &super::ReportChannel) -> (std::os::fd::OwnedFd, super::
 ///
 /// Ordered by primitives: the forked child signals, then waits on a gate that the deciding thread
 /// opens only after it has decided.
+///
+/// Runs in a copy of this test binary running only this test. Any other process this one forks
+/// while the channel is open holds a copy of the parent's end until its own `exec`, and would keep
+/// the socket open past the parent's close — the child's send would then queue, and the child
+/// carry on having written its placement: a decision honoured, but not the branch under test.
 #[cfg(target_os = "linux")]
 #[test]
 fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::os::unix::process::CommandExt;
+
+    const NAME: &str =
+        "containment::cgroup::cgroup_tests::placement_hook_proceeds_when_the_parent_decided_without_the_exchange";
+    const INNER: &str = "COSCA_TEST_DECIDED_ALONE";
+    if std::env::var_os(INNER).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(INNER, "1")
+            .output()
+            .expect("run the case alone");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
 
     let channel = super::ReportChannel::new().expect("open the report channel");
     let slot = channel.slot();
@@ -2015,7 +2039,7 @@ fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
     std::fs::create_dir(&leaf_path).expect("recreate the leaf");
     std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
     let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut channel = leaf.report.take().expect("the channel");
+    let channel = leaf.report.take().expect("the channel");
     let err = leaf.fail_closed(grandchild, channel, "the test cannot decide");
     assert!(err.to_string().contains("not signalled"), "got {err}");
 

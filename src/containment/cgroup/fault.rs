@@ -167,6 +167,7 @@ pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<
 
 /// Hold the NEXT placement hook run by a child forked from this thread — which inherits the flag —
 /// until a byte arrives on `gate`, so a test can order the child's hook after the parent's act.
+#[cfg(feature = "tokio")]
 pub(crate) fn set_hook_gate(gate: std::os::fd::RawFd) {
     HOOK_GATE.with(|g| g.set(Some(gate)));
 }
