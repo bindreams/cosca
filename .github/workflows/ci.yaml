@@ -39,18 +39,14 @@ jobs:
 
       # The prek `cargo-clippy` hook above calls .github/scripts/clippy.sh with
       # neither --target nor --feature-powerset (host, no features) — this crate
-      # declares no `default` feature, so the unix-only tokio/pty/serde code
-      # paths (and any feature-gated dead code among them) are never linted by
-      # the hook alone.
+      # declares no `default` feature, so the host (Linux) side of the
+      # feature-gated tokio/pty/serde code paths (and any feature-gated dead
+      # code among them) is never linted by the hook alone.
       #
-      # Placed after the local-parity checks above, not right after checkout: a
-      # clippy failure there would skip every later step (their implicit
-      # `if: success()`), hiding `Test release helper scripts`'s result.
-      #
-      # `!cancelled()` is the one step in this job that overrides that implicit
-      # `success()`: it makes this step run even after an earlier step in the
-      # job has failed, so the lint result is always reported instead of being
-      # hidden behind an earlier failure.
+      # Placed after the local-parity checks above, not right after checkout,
+      # for the same reason as the test job's Clippy step below: a failure here
+      # would otherwise skip `Test release helper scripts` and hide its result.
+      # `!cancelled()`: same override-success() rationale as that step.
       - name: Clippy (feature powerset)
         if: ${{ !cancelled() }}
         uses: ./.github/actions/clippy-powerset
@@ -101,8 +97,8 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-          # see Clippy (feature powerset) step below for why only this lane
-          # gets the component
+          # see Clippy (feature powerset) step below for why only the
+          # matrix.lint lanes get the component
           components: ${{ matrix.lint && 'clippy' || '' }}
 
       - name: Build
