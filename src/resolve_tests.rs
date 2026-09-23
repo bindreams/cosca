@@ -473,14 +473,17 @@ const FIXTURE_EMPTY_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_EMPTY_PATH_ELEME
 
 /// The child half of [`empty_path_elements_are_skipped`]: a no-op when picked up by an ordinary,
 /// unfiltered suite run ([`FIXTURE_EMPTY_PATH_ELEMENTS_MARKER`] is unset there). Re-executed via
-/// `run_fixture_with_cwd` with that var set and the OS-level cwd already `cwd.path()`, so
-/// `std::env::current_dir()` here IS the planted directory — no mutation needed.
+/// `run_fixture_with_cwd`, [`crate::test_child::expected_cwd`] both fetches the directory the
+/// parent prepared AND asserts `std::env::current_dir()` here actually IS it.
 #[test]
 fn fixture_empty_path_elements_are_skipped() {
-    let Some(_marker) = std::env::var_os(FIXTURE_EMPTY_PATH_ELEMENTS_MARKER) else {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_EMPTY_PATH_ELEMENTS_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    let cwd = std::env::current_dir().expect("current_dir");
+    assert!(
+        cwd.join(exe_name("tool")).is_file(),
+        "the parent must have planted `tool` in this directory: {cwd:?}"
+    );
     let empty = if HOST_WINDOWS { ";;" } else { "::" };
     assert_not_found("tool", go("tool", &cwd, Some(OsStr::new(empty))));
 }
@@ -513,10 +516,13 @@ const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH
 /// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape.
 #[test]
 fn fixture_relative_path_elements_are_skipped() {
-    let Some(_marker) = std::env::var_os(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    let cwd = std::env::current_dir().expect("current_dir");
+    assert!(
+        cwd.join(exe_name("tool")).is_file(),
+        "the parent must have planted `tool` in this directory: {cwd:?}"
+    );
     assert_not_found("tool", go("tool", &cwd, Some(OsStr::new("."))));
 }
 
@@ -640,13 +646,11 @@ const FIXTURE_RELATIVE_CWD_MARKER: &str = "COSCA_FIXTURE_RELATIVE_CWD";
 /// are guaranteed equal by construction.
 #[test]
 fn fixture_relative_cwd_is_absolutised() {
-    let Some(_marker) = std::env::var_os(FIXTURE_RELATIVE_CWD_MARKER) else {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_CWD_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    let want = std::env::current_dir()
-        .expect("current_dir")
-        .join("sub")
-        .join(exe_name("tool"));
+    let want = cwd.join("sub").join(exe_name("tool"));
+    assert!(want.is_file(), "the parent must have planted `tool` here: {want:?}");
     let got = go("./tool", Path::new("sub"), None).unwrap();
     assert!(got.is_absolute(), "{got:?}");
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -686,10 +690,13 @@ const FIXTURE_DRIVE_RELATIVE_MARKER: &str = "COSCA_FIXTURE_DRIVE_RELATIVE";
 #[cfg(windows)]
 #[test]
 fn fixture_drive_relative_name_fails_closed() {
-    let Some(_marker) = std::env::var_os(FIXTURE_DRIVE_RELATIVE_MARKER) else {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_DRIVE_RELATIVE_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    let cwd = std::env::current_dir().expect("current_dir");
+    assert!(
+        cwd.join("tool.exe").is_file(),
+        "the parent must have planted `tool.exe` in this directory: {cwd:?}"
+    );
     assert_refused_on_shape("C:tool", go("C:tool", &cwd, None));
 }
 

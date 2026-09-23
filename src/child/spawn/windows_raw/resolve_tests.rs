@@ -206,10 +206,14 @@ const FIXTURE_RESOLVE_FALLBACK_MARKER: &str = "COSCA_FIXTURE_RESOLVE_FALLBACK";
 /// `crate::resolve::resolve_tests::fixture_empty_path_elements_are_skipped`'s shape.
 #[test]
 fn fixture_resolve_executable_falls_back_to_process_cwd() {
-    let Some(_marker) = std::env::var_os(FIXTURE_RESOLVE_FALLBACK_MARKER) else {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RESOLVE_FALLBACK_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    let want = std::env::current_dir().expect("current_dir").join("sp_b1_fallback.exe");
+    let want = cwd.join("sp_b1_fallback.exe");
+    assert!(
+        want.is_file(),
+        "the parent must have planted `sp_b1_fallback.exe` here: {want:?}"
+    );
     let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());

@@ -8,11 +8,15 @@
 /// CHILD's cwd before its own `exec`/`CreateProcessW`, so no window exists where this process's
 /// cwd is anything other than what it always was.
 ///
-/// `marker_env` is set to `"1"` in the child only, so the fixture can tell this deliberate re-exec
-/// apart from being picked up by an ordinary, unfiltered suite run — where it must no-op rather
-/// than assert against whatever the suite's own ambient cwd happens to be. Mirrors every other
-/// fixture in this file (e.g. [`fixture_registers_then_blocks`]), which use an address env var for
-/// the same tell.
+/// `marker_env` is set to `cwd` itself in the child only, so the fixture can both (a) tell this
+/// deliberate re-exec apart from being picked up by an ordinary, unfiltered suite run — where it
+/// must no-op rather than assert against whatever the suite's own ambient cwd happens to be — and
+/// (b) assert its OWN `std::env::current_dir()` against that same value, rather than trusting
+/// that this function's `.current_dir(cwd)` call below actually took effect. Carrying the
+/// directory in the marker, rather than a bare `"1"`, is what lets a fixture catch this helper's
+/// OWN cwd-setting being silently dropped — a mutation that a caller checking only the fixture's
+/// pass/fail outcome cannot otherwise see, since the fixture would still be asserting something
+/// true about *some* directory, just not necessarily the one the parent prepared.
 ///
 /// Spawns under `spawn_lock()`, matching every other raw `std::process::Command` re-exec of this
 /// test binary (see [`spawn_a_process_that_exits`]'s doc for the macOS fd-marker hazard that
@@ -35,7 +39,7 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
     // placeholder here would only ride along as a harmless-but-stray extra positional filter.
     let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args(["--test-threads=1", "--exact", fixture])
-        .env(marker_env, "1")
+        .env(marker_env, cwd)
         .current_dir(cwd)
         .output()
         .expect("spawn fixture child");
@@ -53,6 +57,29 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
          name on one side of a caller/fixture pair), which libtest also exits 0 for:\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
     );
+}
+
+/// Reads `marker_env`'s value as the directory [`run_fixture_with_cwd`]'s caller prepared, and
+/// returns `None` when it is unset — a fixture is picked up by an ordinary, unfiltered suite run
+/// too, where it must no-op rather than assert against whatever the suite's own ambient cwd
+/// happens to be.
+///
+/// When set, also asserts this fixture's OWN `std::env::current_dir()` actually IS that
+/// directory: `run_fixture_with_cwd`'s `.current_dir(cwd)` call is what is supposed to guarantee
+/// that, but a fixture that never checks it would keep passing even if that call were silently
+/// dropped — an assertion the fixture's OWN body happened to still satisfy in whatever the
+/// process's REAL ambient cwd was, for reasons that have nothing to do with the directory under
+/// test. Every fixture in this file that takes a `marker_env` argument calls this instead of
+/// reading `std::env::current_dir()` directly, so that check is never skippable by omission.
+pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
+    let expected = std::path::PathBuf::from(std::env::var_os(marker_env)?);
+    let actual = std::env::current_dir().expect("current_dir");
+    assert_eq!(
+        actual.canonicalize().expect("canonicalize actual cwd"),
+        expected.canonicalize().expect("canonicalize expected cwd"),
+        "this fixture's OS-level cwd must be the directory run_fixture_with_cwd's caller prepared",
+    );
+    Some(expected)
 }
 
 /// Builds the fully-qualified libtest `--exact` path of the `#[test] fn` named `$name`, for
