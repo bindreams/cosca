@@ -516,7 +516,9 @@ impl CgroupLeaf {
         }
     }
 
-    /// The leaf's directory, for a test that must find this leaf and no other.
+    /// The leaf's directory, for a test that must find this leaf and no other. Its one user is the
+    /// tokio spawn's post-fork failure seam.
+    #[cfg(feature = "tokio")]
     pub(crate) fn path_for_test(&self) -> &Path {
         &self.leaf_path
     }
