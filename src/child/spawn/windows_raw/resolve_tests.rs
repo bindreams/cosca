@@ -136,9 +136,9 @@ fn resolve_executable_env_clear_defeats_ambient_path() {
     //
     // `[Set(PATH, dir), Clear]`, not bare `[Clear]`: if `Clear` stopped dropping the base, a bare
     // `[Clear]` would leave the AMBIENT `PATH` in force, which never happens to contain this
-    // fabricated tempdir — so `is_err()` would hold for the wrong reason. Setting PATH to a directory that WOULD resolve, then clearing it,
-    // means Clear must actually discard a PATH that works, mirroring the sibling
-    // `..._env_remove_path_defeats_ambient_path` test's shape below.
+    // fabricated tempdir — so `is_err()` would hold for the wrong reason. Setting PATH to a
+    // directory that WOULD resolve, then clearing it, means Clear must actually discard a PATH that
+    // works, mirroring the sibling `..._env_remove_path_defeats_ambient_path` test's shape below.
     let got = resolve_with(
         std::path::Path::new("sp_env_clear"),
         None,
