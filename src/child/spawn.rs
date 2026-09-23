@@ -297,14 +297,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Ok(v) => v,
         // Mirror the async spawn's error teardown: kill + reap the just-spawned child so a failed
         // attach never leaks a running/zombie process (std `Child::drop` neither kills nor reaps).
-        // Discarding `kill()` is safe: it can only fail if the child already exited (we still own its
-        // un-reaped pid, so no other failure is possible), and `wait()` then reaps at once — never an
-        // unbounded block.
         Err(e) => {
-            let _ = child.kill();
-            if let Err(_e) = child.wait() {
-                debug_assert!(false, "sync spawn teardown failed to reap child: {_e}");
-            }
+            kill_and_reap(&mut child);
             return Err(e);
         }
     };
@@ -319,18 +313,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let id = match resolve_identity(child.id()) {
         crate::identity::Resolved::Found(id) => id,
         // Same teardown for both arms (never leak the spawned child), different diagnosis:
-        // an OS refusal is not a vanish. The teardown itself is unchanged from the
-        // attach-failure arm above, whose invariant holds here too - for a child we own and
-        // have not reaped, `kill` can only fail because it already exited, and `wait()` then
-        // reaps at once, never an unbounded block.
+        // an OS refusal is not a vanish.
         other => {
-            let _ = child.kill();
-            if let Err(e) = child.wait() {
-                // warn first: `debug_assert` is compiled out in release, and a swallowed
-                // reap failure would otherwise leave no trace at all there.
-                log::warn!("spawn teardown failed to reap pid {}: {e}", child.id());
-                debug_assert!(false, "sync spawn teardown failed to reap child: {e}");
-            }
+            kill_and_reap(&mut child);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure.
@@ -986,6 +971,28 @@ pub(crate) fn attach_or_fault(
         proc_handle,
         prepared,
     )
+}
+
+/// Tear down a just-spawned child a failed spawn will not return: kill it, then reap it.
+///
+/// The wait is bounded only by the kill. A child that exec'd a setuid program refuses an
+/// unprivileged supervisor's signal (`EPERM`), and waiting for it would block for that program's
+/// whole life: it is left running instead, and reported. (`kill` on a child already exited but
+/// unreaped succeeds, so that is not a failure here.)
+fn kill_and_reap(child: &mut std::process::Child) {
+    if let Err(e) = child.kill() {
+        log::warn!(
+            "spawn teardown could not kill pid {} ({e}); it is left running, and not waited for",
+            child.id()
+        );
+        return;
+    }
+    if let Err(e) = child.wait() {
+        // warn first: `debug_assert` is compiled out in release, and a swallowed reap failure
+        // would otherwise leave no trace at all there.
+        log::warn!("spawn teardown failed to reap pid {}: {e}", child.id());
+        debug_assert!(false, "sync spawn teardown failed to reap child: {e}");
+    }
 }
 
 /// Test-only fault injection + assertions for the spawn error-teardown paths, shared by both spawns.

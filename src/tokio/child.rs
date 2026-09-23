@@ -761,11 +761,12 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
     // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
     // whose argument is stripped in release). A no-op on an already-exited child.
     let killed = child.start_kill();
-    debug_assert!(killed.is_ok(), "start_kill of an owned child should not fail");
-    // A failed start_kill means this is not a live process to wait on (ESRCH = already exited;
-    // EPERM is impossible for our own child) — skip, so a kill failure can never turn the bounded
-    // exit-wait into an unbounded block. tokio's field-drop reaps any leftover zombie.
-    if killed.is_err() {
+    // A failed start_kill means the wait below would not be bounded: `EPERM` from a child that
+    // exec'd a setuid program — the one process this supervisor may not signal although it is
+    // its own child. Skip, so a kill failure can never turn the bounded exit-wait into an
+    // unbounded block: the child is left running, and tokio's orphan handling reaps it later.
+    if let Err(e) = killed {
+        log::warn!("spawn teardown could not kill pid {pid} ({e}); it is left running, and not waited for");
         return;
     }
     wait_and_reap(child, pid, done_ok);

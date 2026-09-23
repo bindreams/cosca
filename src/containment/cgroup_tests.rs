@@ -1606,7 +1606,10 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
                 Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
             }
         };
-        assert!(err.to_string().contains("the child and its process group were killed"), "got {err}");
+        assert!(
+            err.to_string().contains("the child and its process group were killed"),
+            "got {err}"
+        );
         assert_eq!(
             child.wait().expect("reap the child").signal(),
             Some(libc::SIGKILL),
@@ -1934,5 +1937,57 @@ fn abandon_kills_the_childs_whole_process_group() {
     stdout
         .read_to_end(&mut rest)
         .expect("read to EOF: every process holding stdout is dead");
+    child.wait().expect("reap the child");
+}
+
+/// A child cosca may not signal — it exec'd a setuid program — cannot be waited out: `abandon`
+/// would block for that program's whole life. It exec'd, so its report is final: the spawn fails
+/// at once, and the child, which cosca could not kill, is left running.
+#[cfg(target_os = "linux")]
+#[test]
+fn abandon_does_not_wait_on_a_child_it_may_not_signal() {
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandon-eperm");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    // `cat` echoes, so a round trip through it proves it alive.
+    let mut child = std::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn");
+
+    super::fault::set_force_pidfd_failure(true);
+    super::fault::set_force_signal_denied(true);
+    let err = match leaf.take_placement(child.id()) {
+        Err(e) => e,
+        Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
+    };
+    assert!(
+        !super::fault::signal_denied_armed(),
+        "the seam must be consumed by the kill"
+    );
+    assert!(err.to_string().contains("could not be signalled"), "got {err}");
+
+    let mut echo = [0u8; 1];
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"x")
+        .expect("write to the child");
+    child
+        .stdout
+        .as_mut()
+        .expect("stdout")
+        .read_exact(&mut echo)
+        .expect("the child must be alive: it could not be signalled");
+    assert_eq!(&echo, b"x");
+    child.kill().expect("kill the child");
     child.wait().expect("reap the child");
 }

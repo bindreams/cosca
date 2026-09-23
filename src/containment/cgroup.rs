@@ -1013,14 +1013,37 @@ impl CgroupLeaf {
             "{child} is not an unreaped child of this process: something else reaped it"
         );
         let fate = if ours {
-            let _ = kill(child, Signal::SIGKILL);
+            #[cfg(test)]
+            let denied = fault::take_force_signal_denied();
+            #[cfg(not(test))]
+            let denied = false;
+            let killed = if denied {
+                Err(nix::errno::Errno::EPERM)
+            } else {
+                kill(child, Signal::SIGKILL)
+            };
             // The child leads its group; the unreaped child holds the group's id.
-            let _ = nix::sys::signal::killpg(child, Signal::SIGKILL);
-            // Its exit, not its reaping: the spawn's error path reaps it.
-            while let Err(nix::errno::Errno::EINTR) =
-                waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
-            {}
-            "the child and its process group were killed"
+            if !denied {
+                let _ = nix::sys::signal::killpg(child, Signal::SIGKILL);
+            }
+            match killed {
+                Ok(()) => {
+                    // Its exit, not its reaping: the spawn's error path reaps it.
+                    while let Err(nix::errno::Errno::EINTR) =
+                        waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+                    {}
+                    "the child and its process group were killed"
+                }
+                // cosca changes no credentials before the placement hook, so a child it may not
+                // signal has exec'd a program that runs as someone else, and its report, sent
+                // before `exec`, is final. Waiting for it would last that program's whole life.
+                Err(nix::errno::Errno::EPERM) => {
+                    "the child could not be signalled (EPERM): it exec'd a program this process may \
+                     not kill, and is left running"
+                }
+                // ESRCH cannot happen to an unreaped child; nothing else is a kill(2) errno.
+                Err(_) => "the child could not be signalled",
+            }
         } else {
             // Reaped, so it has exited — but its number may already be another process's.
             "the child was already reaped by something else in this process, so it was not signalled"
@@ -1283,6 +1306,7 @@ pub(crate) mod fault {
         static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
         static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
         static FORCE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_SIGNAL_DENIED: Cell<bool> = const { Cell::new(false) };
         static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1323,6 +1347,18 @@ pub(crate) mod fault {
     }
     pub(crate) fn pidfd_failure_armed() -> bool {
         FORCE_PIDFD_FAILURE.with(|f| f.get())
+    }
+
+    /// Deny the NEXT `abandon`'s signals with `EPERM`, as a child that exec'd a setuid program
+    /// denies an unprivileged supervisor — which a root test lane cannot reproduce for real.
+    pub(crate) fn set_force_signal_denied(on: bool) {
+        FORCE_SIGNAL_DENIED.with(|f| f.set(on));
+    }
+    pub(crate) fn take_force_signal_denied() -> bool {
+        FORCE_SIGNAL_DENIED.with(|f| f.replace(false))
+    }
+    pub(crate) fn signal_denied_armed() -> bool {
+        FORCE_SIGNAL_DENIED.with(|f| f.get())
     }
 
     /// Put a directory inside the NEXT leaf whose creation fails, just before its unwind runs, so
