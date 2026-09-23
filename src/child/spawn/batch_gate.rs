@@ -321,8 +321,8 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// the gate refuses every one rather than guess. And a path whose final component drops out
 /// resolves to a name with a trailing separator — `x.bat\...` is `…\x.bat\`, which std's
 /// `has_bat_extension` does NOT read as a batch file — yet the gate judges the exposed `x.bat` and
-/// refuses. Moving resolution ahead of the gate (planned) collapses both into a suffix test on the
-/// resolved path and leaves nothing left to predict.
+/// refuses. Moving resolution ahead of the gate (#143, #156) collapses both into a suffix test on
+/// the resolved path and leaves nothing left to predict.
 pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interior) -> Option<String> {
     let text = prog.as_os_str().to_string_lossy();
     // Each surviving component, paired with whether it is the path's FIRST segment — the only
