@@ -447,15 +447,19 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     //
     // The batch gate judges the name Win32 resolves the token to — trailing dots and spaces, `..`
     // collapse, drive and UNC and device roots, and data-stream pieces. The launch is `exefile`
-    // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on `lpFile`
-    // as given: no App Paths, no default-extension search, no `%` expansion in `lpFile` or
-    // `lpDirectory` (measured; see `shell_file`). So the only other requirement is a fully
-    // qualified `.exe`/`.com` path with no `"` in it, which also excludes every spelling shell32
-    // rewrites without a class. A relative or bare token is refused until the image is resolved
-    // before the launch.
+    // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on
+    // `lpFile`. Measured only for an ELEVATED caller, which cosca never launches from: no App
+    // Paths, no bare-name search, `%` literal. The consent route an unelevated caller takes is
+    // unmeasured, so the rest is conservative (see `shell_file`): a fully qualified `.exe`/`.com`
+    // path, which leaves no default extension to apply however the launch treats one, with no
+    // `"` or `%`, and a `current_dir()` with no `%`. A relative or bare token is refused until the
+    // image is resolved before the launch.
     let program_path = std::path::Path::new(&program);
     crate::child::spawn::reject_batch_path(program_path)?;
     shell_file::reject_elevated_program(program_path)?;
+    if let Some(dir) = cmd.cwd() {
+        shell_file::reject_percent_in_directory(dir)?;
+    }
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),

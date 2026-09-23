@@ -6,6 +6,13 @@
 //! image for anything, a batch file included. `SEE_MASK_CLASSNAME` sends shell32 straight to the
 //! class's verb command instead (`SHELL_execute_class`). This measures both on a real runner.
 //!
+//! **What this measures is not cosca's production route.** The caller here is ELEVATED, and an
+//! elevated caller's `runas` launches directly. cosca calls `ShellExecuteEx` only when the caller is
+//! NOT elevated, and that launch goes through the consent service, which this does not exercise.
+//! So these results hold for an elevated caller's launch only. The elevated path's rules
+//! (`src/elevation/shell_file.rs`) stay conservative until the consent route is measured, and do
+//! not rest on these results.
+//!
 //! It ELEVATES, so the `windows-probes` workflow runs it in a step of its own, on a runner whose
 //! process is already elevated (GitHub's Windows runners are), so `runas` raises no prompt. It
 //! launches only copies of `cosca_testbin_image` — never a batch file — and registers one volatile

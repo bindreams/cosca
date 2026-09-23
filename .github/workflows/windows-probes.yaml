@@ -100,8 +100,9 @@ jobs:
       # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without
       # a prompt, and register one volatile App Paths key in HKLM and one in HKCU, deleting each
       # again; a volatile parent key they had to create can stay behind until the runner is gone.
-      # They run on every schedule and pull-request run too: the elevated launch's safety rests on
-      # what they measure, so a change to that code, or a new Windows build, re-measures it.
+      # They run on every schedule and pull-request run too, so a change to that code, or a new
+      # Windows build, re-measures it. They measure an ELEVATED caller's launch, not the consent
+      # route cosca takes from an unelevated one, so the elevated path's rules do not rest on them.
       - name: Run elevating probes
         if: github.event_name != 'workflow_dispatch' || inputs.elevating
         shell: bash

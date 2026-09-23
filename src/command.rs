@@ -270,12 +270,15 @@ impl Command {
     /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
     /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
     /// backend (and this resolver) described above, and nothing resolves the name there. So
-    /// [`elevate`](Self::elevate) on Windows takes only a fully qualified path to an image:
-    /// `ShellExecuteEx` applies `PATHEXT` and file associations even to an absolute name, so a
-    /// name not ending in `.exe` or `.com` is refused with
+    /// [`elevate`](Self::elevate) on Windows takes only a fully qualified path to an image.
+    /// `ShellExecuteEx` can apply `PATHEXT` and file associations even to an absolute name
+    /// (measured without a class; for cosca's `exefile` launch on the consent route it is
+    /// unmeasured), so a name not ending in `.exe` or `.com` is refused with
     /// [`std::io::ErrorKind::InvalidInput`] — both `executable(r"C:\tools\setup")` and
     /// `executable("whoami")` — and a bare or relative one such as `whoami.exe` is refused with
-    /// [`Error::Unsupported`]. Both hold whether or not the caller is already elevated.
+    /// [`Error::Unsupported`]. A `%` in the name or in [`current_dir`](Self::current_dir) is refused
+    /// with [`std::io::ErrorKind::InvalidInput`], since whether the launch expands it is unmeasured.
+    /// All of these hold whether or not the caller is already elevated.
     ///
     /// Every Windows spawn, elevated or not, refuses a `.bat`/`.cmd` that only Win32's
     /// normalisation exposes, such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one

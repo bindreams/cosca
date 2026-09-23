@@ -213,23 +213,23 @@ fn a_clean_unelevated_request_plans_a_launch() {
     assert_eq!(launch.show, SW_SHOWNORMAL);
 }
 
-/// A `%` in `current_dir()` is taken literally by the `exefile` launch (measured), so it is passed
-/// through as given rather than refused.
+/// A `%` in `current_dir()` is refused, whatever the caller's privilege: whether the consent
+/// launch expands it in `lpDirectory` is unmeasured.
 #[test]
-fn a_percent_in_current_dir_reaches_lp_directory_literally() {
-    let mut c = Command::new();
-    c.args([r"C:\Windows\System32\whoami.exe"])
-        .current_dir(r"C:\work\%TEMP%")
-        .elevate();
-    let launch = match super::plan_runas(&c, &win_host(false)) {
-        Ok(super::RunasStep::Launch(launch)) => launch,
-        Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
-        Err(e) => panic!("a % in current_dir() must not be refused: {e:?}"),
-    };
-    assert_eq!(
-        launch.dir_w,
-        Some(r"C:\work\%TEMP%".encode_utf16().chain([0]).collect::<Vec<u16>>())
-    );
+fn a_percent_in_current_dir_is_refused() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([r"C:\Windows\System32\whoami.exe"])
+            .current_dir(r"C:\work\%TEMP%")
+            .elevate();
+        match super::plan_runas(&c, &win_host(elevated)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!(
+                "elevated={elevated}: expected Io(InvalidInput), got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+    }
 }
 
 /// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
@@ -687,9 +687,8 @@ fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
     }
 }
 
-/// An elevated program that is not fully qualified is refused: it is launched as `exefile`, which
-/// finds nothing by a bare name, so a relative token would silently fail — or, were the class
-/// dropped, be looked up through App Paths.
+/// An elevated program that is not fully qualified is refused: a relative or bare token leaves
+/// ShellExecuteEx a lookup to make, App Paths included, which is unmeasured for the consent launch.
 #[test]
 fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
     for elevated in [false, true] {
