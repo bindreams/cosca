@@ -493,10 +493,9 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 /// directory, which cosca does not track. A name that names no file (`C:\`, `tools\dir\`,
 /// `...`, a bare `\\server\share`) is refused the same way.
 ///
-/// Visiting `base_cwd` first was the previous behaviour, and it was a
-/// binary-planting hazard: `executable("helper")` loaded a `helper.exe` dropped in
-/// whatever directory the process happened to sit in. Reach it explicitly with
-/// `./helper`, which contains a separator.
+/// Visiting `base_cwd` first is a binary-planting hazard: `executable("helper")` would load a
+/// `helper.exe` dropped in whatever directory the process happened to sit in. Reach it explicitly
+/// with `./helper`, which contains a separator.
 ///
 /// Existence is tested through `crate::resolve`'s `is_execable`, which asks `std::fs::metadata`
 /// for a file, not just for something: a directory is never a runnable program, so a same-named

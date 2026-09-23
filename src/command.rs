@@ -204,10 +204,9 @@ impl Command {
     /// `CreateProcessW`'s own documented search order with the current directory cut
     /// out, not a fresh rule, so a directory placed early on `PATH` (a dev toolchain
     /// install, a per-user app shim) still cannot shadow e.g. `System32\find.exe`.
-    /// Searching the current directory first was the previous behaviour and was a
-    /// binary-planting hazard: `executable("helper")` would load a `helper.exe` dropped
-    /// in whatever directory the process happened to sit in. Write `./helper` to reach
-    /// it explicitly.
+    /// Searching the current directory first is a binary-planting hazard: `executable("helper")`
+    /// would load a `helper.exe` dropped in whatever directory the process happened to sit in.
+    /// Write `./helper` to reach it explicitly.
     ///
     /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a
     /// descriptor >= 3 also routes an unelevated Windows spawn through the raw backend, so
@@ -702,7 +701,7 @@ impl Command {
     ///
     /// | Flag | Why reserved | Instead |
     /// | --- | --- | --- |
-    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none; a suspended-spawn window is being designed in [cosca#49](https://github.com/bindreams/cosca/issues/49) |
+    /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | none |
     /// | `CREATE_NEW_PROCESS_GROUP` | load-bearing for `CTRL_BREAK` delivery to the contained root | [`contain`](Self::contain) |
     /// | `CREATE_NEW_CONSOLE` | measured: the child gets its own *visible* console window, overriding a requested window suppression | none |
     /// | `CREATE_UNICODE_ENVIRONMENT` | both backends supply it structurally, so a caller can neither set nor clear it meaningfully | none |
