@@ -137,6 +137,40 @@ fn a_relative_exact_program_without_a_cwd_runs_where_it_was_completed() {
     assert_eq!(build_move_fork(&c, a.path(), b.path()), (Some(CWD_TOOL_EXIT), want));
 }
 
+/// The error kind of building and spawning `c` with `dir` as this process's cwd.
+///
+/// Holds `spawn_lock` across the cwd move and the std spawn, as [`build_move_fork`] does.
+fn spawn_error_kind_from(c: &Command, dir: &std::path::Path) -> Option<std::io::ErrorKind> {
+    let _guard = crate::child::spawn::spawn_lock();
+    let _restore = crate::test_child::RestoreCwd::capture();
+    std::env::set_current_dir(dir).expect("cd");
+    let kind = |e: Error| match e {
+        Error::Io(e) => e.kind(),
+        other => panic!("expected Io, got {other:?}"),
+    };
+    match crate::child::spawn::build_std_command(c) {
+        Err(e) => Some(kind(e)),
+        Ok(mut std_cmd) => std_cmd.status().err().map(|e| kind(Error::Io(e))),
+    }
+}
+
+/// `current_dir("")` fails `chdir` for a `Search` program; an `Exact` one must not run instead,
+/// even with a `tool` in the process cwd for the empty directory to be joined onto.
+#[test]
+fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
+    let (cwd, _on_path) = cwd_and_path_tools();
+    let mut exact = Command::new();
+    exact.raw_executable("tool").args(["tool"]).current_dir("");
+    let mut search = Command::new();
+    search
+        .executable(cwd.path().join("tool"))
+        .args([cwd.path().join("tool")])
+        .current_dir("");
+    let want = spawn_error_kind_from(&search, cwd.path());
+    assert_eq!(want, Some(std::io::ErrorKind::NotFound));
+    assert_eq!(spawn_error_kind_from(&exact, cwd.path()), want);
+}
+
 /// Negative control: a `Search` program is not completed by cosca, so a relative `current_dir`
 /// is left for the child to read at the fork.
 #[test]

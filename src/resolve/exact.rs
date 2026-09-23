@@ -30,8 +30,9 @@ use crate::error::Error;
 ///
 /// Refused with `InvalidInput` before any cwd is read: an interior NUL, which no exec argument can
 /// carry, and a name that [names no file](super::names_no_file) — empty, `/`-terminated, or a
-/// final `.`/`..`. `process_cwd` is called at most once, and only when the base needs it, so an
-/// absolute program or child cwd cannot fail on an unreadable process cwd.
+/// final `.`/`..`. An empty `child_cwd` under a relative program is `NotFound`, as the `chdir("")`
+/// it would otherwise reach reports. `process_cwd` is called at most once, and only when the base
+/// needs it, so an absolute program or child cwd cannot fail on an unreadable process cwd.
 pub(crate) fn complete_posix(
     program: &OsStr,
     child_cwd: Option<&Path>,
@@ -56,6 +57,13 @@ pub(crate) fn complete_posix(
         });
     }
     let base = match child_cwd {
+        // Joined, it would name the process cwd, where the `chdir` it stands for fails.
+        Some(dir) if dir.as_os_str().is_empty() => {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current_dir(\"\") names no directory",
+            )))
+        }
         Some(dir) if is_absolute(dir.as_os_str()) => {
             return Ok(Completed {
                 program: PathBuf::from(join(dir.as_os_str(), program)),

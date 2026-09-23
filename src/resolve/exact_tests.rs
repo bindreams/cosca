@@ -39,6 +39,16 @@ fn a_relative_child_cwd_is_itself_joined_onto_the_process_cwd() {
     assert_eq!(complete("tool", Some("sub")).unwrap(), Path::new("/proc-cwd/sub/tool"));
 }
 
+/// `chdir("")` fails with `ENOENT`, which is what a `Search` program's spawn reports; joining the
+/// empty directory onto the process cwd would instead name a real one.
+#[test]
+fn an_empty_child_cwd_is_not_found_as_chdir_would_report_it() {
+    match complete_posix(OsStr::new("tool"), Some(Path::new("")), never) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        other => panic!("expected Io(NotFound), got {other:?}"),
+    }
+}
+
 /// A base read from the process cwd is handed back as the child's cwd, so the sink runs the child
 /// where the program was completed rather than re-reading the process cwd at `fork`.
 #[test]
