@@ -237,9 +237,6 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
     Ok(crt_fds::encode(&entries))
 }
 
-/// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
-/// can close the child ends + attribute list before releasing the spawn lock on either arm.
-/// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
 /// `child_env`, plus the inherited root marker when `marker_env`. The marker is appended AFTER the
 /// user's env ops so it survives a user `env_clear()`, as the std path sets it after the user's
 /// env; recapturing from the same `base` names it exactly as std would.
@@ -265,6 +262,9 @@ pub(crate) fn with_marker(
     marked
 }
 
+/// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
+/// can close the child ends + attribute list before releasing the spawn lock on either arm.
+/// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
 // `CreateProcessW`'s own parameter list, plus the request its failure is classified against.
 // Bundling them would only rename the same values one call site deep.
 #[allow(clippy::too_many_arguments)]
