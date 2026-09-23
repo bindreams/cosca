@@ -97,6 +97,6 @@ pub(crate) use leaf::*;
 #[path = "cgroup/fault.rs"]
 pub(crate) mod fault;
 
-#[cfg(test)]
-#[path = "cgroup_tests.rs"]
-mod cgroup_tests;
+#[cfg(all(target_os = "linux", test))]
+#[path = "cgroup/test_support.rs"]
+pub(crate) mod test_support;

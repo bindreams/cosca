@@ -324,3 +324,7 @@ pub(super) fn log_degrade_into(warned: &Mutex<BTreeSet<DegradeCondition>>, reaso
     log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
     level
 }
+
+#[cfg(test)]
+#[path = "degrade_tests.rs"]
+mod degrade_tests;

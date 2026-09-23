@@ -508,3 +508,7 @@ fn own_start_time() -> u64 {
     unsafe { libc::close(fd) };
     crate::identity::stat_parse::parse_starttime_jiffies(&stat[..len]).unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "channel_tests.rs"]
+mod channel_tests;

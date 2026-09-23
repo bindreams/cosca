@@ -1185,3 +1185,7 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
         Delivery::Queued | Delivery::Decided => Ok(()),
     }
 }
+
+#[cfg(test)]
+#[path = "leaf_tests.rs"]
+mod leaf_tests;

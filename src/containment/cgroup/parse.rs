@@ -94,3 +94,7 @@ pub(crate) fn parse_proc_stat_state(stat: &str) -> Option<char> {
     let tail = &stat[stat.rfind(')')? + 1..];
     tail.split_whitespace().next()?.chars().next()
 }
+
+#[cfg(test)]
+#[path = "parse_tests.rs"]
+mod parse_tests;
