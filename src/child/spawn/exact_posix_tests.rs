@@ -300,6 +300,20 @@ fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
     assert_eq!(kind(&mut exact), std::io::ErrorKind::NotFound);
 }
 
+/// The directory is entered by cosca's hook, not std: std leaves a relative program with a
+/// `current_dir` "platform specific and unstable". Its hook cannot be inspected, so this pins that
+/// std is handed no directory to apply; the unreachable-cwd tests pin that the hook enters it.
+#[test]
+fn a_relative_exact_program_hands_std_no_current_dir() {
+    for dir in ["sub", "/work"] {
+        let mut c = Command::new();
+        c.raw_executable("tool").args(["tool"]).current_dir(dir);
+        let std_cmd = crate::child::spawn::build_std_command(&c).expect("build");
+        assert_eq!(std_cmd.get_current_dir(), None, "{dir}");
+        assert_eq!(std_cmd.get_program(), "./tool", "{dir}");
+    }
+}
+
 /// Negative control: a `Search` program is not completed by cosca, so a relative `current_dir`
 /// is left for the child to read at the fork.
 #[test]

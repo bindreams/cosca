@@ -408,9 +408,16 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
 
 /// `chdir` to `dir` in the child, after std's own setup and just before its `execvp`, so a
 /// relative program is read against the directory the child runs in, both relative to the cwd it
-/// inherited (see `crate::resolve::exact::anchor_posix`). std runs `pre_exec` hooks after its own
-/// `chdir` and immediately before the exec, and a hook forces the fork/exec path over
-/// `posix_spawn`.
+/// inherited (see `crate::resolve::exact::anchor_posix`).
+///
+/// This is what std's `current_dir` would mostly do already, and it is done here because std does
+/// not promise it: "If the program path is relative (e.g., `"./script.sh"`), it's ambiguous
+/// whether it should be interpreted relative to the parent's working directory or relative to
+/// `current_dir`. The behavior in this case is platform specific and unstable". std 1.97.1 happens
+/// to read it against the new directory on both of its paths — fork/exec (which it takes on
+/// Apple for this case) and glibc's `posix_spawn` with `addchdir` — but either could change. std
+/// documents `pre_exec` hooks as running in the child just before the exec, so the ordering is
+/// pinned. The cost is that a hook rules out `posix_spawn`, for these commands only.
 #[cfg(unix)]
 fn enter_in_child(std_cmd: &mut std::process::Command, dir: &std::path::Path) -> Result<(), Error> {
     use std::os::unix::ffi::OsStrExt;
