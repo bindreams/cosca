@@ -504,8 +504,9 @@ fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
         "a detached tree must not be killed: cgroup.kill must never be written"
     );
     assert!(leaf_path.is_dir(), "the detached tree's leaf must survive with it");
-    assert!(
-        !crate::log_capture::levels_since(mark, "cosca-detached-leaf").contains(&log::Level::Warn),
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-detached-leaf"),
+        vec![log::Level::Debug],
         "a leaf left behind for a detached tree is what the caller asked for, not a leak"
     );
 }
