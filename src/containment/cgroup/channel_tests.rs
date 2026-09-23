@@ -246,3 +246,44 @@ fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
         );
     }
 }
+
+/// A child that sent its intent and report before the parent decided finds the channel closed, not
+/// reset: `proceed` reads what was queued before it closes. The child's next send then fails with
+/// `EPIPE`, and finds *proceed*. Run [`alone`].
+#[cfg(target_os = "linux")]
+#[test]
+fn proceed_reads_what_was_sent_before_it_closes() {
+    if !alone("containment::cgroup::channel::channel_tests::proceed_reads_what_was_sent_before_it_closes") {
+        return;
+    }
+    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    let (_end, slot) = childs_copy(&channel);
+    // SAFETY: the channel is open.
+    unsafe {
+        assert_eq!(
+            slot.send_intent().expect("send the intent"),
+            crate::containment::cgroup::Delivery::Queued
+        );
+        assert_eq!(
+            slot.send_report(crate::containment::cgroup::REPORT_PLACED)
+                .expect("send the report"),
+            crate::containment::cgroup::Delivery::Queued
+        );
+    }
+    channel.proceed();
+
+    // SAFETY: `_end` keeps the child's end open; the buffer is on this frame.
+    let sent = unsafe { libc::send(slot.fd, [0u8; 16].as_ptr().cast(), 16, libc::MSG_NOSIGNAL) };
+    assert_eq!(sent, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE),
+        "closed with the child's messages read"
+    );
+    // SAFETY: as above.
+    let sent = unsafe { slot.send_report(crate::containment::cgroup::REPORT_PLACED) };
+    assert_eq!(
+        sent.expect("a closed channel is not an error"),
+        crate::containment::cgroup::Delivery::Decided
+    );
+}
