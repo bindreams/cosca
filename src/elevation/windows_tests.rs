@@ -651,6 +651,20 @@ fn an_unregistered_app_path_reads_as_absent() {
     }
 }
 
+/// A `current_dir()` ShellExecuteEx rewrites is refused: it expands `%TEMP%` in `lpDirectory` and
+/// searches a relative `lpFile` there, so `tools\setup.exe` would load from `%TEMP%\tools`.
+#[test]
+fn launch_runas_refuses_a_current_dir_shell_execute_rewrites() {
+    for elevated in [false, true] {
+        let mut c = Command::new();
+        c.args([r"tools\setup.exe"]).current_dir(r"C:\work\%TEMP%").elevate();
+        assert!(
+            is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+            "elevated={elevated}: a % in current_dir() is expanded by ShellExecuteEx"
+        );
+    }
+}
+
 /// A token ShellExecuteEx rewrites before it opens it is refused, whatever it rewrites to: a
 /// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`.
 #[test]

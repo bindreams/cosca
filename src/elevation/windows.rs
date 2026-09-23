@@ -492,9 +492,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     //
     // The batch gate reads the caller's STRING, so a token `ShellExecuteEx` REWRITES before opening
     // is refused first: quoted, a URL (`file:` is percent-decoded), a `shell:`/`::{CLSID}` name, or
-    // one holding a `%`. See `shell_file`. On what is left, the gate judges the name Win32 resolves
-    // the token to — trailing dots and spaces, `..` collapse, drive and UNC and device roots, and
-    // data-stream pieces.
+    // one holding a `%` — and so is a `current_dir()` holding a `%` or `"`, which it expands before
+    // searching a relative token there. See `shell_file`. On what is left, the gate judges the name
+    // Win32 resolves the token to — trailing dots and spaces, `..` collapse, drive and UNC and
+    // device roots, and data-stream pieces.
     //
     // Then what `ShellExecuteEx` finds by LOOKUP. A token must end in `.exe` or `.com`, so no
     // extension is completed (`PathResolveW`/`PathFileExistsDefExtW` try `.bat` and `.cmd`) and no
@@ -508,6 +509,9 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // though not necessarily the one meant, until the image is resolved before the launch (#139).
     let program_path = std::path::Path::new(&program);
     shell_file::reject_shell_rewrite(program_path)?;
+    if let Some(dir) = cmd.cwd() {
+        shell_file::reject_directory_rewrite(dir)?;
+    }
     crate::child::spawn::reject_batch_path(program_path)?;
     crate::child::spawn::reject_normalised_batch_path(program_path)?;
     shell_file::reject_non_image(program_path)?;

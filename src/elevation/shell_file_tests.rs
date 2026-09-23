@@ -180,3 +180,31 @@ fn an_app_paths_registration_must_name_an_image() {
         );
     }
 }
+
+/// `lpDirectory` is environment-expanded (Wine, with or without `SEE_MASK_DOENVSUBST`) and then
+/// `GetFullPathNameW`-normalised before a relative `lpFile` is searched in it.
+#[test]
+fn a_directory_shell_execute_rewrites_is_refused() {
+    for dir in [r"C:\work\%TEMP%", "%USERPROFILE%", r#""C:\work""#, r#"C:\wo"rk"#] {
+        assert!(
+            matches!(
+                super::reject_directory_rewrite(Path::new(dir)),
+                Err(Error::Unsupported { .. })
+            ),
+            "{dir:?} is rewritten before the search"
+        );
+    }
+    // No URL or namespace handling applies to lpDirectory, so these are plain directories.
+    for dir in [
+        r"C:\work",
+        r"\\server\share\work",
+        r"C:\work\ms-settings:x",
+        "shell",
+        r"C:\www",
+    ] {
+        assert!(
+            super::reject_directory_rewrite(Path::new(dir)).is_ok(),
+            "{dir:?} reaches ShellExecuteEx as the directory it is"
+        );
+    }
+}

@@ -54,6 +54,25 @@ fn unsupported(program: &Path, detail: &str) -> Error {
     }
 }
 
+/// Refuse a working directory `ShellExecuteEx` rewrites before it searches a relative `lpFile`
+/// in it. Wine runs `ExpandEnvironmentStringsW` and then `GetFullPathNameW` over every non-empty
+/// `lpDirectory` (`shlexec.c` `SHELL_execute`, with or without `SEE_MASK_DOENVSUBST`), so a `%` is
+/// refused, as it is in `lpFile`. A `"` is refused too: no directory name holds one, and it is the
+/// character the shell treats as quoting. No URL, namespace or `www` handling applies to
+/// `lpDirectory`, and `GetFullPathNameW` is the normalisation the batch gate already models.
+pub(crate) fn reject_directory_rewrite(dir: &Path) -> Result<(), Error> {
+    if !dir.as_os_str().to_string_lossy().contains(['%', '"']) {
+        return Ok(());
+    }
+    Err(Error::Unsupported {
+        op: format!("elevating in {}", dir.display()),
+        platform: "windows",
+        detail: "ShellExecuteEx expands %VARIABLES% in lpDirectory and searches a relative program \
+                 there, so the directory it uses is not the one given; pass it without % or \""
+            .into(),
+    })
+}
+
 /// Refuse an elevated token whose final component does not end, case-insensitively, in `.exe` or
 /// `.com`. ShellExecuteEx completes a token by LOOKUP — `PathResolveW` with
 /// `PRF_TRYPROGRAMEXTENSIONS` for a bare name and `PathFileExistsDefExtW` for one with a directory
