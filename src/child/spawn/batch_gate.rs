@@ -65,8 +65,9 @@ pub(crate) fn reject_batch_path(prog: &std::path::Path) -> Result<(), Error> {
 /// its `Os`. Both are pinned from any host by `spawn_tests`, which matters because the Windows
 /// branch — the whole `win32_effective_file_name` -> `is_batch_program` composition, where every
 /// subtlety lives — would otherwise be covered by the two Windows CI lanes alone. Reading `cfg!`
-/// here left it possible to revert this function to the `Path::extension()` rule it replaced and
-/// stay green on four of six.
+/// here would have let a regression back to the extension-based reading pass unnoticed off
+/// Windows; see `reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file`
+/// for the cross-platform harness that catches it.
 ///
 /// This gate is LIVE on the std path today, not merely a guard for some future backend. Rust's
 /// own `std::process` detects a `.bat`/`.cmd` program, swaps it for `cmd.exe` and builds a batch

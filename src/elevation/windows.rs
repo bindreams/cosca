@@ -447,9 +447,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // The batch gate reads the caller's STRING, so a token `ShellExecuteEx` REWRITES before opening
     // is refused first: quoted, a URL (`file:` is percent-decoded), a `shell:`/`::{CLSID}` name,
     // one starting with `www` (relaunched as `http://www…`), or one holding a `%` — and so is a
-    // `current_dir()` holding a `%` or `"`, which it expands before searching a relative token there. See `shell_file`. On what is left, the gate judges the name
-    // Win32 resolves the token to — trailing dots and spaces, `..` collapse, drive and UNC and
-    // device roots, and data-stream pieces.
+    // `current_dir()` holding a `%` or `"`, which it expands before searching a relative token
+    // there. On what is left, the gate judges the name Win32 resolves the token to — trailing dots
+    // and spaces, `..` collapse, drive and UNC and device roots, and data-stream pieces. See
+    // `shell_file`.
     //
     // Then what `ShellExecuteEx` would find by LOOKUP: it does none. The launch is `exefile`
     // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on `lpFile`

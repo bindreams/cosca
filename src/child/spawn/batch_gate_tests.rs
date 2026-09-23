@@ -163,8 +163,7 @@ fn the_stream_reading_subsumes_the_shell_reading() {
 
 /// END TO END WITH THE PLATFORM FORCED — the whole Windows composition
 /// (`win32_effective_file_name` -> `is_batch_program`) on every lane, not just the two Windows
-/// ones. Without it, reverting this gate to the `Path::extension()` rule it replaced stayed green
-/// on four of six, and the `..` collapse had no coverage off Windows.
+/// ones.
 #[test]
 fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file() {
     use std::path::Path;
