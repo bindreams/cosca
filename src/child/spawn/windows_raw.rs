@@ -320,7 +320,9 @@ pub(crate) fn spawn_step(
 /// - `Search` — from `executable()`. Resolved through [`resolve::resolve_executable`]: the
 ///   child's cwd, the child's `PATH`, the `.exe` rules. Always absolute on success.
 /// - `Exact` — from `raw_executable()`. Passed through untouched once
-///   [`resolve::absolutise_exact`] has found that it names a file. This is the ONE site on
+///   [`resolve::absolutise_exact`] has found that it names a file, and its normalised form has
+///   passed the batch gate the loader's view needs
+///   ([`reject_normalised_batch_path`](crate::child::spawn::reject_normalised_batch_path)). This is the ONE site on
 ///   Windows that would otherwise resolve it, silently turning a bare `raw_executable("tool")`
 ///   into a `PATH` lookup and breaking the contract at its only user. A relative value keeps
 ///   `lpApplicationName`'s own meaning, which completes it against the CALLING process's current
@@ -333,8 +335,8 @@ pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<Pa
     match cmd.executable_spec() {
         Some(ExecutableSpec::Search(p)) => Ok(Some(resolve::resolve_executable(p, cmd.cwd(), path)?)),
         Some(ExecutableSpec::Exact(p)) => {
-            // For its refusals only; see `absolutise_exact`'s doc.
-            resolve::absolutise_exact(p)?;
+            // Normalised for the refusals only; the loader completes the token itself.
+            crate::child::spawn::reject_normalised_batch_path(&resolve::absolutise_exact(p)?)?;
             Ok(Some(p.to_path_buf()))
         }
         None => program_token(cmd)

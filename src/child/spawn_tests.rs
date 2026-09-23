@@ -305,6 +305,36 @@ fn on_posix(token: &std::ffi::OsStr) -> Result<(), Error> {
     super::reject_batch_path_on(std::path::Path::new(token), false)
 }
 
+/// Normalisation leaves batch names `Path::extension()` cannot see: `.bat` is a bare name to it,
+/// and a data-stream piece hides behind `:`.
+#[test]
+fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
+    for p in [
+        r"C:\t\.bat",
+        r"C:\t\SETUP.CMD",
+        r"C:\t\x.exe:payload.bat",
+        r"C:\t\x.bat::$DATA",
+        r"C:\t\x.bat.:s",
+        r"C:\t\x.bat :s",
+    ] {
+        assert_eq!(
+            unsupported_op(super::reject_normalised_batch_path(std::path::Path::new(p))),
+            format!("running {p}")
+        );
+    }
+    for p in [
+        r"C:\t\setup.exe",
+        r"C:\t\setup.bat.exe",
+        r"C:\t.bat\setup.exe",
+        r"C:\t\batch",
+    ] {
+        assert!(
+            super::reject_normalised_batch_path(std::path::Path::new(p)).is_ok(),
+            "{p}"
+        );
+    }
+}
+
 /// The Win32 verdict refuses an interior NUL too, on BOTH NUL/batch shapes — the derivation is in
 /// [`super::reject_batch_path_on`]'s doc. Neither may come back as the batch refusal: on
 /// `setup` + NUL + `.bat` Win32 loads `setup`, which carries no batch vector at all, and on

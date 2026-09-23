@@ -530,6 +530,24 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
     }
 }
 
+/// An `Exact` batch file reached only through Win32 normalisation is refused as the batch file it
+/// is, before the planner, so the verdict does not depend on privilege.
+#[test]
+fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_of_privilege() {
+    for elevated in [false, true] {
+        // Trailing dot; one trailing space; a file named `.bat`.
+        for probe in [r"C:\t\setup.bat.", r"C:\t\setup.bat ", r"C:\t\.bat"] {
+            let mut c = Command::new();
+            c.raw_executable(probe).args([probe, "a&calc"]).elevate();
+            let detail = unsupported_detail(super::plan_runas(&c, &win_host(elevated)).map(|_| ()));
+            assert!(
+                detail.contains("CVE-2024-24576"),
+                "elevated={elevated}, {probe:?}: {detail}"
+            );
+        }
+    }
+}
+
 /// A NUL-truncated path that only LOOKS like a batch file (`C:\tools\setup` + NUL + `.bat`): Win32
 /// launches `C:\tools\setup`, a different program than the caller named and no batch file at all.
 /// Whichever gate refuses it must therefore say NUL and not CVE-2024-24576, or the caller is sent

@@ -265,6 +265,38 @@ fn image_for_checks_an_exact_program_normalised_but_passes_it_as_written() {
     assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(r"t\tool.")));
 }
 
+/// `CreateProcessW` loads the name Win32 normalises the token to, so a batch file reached only
+/// through normalisation is refused as a plainly-spelled one is.
+#[test]
+fn image_for_refuses_an_exact_batch_reached_through_win32_normalisation() {
+    // Trailing dot; one trailing space; a file named `.bat`, which has no extension to `Path`.
+    for n in ["setup.bat.", "setup.bat ", r"C:\t\.bat"] {
+        let mut cmd = Command::new();
+        cmd.raw_executable(n).args(["tool"]);
+        assert!(
+            reject_batch_program(&cmd).is_ok(),
+            "premise: the token gate misses {n:?}, so image_for is the only refusal"
+        );
+        match image(&cmd) {
+            Err(Error::Unsupported { platform, detail, .. }) => {
+                assert_eq!(platform, "windows");
+                assert!(detail.contains("CVE-2024-24576"), "{n:?}: {detail}");
+            }
+            other => panic!("{n:?} reaches a batch file and must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// Negative control: a name that merely contains `.bat` loads as written.
+#[test]
+fn image_for_passes_an_exact_program_that_is_not_a_batch_file() {
+    for n in ["setup.exe", "setup.bat.exe"] {
+        let mut cmd = Command::new();
+        cmd.raw_executable(n).args(["tool"]);
+        assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(n)));
+    }
+}
+
 #[test]
 fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
     // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without

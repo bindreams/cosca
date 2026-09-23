@@ -545,6 +545,44 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
     }
 }
 
+/// Refuse a program whose Win32-NORMALISED path — `GetFullPathNameW`'s result, which is what
+/// `CreateProcessW` loads — reaches a `.bat`/`.cmd`. The same [`Error::Unsupported`] as
+/// [`reject_batch_path`].
+///
+/// [`reject_batch_path`] reads `Path::extension()` of the token as written, which misses what
+/// normalisation exposes: `setup.bat.` and `setup.bat ` (one trailing space) become `setup.bat`,
+/// and `C:\t\.bat` has no extension to `Path` at all. This tests by suffix instead, as std's own
+/// `has_bat_extension` does, on every data-stream piece of the final component, each trimmed of
+/// trailing dots and spaces — so `x.bat::$DATA` is refused as its piece `x.bat`. Over-refusing a
+/// stream spelling is the safe direction.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn reject_normalised_batch_path(full: &std::path::Path) -> Result<(), Error> {
+    let text = full.as_os_str().to_string_lossy();
+    let name = text
+        .rsplit(['\\', '/'])
+        .next()
+        .expect("rsplit yields at least one piece");
+    let is_batch = |piece: &str| {
+        let piece = piece.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        piece.ends_with(".bat") || piece.ends_with(".cmd")
+    };
+    if name.split(':').any(is_batch) {
+        return Err(batch_refusal(full));
+    }
+    Ok(())
+}
+
+/// The CVE-2024-24576 refusal both batch gates return.
+fn batch_refusal(prog: &std::path::Path) -> Error {
+    Error::Unsupported {
+        op: format!("running {}", prog.display()),
+        platform: "windows",
+        detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
+                 use .commandline() to pass an explicit, pre-escaped command line"
+            .into(),
+    }
+}
+
 /// Reject a program token carrying an interior NUL, or naming a `.bat`/`.cmd`: Win32 silently
 /// truncates at the NUL (`PCWSTR` has no length), and cmd.exe batch escaping is a distinct,
 /// unimplemented vector (CVE-2024-24576 / BatBadBut). Shared by every backend — the std path
@@ -601,13 +639,7 @@ fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error
     if let Some(ext) = loaded.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {
-            return Err(Error::Unsupported {
-                op: format!("running {}", loaded.display()),
-                platform: "windows",
-                detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
-                         use .commandline() to pass an explicit, pre-escaped command line"
-                    .into(),
-            });
+            return Err(batch_refusal(&loaded));
         }
     }
     Ok(())

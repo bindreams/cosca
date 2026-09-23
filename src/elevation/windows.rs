@@ -471,19 +471,16 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // not ending in `.exe`/`.com`; the `Search` arm's land in a later PR.
     //
     // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
-    // resolves the token as a path, so `setup.bat.`, `setup.bat ` and `C:\tools\.bat` all reach the
-    // same batch file while `Path::extension()` reads `None` or something that is not `bat`. That
-    // class is closed by the batch-gate PR merging immediately before this one, which replaces the
-    // `Path::extension()` reading with a byte-level effective-name computation. NOTHING IN THIS
-    // TREE closes it: until that merge lands, do not read the gate below as covering it.
-    //
-    // The one slice this tree does refuse: on this elevated `Exact` arm, `absolutise_exact` hands
-    // the gate Win32's own normalisation, so trailing dots and spaces arrive stripped
-    // (`setup.bat.` is refused). `C:\tools\.bat` survives normalisation and still passes (the image
-    // allowlist below the planner refuses it, but only where a consent prompt is used). The
-    // `Search` arm, and the raw backend's `raw_executable()` sink, which loads the caller's token
-    // as written, get no such help: `raw_executable("setup.bat.")` passes unelevated.
+    // resolves the token as a path, so `setup.bat.`, `setup.bat ` (one trailing space) and
+    // `C:\tools\.bat` all reach a batch file while `Path::extension()` reads `None` or something
+    // that is not `bat`. On the `Exact` arm `program` IS Win32's normalisation, and
+    // `reject_normalised_batch_path` refuses all three — as `image_for` does for the raw backend's
+    // unelevated `raw_executable()`. The `Search` arm's token is not normalised here, so the class
+    // stays open for it.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
+    if let Some(ExecutableSpec::Exact(_)) = cmd.executable_spec() {
+        crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
+    }
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),

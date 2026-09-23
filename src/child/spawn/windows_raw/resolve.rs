@@ -175,21 +175,17 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// Complete a possibly-relative program name into an absolute path the way the Win32 loader
 /// itself would — **without searching, appending an extension, or touching the filesystem**.
 ///
-/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`]. Its result is
-/// used by exactly one caller, the elevated path, because the two Win32 sinks treat a relative
-/// name oppositely:
+/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`]. Only the
+/// elevated path loads its result, because the two Win32 sinks treat a relative name oppositely:
 ///
 /// - `CreateProcessW` completes a partial `lpApplicationName` itself ("the function uses the
 ///   current drive and current directory to complete the specification. The function will not
-///   use the search path"), so the raw backend hands it a relative value untouched, calling this
-///   only for its refusals and discarding the path.
-/// - `ShellExecuteEx` SEARCHES a path-less `lpFile` — `PATHEXT` applied, `lpDirectory` consulted
-///   as a search location — which is how the elevated path reached the `.bat`/`.cmd` vector.
-///   Completing the name here makes `lpFile` absolute, which stops that directory search but NOT
-///   `PATHEXT`: `ShellExecuteEx` applies it to an absolute extensionless `lpFile` too, and a
-///   planted `setup.bat` outranks an existing `setup` (measured). The consent path therefore also
-///   refuses a completed name not ending in `.exe`/`.com` — see
-///   [`crate::resolve::reject_unloadable_image`], which also says what that leaves unmeasured.
+///   use the search path"), so the raw backend hands it a relative value untouched, using this
+///   only for its refusals and its batch gate.
+/// - `ShellExecuteEx` SEARCHES a path-less `lpFile`, which is how the elevated path reached the
+///   `.bat`/`.cmd` vector; completing the name here stops that search. The consent path also gates
+///   the completed name against `.exe`/`.com` — see [`crate::resolve::reject_unloadable_image`]
+///   for why existence-checking is not enough.
 ///
 /// `GetFullPathNameW` is the right primitive rather than a hand-rolled join, on three counts
 /// documented by Win32 itself:
@@ -205,8 +201,9 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// The current directory is process-global and can change between calls, so the elevated path
 /// consumes the relative name exactly once and everything downstream uses the absolute result —
 /// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code. The raw
-/// backend's discarded result is safe from that race: whether it names a file depends only on the
-/// token's own final component, not on the directory it was completed against.
+/// backend's use is safe from that race: whether it names a file, and whether it names a batch
+/// file, depend only on the token's own final component, not on the directory it was completed
+/// against.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
     // FIRST, ahead of the shape check, so the refusal names the NUL. `to_wide_nul` appends a
     // terminator, and `PCWSTR` stops at the FIRST NUL — so an interior NUL silently truncates the
