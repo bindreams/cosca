@@ -181,13 +181,12 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         r"C:\dir\x.bat\y\..",
         r"..\x.bat\y\..",
         r"x.cmd\y\..",
-        // A dots-and-spaces segment BEFORE a `..` has two readings — dropped, or kept as a name the
-        // `..` then pops — and each exposes a different component. Only the final position is
-        // measured, so the gate refuses when either reading reaches a batch file.
+        // A dots-and-spaces segment BEFORE a `..` is a name the `..` pops (measured), exposing the
+        // batch file before it.
         r"y\x.bat\...\..",
         r"y\x.bat\.. \..",
         r"y\x.bat\ \..",
-        r"x.bat\y\...\..",
+        r"y\x.bat\. \..",
         // A dots-and-spaces component trims away to nothing and drops out, exposing the component
         // before it — which here is the batch file.
         r"x.bat\...",
@@ -266,8 +265,12 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
         // `x.bat\y\.. ` resolves to `…\x.bat\y\`.
         r"x.bat\y\.. ",
         r"x.bat\y\..  ",
-        // Both readings of the interior `...` land on `b`.
+        // An interior dots-and-spaces segment is a name the `..` pops, so these land on `b`, `y`
+        // and `a`: measured, `y\x.bat\...\..` resolves to `y\x.bat`.
         r"a\...\..\b",
+        r"x.bat\y\...\..",
+        r"x.bat\y\.. \..",
+        r"a\...\..",
         r"x\ ",
         // A UNC share name is not a batch file either, and the pops below it are clamped away.
         r"\\server\share",
@@ -344,9 +347,7 @@ fn reject_batch_path_on_windows_refuses_a_path_that_names_no_file_of_its_own() {
 /// somewhere materially different — one says route through cmd.exe yourself, the other says name
 /// the executable — so handing out the wrong one is a bug even though the verdict is right.
 ///
-/// The gate takes two readings of an interior dots-and-spaces segment, and one path can refuse
-/// for a different reason under each: `x.bat\...\..` names no file if the `...` drops out and
-/// `x.bat` if it is a name the `..` pops. The batch reason wins, because only it names the vector.
+/// `x.bat\...\..` reaches `x.bat`: the interior `...` is a name the `..` pops.
 #[test]
 fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
     use std::path::Path;
@@ -1139,40 +1140,40 @@ fn win32_effective_file_name_collapses_the_way_win32_resolves() {
         (r"x.bat\...", Some("x.bat")),
     ] {
         assert_eq!(
-            super::win32_effective_file_name(Path::new(probe), super::Interior::Dropped).as_deref(),
+            super::win32_effective_file_name(Path::new(probe)).as_deref(),
             want,
             "{probe:?}"
         );
     }
 }
 
-/// The OTHER reading of an interior dots-and-spaces segment: kept as a name, which a later `..`
-/// pops instead of the component before it. Microsoft's path-format rules read it this way — only
-/// the final segment is trimmed, and three or more periods are "a valid file/directory name" — as
-/// does Wine's `collapse_path`, which reproduces both final-position measurements. A final one
-/// still drops out under this reading.
+/// An interior dots-and-spaces segment is kept as a name, which a later `..` pops instead of the
+/// component before it — measured on x64 and arm64 runners, for segments ending in a period and in
+/// a space alike, by `tests/windows_path_resolution/dots_and_spaces.rs`'s `an_interior_segment_loses_only_a_single_trailing_period`. A final one drops out.
 #[test]
-fn an_interior_dots_segment_may_be_a_name_a_later_pop_removes() {
+fn an_interior_dots_segment_is_a_name_a_later_pop_removes() {
     use std::path::Path;
-    for (probe, dropped, named) in [
-        (r"y\x.bat\...\..", Some("y"), Some("x.bat")),
-        (r"y\x.bat\.. \..", Some("y"), Some("x.bat")),
-        (r"y\x.bat\ \..", Some("y"), Some("x.bat")),
-        (r"x.bat\y\...\..", Some("x.bat"), Some("y")),
-        (r"a\...\..\b", Some("b"), Some("b")),
-        // Final: dropped under both.
-        (r"x.bat\y\...", Some("y"), Some("y")),
-        (r"x.bat\...", Some("x.bat"), Some("x.bat")),
+    for (probe, want) in [
+        (r"y\x.bat\...\..", Some("x.bat")),
+        (r"y\x.bat\....\..", Some("x.bat")),
+        (r"y\x.bat\.. \..", Some("x.bat")),
+        (r"y\x.bat\. \..", Some("x.bat")),
+        (r"y\x.bat\ \..", Some("x.bat")),
+        (r"y\x.bat\  \..", Some("x.bat")),
+        (r"x.bat\y\...\..", Some("y")),
+        (r"a\...\..\b", Some("b")),
+        (r"a\...\..", Some("a")),
+        // Final: dropped.
+        (r"x.bat\y\...", Some("y")),
+        (r"x.bat\...", Some("x.bat")),
         // A trailing run of them is final too.
-        (r"x.bat\...\ ", Some("x.bat"), Some("x.bat")),
+        (r"x.bat\...\ ", Some("x.bat")),
     ] {
-        for (interior, want) in [(super::Interior::Dropped, dropped), (super::Interior::Named, named)] {
-            assert_eq!(
-                super::win32_effective_file_name(Path::new(probe), interior).as_deref(),
-                want,
-                "{probe:?} read {interior:?}"
-            );
-        }
+        assert_eq!(
+            super::win32_effective_file_name(Path::new(probe)).as_deref(),
+            want,
+            "{probe:?}"
+        );
     }
 }
 
@@ -1292,9 +1293,8 @@ enum Comp {
     /// Pops the component before it: exactly `..`.
     Pop,
     /// Only dots and spaces, yet neither `.` nor `..` — `...`, `.. `, a lone space. FINAL, Win32
-    /// trims it away to nothing and it drops out (measured). Interior it is kept as a name a later
-    /// `..` pops (measured, not yet asserted by the Windows probe); [`oracle_refuses`] takes the
-    /// dropped reading as well until it is.
+    /// trims it away to nothing and it drops out. Interior it is kept as a name a later `..` pops.
+    /// Both measured by the Windows path canary.
     Dots,
     /// A bare drive prefix. Names no file when it ends up final — but only in the path's FIRST
     /// position, the only one a drive prefix can occupy. Anywhere else it is an ordinary name
@@ -1379,10 +1379,9 @@ enum Root {
     Device,
 }
 
-/// Walk `rest` (the components after any UNC or device root) as a stack, with interior
-/// [`Comp::Dots`] either dropped (`dots_named == false`) or kept as a name a later `..` pops. A
-/// FINAL run of them drops out under both — the measured case.
-fn oracle_landing(rest: &[Comp], root: Root, dots_named: bool) -> Landing {
+/// Walk `rest` (the components after any UNC or device root) as a stack, with an interior
+/// [`Comp::Dots`] kept as a name a later `..` pops. A FINAL run of them drops out.
+fn oracle_landing(rest: &[Comp], root: Root) -> Landing {
     #[derive(Clone, Copy)]
     enum Entry {
         Name(bool),
@@ -1393,8 +1392,7 @@ fn oracle_landing(rest: &[Comp], root: Root, dots_named: bool) -> Landing {
     for (i, comp) in rest.iter().enumerate() {
         match comp {
             Comp::Empty | Comp::Skip => {}
-            Comp::Dots if dots_named => stack.push(Entry::Dots),
-            Comp::Dots => {}
+            Comp::Dots => stack.push(Entry::Dots),
             // An empty stack is the root, wherever there is one; popping it is a no-op.
             Comp::Pop => {
                 stack.pop();
@@ -1443,21 +1441,17 @@ fn oracle_landing(rest: &[Comp], root: Root, dots_named: bool) -> Landing {
 /// path names no file. The literal `\\?\` is std's verbatim prefix, which this oracle does not
 /// model; [`compare_gate_with_oracle`] judges those probes by std's literal test instead.
 ///
-/// An interior [`Comp::Dots`] is measured as kept, but not yet asserted by the Windows probe, so
-/// the truth here is still "refuse if either reading reaches a batch file or no file" — the same
-/// hedge the gate takes.
+/// An interior [`Comp::Dots`] is a name a later `..` pops, as `tests/windows_path_resolution/dots_and_spaces.rs`'s `an_interior_segment_loses_only_a_single_trailing_period` measures.
 ///
 /// Agreement with an oracle hides whatever the two share. This one shares the classification in
 /// [`COMPONENTS`] and the "no final name refuses" rule, and nothing else.
 fn oracle_refuses(components: &[Comp]) -> bool {
     if let [Comp::Empty, Comp::Empty, Comp::Skip | Comp::QuestionMark, rest @ ..] = components {
-        return [false, true]
-            .into_iter()
-            .any(|dots_named| match oracle_landing(rest, Root::Device, dots_named) {
-                Landing::Name(batch) => batch,
-                Landing::NoFile => true,
-                Landing::UncRoot => unreachable!("a device path has no UNC root"),
-            });
+        return match oracle_landing(rest, Root::Device) {
+            Landing::Name(batch) => batch,
+            Landing::NoFile => true,
+            Landing::UncRoot => unreachable!("a device path has no UNC root"),
+        };
     }
     let (root, rest) = match components {
         [Comp::Empty, Comp::Empty, rest @ ..] => match rest {
@@ -1467,18 +1461,16 @@ fn oracle_refuses(components: &[Comp]) -> bool {
         },
         _ => (None, components),
     };
-    [false, true].into_iter().any(|dots_named| {
-        let kind = if root.is_some() { Root::Unc } else { Root::Plain };
-        match oracle_landing(rest, kind, dots_named) {
-            Landing::Name(batch) => batch,
-            Landing::NoFile => true,
-            // Collapsed onto `\\server\share`: the share is what std tests.
-            Landing::UncRoot => {
-                let (_, share) = root.expect("only a UNC path lands on a UNC root");
-                as_root_name(share).unwrap_or(true)
-            }
+    let kind = if root.is_some() { Root::Unc } else { Root::Plain };
+    match oracle_landing(rest, kind) {
+        Landing::Name(batch) => batch,
+        Landing::NoFile => true,
+        // Collapsed onto `\\server\share`: the share is what std tests.
+        Landing::UncRoot => {
+            let (_, share) = root.expect("only a UNC path lands on a UNC root");
+            as_root_name(share).unwrap_or(true)
         }
-    })
+    }
 }
 
 /// The one over-refusal the gate declares and the oracle does not share: a path collapsed onto its
@@ -1489,10 +1481,7 @@ fn declared_unc_over_refusal(components: &[Comp]) -> bool {
     let [Comp::Empty, Comp::Empty, server, _share, rest @ ..] = components else {
         return false;
     };
-    as_root_name(*server) == Some(true)
-        && [false, true]
-            .into_iter()
-            .any(|dots_named| oracle_landing(rest, Root::Unc, dots_named) == Landing::UncRoot)
+    as_root_name(*server) == Some(true) && oracle_landing(rest, Root::Unc) == Landing::UncRoot
 }
 
 /// The tally of one exhaustive comparison over [`COMPONENTS`].
@@ -1743,9 +1732,9 @@ fn the_oracle_reads_dots_and_spaces_on_its_own_terms() {
     assert!(!oracle_refuses(&[name(true), name(false), Comp::Dots]));
     // `y\x.bat\...\..` — kept as a name, the `..` pops it and exposes `x.bat`.
     assert!(oracle_refuses(&[name(false), name(true), Comp::Dots, Comp::Pop]));
-    // `x.bat\y\...\..` — dropped, the `..` pops `y` and exposes `x.bat`.
-    assert!(oracle_refuses(&[name(true), name(false), Comp::Dots, Comp::Pop]));
-    // `a\...\..\b` — both readings land on `b`.
+    // `x.bat\y\...\..` — kept as a name, the `..` pops it and `y` stays.
+    assert!(!oracle_refuses(&[name(true), name(false), Comp::Dots, Comp::Pop]));
+    // `a\...\..\b` — lands on `b`.
     assert!(!oracle_refuses(&[name(false), Comp::Dots, Comp::Pop, name(false)]));
 }
 

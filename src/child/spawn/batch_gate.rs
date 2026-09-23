@@ -138,15 +138,11 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
     } else {
         // The name Win32 will actually OPEN, not the one `Path::file_name()` reports: on
         // Windows those differ for any path ending in a `..` component, and the difference is
-        // a live bypass. Under BOTH readings of an interior dots-and-spaces segment, because
-        // either can be the one Win32 applies and each exposes a different component.
-        let names = [Interior::Dropped, Interior::Named].map(|reading| win32_effective_file_name(prog, reading));
-        if names.iter().flatten().any(|name| is_batch_program(name)) {
-            Some(BATCH)
-        } else if names.iter().any(Option::is_none) {
-            Some(NO_FILE)
-        } else {
-            None
+        // a live bypass.
+        match win32_effective_file_name(prog) {
+            Some(name) if is_batch_program(&name) => Some(BATCH),
+            Some(_) => None,
+            None => Some(NO_FILE),
         }
     };
     match refusal {
@@ -274,10 +270,13 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// - **Final**, it trims away to nothing and DROPS OUT, popping nothing. Measured on x64 and arm64
 ///   runners for `...`, `....`, `.. .`, `.. ..`, `" "`, `". "` and `".. "`: `x.bat\y\` plus any
 ///   of them resolves to `…\x.bat\y\`, so `y` survives and the batch file stays covered.
-/// - **Interior**, it is kept as a name — a lone trailing `.` comes off, a run of two or more does
-///   not, spaces never do (measured by the Windows path probe's interior-trim table, not yet one of
-///   its assertions). Until the probe asserts it, [`reject_batch_path_on`] also asks the
-///   [`Interior::Dropped`] reading, and narrowing to [`Interior::Named`] is left to that follow-up.
+/// - **Interior**, it is kept as a name a later `..` pops — a lone trailing `.` comes off, a run of
+///   two or more does not, spaces never do. Measured on x64 and arm64 runners, for segments ending
+///   in a period and in a space alike, by the Windows path canary's
+///   `an_interior_segment_loses_only_a_single_trailing_period`: `y\x.bat\...\..` resolves to
+///   `y\x.bat`. Microsoft's path-format rules read it the same way (only the final segment is
+///   trimmed, and three or more periods are "a valid file/directory name"), as does Wine's
+///   `collapse_path`.
 ///
 /// `None` means the path named no file of its own: it was empty, was a bare root or drive prefix,
 /// or popped its own components away. That last case did NOT collapse to nothing — a relative
@@ -333,7 +332,7 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// `has_bat_extension` does NOT read as a batch file — yet the gate judges the exposed `x.bat` and
 /// refuses. Moving resolution ahead of the gate collapses both into a suffix test on the resolved
 /// path and leaves nothing left to predict.
-pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interior) -> Option<String> {
+pub(super) fn win32_effective_file_name(prog: &std::path::Path) -> Option<String> {
     let text = prog.as_os_str().to_string_lossy();
     // Each surviving component, paired with whether it is the path's FIRST segment — the only
     // position a drive prefix can occupy.
@@ -370,15 +369,12 @@ pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interi
             continue;
         }
         // Ordinary component: Win32 drops trailing dots and spaces. Nothing left of it means a
-        // dots-and-spaces component; see the doc for its two readings. Kept, it is an EMPTY name,
-        // which a later `..` can pop and which is never a batch file.
+        // dots-and-spaces component (see the doc), kept as an EMPTY name, which a later `..` can
+        // pop and which is never a batch file.
         let name = segment.trim_end_matches([' ', '.']);
-        if name.is_empty() && interior == Interior::Dropped {
-            continue;
-        }
         stack.push((name, position == 0));
     }
-    // Whatever is final drops out under either reading, however many of them trail.
+    // Whatever is final drops out, however many of them trail.
     while stack.last().is_some_and(|(name, _)| name.is_empty()) {
         stack.pop();
     }
@@ -396,19 +392,6 @@ pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interi
         return None;
     }
     Some(last.to_string())
-}
-
-/// How to read a dots-and-spaces segment (`...`, `.. `, a lone space) that is NOT the path's final
-/// one. [`Interior::Named`] is the measured reading; see [`win32_effective_file_name`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Interior {
-    /// It drops out, as the measured final one does: `y\x.bat\...\..` resolves to `y`.
-    Dropped,
-    /// It is a name, and a later `..` pops it: `y\x.bat\...\..` resolves to `y\x.bat`. Microsoft's
-    /// path-format rules read it this way (only the final segment is trimmed, and three or more
-    /// periods are "a valid file/directory name"), as does Wine's `collapse_path`, which also
-    /// reproduces every final-position measurement.
-    Named,
 }
 
 /// The name a path collapsed onto its UNC root resolves to, judged conservatively.
