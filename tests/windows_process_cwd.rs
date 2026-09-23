@@ -24,8 +24,12 @@ fn probe(mode: &str, child: &str) -> String {
     report
 }
 
+/// No route spawns from a cwd past `MAX_PATH`, even in a long-path-aware process with the policy
+/// on: `CreateProcessW` refuses a NULL `lpCurrentDirectory` inherited from it as
+/// `ERROR_INVALID_PARAMETER` (87), and the same directory passed explicitly as `ERROR_DIRECTORY`
+/// (267). It fails before any child runs, so the child's own manifest changes nothing.
 #[test]
-fn a_long_path_aware_process_spawns_from_a_long_cwd_on_every_route() {
+fn no_route_spawns_from_a_long_cwd_even_when_long_path_aware() {
     let report = probe("long", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
     assert_eq!(
@@ -36,12 +40,12 @@ fn a_long_path_aware_process_spawns_from_a_long_cwd_on_every_route() {
     let expected = [
         "long_paths_enabled=true",
         "set_plain=ok",
-        "cosca_raw_aware=ok,cwd=<long>",
-        "null_cwd_aware=ok,cwd=<long>",
-        "explicit_cwd_aware=ok,cwd=<long>",
-        "cosca_raw_unaware=ok,cwd=<long>",
-        "null_cwd_unaware=ok,cwd=<long>",
-        "explicit_cwd_unaware=ok,cwd=<long>",
+        "cosca_raw_aware=err=267",
+        "null_cwd_aware=err=87",
+        "explicit_cwd_aware=err=267",
+        "cosca_raw_unaware=err=267",
+        "null_cwd_unaware=err=87",
+        "explicit_cwd_unaware=err=267",
     ];
     assert_eq!(facts, expected, "full report:\n{report}");
 }

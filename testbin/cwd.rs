@@ -189,7 +189,8 @@ mod probe {
         use windows::core::{PCWSTR, PWSTR};
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
-            CreateProcessW, WaitForSingleObject, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+            CreateProcessW, WaitForSingleObject, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+            STARTF_USESTDHANDLES, STARTUPINFOW,
         };
         let report = d.join("win32-report.txt");
         let wide = |s: &OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
@@ -200,8 +201,11 @@ mod probe {
             l.push("\"");
             l
         });
+        // Null std handles: the child writes its report to `report`, and would otherwise print it
+        // into this probe's own stdout too.
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
