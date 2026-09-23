@@ -1806,3 +1806,36 @@ fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
     unsafe { libc::close(procs_fd) };
     assert!(result.is_err(), "the spawn must fail");
 }
+
+/// A child that something else in this process already reaped — a `waitpid(-1)` reaper, or
+/// `SIGCHLD` set to `SIG_IGN` — breaks the verdict's precondition. In release the verdict still
+/// decides without a pidfd, and never signals the pid, which may by now be another process's.
+/// (Debug builds assert the precondition instead.)
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+#[test]
+fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
+    let reaped = || {
+        let mut child = std::process::Command::new("/bin/true").spawn().expect("spawn");
+        child.wait().expect("reap");
+        child.id()
+    };
+
+    // `pidfd_open` fails with ESRCH: the leaf is closed, and the spawn degrades.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-reaped");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    match leaf.take_placement(reaped()).expect("decidable") {
+        Err(NotPlaced::Unwaitable { source, .. }) => assert_eq!(source.raw_os_error(), Some(libc::ESRCH)),
+        other => panic!("expected Unwaitable, got {other:?}"),
+    }
+    assert!(!leaf_path.exists(), "the leaf must be closed");
+
+    // Undecidable: the spawn fails, and the reaped pid is not signalled.
+    std::fs::create_dir(&leaf_path).expect("recreate the leaf");
+    std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut channel = leaf.report.take().expect("the channel");
+    let err = leaf.abandon(reaped(), &mut channel, "the test cannot decide");
+    assert!(err.to_string().contains("already reaped"), "got {err}");
+}

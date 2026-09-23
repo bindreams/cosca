@@ -628,7 +628,9 @@ impl ReportChannel {
     /// Block until the report of `pid`, the child spawned with this channel's slot, is final, and
     /// return it. See [`ReportChannel`] for why `spawn` returning is not enough.
     ///
-    /// `pid` must be this process's own unreaped child, so no other process can hold its number.
+    /// `pid` must be this process's own unreaped child, so no other process can hold its number
+    /// (see [`Command::contain`](crate::Command::contain) for what breaks that). If something
+    /// else reaped it, `pidfd_open` fails with `ESRCH` and the verdict decides without a pidfd.
     ///
     /// `Err` is `pidfd_open`'s: the child's exit cannot be watched, so only a report already
     /// sent is final. Nothing blocks in that case; [`CgroupLeaf::take_placement`] decides without
@@ -656,7 +658,7 @@ impl ReportChannel {
                 debug_assert_ne!(
                     e,
                     rustix::io::Errno::SRCH,
-                    "{pid:?} is not an unreaped child of this process"
+                    "{pid:?} is not an unreaped child of this process: something else reaped it"
                 );
                 return match self.read_final() {
                     PlacementReport::NotReported => Err(e.into()),
@@ -963,13 +965,45 @@ impl CgroupLeaf {
     /// before `exec`, so a child killed without sending it never ran a program that could fork. So
     /// the leaf is killed through only then. Otherwise whatever occupies it is not cosca's, and a
     /// degrade never kills.
+    ///
+    /// There is no pidfd here — its failure is why the verdict is undecidable — so the child is
+    /// signalled by pid. That is sound only while `pid` is this process's own unreaped child
+    /// (see [`Command::contain`](crate::Command::contain)): a reaper elsewhere in the process
+    /// could free the number for reuse. A child already reaped is detected and never signalled,
+    /// but one reaped between that check and the `kill` is not.
     fn abandon(&mut self, pid: u32, channel: &mut ReportChannel, why: &str) -> crate::error::Error {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+
         let child = Pid::from_raw(i32::try_from(pid).expect("a spawned child's pid is a positive i32"));
-        // `pid` is this process's own unreaped child, so no other process holds its number.
+        // Whether `pid` is still this process's child, live or exited, without reaping it.
+        let ours = loop {
+            match waitid(
+                Id::Pid(child),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::ECHILD) => break false,
+                _ => break true,
+            }
+        };
+        debug_assert!(
+            ours,
+            "{child} is not an unreaped child of this process: something else reaped it"
+        );
+        if !ours {
+            // Reaped, so it has exited and its report is final — but its number may already be
+            // another process's, so it is not signalled.
+            self.entered = channel.read_final() == PlacementReport::Placed;
+            return crate::error::Error::Containment {
+                detail: format!(
+                    "cannot tell whether child {pid} entered its cgroup leaf: {why}; the child was \
+                     already reaped by something else in this process, so it was not signalled"
+                ),
+            };
+        }
         let _ = kill(child, Signal::SIGKILL);
         // Its exit, not its reaping: the spawn's error path reaps it.
-        let flags = nix::sys::wait::WaitPidFlag::WEXITED | nix::sys::wait::WaitPidFlag::WNOWAIT;
-        while let Err(nix::errno::Errno::EINTR) = nix::sys::wait::waitid(nix::sys::wait::Id::Pid(child), flags) {}
+        while let Err(nix::errno::Errno::EINTR) = waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {}
         // The child has exited, so its report is final.
         self.entered = channel.read_final() == PlacementReport::Placed;
         let kill = if self.entered {

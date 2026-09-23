@@ -100,7 +100,9 @@ impl Command {
         self.inner.kill_on_drop(yes);
         self
     }
-    /// Contain the child's tree with the strongest available mechanism.
+    /// Contain the child's tree with the strongest available mechanism. The same Linux
+    /// precondition applies as for [`Command::contain`](crate::Command::contain): nothing else
+    /// in the process may reap the child.
     pub fn contain(&mut self) -> &mut Command {
         self.inner.contain();
         self

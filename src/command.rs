@@ -511,6 +511,13 @@ impl Command {
     /// Contain the child's whole process tree using the strongest mechanism
     /// available, so dropping or `kill_tree`-ing the child tears down every
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
+    ///
+    /// # Linux: the child must stay this process's to reap
+    /// Until `spawn` returns, cosca tells by the child's pid whether it entered its cgroup, and may
+    /// have to kill it. So nothing else in the process may reap it first: do not set `SIGCHLD` to
+    /// `SIG_IGN`, and do not run a reaper that calls `waitpid(-1, …)` or `wait()`. Either can free
+    /// the pid for reuse by an unrelated process. Debug builds assert this; release builds
+    /// degrade, or fail the spawn, without signalling the pid when they see it.
     pub fn contain(&mut self) -> &mut Command {
         self.contain_with(ContainMode::Strongest)
     }
