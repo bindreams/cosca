@@ -60,9 +60,11 @@ $ErrorActionPreference = "Stop"
 
 # rustup-init doesn't update the CURRENT process's PATH after installing - re-derive cargo's
 # bin dir directly (matches rustup's own default: %USERPROFILE%\.cargo\bin) so the
-# `cargo install cargo-nextest` call further down in THIS script sees it immediately, rather
-# than relying on a fresh process to pick up the user PATH change rustup persists to the
-# registry.
+# already-installed-version check further down in THIS script (`Get-Command cargo-nextest`,
+# and `cargo nextest --version`) sees the freshly-installed toolchain immediately, rather than
+# relying on a fresh process to pick up the user PATH change rustup persists to the registry.
+# (This script never runs `cargo install cargo-nextest` - nextest is installed below by
+# downloading and expanding a prebuilt release zip, not compiled via cargo.)
 $cargoBin = "$env:USERPROFILE\.cargo\bin"
 $env:PATH = "$cargoBin;$env:PATH"
 
@@ -121,9 +123,10 @@ if ($vcRuntimeInstalled) {
     Write-Host "devvm: installed VC++ redistributable"
 }
 
-# cosca's CI (the Skuld migration) pins cargo-nextest at this exact version - install the
-# same one here so `devvm.py run windows-x64 -- cargo nextest run ...` matches what CI runs
-# instead of whatever a fresh install would resolve to today.
+# This version matches the planned CI pin for cargo-nextest (the Skuld migration, #151) - not
+# a pin that exists in CI today. Installing the same version here means `devvm.py run
+# windows-x64 -- cargo nextest run ...` matches what CI is planned to run instead of whatever
+# a fresh install would resolve to today.
 #
 # Downloads nextest's own prebuilt release binary rather than `cargo install
 # cargo-nextest --locked` (compiling it from source). Measured directly (2026-09-23):
@@ -135,6 +138,11 @@ if ($vcRuntimeInstalled) {
 # since nextest only shells out to `cargo build` and then runs the resulting test binaries
 # directly; it doesn't need to have been built with the same toolchain itself.
 $nextestVersion = "0.9.137"
+# SHA-256 of the exact release asset, fetched and independently verified (both against
+# nextest's own published `.sha256` files and a fresh `Get-FileHash` of a freshly downloaded
+# copy) 2026-09-23. Checked before extracting (below) so a corrupted or tampered download is a
+# hard failure, never silently `Expand-Archive`'d.
+$nextestSha256 = "88c746b41b1e96165028ef90b9dac5d37eb923e4e00aee6b9080a038f1ac2705"
 $installedVersion = if (Get-Command cargo-nextest -ErrorAction SilentlyContinue) {
     ((cargo nextest --version 2>$null) -split " ")[1]
 } else {
@@ -147,6 +155,11 @@ if ($installedVersion -eq $nextestVersion) {
     $nextestZip = "$env:TEMP\cargo-nextest-$nextestVersion.zip"
     $nextestUrl = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextestVersion/cargo-nextest-$nextestVersion-x86_64-pc-windows-msvc.zip"
     Invoke-WebRequest -Uri $nextestUrl -OutFile $nextestZip
+    $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $nextestZip).Hash
+    if ($actualSha256 -ine $nextestSha256) {
+        Remove-Item -Path $nextestZip -ErrorAction SilentlyContinue
+        throw "devvm: cargo-nextest download checksum mismatch: expected $nextestSha256, got $actualSha256"
+    }
     New-Item -ItemType Directory -Path $cargoBin -Force | Out-Null
     # -Force overwrites cargo-nextest.exe in place if a different (e.g. mismatched) version
     # was left there by an interrupted previous run.
