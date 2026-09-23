@@ -136,6 +136,10 @@ fn an_elevated_program_must_be_fully_qualified() {
         r"C:tools\setup.exe",
         r"𝒳:\setup.exe",
         "",
+        // Separators are read before a drive, as Win32 reads them: rooted, not drive `\`.
+        r"\:\setup.exe",
+        // Two separators with no share name no file on any drive or share.
+        r"\\setup.exe",
     ] {
         assert!(
             matches!(

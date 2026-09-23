@@ -171,18 +171,13 @@ fn is_drive_prefix(component: &str) -> bool {
     drive_prefix_len(component) == Some(component.len())
 }
 
-/// The byte length of the drive prefix `text` opens with, if any. Win32 asks only whether
-/// `Path[1]` is `:` (ReactOS `RtlDetermineDosPathNameType_Ustr`, Wine
-/// `RtlDetermineDosPathNameType_U`), so ANY one UTF-16 unit is a drive: `1:`, `é:`, and the U+FFFD
-/// a lone surrogate becomes through `to_string_lossy`. A character outside the BMP is two units,
-/// so `Path[1]` is its low surrogate and `𝒳:` is no drive.
+/// The byte length of the drive prefix `text` opens with, if any: any ONE UTF-16 unit, then `:`,
+/// as Win32 reads `Path[1]` (ReactOS `RtlDetermineDosPathNameType_Ustr`, Wine
+/// `RtlDetermineDosPathNameType_U`). `1:`, `é:`, and the U+FFFD a lone surrogate becomes through
+/// `to_string_lossy` are drives; `𝒳:` (two units) is not. The rule is
+/// `crate::resolve::drive_len`'s, so the batch gate and the resolver read one drive the same way.
 pub(crate) fn drive_prefix_len(text: &str) -> Option<usize> {
-    let mut chars = text.char_indices();
-    let (_, drive) = chars.next()?;
-    let (colon, ':') = chars.next()? else {
-        return None;
-    };
-    (drive.len_utf16() == 1).then_some(colon + 1)
+    crate::resolve::drive_len(text.as_bytes())
 }
 
 #[cfg(test)]

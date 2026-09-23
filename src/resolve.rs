@@ -59,14 +59,23 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub(crate) mod exact;
+pub(crate) mod join;
 
 /// Everything the policy reads. Taken as parameters so the rules are testable without touching
 /// the ambient environment.
 pub(crate) struct ResolveInput<'a> {
     /// The program as the caller wrote it.
     pub program: &'a Path,
-    /// The directory the CHILD will run in: `Command::cwd()` when set, else the parent's.
-    pub cwd: &'a Path,
+    /// The directory the CHILD will run in, the base a relative located name is read against.
+    ///
+    /// On the Windows grammar it must be fully qualified: the caller completes it as Win32 does
+    /// (`windows_raw::resolve::complete_on`), since that needs this process's cwd and a drive's own
+    /// directory, which this module does not read. On the POSIX grammar a relative one is joined
+    /// onto this process's cwd.
+    ///
+    /// `None` is allowed only for a name [`needs_base`] says needs none, which then reads nothing;
+    /// for any other name it is a contract violation and panics.
+    pub cwd: Option<&'a Path>,
     /// Directories searched for a bare name BEFORE `PATH`, in order. Ignored entirely when
     /// `windows` is `false` — POSIX has no analogous search order to preserve.
     ///
@@ -101,6 +110,19 @@ pub(crate) struct ResolveInput<'a> {
     pub path_var: Option<&'a OsStr>,
     /// Apply Windows rules: `;` separated `PATH`, `\` a separator, drive prefixes, the `.exe` rule.
     pub windows: bool,
+    /// Keep only candidates ending in `.exe`/`.com`, for a caller that hands the result to a sink
+    /// that extends a name, as `ShellExecuteEx` does: see [`reject_unloadable_image`]. Windows
+    /// only.
+    ///
+    /// A FILTER, so a non-loadable candidate is skipped rather than chosen and then refused: with
+    /// both `bin/tool` and `bin/tool.exe` present, `bin/tool` resolves to `bin/tool.exe`. Refusing
+    /// after the choice would report `InvalidInput` for a string a file on disk satisfies, and let
+    /// whoever can write an extensionless `tool` into `bin/` block the spawn. `false` leaves
+    /// resolution exactly as an ordinary spawn sees it.
+    ///
+    /// It also makes the search fail closed on a candidate whose existence cannot be determined,
+    /// where an ordinary search skips it with a warning: see [`resolve`].
+    pub loadable_only: bool,
 }
 
 /// How the program names its file, which decides whether `PATH` (and, on Windows,
@@ -114,6 +136,72 @@ pub(crate) enum Shape {
     Located,
 }
 
+/// How Win32 reads a path, decided as `RtlDetermineDosPathNameType_U` decides it: separators
+/// first, then a drive. Every Windows-grammar classifier here, and the raw backend's completion
+/// of a `raw_executable()` token or `current_dir`, reads a path through this one function, so no
+/// two of them can disagree on the same string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathType {
+    /// Two leading separators, either kind: UNC, `\\?\`, `\\.\`.
+    Unc,
+    /// A drive and a separator: `C:\x`.
+    DriveAbsolute,
+    /// A drive with no separator after it: `C:x`, relative to that drive's own current directory.
+    DriveRelative,
+    /// One leading separator: `\x`, on the current drive or share.
+    Rooted,
+    /// Anything else, relative to the current directory.
+    Relative,
+}
+
+/// `program`'s Win32 path type. See [`PathType`].
+pub(crate) fn path_type(program: &OsStr) -> PathType {
+    let bytes = program.as_encoded_bytes();
+    let sep_at = |i: usize| bytes.get(i).is_some_and(|&b| is_sep(b, true));
+    if sep_at(0) {
+        return if sep_at(1) { PathType::Unc } else { PathType::Rooted };
+    }
+    match drive_len(bytes) {
+        Some(len) if sep_at(len) => PathType::DriveAbsolute,
+        Some(_) => PathType::DriveRelative,
+        None => PathType::Relative,
+    }
+}
+
+/// The byte length of a drive prefix — any ONE UTF-16 unit, then `:` — or `None`. Win32 takes any
+/// unit there, not only a letter (`RtlDetermineDosPathNameType_U` tests `path[1] == ':'`), so
+/// `1:tool` names drive `1`. Byte-level over the WTF-8 encoding: a lead byte of up to three bytes
+/// is one unit, a four-byte one (a supplementary character) is two.
+///
+/// Not the whole story on its own: [`path_type`] checks separators first, so `\:x` is rooted.
+pub(crate) fn drive_len(bytes: &[u8]) -> Option<usize> {
+    let unit = match *bytes.first()? {
+        b if b < 0x80 => 1,
+        b if b >= 0xF0 => return None,
+        b if b >= 0xE0 => 3,
+        b if b >= 0xC0 => 2,
+        _ => return None,
+    };
+    (bytes.get(unit) == Some(&b':')).then_some(unit + 1)
+}
+
+/// `program` split after its drive (`C:`, any one unit and `:`), for a drive-absolute or
+/// drive-relative path; `None` for any other type.
+pub(crate) fn split_drive(program: &OsStr) -> Option<(&OsStr, &OsStr)> {
+    if !matches!(path_type(program), PathType::DriveAbsolute | PathType::DriveRelative) {
+        return None;
+    }
+    let bytes = program.as_encoded_bytes();
+    let len = drive_len(bytes)?;
+    // SAFETY: `len` ends just after an ASCII `:`, so both halves are whole WTF-8 substrings.
+    Some(unsafe {
+        (
+            OsStr::from_encoded_bytes_unchecked(&bytes[..len]),
+            OsStr::from_encoded_bytes_unchecked(&bytes[len..]),
+        )
+    })
+}
+
 pub(crate) fn classify(program: &OsStr, windows: bool) -> Shape {
     let bytes = program.as_encoded_bytes();
     if bytes.iter().any(|&b| is_sep(b, windows)) {
@@ -123,17 +211,72 @@ pub(crate) fn classify(program: &OsStr, windows: bool) -> Shape {
     // a naive rule calls it bare and searches `PATH` — but joining a directory onto it collapses
     // straight back to `C:tool` (`PathBuf::push` clears for any prefixed path), so the search is
     // a lie that lands in a current directory.
-    if windows && has_drive_prefix(bytes) {
+    if windows && drive_len(bytes).is_some() {
         return Shape::Located;
     }
     Shape::BareName
+}
+
+/// Whether [`resolve`] reads [`ResolveInput::cwd`] for `program`: exactly for a relative located
+/// name. A bare name is searched, an absolute one is its own location, and a drive-relative or
+/// share-less UNC-shaped name is refused before any base is read. A caller that supplies the base
+/// itself asks this to know whether it must.
+pub(crate) fn needs_base(program: &OsStr, windows: bool) -> bool {
+    if windows {
+        return classify(program, true) == Shape::Located
+            && matches!(path_type(program), PathType::Rooted | PathType::Relative);
+    }
+    classify(program, false) == Shape::Located && !is_absolute_name(program, false)
+}
+
+/// Whether Win32 reads `program` as UNC — it starts with two separators, either kind — while no
+/// UNC prefix parses from it, because the share is missing or empty (`\\tool.exe`, `//tool.exe`,
+/// `\\srv\\x.exe`). Windows only.
+fn is_unc_without_share(program: &OsStr, windows: bool) -> bool {
+    windows && path_type(program) == PathType::Unc && windows_prefix_len(program.as_encoded_bytes()) == 0
+}
+
+/// Whether `program` is ABSOLUTE in the simulated platform's grammar: on POSIX a leading `/`; on
+/// Windows a drive and a root (`C:\`), or a UNC, verbatim or device prefix (`\\server\share`,
+/// `\\?\`, `\\.\`). A rooted `\tool` and a drive-relative `C:tool` are not: each still
+/// needs a current directory.
+pub(crate) fn is_absolute_name(program: &OsStr, windows: bool) -> bool {
+    let bytes = program.as_encoded_bytes();
+    if !windows {
+        return bytes.first() == Some(&b'/');
+    }
+    match path_type(program) {
+        PathType::DriveAbsolute => true,
+        PathType::Unc => windows_prefix_len(bytes) > 0 && !is_verbatim_unc_without_share(bytes),
+        PathType::DriveRelative | PathType::Rooted | PathType::Relative => false,
+    }
+}
+
+/// Whether `bytes` is a verbatim UNC prefix (`\\?\UNC\`) missing its server or share, which
+/// names no share as the plain `\\srv` does. [`windows_prefix_len`] counts such a prefix whole,
+/// since nothing may be appended to it either way.
+fn is_verbatim_unc_without_share(bytes: &[u8]) -> bool {
+    let is_verbatim_unc = bytes.len() >= 8
+        && bytes[..4] == *br"\\?\"
+        && bytes[4..7].eq_ignore_ascii_case(b"UNC")
+        && is_sep(bytes[7], true);
+    if !is_verbatim_unc {
+        return false;
+    }
+    let mut parts = bytes[8..].split(|&b| is_sep(b, true));
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    server.is_empty() || share.is_empty()
 }
 
 fn is_sep(b: u8, windows: bool) -> bool {
     b == b'/' || (windows && b == b'\\')
 }
 
-fn has_drive_prefix(bytes: &[u8]) -> bool {
+/// An ASCII-letter drive, for the one place Win32 does not parse the path at all: after a `\\?\`
+/// marker, where `std` and `PureWindowsPath` recognise only a letter. Everywhere else a drive is
+/// [`drive_len`]'s.
+fn has_ascii_drive(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
@@ -142,8 +285,7 @@ fn has_drive_prefix(bytes: &[u8]) -> bool {
 /// cosca does not track, so no filesystem can make it resolve. Refused, never searched; see the
 /// module doc's error-kind rule.
 fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
-    let bytes = program.as_encoded_bytes();
-    windows && has_drive_prefix(bytes) && !bytes.get(2).is_some_and(|&b| is_sep(b, windows))
+    windows && path_type(program) == PathType::DriveRelative
 }
 
 /// The length of the Windows PREFIX — the leading run naming a volume, share, device or verbatim
@@ -166,7 +308,11 @@ fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
 /// those four bytes means no verbatim prefix), and `\\server` with no share is no prefix at all.
 fn windows_prefix_len(bytes: &[u8]) -> usize {
     if !(bytes.len() >= 2 && is_sep(bytes[0], true) && is_sep(bytes[1], true)) {
-        return if has_drive_prefix(bytes) { 2 } else { 0 };
+        // A separator in slot 0 is never a drive: `\:x` is rooted.
+        if bytes.first().is_some_and(|&b| is_sep(b, true)) {
+            return 0;
+        }
+        return drive_len(bytes).unwrap_or(0);
     }
     // End offset of the component starting at `at`, exclusive of its separator.
     let component = |at: usize| {
@@ -186,7 +332,7 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
         }
         // `\\?\C:` — a drive is recognised only EXACTLY here: `\\?\C:x` is the verbatim namespace
         // `C:x`, not drive C. `PureWindowsPath` agrees (`\\?\C:a` names nothing), as does `std`.
-        if has_drive_prefix(&bytes[4..]) && bytes.get(6).is_none_or(|&b| is_sep(b, true)) {
+        if has_ascii_drive(&bytes[4..]) && bytes.get(6).is_none_or(|&b| is_sep(b, true)) {
             return 6;
         }
         return component(4);
@@ -484,13 +630,17 @@ pub(crate) fn reject_unloadable_image(program: &Path, windows: bool) -> Result<(
     if !names_no_file(program.as_os_str(), windows) && has_loadable_extension(program.as_os_str()) {
         return Ok(());
     }
-    Err(Error::Io(std::io::Error::new(
+    Err(unloadable_image(program))
+}
+
+fn unloadable_image(program: &Path) -> Error {
+    Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
             "elevation requires an image named .exe or .com, because ShellExecuteEx may apply \
              PATHEXT to any other name and a planted script would then outrank it: {program:?}"
         ),
-    )))
+    ))
 }
 
 fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {
@@ -576,25 +726,109 @@ fn split_path_var_windows(bytes: &[u8]) -> Vec<PathBuf> {
 /// `#[cfg(unix)]`: simulating POSIX on a Windows HOST therefore skips the execute-bit check
 /// entirely. See #143 — that mismatch is the concrete motivation for replacing this flag with a
 /// platform trait.
-fn is_execable(path: &Path, windows: bool) -> bool {
-    if !path.is_file() {
-        return false;
+///
+/// `Err` when the filesystem could not say whether `path` exists (a permission, I/O or network
+/// failure), as distinct from saying it does not: see [`resolve`] for what each caller does with
+/// that. Only a missing file or directory, a non-directory in the path, and a name no filesystem
+/// accepts are a definite "not here".
+fn is_execable(path: &Path, windows: bool) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if is_absence(&e) => return Ok(false),
+        Err(e) => return Err(e),
     }
     #[cfg(unix)]
     if !windows {
         use std::os::unix::ffi::OsStrExt;
         let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-            return false;
+            return Ok(false);
         };
         // SAFETY: a read-only permission query on a valid NUL-terminated path.
-        return unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 };
+        let rc = unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) };
+        let errno = if rc == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        return execute_permission(rc, errno);
     }
     let _ = windows;
-    true
+    Ok(true)
+}
+
+/// The answer of an `X_OK` `faccessat` that returned `rc` with `errno`: executable, not (denied, or
+/// the file gone since `metadata` saw it), or undeterminable (any other failure), so that `resolve`
+/// applies the same disposition as to a failed `metadata`.
+#[cfg(unix)]
+fn execute_permission(rc: libc::c_int, errno: i32) -> std::io::Result<bool> {
+    if rc == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::from_raw_os_error(errno);
+    if errno == libc::EACCES || is_absence(&e) {
+        return Ok(false);
+    }
+    Err(e)
+}
+
+/// Whether a metadata error says definitely "no such file": nothing at the path, a non-directory
+/// in it, a name no filesystem accepts, or (Windows) no such drive.
+///
+/// Decided on the raw OS code, not [`std::io::ErrorKind`]: std maps `ERROR_BAD_NETPATH` and
+/// `ERROR_BAD_NET_NAME` to `NotFound` too, and an unreachable share may only be unreachable for now.
+fn is_absence(e: &std::io::Error) -> bool {
+    let Some(code) = e.raw_os_error() else {
+        return e.kind() == std::io::ErrorKind::NotFound;
+    };
+    #[cfg(windows)]
+    {
+        // FILE_NOT_FOUND, PATH_NOT_FOUND, INVALID_DRIVE, INVALID_NAME, BAD_PATHNAME, DIRECTORY.
+        matches!(code, 2 | 3 | 15 | 123 | 161 | 267)
+    }
+    #[cfg(unix)]
+    {
+        matches!(code, libc::ENOENT | libc::ENOTDIR)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = code;
+        e.kind() == std::io::ErrorKind::NotFound
+    }
+}
+
+/// `candidate` under `dir`: on the Windows grammar by [`join::join`], the one Windows join, with
+/// the host's separator since the result is probed on this host; otherwise `PathBuf::join`. An empty
+/// `dir` is an absolute name's own location.
+fn join_candidate(dir: &Path, candidate: &OsStr, windows: bool) -> PathBuf {
+    if !windows {
+        return dir.join(candidate);
+    }
+    if dir.as_os_str().is_empty() {
+        return PathBuf::from(candidate);
+    }
+    PathBuf::from(join::join(dir.as_os_str(), candidate, std::path::MAIN_SEPARATOR_STR))
+}
+
+/// Whether a joined candidate is fully qualified, so no current directory, the process's or a
+/// drive's, decides which file it names. Either reading counts: `std`'s knows the host's grammar
+/// (and on Windows only letter drives), [`is_absolute_name`] the simulated one.
+fn accepted(joined: &Path, windows: bool) -> bool {
+    joined.is_absolute() || is_absolute_name(joined.as_os_str(), windows)
 }
 
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     let name = input.program.as_os_str();
+    // The base contract, reported at the call boundary rather than where the base is first used.
+    debug_assert!(
+        input.cwd.is_some() || !needs_base(name, input.windows),
+        "{name:?} needs a base, and none was given"
+    );
+    debug_assert!(
+        !input.windows || input.cwd.is_none_or(|cwd| accepted(cwd, true)),
+        "a Windows base must be fully qualified: {:?}",
+        input.cwd
+    );
     // A name with no stem does not merely fail to resolve, it INVENTS one: the `.exe` rule turned
     // `""` into the candidate `.exe`, `.` into `..exe`, and `C:\t\.` into `C:\t\..exe` — each a
     // file that a writer of the searched directory can plant under a name the caller never wrote.
@@ -619,24 +853,54 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             ),
         )));
     }
+    // `PathBuf::join` would read such a name as rooted and keep the base's own drive, loading a
+    // local file where Win32 reads a UNC path the caller named.
+    if is_unc_without_share(name, input.windows) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "program starts with two separators, which Win32 reads as a UNC path, but names no \
+                 share: {:?}",
+                input.program
+            ),
+        )));
+    }
     // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the
     // exact name the caller wrote, a searched one does not — see `filename_candidates`).
     let shape = classify(name, input.windows);
-    let candidates = filename_candidates(name, input.windows, shape);
-
-    // The cwd is absolutised BEFORE joining. A relative one would otherwise be applied twice:
-    // the resolver joins it, and std chdirs the child into it as well, so `./tool` with
-    // `current_dir("sub")` would exec `sub/sub/tool` (measured).
-    let cwd_owned;
-    let cwd: &Path = if input.cwd.is_absolute() {
-        input.cwd
-    } else {
-        cwd_owned = std::env::current_dir().map_err(Error::Io)?.join(input.cwd);
-        &cwd_owned
-    };
+    let mut candidates = filename_candidates(name, input.windows, shape);
+    debug_assert!(
+        input.windows || !input.loadable_only,
+        "loadable_only is a Windows rule: {:?}",
+        input.program
+    );
+    if input.loadable_only {
+        candidates.retain(|c| has_loadable_extension(c));
+        // Candidates depend on the string alone, so none surviving is a refusal on shape
+        // (`bin/tool.bat`), stated here rather than left to the loop's `NotFound`.
+        if candidates.is_empty() {
+            return Err(unloadable_image(input.program));
+        }
+    }
 
     let dirs: Vec<PathBuf> = match shape {
-        Shape::Located => vec![cwd.to_path_buf()],
+        // An absolute name is its own location: joining it onto any directory yields it again, so
+        // no cwd is read for it.
+        Shape::Located if !needs_base(name, input.windows) => vec![PathBuf::new()],
+        // The cwd is absolutised BEFORE joining. A relative one would otherwise be applied twice:
+        // the resolver joins it, and std chdirs the child into it as well, so `./tool` with
+        // `current_dir("sub")` would exec `sub/sub/tool` (measured).
+        Shape::Located => vec![match input.cwd {
+            // Either reading counts: `std` knows only the host's grammar (and on Windows, only
+            // letter drives), this module's classifier only the simulated one.
+            Some(cwd) if accepted(cwd, input.windows) => cwd.to_path_buf(),
+            Some(cwd) if !input.windows => std::env::current_dir().map_err(Error::Io)?.join(cwd),
+            Some(cwd) => unreachable!("a Windows base must be fully qualified: {cwd:?}"),
+            // A caller that supplies its own base passes `None` only for a name that
+            // `needs_base` says needs none. Reading the process cwd here instead would be a second
+            // read that caller cannot see.
+            None => unreachable!("{:?} needs a base, and none was given", input.program),
+        }],
         // System directories precede `PATH` — never the cwd, which is deliberately absent from
         // this list; see `ResolveInput::system_dirs`'s doc for why that ordering is what keeps
         // this change a strict narrowing of the pre-patch `CreateProcessW` search rather than
@@ -656,17 +920,32 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
 
     for dir in dirs {
         for candidate in &candidates {
-            let joined = dir.join(candidate);
-            // Only an absolute `joined` is accepted — this is what actually keeps a relative or
-            // empty `PATH` element from resolving through the current directory (an empty element
-            // means "the current directory", and a relative one such as `.`/`tools` resolves
-            // against it just as surely). A drive-relative name (`C:tool`) survives the join
-            // unchanged too, because `PathBuf::push` clears for any prefixed path — so it would
-            // otherwise resolve through drive C's own current directory, which cosca does not
-            // track. This single check is also what keeps the contract every backend relies on:
-            // the answer is always absolute.
-            if joined.is_absolute() && is_execable(&joined, input.windows) {
-                return Ok(joined);
+            let joined = join_candidate(&dir, candidate, input.windows);
+            // Only a fully qualified `joined` is accepted — this is what actually keeps a relative
+            // or empty `PATH` element from resolving through the current directory (an empty
+            // element means "the current directory", and a relative one such as `.`/`tools`
+            // resolves against it just as surely). A drive-relative element (`C:` or `C:tools`)
+            // joins to a drive-relative path, which would resolve through drive C's own current
+            // directory, which cosca does not track. This single check is also what keeps the
+            // contract every backend relies on: the answer is always absolute.
+            if !accepted(&joined, input.windows) {
+                continue;
+            }
+            match is_execable(&joined, input.windows) {
+                Ok(true) => return Ok(joined),
+                Ok(false) => {}
+                // A `loadable_only` search fails closed: skipping a candidate it could not check
+                // would let a later directory, perhaps one on `PATH` an attacker can write, supply
+                // the image.
+                Err(e) if input.loadable_only => {
+                    return Err(Error::Io(crate::error::io_context(
+                        format!("could not tell whether {joined:?} exists, so the search stops"),
+                        e,
+                    )))
+                }
+                // An ordinary spawn goes on, so one unreadable `PATH` directory does not break
+                // every search, as `CreateProcessW`'s own does not.
+                Err(e) => log::warn!("skipping {joined:?}, whose existence could not be determined: {e}"),
             }
         }
     }
@@ -679,3 +958,11 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
 #[cfg(test)]
 #[path = "resolve_tests.rs"]
 mod resolve_tests;
+
+#[cfg(test)]
+#[path = "resolve_loadable_tests.rs"]
+mod resolve_loadable_tests;
+
+#[cfg(test)]
+#[path = "resolve_base_tests.rs"]
+mod resolve_base_tests;

@@ -188,29 +188,32 @@ fn the_containment_marker_is_named_as_std_names_it() {
     assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0__cosca_group_root=1\0\0");
 }
 
-// `image_for`: the Search/Exact distinction, at the one site that applies it ────────────
+// `target`: the Search/Exact distinction, at the one site that applies it ────────────
 //
-// These run on the Windows CI runner rather than the host, because `image_for` is inside the
+// These run on the Windows CI runner rather than the host, because `target` is inside the
 // `cfg(windows)` raw backend — the `Exact` arm touches no Win32 API, but it cannot be compiled
 // off Windows to be reached.
 
-/// [`image_for`] against the `PATH` a spawn of `cmd` would give its child.
+/// [`target`]'s image, against the environment a spawn of `cmd` would read.
 fn image(cmd: &Command) -> Result<Option<PathBuf>, Error> {
-    image_for(cmd, spawn_env(cmd)?.path.as_deref())
+    Ok(target(cmd, &spawn_env(cmd)?)?.image)
 }
 
+/// [`target_with`]'s image with this process's cwd read as [`EXACT_CWD`].
+fn image_on(cmd: &Command) -> Result<Option<PathBuf>, Error> {
+    Ok(target_with(cmd, &spawn_env(cmd)?, || Ok(PathBuf::from(EXACT_CWD)))?.image)
+}
+
+const EXACT_CWD: &str = r"C:\cosca-process-cwd";
+
 #[test]
-fn image_for_leaves_an_exact_program_completely_unresolved() {
+fn target_completes_an_exact_program_without_searching_it() {
     // The contract in one assertion: a BARE name, which `executable()` would look up on PATH and
-    // turn absolute (and would append `.exe` to), survives byte-for-byte.
+    // append `.exe` to, is only completed against this process's cwd, as the loader would.
     let mut cmd = Command::new();
     cmd.raw_executable("tool").args(["tool"]);
-    let image = image(&cmd).expect("an exact program is never resolved, so it cannot fail");
-    assert_eq!(
-        image.as_deref(),
-        Some(Path::new("tool")),
-        "raw_executable must reach lpApplicationName exactly as written"
-    );
+    let image = image_on(&cmd).expect("an exact program is never searched, so it cannot miss");
+    assert_eq!(image.as_deref(), Some(Path::new(r"C:\cosca-process-cwd\tool")));
 }
 
 /// The file [`fixture_load_exact_probe`] loads by relative name: a copy of this test binary.
@@ -240,7 +243,8 @@ fn fixture_load_exact_probe() {
         .current_dir(current_dir);
     c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
-    assert_eq!(image(&c).expect("image_for").as_deref(), Some(Path::new(PROBE)));
+    let image = image(&c).expect("target").unwrap();
+    assert!(image.is_absolute() && image.ends_with(PROBE), "{image:?}");
     let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     let code = match c.spawn() {
         Ok(child) if child.wait().expect("wait").success() => LOADED,
@@ -289,7 +293,7 @@ fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
 }
 
 #[test]
-fn image_for_resolves_a_search_program_to_an_absolute_path() {
+fn target_resolves_a_search_program_to_an_absolute_path() {
     // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
     // the same bare name through `executable()` is resolved and absolute. `cmd` is chosen because
     // it lives in the System32 directory the bare-name search visits on any Windows host.
@@ -304,7 +308,7 @@ fn image_for_resolves_a_search_program_to_an_absolute_path() {
 }
 
 #[test]
-fn image_for_rejects_an_empty_exact_program() {
+fn target_rejects_an_empty_exact_program() {
     // An empty `lpApplicationName` is a pointer to a lone NUL, not the NULL pointer, and whether
     // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
     let mut cmd = Command::new();
@@ -337,7 +341,7 @@ fn a_spawn_of_a_program_that_names_no_file_is_invalid_input() {
 }
 
 #[test]
-fn image_for_rejects_an_exact_program_that_names_no_file() {
+fn target_rejects_an_exact_program_that_names_no_file() {
     // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
     // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but as an OS error
     // after the spawn is under way; refusing here makes it `InvalidInput`, as on the elevated
@@ -354,12 +358,15 @@ fn image_for_rejects_an_exact_program_that_names_no_file() {
 }
 
 #[test]
-fn image_for_passes_an_exact_program_as_written() {
-    // `absolutise_exact` reads Win32's normalisation; what reaches `lpApplicationName` must still
-    // be the caller's token, relative and with its trailing dot, for the loader to complete.
+fn target_completes_an_exact_program_as_the_loader_does() {
+    // Completed by `GetFullPathNameW`'s rules, which the loader applies to `lpApplicationName`:
+    // the trailing dot goes, as it would there.
     let mut cmd = Command::new();
     cmd.raw_executable(r"t\tool.").args(["tool"]);
-    assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(r"t\tool.")));
+    assert_eq!(
+        image_on(&cmd).unwrap().as_deref(),
+        Some(Path::new(r"C:\cosca-process-cwd\t\tool"))
+    );
 }
 
 /// `CreateProcessW` loads the name Win32 normalises the token to, so a batch file reached only
@@ -381,18 +388,18 @@ fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
     }
 }
 
-/// Negative control: a name that merely contains `.bat` loads as written.
+/// Negative control: a name that merely contains `.bat` loads, completed.
 #[test]
-fn image_for_passes_an_exact_program_that_is_not_a_batch_file() {
+fn target_completes_an_exact_program_that_is_not_a_batch_file() {
     for n in ["setup.exe", "setup.bat.exe"] {
         let mut cmd = Command::new();
         cmd.raw_executable(n).args(["tool"]);
-        assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(n)));
+        assert_eq!(image_on(&cmd).unwrap(), Some(Path::new(EXACT_CWD).join(n)));
     }
 }
 
 #[test]
-fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
+fn target_falls_back_to_the_program_token_when_no_executable_is_set() {
     // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
     // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.
     let mut cmd = Command::new();
@@ -469,4 +476,100 @@ fn a_high_fd_spawn_without_an_executable_is_gated_on_its_program_token() {
         let err = c.spawn().expect_err("a batch program token must be refused");
         assert!(matches!(err, Error::Unsupported { .. }), "{via}: got {err:?}");
     }
+}
+
+/// The raw backend runs the child in the directory its image was resolved against: one read of the
+/// process cwd serves both, so a `set_current_dir` in between cannot split them.
+#[test]
+fn target_pins_the_resolved_directory_as_the_childs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("tool.exe"), b"x").unwrap();
+    for (cmd_cwd, want_dir) in [(Some("sub"), dir.path().join("sub")), (None, dir.path().to_path_buf())] {
+        let token = if cmd_cwd.is_some() {
+            r".\tool.exe"
+        } else {
+            r"sub\tool.exe"
+        };
+        let mut cmd = Command::new();
+        cmd.executable(token).args([token]);
+        if let Some(c) = cmd_cwd {
+            cmd.current_dir(c);
+        }
+        let reads = std::cell::Cell::new(0);
+        let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
+            reads.set(reads.get() + 1);
+            Ok(dir.path().to_path_buf())
+        })
+        .unwrap();
+        assert_eq!(reads.get(), 1, "{cmd_cwd:?}");
+        assert_eq!(got.cwd, want_dir, "{cmd_cwd:?}");
+        let image = got.image.unwrap();
+        assert!(image.starts_with(&want_dir), "{cmd_cwd:?}: {image:?}");
+    }
+}
+
+/// A share-less UNC `current_dir` is refused with `InvalidInput`, never a panic in the resolver.
+#[test]
+fn target_refuses_a_share_less_unc_current_dir() {
+    let mut cmd = Command::new();
+    cmd.executable(r".\tool.exe")
+        .args([r".\tool.exe"])
+        .current_dir(r"\\server");
+    match target(&cmd, &spawn_env(&cmd).unwrap()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
+        Err(other) => panic!("expected Io(InvalidInput), got {other:?}"),
+        Ok(_) => panic!("a share-less UNC directory must be refused"),
+    }
+}
+
+/// `raw_executable()` completes against this process's cwd, not `current_dir`, as `CreateProcessW`
+/// does; `current_dir` is completed against the same one read and is the child's directory.
+#[test]
+fn target_completes_an_exact_program_and_its_current_dir_from_one_read() {
+    let mut cmd = Command::new();
+    cmd.raw_executable("tool.exe").args(["tool.exe"]).current_dir("sub");
+    let reads = std::cell::Cell::new(0);
+    let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
+        reads.set(reads.get() + 1);
+        Ok(PathBuf::from(EXACT_CWD))
+    })
+    .unwrap();
+    assert_eq!(reads.get(), 1);
+    assert_eq!(got.cwd, Path::new(EXACT_CWD).join("sub"));
+    assert_eq!(got.image, Some(Path::new(EXACT_CWD).join("tool.exe")));
+}
+
+/// `current_dir("")` gets one verdict on both arms: it names no directory.
+#[test]
+fn an_empty_current_dir_is_refused_on_both_arms() {
+    let mut search = Command::new();
+    search.executable("tool").args(["tool"]).current_dir("");
+    let mut exact = Command::new();
+    exact.raw_executable(r"C:\t\tool.exe").args(["tool"]).current_dir("");
+    for (arm, cmd) in [("Search", search), ("Exact", exact)] {
+        match target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
+            panic!("{arm}: must not read the cwd")
+        }) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{arm}: {e}"),
+            Err(other) => panic!("{arm}: expected Io(NotFound), got {other:?}"),
+            Ok(_) => panic!("{arm}: an empty current_dir must be refused"),
+        }
+    }
+}
+
+/// With no `current_dir`, the child runs in the one read of this process's cwd, whatever the
+/// program: `lpCurrentDirectory` is never left for `CreateProcessW` to read again.
+#[test]
+fn target_pins_the_process_cwd_for_every_program() {
+    let mut cmd = Command::new();
+    cmd.executable("cmd").args(["cmd"]);
+    let reads = std::cell::Cell::new(0);
+    let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
+        reads.set(reads.get() + 1);
+        Ok(PathBuf::from(EXACT_CWD))
+    })
+    .unwrap();
+    assert_eq!(reads.get(), 1);
+    assert_eq!(got.cwd, PathBuf::from(EXACT_CWD));
 }

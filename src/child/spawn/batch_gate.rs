@@ -10,7 +10,6 @@ mod streams;
 mod walk;
 
 use streams::is_batch_program;
-pub(crate) use walk::drive_prefix_len;
 use walk::win32_effective_file_name;
 
 /// The prefix Win32 acts on: everything before the first interior NUL, where `CreateProcessW` and

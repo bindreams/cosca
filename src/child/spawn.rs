@@ -1092,7 +1092,7 @@ pub(crate) mod fault {
 // The `.bat`/`.cmd` refusal every backend runs before it spawns.
 #[path = "spawn/batch_gate.rs"]
 mod batch_gate;
-pub(crate) use batch_gate::{drive_prefix_len, reject_batch_path};
+pub(crate) use batch_gate::reject_batch_path;
 
 // Windows raw `CreateProcessW` spawn backend.
 #[cfg(windows)]
