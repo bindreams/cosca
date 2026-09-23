@@ -266,3 +266,14 @@ fn a_verbatim_current_dir_finds_a_dot_relative_name() {
     let got = super::resolve_executable(Path::new("./tool.exe"), Some(Path::new(&verbatim)), None).unwrap();
     assert_eq!(got, Path::new(&verbatim).join("tool.exe"));
 }
+
+/// Every caller NUL-checks a path before completing it, naming its field; a NUL reaching
+/// `GetFullPathNameW` would complete a truncated path, and the assertion catches it.
+#[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
+#[test]
+#[should_panic(expected = "path to complete")]
+fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
+    use std::os::windows::ffi::OsStringExt;
+    let p = OsString::from_wide(&"C:\\a\0b".encode_utf16().collect::<Vec<u16>>());
+    let _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
+}

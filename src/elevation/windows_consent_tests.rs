@@ -101,3 +101,47 @@ fn a_cached_failure_keeps_its_variant() {
     }
     assert_eq!(reads.get(), 1);
 }
+
+/// `lpDirectory` carries a set `current_dir`'s completed base.
+#[test]
+fn a_current_dir_yields_an_lp_directory() {
+    let got = super::lp_directory(Some(std::path::Path::new("sub")), Some(PathBuf::from(r"C:\x\sub"))).unwrap();
+    assert_eq!(got, Some(r"C:\x\sub".encode_utf16().chain([0]).collect::<Vec<u16>>()));
+    assert_eq!(super::lp_directory(None, None).unwrap(), None);
+}
+
+/// A set `current_dir` with no base would run the child in this process's cwd instead of the one
+/// asked for; `consent_base` never returns that, and this is what catches it if it ever did.
+#[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
+#[test]
+#[should_panic(expected = "a current_dir always yields a base")]
+fn a_current_dir_without_a_base_is_a_contract_violation() {
+    let _ = super::lp_directory(Some(std::path::Path::new("sub")), None);
+}
+
+/// `lp_file_for` resolves on this process's `PATH`, which is right only because
+/// `reject_unsupported_config` refused every env op first. Called without that gate, the
+/// assertion catches it.
+#[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
+#[test]
+#[should_panic(expected = "reject_unsupported_config refuses env ops")]
+fn env_ops_reaching_lp_file_for_are_a_contract_violation() {
+    let mut c = Command::new();
+    c.args(["whoami"]).env("COSCA_X", "1").elevate();
+    let dirs = super::ProcessDirs::real();
+    let state = super::ProcessOnce::new(&dirs);
+    let _ = super::lp_file_for(&c, std::ffi::OsStr::new("whoami"), None, &state);
+}
+
+/// `lpFile` must reach `ShellExecuteEx` absolute. An `Exact` token handed over uncompleted,
+/// skipping `elevated_program`, is what the assertion catches.
+#[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
+#[test]
+#[should_panic(expected = "lpFile must reach ShellExecuteEx absolute")]
+fn a_relative_lp_file_is_a_contract_violation() {
+    let mut c = Command::new();
+    c.raw_executable("tool.exe").args(["tool.exe"]).elevate();
+    let dirs = super::ProcessDirs::real();
+    let state = super::ProcessOnce::new(&dirs);
+    let _ = super::lp_file_for(&c, std::ffi::OsStr::new("tool.exe"), None, &state);
+}

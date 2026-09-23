@@ -354,3 +354,33 @@ fn only_a_denied_or_absent_execute_check_is_a_no() {
         assert_eq!(e.raw_os_error(), Some(errno));
     }
 }
+
+/// A Windows base must be fully qualified: the caller completes it as Win32 does. A relative one is
+/// a contract violation, reported in debug at the call boundary and in release where it is used.
+#[test]
+#[should_panic(expected = "must be fully qualified")]
+fn a_relative_windows_base_is_a_contract_violation() {
+    let _ = resolve(ResolveInput {
+        program: Path::new(r"sub\tool.exe"),
+        cwd: Some(Path::new("rel")),
+        system_dirs: &[],
+        path_var: None,
+        windows: true,
+        loadable_only: false,
+    });
+}
+
+/// `loadable_only` is a Windows rule; asking for it on the POSIX grammar is a contract violation.
+#[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
+#[test]
+#[should_panic(expected = "loadable_only is a Windows rule")]
+fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
+    let _ = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: None,
+        system_dirs: &[],
+        path_var: None,
+        windows: false,
+        loadable_only: true,
+    });
+}

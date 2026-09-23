@@ -86,14 +86,7 @@ impl<'a> Validated<'a> {
             shell_file::reject_percent_in_directory(base)?;
         }
         let file_w = wide_nul("program path", program.as_os_str())?;
-        // The base, not `current_dir()` as written: see `consent_base`.
-        debug_assert!(
-            base.is_some() || cmd.cwd().is_none(),
-            "a current_dir always yields a base"
-        );
-        let dir_w = base
-            .map(|base| wide_nul("working directory", base.as_os_str()))
-            .transpose()?;
+        let dir_w = lp_directory(cmd.cwd(), base)?;
         Ok(RunasLaunch {
             file_w,
             class_w: wide_nul("class", OsStr::new("exefile"))?,
@@ -103,6 +96,17 @@ impl<'a> Validated<'a> {
             show: runas_show_command(cmd.flags_request()),
         })
     }
+}
+
+/// `lpDirectory`: the completed base, not `current_dir()` as written (see [`consent_base`]). A set
+/// `current_dir` always yields a base; `None` without one leaves the child in this process's cwd.
+fn lp_directory(cmd_cwd: Option<&Path>, base: Option<PathBuf>) -> Result<Option<Vec<u16>>, Error> {
+    debug_assert!(
+        base.is_some() || cmd_cwd.is_none(),
+        "a current_dir always yields a base: {cmd_cwd:?}"
+    );
+    base.map(|base| wide_nul("working directory", base.as_os_str()))
+        .transpose()
 }
 
 /// Where the consent launch reads this process's state from: its cwd and its environment. The
