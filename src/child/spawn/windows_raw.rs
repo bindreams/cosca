@@ -320,9 +320,7 @@ pub(crate) fn spawn_step(
 /// - `Search` — from `executable()`. Resolved through [`resolve::resolve_executable`]: the
 ///   child's cwd, the child's `PATH`, the `.exe` rules. Always absolute on success.
 /// - `Exact` — from `raw_executable()`. Passed through untouched once
-///   [`resolve::absolutise_exact`] has found that it names a file, and its normalised form has
-///   passed the batch gate the loader's view needs
-///   ([`reject_normalised_batch_path`](crate::child::spawn::reject_normalised_batch_path)). This is the ONE site on
+///   [`resolve::absolutise_exact`] has found that it names a file. This is the ONE site on
 ///   Windows that would otherwise resolve it, silently turning a bare `raw_executable("tool")`
 ///   into a `PATH` lookup and breaking the contract at its only user. A relative value keeps
 ///   `lpApplicationName`'s own meaning, which completes it against the CALLING process's current
@@ -331,18 +329,30 @@ pub(crate) fn spawn_step(
 ///   `fd >= 3`, see `routes_to_raw_backend`). [`program_token`] supplies argv[0] or the command
 ///   line's first token, and THAT is resolved, which is what keeps `lpApplicationName` non-NULL.
 ///   See [`app_name_wide`] for why NULL is a security boundary.
+///
+/// Whichever arm produced it, the path the loader reaches must pass
+/// [`reject_normalised_batch_path`](crate::child::spawn::reject_normalised_batch_path).
 pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<PathBuf>, Error> {
-    match cmd.executable_spec() {
-        Some(ExecutableSpec::Search(p)) => Ok(Some(resolve::resolve_executable(p, cmd.cwd(), path)?)),
-        Some(ExecutableSpec::Exact(p)) => {
-            // Normalised for the refusals only; the loader completes the token itself.
-            crate::child::spawn::reject_normalised_batch_path(&resolve::absolutise_exact(p)?)?;
-            Ok(Some(p.to_path_buf()))
+    // `(image, loaded)`: what `lpApplicationName` gets, and the path the loader reaches through it.
+    // They differ only for `Exact`, whose token the loader completes itself.
+    let (image, loaded) = match cmd.executable_spec() {
+        Some(ExecutableSpec::Search(p)) => {
+            let r = resolve::resolve_executable(p, cmd.cwd(), path)?;
+            (r.clone(), r)
         }
-        None => program_token(cmd)
-            .map(|p| resolve::resolve_executable(&p, cmd.cwd(), path))
-            .transpose(),
-    }
+        Some(ExecutableSpec::Exact(p)) => (p.to_path_buf(), resolve::absolutise_exact(p)?),
+        None => match program_token(cmd) {
+            Some(t) => {
+                let r = resolve::resolve_executable(&t, cmd.cwd(), path)?;
+                (r.clone(), r)
+            }
+            None => return Ok(None),
+        },
+    };
+    // Every arm: resolution can land on `setup.bat.` or `.bat` as written, which
+    // `reject_batch_program`'s `Path::extension()` reading does not see as a batch file.
+    crate::child::spawn::reject_normalised_batch_path(&loaded)?;
+    Ok(Some(image))
 }
 
 /// The resolved image as the NUL-terminated wide string `CreateProcessW` takes for
