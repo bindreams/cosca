@@ -338,6 +338,33 @@ fn oversized_fd_is_unsupported() {
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
+/// An argv-only command (no `.executable()`) that maps fd >= 3 still routes to the raw backend —
+/// `routes_to_raw_backend`'s OTHER trigger, independent of `executable()` (the same routing shape
+/// `fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd` below exercises for a
+/// different bug). Every `.executable()` leg above proves it reached the raw backend from the
+/// CHILD's own report — argv[0] independent of the loaded image, which only `CreateProcessW` can
+/// produce. That signal does not exist here: with no `.executable()`, argv[0] IS the image either
+/// way. So this instead reads the crate's own `#[doc(hidden)]` observe seam
+/// (`cosca::test_take_used_raw_backend`, recorded at `spawn_raw`'s own entry — see its doc) —
+/// and separately proves the fd >= 3 wiring the raw backend is responsible for actually works,
+/// via the SAME `write-fd` relay the `.executable()` legs above use.
+#[test]
+fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
+    let mut c = cosca::Command::new();
+    c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
+        .fd(3, cosca::Stdio::pipe_out())
+        .unwrap();
+    let mut child = c.spawn().expect("raw spawn via the argv-only + fd>=3 route");
+    assert!(
+        cosca::test_take_used_raw_backend(),
+        "an argv-only command mapping fd >= 3 must route through the raw CreateProcessW backend"
+    );
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut child.fd_read_end(cosca::Fd::from(3)).unwrap(), &mut s).unwrap();
+    child.wait().unwrap();
+    assert_eq!(s, "argv-only-fd3");
+}
+
 // Containment over the raw backend (Plan 12 Task 6) =====
 
 /// A CONTAINED child with fd >= 3 routes through the raw backend AND lands in OUR Job Object:
