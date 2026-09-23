@@ -2157,3 +2157,29 @@ fn abandon_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_pla
     child.kill().expect("kill the child");
     child.wait().expect("reap the child");
 }
+
+/// After killing through a placed child's leaf, a drain `abandon` cannot watch is reported, as
+/// `Drop`'s own kill-and-drain reports it — never dropped. A `cgroup.events` that is a directory
+/// opens but cannot be read, so the watch fails for real.
+#[cfg(target_os = "linux")]
+#[test]
+fn abandon_reports_a_drain_it_could_not_watch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandon-unwatchable");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::create_dir(leaf_path.join("cgroup.events")).expect("make cgroup.events unreadable");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn");
+    let mut channel = leaf.report.take().expect("the channel");
+    // SAFETY: `channel` is open.
+    unsafe { channel.slot().report_placed_for_test() };
+
+    let err = leaf
+        .abandon(child.id(), &mut channel, "the test cannot decide")
+        .to_string();
+    assert!(err.contains("drain could not be watched"), "got {err}");
+    child.wait().expect("reap the child");
+}

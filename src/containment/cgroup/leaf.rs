@@ -344,12 +344,14 @@ impl CgroupLeaf {
         self.entered = channel.read_final() == PlacementReport::Placed;
         // Only a placed child's tree is in the leaf; `cgroup.kill` needs no credential to kill it.
         let through_leaf = self.entered.then(|| {
-            let kill = self.hard_kill();
-            if kill.is_ok() {
-                // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
-                let _ = self.wait_drained(None);
-            }
-            kill
+            self.hard_kill()
+                .map_err(|e| format!("cgroup.kill failed ({e})"))
+                .and_then(|()| {
+                    // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
+                    self.wait_drained(None)
+                        .map(drop)
+                        .map_err(|e| format!("cgroup.kill succeeded, but its drain could not be watched ({e})"))
+                })
         });
         let fate = match (signalled, through_leaf) {
             (Signalled::Killed, None) => {
@@ -358,16 +360,15 @@ impl CgroupLeaf {
             (Signalled::Killed, Some(Ok(()))) => {
                 "the child and its process group were killed, and its leaf was killed through".to_string()
             }
-            (Signalled::Killed, Some(Err(e))) => {
-                format!("the child and its process group were killed, but killing through its leaf failed ({e})")
+            (Signalled::Killed, Some(Err(leaf))) => {
+                format!("the child and its process group were killed; through its leaf, {leaf}")
             }
             (Signalled::Denied(e), Some(Ok(()))) => {
                 format!("the child could not be signalled ({e}), but was killed through its leaf")
             }
-            (Signalled::Denied(e), Some(Err(leaf))) => format!(
-                "the child could not be signalled ({e}), and killing through its leaf failed ({leaf}): it is \
-                 left running"
-            ),
+            (Signalled::Denied(e), Some(Err(leaf))) => {
+                format!("the child could not be signalled ({e}); through its leaf, {leaf}")
+            }
             (Signalled::Denied(e), None) => format!(
                 "the child could not be signalled ({e}): it exec'd a program this process may not kill, and \
                  is left running outside its leaf"
@@ -378,7 +379,7 @@ impl CgroupLeaf {
                 match leaf {
                     None => "it had not entered its leaf".to_string(),
                     Some(Ok(())) => "its leaf was killed through".to_string(),
-                    Some(Err(e)) => format!("killing through its leaf failed ({e})"),
+                    Some(Err(leaf)) => format!("through its leaf, {leaf}"),
                 }
             ),
         };
