@@ -148,53 +148,44 @@ fn an_elevated_token_must_end_in_exe_or_com() {
     }
 }
 
-/// The subkeys shell32 opens under `App Paths`: the token, then the token with `.exe` appended
-/// (Wine appends unconditionally on a miss).
+/// The elevated program is launched as `exefile`, which skips shell32's lookup — App Paths
+/// included — and runs `lpFile` as given, so only a fully qualified path is found at all
+/// (measured: a bare name fails in `lpDirectory` and on `PATH`).
 #[test]
-fn app_paths_subkeys_are_the_token_and_the_token_plus_exe() {
-    assert_eq!(
-        super::app_paths_subkeys(std::ffi::OsStr::new(r"C:\tools\foo.exe")),
-        [
-            std::ffi::OsString::from(r"C:\tools\foo.exe"),
-            std::ffi::OsString::from(r"C:\tools\foo.exe.exe")
-        ]
-    );
-}
-
-#[test]
-fn an_app_paths_registration_must_name_an_image() {
-    use super::AppPath::{Absent, Target, Unreadable};
-    let token = Path::new("foo.exe");
-    let target = |s: &str| Target(std::ffi::OsString::from(s));
-    for registered in [
-        vec![Absent, Absent],
-        vec![target(r"C:\Program Files\Foo\foo.exe"), Absent],
-        vec![Absent, target(r#""C:\Program Files\Foo\foo.exe""#)],
-        vec![target(r"C:\Foo\FOO.COM")],
+fn an_elevated_program_must_be_fully_qualified() {
+    for token in [
+        r"C:\tools\setup.exe",
+        "C:/tools/setup.exe",
+        r"c:\setup.com",
+        r"é:\setup.exe",
+        r"\\server\share\setup.exe",
+        "//server/share/setup.exe",
+        r"\\?\C:\tools\setup.exe",
+        r"\\.\C:\tools\setup.exe",
     ] {
         assert!(
-            super::reject_app_path(token, &registered).is_ok(),
-            "{registered:?} runs an image"
+            super::reject_not_fully_qualified(Path::new(token)).is_ok(),
+            "{token:?} is fully qualified"
         );
     }
-    for registered in [
-        vec![target(r"C:\Foo\setup.bat"), Absent],
-        vec![Absent, target(r"C:\Foo\setup.cmd")],
-        vec![target(r"C:\Foo\setup")],
-        vec![target(r"%ProgramFiles%\Foo\foo.exe")],
-        vec![target(r"C:\Foo\foo.exe.")],
-        vec![target(r#""C:\Foo\foo.exe" x"#)],
-        vec![target(r#"C:\Foo\f"o.exe"#)],
-        vec![target("")],
-        vec![Unreadable],
-        vec![target(r"C:\Foo\foo.exe"), Unreadable],
+    for token in [
+        "setup.exe",
+        r"tools\setup.exe",
+        r".\setup.exe",
+        r"..\setup.exe",
+        r"\tools\setup.exe",
+        "/tools/setup.exe",
+        "C:setup.exe",
+        r"C:tools\setup.exe",
+        r"𝒳:\setup.exe",
+        "",
     ] {
         assert!(
             matches!(
-                super::reject_app_path(token, &registered),
+                super::reject_not_fully_qualified(Path::new(token)),
                 Err(Error::Unsupported { .. })
             ),
-            "{registered:?} may run something other than an image"
+            "{token:?} is resolved against a directory, which an exefile launch does not search"
         );
     }
 }

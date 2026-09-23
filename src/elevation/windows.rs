@@ -215,15 +215,12 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
-};
+use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
-use windows::Win32::System::Registry::{
-    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-};
 use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
-use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+use windows::Win32::UI::Shell::{
+    ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
@@ -231,7 +228,7 @@ use crate::child::spawn::windows_raw::RawChild;
 use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
-use crate::elevation::shell_file::{self, AppPath};
+use crate::elevation::shell_file;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
@@ -373,53 +370,6 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
     Ok(OsString::from_wide(&crate::quote::windows::join_wide(&tail_refs)))
 }
 
-/// The default value of `hive\Software\Microsoft\Windows\CurrentVersion\App Paths\<subkey>`,
-/// unexpanded, as `shell_file::reject_app_path` judges it. A missing key or default value is
-/// [`AppPath::Absent`]; any other failure, or a value that is not a string, is
-/// [`AppPath::Unreadable`]. Read through the process's own registry view, which is the one
-/// in-process shell32 reads.
-fn app_path(hive: HKEY, subkey: &OsStr) -> AppPath {
-    let key: Vec<u16> = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\App Paths\")
-        .encode_wide()
-        .chain(subkey.encode_wide())
-        .chain([0])
-        .collect();
-    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
-    let mut data: Vec<u16> = Vec::new();
-    loop {
-        let mut bytes = u32::try_from(data.len() * 2).expect("a registry value fits in u32 bytes");
-        let buffer = (!data.is_empty()).then(|| data.as_mut_ptr().cast());
-        // SAFETY: `key` is NUL-terminated and outlives the call; `buffer`, when given, points at
-        // `bytes` writable bytes of `data`.
-        let rc = unsafe {
-            RegGetValueW(
-                hive,
-                PCWSTR(key.as_ptr()),
-                PCWSTR::null(),
-                flags,
-                None,
-                buffer,
-                Some(&mut bytes),
-            )
-        };
-        if rc == ERROR_FILE_NOT_FOUND {
-            return AppPath::Absent;
-        }
-        match (rc, buffer) {
-            (ERROR_SUCCESS, Some(_)) => {
-                data.truncate(bytes as usize / 2);
-                while data.last() == Some(&0) {
-                    data.pop();
-                }
-                return AppPath::Target(OsString::from_wide(&data));
-            }
-            // Sized, or grown since it was sized: size to what it reports and read again.
-            (ERROR_SUCCESS | ERROR_MORE_DATA, _) => data = vec![0; (bytes as usize).div_ceil(2).max(1)],
-            _ => return AppPath::Unreadable,
-        }
-    }
-}
-
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
 pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
@@ -429,6 +379,9 @@ pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
 /// command. Built only when a consent prompt is actually warranted.
 pub(crate) struct RunasLaunch {
     file_w: Vec<u16>,
+    /// `lpClass`, with `SEE_MASK_CLASSNAME`: always `exefile`, which has the `runas` verb and runs a
+    /// `.com` as well (measured; `comfile` has no `runas` verb).
+    class_w: Vec<u16>,
     params_w: Vec<u16>,
     dir_w: Option<Vec<u16>>,
     verb_w: Vec<u16>,
@@ -493,21 +446,21 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     //
     // The batch gate reads the caller's STRING, so a token `ShellExecuteEx` REWRITES before opening
     // is refused first: quoted, a URL (`file:` is percent-decoded), a `shell:`/`::{CLSID}` name,
-    // one starting with `www` (relaunched as `http://www…`), or one holding a `%` — and so is a `current_dir()` holding a `%` or `"`, which it expands before
-    // searching a relative token there. See `shell_file`. On what is left, the gate judges the name
+    // one starting with `www` (relaunched as `http://www…`), or one holding a `%` — and so is a
+    // `current_dir()` holding a `%` or `"`, which it expands before searching a relative token there. See `shell_file`. On what is left, the gate judges the name
     // Win32 resolves the token to — trailing dots and spaces, `..` collapse, drive and UNC and
     // device roots, and data-stream pieces.
     //
-    // Then what `ShellExecuteEx` finds by LOOKUP. A token must end in `.exe` or `.com`, so no
-    // extension is completed (`PathResolveW`/`PathFileExistsDefExtW` try `.bat` and `.cmd`) and no
-    // other association runs; and every App Paths registration shell32 would consult for it, in
-    // either hive, must name an `.exe` or `.com` too.
+    // Then what `ShellExecuteEx` would find by LOOKUP: it does none. The launch is `exefile`
+    // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on `lpFile`
+    // as given, skipping `SHELL_FindExecutable` — App Paths, `PathResolveW`, the default-extension
+    // search (Wine `shlexec.c` `SHELL_execute`'s class branch returns before them;
+    // `tests/windows_shell_execute.rs` measures that an HKLM App Paths key redirects a bare name
+    // without the class and not with it). Such a launch finds nothing by a bare name, so the token
+    // must be fully qualified, and it must end in `.exe` or `.com` so `exefile` is the right class.
     //
-    // What stays open: an App Paths key written between this check and the launch, which can still
-    // redirect to a batch file (HKCU is writable by the user); and WHICH image a relative token
-    // loads — the search in `lpDirectory` and on the path, and ReactOS's substitution of the drive
-    // root or Windows directory for a missing `lpDirectory` — which is always an `.exe` or `.com`,
-    // though not necessarily the one meant, until the image is resolved before the launch.
+    // What stays open: none of the lookup. A relative or bare token is refused until the image is
+    // resolved before the launch.
     let program_path = std::path::Path::new(&program);
     shell_file::reject_shell_rewrite(program_path)?;
     if let Some(dir) = cmd.cwd() {
@@ -516,11 +469,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     crate::child::spawn::reject_batch_path(program_path)?;
     crate::child::spawn::reject_normalised_batch_path(program_path)?;
     shell_file::reject_non_image(program_path)?;
-    let registered: Vec<AppPath> = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER]
-        .into_iter()
-        .flat_map(|hive| shell_file::app_paths_subkeys(&program).map(|subkey| app_path(hive, &subkey)))
-        .collect();
-    shell_file::reject_app_path(program_path, &registered)?;
+    shell_file::reject_not_fully_qualified(program_path)?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
@@ -539,6 +488,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 
     Ok(RunasStep::Launch(Box::new(RunasLaunch {
         file_w,
+        class_w: wide_nul("class", OsStr::new("exefile"))?,
         params_w,
         dir_w: dir,
         verb_w,
@@ -555,6 +505,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     };
     let RunasLaunch {
         file_w,
+        class_w,
         params_w,
         dir_w,
         verb_w,
@@ -567,12 +518,13 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let proc: OwnedHandle = unsafe {
         let mut info = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_CLASSNAME,
             lpVerb: PCWSTR(verb_w.as_ptr()),
             lpFile: PCWSTR(file_w.as_ptr()),
             lpParameters: PCWSTR(params_w.as_ptr()),
             lpDirectory: dir_w.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
             nShow: show.0,
+            lpClass: PCWSTR(class_w.as_ptr()),
             ..Default::default()
         };
         ShellExecuteExW(&mut info).map_err(|e| {
