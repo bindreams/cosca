@@ -1,6 +1,4 @@
 //! Test-only: a REAL live child process whose process-object DACL denies us rights.
-#![allow(dead_code)] // consumed by later tasks' tests; without this the `-D warnings`
-// pre-commit hook rejects this module's own commit.
 //!
 //! A live process we may not `OpenProcess` is needed to reproduce an access-denied identity
 //! read. Depending on a system service will not do — an elevated CI runner can open those.
