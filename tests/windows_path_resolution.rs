@@ -1228,6 +1228,28 @@ fn literal_rows(rows: &[(&str, &str, &'static str)]) -> Vec<Resolution> {
 #[ignore = "platform canary: needs a Windows runner"]
 fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
     let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    // Printed only, until measured.
+    for input in [
+        r"\\...\x.bat\y\..",
+        r"\\...\x.bat\..",
+        r"\\...\x.bat\..\..\y",
+        r"\\..\x.bat\y\..",
+        r"\\..\x.bat\..",
+        r"\\\x.bat\y\..",
+        r"\\\x.bat\..",
+        r"\\\x.bat",
+        r"\\ \x.bat\y\..",
+        r"\\. \x.bat\y\..",
+        r"\\.. \x.bat\y\..",
+        r"//../x.bat/y/..",
+        r"//.../x.bat/y/..",
+        r"\\srv.\x.bat\y\..",
+    ] {
+        match full_path_name_parts(input) {
+            Ok((resolved, part)) => println!("  PENDING {input:?} -> {resolved:?}  file_part={part:?}"),
+            Err(why) => println!("  PENDING {why}"),
+        }
+    }
     let mut facts = Disagreements::default();
     let rows = literal_rows(&[
         (
@@ -1366,6 +1388,24 @@ fn verbatim_marker_spellings_resolve_alike() {
 #[ignore = "platform canary: needs a Windows runner"]
 fn a_stream_suffix_stays_in_the_final_component() {
     let mut failures: Vec<String> = announce_platform().err().into_iter().collect();
+    // Printed only, until measured.
+    for input in [
+        r"x.bat.:s",
+        r"x.bat :s",
+        r"C:\dir\x.bat.:s",
+        r"C:\dir\x.bat :s",
+        r"C:\dir\x.bat. :s",
+        r"C:\dir\x.bat.:s.",
+        r"C:\dir\x.bat..:s",
+        r"C:\dir\x.bat.::$DATA",
+        r"C:\dir\x.exe.:p.bat",
+        r"\\?\C:\dir\x.bat.:s",
+    ] {
+        match full_path_name_parts(input) {
+            Ok((resolved, part)) => println!("  PENDING {input:?} -> {resolved:?}  file_part={part:?}"),
+            Err(why) => println!("  PENDING {why}"),
+        }
+    }
     let mut facts = Disagreements::default();
     let mut rows = literal_rows(&[
         (r"C:\dir\x.bat:s", r"C:\dir\x.bat:s", "kept as given"),
