@@ -92,6 +92,9 @@ fn a_plain_path_passes() {
         r"\\?\C:\tools\setup.exe",
         r"\\.\C:\tools\setup.exe",
         r"C:\tools\x.exe:s",
+        // Two or more units before the colon, but a separator among them: a path, not a scheme.
+        r"tools\setup.exe:s",
+        r"C:\tools\ms-settings:x",
         r"1:\tools\setup.exe",
         r"é:setup.exe",
         r"tools\www.exe",
