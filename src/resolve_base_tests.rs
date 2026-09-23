@@ -554,3 +554,26 @@ fn a_verbatim_unc_marker_needs_a_backslash() {
     assert_eq!(windows_prefix_len(br"\\?\UNC/srv\tool.exe"), r"\\?\UNC".len());
     assert_eq!(windows_prefix_len(br"\\?\UNC/srv"), r"\\?\UNC".len());
 }
+
+/// A made-verbatim candidate that Win32's completion turns into a share root, or a path on no
+/// share, names no file: it is refused as `InvalidInput`, as `raw_executable()` refuses it, not
+/// reported as a miss.
+#[test]
+fn a_normalised_candidate_that_names_no_file_is_refused() {
+    for completed in [r"\\?\UNC\srv\t.exe", r"\\?\UNC\t.exe", r"\\?\t.exe"] {
+        let normalise = |_: &Path| Ok(PathBuf::from(completed));
+        let got = resolve(ResolveInput {
+            program: Path::new(r"..\..\t.exe"),
+            cwd: Some(Path::new(r"\\?\UNC\srv\shr\d")),
+            system_dirs: &[],
+            path_var: None,
+            windows: true,
+            loadable_only: false,
+            normalise: &normalise,
+        });
+        match got {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{completed:?}: {e}"),
+            other => panic!("{completed:?} must be refused, got {other:?}"),
+        }
+    }
+}

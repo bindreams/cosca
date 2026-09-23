@@ -986,7 +986,20 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
                 continue;
             }
             let probed = if made_verbatim {
-                (input.normalise)(&joined)
+                match (input.normalise)(&joined) {
+                    // Win32's floor lets `..` climb past a verbatim share, to a share root or a
+                    // path on no share (measured). No disk could put a file there.
+                    Ok(path) if names_no_file(path.as_os_str(), true) => {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "{:?} completes against {dir:?} to {path:?}, which names no file",
+                                input.program
+                            ),
+                        )))
+                    }
+                    other => other,
+                }
             } else {
                 Ok(joined.clone())
             }
