@@ -686,7 +686,7 @@ fn kill_on_drop_false_disarms_a_cgroup_leaf() {
     let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-false-leaf");
 
     let attachment = cgroup_attachment_for_test(&leaf_path);
-    attachment.honor_kill_on_drop(false);
+    attachment.attached.honor_kill_on_drop(false);
     drop(attachment);
 
     assert_eq!(
@@ -705,7 +705,7 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
     let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-true-leaf");
 
     let attachment = cgroup_attachment_for_test(&leaf_path);
-    attachment.honor_kill_on_drop(true);
+    attachment.attached.honor_kill_on_drop(true);
     drop(attachment);
 
     assert_eq!(

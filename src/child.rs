@@ -88,7 +88,6 @@ impl Child {
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
     ) -> Child {
-        attachment.honor_kill_on_drop(kill_on_drop);
         Child {
             proc,
             id,
@@ -99,6 +98,12 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
         }
+    }
+
+    /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
+    /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
+    pub(crate) fn commit_kill_on_drop(&self) {
+        self.attached.honor_kill_on_drop(self.kill_on_drop);
     }
 
     // Set by the elevation spawn arms.

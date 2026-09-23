@@ -88,7 +88,6 @@ impl Child {
         pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
-        attachment.honor_kill_on_drop(kill_on_drop);
         Child {
             os: OsResources {
                 proc: Some(proc),
@@ -113,6 +112,12 @@ impl Child {
     #[cfg(windows)]
     pub(super) fn proc(&self) -> &ProcSource {
         self.os.proc.as_ref().expect(PROC_TAKEN)
+    }
+
+    /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
+    /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
+    pub(super) fn commit_kill_on_drop(&self) {
+        self.os.attached.honor_kill_on_drop(self.kill_on_drop);
     }
 
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so

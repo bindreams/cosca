@@ -457,3 +457,87 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
         "std's error record reached the child's stdio: {written:?}"
     );
 }
+
+// kill_on_drop(false) commits only with the spawn -----
+// Async twins of the sync `spawn_tests` of the same name.
+
+/// The sync command `spawn_uncommitted` takes: a long-lived child with `kill_on_drop(false)`.
+#[cfg(target_os = "linux")]
+fn opted_out_blocker() -> crate::command::Command {
+    let mut cmd = crate::command::Command::new();
+    cmd.args(["sleep", "30"]);
+    cmd.kill_on_drop(false);
+    cmd
+}
+
+/// An occupied temp leaf whose child entered it, attached to the next spawn on this thread.
+#[cfg(target_os = "linux")]
+fn attach_entered_leaf(leaf_path: &std::path::Path) {
+    std::fs::create_dir(leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.to_path_buf(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
+    for commit in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-async-commit-leaf");
+        attach_entered_leaf(&leaf_path);
+        let mut child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+        if commit {
+            child.commit_kill_on_drop();
+        }
+        child.kill().expect("end the stand-in root");
+        let _ = child.wait().await;
+        drop(child);
+
+        let expected: &[u8] = if commit { b"" } else { b"1" };
+        assert_eq!(
+            std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+            expected,
+            "committed: {commit}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_password_write_kills_the_contained_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-password-leaf");
+    attach_entered_leaf(&leaf_path);
+    let mut child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+    // Rule out the leaf's `Drop`: only the failure path itself may kill.
+    child.detach();
+
+    let written = Err(Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: "forced password-write failure".into(),
+    });
+    let err = super::finish_elevated(child, written).expect_err("a failed write fails the spawn");
+
+    assert!(
+        matches!(
+            err,
+            Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"1",
+        "the failed spawn must kill its tree through the leaf"
+    );
+}
