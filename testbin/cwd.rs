@@ -13,6 +13,7 @@
 //!   are this binary (long-path aware) and `<unaware-child>` (`cosca_testbin_image`, which is not).
 //! - `verbatim <base> <image-child>`: enters `\\?\<d>`, then reports what Win32 and cosca make of
 //!   `tool.exe.`, `sub.` and `sub.\tool.exe` against that cwd.
+//! - `drive-dir` and `verbatim-unc`: see [`completion`].
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
@@ -23,6 +24,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("long") => probe::long(&args[2], &args[3]),
         Some("verbatim") => probe::verbatim(&args[2], &args[3]),
+        Some("drive-dir") => completion::drive_dir(&args[2], &args[3]),
+        Some("verbatim-unc") => completion::verbatim_unc(&args[2], &args[3]),
         Some("report-cwd") => println!("cwd={}", std::env::current_dir().unwrap().display()),
         other => panic!("unknown mode {other:?}"),
     }
@@ -33,6 +36,10 @@ fn main() {
     eprintln!("cosca_testbin_cwd is a Windows probe");
     std::process::exit(1);
 }
+
+#[cfg(windows)]
+#[path = "cwd/completion.rs"]
+mod completion;
 
 #[cfg(windows)]
 mod probe {
@@ -47,35 +54,35 @@ mod probe {
     }
 
     /// Replaces each `(from, to)` in `s`, in order.
-    struct Render(Vec<(String, &'static str)>);
+    pub(crate) struct Render(pub(crate) Vec<(String, &'static str)>);
 
     impl Render {
-        fn apply(&self, s: &str) -> String {
+        pub(crate) fn apply(&self, s: &str) -> String {
             self.0
                 .iter()
                 .fold(s.to_owned(), |s, (from, to)| s.replace(from.as_str(), to))
         }
     }
 
-    fn verbatim_of(dir: &Path) -> OsString {
+    pub(crate) fn verbatim_of(dir: &Path) -> OsString {
         let mut v = OsString::from(r"\\?\");
         v.push(dir);
         v
     }
 
     /// `base`, canonical and without its `\\?\`, so every path the probe prints spells it alike.
-    fn canonical(base: &str) -> PathBuf {
+    pub(crate) fn canonical(base: &str) -> PathBuf {
         let full = std::fs::canonicalize(base).expect("canonicalize the base");
         let full = full.to_str().expect("a UTF-8 base");
         PathBuf::from(full.strip_prefix(r"\\?\").expect("a verbatim canonical path"))
     }
 
-    fn set_cwd(path: &OsStr) -> Result<(), u32> {
+    pub(crate) fn set_cwd(path: &OsStr) -> Result<(), u32> {
         let r = std::env::set_current_dir(path);
         r.map_err(|e| e.raw_os_error().map_or(u32::MAX, |c| c as u32))
     }
 
-    fn outcome(r: &Result<(), u32>) -> String {
+    pub(crate) fn outcome(r: &Result<(), u32>) -> String {
         match r {
             Ok(()) => "ok".into(),
             Err(code) => format!("err={code}"),
@@ -83,7 +90,7 @@ mod probe {
     }
 
     /// A spawn's outcome: `ok,` and the child's `key=` line on success.
-    fn spawned(r: std::io::Result<(bool, Vec<u8>)>, key: &str, render: &Render) -> String {
+    pub(crate) fn spawned(r: std::io::Result<(bool, Vec<u8>)>, key: &str, render: &Render) -> String {
         match r {
             Ok((true, stdout)) => {
                 let stdout = String::from_utf8_lossy(&stdout);
@@ -100,7 +107,7 @@ mod probe {
         }
     }
 
-    fn cosca_output(cmd: &mut cosca::Command) -> std::io::Result<(bool, Vec<u8>)> {
+    pub(crate) fn cosca_output(cmd: &mut cosca::Command) -> std::io::Result<(bool, Vec<u8>)> {
         match cmd.output() {
             Ok(out) => Ok((out.status.success(), out.stdout)),
             Err(cosca::error::Error::Io(e)) => Err(e),
@@ -108,7 +115,7 @@ mod probe {
         }
     }
 
-    fn std_output(cmd: &mut std::process::Command) -> std::io::Result<(bool, Vec<u8>)> {
+    pub(crate) fn std_output(cmd: &mut std::process::Command) -> std::io::Result<(bool, Vec<u8>)> {
         cmd.output().map(|out| (out.status.success(), out.stdout))
     }
 
