@@ -286,6 +286,54 @@ fn empty_path_element_is_not_resolved_from_cwd() {
     assert_eq!(super::resolve_in_path_var(OsStr::new(":"), "sudo"), None);
 }
 
+const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH_ELEMENTS";
+
+/// A relative `PATH` element (`relbin`, `.`) names a directory under the cwd at detection time, and
+/// a backend found there would be exec-checked against one directory and run from another — or
+/// not found by path at all. The planted `relbin/sudo` sits in the fixture's real cwd, so skipping
+/// it is observable only if the element is refused rather than merely missed.
+#[cfg(unix)]
+#[test]
+fn relative_path_elements_are_never_resolved() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = tempfile::tempdir().unwrap();
+    for dir in ["relbin", "abs"] {
+        let sudo = cwd.path().join(dir).join("sudo");
+        std::fs::create_dir_all(sudo.parent().unwrap()).unwrap();
+        std::fs::write(&sudo, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    crate::test_child::run_fixture_with_cwd(
+        crate::test_child::fixture_path!(fixture_relative_path_elements_are_never_resolved),
+        cwd.path(),
+        FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER,
+    );
+}
+
+/// The child half of [`relative_path_elements_are_never_resolved`], run with the prepared
+/// directory as its real cwd; inert in an ordinary suite run.
+#[cfg(unix)]
+#[test]
+fn fixture_relative_path_elements_are_never_resolved() {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
+        return;
+    };
+    for relative in ["relbin", ".", "./relbin"] {
+        assert_eq!(
+            super::resolve_in_path_var(OsStr::new(relative), "sudo"),
+            None,
+            "{relative}"
+        );
+    }
+    let abs = cwd.join("abs");
+    let path_var = format!("relbin:{}", abs.display());
+    assert_eq!(
+        super::resolve_in_path_var(OsStr::new(&path_var), "sudo"),
+        Some(abs.join("sudo")),
+        "a relative element must be skipped, not resolved ahead of an absolute one"
+    );
+}
+
 #[cfg(unix)]
 mod rewrite_tests {
     use super::super::{password_line, rewrite_with_host, PendingPassword, PosixRewrite};

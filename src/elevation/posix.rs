@@ -175,12 +175,14 @@ pub(super) fn resolve_on_path(program: &str) -> Option<PathBuf> {
     resolve_in_path_var(&std::env::var_os("PATH")?, program)
 }
 
-/// PURE path resolution over an explicit PATH value: check the exec bit and SKIP
-/// empty elements (an empty element is CWD — never resolve a backend there).
+/// Path resolution over an explicit PATH value: check the exec bit and SKIP every
+/// non-absolute element. An empty element means the cwd, and any relative one (`bin`, `.`)
+/// names a directory under it: a backend found there would be exec-checked against the cwd at
+/// detection and launched against whatever the cwd is later, so it is never resolved.
 pub(super) fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
     std::env::split_paths(path_var).find_map(|dir| {
-        if dir.as_os_str().is_empty() {
-            return None; // empty element = CWD; never resolve here
+        if !dir.is_absolute() {
+            return None;
         }
         let cand = dir.join(program);
         is_executable(&cand).then_some(cand)
