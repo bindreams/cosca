@@ -798,18 +798,28 @@ fn a_verbatim_path_is_judged_the_way_std_judges_one() {
             "{plain:?} still resolves to the batch file"
         );
     }
-    // The declared split `verbatim_refusal` documents: std hands `CreateProcessW` the same string
-    // for each pair, and until kernelbase is measured the plain spelling is refused and the
-    // prefixed one accepted.
-    for stream in [r"C:\x.bat:s", r"C:\x.bat:", r"C:\x.bat::$DATA"] {
+    // A data stream of a batch file is refused under the prefix as it is without: std hands
+    // `CreateProcessW` the same string for each pair, and whether that launches cmd.exe is
+    // unmeasured. See `verbatim_refusal`.
+    for stream in [
+        r"C:\x.bat:s",
+        r"C:\x.bat:",
+        r"C:\x.bat::$DATA",
+        r"C:\x.bat.:s",
+        r"C:\x.exe:p.bat:$DATA",
+    ] {
+        for probe in [stream.to_string(), format!(r"\\?\{stream}")] {
+            assert!(
+                super::reject_batch_path_on(Path::new(&probe), true).is_err(),
+                "{probe:?} is refused until kernelbase is measured"
+            );
+        }
+    }
+    // A stream of a file that is no batch file stays accepted.
+    for probe in [r"\\?\C:\x.exe:s", r"\\?\C:\dir\x.exe::$DATA"] {
         assert!(
-            super::reject_batch_path_on(Path::new(stream), true).is_err(),
-            "{stream:?} is refused until kernelbase is measured"
-        );
-        let verbatim = format!(r"\\?\{stream}");
-        assert!(
-            super::reject_batch_path_on(Path::new(&verbatim), true).is_ok(),
-            "{verbatim:?} is accepted on std's literal test"
+            super::reject_batch_path_on(Path::new(probe), true).is_ok(),
+            "{probe:?} is a stream of no batch file"
         );
     }
 }

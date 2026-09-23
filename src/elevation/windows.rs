@@ -446,11 +446,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // The third is token NORMALIZATION before the load, and the gate below does close it: it
     // judges the name Win32 resolves the token to rather than `Path::extension()`, so trailing dots
     // and spaces (`setup.bat.`, `setup.bat `), a leading-dot name (`C:\tools\.bat`), `..` collapse
-    // (`setup.bat\x\..`), a batch-named UNC share, and a data-stream piece (`x.exe:p.bat`) are all
-    // refused. What stays open is only what ShellExecuteEx finds by LOOKUP rather than by reading
-    // the token — the two surfaces above, plus an App Paths registration of a bare name — and the
-    // verbatim stream spellings (`\\?\C:\x.bat:s`, `\\?\C:\x.bat::$DATA`), which the gate accepts
-    // and whose handling by ShellExecuteEx is unmeasured (see `batch_gate::verbatim_refusal`).
+    // (`setup.bat\x\..`), a batch-named UNC share, and a data-stream piece (`x.exe:p.bat`,
+    // `x.bat:s`, with or without `\\?\`) are all refused. What stays open is only what
+    // ShellExecuteEx finds by LOOKUP rather than by reading the token — the two surfaces above,
+    // plus an App Paths registration of a bare name.
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
     crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
 
