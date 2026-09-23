@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Path $dest -Force | Out-Null
 # "succeeded, here's what happened" (0 = nothing to copy, 1 = files copied, 2 = extra files
 # removed, etc. - see Microsoft's robocopy exit code docs); 8 or above means at least one
 # real failure.
-robocopy $source $dest /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS
+robocopy $source $dest /MIR /R:0 /NFL /NDL /NJH /NJS
 $robocopyExit = $LASTEXITCODE
 if ($robocopyExit -ge 8) {
     throw "devvm: robocopy failed mirroring $source to $dest (exit $robocopyExit)"
