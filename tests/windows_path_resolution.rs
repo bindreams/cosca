@@ -13,8 +13,8 @@
 //! # Two kinds of test
 //!
 //! **Canaries** assert a platform fact and FAIL when Windows disagrees, when an asserted
-//! measurement could not be taken, or when they checked nothing at all. A failure means any code modelling that fact must be re-derived
-//! from the new behaviour; do not loosen the assertion.
+//! measurement could not be taken, or when they checked nothing at all. A failure means any code
+//! modelling that fact must be re-derived from the new behaviour; do not loosen the assertion.
 //!
 //! **Surveys**, and the rows a canary prints without asserting, only print. A Win32 error there is
 //! printed as the measurement, not raised, so a change in behaviour nothing asserts on never turns
@@ -74,8 +74,8 @@ struct Platform {
     detail: String,
 }
 
-/// A registry string under `HKLM`, or the Win32 error that stopped it being read. A value that grows
-/// while being read is read again at its new size.
+/// A registry string under `HKLM`, or the Win32 error that stopped it being read. A value that
+/// grows while being read is read again at its new size.
 fn reg_sz(subkey: &str, value: &str) -> Result<String, String> {
     use std::os::windows::ffi::OsStringExt;
     let (subkey_w, value_w) = (wide(subkey), wide(value));
@@ -686,8 +686,8 @@ fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
 /// Canary: through `\\?\`, a dots-and-spaces name is an ordinary file — except `.` and `..`,
 /// which fail `ERROR_INVALID_NAME`.
 ///
-/// So a verbatim final `.` or `..` can never name a file, while `...`, `" "`, `"x "` and `". "` can.
-/// A model of verbatim paths that treats either group otherwise is wrong on this Windows.
+/// So a verbatim final `.` or `..` can never name a file, while `...`, `" "`, `"x "` and `". "`
+/// can. A model of verbatim paths that treats either group otherwise is wrong on this Windows.
 ///
 /// The plain-spelling rows, `GetFullPathNameW` and the listings are printed, not asserted. Each
 /// (name, spelling) pair gets its OWN directory, so a listing can never be ambiguous about which
@@ -1610,7 +1610,8 @@ fn x_space_measured_in_a_single_directory() {
     }
 }
 
-/// `CreateProcessW(lpApplicationName = program)` with no arguments, stdout captured to `out_path`. `Err` is a spawn that did not happen, rendered with its Win32 error.
+/// `CreateProcessW(lpApplicationName = program)` with no arguments, stdout captured to `out_path`.
+/// `Err` is a spawn that did not happen, rendered with its Win32 error.
 fn create_process(program: &str, out_path: &str) -> Result<(u32, String), String> {
     use std::os::windows::io::AsRawHandle;
 
