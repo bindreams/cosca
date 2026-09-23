@@ -459,12 +459,12 @@ fn has_loadable_extension(name: &OsStr) -> bool {
 ///
 /// Those measurements are of a launch without a class. cosca launches as `exefile`
 /// (`SEE_MASK_CLASSNAME`), and whether that launch applies `PATHEXT` on the consent route an
-/// unelevated caller takes is unmeasured. This rule does not depend on the answer: a name ending
-/// in `.exe`/`.com` leaves no default extension to add either way.
+/// unelevated caller takes is unmeasured.
 ///
-/// The allowlist closes the extensionless case only. Whether `ShellExecuteEx` also applies
-/// `PATHEXT` to an `lpFile` that already ends in `.exe` — a real `tool.exe` beside a planted
-/// `tool.exe.bat` — is unmeasured, and this rule makes no claim about it.
+/// The allowlist closes the extensionless case only, whatever that answer is. Whether
+/// `ShellExecuteEx` applies `PATHEXT` to an `lpFile` that already ends in `.exe` — a real
+/// `tool.exe` beside a planted `tool.exe.bat` — is unmeasured on every route, and this rule makes
+/// no claim about it.
 ///
 /// # Deliberately stricter than an unelevated spawn
 ///

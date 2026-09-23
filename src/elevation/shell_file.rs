@@ -10,11 +10,13 @@
 //! and takes a `%` in `lpFile` or `lpDirectory` literally. The production route is different: cosca
 //! calls `ShellExecuteEx` only when the caller is NOT elevated, and that launch goes through the
 //! consent service. That route is unmeasured, so every rule here is conservative until it is: a
-//! fully qualified `.exe`/`.com` path leaves no lookup or default extension to apply whatever the
-//! launch does, and a `%` is refused rather than trusted to stay literal. The rewrites shell32
-//! makes without a class — quotes stripped, a `file:` URL decoded, `shell:`, `::{CLSID}`, `www`,
-//! `%VAR%` — are refused by the same rules, since none of those spellings is a fully qualified image
-//! path free of `"` and `%`.
+//! fully qualified path leaves no lookup to make, an `.exe`/`.com` name leaves no extensionless
+//! name for `PATHEXT` to complete, and a `%` is refused rather than trusted to stay literal.
+//! Whether `PATHEXT` applies to a name already ending in `.exe` is unmeasured on every route (see
+//! [`crate::resolve::reject_unloadable_image`]). The rewrites shell32 makes without a class —
+//! quotes stripped, a `file:` URL decoded, `shell:`, `::{CLSID}`, `www`, `%VAR%` — are refused by
+//! the same rules, since none of those spellings is a fully qualified image path free of `"` and
+//! `%`.
 
 use std::path::Path;
 

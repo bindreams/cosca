@@ -451,9 +451,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // `lpFile`. Measured only for an ELEVATED caller, which cosca never launches from: no App
     // Paths, no bare-name search, `%` literal. The consent route an unelevated caller takes is
     // unmeasured, so the rest is conservative (see `shell_file`): a fully qualified `.exe`/`.com`
-    // path, which leaves no default extension to apply however the launch treats one, with no
-    // `"` or `%`, and a `current_dir()` with no `%`. A relative or bare token is refused until the
-    // image is resolved before the launch.
+    // path, which leaves no extensionless name for `PATHEXT` to complete (whether it applies to a
+    // name already ending in `.exe` is unmeasured on every route), with no `"` or `%`, and a
+    // `current_dir()` with no `%`. A relative or bare token is refused until the image is resolved
+    // before the launch.
     let program_path = std::path::Path::new(&program);
     crate::child::spawn::reject_batch_path(program_path)?;
     shell_file::reject_elevated_program(program_path)?;
