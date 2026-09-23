@@ -156,9 +156,10 @@ jobs:
           esac
 
       # Release lane (debug_assertions off): exercises the calm-release arm of the
-      # should_panic oracles in the macOS-gated kinfo_tests.rs.
+      # should_panic oracles in the macOS-gated kinfo_tests.rs, and the Linux cgroup tests of what
+      # release builds do where debug builds assert a broken precondition instead.
       - name: Unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin'
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
         run: cargo test --locked --release --lib --target ${{ matrix.target }}
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
@@ -170,7 +171,7 @@ jobs:
       # gaps that only a default-features-only build exposes, which
       # --all-features alone never catches.
       #
-      # Placed after the test steps above (including the darwin-only release
+      # Placed after the test steps above (including the darwin and Linux release
       # lane just above), not right after Build: a clippy failure there would
       # skip every later step (their implicit `if: success()`), hiding test
       # results.
