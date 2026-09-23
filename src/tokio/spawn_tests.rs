@@ -166,7 +166,7 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     assert!(
-        crate::log_capture::contains_since(mark, "nothing can reach it"),
+        warned_for(mark, pid, "nothing can reach it"),
         "the failure must say the child may be left running"
     );
 
@@ -190,6 +190,16 @@ fn the_unreachable_child_warning_is_once_per_errno() {
         super::warn_child_may_be_unreachable_into(&warned, &other),
         log::Level::Warn
     );
+}
+
+/// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` — the seam's
+/// error names it — and so of this test's spawn, whatever other tests log meanwhile.
+#[cfg(target_os = "linux")]
+fn warned_for(mark: usize, pid: u32, marker: &str) -> bool {
+    let spawn = format!("for child {pid})");
+    crate::log_capture::records_since(mark, marker)
+        .iter()
+        .any(|record| record.contains(&spawn))
 }
 
 /// Whether the child `pidfd` names has been reaped — which a pidfd, unlike a pid, can answer after
@@ -249,7 +259,7 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() 
 
         let case = format!("placed: {placed}, refuses the kill: {refuses}");
         assert_eq!(
-            crate::log_capture::contains_since(mark, "nothing can reach it"),
+            warned_for(mark, pid, "nothing can reach it"),
             refuses,
             "{case}: the warning must fire exactly when the child is out of reach"
         );

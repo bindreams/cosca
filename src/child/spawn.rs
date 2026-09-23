@@ -1137,10 +1137,12 @@ pub(crate) mod fault {
             // Above 2: a test may have 0, 1 or 2 closed across the spawn, and restore them.
             .and_then(|pidfd| rustix::io::fcntl_dupfd_cloexec(&pidfd, 3).ok());
         FORGOTTEN_PIDFD.with(|f| *f.borrow_mut() = pidfd);
+        let pid = child.id().expect("an unreaped child has its pid");
         std::mem::forget(child);
-        Err(crate::error::Error::Io(std::io::Error::other(
-            "forced post-fork spawn failure (test seam)",
-        )))
+        // Its pid names this spawn's failure, so a test can tell its log records from any other's.
+        Err(crate::error::Error::Io(std::io::Error::other(format!(
+            "forced post-fork spawn failure (test seam) for child {pid}"
+        ))))
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {
