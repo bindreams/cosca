@@ -112,6 +112,7 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
         return;
     };
+    drop_root();
     let mut gate = [0u8; 1];
     std::io::stdin().read_exact(&mut gate).expect("gate byte");
     if std::fs::metadata(&own_path).is_ok() {
@@ -147,6 +148,31 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     };
     std::process::exit(code);
 }
+
+/// Root reaches an unsearchable directory anyway (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`), so a
+/// root fixture becomes [`UNPRIVILEGED`] first: the test is then the same one it is for any other
+/// user, rather than one that cannot set up its own precondition.
+fn drop_root() {
+    // SAFETY: plain credential syscalls on this single-threaded fixture process.
+    unsafe {
+        if libc::geteuid() != 0 {
+            return;
+        }
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(UNPRIVILEGED) != 0
+            || libc::setuid(UNPRIVILEGED) != 0
+        {
+            report(&format!(
+                "precondition: dropping root: {}",
+                std::io::Error::last_os_error()
+            ));
+            std::process::exit(PRECONDITION_FAILED);
+        }
+    }
+}
+
+/// The uid and gid a root fixture drops to: `nobody` on Linux.
+const UNPRIVILEGED: libc::uid_t = 65534;
 
 /// The command `.elevate()` spawns from a process that is already root, on any host.
 fn already_elevated(c: &mut Command) -> Result<Command, Error> {
@@ -193,6 +219,8 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("tempdir");
+    // Reachable by the unprivileged user a root fixture drops to; `tempdir` makes it 0700.
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
