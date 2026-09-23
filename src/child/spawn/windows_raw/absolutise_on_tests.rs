@@ -280,13 +280,33 @@ fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
     let _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
 }
 
-/// A verbatim path is taken as written, as `std::path::absolute` takes one: a trailing dot or a
-/// `..` in it names a real, verbatim-only file, which `GetFullPathNameW` could rewrite.
+/// A verbatim `current_dir` is never completed to a different path: it is kept as written when
+/// normalising leaves it alone, and refused when normalising would change it, since the directory
+/// resolved against must be the one the child runs in.
 #[test]
-fn a_verbatim_path_is_completed_as_written() {
+fn a_verbatim_directory_is_kept_or_refused_never_rewritten() {
+    let kept = complete_on(Path::new(r"\\?\C:\t\a"), || panic!("must not read the cwd"), no_drive).unwrap();
+    assert_eq!(kept.path, PathBuf::from(r"\\?\C:\t\a"));
     for path in [r"\\?\C:\t\a.", r"\\?\C:\t\x\..\y", r"\\?\C:\t\a "] {
-        let got = complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive).unwrap();
-        assert_eq!(got.path, PathBuf::from(path), "{path:?}");
-        assert!(!got.used_cwd);
+        match complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive) {
+            Ok(got) => assert_eq!(got.path, PathBuf::from(path), "{path:?} was rewritten"),
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{path:?}: {e}"),
+            Err(other) => panic!("{path:?}: {other:?}"),
+        }
+    }
+}
+
+/// A verbatim `raw_executable()` token is taken as written: `\\?\C:\t\tool.exe.` names that
+/// file, not its sibling `tool.exe`, and `...` is a file name there.
+#[test]
+fn a_verbatim_exact_token_is_taken_as_written() {
+    for token in [r"\\?\C:\t\tool.exe.", r"\\?\C:\t\x\..\tool.exe", r"\\?\C:\t\..."] {
+        assert_eq!(
+            absolutise_exact(Path::new(token)).unwrap(),
+            PathBuf::from(token),
+            "{token:?}"
+        );
+        let got = absolutise_exact_on(Path::new(token), || panic!("must not read the cwd"), no_drive).unwrap();
+        assert_eq!(got.path, PathBuf::from(token), "{token:?}");
     }
 }

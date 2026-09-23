@@ -281,8 +281,9 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// Complete a possibly-relative program name into an absolute path the way the Win32 loader
 /// itself would — **without searching, appending an extension, or touching the filesystem**.
 ///
-/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`]. Only the
-/// elevated path loads its result, because the two Win32 sinks treat a relative name oppositely:
+/// This is the `Exact` (`raw_executable()`) counterpart to [`resolve_executable`], used by the raw
+/// backend for its refusals only; the elevated path completes through [`absolutise_exact_on`],
+/// which shares its checks. The two Win32 sinks treat a relative name oppositely:
 ///
 /// - `CreateProcessW` completes a partial `lpApplicationName` itself ("the function uses the
 ///   current drive and current directory to complete the specification. The function will not
@@ -304,10 +305,11 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 ///   state Win32 tracks and cosca does not, which is why `executable()`'s search path fails such
 ///   names closed instead. Here the platform answers it correctly.
 ///
+/// A verbatim (`\\?\`) name is taken as written, never normalised.
+///
 /// The current directory is process-global and can change between calls, so the elevated path
-/// consumes the relative name exactly once and everything downstream uses the absolute result —
-/// which is precisely what `GetFullPathNameW`'s own doc advises for shared library code. The raw
-/// backend's use is safe from that race: whether it names a file, and whether it names a batch
+/// consumes the relative name exactly once, through [`absolutise_exact_on`]'s one read, and
+/// everything downstream uses the absolute result. The raw backend's use is safe from that race: whether it names a file, and whether it names a batch
 /// file, depend only on the token's own final component, not on the directory it was completed
 /// against.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
@@ -346,10 +348,23 @@ pub(crate) fn complete_on(
     drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
 ) -> Result<Completed, Error> {
     let anchored = anchor(path, process_cwd, drive_cwd)?;
-    // A verbatim path is taken as written, as `std::path::absolute` takes one: Win32 hands it to
-    // the filesystem unparsed, so it may name a file only a verbatim path reaches (`a.`, `a `),
-    // which normalising would rewrite.
-    if anchored.path.as_os_str().as_encoded_bytes().starts_with(br"\\?\") {
+    // A verbatim path names what it spells, which may be a directory only a verbatim path reaches
+    // (`a.`, `a `). It is kept as written, but only when normalising would not change it: whatever
+    // is done with the result as a working directory may normalise it again (ReactOS
+    // `CreateProcessInternalW` runs `GetFullPathNameW` on `lpCurrentDirectory`), and the directory
+    // resolved against must be the one run in.
+    if is_verbatim(&anchored.path) {
+        let normalised = full_path_name(&anchored.path)?;
+        if normalised != anchored.path {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the verbatim path {:?} would be normalised to {normalised:?} where it is used as a \
+                     directory; spell it as that",
+                    anchored.path
+                ),
+            )));
+        }
         return Ok(anchored);
     }
     Ok(Completed {
@@ -443,6 +458,11 @@ pub(crate) fn absolutise_exact_on(
     Ok(Completed { path, used_cwd })
 }
 
+/// Whether `path` is verbatim (`\\?\`), which Win32 passes to the filesystem unparsed.
+fn is_verbatim(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().starts_with(br"\\?\")
+}
+
 /// `GetFullPathNameW` on `path`.
 fn full_path_name(path: &Path) -> Result<PathBuf, Error> {
     // `to_wide_nul` would truncate at an interior NUL, so `GetFullPathNameW` would complete a path
@@ -477,7 +497,14 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
     // BEFORE: normalisation can also REMOVE the shape. `C:\t\.` normalises to `C:\t`, whose final
     // component `t` names a file, so only the spelling shows that the caller named a directory.
     reject_unnameable_program(program)?;
-    let full = full_path_name(&anchored()?)?;
+    let anchored = anchored()?;
+    // A verbatim path is taken as written, as `std::path::absolute` takes one: the loader hands it
+    // to the filesystem unparsed, so `\\?\C:\t\tool.exe.` names that file, which normalising would
+    // turn into its sibling `tool.exe`.
+    if is_verbatim(&anchored) {
+        return Ok(anchored);
+    }
+    let full = full_path_name(&anchored)?;
     // AFTER: normalisation STRIPS trailing dots and spaces from the final component, so it can
     // CREATE the shape the pre-check refuses. `C:\t\...` passes as written — `...` is neither
     // empty nor `.`/`..` — and normalises to `C:\t\`, a directory, which would then be handed to

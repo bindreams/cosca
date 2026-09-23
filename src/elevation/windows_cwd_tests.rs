@@ -344,3 +344,24 @@ fn an_empty_current_dir_is_refused_at_the_consent_launch() {
     }
     assert_eq!(reader.reads.get(), 0);
 }
+
+/// Under consent a verbatim `raw_executable()` is sent as written: `tool.exe.` is refused by the
+/// allowlist rather than normalised into its sibling `tool.exe`, and a literal `..` stays literal.
+#[test]
+fn a_verbatim_exact_token_reaches_the_consent_launch_as_written() {
+    let reader = Reader::new(Path::new(r"C:\cosca-must-not-be-read"));
+    let mut dotted = Command::new();
+    dotted.raw_executable(r"\\?\C:\t\tool.exe.").args(["tool"]).elevate();
+    match plan_err(&dotted, &reader) {
+        crate::error::Error::Io(e) => assert!(e.to_string().contains("PATHEXT"), "{e}"),
+        other => panic!("expected the allowlist's refusal, got {other:?}"),
+    }
+    let mut dotdot = Command::new();
+    dotdot
+        .raw_executable(r"\\?\C:\t\x\..\tool.exe")
+        .args(["tool"])
+        .elevate();
+    let launch = plan(&dotdot, &reader);
+    assert_eq!(unwide(&launch.file_w), PathBuf::from(r"\\?\C:\t\x\..\tool.exe"));
+    assert_eq!(reader.reads.get(), 0);
+}
