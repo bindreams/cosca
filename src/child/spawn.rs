@@ -477,14 +477,10 @@ fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<Resolv
     Ok(as_given(cmd.executable_path()))
 }
 
-// Program + the trailing args (argv mode). `executable` overrides the loaded
-// file; argv[0] is the conventional program name otherwise.
-//
-// POSIX: when `executable` is set, the user's argv[0] — the executable as written
-// for an empty argv — is preserved via `CommandExt::arg0` (set on the caller's
-// std_cmd). On Windows a set `executable` never reaches this std path — it routes to the raw
-// `CreateProcessW` backend, which preserves argv[0] independently of the loaded
-// image (argv[0] no longer degrades to the executable path).
+// Program + the trailing args (argv mode). `executable` overrides the loaded file; argv[0] is the
+// conventional program name otherwise — POSIX argv[0] preservation happens at the caller (see
+// build_std_command). On Windows a set `executable` never reaches this std path — it routes to
+// the raw `CreateProcessW` backend, which preserves argv[0] independently of the loaded image.
 fn resolve_program_argv<'a>(
     cmd: &'a Command,
     argv: &'a [std::ffi::OsString],
