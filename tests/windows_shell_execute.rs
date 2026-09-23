@@ -161,10 +161,11 @@ fn uac_policy(name: &str) -> String {
     }
 }
 
-/// What a payload run reported: the image it was loaded from.
+/// What a payload run reported: the image it was loaded from, and its current directory.
 #[derive(Debug)]
 struct Report {
     image: String,
+    cwd: String,
 }
 
 /// Why a launch produced no report.
@@ -233,8 +234,8 @@ fn launch_in_apartment(
     let _ = unsafe { CloseHandle(sei.hProcess) };
     let body = std::fs::read_to_string(report).map_err(|e| Failure::Other(format!("exit {code}, no report: {e}")))?;
     let line = |prefix: &str| body.lines().find_map(|l| l.strip_prefix(prefix).map(str::to_string));
-    match line("image=") {
-        Some(image) => Ok(Report { image }),
+    match (line("image="), line("cwd=")) {
+        (Some(image), Some(cwd)) => Ok(Report { image, cwd }),
         _ => Err(Failure::Other(format!("exit {code}, incomplete report: {body:?}"))),
     }
 }
@@ -330,6 +331,13 @@ fn ends_with(got: &Result<Report, Failure>, path: &Path) -> bool {
 
 fn failed_with(got: &Result<Report, Failure>, hresult: i32) -> bool {
     matches!(got, Err(Failure::Shell(code)) if *code == hresult)
+}
+
+/// The last component of `path`, which is all the probe compares: the root may come back 8.3.
+fn last_component(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 /// Canary: with `SEE_MASK_CLASSNAME` and `lpClass = "exefile"`, `runas` runs a FULL path — an
@@ -451,6 +459,59 @@ fn exefile_skips_the_app_paths_lookup() {
             }
         }
         drop(key);
+    }
+    drop(l.root);
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+    mark_passed();
+}
+
+/// Canary: launched as `exefile`, a `%` is taken literally, in `lpFile` and in `lpDirectory`
+/// alike: with `COSCA_PROBE_PCT=exp` set, `…\%COSCA_PROBE_PCT%\…` loads from, and runs in, the
+/// directory literally named that, not `…\exp\…`.
+#[test]
+#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
+fn exefile_takes_percent_literally() {
+    let _serial = serial();
+    let l = layout();
+    let literal_name = "%COSCA_PROBE_PCT%";
+    let (literal, expanded) = (l.root.path().join(literal_name), l.root.path().join("exp"));
+    let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
+    for dir in [&literal, &expanded] {
+        std::fs::create_dir(dir).expect("mkdir");
+        std::fs::copy(source, dir.join("cosca_probe_pct.exe")).expect("copy the payload");
+    }
+    std::env::set_var("COSCA_PROBE_PCT", "exp");
+    let file = literal.join("cosca_probe_pct.exe");
+    let by_file = run(
+        &l,
+        "exefile, % in lpFile",
+        "runas",
+        file.as_os_str(),
+        &l.dir_empty,
+        Some("exefile"),
+    );
+    let a = l.dir_a.join(APP);
+    let by_dir = run(
+        &l,
+        "exefile, % in lpDirectory",
+        "runas",
+        a.as_os_str(),
+        &literal,
+        Some("exefile"),
+    );
+    std::env::remove_var("COSCA_PROBE_PCT");
+    let mut failures: Vec<String> = Vec::new();
+    match &by_file {
+        Ok(r)
+            if last_component(Path::new(&r.image).parent().map_or("", |p| p.to_str().unwrap_or("")))
+                == literal_name => {}
+        other => failures.push(format!("% in lpFile should load from the literal directory: {other:?}")),
+    }
+    match &by_dir {
+        Ok(r) if last_component(&r.cwd) == literal_name => {}
+        other => failures.push(format!(
+            "% in lpDirectory should run in the literal directory: {other:?}"
+        )),
     }
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
