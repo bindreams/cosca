@@ -170,3 +170,20 @@ fn raw_program_and_line_allows_a_non_empty_command_line_with_no_executable_set()
     cmd.commandline("tool --flag");
     assert!(raw_program_and_line(&cmd).is_ok());
 }
+
+/// The containment marker is an op after the user's, so it takes the name std gives it: after a
+/// user's `env_remove("__cosca_group_root")`, that spelling, as on the std path.
+#[test]
+fn the_containment_marker_is_named_as_std_names_it() {
+    let removed = "__cosca_group_root";
+    let mut std_cmd = std::process::Command::new("unused");
+    std_cmd.env_remove(removed).env(crate::containment::NESTED_ENV, "1");
+    let std_name: Vec<_> = std_cmd.get_envs().map(|(k, _)| k.to_os_string()).collect();
+    assert_eq!(std_name, [OsString::from(removed)], "std control");
+
+    let snapshot = env_snapshot::EnvSnapshot::from_block("A=1\0\0".encode_utf16().collect());
+    let user_ops = [EnvOp::Remove(removed.into())];
+    let ops = child_ops(&user_ops, true);
+    let block = resolve::ChildEnv::capture(&snapshot, &ops).into_block().unwrap();
+    assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0__cosca_group_root=1\0\0");
+}
