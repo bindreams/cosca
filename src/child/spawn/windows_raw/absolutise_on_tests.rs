@@ -188,15 +188,24 @@ fn only_an_existing_fully_qualified_drive_directory_is_used() {
 /// `tests/windows_process_cwd.rs`).
 #[test]
 fn a_relative_name_on_a_verbatim_unc_cwd_collapses_as_win32_does() {
+    let cwd = || Ok(PathBuf::from(r"\\?\UNC\srv\shr\d"));
     for (name, want) in [
         (r"..\t.exe", r"\\?\UNC\srv\shr\t.exe"),
         (r"..\..\t.exe", r"\\?\UNC\srv\t.exe"),
         (r"..\..\..\t.exe", r"\\?\UNC\t.exe"),
     ] {
-        let got = complete_on(Path::new(name), || Ok(PathBuf::from(r"\\?\UNC\srv\shr\d")), no_drive).unwrap();
+        let got = complete_on(Path::new(name), cwd, no_drive).unwrap();
         assert_eq!(got.path, PathBuf::from(want), "{name:?}");
-        let exact = absolutise_exact_on(Path::new(name), || Ok(PathBuf::from(r"\\?\UNC\srv\shr\d")), no_drive).unwrap();
-        assert_eq!(exact.path, PathBuf::from(want), "raw_executable {name:?}");
+    }
+    let exact = absolutise_exact_on(Path::new(r"..\t.exe"), cwd, no_drive).unwrap();
+    assert_eq!(exact.path, PathBuf::from(r"\\?\UNC\srv\shr\t.exe"));
+    // Past the share, Win32's completion names a share root or no share at all, so no program.
+    for name in [r"..\..\t.exe", r"..\..\..\t.exe"] {
+        match absolutise_exact_on(Path::new(name), cwd, no_drive) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{name:?}: {e}"),
+            Err(other) => panic!("{name:?}: expected Io, got {other:?}"),
+            Ok(done) => panic!("{name:?}: must be refused, got {:?}", done.path),
+        }
     }
 }
 
@@ -243,12 +252,14 @@ fn the_effective_cwd_completes_current_dir_as_win32_does() {
 /// A drive's own directory comes from the spawn's snapshot, not a second read of the environment.
 #[test]
 fn the_effective_cwd_reads_a_drive_directory_from_the_given_snapshot() {
-    let block: Vec<u16> = "=Q:=Q:\\qcwd\0\0".encode_utf16().collect();
+    let qcwd = tempfile::tempdir().unwrap();
+    let qcwd = qcwd.path().to_str().unwrap();
+    let block: Vec<u16> = format!("=Q:={qcwd}\0\0").encode_utf16().collect();
     let got = super::effective_cwd(Some(Path::new("Q:sub")), &EnvSnapshot::from_block(block), || {
-        Ok(PathBuf::from(r"C:\x"))
+        Ok(PathBuf::from(r"D:\x"))
     })
     .unwrap();
-    assert_eq!(got, PathBuf::from(r"Q:\qcwd\sub"));
+    assert_eq!(got, PathBuf::from(format!(r"{qcwd}\sub")));
 }
 
 /// With no `current_dir`, the effective cwd is one read of this process's cwd, whatever the program.
