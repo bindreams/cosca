@@ -1704,3 +1704,26 @@ fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killi
     occupant.wait().expect("reap the occupant");
     assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
+
+/// A child is in a leaf when its cgroup is the leaf's own path or nested under it — not when some
+/// other cgroup merely shares the leaf's name or a prefix of it.
+#[test]
+fn a_cgroup_path_is_inside_a_leaf_only_at_or_under_its_own_path() {
+    let leaf = "/slice/cosca-7-0";
+    for (path, inside) in [
+        ("/slice/cosca-7-0", true),
+        ("/slice/cosca-7-0/nested", true),
+        ("/slice/cosca-7-0/nested/deeper", true),
+        ("/other/cosca-7-0", false),
+        ("/slice/cosca-7-0-sibling", false),
+        ("/slice/cosca-7-01", false),
+        ("/slice", false),
+        ("/", false),
+    ] {
+        assert_eq!(super::is_at_or_under(path, leaf), inside, "{path} in {leaf}");
+    }
+    assert!(
+        super::is_at_or_under("/cosca-7-0/x", "/cosca-7-0"),
+        "a leaf under the root cgroup"
+    );
+}

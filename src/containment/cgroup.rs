@@ -33,6 +33,14 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
+/// Whether the cgroup at `path` is `leaf` itself or nested under it. Both are unified-hierarchy
+/// paths as `/proc/<pid>/cgroup` prints them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn is_at_or_under(path: &str, leaf: &str) -> bool {
+    path.strip_prefix(leaf)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
 /// success, or `None` when no such line is present (v1-only or empty).
@@ -794,6 +802,9 @@ pub(crate) struct CgroupLeaf {
     report: Option<ReportChannel>,
     /// Whether the child reported entering the leaf, recorded when `report` is released.
     entered: bool,
+    /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
+    /// created outside the cgroup filesystem.
+    cgroup_path: Option<String>,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -934,14 +945,15 @@ impl CgroupLeaf {
         Err(self.abandon(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
     }
 
-    /// Whether `pid`'s own cgroup is this leaf or inside it.
+    /// Whether `pid`'s own cgroup is this leaf or nested under it. A leaf with no known
+    /// unified-hierarchy path (a test leaf) holds nothing.
     fn holds(&self, pid: u32) -> bool {
-        let Some(leaf_name) = self.leaf_path.file_name().and_then(|name| name.to_str()) else {
+        let Some(leaf) = &self.cgroup_path else {
             return false;
         };
         fs::read_to_string(format!("/proc/{pid}/cgroup"))
             .ok()
-            .and_then(|text| parse_v2_relative_path(&text).map(|path| path.split('/').any(|part| part == leaf_name)))
+            .and_then(|text| parse_v2_relative_path(&text).map(|path| is_at_or_under(path, leaf)))
             .unwrap_or(false)
     }
 
@@ -1107,6 +1119,7 @@ impl CgroupLeaf {
             procs_fd: None,
             report: Some(ReportChannel::new().expect("open a placement-report channel")),
             entered: false,
+            cgroup_path: None,
         }
     }
 
@@ -1254,7 +1267,10 @@ pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
         }
     })?;
 
-    create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))
+    let mut leaf = create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))?;
+    let name = leaf.leaf_path.file_name().expect("a leaf has a name").to_string_lossy();
+    leaf.cgroup_path = Some(format!("{}/{name}", rel_path.trim_end_matches('/')));
+    Ok(leaf)
 }
 
 /// Create a containment leaf directly under `current` — the supervisor's own cgroup in
@@ -1365,6 +1381,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,
+        cgroup_path: None,
     })
 }
 
