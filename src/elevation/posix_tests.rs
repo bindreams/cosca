@@ -997,7 +997,16 @@ mod rewrite_tests {
                 Ok(PathBuf::from("/proc-cwd"))
             })
             .expect("rewrite");
-            assert_eq!(reads.get(), 1, "{:?}", rw.report.map(|r| r.via));
+            let via = rw.report.as_ref().map(|r| r.via.clone());
+            assert_eq!(reads.get(), 1, "{via:?}");
+            // A build that re-read the real cwd behind the injected one would pass the count alone.
+            let derived = rw.derived.as_ref().expect("derived");
+            assert_eq!(derived.cwd(), Some(std::path::Path::new("/proc-cwd")), "{via:?}");
+            let argv = derived_argv(&rw);
+            assert!(
+                argv.iter().any(|a| a.to_string_lossy().contains("/proc-cwd/tool")),
+                "{via:?}: {argv:?}"
+            );
         }
     }
 
