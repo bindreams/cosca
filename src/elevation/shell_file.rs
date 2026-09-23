@@ -41,13 +41,93 @@ pub(crate) fn reject_shell_rewrite(program: &Path) -> Result<(), Error> {
         None
     };
     match detail {
-        Some(detail) => Err(Error::Unsupported {
-            op: format!("elevating {}", program.display()),
-            platform: "windows",
-            detail: detail.into(),
-        }),
+        Some(detail) => Err(unsupported(program, detail)),
         None => Ok(()),
     }
+}
+
+fn unsupported(program: &Path, detail: &str) -> Error {
+    Error::Unsupported {
+        op: format!("elevating {}", program.display()),
+        platform: "windows",
+        detail: detail.into(),
+    }
+}
+
+/// Refuse an elevated token whose final component does not end, case-insensitively, in `.exe` or
+/// `.com`. ShellExecuteEx completes a token by LOOKUP — `PathResolveW` with
+/// `PRF_TRYPROGRAMEXTENSIONS` for a bare name and `PathFileExistsDefExtW` for one with a directory
+/// (Wine and ReactOS `SHELL_FindExecutable`), both trying `.bat` and `.cmd` — and dispatches any
+/// other extension through its association. A string rule, so it needs no resolution.
+pub(crate) fn reject_non_image(program: &Path) -> Result<(), Error> {
+    let lower = program.as_os_str().to_string_lossy().to_ascii_lowercase();
+    if lower.ends_with(".exe") || lower.ends_with(".com") {
+        return Ok(());
+    }
+    Err(unsupported(
+        program,
+        "an elevated program must name its image, ending in .exe or .com: ShellExecuteEx completes \
+         any other token by lookup, which can reach a .bat, and dispatches other extensions through \
+         their association",
+    ))
+}
+
+/// What one `App Paths` subkey holds, as [`reject_app_path`] needs it.
+#[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum AppPath {
+    /// No such key, or no default value in it.
+    Absent,
+    /// The default value, unexpanded.
+    Target(std::ffi::OsString),
+    /// Present but not readable as a string: access denied, or another value type.
+    Unreadable,
+}
+
+/// The subkeys of `Software\Microsoft\Windows\CurrentVersion\App Paths` shell32 opens for
+/// `program`: the token as given, then with `.exe` appended (Wine `shlexec.c` `SHELL_TryAppPathW`
+/// appends on any miss; ReactOS only when there is no extension). The token is appended whole, so a
+/// token with a directory opens a nested key.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn app_paths_subkeys(program: &std::ffi::OsStr) -> [std::ffi::OsString; 2] {
+    let mut with_exe = program.to_os_string();
+    with_exe.push(".exe");
+    [program.to_os_string(), with_exe]
+}
+
+/// Refuse `program` unless every `App Paths` registration shell32 would consult for it names an
+/// image. `SHELL_FindExecutable` asks App Paths FIRST — before any file-exists check, and for any
+/// token, bare or not (Wine `shlexec.c:624`; ReactOS `shlexec.cpp:1066`, reached for an `.exe`
+/// once the direct launch at `:2534` fails) — and runs the registered target in place of the
+/// token. So `foo.exe` registered to `C:\x\setup.bat` runs the batch file.
+///
+/// `registered` is what each hive holds at each of [`app_paths_subkeys`]. A target must be one
+/// path, optionally in one pair of quotes, with no `%` (a `REG_EXPAND_SZ` may be expanded), ending
+/// in `.exe` or `.com`; anything unreadable is refused.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn reject_app_path(program: &Path, registered: &[AppPath]) -> Result<(), Error> {
+    for entry in registered {
+        let acceptable = match entry {
+            AppPath::Absent => true,
+            AppPath::Unreadable => false,
+            AppPath::Target(target) => {
+                let target = target.to_string_lossy();
+                let bare = target
+                    .strip_prefix('"')
+                    .and_then(|t| t.strip_suffix('"'))
+                    .unwrap_or(&target);
+                !bare.contains(['"', '%']) && reject_non_image(Path::new(bare)).is_ok()
+            }
+        };
+        if !acceptable {
+            return Err(unsupported(
+                program,
+                "an App Paths registration for this name runs something that is not an .exe or .com \
+                 image, and ShellExecuteEx consults it before the file; name the executable by its path",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether the text before the first `:` is two or more UTF-16 units with no separator in it.

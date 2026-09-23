@@ -214,8 +214,13 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+};
 use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
@@ -225,6 +230,7 @@ use crate::child::spawn::windows_raw::RawChild;
 use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
+use crate::elevation::shell_file::{self, AppPath};
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
@@ -243,11 +249,10 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 ///   elevated program acts on.
 ///
 /// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
-/// closes the interior-NUL divergence between the elevated and unelevated paths. A separate
-/// divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse — both by an
-/// extension this gate never sees (PATHEXT completion of an extension-less token) and by other
-/// registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). Neither is closed
-/// here; the image allowlist in [`plan_runas`] closes both.
+/// closes the interior-NUL divergence between the elevated and unelevated paths. `ShellExecuteEx`
+/// RESOLVING a program `CreateProcessW` would refuse — completing an extension-less token, or
+/// dispatching `.lnk`, `.vbs`, `.msc`, … through an association — is closed by the gates in
+/// `plan_runas`, not here.
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -367,6 +372,53 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
     Ok(OsString::from_wide(&crate::quote::windows::join_wide(&tail_refs)))
 }
 
+/// The default value of `hive\Software\Microsoft\Windows\CurrentVersion\App Paths\<subkey>`,
+/// unexpanded, as `shell_file::reject_app_path` judges it. A missing key or default value is
+/// [`AppPath::Absent`]; any other failure, or a value that is not a string, is
+/// [`AppPath::Unreadable`]. Read through the process's own registry view, which is the one
+/// in-process shell32 reads.
+fn app_path(hive: HKEY, subkey: &OsStr) -> AppPath {
+    let key: Vec<u16> = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\App Paths\")
+        .encode_wide()
+        .chain(subkey.encode_wide())
+        .chain([0])
+        .collect();
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    let mut data: Vec<u16> = Vec::new();
+    loop {
+        let mut bytes = u32::try_from(data.len() * 2).expect("a registry value fits in u32 bytes");
+        let buffer = (!data.is_empty()).then(|| data.as_mut_ptr().cast());
+        // SAFETY: `key` is NUL-terminated and outlives the call; `buffer`, when given, points at
+        // `bytes` writable bytes of `data`.
+        let rc = unsafe {
+            RegGetValueW(
+                hive,
+                PCWSTR(key.as_ptr()),
+                PCWSTR::null(),
+                flags,
+                None,
+                buffer,
+                Some(&mut bytes),
+            )
+        };
+        if rc == ERROR_FILE_NOT_FOUND {
+            return AppPath::Absent;
+        }
+        match (rc, buffer) {
+            (ERROR_SUCCESS, Some(_)) => {
+                data.truncate(bytes as usize / 2);
+                while data.last() == Some(&0) {
+                    data.pop();
+                }
+                return AppPath::Target(OsString::from_wide(&data));
+            }
+            // Sized, or grown since it was sized: size to what it reports and read again.
+            (ERROR_SUCCESS | ERROR_MORE_DATA, _) => data = vec![0; (bytes as usize).div_ceil(2).max(1)],
+            _ => return AppPath::Unreadable,
+        }
+    }
+}
+
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
 pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
     launch_runas_with_host(cmd, &Host::detect())
@@ -444,16 +496,26 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // the token to — trailing dots and spaces, `..` collapse, drive and UNC and device roots, and
     // data-stream pieces.
     //
-    // What stays open is what `ShellExecuteEx` finds by LOOKUP rather than by reading the token,
-    // which `wide_nul`'s doc also names: default-extension completion of a token without one
-    // (`PathFileExistsDefExtW`/`PathResolveW` try `.bat` and `.cmd`, for a path with a directory
-    // too), an App Paths registration of a bare name, and the other registered `runas`
-    // associations. Each lands in a later PR: resolution makes the completion ours
-    // (`resolve_executable_in` never reads PATHEXT), and an extension allowlist covers the
-    // associations.
-    crate::elevation::shell_file::reject_shell_rewrite(std::path::Path::new(&program))?;
-    crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
-    crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
+    // Then what `ShellExecuteEx` finds by LOOKUP. A token must end in `.exe` or `.com`, so no
+    // extension is completed (`PathResolveW`/`PathFileExistsDefExtW` try `.bat` and `.cmd`) and no
+    // other association runs; and every App Paths registration shell32 would consult for it, in
+    // either hive, must name an `.exe` or `.com` too.
+    //
+    // What stays open: an App Paths key written between this check and the launch, which can still
+    // redirect to a batch file (HKCU is writable by the user); and WHICH image a relative token
+    // loads — the search in `lpDirectory` and on the path, and ReactOS's substitution of the drive
+    // root or Windows directory for a missing `lpDirectory` — which is always an `.exe` or `.com`,
+    // though not necessarily the one meant, until the image is resolved before the launch (#139).
+    let program_path = std::path::Path::new(&program);
+    shell_file::reject_shell_rewrite(program_path)?;
+    crate::child::spawn::reject_batch_path(program_path)?;
+    crate::child::spawn::reject_normalised_batch_path(program_path)?;
+    shell_file::reject_non_image(program_path)?;
+    let registered: Vec<AppPath> = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER]
+        .into_iter()
+        .flat_map(|hive| shell_file::app_paths_subkeys(&program).map(|subkey| app_path(hive, &subkey)))
+        .collect();
+    shell_file::reject_app_path(program_path, &registered)?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),

@@ -49,7 +49,7 @@ fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
 #[test]
 fn piped_stdio_is_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args(["whoami.exe"]).elevate();
     c.stdout(Stdio::pipe()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 }
@@ -57,12 +57,12 @@ fn piped_stdio_is_unsupported() {
 #[test]
 fn null_and_merge_stdio_are_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args(["whoami.exe"]).elevate();
     c.stdin(Stdio::null()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 
     let mut c2 = Command::new();
-    c2.args(["whoami"]).elevate();
+    c2.args(["whoami.exe"]).elevate();
     c2.stderr(Stdio::merge(crate::stdio::Fd::STDOUT)).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
@@ -70,7 +70,7 @@ fn null_and_merge_stdio_are_unsupported() {
 #[test]
 fn high_fd_is_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args(["whoami.exe"]).elevate();
     c.fd(3, Stdio::pipe_out()).unwrap();
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 }
@@ -78,18 +78,18 @@ fn high_fd_is_unsupported() {
 #[test]
 fn env_and_contain_are_unsupported() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().env("FOO", "bar");
+    c.args(["whoami.exe"]).elevate().env("FOO", "bar");
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 
     let mut c2 = Command::new();
-    c2.args(["whoami"]).elevate().contain();
+    c2.args(["whoami.exe"]).elevate().contain();
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
 
 #[test]
 fn inherit_only_is_accepted() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args(["whoami.exe"]).elevate();
     c.stdout(Stdio::inherit()).unwrap();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
@@ -126,7 +126,7 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
     // already-elevated short-circuit, so the verdict is identical for elevated=false/true.
     for elevated in [false, true] {
         let mut c = Command::new();
-        c.args(["whoami"]).elevate();
+        c.args(["whoami.exe"]).elevate();
         c.stdout(Stdio::pipe()).unwrap();
         assert!(
             is_unsupported(super::plan_runas(&c, &win_host(elevated))),
@@ -208,7 +208,7 @@ fn already_elevated_inherit_only_is_run_as_is() {
     // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
     // passes the gate and short-circuits (no ShellExecuteEx).
     let mut c = Command::new();
-    c.args(["whoami"]).elevate();
+    c.args(["whoami.exe"]).elevate();
     assert!(matches!(
         super::plan_runas(&c, &win_host(true)),
         Ok(super::RunasStep::AlreadyElevated)
@@ -377,7 +377,7 @@ fn runas_shows_the_window_by_default() {
 #[test]
 fn elevation_rejects_raw_creation_flags() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().creation_flags(0x0000_0040);
+    c.args(["whoami.exe"]).elevate().creation_flags(0x0000_0040);
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
@@ -385,14 +385,14 @@ fn elevation_rejects_raw_creation_flags() {
 #[test]
 fn elevation_accepts_a_zero_creation_flags_word() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().creation_flags(0);
+    c.args(["whoami.exe"]).elevate().creation_flags(0);
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
 #[test]
 fn elevation_rejects_detached() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().detached();
+    c.args(["whoami.exe"]).elevate().detached();
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
@@ -400,7 +400,7 @@ fn elevation_rejects_detached() {
 #[test]
 fn elevation_rejects_breakaway() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().breakaway_from_job();
+    c.args(["whoami.exe"]).elevate().breakaway_from_job();
     let detail = unsupported_detail(super::reject_unsupported_config(&c));
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
@@ -411,7 +411,7 @@ fn elevation_rejects_breakaway() {
 #[test]
 fn elevation_accepts_no_window() {
     let mut c = Command::new();
-    c.args(["whoami"]).elevate().no_window();
+    c.args(["whoami.exe"]).elevate().no_window();
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
@@ -610,6 +610,44 @@ fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_
                 "elevated={elevated}, {probe:?}: {detail}"
             );
         }
+    }
+}
+
+/// A token ShellExecuteEx would complete by lookup is refused: an extension-less one can become
+/// `setup.bat` (`PathResolveW` with `PRF_TRYPROGRAMEXTENSIONS`), and any other extension runs
+/// through its association.
+#[test]
+fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
+    for elevated in [false, true] {
+        for probe in [
+            r"C:\tools\setup",
+            "setup",
+            "setup.lnk",
+            "setup.msc",
+            r"C:\tools\setup.exe.",
+        ] {
+            let mut c = Command::new();
+            c.args([probe, "a&calc"]).elevate();
+            assert!(
+                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                "elevated={elevated}: {probe:?} may be completed or dispatched by ShellExecuteEx"
+            );
+        }
+    }
+}
+
+/// The App Paths reader reports a key nobody registered as absent, in both hives. Read-only.
+#[test]
+fn an_unregistered_app_path_reads_as_absent() {
+    let subkey = std::ffi::OsString::from(format!("cosca-unregistered-{}.exe", std::process::id()));
+    for hive in [
+        windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        windows::Win32::System::Registry::HKEY_CURRENT_USER,
+    ] {
+        assert!(matches!(
+            super::app_path(hive, &subkey),
+            crate::elevation::shell_file::AppPath::Absent
+        ));
     }
 }
 

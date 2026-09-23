@@ -88,3 +88,95 @@ fn a_plain_path_passes() {
         );
     }
 }
+
+/// ShellExecuteEx completes an extension-less token by lookup (`PathResolveW` with
+/// `PRF_TRYPROGRAMEXTENSIONS`, `PathFileExistsDefExtW`), trying `.bat` and `.cmd` among others, so
+/// the elevated path takes only a token that already names an image.
+#[test]
+fn an_elevated_token_must_end_in_exe_or_com() {
+    for token in [
+        r"C:\tools\setup.exe",
+        "setup.COM",
+        "x.EXE",
+        r"\\server\share\x.exe",
+        "a.b.exe",
+    ] {
+        assert!(
+            super::reject_non_image(Path::new(token)).is_ok(),
+            "{token:?} names an image"
+        );
+    }
+    for token in [
+        r"C:\tools\setup",
+        "setup",
+        "setup.bat",
+        "setup.cmd",
+        "setup.lnk",
+        "setup.msc",
+        "setup.exe.",
+        "setup.exe ",
+        "setup.exe:s",
+        r"C:\tools\",
+        r"C:\tools\setup.exe\",
+        "",
+    ] {
+        assert!(
+            matches!(
+                super::reject_non_image(Path::new(token)),
+                Err(Error::Unsupported { .. })
+            ),
+            "{token:?} does not end in .exe or .com"
+        );
+    }
+}
+
+/// The subkeys shell32 opens under `App Paths`: the token, then the token with `.exe` appended
+/// (Wine appends unconditionally on a miss).
+#[test]
+fn app_paths_subkeys_are_the_token_and_the_token_plus_exe() {
+    assert_eq!(
+        super::app_paths_subkeys(std::ffi::OsStr::new(r"C:\tools\foo.exe")),
+        [
+            std::ffi::OsString::from(r"C:\tools\foo.exe"),
+            std::ffi::OsString::from(r"C:\tools\foo.exe.exe")
+        ]
+    );
+}
+
+#[test]
+fn an_app_paths_registration_must_name_an_image() {
+    use super::AppPath::{Absent, Target, Unreadable};
+    let token = Path::new("foo.exe");
+    let target = |s: &str| Target(std::ffi::OsString::from(s));
+    for registered in [
+        vec![Absent, Absent],
+        vec![target(r"C:\Program Files\Foo\foo.exe"), Absent],
+        vec![Absent, target(r#""C:\Program Files\Foo\foo.exe""#)],
+        vec![target(r"C:\Foo\FOO.COM")],
+    ] {
+        assert!(
+            super::reject_app_path(token, &registered).is_ok(),
+            "{registered:?} runs an image"
+        );
+    }
+    for registered in [
+        vec![target(r"C:\Foo\setup.bat"), Absent],
+        vec![Absent, target(r"C:\Foo\setup.cmd")],
+        vec![target(r"C:\Foo\setup")],
+        vec![target(r"%ProgramFiles%\Foo\foo.exe")],
+        vec![target(r"C:\Foo\foo.exe.")],
+        vec![target(r#""C:\Foo\foo.exe" x"#)],
+        vec![target(r#"C:\Foo\f"o.exe"#)],
+        vec![target("")],
+        vec![Unreadable],
+        vec![target(r"C:\Foo\foo.exe"), Unreadable],
+    ] {
+        assert!(
+            matches!(
+                super::reject_app_path(token, &registered),
+                Err(Error::Unsupported { .. })
+            ),
+            "{registered:?} may run something other than an image"
+        );
+    }
+}
