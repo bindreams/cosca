@@ -25,6 +25,7 @@ fn absolute_names_by_grammar() {
         // eight bytes and so reads a share-less UNC there; cosca follows NT, which is what opens the
         // path, and its own join, which reads the namespace.
         (r"\\?\UNC/srv", true, true),
+        (r"\\?\UNC/srv\tool.exe", true, true),
         (r"\\srv", true, false),
         (r"\t\tool", true, false),
         ("C:tool", true, false),
@@ -477,4 +478,17 @@ fn a_verbatim_search_directory_is_taken_as_written() {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}"),
         other => panic!("nothing is on disk there, got {other:?}"),
     }
+}
+
+/// `UNC` marks a verbatim UNC prefix only before `\`, as NT reads it: after `UNC/` the prefix is
+/// the namespace `\\?\UNC`, split on either separator as every prefix component is here, and
+/// `tool.exe` is a file in it rather than a share.
+#[test]
+fn a_verbatim_unc_marker_needs_a_backslash() {
+    assert_eq!(
+        windows_prefix_len(br"\\?\UNC\srv\shr\tool.exe"),
+        r"\\?\UNC\srv\shr".len()
+    );
+    assert_eq!(windows_prefix_len(br"\\?\UNC/srv\tool.exe"), r"\\?\UNC".len());
+    assert_eq!(windows_prefix_len(br"\\?\UNC/srv"), r"\\?\UNC".len());
 }

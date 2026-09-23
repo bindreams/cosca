@@ -322,6 +322,11 @@ fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
 /// Two `std` rules ARE followed, because they decide whether a prefix is present rather than how
 /// its components are split: the `\\?\` marker must be spelt with literal backslashes (a `/` among
 /// those four bytes means no verbatim prefix), and `\\server` with no share is no prefix at all.
+///
+/// The `UNC` marker is NT's, not `std`'s: it marks a UNC path only before `\`, since NT does not
+/// read `/` as a separator after `\\?\`. So `\\?\UNC/srv\tool.exe` is the namespace `\\?\UNC`
+/// holding `srv\tool.exe`, not a share. `std` rewrites `/` to `\` in the first eight bytes and would
+/// read a share there. The share-less gate and [`join`] read the marker the same way.
 fn windows_prefix_len(bytes: &[u8]) -> usize {
     if !(bytes.len() >= 2 && is_sep(bytes[0], true) && is_sep(bytes[1], true)) {
         // A separator in slot 0 is never a drive: `\:x` is rooted.
@@ -339,7 +344,7 @@ fn windows_prefix_len(bytes: &[u8]) -> usize {
     };
     if bytes.len() >= 4 && bytes[2] == b'?' && is_sep(bytes[3], true) && !bytes[..4].contains(&b'/') {
         // `\\?\UNC\server\share`: server and share belong to the prefix, as they do without it.
-        if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && is_sep(bytes[7], true) {
+        if bytes.len() >= 8 && bytes[4..7].eq_ignore_ascii_case(b"UNC") && bytes[7] == b'\\' {
             let server = component(8);
             if server >= bytes.len() {
                 return bytes.len();

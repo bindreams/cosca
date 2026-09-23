@@ -1129,9 +1129,6 @@ fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
         r"\\?\C:",
         r"\\?\C:\",
         r"\\?\UNC\server\share",
-        // `std` matches the `UNC\` marker through the same `/`-for-`\` normalisation it applies
-        // to the rest of a prefix, so this is a share root too.
-        r"\\?\UNC/server\share",
         r"\\?\GLOBALROOT",
         r"\\.\pipe",
         r"\\",
@@ -1154,6 +1151,12 @@ fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string()
         (r"\\?\UNC\srv/shr/a", "a"),
         (r"\\?\ns/a", "a"),
         (r"\\?\GLOBALROOT/Device/X/tool.exe", "tool.exe"),
+        // `UNC` marks a UNC path only before `\`, as NT reads it, so these are the namespace
+        // `UNC` and the names after it, not a share root. std's `parse_prefix` rewrites `/` to `\`
+        // in the first eight bytes and would read a share root.
+        (r"\\?\UNC/srv\tool.exe", "tool.exe"),
+        (r"\\?\UNC/server\share", "share"),
+        (r"\\?\UNC/srv/shr", "shr"),
     ] {
         let got = final_component(OsStr::new(n), true);
         assert_eq!(got, want.as_bytes(), "{n:?} -> {:?}", String::from_utf8_lossy(got));
@@ -1162,13 +1165,7 @@ fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string()
     // The other half of the same rule, so widening the separator set cannot be "fixed" by dropping
     // the prefix parse: a share root is still a root however its halves are spelt, and
     // `PureWindowsPath` names nothing for any of these either.
-    for n in [
-        r"\\?\UNC\srv/shr",
-        r"\\?\UNC/srv/shr",
-        r"\\?\UNC\srv\shr",
-        r"\\?\ns",
-        r"\\?\GLOBALROOT",
-    ] {
+    for n in [r"\\?\UNC\srv/shr", r"\\?\UNC\srv\shr", r"\\?\ns", r"\\?\GLOBALROOT"] {
         assert!(names_no_file(OsStr::new(n), true), "{n:?} names no file");
     }
 }
