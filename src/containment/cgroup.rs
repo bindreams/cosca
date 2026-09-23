@@ -979,19 +979,20 @@ impl CgroupLeaf {
             .unwrap_or(false)
     }
 
-    /// Fail a spawn whose membership cannot be decided: kill the child, which ends its chance to
-    /// enter the leaf and makes its report final.
+    /// Fail a spawn whose membership cannot be decided: kill the child as a group, which ends its
+    /// chance to enter the leaf and makes its report final, then apply the module's report
+    /// contract — kill through the leaf only on `Placed`.
     ///
-    /// Only a `Placed` report lets anything of the child's into the leaf: the report is sent
-    /// before `exec`, so a child killed without sending it never ran a program that could fork. So
-    /// the leaf is killed through only then. Otherwise whatever occupies it is not cosca's, and a
-    /// degrade never kills.
+    /// The group, not only the pid: between the last look at the report and the kill, the child
+    /// can report, exec and fork, and its descendants start in its process group, outside the
+    /// leaf. The pid too: a child killed before its own `setpgid` leads no group yet.
     ///
     /// There is no pidfd here — its failure is why the verdict is undecidable — so the child is
-    /// signalled by pid. That is sound only while `pid` is this process's own unreaped child
-    /// (see [`Command::contain`](crate::Command::contain)): a reaper elsewhere in the process
-    /// could free the number for reuse. A child already reaped is detected and never signalled,
-    /// but one reaped between that check and the `kill` is not.
+    /// signalled by number. That is sound while `pid` is this process's own unreaped child (see
+    /// [`Command::contain`](crate::Command::contain)): the kernel does not reuse a pid, nor so a
+    /// process-group id, while any task holds it, and the unreaped child does. A child something
+    /// else already reaped is detected and never signalled; one reaped between that check and the
+    /// kill — only possible when the precondition is broken — is not.
     fn abandon(&mut self, pid: u32, channel: &mut ReportChannel, why: &str) -> crate::error::Error {
         use nix::sys::wait::{waitid, Id, WaitPidFlag};
 
@@ -1011,41 +1012,35 @@ impl CgroupLeaf {
             ours,
             "{child} is not an unreaped child of this process: something else reaped it"
         );
-        if !ours {
-            // Reaped, so it has exited and its report is final — but its number may already be
-            // another process's, so it is not signalled.
-            self.entered = channel.read_final() == PlacementReport::Placed;
-            return crate::error::Error::Containment {
-                detail: format!(
-                    "cannot tell whether child {pid} entered its cgroup leaf: {why}; the child was \
-                     already reaped by something else in this process, so it was not signalled"
-                ),
-            };
-        }
-        let _ = kill(child, Signal::SIGKILL);
-        // Its exit, not its reaping: the spawn's error path reaps it.
-        while let Err(nix::errno::Errno::EINTR) = waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {}
+        let fate = if ours {
+            let _ = kill(child, Signal::SIGKILL);
+            // The child leads its group; the unreaped child holds the group's id.
+            let _ = nix::sys::signal::killpg(child, Signal::SIGKILL);
+            // Its exit, not its reaping: the spawn's error path reaps it.
+            while let Err(nix::errno::Errno::EINTR) =
+                waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+            {}
+            "the child and its process group were killed"
+        } else {
+            // Reaped, so it has exited — but its number may already be another process's.
+            "the child was already reaped by something else in this process, so it was not signalled"
+        };
         // The child has exited, so its report is final.
         self.entered = channel.read_final() == PlacementReport::Placed;
-        let kill = if self.entered {
-            let kill = self.hard_kill();
-            // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
-            if kill.is_ok() {
-                let _ = self.wait_drained(None);
+        let leaf = if self.entered {
+            match self.hard_kill() {
+                Ok(()) => {
+                    // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
+                    let _ = self.wait_drained(None);
+                    "its leaf was killed through".to_string()
+                }
+                Err(e) => format!("killing through its leaf failed ({e})"),
             }
-            Some(kill)
         } else {
-            None
+            "it had not entered its leaf".to_string()
         };
         crate::error::Error::Containment {
-            detail: format!(
-                "cannot tell whether child {pid} entered its cgroup leaf: {why}; the child was killed{}",
-                match kill {
-                    None => ", and it had not entered the leaf".to_string(),
-                    Some(Ok(())) => ", and its leaf killed through".to_string(),
-                    Some(Err(e)) => format!(", but killing through its leaf failed ({e})"),
-                }
-            ),
+            detail: format!("cannot tell whether child {pid} entered its cgroup leaf: {why}; {fate}, and {leaf}"),
         }
     }
 

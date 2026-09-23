@@ -1606,7 +1606,7 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
                 Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
             }
         };
-        assert!(err.to_string().contains("the child was killed"), "got {err}");
+        assert!(err.to_string().contains("the child and its process group were killed"), "got {err}");
         assert_eq!(
             child.wait().expect("reap the child").signal(),
             Some(libc::SIGKILL),
@@ -1896,4 +1896,43 @@ fn cgroup_drop_kills_through_an_occupied_leaf_whose_report_is_in_flight() {
         "the occupant must be killed through the leaf"
     );
     assert!(!leaf_path.exists(), "the leaf must be removed");
+}
+
+/// A child cosca gives up on is killed as a group: between the last look at its report and the
+/// kill it can report, exec, and fork, and what it forks is in its process group, not the leaf.
+/// Each process in the tree holds the child's stdout, so reading it to EOF proves all are dead.
+/// A regression hangs this test on the read.
+#[cfg(target_os = "linux")]
+#[test]
+fn abandon_kills_the_childs_whole_process_group() {
+    use std::io::{BufRead, Read};
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandon-group");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    // The child leads its own group, as a contained child does, and forks a descendant into it.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 300 & echo forked; wait"])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read the child's line");
+    assert_eq!(
+        line, "forked\n",
+        "the descendant must exist before the child is given up on"
+    );
+
+    super::fault::set_force_pidfd_failure(true);
+    assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
+    let mut rest = Vec::new();
+    stdout
+        .read_to_end(&mut rest)
+        .expect("read to EOF: every process holding stdout is dead");
+    child.wait().expect("reap the child");
 }
