@@ -1,8 +1,10 @@
 //! macOS graphical elevation: the `osascript … with administrator privileges`
 //! effect path for [`Auth::Gui`](super::Auth::Gui).
 //!
-//! Everything here is PURE — no syscalls, no `cfg!` — so the whole module is
-//! compiled and unit-tested on every platform, exactly like [`super::plan`].
+//! Everything here is PURE — no `cfg!`, and no syscalls beyond reading this process's cwd for a
+//! relative `raw_executable()` with no absolute `current_dir()` (see
+//! [`program_and_args`]) — so the whole module is compiled and unit-tested on every
+//! platform, exactly like [`super::plan`].
 //!
 //! # The two quoting layers
 //!
@@ -18,10 +20,10 @@
 //! [`wrap_do_shell_script`].
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::{ElevatedStdio, ElevatedVia, ElevationReport};
-use crate::command::{Command, CommandInput};
+use super::{ElevatedStdio, ElevatedVia, ElevationReport, Launch};
+use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -82,18 +84,21 @@ fn is_posix_absolute(s: &OsStr) -> Result<bool, Error> {
 /// authorization trampoline.
 ///
 /// Requiring the cwd to be absolute makes osascript's directory and the script's
-/// `cd --` resolve the same PATH. It does not make them resolve the same OUTCOME:
+/// `cd -P --` resolve the same PATH. `-P` makes the `cd` read it as the kernel's `chdir` does —
+/// osascript's own cwd, and the unelevated spawn's: a shell's default logical `cd` takes
+/// `link/..` to the directory holding `link`, not to the parent of its target, and would run a
+/// different `./tool`. It does not make them resolve the same OUTCOME:
 /// the `cd` runs as root on the far side of the trampoline, so a directory the
 /// caller can traverse but root cannot (NFS `root_squash`) fails there, `&&`
 /// short-circuits, and the payload never runs. That surfaces as a bare non-zero
 /// exit, since [`ElevatedStdio::OsascriptRelay`] never relays the payload's stderr.
 ///
-/// Precondition: `program` and `cwd` are POSIX-absolute — enforced by
-/// [`reject_structural_gui_config`].
+/// Precondition: `cwd` is POSIX-absolute, and so is `program` unless `cwd` is set — enforced by
+/// [`reject_structural_gui_config`] and [`program_and_args`].
 pub(crate) fn build_shell_command(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> Result<Vec<u8>, Error> {
     debug_assert!(
-        matches!(is_posix_absolute(program), Ok(true)),
-        "the structural gate must reject a non-absolute program before composition"
+        cwd.is_some() || matches!(is_posix_absolute(program), Ok(true)),
+        "a relative program needs the directory it is read against"
     );
     debug_assert!(
         cwd.is_none_or(|d| matches!(is_posix_absolute(d.as_os_str()), Ok(true))),
@@ -107,7 +112,7 @@ pub(crate) fn build_shell_command(program: &OsStr, args: &[OsString], cwd: Optio
 
     let mut out = Vec::new();
     if let Some(dir) = cwd {
-        out.extend_from_slice(b"cd -- ");
+        out.extend_from_slice(b"cd -P -- ");
         out.extend_from_slice(&crate::quote::posix::quote(os_bytes(dir.as_os_str())?));
         out.extend_from_slice(b" && ");
     }
@@ -158,49 +163,53 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
     Ok(script)
 }
 
-/// Program + args, honoring `executable()`. `exec`ing the program sets argv[0] to
-/// its own path, so an argv[0] distinct from a set `executable()` cannot survive.
-pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
-    // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
-    // `Argv(vec![])`, so folding it into the commandline arm would answer "no
-    // program set" with a message about re-quoting a command line.
-    let argv = match cmd.input() {
-        CommandInput::Argv(argv) => argv,
-        CommandInput::Empty => {
-            return Err(unsupported(
-                "macOS graphical elevation of an empty command",
-                "set a program via .args([...]) before .elevate()".into(),
-            ))
+/// The argv, refused unless it is one `do shell script` can exec. `exec`ing the program sets
+/// argv[0] to its own path, so an argv[0] distinct from a set `executable()` cannot survive.
+fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
+    super::elevation_argv(
+        cmd,
+        &super::ArgvRefusals {
+            platform: "macos",
+            op_prefix: "macOS graphical elevation",
+            commandline: "the command must be an argv (set .args([...])); a raw command line cannot be \
+                          re-quoted for /bin/sh without guessing its word boundaries",
+            argv0: "`do shell script` execs the program, which sets argv[0] to its own path; a separate \
+                    argv[0] cannot survive elevation",
+        },
+    )
+}
+
+/// Program + args + the directory to run them in, honoring `executable()`. A `raw_executable()`
+/// program comes back as [`crate::resolve::exact::enter_posix`] gives it: the absolute
+/// directory the script `cd`s to, reading `process_cwd` at most once, and the name to exec there.
+///
+/// The directory itself is still a path, because root's shell starts wherever the trampoline
+/// puts it: a rename of one of its ancestors between this call and the `cd` — a window that spans
+/// authentication — moves both the file and the directory together. Nothing can change the file
+/// between the `cd` and the exec.
+pub(crate) fn program_and_args(
+    cmd: &Command,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Launch, Error> {
+    let argv = checked_argv(cmd)?;
+    let as_given = || cmd.cwd().map(Path::to_path_buf);
+    let (program, cwd) = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) => {
+            let entered = crate::resolve::exact::enter_posix(
+                p.as_os_str(),
+                cmd.cwd(),
+                crate::command::explain_cwd_read(process_cwd),
+            )?;
+            (entered.program, entered.dir)
         }
-        CommandInput::CommandLine(_) => {
-            return Err(unsupported(
-                "macOS graphical elevation of a commandline() command",
-                "the command must be an argv (set .args([...])); a raw command line cannot be \
-                 re-quoted for /bin/sh without guessing its word boundaries"
-                    .into(),
-            ))
-        }
+        Some(crate::command::ExecutableSpec::Search(p)) => (p.clone(), as_given()),
+        None => (PathBuf::from(&argv[0]), as_given()),
     };
-    let Some(first) = argv.first() else {
-        return Err(unsupported(
-            "macOS graphical elevation of an empty command",
-            "set a program via .args([...]) before .elevate()".into(),
-        ));
-    };
-    match cmd.executable_path() {
-        Some(exe) => {
-            if first.as_os_str() != exe.as_os_str() {
-                return Err(unsupported(
-                    "macOS graphical elevation with an argv[0] distinct from executable()",
-                    "`do shell script` execs the program, which sets argv[0] to its own path; \
-                     a separate argv[0] cannot survive elevation"
-                        .into(),
-                ));
-            }
-            Ok((exe.as_os_str().to_os_string(), argv[1..].to_vec()))
-        }
-        None => Ok((first.clone(), argv[1..].to_vec())),
-    }
+    Ok(Launch {
+        program: program.into_os_string(),
+        args: argv[1..].to_vec(),
+        cwd,
+    })
 }
 
 /// The honest capability matrix for macOS graphical elevation. Every rejection below
@@ -211,24 +220,12 @@ pub(crate) fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>
 /// and `Error::Quote(NonUtf8)` for a program or directory with no byte form
 /// (reachable only off-unix, where an `OsStr` is WTF-16). Both are typed; neither is
 /// a panic.
+/// Reads nothing: an already-root caller runs no osascript, and needs no path to its cwd.
 pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
-    let (program, _) = program_and_args(cmd)?;
-    // root's /bin/sh resolves a bare name against ITS OWN PATH, so a relative
-    // program would let the environment choose which binary runs as root. The crate
-    // closes the same hole for its POSIX backends by carrying absolute paths.
-    if !is_posix_absolute(&program)? {
-        return Err(unsupported(
-            "macOS graphical elevation of a non-absolute program",
-            format!(
-                "{program:?} would be resolved by the elevated shell's own PATH, not the caller's, \
-                 so the binary that runs as root is not the one you selected; pass an absolute path"
-            ),
-        ));
-    }
-    // Same hole, for the directory. The caller's cwd is applied twice — to osascript,
-    // and as `cd --` inside the script — and the trampoline does not carry a cwd
-    // across, so a RELATIVE path resolves against two different bases and the two
-    // silently disagree. Absolute makes them name the same directory.
+    // The caller's cwd is applied twice — to osascript, and as `cd -P --` inside the
+    // script — and the trampoline does not carry a cwd across, so a RELATIVE path
+    // resolves against two different bases and the two silently disagree. Absolute
+    // makes them name the same directory.
     if let Some(dir) = cmd.cwd() {
         if !is_posix_absolute(dir.as_os_str())? {
             return Err(unsupported(
@@ -237,6 +234,30 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
                     "{dir:?} would resolve against this process's directory for osascript but \
                      against whatever the authorization trampoline hands the elevated shell for \
                      the command itself; pass an absolute path"
+                ),
+            ));
+        }
+    }
+    let argv = checked_argv(cmd)?;
+    // A `raw_executable()` program is completed to an absolute path at build time, so only its
+    // shape can be judged here.
+    let program = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) => {
+            crate::resolve::exact::refuse_unnameable(p.as_os_str())?;
+            None
+        }
+        _ => Some(cmd.executable_path().map_or(argv[0].as_os_str(), |p| p.as_os_str())),
+    };
+    // root's /bin/sh resolves a bare name against ITS OWN PATH, so a relative
+    // program would let the environment choose which binary runs as root. The crate
+    // closes the same hole for its POSIX backends by carrying absolute paths.
+    if let Some(program) = program {
+        if !is_posix_absolute(program)? {
+            return Err(unsupported(
+                "macOS graphical elevation of a non-absolute program",
+                format!(
+                    "{program:?} would be resolved by the elevated shell's own PATH, not the caller's, \
+                     so the binary that runs as root is not the one you selected; pass an absolute path"
                 ),
             ));
         }
@@ -296,12 +317,13 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
 /// 0-2 stdio is MOVED (`ResolvedStdio::File` is not `Clone`), matching the POSIX
 /// rewrite's contract.
 ///
-/// Precondition: [`reject_structural_gui_config`] has already passed, so the program
-/// and cwd are absolute, and there are no env ops and no containment. `kill_on_drop`
+/// Precondition: [`reject_structural_gui_config`] passed and `launch` is [`program_and_args`]'s,
+/// so the program and cwd are absolute, and there are no env ops and no containment. `kill_on_drop`
 /// is NOT gated (see that function), so it is transferred like the POSIX rewrite
 /// transfers it.
 pub(crate) fn build_rewrite(
     cmd: &mut Command,
+    launch: Launch,
     osascript: &Path,
     arg_max: Option<usize>,
 ) -> Result<(Command, ElevationReport), Error> {
@@ -320,8 +342,8 @@ pub(crate) fn build_rewrite(
         cmd.fds().keys().all(|s| s.raw() < 3),
         "reject_structural_gui_config must reject fd >= 3 before build_rewrite"
     );
-    let (program, args) = program_and_args(cmd)?;
-    let shell_command = build_shell_command(&program, &args, cmd.cwd())?;
+    let Launch { program, args, cwd } = launch;
+    let shell_command = build_shell_command(&program, &args, cwd.as_deref())?;
     let script = wrap_do_shell_script(&shell_command, arg_max)?;
 
     let mut derived = Command::new();
@@ -332,9 +354,9 @@ pub(crate) fn build_rewrite(
     ]);
     // The cwd is set on osascript AS WELL AS stated in the script: setting it here
     // turns a bogus directory into a precise spawn-time `Io` error instead of an
-    // opaque non-zero exit, and the script's `cd --` makes the payload's cwd
+    // opaque non-zero exit, and the script's `cd -P --` makes the payload's cwd
     // deterministic either way. The two name the same directory by construction.
-    if let Some(d) = cmd.cwd() {
+    if let Some(d) = cwd {
         derived.current_dir(d);
     }
     // kill_on_drop MUST be carried, exactly as `posix::transfer_process_attrs`

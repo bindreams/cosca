@@ -187,3 +187,198 @@ fn the_containment_marker_is_named_as_std_names_it() {
     let block = resolve::ChildEnv::capture(&snapshot, &ops).into_block().unwrap();
     assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0__cosca_group_root=1\0\0");
 }
+
+// `image_for`: the Search/Exact distinction, at the one site that applies it ────────────
+//
+// These run on the Windows CI runner rather than the host, because `image_for` is inside the
+// `cfg(windows)` raw backend — the `Exact` arm touches no Win32 API, but it cannot be compiled
+// off Windows to be reached.
+
+/// [`image_for`] against the `PATH` a spawn of `cmd` would give its child.
+fn image(cmd: &Command) -> Result<Option<PathBuf>, Error> {
+    image_for(cmd, spawn_env(cmd)?.path.as_deref())
+}
+
+#[test]
+fn image_for_leaves_an_exact_program_completely_unresolved() {
+    // The contract in one assertion: a BARE name, which `executable()` would look up on PATH and
+    // turn absolute (and would append `.exe` to), survives byte-for-byte.
+    let mut cmd = Command::new();
+    cmd.raw_executable("tool").args(["tool"]);
+    let image = image(&cmd).expect("an exact program is never resolved, so it cannot fail");
+    assert_eq!(
+        image.as_deref(),
+        Some(Path::new("tool")),
+        "raw_executable must reach lpApplicationName exactly as written"
+    );
+}
+
+/// The file [`fixture_load_exact_probe`] loads by relative name: a copy of this test binary.
+const PROBE: &str = "cosca_exact_cwd_probe.exe";
+const FIXTURE_LOAD_EXACT_PROBE_TEST: &str = "child::spawn::windows_raw::windows_raw_tests::fixture_load_exact_probe";
+/// The `current_dir()` [`fixture_load_exact_probe`] gives [`PROBE`]. Its presence also marks a
+/// deliberate re-exec rather than an ordinary suite run.
+const FIXTURE_LOAD_EXACT_PROBE_ENV: &str = "COSCA_FIXTURE_LOAD_EXACT_PROBE_CURRENT_DIR";
+/// [`fixture_load_exact_probe`]'s exit codes.
+const LOADED: i32 = 0;
+const FILE_NOT_FOUND: i32 = 20;
+const OTHER_FAILURE: i32 = 21;
+
+/// Inert in an ordinary suite run. Re-executed with [`FIXTURE_LOAD_EXACT_PROBE_ENV`] set, it
+/// spawns `raw_executable(PROBE)` with that `current_dir()` from whatever cwd its spawner gave it,
+/// and exits with [`LOADED`], [`FILE_NOT_FOUND`] or [`OTHER_FAILURE`]. The spawner sets the cwd,
+/// so no process in the test moves its own.
+#[test]
+fn fixture_load_exact_probe() {
+    let Some(current_dir) = std::env::var_os(FIXTURE_LOAD_EXACT_PROBE_ENV) else {
+        return;
+    };
+    let mut c = Command::new();
+    // A filter that matches nothing, so the probe exits 0 without running a test.
+    c.raw_executable(PROBE)
+        .args([PROBE, "--exact", "__cosca_no_such_test__"])
+        .current_dir(current_dir);
+    c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
+    assert_eq!(image(&c).expect("image_for").as_deref(), Some(Path::new(PROBE)));
+    let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    let code = match c.spawn() {
+        Ok(child) if child.wait().expect("wait").success() => LOADED,
+        Err(Error::Io(e))
+            if e.raw_os_error() == Some(not_found.0 as i32)
+                || e.raw_os_error() == Some(windows::core::HRESULT::from_win32(not_found.0).0) =>
+        {
+            FILE_NOT_FOUND
+        }
+        _ => OTHER_FAILURE,
+    };
+    std::process::exit(code);
+}
+
+/// [`fixture_load_exact_probe`]'s exit code when run with `process_cwd` as its cwd.
+fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
+    let mut c = Command::new();
+    c.executable(std::env::current_exe().expect("current_exe"))
+        .args(crate::test_child::fixture_argv(FIXTURE_LOAD_EXACT_PROBE_TEST))
+        .env(FIXTURE_LOAD_EXACT_PROBE_ENV, current_dir)
+        .current_dir(process_cwd);
+    // libtest writes its banner to fd 1 directly, past its own capture.
+    c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
+    c.spawn().expect("spawn the fixture").wait().expect("wait").code()
+}
+
+/// `lpCurrentDirectory` takes no part in image lookup: a relative `Exact` image loads from the
+/// process's cwd whatever `current_dir()` says. The Windows counterpart of the POSIX
+/// `a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path` and
+/// `a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path`, where the child's directory
+/// decides instead.
+#[test]
+fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
+    let (with, without) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    std::fs::copy(std::env::current_exe().expect("current_exe"), with.path().join(PROBE)).expect("copy");
+    assert_eq!(load_exact_probe(with.path(), without.path()), Some(LOADED));
+    assert_eq!(
+        load_exact_probe(without.path(), with.path()),
+        Some(FILE_NOT_FOUND),
+        "current_dir() holds the image but the process cwd does not"
+    );
+}
+
+#[test]
+fn image_for_resolves_a_search_program_to_an_absolute_path() {
+    // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
+    // the same bare name through `executable()` is resolved and absolute. `cmd` is chosen because
+    // it lives in the System32 directory the bare-name search visits on any Windows host.
+    let mut cmd = Command::new();
+    cmd.executable("cmd").args(["cmd"]);
+    let image = image(&cmd).expect("cmd resolves on any Windows host").unwrap();
+    assert!(
+        image.is_absolute(),
+        "a Search program must be absolute by the time the backend sees it, got {image:?}"
+    );
+    assert_ne!(image, Path::new("cmd"), "it must actually have been resolved");
+}
+
+#[test]
+fn image_for_rejects_an_empty_exact_program() {
+    // An empty `lpApplicationName` is a pointer to a lone NUL, not the NULL pointer, and whether
+    // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
+    let mut cmd = Command::new();
+    cmd.raw_executable("").args(["tool"]);
+    match image(&cmd) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        other => panic!("an empty exact program must be Io(InvalidInput), got {other:?}"),
+    }
+}
+
+#[test]
+fn image_for_rejects_an_exact_program_that_names_no_file() {
+    // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
+    // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but as an OS error
+    // after the spawn is under way; refusing here makes it `InvalidInput`, as on the elevated
+    // sink. `C:\t\...` and `C:\t\. ` (one trailing space) name no file only after Win32
+    // normalisation, so they pin the post-check.
+    for n in [r"C:\t\dir\", r"C:\t\.", ".", "..", "C:", r"C:\t\...", r"C:\t\. "] {
+        let mut cmd = Command::new();
+        cmd.raw_executable(n).args(["tool"]);
+        match image(&cmd) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!("{n:?} names no file and must be Io(InvalidInput), got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn image_for_checks_an_exact_program_normalised_but_passes_it_as_written() {
+    // The post-check reads Win32's normalisation; what reaches `lpApplicationName` must still be
+    // the caller's token, relative and with its trailing dot, for the loader to complete.
+    let mut cmd = Command::new();
+    cmd.raw_executable(r"t\tool.").args(["tool"]);
+    assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(r"t\tool.")));
+}
+
+/// `CreateProcessW` loads the name Win32 normalises the token to, so a batch file reached only
+/// through normalisation is refused as a plainly-spelled one is.
+#[test]
+fn image_for_refuses_an_exact_batch_reached_through_win32_normalisation() {
+    // Trailing dot; one trailing space; a file named `.bat`, which has no extension to `Path`.
+    for n in ["setup.bat.", "setup.bat ", r"C:\t\.bat"] {
+        let mut cmd = Command::new();
+        cmd.raw_executable(n).args(["tool"]);
+        assert!(
+            reject_batch_program(&cmd).is_ok(),
+            "premise: the token gate misses {n:?}, so image_for is the only refusal"
+        );
+        match image(&cmd) {
+            Err(Error::Unsupported { platform, detail, .. }) => {
+                assert_eq!(platform, "windows");
+                assert!(detail.contains("CVE-2024-24576"), "{n:?}: {detail}");
+            }
+            other => panic!("{n:?} reaches a batch file and must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// Negative control: a name that merely contains `.bat` loads as written.
+#[test]
+fn image_for_passes_an_exact_program_that_is_not_a_batch_file() {
+    for n in ["setup.exe", "setup.bat.exe"] {
+        let mut cmd = Command::new();
+        cmd.raw_executable(n).args(["tool"]);
+        assert_eq!(image(&cmd).unwrap().as_deref(), Some(Path::new(n)));
+    }
+}
+
+#[test]
+fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
+    // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
+    // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.
+    let mut cmd = Command::new();
+    cmd.args(["cmd", "/C", "exit 0"]);
+    let image = image(&cmd).expect("argv[0] resolves").unwrap();
+    assert!(image.is_absolute(), "the fallback must resolve too, got {image:?}");
+}

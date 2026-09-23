@@ -19,7 +19,7 @@ pub(crate) mod flags;
 #[derive(Debug)]
 pub struct Command {
     input: CommandInput,
-    executable: Option<PathBuf>,
+    executable: Option<ExecutableSpec>,
     fds: BTreeMap<Fd, ResolvedStdio>,
     env_ops: Vec<EnvOp>,
     cwd: Option<PathBuf>,
@@ -28,6 +28,69 @@ pub struct Command {
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
     flags: FlagsRequest,
+}
+
+/// [`Command::posix_launch`]'s error when this process's cwd cannot be read: says why a path was
+/// needed, and keeps the read's own error — errno included — as its source.
+#[derive(Debug)]
+struct CwdUnreadable(std::io::Error);
+
+impl std::fmt::Display for CwdUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "elevating raw_executable() needs this process's working directory as a path, and it \
+             cannot be read: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CwdUnreadable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// `process_cwd`, with a failure explained as [`CwdUnreadable`] and its own error kept as the
+/// source — for every elevation sink that needs this process's cwd as a path.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn explain_cwd_read(
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> impl FnOnce() -> std::io::Result<PathBuf> {
+    move || process_cwd().map_err(|e| std::io::Error::new(e.kind(), CwdUnreadable(e)))
+}
+
+/// [`Command::posix_launch`]'s answer.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct PosixLaunch {
+    pub(crate) program: Option<PathBuf>,
+    pub(crate) cwd: Option<PathBuf>,
+}
+
+/// Which setter recorded the executable path, and therefore whether cosca resolves it before
+/// the OS sees it.
+///
+/// The variants are alternatives on ONE field: [`Command::executable`] and
+/// [`Command::raw_executable`] overwrite each other, last call wins. Downstream, only the sites
+/// that would otherwise resolve need the discriminant — everything that merely wants the path
+/// uses [`Command::executable_path`], which is variant-agnostic.
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutableSpec {
+    /// From [`Command::executable`]: cosca resolves it (`PATH`, `.exe`) before the OS sees it.
+    Search(PathBuf),
+    /// From [`Command::raw_executable`]: never searched — at most completed to an absolute path,
+    /// where a sink would otherwise search a relative one.
+    Exact(PathBuf),
+}
+
+impl ExecutableSpec {
+    /// The path as written, whichever setter recorded it.
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            ExecutableSpec::Search(p) | ExecutableSpec::Exact(p) => p,
+        }
+    }
 }
 
 /// An environment variable operation, recorded in order.
@@ -209,9 +272,83 @@ impl Command {
     /// backend (and this resolver) described above, so a bare or relative
     /// `executable` there is neither searched in `PATH` nor refused for a
     /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
-    /// unresolved.
+    /// unresolved. That search applies `PATHEXT` and file associations even to an absolute name,
+    /// so where a consent prompt is used, [`elevate`](Self::elevate) on Windows refuses with
+    /// [`std::io::ErrorKind::InvalidInput`] any name not ending in `.exe` or `.com`: both
+    /// `executable(r"C:\tools\setup")` and `executable("whoami")` are refused, and
+    /// `whoami.exe` is not. Whether `PATHEXT` is also applied to a name that already ends in
+    /// `.exe` is unmeasured.
+    ///
+    /// Every Windows spawn, elevated or not, refuses a `.bat`/`.cmd` that only Win32's
+    /// normalisation exposes, such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one
+    /// trailing space) and `C:\t\.bat`, with [`Error::Unsupported`] (CVE-2024-24576).
+    ///
+    /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
+    /// replaces the other.
     pub fn executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
-        self.executable = Some(path.into());
+        self.executable = Some(ExecutableSpec::Search(path.into()));
+        self
+    }
+
+    /// Load exactly this file, with **no resolution of any kind** — no `PATH` search, no `.exe`
+    /// appending, no existence check.
+    ///
+    /// This is the underlying primitive that [`executable`](Self::executable) layers a search
+    /// over. A relative value keeps the platform primitive's own meaning — but **which directory
+    /// that is differs by platform, and it is not the same one `executable()` uses**:
+    ///
+    /// - **Windows:** the **calling process's** current directory. `CreateProcessW` completes a
+    ///   partial `lpApplicationName` "using the current drive and current directory", and
+    ///   `lpCurrentDirectory` (what [`current_dir`](Self::current_dir) sets) does not affect
+    ///   image lookup at all. So `raw_executable("helper.exe").current_dir(r"D:\work")` loads
+    ///   `helper.exe` from wherever THIS process happens to sit, not from `D:\work`. Pass an
+    ///   absolute path if that distinction
+    ///   could ever matter — and note that a directory this process sits in may be writable by
+    ///   someone else, which is the binary-planting shape [`executable`](Self::executable)
+    ///   deliberately refuses to walk into.
+    /// - **POSIX:** the **child's** working directory — [`current_dir`](Self::current_dir) when
+    ///   set (itself read against this process's directory if relative), else this process's. The
+    ///   `chdir` happens before the exec, so that is where a relative path lands. A bare `tool`
+    ///   is run as `./tool`, never looked up on `PATH`: the child enters its directory and reads
+    ///   the name there, both from the cwd it inherits, so no path to this process's cwd is ever
+    ///   needed and the file loaded and the directory run in are always the same.
+    ///
+    ///   Under [`elevate`](Self::elevate), see that method's doc for which directory each
+    ///   backend runs in; the file loaded here is always the one the directory it names holds.
+    ///
+    /// [`executable`](Self::executable) resolves against the child's working directory on both.
+    /// The divergence is inherited from the platform primitives, not chosen here.
+    ///
+    /// A drive-relative name (`C:tool`) is honoured rather than refused: it names a file relative
+    /// to drive C's own current directory, which Windows tracks and this crate does not.
+    /// [`executable`](Self::executable) fails such a name closed for exactly that reason; here
+    /// the platform answers it.
+    ///
+    /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
+    /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
+    ///
+    /// On Windows a `.bat`/`.cmd` is refused with [`Error::Unsupported`] (CVE-2024-24576), judged
+    /// on the name Win32 loads, so `setup.bat.` and `C:\t\.bat` are refused too.
+    ///
+    /// # Elevation
+    ///
+    /// On Windows the elevated path goes through `ShellExecuteEx`, which searches a path-less
+    /// `lpFile` and applies `PATHEXT` even to an absolute one. cosca completes the name to an
+    /// absolute path first, by the same rules as above, and where a consent prompt is used refuses
+    /// it with [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
+    /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
+    /// `C:\tools\setup`. Whether `PATHEXT` is also applied to a name that already ends in `.exe`
+    /// is unmeasured.
+    ///
+    /// Every elevation backend derives the child's `argv[0]` from the program it is handed
+    /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under
+    /// `sudo`, `doas` and `osascript`, and the completed absolute path under `pkexec`, `run0` and
+    /// `ShellExecuteEx`. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
+    /// only unelevated, or from an already-elevated caller, which runs no backend and spawns
+    /// with argv verbatim. Handing a backend the bare name instead would let it search for the
+    /// image.
+    pub fn raw_executable<P: Into<PathBuf>>(&mut self, path: P) -> &mut Command {
+        self.executable = Some(ExecutableSpec::Exact(path.into()));
         self
     }
 
@@ -219,8 +356,60 @@ impl Command {
         &self.input
     }
 
+    /// The executable path as written, whichever setter recorded it.
+    ///
+    /// Deliberately variant-agnostic: most readers — the elevation `argv[0]` guards, backend
+    /// routing, the argv and command-line builders — want the path and nothing else. Only a
+    /// caller that must not resolve an `Exact` path should reach for
+    /// [`executable_spec`](Self::executable_spec).
     pub(crate) fn executable_path(&self) -> Option<&Path> {
-        self.executable.as_deref()
+        self.executable.as_ref().map(ExecutableSpec::path)
+    }
+
+    /// The path together with which setter recorded it.
+    pub(crate) fn executable_spec(&self) -> Option<&ExecutableSpec> {
+        self.executable.as_ref()
+    }
+
+    /// Carry another command's executable over whole, setter included.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn set_executable_spec(&mut self, spec: Option<ExecutableSpec>) {
+        self.executable = spec;
+    }
+
+    /// The program and working directory a POSIX elevation backend is handed. An `Exact` program
+    /// is completed to an absolute path by [`crate::resolve::exact::complete_posix`] against the
+    /// child's working directory, so no backend can search for it; a `Search` one is as written.
+    /// `program` is `None` when neither setter was called. The unelevated spawn does not come
+    /// here: it needs no path (see [`crate::resolve::exact::anchor_posix`]).
+    ///
+    /// Reads this process's cwd through `process_cwd` only for a relative `Exact` program with no
+    /// absolute [`current_dir`](Self::current_dir), and then `cwd` is the absolute directory that
+    /// one reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given. A
+    /// failed read keeps its kind and says why a path was needed; see
+    /// [`crate::resolve::exact::complete_posix`] for when a cwd with no path gets that far.
+    // Off unix the only caller is the macOS elevation module, itself dead there.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn posix_launch(
+        &self,
+        process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+    ) -> Result<PosixLaunch, Error> {
+        let process_cwd = explain_cwd_read(process_cwd);
+        let as_given = |program| PosixLaunch {
+            program,
+            cwd: self.cwd().map(Path::to_path_buf),
+        };
+        match self.executable_spec() {
+            Some(ExecutableSpec::Exact(p)) => {
+                let done = crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), process_cwd)?;
+                Ok(PosixLaunch {
+                    program: Some(done.program),
+                    cwd: done.child_cwd,
+                })
+            }
+            Some(ExecutableSpec::Search(p)) => Ok(as_given(Some(p.clone()))),
+            None => Ok(as_given(None)),
+        }
     }
 
     /// Wire descriptor `slot` to `target`. Errors now if the target's direction
@@ -478,6 +667,29 @@ impl Command {
     /// Run this child elevated (admin/root). Sugar for `Backend::Auto` +
     /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
     /// CHILD, never this process.
+    ///
+    /// On POSIX the backend, not cosca, decides the directory the child runs in. The backend is
+    /// started in [`current_dir`](Self::current_dir), or this process's cwd; `pkexec` then
+    /// switches to the target user's home, and a sudoers `runcwd` moves `sudo`'s child the same
+    /// way — measured: pkexec 0.105–127 and sudo 1.9.5–1.9.17 with `runcwd=~` ran it in `/root`.
+    ///
+    /// A relative [`raw_executable`](Self::raw_executable) reaches each backend in a form it
+    /// cannot search:
+    ///
+    /// - `sudo` and `doas` are handed `./tool` in the directory they are started in, and read it
+    ///   there after authenticating; under a sudoers `runcwd`, `./tool` is then not found.
+    /// - `pkexec` and `run0` pick their own directory, so they are handed an absolute path
+    ///   completed against this process's cwd (read once); a rename of an ancestor during
+    ///   authentication can redirect it.
+    /// - `osascript`'s shell `cd -P`s to that absolute directory and runs `./tool` there, so this
+    ///   path runs the child in the directory whatever the trampoline does.
+    ///
+    /// On the three that need a path, a cwd with no usable path fails the spawn. An unlinked
+    /// directory fails the reading everywhere, with `NotFound` and an error saying why a path was
+    /// needed. An unsearchable ancestor fails it on macOS, with `PermissionDenied` and the same
+    /// explanation; on Linux the reading succeeds and entering the path fails later with a plain
+    /// `PermissionDenied`. An already-root caller runs no backend and spawns as it would
+    /// unelevated.
     pub fn elevate(&mut self) -> &mut Command {
         self.elevation.enabled = true;
         self

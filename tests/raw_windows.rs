@@ -136,6 +136,57 @@ fn batch_script_via_executable_is_unsupported() {
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
+/// A token routed raw by fd 3, via `executable()` and via argv[0].
+fn raw_routed(token: &std::path::Path) -> [(&'static str, cosca::Command); 2] {
+    let mut exe = cosca::Command::new();
+    exe.executable(token).args(["x", "write-fd", "3", "ok"]);
+    let mut argv0 = cosca::Command::new();
+    argv0.args([token.as_os_str(), "write-fd".as_ref(), "3".as_ref(), "ok".as_ref()]);
+    for c in [&mut exe, &mut argv0] {
+        c.fd(3, cosca::Stdio::null()).unwrap();
+    }
+    [("executable()", exe), ("argv[0]", argv0)]
+}
+
+/// A batch file that only Win32's normalisation exposes resolves (the file exists) and must still
+/// be refused: `Path::extension()` reads `""`, `"bat "` and `None` for these three.
+#[test]
+fn a_batch_reached_through_normalisation_is_refused_on_the_raw_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    for f in ["x.bat", ".bat"] {
+        std::fs::write(dir.path().join(f), b"@echo off\n").unwrap();
+    }
+    // Trailing dot; one trailing space; a file named `.bat`.
+    for name in ["x.bat.", "x.bat ", ".bat"] {
+        let token = dir.path().join(name);
+        for (via, mut c) in raw_routed(&token) {
+            match c.spawn() {
+                Err(e @ cosca::error::Error::Unsupported { .. }) => {
+                    assert!(e.to_string().contains("CVE-2024-24576"), "{via} {name:?}: {e}");
+                }
+                other => panic!(
+                    "{via} {name:?}: expected Unsupported, got {:?}",
+                    other.map(|_| "a child")
+                ),
+            }
+        }
+    }
+}
+
+/// Controls: a `.exe` whose stem merely contains `.bat` runs, as does a plain one.
+#[test]
+fn an_exe_named_like_a_batch_still_runs_on_the_raw_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["x.bat.exe", "tool.exe"] {
+        let token = dir.path().join(name);
+        std::fs::copy(common::testbin(), &token).unwrap();
+        for (via, mut c) in raw_routed(&token) {
+            let child = c.spawn().unwrap_or_else(|e| panic!("{via} {name:?}: {e}"));
+            assert!(child.wait().unwrap().success(), "{via} {name:?}");
+        }
+    }
+}
+
 /// End-to-end proof of the gate's ORDERING, through `spawn()` rather than the gate alone. A token
 /// carrying an interior NUL must come back as the NUL whichever side of the batch rule it falls:
 ///

@@ -28,6 +28,68 @@ pub(crate) mod windows;
 #[cfg(unix)]
 #[doc(hidden)]
 pub use posix::controlling_terminal_present;
+
+/// One backend's words for the argv refusals every elevation path shares ([`elevation_argv`]).
+pub(crate) struct ArgvRefusals {
+    pub(crate) platform: &'static str,
+    /// Starts each `op`: `"{op_prefix} of an empty command"` and so on.
+    pub(crate) op_prefix: &'static str,
+    /// Why a `commandline()` command cannot be elevated here.
+    pub(crate) commandline: &'static str,
+    /// Why an argv[0] distinct from a set `executable()` cannot survive this backend.
+    pub(crate) argv0: &'static str,
+}
+
+/// The argv an elevation backend can work from. Refused, as [`crate::error::Error::Unsupported`]
+/// in `words`' terms: no program (`Empty`, or an empty argv), a `commandline()` command, and an
+/// argv[0] distinct from a set `executable()`.
+///
+/// `Empty` is matched on its own rather than folded into the command-line refusal: a fresh
+/// `Command` is `Empty`, and telling `Command::new().executable("x").elevate()` it elevated a
+/// command line would send its author to audit a builder call their code never makes.
+pub(crate) fn elevation_argv<'a>(
+    cmd: &'a crate::command::Command,
+    words: &ArgvRefusals,
+) -> Result<&'a [OsString], crate::error::Error> {
+    use crate::command::CommandInput;
+    let refuse = |what: &str, detail: &str| crate::error::Error::Unsupported {
+        op: format!("{} {what}", words.op_prefix),
+        platform: words.platform,
+        detail: detail.into(),
+    };
+    let no_program = || {
+        refuse(
+            "of an empty command",
+            "set a program via .args([...]) before .elevate()",
+        )
+    };
+    let argv = match cmd.input() {
+        CommandInput::Argv(argv) => argv,
+        CommandInput::Empty => return Err(no_program()),
+        CommandInput::CommandLine(_) => return Err(refuse("of a commandline() command", words.commandline)),
+    };
+    let Some(first) = argv.first() else {
+        return Err(no_program());
+    };
+    if cmd
+        .executable_path()
+        .is_some_and(|exe| first.as_os_str() != exe.as_os_str())
+    {
+        return Err(refuse("with an argv[0] distinct from executable()", words.argv0));
+    }
+    Ok(argv)
+}
+
+/// What an elevation gate validated and the build then wraps: the program, its arguments, and the
+/// directory to run them in. Computed once per rewrite, so a `raw_executable()` program and its
+/// directory come from one reading of this process's cwd.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct Launch {
+    pub(crate) program: OsString,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) cwd: Option<PathBuf>,
+}
 pub use sanitize::EnvSanitizer;
 
 /// Is the CURRENT process already elevated (root on Unix, an elevated token on

@@ -50,3 +50,19 @@ async fn attach_failure_reaps_the_spawned_child() {
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
+
+/// The async mirror of `child::spawn::exact_posix_tests`: tokio builds its command through the
+/// same `build_std_command`, so a bare `raw_executable()` must load the child-cwd file here too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
+    use crate::test_child::{cwd_and_path_tools, CWD_TOOL_EXIT};
+    let (cwd, on_path) = cwd_and_path_tools();
+    let mut c = Command::new();
+    c.raw_executable("tool")
+        .args(["tool"])
+        .current_dir(cwd.path())
+        .env("PATH", on_path.path());
+    let status = c.spawn().expect("spawn").wait().await.expect("wait");
+    assert_eq!(status.code(), Some(CWD_TOOL_EXIT));
+}

@@ -182,7 +182,7 @@ fn a_clean_unelevated_request_plans_a_launch() {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let mut c = Command::new();
-    c.args(["whoami", "/all"]).elevate();
+    c.args(["whoami.exe", "/all"]).elevate();
     let launch = match super::plan_runas(&c, &win_host(false)) {
         Ok(super::RunasStep::Launch(launch)) => launch,
         Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
@@ -213,6 +213,139 @@ fn already_elevated_inherit_only_is_run_as_is() {
         super::plan_runas(&c, &win_host(true)),
         Ok(super::RunasStep::AlreadyElevated)
     ));
+}
+
+/// Kills replacing `elevated_program`'s `Exact` arm with `let program = token;`, which hands
+/// `ShellExecuteEx` a path-less `lpFile` to search (see `absolutise_exact`'s doc): the result must
+/// be absolute, and for a relative input must DIFFER from the token as written.
+#[test]
+fn elevated_exact_program_is_completed_to_an_absolute_path() {
+    let mut c = Command::new();
+    c.raw_executable("tool.exe").args(["tool.exe"]).elevate();
+    let argv = super::elevated_argv(&c).expect("an argv command");
+    let program = super::elevated_program(&c, argv).expect("a relative Exact program completes");
+    let p = std::path::Path::new(&program);
+    assert!(
+        p.is_absolute(),
+        "an Exact program must reach lpFile absolute, got {program:?}"
+    );
+    assert_ne!(
+        p.as_os_str(),
+        std::ffi::OsStr::new("tool.exe"),
+        "a relative Exact token must have been completed, not passed through"
+    );
+    // Completed, NOT searched: no extension invented and the file name is untouched.
+    assert_eq!(p.file_name().unwrap(), std::ffi::OsStr::new("tool.exe"), "{program:?}");
+}
+
+/// The consent path's `Exact` arm applies [`crate::resolve::reject_unloadable_image`]: an absolute
+/// extensionless `lpFile` is still PATHEXT-completed by `ShellExecuteEx`. Relative too, since
+/// completion does not add an extension.
+#[test]
+fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
+    for n in [r"C:\tools\setup", "setup", r"C:\tools\setup.bat.exe.lnk"] {
+        let mut c = Command::new();
+        c.raw_executable(n).args([n]).elevate();
+        match super::plan_runas(&c, &win_host(false)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                assert!(
+                    e.to_string().contains("PATHEXT"),
+                    "{n:?}: the reason must be named: {e}"
+                );
+            }
+            other => panic!("{n:?}: expected Io(InvalidInput), got {:?}", other.map(|_| "Ok")),
+        }
+    }
+}
+
+/// An already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
+/// extension, so the allowlist is not applied there. Kills moving the gate above the short-circuit.
+#[test]
+fn an_extensionless_exact_program_is_not_refused_when_already_elevated() {
+    let mut c = Command::new();
+    c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
+    assert!(matches!(
+        super::plan_runas(&c, &win_host(true)),
+        Ok(super::RunasStep::AlreadyElevated)
+    ));
+}
+
+/// Negative control: a loadable image name still plans a launch.
+#[test]
+fn an_exact_exe_or_com_program_plans_a_launch() {
+    for n in [r"C:\tools\setup.exe", r"C:\tools\SETUP.COM", "setup.exe"] {
+        let mut c = Command::new();
+        c.raw_executable(n).args([n]).elevate();
+        assert!(
+            matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
+            "{n:?} must plan a launch"
+        );
+    }
+}
+
+/// The allowlist is the consent path's, not `raw_executable()`'s: an `executable()` or argv[0]
+/// token reaches `ShellExecuteEx` as written, so an extensionless one is PATHEXT-completed too,
+/// and a bare one is searched besides.
+#[test]
+fn an_extensionless_search_program_is_refused_on_the_consent_path() {
+    for (via, c) in search_commands(&[r"C:\tools\setup", "whoami"]) {
+        match super::plan_runas(&c, &win_host(false)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                assert!(
+                    e.to_string().contains("PATHEXT"),
+                    "{via}: the reason must be named: {e}"
+                );
+            }
+            other => panic!("{via}: expected Io(InvalidInput), got {:?}", other.map(|_| "Ok")),
+        }
+    }
+}
+
+/// Negative control for the `Search` and argv[0] arms.
+#[test]
+fn a_search_exe_or_com_program_plans_a_launch() {
+    for (via, c) in search_commands(&[r"C:\tools\setup.exe", "whoami.exe", "WHOAMI.COM"]) {
+        assert!(
+            matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
+            "{via} must plan a launch"
+        );
+    }
+}
+
+/// The normalised-batch gate applies to every arm, before the planner. On a token ending in
+/// `.exe`/`.com` it is the only batch gate that sees a stream piece.
+#[test]
+fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privilege() {
+    let probes = [
+        r"C:\t\setup.bat.",
+        r"C:\t\setup.bat ",
+        r"C:\t\.bat",
+        r"C:\t\setup.bat:.exe",
+    ];
+    for elevated in [false, true] {
+        for (via, c) in search_commands(&probes) {
+            let detail = unsupported_detail(super::plan_runas(&c, &win_host(elevated)).map(|_| ()));
+            assert!(
+                detail.contains("CVE-2024-24576"),
+                "elevated={elevated}, {via}: {detail}"
+            );
+        }
+    }
+}
+
+/// Each name as an `executable()` and as a bare argv[0], the two ways a token reaches `lpFile`
+/// unresolved.
+fn search_commands(names: &[&str]) -> Vec<(String, Command)> {
+    let mut out = Vec::new();
+    for &n in names {
+        let mut exe = Command::new();
+        exe.executable(n).args([n]).elevate();
+        out.push((format!("executable({n:?})"), exe));
+        let mut argv = Command::new();
+        argv.args([n]).elevate();
+        out.push((format!("args([{n:?}])"), argv));
+    }
+    out
 }
 
 // ===== creation-flag intents on the consent-prompt path =====
@@ -443,7 +576,7 @@ fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
 ///
 /// Scope, so this test is not read as proving more than it does: the gate keys on the caller's
 /// string, and `ShellExecuteEx` resolves the file. An extension-less `args(["setup", "a&calc"])`
-/// passes it and can still be PATHEXT-completed to `setup.bat` — see `plan_runas`.
+/// passes it; `plan_runas`'s image allowlist is what refuses that one.
 ///
 /// Privilege-independent for the same reason as the config gate: the already-elevated caller
 /// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
@@ -457,6 +590,24 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
             assert!(
                 is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
                 "elevated={elevated}: {probe:?} must be refused before ShellExecuteEx hands it to cmd.exe"
+            );
+        }
+    }
+}
+
+/// An `Exact` batch file reached only through Win32 normalisation is refused as the batch file it
+/// is, before the planner, so the verdict does not depend on privilege.
+#[test]
+fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_of_privilege() {
+    for elevated in [false, true] {
+        // Trailing dot; one trailing space; a file named `.bat`.
+        for probe in [r"C:\t\setup.bat.", r"C:\t\setup.bat ", r"C:\t\.bat"] {
+            let mut c = Command::new();
+            c.raw_executable(probe).args([probe, "a&calc"]).elevate();
+            let detail = unsupported_detail(super::plan_runas(&c, &win_host(elevated)).map(|_| ()));
+            assert!(
+                detail.contains("CVE-2024-24576"),
+                "elevated={elevated}, {probe:?}: {detail}"
             );
         }
     }

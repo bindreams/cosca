@@ -17,6 +17,10 @@
 //! two calls' identical text: matching by text alone would let a duplicate of an already-allowed
 //! line slip in uncounted, so each entry also carries the exact number of lines it may match.
 //!
+//! `src/child/spawn.rs`'s one call is library code, not a test's: the `pre_exec` hook that enters
+//! a `raw_executable()` child's directory. It runs in the forked child, between `fork` and `exec`,
+//! so it moves that child's cwd and never this process's.
+//!
 //! The match itself is word-boundary, not substring: a bare identifier occurrence trips it, with
 //! no trailing `(` required, so an aliased import (`use ... as cd; cd(d)`), a `.map(...)`
 //! reference, and turbofish syntax all still get caught, alongside the non-std spellings
@@ -29,15 +33,22 @@ use std::path::Path;
 /// `(file path relative to the repo root, exact trimmed line text, exact expected match count)`
 /// for every allowlisted call site — see this file's module doc for why both the text and the
 /// count must match exactly.
-const ALLOWLIST: &[(&str, &str, usize)] = &[(
-    "testbin/main.rs",
-    concat!(
-        "std::env::set_current",
-        "_dir(dir).expect(\"ch",
-        "dir to the decoy directory\");"
+const ALLOWLIST: &[(&str, &str, usize)] = &[
+    (
+        "testbin/main.rs",
+        concat!(
+            "std::env::set_current",
+            "_dir(dir).expect(\"ch",
+            "dir to the decoy directory\");"
+        ),
+        2,
     ),
-    2,
-)];
+    (
+        "src/child/spawn.rs",
+        concat!("if libc::ch", "dir(dir.as_ptr()) == 0 {"),
+        1,
+    ),
+];
 
 /// Two-piece halves of every identifier this guard treats as a process-cwd mutation. Never written
 /// contiguously anywhere in this file: this file is scanned by its own [`no_test_mutates_the_process_cwd`]

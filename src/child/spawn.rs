@@ -183,8 +183,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // write would hit a closed/wrong fd (silent CgroupV2->ProcessGroup downgrade,
     // or a stray "0" corrupting the user's fd). By running command-fds LAST, the
     // cgroup write+close happens while its fd is still valid; command-fds may then
-    // freely reuse the now-closed slot. Net child order: std stdio (0/1/2) ->
-    // containment pre_execs (cgroup placement / setsid) -> command-fds dup2 (last).
+    // freely reuse the now-closed slot. Net child order: std stdio (0/1/2) -> the
+    // `raw_executable()` chdir (`build_std_command`'s `enter_in_child`) -> containment
+    // pre_execs (cgroup placement / setsid) -> command-fds dup2 (last).
     //
     // On macOS, `prepare` also clears FD_CLOEXEC on the marker write end for the forked
     // child only (the supervisor's own copy stays CLOEXEC — see `fdmarker::install`'s doc
@@ -360,21 +361,32 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
     // Program + args via the `quote` model.
-    let (program, mut std_cmd) = match cmd.input() {
+    let StdLaunch {
+        program,
+        mut std_cmd,
+        cwd,
+        enter,
+    } = match cmd.input() {
         CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
         CommandInput::Argv(argv) => {
-            let (program, rest) = resolve_program_argv(cmd, argv)?;
+            let (Resolved { program, cwd, enter }, rest) = resolve_program_argv(cmd, argv)?;
             let mut c = std::process::Command::new(&program);
             c.args(rest);
             // POSIX: when executable() overrides the loaded file, preserve the
-            // user's argv[0] via arg0(). Without this, std would set argv[0] to
-            // the executable path, silently dropping the user's intended name.
+            // user's argv[0] via arg0() — the executable as written when argv is
+            // empty. Without this, std would set argv[0] to the (possibly completed)
+            // program path, silently dropping the user's intended name.
             #[cfg(unix)]
-            if cmd.executable_path().is_some() && !argv.is_empty() {
+            if let Some(exe) = cmd.executable_path() {
                 use std::os::unix::process::CommandExt;
-                c.arg0(&argv[0]);
+                c.arg0(argv.first().map_or(exe.as_os_str(), std::ffi::OsString::as_os_str));
             }
-            (program, c)
+            StdLaunch {
+                program,
+                std_cmd: c,
+                cwd,
+                enter,
+            }
         }
         CommandInput::CommandLine(line) => build_from_commandline(cmd, line)?,
     };
@@ -384,33 +396,99 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
+    // std runs a batch file through cmd.exe after `GetFullPathNameW`, so `setup.bat.` and
+    // `C:\t\.bat` are batch files too; a `commandline()` tail would then reach cmd.exe unescaped.
+    #[cfg(windows)]
+    reject_normalised_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
-    if let Some(dir) = cmd.cwd() {
-        std_cmd.current_dir(dir);
+    match cwd {
+        Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,
+        Some(dir) => {
+            std_cmd.current_dir(dir);
+        }
+        None => {}
     }
     Ok(std_cmd)
 }
 
-// Pick the executable file to load (`executable` overrides argv[0]/first-token).
-fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> std::ffi::OsString {
-    match cmd.executable_path() {
-        Some(p) => p.as_os_str().to_os_string(),
-        None => fallback,
+/// `chdir` to `dir` in the child, after std's own setup and just before its `execvp`, so a
+/// relative program is read against the directory the child runs in, both relative to the cwd it
+/// inherited (see `crate::resolve::exact::anchor_posix`).
+///
+/// This is what std's `current_dir` would mostly do already, and it is done here because std does
+/// not promise it: "If the program path is relative (e.g., `"./script.sh"`), it's ambiguous
+/// whether it should be interpreted relative to the parent's working directory or relative to
+/// `current_dir`. The behavior in this case is platform specific and unstable". std 1.97.1 happens
+/// to read it against the new directory on both of its paths — fork/exec (which it takes on
+/// Apple for this case) and glibc's `posix_spawn` with `addchdir` — but either could change. std
+/// documents `pre_exec` hooks as running in the child just before the exec, so the ordering is
+/// pinned. The cost is that a hook rules out `posix_spawn`, for these commands only.
+#[cfg(unix)]
+fn enter_in_child(std_cmd: &mut std::process::Command, dir: &std::path::Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+    let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current_dir() contains an embedded NUL",
+        ))
+    })?;
+    // SAFETY: `chdir` is async-signal-safe, and `dir` is allocated before the fork and only read
+    // after it.
+    unsafe {
+        std_cmd.pre_exec(move || {
+            if libc::chdir(dir.as_ptr()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
     }
+    Ok(())
 }
 
-// Program + the trailing args (argv mode). `executable` overrides the loaded
-// file; argv[0] is the conventional program name otherwise.
-//
-// POSIX: when `executable` is set and argv is non-empty, the user's argv[0] is
-// preserved via `CommandExt::arg0` (set on the caller's std_cmd). On Windows a
-// set `executable` never reaches this std path — it routes to the raw
-// `CreateProcessW` backend, which preserves argv[0] independently of the loaded
-// image (argv[0] no longer degrades to the executable path).
+#[cfg(not(unix))]
+fn enter_in_child(_: &mut std::process::Command, _: &std::path::Path) -> Result<(), Error> {
+    unreachable!("only anchor_posix asks the child to enter its directory")
+}
+
+/// The program to load and the directory to run it in.
+struct Resolved {
+    program: std::ffi::OsString,
+    cwd: Option<std::path::PathBuf>,
+    /// The child enters `cwd` itself; see `crate::resolve::exact::Anchored::enter`.
+    enter: bool,
+}
+
+// Pick the executable file to load (`executable` overrides argv[0]/first-token). On POSIX an
+// `Exact` program arrives in a form no exec searches (see `crate::resolve::exact::anchor_posix`);
+// on Windows a set executable never reaches this std path, routing to the raw backend instead.
+fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<Resolved, Error> {
+    let as_given = |exe: Option<&std::path::Path>| Resolved {
+        program: exe.map_or(fallback, |p| p.as_os_str().to_os_string()),
+        cwd: cmd.cwd().map(std::path::Path::to_path_buf),
+        enter: false,
+    };
+    #[cfg(unix)]
+    if let Some(crate::command::ExecutableSpec::Exact(p)) = cmd.executable_spec() {
+        let a = crate::resolve::exact::anchor_posix(p.as_os_str(), cmd.cwd())?;
+        return Ok(Resolved {
+            program: a.program.into_os_string(),
+            cwd: a.cwd,
+            enter: a.enter,
+        });
+    }
+    Ok(as_given(cmd.executable_path()))
+}
+
+// Program + the trailing args (argv mode). `executable` overrides the loaded file; argv[0] is the
+// conventional program name otherwise — POSIX argv[0] preservation happens at the caller (see
+// build_std_command). On Windows a set `executable` never reaches this std path — it routes to
+// the raw `CreateProcessW` backend, which preserves argv[0] independently of the loaded image.
 fn resolve_program_argv<'a>(
     cmd: &'a Command,
     argv: &'a [std::ffi::OsString],
-) -> Result<(std::ffi::OsString, &'a [std::ffi::OsString]), Error> {
+) -> Result<(Resolved, &'a [std::ffi::OsString]), Error> {
     if argv.is_empty() && cmd.executable_path().is_none() {
         return Err(Error::Io(std::io::Error::other("empty argv")));
     }
@@ -419,16 +497,22 @@ fn resolve_program_argv<'a>(
     } else {
         argv[0].clone()
     };
-    let program = resolve_program(cmd, fallback);
+    let program = resolve_program(cmd, fallback)?;
     let rest = if argv.is_empty() { argv } else { &argv[1..] };
     Ok((program, rest))
 }
 
-/// The resolved program token alongside the `std::process::Command` built from it.
-type StdProgram = (std::ffi::OsString, std::process::Command);
+/// The resolved program token alongside the `std::process::Command` built from it and the
+/// directory to run it in.
+struct StdLaunch {
+    program: std::ffi::OsString,
+    std_cmd: std::process::Command,
+    cwd: Option<std::path::PathBuf>,
+    enter: bool,
+}
 
 #[cfg(unix)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdProgram, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdLaunch, Error> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let words = crate::quote::posix::split(line.as_bytes())?;
@@ -438,7 +522,7 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
     if argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
-    let program = resolve_program(cmd, argv[0].clone());
+    let Resolved { program, cwd, enter } = resolve_program(cmd, argv[0].clone())?;
     let mut c = std::process::Command::new(&program);
     // When executable() overrides the loaded file, argv[0] from the command
     // line is the user's intended name — preserve it via arg0().
@@ -447,11 +531,16 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
         c.arg0(&argv[0]);
     }
     c.args(&argv[1..]);
-    Ok((program, c))
+    Ok(StdLaunch {
+        program,
+        std_cmd: c,
+        cwd,
+        enter,
+    })
 }
 
 #[cfg(windows)]
-fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<StdProgram, Error> {
+fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdLaunch, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
@@ -470,7 +559,12 @@ fn build_from_commandline(_cmd: &Command, line: &std::ffi::OsString) -> Result<S
     let program = std::ffi::OsString::from_wide(&first);
     let mut c = std::process::Command::new(&program);
     c.raw_arg(std::ffi::OsString::from_wide(&rest)); // args only — program is prepended by std
-    Ok((program, c))
+    Ok(StdLaunch {
+        program,
+        std_cmd: c,
+        cwd: cmd.cwd().map(std::path::Path::to_path_buf),
+        enter: false,
+    })
 }
 
 /// The prefix Win32 acts on: everything before the first interior NUL, where `CreateProcessW` and
@@ -507,9 +601,51 @@ fn win32_prefix(prog: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path>
     }
 }
 
+/// Refuse a program whose Win32-NORMALISED path — `GetFullPathNameW`'s result, which is what
+/// `CreateProcessW` loads — reaches a `.bat`/`.cmd`, for [`batch_refusal`]'s reason.
+///
+/// [`reject_batch_path`] reads `Path::extension()` of the token as written, which misses what
+/// normalisation exposes: `setup.bat.` and `setup.bat ` (one trailing space) become `setup.bat`,
+/// and `C:\t\.bat` has no extension to `Path` at all. This tests by suffix instead, as std's own
+/// `has_bat_extension` does, on every data-stream piece of the final component, each trimmed of
+/// trailing dots and spaces — so `x.bat::$DATA` is refused as its piece `x.bat`. Over-refusing a
+/// stream spelling is the safe direction.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn reject_normalised_batch_path(full: &std::path::Path) -> Result<(), Error> {
+    let text = full.as_os_str().to_string_lossy();
+    let name = text
+        .rsplit(['\\', '/'])
+        .next()
+        .expect("rsplit yields at least one piece");
+    let is_batch = |piece: &str| {
+        let piece = piece.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        piece.ends_with(".bat") || piece.ends_with(".cmd")
+    };
+    if name.split(':').any(is_batch) {
+        return Err(batch_refusal(full));
+    }
+    Ok(())
+}
+
+/// The refusal every batch gate returns, and the one statement of why.
+///
+/// Win32 runs a `.bat`/`.cmd` through `cmd.exe`, which re-parses the command line by rules of its
+/// own — its metacharacters (`&`, `|`, `^`, `%`) act even inside the quoting cosca writes for
+/// `CommandLineToArgvW`. So `args(["setup.bat", "a&calc"])` would also run `calc`. That is
+/// CVE-2024-24576 (BatBadBut); cosca refuses the file rather than implement cmd.exe escaping.
+fn batch_refusal(prog: &std::path::Path) -> Error {
+    Error::Unsupported {
+        op: format!("running {}", prog.display()),
+        platform: "windows",
+        detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
+                 use .commandline() to pass an explicit, pre-escaped command line"
+            .into(),
+    }
+}
+
 /// Reject a program token carrying an interior NUL, or naming a `.bat`/`.cmd`: Win32 silently
-/// truncates at the NUL (`PCWSTR` has no length), and cmd.exe batch escaping is a distinct,
-/// unimplemented vector (CVE-2024-24576 / BatBadBut). Shared by every backend — the std path
+/// truncates at the NUL (`PCWSTR` has no length), and a batch file is refused for
+/// [`batch_refusal`]'s reason. Shared by every backend — the std path
 /// (`build_std_command`), the raw one (`windows_raw::reject_batch_program`), and the elevated
 /// `ShellExecuteEx` launch.
 ///
@@ -563,13 +699,7 @@ fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Result<(), Error
     if let Some(ext) = loaded.extension() {
         let ext = ext.to_string_lossy().to_ascii_lowercase();
         if ext == "bat" || ext == "cmd" {
-            return Err(Error::Unsupported {
-                op: format!("running {}", loaded.display()),
-                platform: "windows",
-                detail: "cmd.exe batch escaping is not implemented (CVE-2024-24576); \
-                         use .commandline() to pass an explicit, pre-escaped command line"
-                    .into(),
-            });
+            return Err(batch_refusal(&loaded));
         }
     }
     Ok(())
@@ -930,3 +1060,7 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, unix))]
+#[path = "spawn/exact_posix_tests.rs"]
+mod exact_posix_tests;

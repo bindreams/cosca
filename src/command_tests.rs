@@ -1,4 +1,4 @@
-use crate::command::{Command, CommandInput};
+use crate::command::{Command, CommandInput, ExecutableSpec};
 use crate::containment::Nesting;
 use crate::stdio::{Direction, ResolvedStdio, Stdio};
 use crate::{ContainMode, Fd};
@@ -301,4 +301,49 @@ fn repeated_creation_flags_calls_replace_rather_than_accumulate() {
     );
     cmd.creation_flags(0);
     assert_eq!(cmd.flags_request().raw, 0, "zero clears a word set earlier");
+}
+
+// ===== executable vs raw_executable =====
+
+/// The two setters differ only in whether the path is later resolved, so the discriminant IS the
+/// feature: with one field and no variant, nothing downstream can tell "find this for me" from
+/// "load exactly this", and both contracts cannot coexist.
+#[test]
+fn executable_records_search_and_raw_executable_records_exact() {
+    let mut a = Command::new();
+    a.executable("helper");
+    assert!(matches!(a.executable_spec(), Some(ExecutableSpec::Search(p)) if p == Path::new("helper")));
+
+    let mut b = Command::new();
+    b.raw_executable("helper");
+    assert!(matches!(b.executable_spec(), Some(ExecutableSpec::Exact(p)) if p == Path::new("helper")));
+}
+
+/// One field, two setters: they are alternatives rather than additive, and the LAST call wins
+/// whichever order they arrive in. A caller switching from one to the other must not end up
+/// carrying both intents.
+#[test]
+fn last_executable_setter_wins_in_either_order() {
+    let mut a = Command::new();
+    a.executable("search-me").raw_executable("exact-me");
+    assert!(matches!(a.executable_spec(), Some(ExecutableSpec::Exact(p)) if p == Path::new("exact-me")));
+
+    let mut b = Command::new();
+    b.raw_executable("exact-me").executable("search-me");
+    assert!(matches!(b.executable_spec(), Some(ExecutableSpec::Search(p)) if p == Path::new("search-me")));
+}
+
+/// `executable_path()` stays variant-agnostic on purpose: most callers (the elevation `argv[0]`
+/// guards, backend routing, the argv and command-line builders) want only the path and don't care
+/// which setter produced it. Keeping this getter working means only the sites that actually
+/// resolve need to special-case `Exact`.
+#[test]
+fn executable_path_is_variant_agnostic() {
+    let mut a = Command::new();
+    a.executable("/bin/busybox");
+    assert_eq!(a.executable_path(), Some(Path::new("/bin/busybox")));
+
+    let mut b = Command::new();
+    b.raw_executable("/bin/busybox");
+    assert_eq!(b.executable_path(), Some(Path::new("/bin/busybox")));
 }

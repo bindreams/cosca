@@ -31,3 +31,29 @@ async fn tokio_child_elevation_is_none_without_elevate() {
     let child = c.spawn().expect("spawn");
     assert!(child.elevation().is_none());
 }
+
+/// The async builder hand-mirrors the sync one and parity is not compiler-enforced (see this
+/// module's own doc), so a delegate can silently go missing. This test pins that `raw_executable`
+/// exists and forwards correctly.
+///
+/// Asserted over the RECORDED spec rather than "a method was called", so it also pins that the
+/// delegate forwards to `raw_executable` and not to `executable`.
+#[test]
+fn tokio_raw_executable_records_an_exact_spec() {
+    use crate::command::ExecutableSpec;
+    use std::path::Path;
+
+    let mut c = super::Command::new();
+    c.raw_executable("helper");
+    assert!(
+        matches!(c.inner.executable_spec(), Some(ExecutableSpec::Exact(p)) if p == Path::new("helper")),
+        "raw_executable must record Exact, got {:?}",
+        c.inner.executable_spec()
+    );
+
+    // And the sibling setter still records Search through the same wrapper, so the two are not
+    // accidentally wired to the same inner method.
+    let mut s = super::Command::new();
+    s.executable("helper");
+    assert!(matches!(s.inner.executable_spec(), Some(ExecutableSpec::Search(_))));
+}

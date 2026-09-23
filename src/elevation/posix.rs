@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use super::plan::{BackendSet, Host, Os, Transition};
-use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Privilege, Secret};
-use crate::command::{Command, CommandInput, EnvOp};
+use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
+use crate::command::{Command, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
 use crate::stdio::{Fd, Stdio};
 
@@ -175,12 +175,14 @@ pub(super) fn resolve_on_path(program: &str) -> Option<PathBuf> {
     resolve_in_path_var(&std::env::var_os("PATH")?, program)
 }
 
-/// PURE path resolution over an explicit PATH value: check the exec bit and SKIP
-/// empty elements (an empty element is CWD — never resolve a backend there).
+/// Path resolution over an explicit PATH value: check the exec bit and SKIP every
+/// non-absolute element. An empty element means the cwd, and any relative one (`bin`, `.`)
+/// names a directory under it: a backend found there would be exec-checked against the cwd at
+/// detection and launched against whatever the cwd is later, so it is never resolved.
 pub(super) fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
     std::env::split_paths(path_var).find_map(|dir| {
-        if dir.as_os_str().is_empty() {
-            return None; // empty element = CWD; never resolve here
+        if !dir.is_absolute() {
+            return None;
         }
         let cand = dir.join(program);
         is_executable(&cand).then_some(cand)
@@ -432,54 +434,95 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
     map.into_iter().collect()
 }
 
-/// Program + args, honoring `executable()`. An argv[0] distinct from a set
-/// `executable()` cannot survive the backend wrapper → `Unsupported`.
-fn program_and_args(cmd: &Command) -> Result<(OsString, Vec<OsString>), Error> {
-    // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
-    // `Argv(vec![])`, so folding it into the commandline arm would answer "no
-    // program set" with a message about re-quoting a command line that was never set.
-    let empty = || Error::Unsupported {
-        op: "elevation of an empty command".into(),
-        platform: "unix",
-        detail: "set a program via .args([...]) before .elevate()".into(),
-    };
-    let argv =
-        match cmd.input() {
-            CommandInput::Argv(argv) => argv,
-            CommandInput::Empty => return Err(empty()),
-            CommandInput::CommandLine(_) => return Err(Error::Unsupported {
-                op: "elevation of a commandline() command".into(),
-                platform: "unix",
-                detail:
-                    "elevation requires an argv command (set .args([...])); a raw command line cannot be safely wrapped"
-                        .into(),
-            }),
-        };
-    if argv.is_empty() {
-        return Err(empty());
+/// The argv, refused unless a backend can wrap it ([`super::elevation_argv`]).
+fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
+    super::elevation_argv(
+        cmd,
+        &super::ArgvRefusals {
+            platform: "unix",
+            op_prefix: "elevation",
+            commandline: "elevation requires an argv command (set .args([...])); a raw command line cannot be \
+                          safely wrapped",
+            argv0: "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot \
+                    survive elevation",
+        },
+    )
+}
+
+/// Program + args + the directory to run them in, for a backend that moves its cwd; a
+/// `raw_executable()` program comes back absolute ([`Command::posix_launch`]), so the wrapper
+/// cannot search for it. The path is re-resolved after authentication, so a rename of an ancestor
+/// during the prompt can still swap the file: these backends take no directory object.
+fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<Launch, Error> {
+    let argv = checked_argv(cmd)?;
+    let launch = cmd.posix_launch(process_cwd)?;
+    Ok(Launch {
+        program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
+        args: argv[1..].to_vec(),
+        cwd: launch.cwd,
+    })
+}
+
+/// Whether `backend` runs the program in the directory it was itself started in. The wrapper is
+/// then started in the caller's directory, and inherits it as a directory OBJECT, not a path.
+///
+/// Measured: `sudo` (1.9.13, 1.9.17) keeps it unless a sudoers `runcwd` moves it, `doas`
+/// (OpenDoas, Debian 12) keeps it, and `pkexec` always moves it to the target's home. `run0`,
+/// not measured, hands the service manager its directory as a `WorkingDirectory=` path, re-resolved
+/// after authentication, so it is treated like `pkexec`.
+fn keeps_cwd(backend: Backend) -> bool {
+    match backend {
+        Backend::Sudo | Backend::Doas => true,
+        Backend::Pkexec | Backend::Run0 => false,
+        Backend::Auto => unreachable!("the planner resolves Auto"),
     }
-    match cmd.executable_path() {
-        Some(exe) => {
-            if argv[0].as_os_str() != exe.as_os_str() {
-                return Err(Error::Unsupported {
-                    op: "elevation with an argv[0] distinct from executable()".into(),
-                    platform: "unix",
-                    detail: "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot survive elevation".into(),
-                });
-            }
-            Ok((exe.as_os_str().to_os_string(), argv[1..].to_vec()))
+}
+
+/// Program + args + directory for a backend that [keeps its cwd](keeps_cwd): a
+/// `raw_executable()` program in the unelevated spawn's form ([`crate::resolve::exact::anchor_posix`]
+/// — `./tool`), and `current_dir()` as given, entered by the wrapper at `fork`. Reads nothing.
+///
+/// The backend reads `./tool` against the directory object it inherited, after authenticating,
+/// so a rename of an ancestor during the prompt cannot swap the file loaded; an absolute path
+/// would be re-resolved then. Measured under `sudo -S`, blocked on its password while an
+/// ancestor was renamed and another tree moved into its place: the absolute path ran the
+/// substitute, `./tool` the original.
+///
+/// A sudoers `runcwd` moves `sudo`'s child before the exec, and `./tool` is then read there —
+/// measured: `sudo: unable to execute ./tool: No such file or directory` under `runcwd=~`. That
+/// directory is the administrator's choice, as `secure_path` is for a bare name, so this never
+/// loads a file an unprivileged user placed; the absolute path, which would load the named file
+/// there, is the one a rename can swap.
+fn anchored_program_and_args(cmd: &Command) -> Result<Launch, Error> {
+    let argv = checked_argv(cmd)?;
+    let program = match cmd.executable_spec() {
+        Some(crate::command::ExecutableSpec::Exact(p)) => {
+            crate::resolve::exact::anchor_posix(p.as_os_str(), cmd.cwd())?
+                .program
+                .into_os_string()
         }
-        None => Ok((argv[0].clone(), argv[1..].to_vec())),
-    }
+        Some(crate::command::ExecutableSpec::Search(p)) => p.as_os_str().to_os_string(),
+        None => argv[0].clone(),
+    };
+    Ok(Launch {
+        program,
+        args: argv[1..].to_vec(),
+        cwd: cmd.cwd().map(Path::to_path_buf),
+    })
 }
 
 /// Structural request-validation, evaluated against the REQUESTED backend so the verdict
 /// is privilege-independent. Run BEFORE the already-elevated short-circuit, so an
 /// already-elevated caller gets the same rejection. (Backend availability + NoTty are
 /// environmental and stay in the planner, after the short-circuit.)
+///
+/// Reads nothing: an already-root caller runs no backend, and needs no path to its cwd.
 fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) -> Result<(), Error> {
-    // commandline() / empty / distinct-argv0.
-    program_and_args(cmd)?;
+    // commandline() / empty / distinct-argv0, and a `raw_executable()` that names no file.
+    checked_argv(cmd)?;
+    if let Some(crate::command::ExecutableSpec::Exact(p)) = cmd.executable_spec() {
+        crate::resolve::exact::refuse_unnameable(p.as_os_str())?;
+    }
     if cmd.fds().keys().any(|f| f.raw() >= 3) {
         return Err(Error::Unsupported {
             op: "fd >= 3 on an elevated POSIX child".into(),
@@ -524,13 +567,14 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
     Ok(())
 }
 
-/// Transfer the caller's cwd / containment / kill-on-drop onto the derived command.
+/// Transfer the caller's cwd (the [`Launch`]'s, so it matches the program) /
+/// containment / kill-on-drop onto the derived command.
 /// Does NOT suppress the fd marker — that is only correct for a real wrapper spawn
 /// (`ElevatePosix`), whose `closefrom` destroys it; `RunAsIs`'s derived command spawns the
 /// original program directly, with no wrapper to destroy anything, so its caller must
 /// suppress explicitly if that arm ever needs to.
-fn transfer_process_attrs(derived: &mut Command, cmd: &Command) {
-    if let Some(d) = cmd.cwd() {
+fn transfer_process_attrs(derived: &mut Command, cmd: &Command, cwd: Option<PathBuf>) {
+    if let Some(d) = cwd {
         derived.current_dir(d);
     }
     derived.set_contain(cmd.contain_request());
@@ -544,10 +588,22 @@ pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
     rewrite_with_host(cmd, &Host::detect())
 }
 
-/// PURE given `host`: gate + plan + sanitize + build a DERIVED command. The caller's
+/// PURE given `host` (and, for a relative `raw_executable()`, this process's cwd): gate + plan +
+/// sanitize + build a DERIVED command. The caller's
 /// `Command` `input`/`env_ops` are left untouched (non-destructive): the caller's fd 0-2
 /// stdio is MOVED into the derived command (`ResolvedStdio::File` is not `Clone`).
 pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
+    rewrite_with_host_and_cwd(cmd, host, std::env::current_dir)
+}
+
+/// [`rewrite_with_host`], reading this process's cwd through `process_cwd` — at most once, so
+/// the program and the directory it runs in cannot come from two different readings, and only
+/// for a backend, which runs in another process and so needs a path.
+pub(crate) fn rewrite_with_host_and_cwd(
+    cmd: &mut Command,
+    host: &Host,
+    process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PosixRewrite, Error> {
     let requested_backend = cmd.elevation_request().backend;
     let requested_auth = cmd.elevation_request().auth.clone();
 
@@ -569,7 +625,8 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
         Transition::Reject { error } => Err(error),
         Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
         Transition::ElevateMacosGui { osascript, arg_max } => {
-            let (derived, report) = super::macos::build_rewrite(cmd, &osascript, arg_max)?;
+            let launch = super::macos::program_and_args(cmd, process_cwd)?;
+            let (derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
             Ok(PosixRewrite {
                 derived: Some(derived),
                 report: Some(report),
@@ -582,17 +639,16 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
         Transition::RunAsIs => {
             // Already elevated: no wrapper, but the sanitizer STILL runs so a dangerous
             // forwarded var never reaches the root child. Build a non-destructive derived
-            // command (the ORIGINAL program + args, sanitized env, fds MOVED).
+            // command (the ORIGINAL program, executable and args, sanitized env, fds MOVED).
+            // No backend runs, so the derived command spawns as an unelevated one does, and a
+            // `raw_executable()` needs no path to this process's cwd.
             let (kept, stripped) = cmd.elevation_request().sanitizer.apply(explicit_set_env(cmd.env_ops()));
-            let (program, args) = program_and_args(cmd)?;
-            let mut argv = Vec::with_capacity(args.len() + 1);
-            argv.push(program);
-            argv.extend(args);
             let env_ops: Vec<EnvOp> = kept.iter().map(|(k, v)| EnvOp::Set(k.clone(), v.clone())).collect();
             let mut derived = Command::new();
-            derived.set_input_argv(argv);
+            derived.set_input_argv(checked_argv(cmd)?.to_vec());
+            derived.set_executable_spec(cmd.executable_spec().cloned());
             derived.set_env_ops(env_ops);
-            transfer_process_attrs(&mut derived, cmd);
+            transfer_process_attrs(&mut derived, cmd, cmd.cwd().map(Path::to_path_buf));
             for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
                 derived.fds_mut().insert(slot, resolved);
             }
@@ -620,7 +676,11 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                             .into(),
                 });
             }
-            let (program, args) = program_and_args(cmd)?;
+            let Launch { program, args, cwd } = if keeps_cwd(backend) {
+                anchored_program_and_args(cmd)?
+            } else {
+                program_and_args(cmd, process_cwd)?
+            };
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
@@ -638,7 +698,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             let mut derived = Command::new();
             derived.set_input_argv(argv);
             derived.set_env_ops(new_ops);
-            transfer_process_attrs(&mut derived, cmd);
+            transfer_process_attrs(&mut derived, cmd, cwd);
             // Only THIS arm's derived command is a real wrapper spawn (`sudo`/`doas`/`pkexec`
             // …): its `closefrom` destroys an installed marker, so the marker must not be
             // installed on it at all. `RunAsIs` spawns the original program with no wrapper —

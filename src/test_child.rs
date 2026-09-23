@@ -321,3 +321,34 @@ pub(crate) fn spawn_async_blocker() -> (crate::tokio::Child, std::net::TcpStream
     assert_eq!(&tag, b"R", "unexpected control tag");
     (child, sock)
 }
+
+/// Exit code of the `tool` in [`cwd_and_path_tools`]'s first directory.
+#[cfg(unix)]
+pub(crate) const CWD_TOOL_EXIT: i32 = 11;
+/// Exit code of the `tool` in [`cwd_and_path_tools`]'s second directory.
+#[cfg(unix)]
+pub(crate) const PATH_TOOL_EXIT: i32 = 22;
+
+/// Two directories, each holding an executable script named `tool` that exits with its own code
+/// ([`CWD_TOOL_EXIT`], [`PATH_TOOL_EXIT`]), so a child's exit status says which one was loaded.
+/// Meant as the child's working directory and its `PATH`, respectively.
+///
+/// Each write is serialized against every other spawn's `fork` and the guard dropped before the
+/// caller's spawn: a `fork` while a script's writable descriptor is open leaves the forked child
+/// holding it until it execs, and `execve` of that script then fails with `ETXTBSY`. The lock is
+/// not reentrant, so holding it across a `spawn()` would deadlock.
+#[cfg(unix)]
+pub(crate) fn cwd_and_path_tools() -> (tempfile::TempDir, tempfile::TempDir) {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    for (dir, code) in [(&dirs.0, CWD_TOOL_EXIT), (&dirs.1, PATH_TOOL_EXIT)] {
+        let tool = dir.path().join("tool");
+        let _guard = crate::child::spawn::spawn_lock();
+        std::fs::write(&tool, format!("#!/bin/sh\nexit {code}\n")).expect("write tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    }
+    dirs
+}

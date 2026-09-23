@@ -51,7 +51,7 @@ use crate::child::spawn::{
     attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, PipeOwnership,
 };
 use crate::child::Child;
-use crate::command::{Command, CommandInput, EnvOp};
+use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -62,16 +62,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
     reject_batch_program(cmd)?;
 
-    // A route to this backend never implies `executable()` is set (it can be reached purely by
-    // `fd >= 3`, see `routes_to_raw_backend`). Falling back to `program_token` here keeps
-    // `lpApplicationName` non-NULL either way: a NULL `lpApplicationName` makes `CreateProcessW`
-    // search for the image ITSELF, including the current directory, reopening the binary-planting
-    // hole this resolver otherwise closes.
-    let program: Option<PathBuf> = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
     let spawn_env = spawn_env(cmd)?;
-    let image: Option<PathBuf> = program
-        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), spawn_env.path.as_deref()))
-        .transpose()?;
+    let image: Option<PathBuf> = image_for(cmd, spawn_env.path.as_deref())?;
     if let Some(p) = &image {
         resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
     }
@@ -316,6 +308,51 @@ pub(crate) fn spawn_step(
     // environment as of NOW, not the snapshot its image was resolved against.
     proc::create_process(Some(app), cmdline, si, Some(env), cwd, flags)
         .map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, request))
+}
+
+/// Which file this backend will load, applying cosca's resolution policy to a `Search` program
+/// and deliberately NOT applying it to an `Exact` one.
+///
+/// `pub(crate)`: shared verbatim with the async raw backend so the two cannot silently diverge.
+///
+/// The three arms:
+///
+/// - `Search` — from `executable()`. Resolved through [`resolve::resolve_executable`]: the
+///   child's cwd, the child's `PATH`, the `.exe` rules. Always absolute on success.
+/// - `Exact` — from `raw_executable()`. Passed through untouched once
+///   [`resolve::absolutise_exact`] has found that it names a file. This is the ONE site on
+///   Windows that would otherwise resolve it, silently turning a bare `raw_executable("tool")`
+///   into a `PATH` lookup and breaking the contract at its only user. A relative value keeps
+///   `lpApplicationName`'s own meaning, which completes it against the CALLING process's current
+///   directory (see `Command::raw_executable`'s doc).
+/// - neither setter — a route here never implies either was called (it can be reached purely by
+///   `fd >= 3`, see `routes_to_raw_backend`). [`program_token`] supplies argv[0] or the command
+///   line's first token, and THAT is resolved, which is what keeps `lpApplicationName` non-NULL.
+///   See [`app_name_wide`] for why NULL is a security boundary.
+///
+/// Whichever arm produced it, the path the loader reaches must pass
+/// [`reject_normalised_batch_path`](crate::child::spawn::reject_normalised_batch_path).
+pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<PathBuf>, Error> {
+    // `(image, loaded)`: what `lpApplicationName` gets, and the path the loader reaches through it.
+    // They differ only for `Exact`, whose token the loader completes itself.
+    let (image, loaded) = match cmd.executable_spec() {
+        Some(ExecutableSpec::Search(p)) => {
+            let r = resolve::resolve_executable(p, cmd.cwd(), path)?;
+            (r.clone(), r)
+        }
+        Some(ExecutableSpec::Exact(p)) => (p.to_path_buf(), resolve::absolutise_exact(p)?),
+        None => match program_token(cmd) {
+            Some(t) => {
+                let r = resolve::resolve_executable(&t, cmd.cwd(), path)?;
+                (r.clone(), r)
+            }
+            None => return Ok(None),
+        },
+    };
+    // Every arm: resolution can land on `setup.bat.` or `.bat` as written, which
+    // `reject_batch_program`'s `Path::extension()` reading does not see as a batch file.
+    crate::child::spawn::reject_normalised_batch_path(&loaded)?;
+    Ok(Some(image))
 }
 
 /// The resolved image as the NUL-terminated wide string `CreateProcessW` takes for

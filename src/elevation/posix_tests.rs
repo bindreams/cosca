@@ -286,6 +286,54 @@ fn empty_path_element_is_not_resolved_from_cwd() {
     assert_eq!(super::resolve_in_path_var(OsStr::new(":"), "sudo"), None);
 }
 
+const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH_ELEMENTS";
+
+/// A relative `PATH` element (`relbin`, `.`) names a directory under the cwd at detection time, and
+/// a backend found there would be exec-checked against one directory and run from another — or
+/// not found by path at all. `relbin/sudo` and `./sudo` are planted in the fixture's real cwd, so
+/// skipping them is observable only if the element is refused rather than merely missed.
+#[cfg(unix)]
+#[test]
+fn relative_path_elements_are_never_resolved() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = tempfile::tempdir().unwrap();
+    for dir in ["relbin", "abs", "."] {
+        let sudo = cwd.path().join(dir).join("sudo");
+        std::fs::create_dir_all(sudo.parent().unwrap()).unwrap();
+        std::fs::write(&sudo, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    crate::test_child::run_fixture_with_cwd(
+        crate::test_child::fixture_path!(fixture_relative_path_elements_are_never_resolved),
+        cwd.path(),
+        FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER,
+    );
+}
+
+/// The child half of [`relative_path_elements_are_never_resolved`], run with the prepared
+/// directory as its real cwd; inert in an ordinary suite run.
+#[cfg(unix)]
+#[test]
+fn fixture_relative_path_elements_are_never_resolved() {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
+        return;
+    };
+    for relative in ["relbin", ".", "./relbin"] {
+        assert_eq!(
+            super::resolve_in_path_var(OsStr::new(relative), "sudo"),
+            None,
+            "{relative}"
+        );
+    }
+    let abs = cwd.join("abs");
+    let path_var = format!("relbin:{}", abs.display());
+    assert_eq!(
+        super::resolve_in_path_var(OsStr::new(&path_var), "sudo"),
+        Some(abs.join("sudo")),
+        "a relative element must be skipped, not resolved ahead of an absolute one"
+    );
+}
+
 #[cfg(unix)]
 mod rewrite_tests {
     use super::super::{password_line, rewrite_with_host, PendingPassword, PosixRewrite};
@@ -892,6 +940,314 @@ mod rewrite_tests {
             !derived.fd_marker_suppressed(),
             "RunAsIs spawns the original program with no wrapper; suppressing the marker here \
              is a false justification and loses setsid-proof containment for no reason"
+        );
+    }
+
+    // ===== raw_executable(): the wrapper is handed an absolute path =====
+
+    fn exact_tool(cwd: Option<&str>) -> Command {
+        let mut c = Command::new();
+        c.raw_executable("tool")
+            .args(["tool", "-x"])
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
+        c
+    }
+
+    /// [`exact_tool`] under `pkexec`, a backend that moves its cwd and so gets a completed path.
+    fn pkexec_tool(cwd: Option<&str>) -> Command {
+        let mut c = exact_tool(cwd);
+        c.elevation_backend(Backend::Pkexec).elevation_auth(Auth::Gui);
+        c
+    }
+
+    /// `pkexec` searches its own `PATH` for a bare name, so a bare `tool` would load whatever that
+    /// search finds instead of the file in the child's working directory.
+    #[test]
+    fn a_bare_exact_program_reaches_pkexec_completed_against_the_childs_cwd() {
+        let rw = rewrite_with_host(&mut pkexec_tool(Some("/work")), &every_backend_host()).expect("rewrite");
+        let a = derived_argv(&rw);
+        assert!(a.ends_with(&[OsString::from("/work/tool"), "-x".into()]), "{a:?}");
+    }
+
+    #[test]
+    fn a_bare_exact_program_without_a_cwd_is_completed_against_the_process_cwd() {
+        // Reads the process cwd twice (here and in the rewrite); no test in this binary moves it
+        // (`tests/no_chdir_guard.rs`), so both readings agree.
+        let rw = rewrite_with_host(&mut pkexec_tool(None), &every_backend_host()).expect("rewrite");
+        let want = std::env::current_dir().unwrap().join("tool").into_os_string();
+        assert!(derived_argv(&rw).contains(&want), "{:?}", derived_argv(&rw));
+    }
+
+    /// `RunAsIs` spawns the program itself; it must be the completed one there too.
+    #[test]
+    fn an_already_elevated_exact_program_is_spawned_as_an_unelevated_one_is() {
+        for cwd in [Some("/work"), Some("sub"), None] {
+            let rw = super::super::rewrite_with_host_and_cwd(&mut exact_tool(cwd), &elevated_sudo_host(), || {
+                panic!("no backend runs, so nothing needs this process's cwd as a path")
+            })
+            .expect("rewrite");
+            let derived = rw.derived.as_ref().expect("derived");
+            assert!(
+                matches!(derived.executable_spec(), Some(crate::command::ExecutableSpec::Exact(p)) if p == std::path::Path::new("tool")),
+                "{:?}",
+                derived.executable_spec()
+            );
+            assert_eq!(derived_argv(&rw), [OsString::from("tool"), "-x".into()]);
+            assert_eq!(derived.cwd(), cwd.map(std::path::Path::new));
+        }
+    }
+
+    #[test]
+    fn an_elevated_exact_program_that_names_no_file_is_refused() {
+        for n in ["", ".", "dir/"] {
+            let mut c = Command::new();
+            c.raw_executable(n)
+                .args([n])
+                .elevation_backend(Backend::Sudo)
+                .elevation_auth(Auth::NonInteractive);
+            match rewrite_with_host(&mut c, &sudo_host()) {
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                other => panic!(
+                    "{n:?} names no file and must be Io(InvalidInput), got {:?}",
+                    other.err()
+                ),
+            }
+        }
+    }
+
+    /// The derived command's working directory: absolute, and the directory `program` was
+    /// completed against — one reading of the process cwd for both.
+    fn assert_runs_where_completed(rw: &PosixRewrite, program: &OsString) {
+        let cwd = rw.derived.as_ref().expect("derived").cwd().expect("a pinned cwd");
+        assert!(cwd.is_absolute(), "{cwd:?}");
+        assert_eq!(Some(cwd), std::path::Path::new(program).parent(), "{program:?}");
+    }
+
+    /// Under a wrapper, with a relative `current_dir` or none.
+    #[test]
+    fn an_elevated_exact_programs_cwd_is_the_directory_it_was_completed_against() {
+        for cwd in [Some("sub"), None] {
+            let rw = rewrite_with_host(&mut pkexec_tool(cwd), &every_backend_host()).expect("rewrite");
+            let a = derived_argv(&rw);
+            assert_runs_where_completed(&rw, &a[a.len() - 2]);
+        }
+    }
+
+    /// A second reading could differ from the first, loading the program from one directory and
+    /// running it in another — for every backend that needs a path.
+    #[test]
+    fn a_rewrite_reads_the_process_cwd_exactly_once() {
+        let mut gui = exact_tool(None);
+        gui.elevation_backend(Backend::Auto).elevation_auth(Auth::Gui);
+        let cases = [(pkexec_tool(None), every_backend_host()), (gui, macos_gui_host(false))];
+        for (mut c, host) in cases {
+            let reads = std::cell::Cell::new(0);
+            let rw = super::super::rewrite_with_host_and_cwd(&mut c, &host, || {
+                reads.set(reads.get() + 1);
+                Ok(PathBuf::from("/proc-cwd"))
+            })
+            .expect("rewrite");
+            let via = rw.report.as_ref().map(|r| r.via.clone());
+            assert_eq!(reads.get(), 1, "{via:?}");
+            // A build that re-read the real cwd behind the injected one would pass the count alone.
+            let derived = rw.derived.as_ref().expect("derived");
+            assert_eq!(derived.cwd(), Some(std::path::Path::new("/proc-cwd")), "{via:?}");
+            let argv = derived_argv(&rw);
+            // pkexec is handed the completed path; osascript's script `cd`s to the directory.
+            assert!(
+                argv.iter().any(|a| {
+                    let a = a.to_string_lossy();
+                    a == "/proc-cwd/tool" || a.contains("cd -P -- /proc-cwd && exec ./tool")
+                }),
+                "{via:?}: {argv:?}"
+            );
+        }
+    }
+
+    /// Negative control: a `Search` program's relative `current_dir` is passed through.
+    #[test]
+    fn an_elevated_search_programs_relative_cwd_is_passed_through() {
+        let mut c = exact_tool(Some("sub"));
+        c.executable("tool");
+        let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
+        assert_eq!(
+            rw.derived.as_ref().expect("derived").cwd(),
+            Some(std::path::Path::new("sub"))
+        );
+    }
+
+    /// The backend runs in another process and needs a path; a cwd with none fails loudly, with the
+    /// OS's kind kept.
+    #[test]
+    fn an_elevated_exact_program_in_a_cwd_with_no_path_says_why() {
+        let r = super::super::rewrite_with_host_and_cwd(&mut pkexec_tool(None), &every_backend_host(), || {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        });
+        match r {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(e.to_string().contains("working directory as a path"), "{e}");
+                let errno = std::error::Error::source(&e)
+                    .and_then(|s| s.downcast_ref::<std::io::Error>())
+                    .and_then(std::io::Error::raw_os_error);
+                assert_eq!(errno, Some(libc::EACCES), "the errno must survive as the source");
+            }
+            Err(other) => panic!("expected Io, got {other}"),
+            Ok(_) => panic!("a cwd with no path cannot be handed to the backend"),
+        }
+    }
+
+    /// A host offering every CLI backend, for a request that names one.
+    fn every_backend_host() -> Host {
+        Host {
+            available: BackendSet {
+                run0: Some(PathBuf::from("/usr/bin/run0")),
+                sudo: Some(PathBuf::from("/usr/bin/sudo")),
+                doas: Some(PathBuf::from("/usr/bin/doas")),
+                pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
+                osascript: None,
+            },
+            ..sudo_host()
+        }
+    }
+
+    /// The rewrite with `/proc-cwd` as this process's cwd.
+    fn rewrite_at_proc_cwd(c: &mut Command, host: &Host) -> PosixRewrite {
+        super::super::rewrite_with_host_and_cwd(c, host, || Ok(PathBuf::from("/proc-cwd"))).expect("rewrite")
+    }
+
+    /// Its presence marks a deliberate re-exec of [`fixture_elevated_exact_in_an_unlinked_cwd`].
+    const FIXTURE_UNLINKED_CWD_ENV: &str = "COSCA_FIXTURE_UNLINKED_CWD";
+
+    /// Inert in an ordinary suite run. Re-executed by
+    /// [`an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read`], it waits for one byte on
+    /// stdin — sent once its cwd has been removed — then rewrites for `pkexec`.
+    #[test]
+    fn fixture_elevated_exact_in_an_unlinked_cwd() {
+        use std::io::Read;
+        if std::env::var_os(FIXTURE_UNLINKED_CWD_ENV).is_none() {
+            return;
+        }
+        std::io::stdin().read_exact(&mut [0u8; 1]).expect("gate byte");
+        assert!(std::env::current_dir().is_err(), "precondition: the cwd is unlinked");
+        match rewrite_with_host(&mut pkexec_tool(None), &every_backend_host()) {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+                assert!(e.to_string().contains("working directory as a path"), "{e}");
+            }
+            Err(other) => panic!("expected Io(NotFound), got {other}"),
+            Ok(_) => panic!("an unlinked cwd has no path to hand pkexec"),
+        }
+    }
+
+    /// An unlinked cwd has no path on any OS: the read itself fails, with `NotFound`, where an
+    /// unsearchable ancestor fails it only on macOS. The cwd is removed from under a child this
+    /// test spawned in it, so this process's own cwd never moves.
+    #[test]
+    fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
+        use std::io::Write;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("gone");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let mut child = {
+            // Every fork in this binary holds it; see `crate::test_child::run_fixture_with_cwd`.
+            let _guard = crate::child::spawn::spawn_lock();
+            std::process::Command::new(std::env::current_exe().expect("current_exe"))
+                .args([
+                    "--test-threads=1",
+                    "--exact",
+                    crate::test_child::fixture_path!(fixture_elevated_exact_in_an_unlinked_cwd),
+                ])
+                .env(FIXTURE_UNLINKED_CWD_ENV, "1")
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the fixture")
+        };
+        std::fs::remove_dir(&dir).expect("rmdir the fixture's cwd");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"x")
+            .expect("release the fixture");
+        let out = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `sudo` and `doas` keep the cwd they are started in, so they are handed `./tool` and started
+    /// in the caller's directory: they read the name against that directory OBJECT after
+    /// authenticating, and a rename of an ancestor during the prompt cannot swap the file.
+    #[test]
+    fn a_cwd_keeping_backend_gets_the_program_anchored_to_the_inherited_cwd() {
+        for backend in [Backend::Sudo, Backend::Doas] {
+            for cwd in [None, Some("sub"), Some("/work")] {
+                let mut c = exact_tool(cwd);
+                c.elevation_backend(backend);
+                let rw = super::super::rewrite_with_host_and_cwd(&mut c, &every_backend_host(), || {
+                    panic!("{backend:?} needs no path to this process's cwd")
+                })
+                .expect("rewrite");
+                let a = derived_argv(&rw);
+                assert!(
+                    a.ends_with(&[OsString::from("--"), "./tool".into(), "-x".into()]),
+                    "{backend:?} {cwd:?}: {a:?}"
+                );
+                assert_eq!(
+                    rw.derived.as_ref().expect("derived").cwd(),
+                    cwd.map(std::path::Path::new)
+                );
+            }
+        }
+    }
+
+    /// `pkexec` and `run0` start the program in a directory of their own choosing, so they get an
+    /// absolute path, completed against one reading of the process cwd.
+    #[test]
+    fn a_cwd_moving_backend_gets_the_program_completed() {
+        for backend in [Backend::Pkexec, Backend::Run0] {
+            let auth = if backend == Backend::Pkexec {
+                Auth::Gui
+            } else {
+                Auth::NonInteractive
+            };
+            let mut c = exact_tool(None);
+            c.elevation_backend(backend).elevation_auth(auth);
+            let rw = rewrite_at_proc_cwd(&mut c, &every_backend_host());
+            let a = derived_argv(&rw);
+            assert!(a.ends_with(&[OsString::from("/proc-cwd/tool"), "-x".into()]), "{a:?}");
+            assert_eq!(
+                rw.derived.as_ref().expect("derived").cwd(),
+                Some(std::path::Path::new("/proc-cwd"))
+            );
+        }
+    }
+
+    /// Negative control: a `Search` program still reaches the wrapper as written.
+    #[test]
+    fn an_elevated_search_program_is_passed_as_written() {
+        let mut c = Command::new();
+        c.executable("tool")
+            .args(["tool", "-x"])
+            .current_dir("/work")
+            .elevation_backend(Backend::Sudo)
+            .elevation_auth(Auth::NonInteractive);
+        let a = derived_argv(&rewrite_with_host(&mut c, &sudo_host()).expect("rewrite"));
+        assert_eq!(
+            a[a.len() - 3..],
+            [OsString::from("--"), "tool".into(), "-x".into()],
+            "{a:?}"
         );
     }
 }

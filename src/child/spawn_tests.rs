@@ -118,6 +118,17 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     exe_only.executable("cmd").args(["cmd", "/C", "exit 0"]);
     assert!(super::routes_to_raw_backend(&exe_only), "an executable() routes to raw");
 
+    // BOTH setters must route here. The rule reads `executable_path()`, which is deliberately
+    // variant-agnostic, so this holds today — the case exists to stop it being "tightened" to
+    // `Search` only. That would send `raw_executable()` down the std path, where std resolves a
+    // bare name itself, breaking the no-resolution contract at the one backend that honours it.
+    let mut raw_exe_only = Command::new();
+    raw_exe_only.raw_executable("cmd").args(["cmd", "/C", "exit 0"]);
+    assert!(
+        super::routes_to_raw_backend(&raw_exe_only),
+        "a raw_executable() routes to raw too"
+    );
+
     let mut high_fd_only = Command::new();
     high_fd_only.args(["cmd", "/C", "exit 0"]);
     high_fd_only.fd(3, Stdio::pipe_out()).unwrap();
@@ -292,6 +303,80 @@ fn on_win32(token: &std::ffi::OsStr) -> Result<(), Error> {
 /// The gate under a POSIX verdict, ditto.
 fn on_posix(token: &std::ffi::OsStr) -> Result<(), Error> {
     super::reject_batch_path_on(std::path::Path::new(token), false)
+}
+
+/// Normalisation leaves batch names `Path::extension()` cannot see: `.bat` is a bare name to it,
+/// and a data-stream piece hides behind `:`.
+#[test]
+fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
+    for p in [
+        r"C:\t\.bat",
+        r"C:\t\SETUP.CMD",
+        r"C:\t\x.exe:payload.bat",
+        r"C:\t\x.bat::$DATA",
+        r"C:\t\x.bat.:s",
+        r"C:\t\x.bat :s",
+    ] {
+        assert_eq!(
+            unsupported_op(super::reject_normalised_batch_path(std::path::Path::new(p))),
+            format!("running {p}")
+        );
+    }
+    for p in [
+        r"C:\t\setup.exe",
+        r"C:\t\setup.bat.exe",
+        r"C:\t.bat\setup.exe",
+        r"C:\t\batch",
+    ] {
+        assert!(
+            super::reject_normalised_batch_path(std::path::Path::new(p)).is_ok(),
+            "{p}"
+        );
+    }
+}
+
+/// Argv and command-line commands on the default std route (no `executable()`, no fd >= 3).
+#[cfg(windows)]
+fn std_routed(args: &[&str], lines: &[&str]) -> Vec<(String, Command)> {
+    let mut out = Vec::new();
+    for &n in args {
+        let mut c = Command::new();
+        c.args([n]);
+        out.push((format!("args([{n:?}])"), c));
+    }
+    for &l in lines {
+        let mut c = Command::new();
+        c.commandline(l);
+        out.push((format!("commandline({l:?})"), c));
+    }
+    for (via, c) in &out {
+        assert!(!super::routes_to_raw_backend(c), "{via} must take the std route");
+    }
+    out
+}
+
+/// std runs a batch file through cmd.exe once `GetFullPathNameW` has trimmed the name, and a
+/// `commandline()` tail reaches it unescaped, so these must be refused as they are on the raw route.
+#[cfg(windows)]
+#[test]
+fn the_std_route_refuses_a_batch_only_normalisation_exposes() {
+    // Trailing dot; one trailing space; a file named `.bat`.
+    for (via, c) in std_routed(&["x.bat.", "x.bat ", ".bat"], &["x.bat. a&b"]) {
+        match super::build_std_command(&c) {
+            Err(Error::Unsupported { .. }) => {}
+            other => panic!("{via}: expected Unsupported, got {:?}", other.map(|_| "a command")),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_std_route_accepts_an_exe_named_like_a_batch() {
+    for (via, c) in std_routed(&["x.bat.exe", "tool.exe"], &["x.bat.exe a&b"]) {
+        if let Err(e) = super::build_std_command(&c) {
+            panic!("{via}: {e:?}");
+        }
+    }
 }
 
 /// The Win32 verdict refuses an interior NUL too, on BOTH NUL/batch shapes — the derivation is in
