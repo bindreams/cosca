@@ -1,42 +1,40 @@
 //! Test-only child processes shared across the crate's unit tests.
 
-/// RAII guard for a unit test that must mutate the process's (global) current directory: restores
-/// it on drop, including mid-unwind, so a panicking assertion never leaves the (multithreaded)
-/// test binary in a corrupted cwd for every other test that runs afterward.
+/// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
+/// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
+/// cwd is `cwd` — proving whatever the fixture's body proves about a process's REAL cwd without
+/// ever mutating THIS (shared, multithreaded) test binary's own cwd, which every other
+/// concurrently running test in this binary would otherwise race. `Command::current_dir` sets the
+/// CHILD's cwd before its own `exec`/`CreateProcessW`, so no window exists where this process's
+/// cwd is anything other than what it always was.
 ///
-/// The cwd is process-global, so an unguarded `set_current_dir` races every concurrent spawn AND
-/// every other cwd-sensitive test in the same binary. Callers MUST additionally hold
-/// `crate::child::spawn::spawn_lock()` for the guard's whole lifetime, declaring the lock guard
-/// FIRST so it drops LAST (after this restores the cwd). Note precisely what that lock does and
-/// does not buy: it is the lock every spawn's `CreateProcessW`/fork call itself serializes on, but
-/// program *resolution* (`resolve_executable`, which reads `std::env::current_dir()` for the
-/// `cmd_cwd: None` fallback) runs BEFORE that lock is taken — see
-/// `child::spawn::windows_raw::resolve::resolve_executable` and `spawn_raw`. So this pairing
-/// serializes cwd-mutating tests against each other and against most of a concurrent spawn's own
-/// window, but not against another thread's resolution step specifically; there is no stronger
-/// lock in this crate to pair with instead.
+/// `marker_env` is set to `"1"` in the child only, so the fixture can tell this deliberate re-exec
+/// apart from being picked up by an ordinary, unfiltered suite run — where it must no-op rather
+/// than assert against whatever the suite's own ambient cwd happens to be. Mirrors every other
+/// fixture in this file (e.g. [`fixture_registers_then_blocks`]), which use an address env var for
+/// the same tell.
 ///
-/// `Drop` deliberately does NOT `.expect()`/panic on a failed restore: aborting the whole test
-/// binary (a panic during unwinding is panic-in-panic, which aborts the process) would discard
-/// every other test's result along with it — far worse than a stale cwd, which is at least visible
-/// once logged.
-pub(crate) struct RestoreCwd(std::path::PathBuf);
-impl RestoreCwd {
-    /// Captures the CURRENT process cwd to restore later. Call this BEFORE mutating it.
-    pub(crate) fn capture() -> RestoreCwd {
-        RestoreCwd(std::env::current_dir().expect("read the process cwd so it can be restored"))
-    }
-}
-impl Drop for RestoreCwd {
-    fn drop(&mut self) {
-        if let Err(e) = std::env::set_current_dir(&self.0) {
-            // Best-effort: see the struct doc for why this does not panic.
-            eprintln!(
-                "RestoreCwd: failed to restore the process cwd to {}: {e}",
-                self.0.display()
-            );
-        }
-    }
+/// Spawns under `spawn_lock()`, matching every other raw `std::process::Command` re-exec of this
+/// test binary (see [`spawn_a_process_that_exits`]'s doc for the macOS fd-marker hazard that
+/// convention guards against).
+///
+/// Panics with the child's captured stdout/stderr on a non-zero exit, i.e. whenever the fixture's
+/// own assertions failed.
+pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
+    let _guard = crate::child::spawn::spawn_lock();
+    let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["cosca_unit_tests", "--test-threads=1", "--exact", fixture])
+        .env(marker_env, "1")
+        .current_dir(cwd)
+        .output()
+        .expect("spawn fixture child");
+    assert!(
+        output.status.success(),
+        "fixture {fixture} failed (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 /// A child that exits promptly and needs no external binary: this same test binary, run

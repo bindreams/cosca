@@ -185,18 +185,31 @@ fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
 fn resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_b1_fallback.exe")).unwrap();
-    let want = dir.path().join("sp_b1_fallback.exe");
 
     // `cmd_cwd: None` mirrors an unset `Command::cwd()` — the doc says that means "the parent's",
     // i.e. the real process cwd, so the `None` fallback must still reach it rather than resolving
-    // nothing. Exercising that fallback needs an actual process-cwd mutation, which is
-    // process-global: serialize against `spawn_lock()` (see `crate::test_child::RestoreCwd`'s doc
-    // for exactly what that lock does and does not buy) and restore via `RestoreCwd`'s `Drop`,
-    // declared AFTER the lock guard so it runs — and un-does the mutation — BEFORE the lock
-    // releases, even if an assertion below panics.
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(dir.path()).unwrap();
+    // nothing. Exercising that fallback needs a process whose REAL cwd is `dir.path()`; that
+    // process must not be THIS one (every other test in this binary shares its cwd), so the check
+    // runs in a re-exec'd child instead — see `crate::test_child::run_fixture_with_cwd`.
+    crate::test_child::run_fixture_with_cwd(
+        "child::spawn::windows_raw::resolve::resolve_tests::fixture_resolve_executable_falls_back_to_process_cwd",
+        dir.path(),
+        FIXTURE_RESOLVE_FALLBACK_MARKER,
+    );
+}
+
+const FIXTURE_RESOLVE_FALLBACK_MARKER: &str = "COSCA_FIXTURE_RESOLVE_FALLBACK";
+
+/// The child half of [`resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given`].
+/// Reconstructs `want` from its own (already-`dir.path()`) cwd rather than receiving it from the
+/// parent, since the two are guaranteed equal by construction. Mirrors
+/// `crate::resolve::resolve_tests::fixture_empty_path_elements_are_skipped`'s shape.
+#[test]
+fn fixture_resolve_executable_falls_back_to_process_cwd() {
+    let Some(_marker) = std::env::var_os(FIXTURE_RESOLVE_FALLBACK_MARKER) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    let want = std::env::current_dir().expect("current_dir").join("sp_b1_fallback.exe");
     let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());

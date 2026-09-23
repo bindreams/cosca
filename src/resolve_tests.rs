@@ -458,12 +458,31 @@ fn empty_path_elements_are_skipped() {
     // would then stat against the PROCESS's real OS cwd, not the `cwd` parameter `go()` was handed.
     // For that hazard to be live, the process's real cwd must actually BE `cwd.path()` (holding the
     // planted file) for the duration — otherwise deleting `joined.is_absolute() &&` still finds
-    // nothing there and this passes for the wrong reason, on any host.
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(cwd.path()).unwrap();
+    // nothing there and this passes for the wrong reason, on any host. That process must not be
+    // THIS one (every other test in this binary shares its cwd), so the check runs in a re-exec'd
+    // child spawned with `cwd.path()` as its OS-level cwd instead — see
+    // `crate::test_child::run_fixture_with_cwd`.
+    crate::test_child::run_fixture_with_cwd(
+        "resolve::resolve_tests::fixture_empty_path_elements_are_skipped",
+        cwd.path(),
+        FIXTURE_EMPTY_PATH_ELEMENTS_MARKER,
+    );
+}
+
+const FIXTURE_EMPTY_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_EMPTY_PATH_ELEMENTS";
+
+/// The child half of [`empty_path_elements_are_skipped`]: a no-op when picked up by an ordinary,
+/// unfiltered suite run ([`FIXTURE_EMPTY_PATH_ELEMENTS_MARKER`] is unset there). Re-executed via
+/// `run_fixture_with_cwd` with that var set and the OS-level cwd already `cwd.path()`, so
+/// `std::env::current_dir()` here IS the planted directory — no mutation needed.
+#[test]
+fn fixture_empty_path_elements_are_skipped() {
+    let Some(_marker) = std::env::var_os(FIXTURE_EMPTY_PATH_ELEMENTS_MARKER) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    let cwd = std::env::current_dir().expect("current_dir");
     let empty = if HOST_WINDOWS { ";;" } else { "::" };
-    assert_not_found("tool", go("tool", cwd.path(), Some(OsStr::new(empty))));
+    assert_not_found("tool", go("tool", &cwd, Some(OsStr::new(empty))));
 }
 
 #[test]
@@ -479,11 +498,26 @@ fn relative_path_elements_are_skipped() {
     // `.` resolves against the process cwd just as surely as an empty element does — and is
     // rejected by the same `joined.is_absolute()` check `empty_path_elements_are_skipped`
     // exercises above, not a distinct code path. Same reasoning as there: the process's real OS cwd
-    // must actually be `cwd.path()` for this to be a live check.
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(cwd.path()).unwrap();
-    assert_not_found("tool", go("tool", cwd.path(), Some(OsStr::new("."))));
+    // must actually be `cwd.path()` for this to be a live check, and that process must not be THIS
+    // one — see `fixture_empty_path_elements_are_skipped`'s doc.
+    crate::test_child::run_fixture_with_cwd(
+        "resolve::resolve_tests::fixture_relative_path_elements_are_skipped",
+        cwd.path(),
+        FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER,
+    );
+}
+
+const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH_ELEMENTS";
+
+/// The child half of [`relative_path_elements_are_skipped`]; see
+/// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape.
+#[test]
+fn fixture_relative_path_elements_are_skipped() {
+    let Some(_marker) = std::env::var_os(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    let cwd = std::env::current_dir().expect("current_dir");
+    assert_not_found("tool", go("tool", &cwd, Some(OsStr::new("."))));
 }
 
 // ── the Windows .exe rule ────────────────────────────────────────────────────────────
@@ -577,26 +611,42 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     let tmp = tempfile::tempdir().unwrap();
     let sub = tmp.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
+    // Only `cfg(unix)` reads `want` (to set the execute bit) — the fixture below reconstructs the
+    // same path independently, so a non-unix build never uses this binding at all.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let want = touch(&sub, &exe_name("tool"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&want, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // `resolve()` absolutises a relative `cwd` via `std::env::current_dir()` (see resolve.rs's
-    // own "applied twice" note) — there is no way to exercise that fallback without actually
-    // mutating the process cwd. `spawn_lock()` is NOT a general cwd lock — it is the lock every
-    // spawn's OS call itself serializes on, taken well after program resolution runs (resolution
-    // reads `std::env::current_dir()` before that lock is ever acquired; see
-    // `child::spawn::windows_raw::resolve::resolve_executable`'s doc). Holding it here still
-    // serializes this mutation against every OTHER test in this binary that also pairs
-    // `spawn_lock()` with `crate::test_child::RestoreCwd` for its own cwd mutation (the shared
-    // convention every such test in this crate follows), which is the only cwd race this test
-    // needs to avoid. `RestoreCwd` is declared AFTER the lock guard, so it drops — and un-does the
-    // mutation — BEFORE the lock releases, even if an assertion below panics.
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(tmp.path()).unwrap();
+    // `resolve()` absolutises a relative `cwd` via `std::env::current_dir()` (see resolve.rs's own
+    // "applied twice" note) — there is no way to exercise that fallback without a process whose
+    // REAL cwd is `tmp.path()`. That process must not be THIS one (every other test in this binary
+    // shares its cwd), so the check runs in a re-exec'd child instead — see
+    // `crate::test_child::run_fixture_with_cwd`.
+    crate::test_child::run_fixture_with_cwd(
+        "resolve::resolve_tests::fixture_relative_cwd_is_absolutised",
+        tmp.path(),
+        FIXTURE_RELATIVE_CWD_MARKER,
+    );
+}
+
+const FIXTURE_RELATIVE_CWD_MARKER: &str = "COSCA_FIXTURE_RELATIVE_CWD";
+
+/// The child half of [`a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice`]; see
+/// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape. Reconstructs `want`
+/// from its own (already-`tmp.path()`) cwd rather than receiving it from the parent, since the two
+/// are guaranteed equal by construction.
+#[test]
+fn fixture_relative_cwd_is_absolutised() {
+    let Some(_marker) = std::env::var_os(FIXTURE_RELATIVE_CWD_MARKER) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    let want = std::env::current_dir()
+        .expect("current_dir")
+        .join("sub")
+        .join(exe_name("tool"));
     let got = go("./tool", Path::new("sub"), None).unwrap();
     assert!(got.is_absolute(), "{got:?}");
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -618,10 +668,29 @@ fn a_drive_relative_name_fails_closed() {
     // C's current directory has something to find; a tempdir under `%TEMP%`, as here, lives on the
     // runner's system drive, which is `C:` on every GitHub-hosted Windows runner this crate targets.
     touch(cwd.path(), "tool.exe");
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(cwd.path()).unwrap();
-    assert_refused_on_shape("C:tool", go("C:tool", cwd.path(), None));
+    // The refusal must hold even where the process's REAL cwd is `cwd.path()` — that process must
+    // not be THIS one (every other test in this binary shares its cwd), so the check runs in a
+    // re-exec'd child instead — see `crate::test_child::run_fixture_with_cwd`.
+    crate::test_child::run_fixture_with_cwd(
+        "resolve::resolve_tests::fixture_drive_relative_name_fails_closed",
+        cwd.path(),
+        FIXTURE_DRIVE_RELATIVE_MARKER,
+    );
+}
+
+#[cfg(windows)]
+const FIXTURE_DRIVE_RELATIVE_MARKER: &str = "COSCA_FIXTURE_DRIVE_RELATIVE";
+
+/// The child half of [`a_drive_relative_name_fails_closed`]; see
+/// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape.
+#[cfg(windows)]
+#[test]
+fn fixture_drive_relative_name_fails_closed() {
+    let Some(_marker) = std::env::var_os(FIXTURE_DRIVE_RELATIVE_MARKER) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    let cwd = std::env::current_dir().expect("current_dir");
+    assert_refused_on_shape("C:tool", go("C:tool", &cwd, None));
 }
 
 // ── Windows system directories precede PATH for a bare name ─────────────────────────────
