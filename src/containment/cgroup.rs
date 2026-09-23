@@ -22,7 +22,7 @@
 //! `place_self_in_cgroup_pre_exec` is called inside a `pre_exec` closure
 //! (after `fork`, before `exec`). The only async-signal-safe operations there
 //! are raw `libc::write` + `libc::close` — no allocation, no `format!`, no
-//! `String`.
+//! `String`. Its outcome crosses back through a pipe (`ReportPipe`).
 
 // The parsers below are pure (no OS deps) — compiled on all platforms so their unit tests run
 // on any host.
@@ -172,11 +172,11 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
-    /// The shared page the child reports its self-placement outcome through could not be
-    /// mapped. Without it the child's own errno would be unobservable, so the leaf is not
-    /// created half-instrumented.
-    #[error("could not map the placement-report memory page shared with the forked child: {0}")]
-    MapReportPage(#[source] io::Error),
+    /// The pipe the child reports its self-placement outcome through could not be opened, or
+    /// its write end moved to fd 3 or above. Without it the child's own report would be
+    /// unobservable, so the leaf is not created half-instrumented.
+    #[error("could not open the placement-report pipe shared with the forked child: {0}")]
+    OpenReportPipe(#[source] io::Error),
 }
 
 /// What the child's own `pre_exec` self-placement write reported back to the parent.
@@ -184,15 +184,15 @@ pub(crate) enum LeafError {
 /// This is the one step whose reason lives entirely in the forked child: it runs after
 /// `fork`, in a copy-on-write address space, under async-signal-safety rules that forbid
 /// allocating or formatting anything. The child therefore reports a single word through a
-/// shared page (see [`ReportPage`]), which this enum names.
+/// pipe (see [`ReportPipe`]), which this enum names.
 ///
-/// The word belongs to the LEAF, not to a child. Production creates one leaf per spawn, so the
-/// distinction is invisible there; several children sharing one leaf would share one slot and
-/// overwrite each other's reports (see [`ReportPage`]).
+/// The pipe belongs to the LEAF, not to a child. Production creates one leaf per spawn, so the
+/// distinction is invisible there; several children sharing one leaf would share one pipe, and
+/// the first report written would stand for all of them (see [`ReportPipe`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum PlacementReport {
-    /// No outcome was ever stored: the `pre_exec` closure did not run.
+    /// The child exited without reporting: its `pre_exec` closure did not run.
     NotReported,
     /// The child's `write` to `cgroup.procs` succeeded — at that instant it WAS a member.
     Placed,
@@ -204,7 +204,7 @@ impl fmt::Display for PlacementReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlacementReport::NotReported => {
-                f.write_str("the child stored no self-placement outcome (its pre_exec closure did not run)")
+                f.write_str("the child reported no self-placement outcome (its pre_exec closure did not run)")
             }
             PlacementReport::Placed => f.write_str("the child's pre_exec self-placement write succeeded"),
             PlacementReport::WriteFailed(errno) => write!(
@@ -320,7 +320,7 @@ pub(crate) enum DegradeKind {
     KillUnsupported,
     CheckKill,
     OpenProcs,
-    MapReportPage,
+    OpenReportPipe,
     PlacementNotReported,
     PlacementWriteFailed,
 }
@@ -354,7 +354,7 @@ impl DegradeReason for LeafError {
             LeafError::KillUnsupported { .. } => (DegradeKind::KillUnsupported, None),
             LeafError::CheckKill { source, .. } => (DegradeKind::CheckKill, Some(source)),
             LeafError::OpenProcs { source, .. } => (DegradeKind::OpenProcs, Some(source)),
-            LeafError::MapReportPage(e) => (DegradeKind::MapReportPage, Some(e)),
+            LeafError::OpenReportPipe(e) => (DegradeKind::OpenReportPipe, Some(e)),
         };
         DegradeCondition {
             kind,
@@ -442,7 +442,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Process-wide monotonic counter; combined with the pid, gives a unique leaf
 /// name even when the same process spawns on multiple threads simultaneously.
@@ -511,159 +511,207 @@ fn proc_state(pid: u32) -> Option<char> {
     parse_proc_stat_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
-/// Sentinel stored in a [`ReportPage`] while the child has reported nothing. A fresh
-/// anonymous mapping is zero-filled, so this is also the page's initial state.
-#[cfg(target_os = "linux")]
-const REPORT_NOT_REPORTED: i32 = 0;
-/// Sentinel stored by the child when its `cgroup.procs` write succeeded. Negative so it can
-/// never collide with an errno, which `write(2)` only ever reports as positive.
+/// A report of a successful placement. Negative so it can never collide with an errno, which
+/// `write(2)` only ever reports as positive.
 #[cfg(target_os = "linux")]
 const REPORT_PLACED: i32 = -1;
 
-/// A single machine word shared with the forked child (`MAP_SHARED | MAP_ANONYMOUS`), so the
-/// self-placement write's outcome crosses back out of the child.
+/// The channel the forked child reports its self-placement outcome through: a pipe carrying one
+/// native-endian `i32`, the write's errno or [`REPORT_PLACED`].
 ///
-/// `pre_exec` runs after `fork`, where every ordinary channel is closed to it: the address
-/// space is copy-on-write (the parent cannot see a normal store), and async-signal-safety
-/// forbids allocating, formatting or locking. A shared anonymous page admits exactly one
-/// async-signal-safe operation — an aligned atomic store of one `i32` — which is all a report
-/// needs to be.
+/// `pre_exec` runs after `fork`, where async-signal-safety forbids allocating, formatting or
+/// locking, and nothing the child computes survives its `exec`. One `write(2)` of four bytes is
+/// all a report needs, and a pipe also tells the parent when the report is final.
 ///
-/// **One slot per LEAF, not per child.** The page belongs to the `CgroupLeaf`, and a production
-/// spawn creates one leaf per child, so leaf and child coincide there. A caller that routes
-/// several children through ONE leaf gets one slot for all of them, and the last store wins —
-/// `take_placement` would then attribute the last child's outcome to whichever pid it was asked
-/// about. Give each child its own [`ReportPage`] rather than sharing a leaf's.
+/// # When the report is final
+/// Not when `spawn` returns. `std`'s Unix spawn returns once its own close-on-exec error channel
+/// reads EOF, normally at the child's `exec`. But that channel takes the lowest free fds: with two
+/// of this process's 0, 1 and 2 closed, its child end is one of them. When `std` `dup2`s the
+/// child's stdio for that slot into place, before any `pre_exec` runs, it closes that end, and
+/// `spawn` returns before the child has placed itself.
+///
+/// [`ReportPipe::wait`] therefore waits for the child itself: for the report, or for the child's
+/// exit. The report is always written before `exec`, so a child that exits without one never ran
+/// its placement, and `NotReported` is then the truth. Its exit is watched through a pidfd, not
+/// the pipe's EOF: every process this one forks while the write end is open inherits it, so EOF
+/// would also wait for other threads' children to exec or exit.
+///
+/// The write end sits at fd 3 or above, where the child's stdio `dup2` cannot close it. The only
+/// later `dup2` is command-fds' mapping of fds 3 and up, whose hook the spawn registers after the
+/// placement hook: it can replace the write end only once the report is written.
+///
+/// The wait is no longer than the one `std` intends: the child reaches its report on `std`'s own
+/// path from `fork` to `exec`, all of which `spawn` normally waits out.
+///
+/// **One report per pipe.** A caller that routes several children through one pipe reads the
+/// first report written, whoever wrote it.
 ///
 /// # What this costs, and what it can cost a spawn
-/// One `mmap` per contained spawn — the kernel rounds the 4-byte length up to a page, so 4 KiB
-/// and one VMA — held from the leaf's creation until `attach` takes the placement verdict, and
-/// unmapped there along with the leaf's `cgroup.procs` fd. A live contained child costs the
-/// supervisor neither; only spawns in flight do.
-///
-/// A mapping that cannot be made (`ENOMEM`, or `vm.max_map_count` exhausted by something else)
-/// DEGRADES the spawn — it keeps its process group and loses the fork-proof kill — rather than
-/// failing it, which makes it quiet: weaker containment, not an error.
-/// `LeafError::MapReportPage` is what makes it audible at all.
-///
-/// **Not a race.** The child stores its outcome strictly before `exec`, and `std`'s Unix
-/// spawn does not return to the parent until the child has exec'd (it reads the child's
-/// CLOEXEC error pipe to EOF). Every parent read therefore happens after the child's store,
-/// ordered by the kernel through that pipe, not by timing.
+/// Two fds per contained spawn in flight, held from the leaf's creation until `attach` takes the
+/// placement verdict; a live contained child costs the supervisor none. A pipe that cannot be
+/// opened (`EMFILE`, `ENFILE`) DEGRADES the spawn — it keeps its process group and loses the
+/// fork-proof kill — rather than failing it. `LeafError::OpenReportPipe` is what makes that audible.
 #[cfg(target_os = "linux")]
-pub(crate) struct ReportPage {
-    ptr: *mut AtomicI32,
+pub(crate) struct ReportPipe {
+    read: io::PipeReader,
+    /// The parent's copy of the write end, at fd 3 or above. Closed before waiting.
+    write: Option<OwnedFd>,
 }
 
-// Safety: the page is owned solely by this handle (never cloned, `munmap`ed exactly once by
-// `Drop`), and every access to it goes through an atomic.
 #[cfg(target_os = "linux")]
-unsafe impl Send for ReportPage {}
-#[cfg(target_os = "linux")]
-unsafe impl Sync for ReportPage {}
-
-#[cfg(target_os = "linux")]
-impl ReportPage {
-    pub(crate) fn new() -> io::Result<ReportPage> {
-        // Test-only fault seam: fail the mapping (take semantics — see `fault`).
+impl ReportPipe {
+    pub(crate) fn new() -> io::Result<ReportPipe> {
+        // Test-only fault seam: fail the pipe (take semantics — see `fault`).
         #[cfg(test)]
-        if fault::take_force_map_report_page_failure() {
-            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        if fault::take_force_report_pipe_failure() {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
         }
-        // Safety: a fresh anonymous mapping — no caller-supplied address, length or fd.
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                std::mem::size_of::<AtomicI32>(),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if raw == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let ptr = raw.cast::<AtomicI32>();
-        // Anonymous pages are zero-filled and REPORT_NOT_REPORTED is 0, so this store changes
-        // nothing — it states the initial sentinel instead of inheriting it from mmap's
-        // guarantee, so renaming or renumbering the sentinel cannot silently desynchronize.
-        // Safety: `ptr` is a live, aligned, writable mapping of exactly one AtomicI32.
-        unsafe { (*ptr).store(REPORT_NOT_REPORTED, Ordering::SeqCst) };
-        Ok(ReportPage { ptr })
+        // Both ends close-on-exec: the child needs its write end only until `exec`, and no
+        // program this process starts may inherit either. Both at fd 3 or above: the write end so
+        // the child's stdio cannot replace it, and the read end so it takes no std slot this
+        // process left closed — that gap is the host's, not cosca's to fill.
+        let (read, write) = io::pipe()?;
+        let read = io::PipeReader::from(rustix::io::fcntl_dupfd_cloexec(&read, 3)?);
+        let write = rustix::io::fcntl_dupfd_cloexec(&write, 3)?;
+        Ok(ReportPipe {
+            read,
+            write: Some(write),
+        })
     }
 
-    /// A `Copy` handle to the page for capture by the `pre_exec` closure (which must not
-    /// capture the owning `ReportPage`: the leaf keeps it, and the child must not `munmap`).
+    /// A `Copy` handle to the write end for capture by the `pre_exec` closure (which must not
+    /// capture the owning `ReportPipe`: the leaf keeps it).
     pub(crate) fn slot(&self) -> ReportSlot {
-        ReportSlot { ptr: self.ptr }
+        ReportSlot {
+            fd: self
+                .write
+                .as_ref()
+                .expect("the write end is open until the wait")
+                .as_raw_fd(),
+        }
     }
 
-    /// The child's report, read from the parent after the spawn has returned.
-    pub(crate) fn read(&self) -> PlacementReport {
-        // Safety: as above; the mapping outlives this handle.
-        match unsafe { (*self.ptr).load(Ordering::SeqCst) } {
-            REPORT_NOT_REPORTED => PlacementReport::NotReported,
+    /// Block until the report of `pid`, the child spawned with this pipe's slot, is final, and
+    /// return it. See [`ReportPipe`] for why `spawn` returning is not enough.
+    ///
+    /// `pid` must be this process's own unreaped child, so no other process can hold its number.
+    pub(crate) fn wait(mut self, pid: u32) -> PlacementReport {
+        use rustix::event::{poll, PollFd, PollFlags};
+
+        // The parent's own copy would otherwise keep the pipe open forever.
+        self.write = None;
+        let pid = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("a spawned child's pid is a positive i32");
+        // A child cgroup.kill can contain runs on a kernel with pidfds (5.3; cgroup.kill is 5.14),
+        // but the open can still fail: a full fd table, or a seccomp filter. Then only the pipe's
+        // EOF shows the child exited without a report.
+        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+            .inspect_err(|e| {
+                log::debug!("cgroup v2: pidfd_open({pid:?}) failed ({e}); waiting on the report pipe's EOF instead")
+            })
+            .ok();
+        let mut fds = vec![PollFd::new(&self.read, PollFlags::IN)];
+        fds.extend(pidfd.as_ref().map(|pidfd| PollFd::new(pidfd, PollFlags::IN)));
+        // No timeout: the child reports or exits on its way to `exec`, like `std`'s own wait.
+        loop {
+            match poll(&mut fds, None) {
+                Ok(_) => break,
+                // `ENOMEM` is the kernel's transient shortage, not an answer.
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
+                Err(e) => panic!("poll on the placement report pipe failed: {e}"),
+            }
+        }
+        self.read_final()
+    }
+
+    /// The report, read without blocking. The caller has established it is final: the child
+    /// reported, or can no longer report.
+    fn read_final(&mut self) -> PlacementReport {
+        use std::io::Read;
+
+        // A pipe write of 4 bytes is atomic (PIPE_BUF is at least 512): all of it or none.
+        let available = rustix::io::ioctl_fionread(&self.read).expect("FIONREAD on the report pipe");
+        if available == 0 {
+            return PlacementReport::NotReported;
+        }
+        debug_assert!(
+            available >= 4,
+            "a report is written whole, but {available} bytes are queued"
+        );
+        let mut report = [0u8; 4];
+        self.read
+            .read_exact(&mut report)
+            .expect("read a report that is already queued");
+        match i32::from_ne_bytes(report) {
             REPORT_PLACED => PlacementReport::Placed,
-            errno => PlacementReport::WriteFailed(errno),
+            errno => {
+                debug_assert!(errno > 0, "a failed write reports its positive errno, got {errno}");
+                PlacementReport::WriteFailed(errno)
+            }
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for ReportPage {
-    fn drop(&mut self) {
-        // Safety: this handle owns the mapping and unmaps it exactly once.
-        unsafe { libc::munmap(self.ptr.cast(), std::mem::size_of::<AtomicI32>()) };
+#[cfg(all(target_os = "linux", test))]
+impl ReportPipe {
+    /// The report of a child that has already been reaped, or of writes made in this process.
+    pub(crate) fn report_for_test(mut self) -> PlacementReport {
+        self.write = None;
+        self.read_final()
     }
 }
 
-/// The child-side half of a [`ReportPage`]: a `Copy` pointer with one async-signal-safe
-/// operation. Owns nothing — the parent's `ReportPage` unmaps the page.
+/// The child-side half of a [`ReportPipe`]: the write end's number, with one async-signal-safe
+/// operation. Owns nothing — the parent's `ReportPipe` closes the pipe.
+///
+/// The closure holding it can OUTLIVE the pipe: `attach` closes the pipe once the spawn has
+/// returned, and on the spawn-FAILURE path `Prepared` (and with it the leaf) drops first — both
+/// before the `Command` that still owns the closure. The number is stale from then on, which is
+/// sound only because nothing ever invokes the closure again: each `Command` is spawned once.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub(crate) struct ReportSlot {
-    ptr: *mut AtomicI32,
+    fd: RawFd,
 }
-
-// Safety: a raw pointer to a shared mapping, with one operation — an atomic store — and one
-// caller: the `pre_exec` closure, which the kernel invokes only between the fork and the exec
-// of the single spawn the owning `CgroupLeaf` was created for. The leaf, and so the mapping, is
-// alive across all of that.
-//
-// The closure can OUTLIVE the mapping: `attach` unmaps it once the spawn has returned, and on the
-// spawn-FAILURE path `Prepared` (and with it the leaf's `munmap`) drops first — both before the
-// `Command` that still owns the closure. The pointer dangles from then on, which is sound only
-// because nothing ever invokes the closure again: each `Command` is spawned once.
-//
-// `Sync` as well as `Send` because `Command::pre_exec` requires both of its closure, and an
-// atomic store adds no unsynchronized access when shared across threads.
-#[cfg(target_os = "linux")]
-unsafe impl Send for ReportSlot {}
-#[cfg(target_os = "linux")]
-unsafe impl Sync for ReportSlot {}
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
-    /// Store the child's outcome. Async-signal-safe: one aligned atomic store, no allocation.
+    /// Write the child's outcome. Async-signal-safe: one `write(2)`, no allocation.
     ///
     /// # Safety
-    /// The page this slot points at must still be mapped, which holds for as long as the
-    /// `CgroupLeaf` that produced it is alive.
+    /// The pipe's write end must still be open at this number, and its read end in the parent,
+    /// which holds from the leaf's creation until the parent has read the report.
     unsafe fn report(self, value: i32) {
-        // Safety: the caller guarantees the mapping is live; the store is atomic.
-        unsafe { (*self.ptr).store(value, Ordering::SeqCst) };
+        let bytes = value.to_ne_bytes();
+        loop {
+            // Safety: `bytes` is a valid buffer; the caller guarantees the fd.
+            let written = unsafe { libc::write(self.fd, bytes.as_ptr().cast(), bytes.len()) };
+            // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
+            if written == -1 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            // A 4-byte write into a pipe with room and a live reader is whole and cannot fail. A
+            // child that could not report would read as never placed, so fail loudly in debug.
+            #[cfg(debug_assertions)]
+            if written != bytes.len() as isize {
+                // Safety: async-signal-safe.
+                unsafe { libc::abort() };
+            }
+            return;
+        }
     }
 }
 
 #[cfg(all(target_os = "linux", test))]
 impl ReportSlot {
-    /// Store `Placed` without any write, for tests of what cosca does with a report.
+    /// Report `Placed` without a `cgroup.procs` write, for tests of what cosca does with a report.
     ///
     /// # Safety
     /// As [`ReportSlot::report`].
     pub(crate) unsafe fn report_placed_for_test(self) {
-        // Safety: the caller guarantees the mapping is live.
+        // Safety: the caller guarantees the pipe is open.
         unsafe { self.report(REPORT_PLACED) };
     }
 }
@@ -677,7 +725,7 @@ impl ReportSlot {
 /// rule), the closure returns an error and the spawn falls back to the
 /// process-group mechanism.
 ///
-/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report page: the child
+/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report pipe: the child
 /// needs them only until its `exec`.
 ///
 /// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill` and
@@ -693,7 +741,7 @@ pub(crate) struct CgroupLeaf {
     procs_fd: Option<OwnedFd>,
     /// Where the forked child reports whether its self-placement write succeeded. `None` once
     /// the placement verdict is taken.
-    report: Option<ReportPage>,
+    report: Option<ReportPipe>,
     /// Whether the child reported entering the leaf, recorded when `report` is released.
     entered: bool,
 }
@@ -711,11 +759,16 @@ impl CgroupLeaf {
     }
 
     /// Whether the child reported entering this leaf.
-    fn child_entered(&self) -> bool {
-        match &self.report {
-            Some(page) => page.read() == PlacementReport::Placed,
-            None => self.entered,
+    ///
+    /// Before the verdict this reads the report without waiting, so it is only called once no
+    /// report can still arrive: from `Drop`, which runs before the verdict only when the spawn
+    /// failed, and `std` reaps a child whose spawn failed before returning the error.
+    fn child_entered(&mut self) -> bool {
+        if let Some(mut pipe) = self.report.take() {
+            pipe.write = None;
+            self.entered = pipe.read_final() == PlacementReport::Placed;
         }
+        self.entered
     }
 
     /// The leaf's `cgroup.events` path — the drain edge. Both watches open it for themselves:
@@ -730,7 +783,7 @@ impl CgroupLeaf {
     /// The child reported no successful write, so nothing it forks is in the leaf either.
     /// Whatever keeps the `rmdir` from succeeding, cosca did not put there, and killing it would
     /// kill a process cosca was never asked to contain.
-    pub(crate) fn remove_unentered(self) {
+    pub(crate) fn remove_unentered(mut self) {
         debug_assert!(!self.child_entered(), "remove_unentered on a leaf its child entered");
     }
 
@@ -742,16 +795,17 @@ impl CgroupLeaf {
 
     /// Whether `pid` entered this leaf: `Ok` when its own write into it succeeded.
     ///
-    /// Used once, post-spawn (parent side). The child's report is the verdict: `cgroup.procs`
+    /// Used once, post-spawn (parent side). Blocks until the report is final — `spawn` returning
+    /// does not make it so (see [`ReportPipe`]). The child's report is the verdict: `cgroup.procs`
     /// lists only live tasks, so a placed child that has already exited reads back absent from
     /// it. Only a child that reported no successful write has `cgroup.procs` and its `/proc`
     /// state read, to diagnose why — see [`NotPlaced`].
     ///
-    /// Taking the verdict closes the `cgroup.procs` fd and unmaps the report page: nothing
+    /// Taking the verdict closes the `cgroup.procs` fd and the report pipe: nothing
     /// needs either after the child's `exec`, and otherwise every live contained child would
     /// hold one fd and one mapping in the supervisor.
     pub(crate) fn take_placement(&mut self, pid: u32) -> Result<(), NotPlaced> {
-        let report = self.report.take().expect(RELEASED).read();
+        let report = self.report.take().expect(RELEASED).wait(pid);
         self.procs_fd = None;
         self.entered = report == PlacementReport::Placed;
         let report = match report {
@@ -900,12 +954,12 @@ impl CgroupLeaf {
         CgroupLeaf {
             leaf_path,
             procs_fd: None,
-            report: Some(ReportPage::new().expect("map a placement-report page")),
+            report: Some(ReportPipe::new().expect("open a placement-report pipe")),
             entered: false,
         }
     }
 
-    /// Whether the leaf still holds its `cgroup.procs` fd or its report page.
+    /// Whether the leaf still holds its `cgroup.procs` fd or its report pipe.
     pub(crate) fn holds_spawn_resources(&self) -> bool {
         self.procs_fd.is_some() || self.report.is_some()
     }
@@ -974,13 +1028,13 @@ pub(crate) mod fault {
     use std::cell::Cell;
     thread_local! {
         static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
-        static FORCE_MAP_REPORT_PAGE_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_REPORT_PIPE_FAILURE: Cell<bool> = const { Cell::new(false) };
         static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Treat the NEXT created leaf as exposing `cgroup.kill`. Supplies the single fact a temp
     /// directory cannot, so every step AFTER the check — the `cgroup.procs` open, the report
-    /// mapping, and the unwind that removes the leaf — runs for real, against the kernel's own
+    /// pipe, and the unwind that removes the leaf — runs for real, against the kernel's own
     /// errnos, on any Linux host.
     pub(crate) fn set_force_kill_supported(on: bool) {
         FORCE_KILL_SUPPORTED.with(|f| f.set(on));
@@ -992,17 +1046,17 @@ pub(crate) mod fault {
         FORCE_KILL_SUPPORTED.with(|f| f.get())
     }
 
-    /// Fail the NEXT `ReportPage::new` with `ENOMEM` — the real exhaustion this mapping can
-    /// hit (`vm.max_map_count`), which no test may provoke for real without taking the host's
-    /// whole address space with it.
-    pub(crate) fn set_force_map_report_page_failure(on: bool) {
-        FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.set(on));
+    /// Fail the NEXT `ReportPipe::new` with `EMFILE` — the real exhaustion this pipe can hit,
+    /// which no test may provoke for real: the fd limit is process-wide, and would fail every
+    /// other test running in this binary.
+    pub(crate) fn set_force_report_pipe_failure(on: bool) {
+        FORCE_REPORT_PIPE_FAILURE.with(|f| f.set(on));
     }
-    pub(crate) fn take_force_map_report_page_failure() -> bool {
-        FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.replace(false))
+    pub(crate) fn take_force_report_pipe_failure() -> bool {
+        FORCE_REPORT_PIPE_FAILURE.with(|f| f.replace(false))
     }
-    pub(crate) fn map_report_page_failure_armed() -> bool {
-        FORCE_MAP_REPORT_PAGE_FAILURE.with(|f| f.get())
+    pub(crate) fn report_pipe_failure_armed() -> bool {
+        FORCE_REPORT_PIPE_FAILURE.with(|f| f.get())
     }
 
     /// Put a directory inside the NEXT leaf whose creation fails, just before its unwind runs, so
@@ -1109,12 +1163,12 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         }
     }
 
-    // The report page is mapped before the fd is opened so a failure here unwinds nothing but
+    // The report pipe is opened before the procs fd so a failure here unwinds nothing but
     // the directory: a leaf whose child could not report its placement outcome would reopen
     // exactly the silence this module is reporting its way out of.
-    let report = match ReportPage::new() {
+    let report = match ReportPipe::new() {
         Ok(r) => r,
-        Err(e) => return Err(fail(&leaf_path, LeafError::MapReportPage(e))),
+        Err(e) => return Err(fail(&leaf_path, LeafError::OpenReportPipe(e))),
     };
 
     // Open cgroup.procs for writing, close-on-exec: the child's pre_exec write runs after fork
@@ -1160,15 +1214,14 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
 /// `Ok(())` to fall back to the already-configured process group rather than
 /// aborting the spawn.
 ///
-/// The outcome — success, or the exact errno — is also stored in `slot` so it reaches the
+/// The outcome — success, or the exact errno — is also written to `slot` so it reaches the
 /// parent. The `Err` return value cannot: it is discarded by design (a failed placement must
 /// not abort the spawn), and nothing else the child computes survives its `exec`.
 ///
 /// # Safety
 /// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
-/// open, writable fd in the child process, and `slot`'s page must still be mapped.
-/// Async-signal-safe: raw `libc::write` + `libc::close` + one atomic store, no allocation,
-/// no format strings.
+/// open, writable fd in the child process, and `slot`'s pipe must still be open.
+/// Async-signal-safe: raw `libc::write` + `libc::close`, no allocation, no format strings.
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
     static ZERO: &[u8] = b"0";
@@ -1185,11 +1238,10 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     // Safety: procs_fd is valid; close is async-signal-safe.
     unsafe { libc::close(procs_fd) };
     if ret == -1 {
-        // `write(2)` only ever sets a positive errno, but the report page's sentinels occupy
-        // 0 and -1, so a nonsensical value is mapped to EIO rather than read back as a
-        // fabricated "placed" or "not reported".
+        // `write(2)` only ever sets a positive errno, but a report of -1 means "placed", so a
+        // nonsensical value is mapped to EIO rather than read back as a fabricated placement.
         let reported = if errno > 0 { errno } else { libc::EIO };
-        // Safety: the caller guarantees the slot's page is mapped.
+        // Safety: the caller guarantees the slot's pipe is open.
         unsafe { slot.report(reported) };
         Err(io::Error::from_raw_os_error(errno))
     } else {

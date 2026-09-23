@@ -466,7 +466,7 @@ pub(crate) fn prepare(
                 // Safety: pre_exec runs post-fork, pre-exec; the function is
                 // async-signal-safe (libc::write + libc::close, no alloc).
                 let procs_fd = l.procs_fd();
-                // The child's own outcome — success, or the write's errno — is stored here;
+                // The child's own outcome — success, or the write's errno — is written here;
                 // it is the only channel out of a post-fork, pre-exec address space, and the
                 // `Err` below is discarded precisely so a failed placement cannot abort the
                 // spawn.
@@ -594,7 +594,8 @@ fn attach_tree(
                     // when the supervisor is itself an undelegated leaf). The child's own
                     // report of that write decides membership; re-reading cgroup.procs cannot,
                     // because it lists only live tasks and a placed child may already have
-                    // exited. Taking the verdict releases the leaf's fd and report page.
+                    // exited. Taking the verdict waits for that report — `spawn` returning does
+                    // not mean the child has made it — then releases the leaf's fd and pipe.
                     match leaf.take_placement(raw_pid) {
                         Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
                         // The child never entered the leaf, so nothing it forks did either. The

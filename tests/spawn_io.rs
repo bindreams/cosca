@@ -1267,43 +1267,48 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
         .expect("a cgroup v2 `0::` line")
 }
 
-/// A closed descriptor 0, 1 or 2 cannot capture the child's placement write.
+/// Closed descriptors among 0, 1 and 2 can neither capture the child's placement write nor
+/// hide its placement report.
 ///
-/// A descriptor the supervisor opens takes the lowest free number. With 0, 1 or 2 closed at
-/// spawn time, a `cgroup.procs` fd opened there collides with the child's stdio: `std` `dup2`s
-/// the child's stdio onto 0/1/2 before any `pre_exec` runs, so the placement write lands in the
-/// user's file, succeeds, and reports a placement that never happened. A `Stdio::from_file` end
-/// is a dup numbered 3 or above, so it does not fill the gap first.
+/// A descriptor the supervisor opens takes the lowest free number, and `std` `dup2`s the child's
+/// stdio onto 0/1/2 before any `pre_exec` runs. So with slots closed at spawn time:
+/// - a `cgroup.procs` fd opened in a gap would be replaced by the child's stdio, and the placement
+///   write would land in the user's file and report a placement that never happened;
+/// - with two or more closed, `std`'s own error channel lands its child end on one of them, the
+///   child's stdio closes it, and `spawn` returns before the child has placed itself. Reading the
+///   report then would miss the placement, degrade to a process group, and leave the child in a
+///   leaf nothing kills through.
 ///
-/// Each slot runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
+/// A `Stdio::from_file` end is a dup numbered 3 or above, so it does not fill a gap first.
+///
+/// Each case runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
 /// is process-wide, so in a binary with other tests running it would hand their next `open` the
 /// slot, and with 2 closed a failing assertion's message would go nowhere.
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write() {
-    const NAME: &str = "linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write";
-    const SLOT_ENV: &str = "COSCA_TEST_CLOSED_SLOT";
+fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
+    const NAME: &str = "linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child";
 
     stderr_log::install();
     if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         return; // unprovisioned: not a CI-cgroup environment.
     }
-    if let Ok(slot) = std::env::var(SLOT_ENV) {
-        return spawn_with_slot_closed(slot.parse().ok());
+    if let Ok(slots) = std::env::var(CLOSED_SLOTS_ENV) {
+        return spawn_with_slots_closed(&parse_closed_slots(&slots));
     }
-    // "open" is the control: the same spawn with every slot open.
-    let failures: Vec<String> = ["open", "0", "1", "2"]
+    // "" is the control: the same spawn with every slot open.
+    let failures: Vec<String> = ["", "0", "1", "2", "1,2", "0,1", "0,2", "0,1,2"]
         .into_iter()
-        .filter_map(|slot| {
+        .filter_map(|slots| {
             let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
                 .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
-                .env(SLOT_ENV, slot)
+                .env(CLOSED_SLOTS_ENV, slots)
                 .output()
-                .expect("run this test with one slot closed");
+                .expect("run this test with the slots closed");
             let stdout = String::from_utf8_lossy(&out.stdout);
             (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
                 format!(
-                    "slot {slot}: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                    "slots [{slots}]: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
                     out.status,
                     String::from_utf8_lossy(&out.stderr)
                 )
@@ -1313,10 +1318,59 @@ fn linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// One case of [`linux_cgroup_v2_a_closed_stdio_slot_cannot_capture_the_placement_write`]:
-/// spawn a contained `sh` with `slot` closed in this process and wired to a file in the child.
+/// Selects the slots one case of
+/// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`] closes:
+/// comma-separated, empty for none.
 #[cfg(target_os = "linux")]
-fn spawn_with_slot_closed(slot: Option<i32>) {
+const CLOSED_SLOTS_ENV: &str = "COSCA_TEST_CLOSED_SLOTS";
+
+#[cfg(target_os = "linux")]
+fn parse_closed_slots(slots: &str) -> Vec<i32> {
+    slots
+        .split(',')
+        .filter(|slot| !slot.is_empty())
+        .map(|slot| {
+            let slot: i32 = slot.parse().unwrap_or_else(|_| panic!("bad slot {slot:?}"));
+            assert!((0..=2).contains(&slot), "slot {slot} is not a std slot");
+            slot
+        })
+        .collect()
+}
+
+/// Block until the cgroup at `leaf` has no live member, on the kernel's `populated` edge.
+#[cfg(target_os = "linux")]
+fn wait_unpopulated(leaf: &std::path::Path) {
+    use std::io::Seek;
+    use std::os::fd::AsRawFd;
+
+    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open cgroup.events");
+    loop {
+        let mut text = String::new();
+        events.rewind().expect("rewind cgroup.events");
+        events.read_to_string(&mut text).expect("read cgroup.events");
+        if text.lines().any(|line| line == "populated 0") {
+            return;
+        }
+        let mut fd = libc::pollfd {
+            fd: events.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; -1 blocks until the kernel reports a transition.
+        let ret = unsafe { libc::poll(&mut fd, 1, -1) };
+        assert!(
+            ret >= 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
+            "poll cgroup.events: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// One case of [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`]:
+/// spawn a contained `sh` with `slots` closed in this process and each wired to a file in the
+/// child, then check what cosca reports against where the child really is.
+#[cfg(target_os = "linux")]
+fn spawn_with_slots_closed(slots: &[i32]) {
     use std::io::{BufRead, Seek};
 
     const CONTENTS: &[u8] = b"untouched\n";
@@ -1333,23 +1387,32 @@ fn spawn_with_slot_closed(slot: Option<i32>) {
     // The root stays alive in `wait` for as long as the worker does.
     cmd.executable("/bin/sh")
         .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & wait"#, testbin(), &addr]);
-    if let Some(slot) = slot {
+    for &slot in slots {
         cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
             .expect("wire the slot to the file");
     }
     cmd.contain();
 
-    // Everything this process needs open is opened above, so nothing fills the gap but the spawn.
-    // SAFETY: `slot` is one of this process's own std descriptors; it is closed only across the
-    // spawn and restored from `saved` before anything else runs.
-    let saved = slot.map(|slot| unsafe {
-        let saved = libc::dup(slot);
-        assert!(saved >= 0, "dup({slot}): {}", std::io::Error::last_os_error());
-        assert_eq!(libc::close(slot), 0, "close({slot})");
-        (slot, saved)
-    });
-    let spawned = cmd.spawn();
-    if let Some((slot, saved)) = saved {
+    // Everything this process needs open is opened above, so nothing fills the gaps but the
+    // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
+    // SAFETY: each slot is one of this process's own std descriptors; it is closed only across
+    // the spawn and restored from its saved copy before anything else runs.
+    let saved: Vec<(i32, i32)> = slots
+        .iter()
+        .map(|&slot| unsafe {
+            let saved = libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3);
+            assert!(saved >= 3, "dup({slot}): {}", std::io::Error::last_os_error());
+            (slot, saved)
+        })
+        .collect();
+    for &(slot, _) in &saved {
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::close(slot) }, 0, "close({slot})");
+    }
+    // One CPU for parent and child: the parent runs on while the child waits its turn, so a
+    // report read at `spawn`'s return would be read before the child made it.
+    let spawned = on_one_cpu(|| cmd.spawn());
+    for &(slot, saved) in &saved {
         // SAFETY: `saved` is this process's own open descriptor, duplicated above.
         unsafe {
             assert_eq!(libc::dup2(saved, slot), slot, "restore fd {slot}");
@@ -1357,7 +1420,7 @@ fn spawn_with_slot_closed(slot: Option<i32>) {
         }
     }
     let child = spawned.expect("spawn");
-    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let containment = child.containment();
 
     let (worker, _) = listener.accept().expect("accept the worker");
     let mut worker = std::io::BufReader::new(worker);
@@ -1369,15 +1432,19 @@ fn spawn_with_slot_closed(slot: Option<i32>) {
         .and_then(|pid| pid.parse().ok())
         .unwrap_or_else(|| panic!("expected the worker's tagged pid, got {hello:?}"));
 
-    // The root is alive in `wait`, so its cgroup is readable; the worker inherited the same one.
+    // The worker is `sh`'s own fork, made after `sh` exec'd, so the root's placement — whichever
+    // way it went — is settled. The root is alive in `wait`, so its cgroup is readable.
     let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
-    let root_cgroup = unified_cgroup(&root_cgroup);
+    let root_cgroup = unified_cgroup(&root_cgroup).to_string();
     let leaf_prefix = format!("{own}/cosca-{}-", std::process::id());
-    assert!(
-        root_cgroup
-            .strip_prefix(&leaf_prefix)
-            .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())),
-        "slot {slot:?}: the child must be in its leaf {leaf_prefix}<seq>, but is in {root_cgroup}"
+    let in_leaf = root_cgroup
+        .strip_prefix(&leaf_prefix)
+        .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
+    assert_eq!(
+        (containment, in_leaf),
+        (cosca::Containment::CgroupV2, true),
+        "slots {slots:?}: cosca reports {containment:?}, and the child is in {root_cgroup} (its \
+         leaf would be {leaf_prefix}<seq>)"
     );
     let worker_cgroup = std::fs::read_to_string(format!("/proc/{worker_pid}/cgroup")).expect("worker cgroup");
     assert_eq!(
@@ -1392,7 +1459,7 @@ fn spawn_with_slot_closed(slot: Option<i32>) {
     assert_eq!(
         String::from_utf8_lossy(&written),
         String::from_utf8_lossy(CONTENTS),
-        "slot {slot:?}: the placement write landed in the child's stdio file"
+        "slots {slots:?}: the placement write landed in the child's stdio file"
     );
 
     // Proof of life before the kill: a round trip only a live worker completes.
@@ -1406,6 +1473,12 @@ fn spawn_with_slot_closed(slot: Option<i32>) {
     let mut buf = [0u8; 1];
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must kill the worker");
+
+    // The leaf is removed with the child: nothing is left behind once its members have exited.
+    let leaf = std::path::Path::new("/sys/fs/cgroup").join(root_cgroup.trim_start_matches('/'));
+    wait_unpopulated(&leaf);
+    drop(child);
+    assert!(!leaf.exists(), "slots {slots:?}: {} was left behind", leaf.display());
 }
 
 /// Once a spawn has returned, the supervisor holds no descriptor for the child's leaf

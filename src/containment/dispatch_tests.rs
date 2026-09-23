@@ -514,11 +514,11 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
 
     let leaf = CgroupLeaf::for_test_at(leaf_path.to_path_buf());
     match report {
-        // SAFETY: the slot's page lives as long as `leaf`.
+        // SAFETY: the slot's pipe lives as long as `leaf`.
         ChildReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
         ChildReport::WriteFailed => {
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
-            // no-op. The slot's page lives as long as `leaf`.
+            // no-op. The slot's pipe lives as long as `leaf`.
             let _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
         }
         ChildReport::NotReported => {}
@@ -557,7 +557,7 @@ fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
     };
     assert!(
         !leaf.holds_spawn_resources(),
-        "a live child's leaf must not hold its cgroup.procs fd or report page past the verdict"
+        "a live child's leaf must not hold its cgroup.procs fd or report pipe past the verdict"
     );
     assert!(
         !leaf_path.join("cgroup.kill").exists(),
