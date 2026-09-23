@@ -25,7 +25,28 @@ impl LeafDir {
     pub(crate) fn create(parent: &Path, name: &str) -> io::Result<LeafDir> {
         let parent = open_dir(rustix::fs::CWD, parent)?;
         rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o777))?;
-        let dir = open_dir(&parent, name)?;
+        #[cfg(test)]
+        let held = if super::fault::take_force_leaf_open_failure() {
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        } else {
+            open_dir(&parent, name)
+        };
+        #[cfg(not(test))]
+        let held = open_dir(&parent, name);
+        let dir = match held {
+            Ok(dir) => dir,
+            Err(e) => {
+                // The directory it just made, still empty: nothing is placed in a leaf before it
+                // is held.
+                if let Err(rm) = rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR) {
+                    log::warn!(
+                        "cgroup leaf {name} was not removed: rmdir failed ({rm}) after it could not be opened \
+                         ({e}); it stays on this host until a cgroup manager reaps it"
+                    );
+                }
+                return Err(e);
+            }
+        };
         Ok(LeafDir {
             parent,
             dir,
@@ -101,13 +122,13 @@ impl LeafDir {
         Ok(rustix::fs::unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR)?)
     }
 
-    /// Whether the leaf's name in its parent still resolves to the leaf itself. It does not once
-    /// something is mounted over it, or once it was removed and the name reused.
-    pub(crate) fn name_resolves_here(&self) -> io::Result<bool> {
+    /// What the leaf's name in its parent resolves to now.
+    pub(crate) fn name_resolves(&self) -> io::Result<Resolves> {
         let here = rustix::fs::fstat(&self.dir)?;
         match rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(there) => Ok((there.st_dev, there.st_ino) == (here.st_dev, here.st_ino)),
-            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Ok(there) if (there.st_dev, there.st_ino) == (here.st_dev, here.st_ino) => Ok(Resolves::Here),
+            Ok(_) => Ok(Resolves::Elsewhere),
+            Err(rustix::io::Errno::NOENT) => Ok(Resolves::Nothing),
             Err(e) => Err(e.into()),
         }
     }
@@ -120,10 +141,22 @@ impl LeafDir {
     }
 }
 
+/// What a leaf's name resolves to (see [`LeafDir::name_resolves`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolves {
+    /// The leaf itself.
+    Here,
+    /// Something else: a mount over the leaf, or a new directory reusing the name.
+    Elsewhere,
+    /// Nothing: the leaf was removed.
+    Nothing,
+}
+
 /// A path through which a watch or an open reaches `fd`'s own inode, whatever is mounted over its
-/// path since.
+/// path since. `thread-self`, not `self`: after `unshare(CLONE_FILES)` a thread has its own
+/// descriptor table, and `/proc/self/fd` shows the thread-group leader's.
 pub(crate) fn fd_path(fd: BorrowedFd<'_>) -> String {
-    format!("/proc/self/fd/{}", fd.as_raw_fd())
+    format!("/proc/thread-self/fd/{}", fd.as_raw_fd())
 }
 
 fn open_dir(at: impl AsFd, path: impl rustix::path::Arg) -> io::Result<OwnedFd> {
@@ -144,6 +177,20 @@ pub(crate) fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
         return Ok(fd);
     }
     Ok(rustix::io::fcntl_dupfd_cloexec(&fd, 3)?)
+}
+
+/// Open `name` in `dir` as a directory, refusing to cross a mount or follow a symlink on the way.
+fn open_child_on_this_mount(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> rustix::io::Result<OwnedFd> {
+    use rustix::fs::ResolveFlags;
+
+    let fd = rustix::fs::openat2(
+        dir,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+    )?;
+    above_stdio(fd).map_err(|e| rustix::io::Errno::from_io_error(&e).unwrap_or(rustix::io::Errno::IO))
 }
 
 fn remove_children(dir: BorrowedFd<'_>) -> io::Result<usize> {
@@ -185,12 +232,16 @@ fn remove_children(dir: BorrowedFd<'_>) -> io::Result<usize> {
         if !is_dir {
             continue;
         }
-        let child = match open_dir(dir, name) {
+        // Never across a mount: a mount on a child cgroup shows some other directory, whose
+        // contents are not the leaf's to remove. `EXDEV` says the name leads onto one.
+        let child = match open_child_on_this_mount(dir, name) {
             Ok(child) => child,
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENODEV)) => continue,
-            Err(e) => return Err(e),
+            Err(e) if gone(e) || e == rustix::io::Errno::XDEV => continue,
+            Err(e) => return Err(e.into()),
         };
         removed += remove_children(child.as_fd())?;
+        // `dir` was reached without crossing a mount, so this removes a directory entry of the
+        // leaf's own filesystem; one mounted on since is refused `EBUSY`, not followed.
         match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
             Ok(()) => removed += 1,
             Err(e) if gone(e) || e == rustix::io::Errno::BUSY => {}
@@ -199,3 +250,7 @@ fn remove_children(dir: BorrowedFd<'_>) -> io::Result<usize> {
     }
     Ok(removed)
 }
+
+#[cfg(test)]
+#[path = "dir_tests.rs"]
+mod dir_tests;

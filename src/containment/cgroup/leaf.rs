@@ -510,15 +510,21 @@ impl CgroupLeaf {
     /// longer resolves to it from the held parent, or its mount table lists a mount on it through
     /// any cgroup2 mount (a namespace entered since creation sees mounts the held descriptors do
     /// not). `is_local_mountpoint` in `vfs_rmdir` asks the same of this namespace (kernel v6.12).
-    fn mounted_on(&self) -> io::Result<bool> {
-        if !self.dir.name_resolves_here()? {
-            return Ok(true);
+    fn mounted_on(&self) -> io::Result<Mounted> {
+        match self.dir.name_resolves()? {
+            Resolves::Here => {}
+            Resolves::Elsewhere => return Ok(Mounted::Yes),
+            Resolves::Nothing => return Ok(Mounted::Gone),
         }
         let Some(cgroup_path) = &self.cgroup_path else {
-            return Ok(false);
+            return Ok(Mounted::No);
         };
         let mountinfo = fs::read_to_string("/proc/thread-self/mountinfo")?;
-        Ok(mounted_on_cgroup(&mountinfo, cgroup_path))
+        Ok(if mounted_on_cgroup(&mountinfo, cgroup_path) {
+            Mounted::Yes
+        } else {
+            Mounted::No
+        })
     }
 
     /// SIGTERM every pid currently listed in `cgroup.procs`.
@@ -658,6 +664,15 @@ impl Drop for CgroupLeaf {
     }
 }
 
+/// Whether something is mounted on a leaf (see [`CgroupLeaf::mounted_on`]).
+#[cfg(target_os = "linux")]
+enum Mounted {
+    Yes,
+    No,
+    /// The leaf is gone.
+    Gone,
+}
+
 /// How an abandoned spawn's child ended up (see [`CgroupLeaf::abandon_before_verdict`]).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -784,8 +799,10 @@ impl CgroupLeaf {
             // clear that, so it ends the loop. Every other `EBUSY` is cgroupfs's, and a new round
             // kills, drains and sweeps the real leaf before the next `rmdir`.
             match self.mounted_on() {
-                Ok(false) => {}
-                Ok(true) => {
+                Ok(Mounted::No) => {}
+                // Removed by another party since the `rmdir`: nothing is left behind.
+                Ok(Mounted::Gone) => return,
+                Ok(Mounted::Yes) => {
                     return warn_leaf_left_behind(
                         &self.leaf_path,
                         format_args!(

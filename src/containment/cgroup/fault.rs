@@ -27,11 +27,21 @@ thread_local! {
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+    static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
 type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+
+/// Make the NEXT leaf directory made on this thread fail to be held after its `mkdir`, with
+/// `EMFILE`, as at `RLIMIT_NOFILE`. Take semantics.
+pub(crate) fn set_force_leaf_open_failure(on: bool) {
+    FORCE_LEAF_OPEN_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_leaf_open_failure() -> bool {
+    FORCE_LEAF_OPEN_FAILURE.with(|f| f.replace(false))
+}
 
 /// Make the NEXT leaf creation's `cgroup.kill` lookup on this thread fail with `errno`: a lookup
 /// through the held leaf directory fails only on a real error, which a temp directory cannot
