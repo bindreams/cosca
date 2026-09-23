@@ -141,3 +141,23 @@ fn marker_file_name_is_a_valid_windows_file_name() {
     );
     assert_eq!(marker_file_name("top_level"), "top_level");
 }
+
+#[test]
+fn reap_after_terminate_reaps_only_a_terminated_child() {
+    let mut reaped = false;
+    let outcome = reap_after_terminate(
+        || Err("denied".into()),
+        || {
+            reaped = true;
+            Ok(())
+        },
+    );
+    assert!(
+        !reaped,
+        "a child whose termination failed may still be alive: waiting could block"
+    );
+    assert_eq!(outcome, [("terminate", Err("denied".to_string()))]);
+
+    let outcome = reap_after_terminate(|| Ok(()), || Err("gone".into()));
+    assert_eq!(outcome, [("terminate", Ok(())), ("reap", Err("gone".to_string()))]);
+}

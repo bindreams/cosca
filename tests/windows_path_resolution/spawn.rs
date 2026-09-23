@@ -2,14 +2,15 @@
 
 use crate::dots_and_spaces::WEIRD_NAMES;
 use crate::harness::canary;
-use crate::pure::{all_succeeded, payload_outcome, verbatim_spelling, PayloadOutcome};
+use crate::pure::{all_succeeded, payload_outcome, reap_after_terminate, verbatim_spelling, PayloadOutcome};
 use crate::winapi::{outcome, wide};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, QueryFullProcessImageNameW, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_NAME_WIN32, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_NAME_WIN32, STARTF_USESTDHANDLES,
+    STARTUPINFOW,
 };
 
 /// Canary: an image under a verbatim dots-and-spaces name LOADS through `std::process`, and the
@@ -285,17 +286,18 @@ pub(crate) fn suspended_image(program: &str) -> Result<String, String> {
             &mut len,
         )
     };
-    // Terminate and reap whatever happened above: the process must never be resumed.
-    let killed = child.kill();
-    let reaped = child.wait();
-    // All three are reported: a failed kill is what would let the child run, so it must never be
-    // hidden behind a failed query.
-    all_succeeded([
-        ("QueryFullProcessImageNameW", queried.map_err(|e| e.to_string())),
-        ("terminate", killed.map_err(|e| e.to_string())),
-        ("reap", reaped.map(drop).map_err(|e| e.to_string())),
-    ])
-    .map_err(|why| format!("the suspended child of {program:?}: {why}"))?;
+    // Terminate whatever happened above: the process must never be resumed. `TerminateProcess`
+    // directly, not `Child::kill`, which reports success on ERROR_ACCESS_DENIED even while the
+    // process lives. Only a terminated child is reaped, so the unbounded wait cannot block.
+    let handle = HANDLE(child.as_raw_handle());
+    // SAFETY: the process handle is owned by `child` and alive.
+    let terminate = || unsafe { TerminateProcess(handle, 1) }.map_err(|e| e.to_string());
+    let reap = || child.wait().map(drop).map_err(|e| e.to_string());
+    // Every outcome is reported: a failed terminate is what would let the child run, so it must
+    // never be hidden behind a failed query.
+    let steps = std::iter::once(("QueryFullProcessImageNameW", queried.map_err(|e| e.to_string())))
+        .chain(reap_after_terminate(terminate, reap));
+    all_succeeded(steps).map_err(|why| format!("the suspended child of {program:?}: {why}"))?;
     Ok(String::from_utf16_lossy(&buf[..len as usize]))
 }
 

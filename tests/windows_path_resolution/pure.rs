@@ -153,3 +153,16 @@ pub fn all_succeeded(steps: impl IntoIterator<Item = (&'static str, Result<(), S
 pub fn marker_file_name(test_name: &str) -> String {
     test_name.replace("::", ".")
 }
+
+/// Terminate a child, then reap it only if termination succeeded: a child that was not
+/// terminated may still be alive, and an unbounded wait on it could block forever. Returns the
+/// outcome of each step that ran, for [`all_succeeded`].
+pub fn reap_after_terminate(
+    terminate: impl FnOnce() -> Result<(), String>,
+    reap: impl FnOnce() -> Result<(), String>,
+) -> Vec<(&'static str, Result<(), String>)> {
+    match terminate() {
+        Ok(()) => vec![("terminate", Ok(())), ("reap", reap())],
+        Err(e) => vec![("terminate", Err(e))],
+    }
+}
