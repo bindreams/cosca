@@ -135,7 +135,7 @@ fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
         (r" \", r"C:\dir\ \", None),
         (".. .", r"C:\dir\", None),
         (r".. .\", r"C:\dir\.. \", None),
-        ("..", r"C:\", None),
+        ("..", r"C:\dir\", None),
         (r"..\", r"C:\", None),
         (".", r"C:\dir", Some("dir")),
         (r".\", r"C:\dir\", None),

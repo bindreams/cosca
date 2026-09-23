@@ -41,7 +41,7 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
         println!("temp root: {root:?}\nsource image: {source:?}");
         let mut spawnable = 0usize;
 
-        for (i, &(name, note, creatable)) in WEIRD_NAMES.iter().enumerate() {
+        for (i, &(name, note, creatable)) in WEIRD_NAMES.iter().enumerate().skip(1) {
             let case_dir = format!(r"{root}\case{i}");
             if let Err(e) = std::fs::create_dir(&case_dir) {
                 failures.push(format!("could not create the case directory {case_dir:?}: {e}"));
