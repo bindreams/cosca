@@ -8,7 +8,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use super::{drive_len, is_sep, path_type, windows_prefix_len, PathType};
+use super::{drive_len, has_ascii_drive, is_sep, path_type, windows_prefix_len, PathType};
 
 /// `rest` appended to the directory `base`, a separator `sep` between them.
 ///
@@ -61,9 +61,13 @@ fn is_verbatim(bytes: &[u8]) -> bool {
 }
 
 /// The length of a verbatim path's prefix as std parses it, its components split on `\` alone:
-/// `\\?\UNC\server\share`, or else `\\?\` and one component (`C:` or a namespace). So `srv/shr` is
-/// one server name, where [`windows_prefix_len`] splits it for its own reasons. `UNC` is matched
+/// `\\?\UNC\server\share`, or else `\\?\` and one component (a namespace). So `srv/shr` is one
+/// server name, where [`windows_prefix_len`] splits it for its own reasons. `UNC` is matched
 /// case-insensitively, as Win32 matches it, where std matches only `UNC`.
+///
+/// A drive is std's exception: an ASCII letter and `:` that end the path or precede either
+/// separator are the prefix `\\?\C:` alone, so `\\?\C:/x` is drive C, rooted at the `/`. A
+/// digit makes no drive here, so `\\?\1:/x` is one namespace.
 fn verbatim_prefix_len(bytes: &[u8]) -> usize {
     debug_assert!(is_verbatim(bytes), "{bytes:?} must be verbatim");
     let end = |at: usize| {
@@ -80,6 +84,9 @@ fn verbatim_prefix_len(bytes: &[u8]) -> usize {
         let share = end(server + 1);
         return if share == server + 1 { server } else { share };
     }
+    if has_ascii_drive(&bytes[4..]) && bytes.get(6).is_none_or(|&b| is_sep(b, true)) {
+        return 6;
+    }
     end(4)
 }
 
@@ -91,15 +98,21 @@ enum Part<'a> {
     Normal(&'a [u8]),
 }
 
-/// [`append`] on a verbatim base, as std's `PathBuf::push` does it: the base's components (split on
-/// `\` alone after the prefix, empty ones dropped, `.` and `..` kept), then `rest`'s (split on both
+/// [`append`] on a verbatim base, as std's `PathBuf::push` does it: the base's components (after
+/// the prefix, one `\` or `/` taken as the root, the rest split on `\` alone, empty ones dropped,
+/// `.` and `..` kept), then `rest`'s (split on both
 /// separators, `.` dropped; a leading separator clears back to the root; `..` pops only a normal
 /// component), rebuilt as the prefix, its root and the components joined with `\`. A verbatim prefix
 /// always has a root, so `\\?\C:` + `t` is `\\?\C:\t`. The prefix is [`verbatim_prefix_len`]'s.
 fn append_verbatim(base: &OsStr, rest: &OsStr) -> OsString {
     let bytes = base.as_encoded_bytes();
     let prefix = verbatim_prefix_len(bytes);
-    let mut parts: Vec<Part<'_>> = bytes[prefix..]
+    let body = &bytes[prefix..];
+    let body = match body.first() {
+        Some(&b) if is_sep(b, true) => &body[1..],
+        _ => body,
+    };
+    let mut parts: Vec<Part<'_>> = body
         .split(|&b| b == b'\\')
         .filter_map(|piece| match piece {
             b"" => None,
