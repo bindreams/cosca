@@ -1033,12 +1033,16 @@ mod rewrite_tests {
     #[test]
     fn an_elevated_exact_program_in_a_cwd_with_no_path_says_why() {
         let r = super::super::rewrite_with_host_and_cwd(&mut exact_tool(None), &sudo_host(), || {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
         });
         match r {
             Err(Error::Io(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
                 assert!(e.to_string().contains("working directory as a path"), "{e}");
+                let errno = std::error::Error::source(&e)
+                    .and_then(|s| s.downcast_ref::<std::io::Error>())
+                    .and_then(std::io::Error::raw_os_error);
+                assert_eq!(errno, Some(libc::EACCES), "the errno must survive as the source");
             }
             Err(other) => panic!("expected Io, got {other}"),
             Ok(_) => panic!("a cwd with no path cannot be handed to the backend"),

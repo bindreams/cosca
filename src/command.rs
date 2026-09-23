@@ -30,6 +30,28 @@ pub struct Command {
     flags: FlagsRequest,
 }
 
+/// [`Command::posix_launch`]'s error when this process's cwd cannot be read: says why a path was
+/// needed, and keeps the read's own error — errno included — as its source.
+#[derive(Debug)]
+struct CwdUnreadable(std::io::Error);
+
+impl std::fmt::Display for CwdUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "elevating raw_executable() needs this process's working directory as a path, and it \
+             cannot be read: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CwdUnreadable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// [`Command::posix_launch`]'s answer.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct PosixLaunch {
@@ -366,17 +388,7 @@ impl Command {
         &self,
         process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
     ) -> Result<PosixLaunch, Error> {
-        let process_cwd = || {
-            process_cwd().map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "elevating raw_executable() needs this process's working directory as a path, \
-                         and it cannot be read: {e}"
-                    ),
-                )
-            })
-        };
+        let process_cwd = || process_cwd().map_err(|e| std::io::Error::new(e.kind(), CwdUnreadable(e)));
         let as_given = |program| PosixLaunch {
             program,
             cwd: self.cwd().map(Path::to_path_buf),
