@@ -1727,3 +1727,82 @@ fn a_cgroup_path_is_inside_a_leaf_only_at_or_under_its_own_path() {
         "a leaf under the root cgroup"
     );
 }
+
+// What the placement hook returns -----
+// `pre_exec` failing aborts the spawn. A failed placement must not (the child degrades to its
+// process group); a report the waiting parent can never receive must (it would read as never
+// placed for as long as the child lives).
+
+/// A failed placement whose report is delivered lets the spawn proceed.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_hook_proceeds_past_a_failed_placement() {
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    // SAFETY: fd -1 is never writable, so the placement fails with EBADF; the channel is open.
+    let result = unsafe { super::place_self_in_cgroup_pre_exec(-1, channel.slot()) };
+    assert!(
+        result.is_ok(),
+        "a failed placement must not abort the spawn: {result:?}"
+    );
+    assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EBADF));
+}
+
+/// A report that cannot be sent to a parent still waiting for it fails the spawn.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_hook_fails_when_its_report_cannot_be_sent() {
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    // fd -1 is never open, so the send fails with EBADF.
+    let slot = super::ReportSlot { fd: -1 };
+    // SAFETY: `procs_fd` is open and closed by the hook; the slot's fd is deliberately invalid.
+    let result = unsafe { super::place_self_in_cgroup_pre_exec(procs_fd, slot) };
+    assert_eq!(
+        result.map_err(|e| e.raw_os_error()),
+        Err(Some(libc::EBADF)),
+        "an undeliverable report must abort the spawn"
+    );
+}
+
+/// A parent that has already decided without the report closes its end. The report then fails
+/// with `EPIPE`, which must neither abort the spawn nor raise `SIGPIPE`.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_hook_proceeds_when_the_parent_decided_without_the_report() {
+    use std::os::fd::AsRawFd;
+
+    use rustix::net::{socketpair, AddressFamily, SocketFlags, SocketType};
+
+    let (parent, child) =
+        socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None).expect("open a socket pair");
+    drop(parent);
+    let slot = super::ReportSlot { fd: child.as_raw_fd() };
+    // SAFETY: fd -1 is never writable; `child` is open for the call.
+    let result = unsafe { super::place_self_in_cgroup_pre_exec(-1, slot) };
+    assert!(result.is_ok(), "EPIPE must not abort the spawn: {result:?}");
+}
+
+/// Through a real spawn: an undeliverable report aborts it rather than exec'ing a child the
+/// parent would misread as never placed.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
+    use std::os::unix::process::CommandExt;
+
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    let slot = super::ReportSlot { fd: -1 };
+    let mut cmd = std::process::Command::new("/bin/true");
+    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls.
+    unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let result = cmd.spawn();
+    // SAFETY: the parent's own copy of the descriptor, closed exactly once.
+    unsafe { libc::close(procs_fd) };
+    assert!(result.is_err(), "the spawn must fail");
+}

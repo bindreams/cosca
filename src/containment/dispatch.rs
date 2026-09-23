@@ -460,23 +460,19 @@ pub(crate) fn prepare(
             if let Some(ref l) = leaf {
                 // Wire the pre_exec self-placement. The closure captures the raw
                 // fd integer (Copy) — not the leaf itself (which stays in Prepared).
-                // On error (e.g. EBUSY — "no internal processes" rule), the closure
-                // returns Ok so the spawn proceeds and `attach` falls back to the
-                // already-configured process group rather than aborting the spawn.
+                // A failed placement (e.g. EBUSY — "no internal processes" rule) returns Ok,
+                // so the spawn proceeds and `attach` falls back to the already-configured
+                // process group. Only a report the child cannot send fails the spawn. Both the
+                // sync and the tokio spawn register this one closure through `prepare`.
                 // Safety: pre_exec runs post-fork, pre-exec; the function is
-                // async-signal-safe (libc::write + libc::close, no alloc).
+                // async-signal-safe (libc::write + libc::close + libc::send, no alloc).
                 let procs_fd = l.procs_fd();
-                // The child's own outcome — success, or the write's errno — is written here;
-                // it is the only channel out of a post-fork, pre-exec address space, and the
-                // `Err` below is discarded precisely so a failed placement cannot abort the
-                // spawn.
+                // The child's own outcome — success, or the write's errno — is sent here; it
+                // is the only channel out of a post-fork, pre-exec address space.
                 let slot = l.placement_slot();
                 unsafe {
                     use std::os::unix::process::CommandExt;
-                    std_cmd.pre_exec(move || {
-                        let _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot);
-                        Ok(())
-                    });
+                    std_cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
                 }
             }
             return Ok(Prepared {

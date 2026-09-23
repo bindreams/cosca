@@ -732,32 +732,31 @@ pub(crate) struct ReportSlot {
 impl ReportSlot {
     /// Send the child's outcome. Async-signal-safe: one `send(2)`, no allocation.
     ///
+    /// `EPIPE` is `Ok`: the parent closes its end before the report arrives only after deciding
+    /// without it (see [`CgroupLeaf::decide_unwaitable`]), and that decision already holds for
+    /// this child. Either the leaf was closed, so this child's placement failed with `ENODEV`;
+    /// or this child was found in the leaf; or it is being killed. Every other failure is `Err`.
+    ///
     /// # Safety
     /// The child's end must still be open at this number, which holds from the leaf's creation
     /// until the parent has taken the verdict.
-    unsafe fn report(self, value: i32) {
+    unsafe fn report(self, value: i32) -> io::Result<()> {
         let bytes = value.to_ne_bytes();
         loop {
             // Safety: `bytes` is a valid buffer; the caller guarantees the fd.
             let sent = unsafe { libc::send(self.fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };
+            if sent == bytes.len() as isize {
+                return Ok(());
+            }
             // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
-            let errno = if sent == -1 {
-                unsafe { *libc::__errno_location() }
-            } else {
-                0
-            };
-            if errno == libc::EINTR {
-                continue;
+            let errno = unsafe { *libc::__errno_location() };
+            match (sent, errno) {
+                (-1, libc::EINTR) => continue,
+                (-1, libc::EPIPE) => return Ok(()),
+                (-1, errno) => return Err(io::Error::from_raw_os_error(errno)),
+                // SOCK_SEQPACKET sends a message whole or not at all.
+                _ => return Err(io::Error::from_raw_os_error(libc::EMSGSIZE)),
             }
-            // `EPIPE` is a parent that decided without this report (see
-            // `CgroupLeaf::take_placement`). Anything else is a report lost to a parent still
-            // waiting for it, which would read as never placed, so fail loudly in debug.
-            #[cfg(debug_assertions)]
-            if sent != bytes.len() as isize && errno != libc::EPIPE {
-                // Safety: async-signal-safe.
-                unsafe { libc::abort() };
-            }
-            return;
         }
     }
 }
@@ -770,7 +769,7 @@ impl ReportSlot {
     /// As [`ReportSlot::report`].
     pub(crate) unsafe fn report_placed_for_test(self) {
         // Safety: the caller guarantees the channel is open.
-        unsafe { self.report(REPORT_PLACED) };
+        unsafe { self.report(REPORT_PLACED) }.expect("send the report");
     }
 }
 
@@ -1388,21 +1387,20 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
 /// Place the calling process into the pre-created cgroup leaf by writing `"0"`
 /// to `procs_fd`, then close the fd so it does not propagate to grandchildren.
 ///
-/// Called inside a `pre_exec` closure (post-fork, pre-exec). Returns `Ok` on
-/// success. Returns `Err` if the write fails (e.g. `EBUSY` when the
-/// supervisor's cgroup is itself a leaf — the "no internal processes" rule);
-/// the caller (`pre_exec` registered by `dispatch::prepare`) maps `Err` to
-/// `Ok(())` to fall back to the already-configured process group rather than
-/// aborting the spawn.
+/// Called inside a `pre_exec` closure (post-fork, pre-exec), whose `Err` aborts the spawn.
 ///
-/// The outcome — success, or the exact errno — is also written to `slot` so it reaches the
-/// parent. The `Err` return value cannot: it is discarded by design (a failed placement must
-/// not abort the spawn), and nothing else the child computes survives its `exec`.
+/// The outcome — success, or the exact errno — is sent to `slot`, the only way it reaches the
+/// parent. A failed write (e.g. `EBUSY` when the supervisor's cgroup is itself a leaf — the "no
+/// internal processes" rule) returns `Ok`: the child proceeds in the process group already set
+/// up, and the parent degrades on the report. `Err` is a report that could not be sent: a parent
+/// still waiting for it would read a child that may be in its leaf as never placed, for the
+/// child's whole life, so the spawn fails instead (see [`ReportSlot::report`]).
 ///
 /// # Safety
 /// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
 /// open, writable fd in the child process, and `slot`'s channel must still be open.
-/// Async-signal-safe: raw `libc::write` + `libc::close`, no allocation, no format strings.
+/// Async-signal-safe: raw `libc::write`, `libc::close` and `libc::send`, no allocation, no
+/// format strings.
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
     static ZERO: &[u8] = b"0";
@@ -1418,18 +1416,15 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     // Always close the fd — even on error — so it does not propagate to children.
     // Safety: procs_fd is valid; close is async-signal-safe.
     unsafe { libc::close(procs_fd) };
-    if ret == -1 {
+    let report = match ret {
         // `write(2)` only ever sets a positive errno, but a report of -1 means "placed", so a
         // nonsensical value is mapped to EIO rather than read back as a fabricated placement.
-        let reported = if errno > 0 { errno } else { libc::EIO };
-        // Safety: the caller guarantees the slot's channel is open.
-        unsafe { slot.report(reported) };
-        Err(io::Error::from_raw_os_error(errno))
-    } else {
-        // Safety: as above.
-        unsafe { slot.report(REPORT_PLACED) };
-        Ok(())
-    }
+        -1 if errno > 0 => errno,
+        -1 => libc::EIO,
+        _ => REPORT_PLACED,
+    };
+    // Safety: the caller guarantees the slot's channel is open.
+    unsafe { slot.report(report) }
 }
 
 #[cfg(test)]
