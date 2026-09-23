@@ -10,7 +10,7 @@ use zeroize::Zeroize;
 
 use super::plan::{BackendSet, Host, Os, Transition};
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
-use crate::command::{Command, CommandInput, EnvOp};
+use crate::command::{Command, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
 use crate::stdio::{Fd, Stdio};
 
@@ -432,45 +432,19 @@ fn explicit_set_env(ops: &[EnvOp]) -> Vec<(OsString, OsString)> {
     map.into_iter().collect()
 }
 
-/// The argv, refused unless a backend can wrap it. An argv[0] distinct from a set `executable()`
-/// cannot survive the backend wrapper → `Unsupported`.
+/// The argv, refused unless a backend can wrap it ([`super::elevation_argv`]).
 fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
-    // `Argv(vec![])`, so folding it into the commandline arm would answer "no
-    // program set" with a message about re-quoting a command line that was never set.
-    let empty = || Error::Unsupported {
-        op: "elevation of an empty command".into(),
-        platform: "unix",
-        detail: "set a program via .args([...]) before .elevate()".into(),
-    };
-    let argv =
-        match cmd.input() {
-            CommandInput::Argv(argv) => argv,
-            CommandInput::Empty => return Err(empty()),
-            CommandInput::CommandLine(_) => return Err(Error::Unsupported {
-                op: "elevation of a commandline() command".into(),
-                platform: "unix",
-                detail:
-                    "elevation requires an argv command (set .args([...])); a raw command line cannot be safely wrapped"
-                        .into(),
-            }),
-        };
-    if argv.is_empty() {
-        return Err(empty());
-    }
-    if cmd
-        .executable_path()
-        .is_some_and(|exe| argv[0].as_os_str() != exe.as_os_str())
-    {
-        return Err(Error::Unsupported {
-            op: "elevation with an argv[0] distinct from executable()".into(),
+    super::elevation_argv(
+        cmd,
+        &super::ArgvRefusals {
             platform: "unix",
-            detail:
-                "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot survive elevation"
-                    .into(),
-        });
-    }
-    Ok(argv)
+            op_prefix: "elevation",
+            commandline: "elevation requires an argv command (set .args([...])); a raw command line cannot be \
+                          safely wrapped",
+            argv0: "the backend runs the loaded file with argv[0] = its path; a separate argv[0] cannot \
+                    survive elevation",
+        },
+    )
 }
 
 /// Program + args + the directory to run them in, for a backend that moves its cwd; a

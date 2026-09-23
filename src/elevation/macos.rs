@@ -23,7 +23,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use super::{ElevatedStdio, ElevatedVia, ElevationReport, Launch};
-use crate::command::{Command, CommandInput};
+use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -163,44 +163,17 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
 /// The argv, refused unless it is one `do shell script` can exec. `exec`ing the program sets
 /// argv[0] to its own path, so an argv[0] distinct from a set `executable()` cannot survive.
 fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    // `Empty` is matched FIRST. A fresh `Command` is `CommandInput::Empty`, not
-    // `Argv(vec![])`, so folding it into the commandline arm would answer "no
-    // program set" with a message about re-quoting a command line.
-    let argv = match cmd.input() {
-        CommandInput::Argv(argv) => argv,
-        CommandInput::Empty => {
-            return Err(unsupported(
-                "macOS graphical elevation of an empty command",
-                "set a program via .args([...]) before .elevate()".into(),
-            ))
-        }
-        CommandInput::CommandLine(_) => {
-            return Err(unsupported(
-                "macOS graphical elevation of a commandline() command",
-                "the command must be an argv (set .args([...])); a raw command line cannot be \
-                 re-quoted for /bin/sh without guessing its word boundaries"
-                    .into(),
-            ))
-        }
-    };
-    let Some(first) = argv.first() else {
-        return Err(unsupported(
-            "macOS graphical elevation of an empty command",
-            "set a program via .args([...]) before .elevate()".into(),
-        ));
-    };
-    if cmd
-        .executable_path()
-        .is_some_and(|exe| first.as_os_str() != exe.as_os_str())
-    {
-        return Err(unsupported(
-            "macOS graphical elevation with an argv[0] distinct from executable()",
-            "`do shell script` execs the program, which sets argv[0] to its own path; \
-             a separate argv[0] cannot survive elevation"
-                .into(),
-        ));
-    }
-    Ok(argv)
+    super::elevation_argv(
+        cmd,
+        &super::ArgvRefusals {
+            platform: "macos",
+            op_prefix: "macOS graphical elevation",
+            commandline: "the command must be an argv (set .args([...])); a raw command line cannot be \
+                          re-quoted for /bin/sh without guessing its word boundaries",
+            argv0: "`do shell script` execs the program, which sets argv[0] to its own path; a separate \
+                    argv[0] cannot survive elevation",
+        },
+    )
 }
 
 /// Program + args + the directory to run them in, honoring `executable()`. A `raw_executable()`

@@ -204,3 +204,46 @@ fn non_permission_kill_error_stays_io_even_when_elevated() {
     let other = std::io::Error::from(std::io::ErrorKind::NotFound);
     assert!(matches!(super::map_elevated_kill_error(other, true), Error::Io(_)));
 }
+
+/// Every backend's argv gate is this one function; only the words differ.
+#[test]
+fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
+    use crate::command::Command;
+    use crate::error::Error;
+    const WORDS: super::ArgvRefusals = super::ArgvRefusals {
+        platform: "test",
+        op_prefix: "test elevation",
+        commandline: "no command lines here",
+        argv0: "no separate argv[0] here",
+    };
+    let refusal = |c: &Command| match super::elevation_argv(c, &WORDS) {
+        Err(Error::Unsupported { op, platform, detail }) => {
+            assert_eq!(platform, "test");
+            format!("{op} / {detail}")
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    };
+    let mut empty_argv = Command::new();
+    empty_argv.args::<[&str; 0], &str>([]);
+    for no_program in [Command::new(), empty_argv] {
+        assert_eq!(
+            refusal(&no_program),
+            "test elevation of an empty command / set a program via .args([...]) before .elevate()"
+        );
+    }
+    let mut line = Command::new();
+    line.commandline("id -u");
+    assert_eq!(
+        refusal(&line),
+        "test elevation of a commandline() command / no command lines here"
+    );
+    let mut argv0 = Command::new();
+    argv0.executable("/usr/bin/id").args(["not-id"]);
+    assert_eq!(
+        refusal(&argv0),
+        "test elevation with an argv[0] distinct from executable() / no separate argv[0] here"
+    );
+    let mut ok = Command::new();
+    ok.executable("/usr/bin/id").args(["/usr/bin/id", "-u"]);
+    assert_eq!(super::elevation_argv(&ok, &WORDS).expect("accepted").len(), 2);
+}

@@ -222,7 +222,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCL
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
-use crate::command::{CommandInput, ExecutableSpec};
+use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
@@ -312,49 +312,25 @@ impl Drop for ComInit {
 /// The argv runas can work from at all. Split from [`elevated_program`] and [`elevated_params`] so
 /// the program's NUL check can sit between them — see [`plan_runas`].
 fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
-    // Matched variant by variant rather than through a catch-all `else`: `Empty` is not a
-    // `commandline()` command, and `Command::new().executable("x.exe").elevate()` told that it had
-    // elevated one is sent to audit a builder call its code never makes. It wants the same
-    // "no program" refusal the empty-argv case below already returns.
-    let argv: &[OsString] = match cmd.input() {
-        CommandInput::Argv(argv) => argv,
-        CommandInput::Empty => &[],
-        CommandInput::CommandLine(_) => {
-            return Err(Error::Unsupported {
-                op: "elevation of a commandline() command".into(),
-                platform: "windows",
-                detail: "runas elevation requires an argv command (set .args([...]))".into(),
-            })
-        }
-    };
-    if argv.is_empty() {
-        return Err(Error::Unsupported {
-            op: "elevation of an empty command".into(),
+    super::elevation_argv(
+        cmd,
+        &super::ArgvRefusals {
             platform: "windows",
-            detail: "set a program via .args([...]) before .elevate()".into(),
-        });
-    }
-    Ok(argv)
+            op_prefix: "elevation",
+            commandline: "runas elevation requires an argv command (set .args([...]))",
+            argv0: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image",
+        },
+    )
 }
 
-/// The loaded image. Honors `executable()`; an argv[0] distinct from a set `executable()` cannot
-/// be preserved by runas. A `raw_executable()` program is additionally COMPLETED to an absolute
+/// The loaded image. Honors `executable()`. A `raw_executable()` program is additionally COMPLETED to an absolute
 /// path — see the `Exact` arm below for why that is the opposite of searching for it.
 fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error> {
     // The token AS WRITTEN, before any completion: argv[0], or the explicit executable.
-    let token = match cmd.executable_path() {
-        Some(exe) => {
-            if argv[0].as_os_str() != exe.as_os_str() {
-                return Err(Error::Unsupported {
-                    op: "elevation with an argv[0] distinct from executable()".into(),
-                    platform: "windows",
-                    detail: "ShellExecuteEx(runas) cannot set an argv[0] independent of the loaded image".into(),
-                });
-            }
-            exe.as_os_str().to_os_string()
-        }
-        None => argv[0].clone(),
-    };
+    // `elevated_argv` refused an argv[0] distinct from a set executable, so the two agree.
+    let token = cmd
+        .executable_path()
+        .map_or_else(|| argv[0].clone(), |exe| exe.as_os_str().to_os_string());
 
     // An `Exact` token is completed, never passed through: `ShellExecuteEx` would search a
     // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
