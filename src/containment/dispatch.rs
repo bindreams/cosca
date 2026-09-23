@@ -595,7 +595,7 @@ fn attach_tree(
                     // An undecidable verdict fails the spawn: the child is already killed.
                     match leaf.take_placement(raw_pid)? {
                         Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
-                        // The child never entered the leaf, so nothing it forks did either. The
+                        // Nothing of the child's is in the leaf: its final report is not Placed. The
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.
                         Err(reason) => {

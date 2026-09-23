@@ -387,7 +387,9 @@ fn placement_report_renders_the_childs_errno() {
     let busy = std::io::Error::from_raw_os_error(16).to_string();
     assert!(PlacementReport::WriteFailed(16).to_string().contains(&busy));
     assert!(PlacementReport::Placed.to_string().contains("succeeded"));
-    assert!(PlacementReport::NotReported.to_string().contains("did not run"));
+    assert!(PlacementReport::NotReported
+        .to_string()
+        .contains("exited before reporting"));
 }
 
 /// A child whose write failed renders the pid, the leaf path, the file's actual contents, its
@@ -407,7 +409,7 @@ fn placement_absent_renders_every_observed_fact() {
         "cosca-7-0/cgroup.procs",
         "empty",
         "errno 16",
-        "never entered",
+        "is not in the leaf",
         "already exited",
     ] {
         assert!(
@@ -432,8 +434,8 @@ fn placement_absent_renders_a_child_that_reported_nothing() {
         child_state: Some('S'),
     }
     .to_string();
-    assert!(rendered.contains("did not run"), "got {rendered:?}");
-    assert!(rendered.contains("never entered"), "got {rendered:?}");
+    assert!(rendered.contains("exited before reporting"), "got {rendered:?}");
+    assert!(rendered.contains("is not in the leaf"), "got {rendered:?}");
 }
 
 /// A live child that is nonetheless not a member is a different diagnosis from a zombie one,

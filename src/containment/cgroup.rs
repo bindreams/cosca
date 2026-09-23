@@ -36,12 +36,13 @@
 //! return before the child has run any `pre_exec`. Nothing received is not "not entered".
 //!
 //! **Absence.** Nothing of the child's is in the leaf only when there is proof of it:
-//! - a final report other than `Placed` — the child never entered, and a child that sends no
-//!   `Placed` never runs a program that could fork into the leaf; or
+//! - a final report other than `Placed` — the child either never entered, or exited before
+//!   reporting (its placement may have been interrupted between the write and the send). Either
+//!   way it never exec'd, so it never ran a program that could fork into the leaf; or
 //! - the leaf's own removal — `rmdir` succeeds only on a leaf with no live member.
 //!
 //! **Kill.** cosca kills through a leaf whenever it lacks proof of absence, and never when it has
-//! it: an occupant of a leaf the child provably never entered is not cosca's to kill. So an
+//! it: an occupant of a leaf that provably holds nothing of the child's is not cosca's to kill. So an
 //! occupied leaf whose report is still in flight is killed through, and then removed — killed
 //! again for as long as anything re-enters it before the removal lands.
 //!
@@ -228,7 +229,8 @@ pub(crate) enum LeafError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum PlacementReport {
-    /// The child exited without reporting: its `pre_exec` closure did not run.
+    /// The child exited before reporting its placement outcome: its `pre_exec` may not have run,
+    /// or may have been interrupted between the write and the send. It never exec'd either way.
     NotReported,
     /// The child's `write` to `cgroup.procs` succeeded — at that instant it WAS a member.
     Placed,
@@ -239,9 +241,10 @@ pub(crate) enum PlacementReport {
 impl fmt::Display for PlacementReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlacementReport::NotReported => {
-                f.write_str("the child reported no self-placement outcome (its pre_exec closure did not run)")
-            }
+            PlacementReport::NotReported => f.write_str(
+                "the child exited before reporting its placement outcome (its pre_exec may not \
+                     have run, or may have been interrupted)",
+            ),
             PlacementReport::Placed => f.write_str("the child's pre_exec self-placement write succeeded"),
             PlacementReport::WriteFailed(errno) => write!(
                 f,
@@ -252,11 +255,11 @@ impl fmt::Display for PlacementReport {
     }
 }
 
-/// What a child that did not enter its leaf reported: never a successful write.
+/// What a child with nothing in its leaf reported: never a successful write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum NotEntered {
-    /// Its `pre_exec` closure did not run.
+    /// It exited before reporting its placement outcome (see [`PlacementReport::NotReported`]).
     NotReported,
     /// Its `write` to `cgroup.procs` failed with this errno.
     WriteFailed(i32),
@@ -335,7 +338,7 @@ impl fmt::Display for NotPlaced {
                 };
                 write!(
                     f,
-                    "child {pid} never entered the leaf cgroup: {report}; {} is {listed}; {state}",
+                    "child {pid} is not in the leaf cgroup: {report}; {} is {listed}; {state}",
                     path.display()
                 )
             }
@@ -346,7 +349,7 @@ impl fmt::Display for NotPlaced {
                 report,
             } => write!(
                 f,
-                "child {pid} never entered the leaf cgroup: {report}; {} could not be read: {source}",
+                "child {pid} is not in the leaf cgroup: {report}; {} could not be read: {source}",
                 path.display()
             ),
             NotPlaced::Unwaitable { pid, source } => write!(
@@ -591,7 +594,7 @@ const REPORT_PLACED: i32 = -1;
 ///
 /// [`ReportChannel::wait`] therefore waits for the child itself: for the report, or for the
 /// child's exit, watched through a pidfd. The report is always sent before `exec`, so a child that
-/// exits without one never ran its placement, and `NotReported` is then the truth. The channel's
+/// exits without one never exec'd, so nothing of its is in the leaf, and `NotReported` says so. The channel's
 /// EOF is no substitute for the pidfd: every process this one forks while the channel is open
 /// inherits the child's end, so EOF would also wait for other threads' children to exec or exit —
 /// and forever on one that never execs.
@@ -861,9 +864,11 @@ impl CgroupLeaf {
         self.leaf_path.join("cgroup.events")
     }
 
-    /// Remove a leaf its child never entered: close the fd and `rmdir`, never `cgroup.kill`.
+    /// Remove a leaf that holds nothing of its child's: close the fd and `rmdir`, never
+    /// `cgroup.kill`.
     ///
-    /// The child reported no successful write, so nothing it forks is in the leaf either.
+    /// The child's final report is not `Placed`, so it never exec'd a program that could fork
+    /// into the leaf (see the module's report contract).
     /// Whatever keeps the `rmdir` from succeeding, cosca did not put there, and killing it would
     /// kill a process cosca was never asked to contain.
     pub(crate) fn remove_unentered(self) {
@@ -1225,7 +1230,7 @@ impl Drop for CgroupLeaf {
             if !removed_after_drain(&first) {
                 warn_leaf_left_behind(
                     &self.leaf_path,
-                    format_args!("rmdir failed ({first}); cgroup.kill not written: the child never entered it"),
+                    format_args!("rmdir failed ({first}); cgroup.kill not written: nothing of the child's is in it"),
                 );
             }
             return;
