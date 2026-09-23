@@ -192,7 +192,7 @@ fn resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given() {
     // process must not be THIS one (every other test in this binary shares its cwd), so the check
     // runs in a re-exec'd child instead — see `crate::test_child::run_fixture_with_cwd`.
     crate::test_child::run_fixture_with_cwd(
-        "child::spawn::windows_raw::resolve::resolve_tests::fixture_resolve_executable_falls_back_to_process_cwd",
+        crate::test_child::fixture_path!(fixture_resolve_executable_falls_back_to_process_cwd),
         dir.path(),
         FIXTURE_RESOLVE_FALLBACK_MARKER,
     );

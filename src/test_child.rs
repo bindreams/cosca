@@ -19,7 +19,13 @@
 /// convention guards against).
 ///
 /// Panics with the child's captured stdout/stderr on a non-zero exit, i.e. whenever the fixture's
-/// own assertions failed.
+/// own assertions failed — OR when the child's own libtest banner does not show that exactly the
+/// one intended fixture ran. `--exact <fixture>` naming a test that does not exist (a typo, or a
+/// rename on one side of the caller/fixture pair) makes libtest match ZERO tests and still exit
+/// 0, which a bare `status.success()` check cannot tell apart from "the fixture ran and passed" —
+/// build `fixture` with [`fixture_path!`] rather than a hand-typed string literal, so a mismatch
+/// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
+/// filter; this stdout check is the remaining backstop for whatever that still lets through.
 pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
     let _guard = crate::child::spawn::spawn_lock();
     // No `"cosca_unit_tests"` placeholder in slot 0: that convention belongs to [`fixture_argv`],
@@ -33,13 +39,50 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
         .current_dir(cwd)
         .output()
         .expect("spawn fixture child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "fixture {fixture} failed (status {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        "fixture {fixture} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
     );
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
+        "fixture {fixture} exited 0 but its libtest banner shows something other than exactly \
+         one test run and passed — most likely `--exact {fixture}` matched ZERO tests (a stale \
+         name on one side of a caller/fixture pair), which libtest also exits 0 for:\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+    );
+}
+
+/// Builds the fully-qualified libtest `--exact` path of the `#[test] fn` named `$name`, for
+/// [`run_fixture_with_cwd`]'s `fixture` argument. Two things tie the call site to the fixture
+/// instead of letting them drift apart as two independently hand-typed strings:
+///
+/// - `let _: fn() = $name;` forces the compiler to resolve `$name` as an item in scope — a typo
+///   or a stale name after a rename is a compile error here, not a filter that silently matches
+///   zero tests at runtime (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
+///   this macro exists to rule out).
+/// - `module_path!()` derives the module portion at compile time, so it can never fall out of
+///   sync with a file move or a module rename; libtest's `--exact` filter never includes the
+///   crate-name component `module_path!()` always carries as its own first segment, hence the
+///   [`strip_crate_prefix`] call.
+macro_rules! fixture_path {
+    ($name:ident) => {{
+        let _: fn() = $name;
+        crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
+    }};
+}
+pub(crate) use fixture_path;
+
+/// Strips the crate-name segment `module_path!()` always carries as its own first component
+/// (e.g. `"cosca::resolve::resolve_tests"`), since libtest's `--exact` filter never includes it
+/// (e.g. `"resolve::resolve_tests"`). Panics if `path` does not start with that segment, which
+/// would mean `module_path!()`'s documented contract no longer holds.
+pub(crate) fn strip_crate_prefix(path: &'static str) -> &'static str {
+    let prefix = concat!(env!("CARGO_PKG_NAME"), "::");
+    path.strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("{path:?} does not start with {prefix:?} — module_path!()'s contract changed"))
 }
 
 /// A child that exits promptly and needs no external binary: this same test binary, run

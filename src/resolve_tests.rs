@@ -463,7 +463,7 @@ fn empty_path_elements_are_skipped() {
     // child spawned with `cwd.path()` as its OS-level cwd instead — see
     // `crate::test_child::run_fixture_with_cwd`.
     crate::test_child::run_fixture_with_cwd(
-        "resolve::resolve_tests::fixture_empty_path_elements_are_skipped",
+        crate::test_child::fixture_path!(fixture_empty_path_elements_are_skipped),
         cwd.path(),
         FIXTURE_EMPTY_PATH_ELEMENTS_MARKER,
     );
@@ -501,7 +501,7 @@ fn relative_path_elements_are_skipped() {
     // must actually be `cwd.path()` for this to be a live check, and that process must not be THIS
     // one — see `fixture_empty_path_elements_are_skipped`'s doc.
     crate::test_child::run_fixture_with_cwd(
-        "resolve::resolve_tests::fixture_relative_path_elements_are_skipped",
+        crate::test_child::fixture_path!(fixture_relative_path_elements_are_skipped),
         cwd.path(),
         FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER,
     );
@@ -626,7 +626,7 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     // shares its cwd), so the check runs in a re-exec'd child instead — see
     // `crate::test_child::run_fixture_with_cwd`.
     crate::test_child::run_fixture_with_cwd(
-        "resolve::resolve_tests::fixture_relative_cwd_is_absolutised",
+        crate::test_child::fixture_path!(fixture_relative_cwd_is_absolutised),
         tmp.path(),
         FIXTURE_RELATIVE_CWD_MARKER,
     );
@@ -672,7 +672,7 @@ fn a_drive_relative_name_fails_closed() {
     // not be THIS one (every other test in this binary shares its cwd), so the check runs in a
     // re-exec'd child instead — see `crate::test_child::run_fixture_with_cwd`.
     crate::test_child::run_fixture_with_cwd(
-        "resolve::resolve_tests::fixture_drive_relative_name_fails_closed",
+        crate::test_child::fixture_path!(fixture_drive_relative_name_fails_closed),
         cwd.path(),
         FIXTURE_DRIVE_RELATIVE_MARKER,
     );
