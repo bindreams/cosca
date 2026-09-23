@@ -510,7 +510,21 @@ pub(crate) fn resolve_executable_in(
         path_var: path,
         windows: true,
         loadable_only,
+        normalise: &normalise_candidate,
     })
+}
+
+/// [`crate::resolve::ResolveInput::normalise`]: `GetFullPathNameW`, as [`complete_exact`] completes
+/// a `raw_executable()` token on a verbatim cwd. An `executable()` name is not NUL-checked before
+/// the search, so a NUL here fails the candidate as `std::fs::metadata` would, not the assertion in
+/// [`full_path_name`].
+fn normalise_candidate(candidate: &Path) -> std::io::Result<PathBuf> {
+    let io = |e| match e {
+        Error::Io(e) => e,
+        other => std::io::Error::other(other.to_string()),
+    };
+    ensure_no_nul_wide("program candidate", candidate.as_os_str()).map_err(io)?;
+    full_path_name(candidate).map_err(io)
 }
 
 // Environment block =====

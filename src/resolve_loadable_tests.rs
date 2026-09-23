@@ -22,6 +22,7 @@ fn go(program: &str, cwd: &Path, path_var: Option<&OsStr>, loadable_only: bool) 
         path_var,
         windows: true,
         loadable_only,
+        normalise: &as_written,
     })
 }
 

@@ -63,6 +63,7 @@ fn go(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::Path
         path_var: path,
         windows: HOST_WINDOWS,
         loadable_only: false,
+        normalise: &as_written,
     })
 }
 
@@ -391,6 +392,7 @@ fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::p
         path_var: path,
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     })
 }
 
@@ -757,6 +759,7 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
         path_var: Some(&path),
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -781,6 +784,7 @@ fn bare_name_only_on_path_still_resolves_from_path() {
         path_var: Some(&path),
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -806,6 +810,7 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
         path_var: Some(&path),
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -819,6 +824,7 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
         path_var: None,
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     });
     assert_not_found("tool", miss);
 }
@@ -846,6 +852,7 @@ fn posix_ignores_system_dirs_entirely() {
         path_var: None,
         windows: false,
         loadable_only: false,
+        normalise: &as_written,
     });
     assert_not_found("tool", got);
 }

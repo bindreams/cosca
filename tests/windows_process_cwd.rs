@@ -50,7 +50,8 @@ fn no_route_spawns_from_a_long_cwd_even_when_long_path_aware() {
     assert_eq!(facts, expected, "full report:\n{report}");
 }
 
-/// A relative name against a verbatim process cwd: cosca loads and runs where Win32 does.
+/// A relative name against a verbatim process cwd: cosca loads and runs where Win32 does, by
+/// `raw_executable()` and by `executable()`'s search alike.
 #[test]
 fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
     let report = probe("verbatim", env!("CARGO_BIN_EXE_cosca_testbin_image"));
@@ -61,6 +62,8 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
         r"gfpn_sub=<vd>\sub",
         r"win32_tool=ok,image=<d>\tool.exe",
         r"raw_tool=ok,image=<d>\tool.exe",
+        r"raw_nested=ok,image=<d>\sub\tool.exe",
+        r"exe_nested=ok,image=<d>\sub\tool.exe",
         r"raw_sub=ok,cwd=<vd>\sub",
         r"std_sub=ok,cwd=<vd>\sub",
     ];

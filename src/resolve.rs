@@ -123,6 +123,18 @@ pub(crate) struct ResolveInput<'a> {
     /// It also makes the search fail closed on a candidate whose existence cannot be determined,
     /// where an ordinary search skips it with a warning: see [`resolve`].
     pub loadable_only: bool,
+    /// How Win32 completes a candidate that is verbatim (`\\?\`) only because its directory is:
+    /// `GetFullPathNameW`, which the raw backend passes. Win32 normalises a name it completes
+    /// against a verbatim cwd (`sub.\tool.exe` on `\\?\C:\d` is `\\?\C:\d\sub\tool.exe`), and
+    /// the candidate is probed and returned as that. A name written verbatim, or joined onto any
+    /// other directory, never reaches it. Windows only.
+    pub normalise: &'a dyn Fn(&Path) -> std::io::Result<PathBuf>,
+}
+
+/// [`ResolveInput::normalise`] for a test that probes every candidate as joined.
+#[cfg(test)]
+pub(crate) fn as_written(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(path.to_path_buf())
 }
 
 /// How the program names its file, which decides whether `PATH` (and, on Windows,
@@ -931,9 +943,18 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             if !accepted(&joined, input.windows) {
                 continue;
             }
-            match is_execable(&joined, input.windows) {
-                Ok(true) => return Ok(joined),
-                Ok(false) => {}
+            let made_verbatim = input.windows
+                && join::is_verbatim(dir.as_os_str().as_encoded_bytes())
+                && !join::is_verbatim(candidate.as_encoded_bytes());
+            let probed = if made_verbatim {
+                (input.normalise)(&joined)
+            } else {
+                Ok(joined.clone())
+            }
+            .and_then(|path| Ok(is_execable(&path, input.windows)?.then_some(path)));
+            match probed {
+                Ok(Some(path)) => return Ok(path),
+                Ok(None) => {}
                 // A `loadable_only` search fails closed: skipping a candidate it could not check
                 // would let a later directory, perhaps one on `PATH` an attacker can write, supply
                 // the image.

@@ -56,7 +56,7 @@ pub(crate) fn join(base: &OsStr, name: &OsStr, sep: &str) -> OsString {
     }
 }
 
-fn is_verbatim(bytes: &[u8]) -> bool {
+pub(super) fn is_verbatim(bytes: &[u8]) -> bool {
     bytes.starts_with(br"\\?\")
 }
 

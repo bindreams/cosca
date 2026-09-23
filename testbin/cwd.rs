@@ -12,7 +12,7 @@
 //!   NULL `lpCurrentDirectory`, main's route) and `std` with the long `current_dir`. The children
 //!   are this binary (long-path aware) and `<unaware-child>` (`cosca_testbin_image`, which is not).
 //! - `verbatim <base> <image-child>`: enters `\\?\<d>`, then reports what Win32 and cosca make of
-//!   `tool.exe.` and `sub.` against that cwd.
+//!   `tool.exe.`, `sub.` and `sub.\tool.exe` against that cwd.
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
@@ -156,6 +156,7 @@ mod probe {
         let d = canonical(base).join("d");
         std::fs::create_dir_all(d.join("sub")).expect("create <d>\\sub");
         std::fs::copy(image, d.join("tool.exe")).expect("copy the image child");
+        std::fs::copy(image, d.join("sub").join("tool.exe")).expect("copy the image child into sub");
         let vd = verbatim_of(&d);
         let set = set_cwd(&vd);
         println!("set={}", outcome(&set));
@@ -175,6 +176,16 @@ mod probe {
         let mut raw_tool = cosca::Command::new();
         raw_tool.raw_executable("tool.exe.").commandline("tool");
         println!("raw_tool={}", spawned(cosca_output(&mut raw_tool), "image=", &render));
+        for (key, raw) in [("raw_nested", true), ("exe_nested", false)] {
+            let mut nested = cosca::Command::new();
+            if raw {
+                nested.raw_executable(r"sub.\tool.exe");
+            } else {
+                nested.executable(r"sub.\tool.exe");
+            }
+            nested.commandline("tool");
+            println!("{key}={}", spawned(cosca_output(&mut nested), "image=", &render));
+        }
         let mut raw_sub = cosca::Command::new();
         raw_sub.executable(image).commandline("x").current_dir("sub.");
         println!("raw_sub={}", spawned(cosca_output(&mut raw_sub), "cwd=", &render));

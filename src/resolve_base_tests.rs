@@ -52,6 +52,7 @@ fn an_absolute_name_needs_no_base() {
         path_var: None,
         windows: cfg!(windows),
         loadable_only: false,
+        normalise: &as_written,
     });
     assert_eq!(got.unwrap(), tool);
 }
@@ -75,6 +76,7 @@ fn a_bare_name_needs_no_base() {
         path_var: Some(dir.path().as_os_str()),
         windows: cfg!(windows),
         loadable_only: false,
+        normalise: &as_written,
     });
     assert_eq!(got.unwrap(), tool);
 }
@@ -98,6 +100,7 @@ fn a_unc_shaped_name_with_no_share_is_refused() {
             path_var: None,
             windows: true,
             loadable_only: false,
+            normalise: &as_written,
         });
         match got {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{name:?}: {e}"),
@@ -172,6 +175,7 @@ fn a_digit_drive_is_drive_relative_everywhere() {
         path_var: None,
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     });
     match got {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
@@ -199,6 +203,7 @@ fn a_located_name_without_a_base_is_a_contract_violation() {
         path_var: None,
         windows: false,
         loadable_only: false,
+        normalise: &as_written,
     });
 }
 
@@ -292,6 +297,7 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
         path_var: Some(path_var),
         windows: true,
         loadable_only,
+        normalise: &as_written,
     })
 }
 
@@ -375,6 +381,7 @@ fn a_relative_windows_base_is_a_contract_violation() {
         path_var: None,
         windows: true,
         loadable_only: false,
+        normalise: &as_written,
     });
 }
 
@@ -390,5 +397,55 @@ fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
         path_var: None,
         windows: false,
         loadable_only: true,
+        normalise: &as_written,
     });
+}
+
+/// A candidate made verbatim by its base, not by the caller, is normalised as Win32 completes a
+/// relative name against a verbatim cwd, and the normalised path is the one probed and returned.
+#[test]
+fn a_candidate_made_verbatim_by_its_base_is_normalised() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("tool.exe");
+    std::fs::write(&tool, b"x").unwrap();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let normalise = |p: &Path| {
+        seen.borrow_mut().push(p.to_path_buf());
+        Ok(tool.clone())
+    };
+    let got = resolve(ResolveInput {
+        program: Path::new(r"sub.\tool.exe"),
+        cwd: Some(Path::new(r"\\?\C:\d")),
+        system_dirs: &[],
+        path_var: None,
+        windows: true,
+        loadable_only: false,
+        normalise: &normalise,
+    });
+    assert_eq!(got.unwrap(), tool);
+    assert_eq!(*seen.borrow(), [PathBuf::from(r"\\?\C:\d\sub.\tool.exe")]);
+}
+
+/// A name written verbatim, or joined onto a plain base, is probed as it stands.
+#[test]
+fn only_a_verbatim_base_makes_a_candidate_normalised() {
+    let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be normalised") };
+    for (program, cwd) in [
+        (r"\\?\C:\d\sub.\tool.exe", None),
+        (r"sub.\tool.exe", Some(Path::new(r"C:\d"))),
+    ] {
+        let got = resolve(ResolveInput {
+            program: Path::new(program),
+            cwd,
+            system_dirs: &[],
+            path_var: None,
+            windows: true,
+            loadable_only: false,
+            normalise: &never,
+        });
+        match got {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{program:?}: {e}"),
+            other => panic!("{program:?} must miss, got {other:?}"),
+        }
+    }
 }
