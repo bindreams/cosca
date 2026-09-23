@@ -248,7 +248,7 @@ impl CgroupLeaf {
         mut channel: ReportChannel,
         source: io::Error,
     ) -> Result<Result<(), NotPlaced>, crate::error::Error> {
-        let remove = || fs::remove_dir(&self.leaf_path);
+        let remove = || self.rmdir_leaf();
         // Test-only fault seam: a leaf that is busy with another process.
         #[cfg(test)]
         let removed = match fault::take_force_leaf_busy() {
@@ -429,6 +429,16 @@ impl CgroupLeaf {
         }
     }
 
+    /// `rmdir` the leaf.
+    fn rmdir_leaf(&self) -> io::Result<()> {
+        #[cfg(test)]
+        fault::record_leaf_step(|| {
+            let events = fs::read_to_string(self.events_path()).unwrap_or_default();
+            format!("rmdir {}", events.lines().next().unwrap_or("(no cgroup.events)"))
+        });
+        fs::remove_dir(&self.leaf_path)
+    }
+
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
     ///
     /// `Ok` means the tree is dead: either the atomic kill fired, or the leaf was already gone
@@ -444,6 +454,8 @@ impl CgroupLeaf {
         let path = self.leaf_path.join("cgroup.kill");
         match fs::write(&path, b"1") {
             Ok(()) => {
+                #[cfg(test)]
+                fault::record_leaf_step(|| "kill".to_string());
                 self.killed.store(true, Ordering::Relaxed);
                 Ok(())
             }
@@ -513,6 +525,48 @@ impl CgroupLeaf {
                 Ok(_) => continue,                            // a transition fired — re-read
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(Error::Io(io::Error::from(e))),
+            }
+        }
+    }
+
+    /// Block until every process in the leaf has exited: `populated` reads 0, or the leaf is gone.
+    ///
+    /// No deadline and no interval: the wait is an inotify watch on `cgroup.events`, which the
+    /// kernel modifies when `populated` flips. The watch is armed before the first read, so a flip
+    /// between the two is seen on the read. Only a member stuck in uninterruptible sleep (D state)
+    /// keeps it waiting, since nothing can end that member sooner.
+    fn block_until_drained(&self) -> Result<(), crate::error::Error> {
+        use rustix::fs::inotify;
+
+        use crate::error::Error;
+
+        let path = self.events_path();
+        let watch = inotify::init(inotify::CreateFlags::CLOEXEC).map_err(|e| Error::Io(e.into()))?;
+        if let Err(e) = inotify::add_watch(&watch, &path, inotify::WatchFlags::MODIFY) {
+            let e = io::Error::from(e);
+            return if removed_after_drain(&e) {
+                Ok(())
+            } else {
+                Err(Error::Io(e))
+            };
+        }
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if removed_after_drain(&e) => return Ok(()),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let mut buf = String::new();
+        let mut events = [0u8; 1024];
+        loop {
+            if !read_populated(&mut file, &mut buf)? {
+                return Ok(());
+            }
+            #[cfg(test)]
+            fault::notify_drain_blocking();
+            // Any event is a reason to re-read; what it says does not matter.
+            match rustix::io::read(&watch, &mut events) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(Error::Io(e.into())),
             }
         }
     }
@@ -605,18 +659,18 @@ impl Drop for CgroupLeaf {
         if self.abandoned {
             return;
         }
-        // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill
-        // to drain it, then retry — but only if the child entered it: a final report other than
-        // `Placed` proves nothing of the child's is there. A leaf that outlives the removal is
-        // reported.
-        let Err(first) = fs::remove_dir(&self.leaf_path) else {
+        // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill,
+        // wait for the leaf to drain, then retry — but only if the child entered it: a final
+        // report other than `Placed` proves nothing of the child's is there. A leaf that outlives
+        // the removal is reported.
+        let Err(first) = self.rmdir_leaf() else {
             return;
         };
         // `Drop` kills only when both hold:
         //
         // | entered | armed | Drop                                         |
         // |---------|-------|----------------------------------------------|
-        // | true    | true  | rmdir; if it fails, cgroup.kill, rmdir again |
+        // | true    | true  | rmdir; if it fails, cgroup.kill, drain, rmdir |
         // | true    | false | one rmdir: the caller opted the tree out     |
         // | false   | true  | one rmdir: the child never entered the leaf  |
         // | false   | false | one rmdir: the child never entered the leaf  |
@@ -650,25 +704,11 @@ impl Drop for CgroupLeaf {
             }
             return;
         }
-        let kill = self.hard_kill();
-        let Err(second) = fs::remove_dir(&self.leaf_path) else {
-            return;
-        };
-        // A leaf that is GONE is not a leak: `rmdir` on a cgroup v2 leaf succeeds only once it
-        // is empty, so another party having removed it means it left nothing behind here.
-        if removed_after_drain(&second) {
-            return;
+        // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
+        // that is already gone left nothing behind.
+        if !removed_after_drain(&first) {
+            self.drain_and_remove(first, false, "after its handle's teardown");
         }
-        warn_leaf_left_behind(
-            &self.leaf_path,
-            format_args!(
-                "first rmdir failed ({first}), cgroup.kill {}, second rmdir failed ({second})",
-                match kill {
-                    Ok(()) => "succeeded".to_string(),
-                    Err(e) => format!("failed ({e})"),
-                }
-            ),
-        );
     }
 }
 
@@ -728,7 +768,10 @@ impl CgroupLeaf {
         let fate = end_child(&received);
         let through_leaf = self.entered.then(|| self.hard_kill());
         if self.entered {
-            self.remove_killing_through(through_leaf.as_ref().is_some_and(Result::is_ok));
+            self.remove_killing_through(
+                through_leaf.as_ref().is_some_and(Result::is_ok),
+                "after its spawn was abandoned",
+            );
         } else {
             self.remove_holding_nothing();
         }
@@ -741,84 +784,80 @@ impl CgroupLeaf {
         }
     }
 
-    /// Remove an abandoned leaf its child entered: killed through, drained, its empty child
-    /// cgroups removed, and killed again for as long as anything re-enters it before the removal
-    /// lands. `killed` says whether the caller's own kill through it succeeded.
+    /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
+    /// and killed again for as long as anything re-enters it before the removal lands. `killed`
+    /// says whether the caller's own kill through it succeeded; `context` says what removal this
+    /// is, for the report of a leaf left behind.
+    fn remove_killing_through(&mut self, killed: bool, context: &str) {
+        match self.rmdir_leaf() {
+            Ok(()) => {}
+            Err(e) if removed_after_drain(&e) => {}
+            Err(occupied) => self.drain_and_remove(occupied, killed, context),
+        }
+    }
+
+    /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed with
+    /// `occupied`.
     ///
-    /// `rmdir` gives the same `EBUSY` for a leaf holding a child cgroup as for a populated one,
-    /// and killing removes no directory. A round that removes nothing is a stall unless a fresh
-    /// sweep — child cgroups may appear after the last one — or a re-entered leaf shows progress;
-    /// a stalled leaf is reported, not retried.
-    fn remove_killing_through(&mut self, mut killed: bool) {
+    /// Every drain is waited for, however long it takes ([`block_until_drained`](Self::block_until_drained)).
+    /// `rmdir` gives the same `EBUSY` for a leaf holding a child cgroup as for a populated one, and
+    /// killing removes no directory. A drained round that removes nothing and finds the leaf not
+    /// re-entered has nothing left to wait for, so the leaf is reported rather than retried.
+    fn drain_and_remove(&mut self, mut occupied: io::Error, mut killed: bool, context: &str) {
         loop {
-            let occupied = match fs::remove_dir(&self.leaf_path) {
-                Ok(()) => return,
-                Err(e) if removed_after_drain(&e) => return,
-                Err(e) => e,
-            };
-            if occupied.raw_os_error() != Some(libc::EBUSY) {
-                return warn_leaf_left_behind(
-                    &self.leaf_path,
-                    format_args!("rmdir failed ({occupied}) after its spawn was abandoned"),
-                );
+            // A cgroup reports an occupied leaf as `EBUSY`; any other directory, as `ENOTEMPTY`.
+            if !matches!(occupied.raw_os_error(), Some(libc::EBUSY) | Some(libc::ENOTEMPTY)) {
+                return warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({occupied}) {context}"));
             }
             if !killed {
                 if let Err(e) = self.hard_kill() {
                     return warn_leaf_left_behind(
                         &self.leaf_path,
-                        format_args!(
-                            "rmdir failed ({occupied}) after its spawn was abandoned; cgroup.kill failed ({e})"
-                        ),
+                        format_args!("rmdir failed ({occupied}) {context}; cgroup.kill failed ({e})"),
                     );
                 }
             }
             killed = false;
             // Every member was just sent SIGKILL, so the leaf drains.
-            if let Err(e) = self.wait_drained(None) {
+            if let Err(e) = self.block_until_drained() {
                 return warn_leaf_left_behind(
                     &self.leaf_path,
-                    format_args!(
-                        "rmdir failed ({occupied}) after its spawn was abandoned; its drain could not be watched ({e})"
-                    ),
+                    format_args!("rmdir failed ({occupied}) {context}; its drain could not be watched ({e})"),
                 );
             }
-            match remove_child_cgroups(&self.leaf_path) {
-                Ok(removed) if removed > 0 => continue,
-                Ok(_) => {}
+            let swept = match remove_child_cgroups(&self.leaf_path) {
+                Ok(removed) => removed,
                 Err(e) => {
                     return warn_leaf_left_behind(
                         &self.leaf_path,
-                        format_args!(
-                            "rmdir failed ({occupied}) after its spawn was abandoned; a child cgroup could not be \
-                             removed ({e})"
-                        ),
+                        format_args!("rmdir failed ({occupied}) {context}; a child cgroup could not be removed ({e})"),
                     )
                 }
-            }
-            // Nothing removed: progress only if the retried `rmdir` lands, a fresh sweep finds a
-            // new child cgroup, or something re-entered the leaf.
-            let again = match fs::remove_dir(&self.leaf_path) {
+            };
+            occupied = match self.rmdir_leaf() {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
                 Err(e) => e,
             };
+            if swept > 0 {
+                continue;
+            }
+            // Nothing removed: progress only if a fresh sweep finds a new child cgroup, or
+            // something re-entered the leaf.
             match (remove_child_cgroups(&self.leaf_path), self.repopulated()) {
                 (Ok(removed), _) if removed > 0 => continue,
                 (_, Ok(true)) => continue,
                 (_, Ok(false)) => {
                     return warn_leaf_left_behind(
                         &self.leaf_path,
-                        format_args!(
-                            "rmdir failed ({again}) after its spawn was abandoned; nothing was left to kill or remove"
-                        ),
+                        format_args!("rmdir failed ({occupied}) {context}; nothing was left to kill or remove"),
                     )
                 }
                 (_, Err(e)) => {
                     return warn_leaf_left_behind(
                         &self.leaf_path,
                         format_args!(
-                            "rmdir failed ({again}) after its spawn was abandoned; whether it was re-entered could \
-                             not be read ({e})"
+                            "rmdir failed ({occupied}) {context}; whether it was re-entered could not be read ({e})"
                         ),
                     )
                 }
@@ -829,13 +868,13 @@ impl CgroupLeaf {
     /// Remove an abandoned leaf that holds nothing of its child's: never killed through — an
     /// occupant is not cosca's — though its empty child cgroups are removed.
     fn remove_holding_nothing(&mut self) {
-        let first = match fs::remove_dir(&self.leaf_path) {
+        let first = match self.rmdir_leaf() {
             Ok(()) => return,
             Err(e) if removed_after_drain(&e) => return,
             Err(e) => e,
         };
         let why = match remove_child_cgroups(&self.leaf_path) {
-            Ok(removed) if removed > 0 => match fs::remove_dir(&self.leaf_path) {
+            Ok(removed) if removed > 0 => match self.rmdir_leaf() {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
                 Err(e) => format!("its child cgroups were removed, but rmdir failed again ({e})"),

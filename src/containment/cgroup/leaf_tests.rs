@@ -685,6 +685,56 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
     }
 }
 
+// An armed Drop's drain -----
+
+/// An armed `Drop` that kills through its leaf removes it only once the leaf has drained: no
+/// `rmdir` after the `cgroup.kill` write sees `populated 1`. Another thread flips a fake
+/// `cgroup.events` to `populated 0` once the drop's wait is blocked, and only then.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-draining-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let events = leaf_path.join("cgroup.events");
+    std::fs::write(&events, "populated 1\nfrozen 0\n").expect("write cgroup.events");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel();
+    // Ends when the drop's notifier is taken, which drops the only sender. The flip rewrites the
+    // one byte that differs, in place: a truncating rewrite could be read half-done, as an empty
+    // file.
+    let flipper = std::thread::spawn(move || {
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&events)
+            .expect("open cgroup.events");
+        while blocking_rx.recv().is_ok() {
+            file.write_all_at(b"0", "populated ".len() as u64)
+                .expect("drain the fake leaf");
+        }
+    });
+
+    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
+    crate::containment::cgroup::fault::record_leaf_steps();
+    drop(entered_leaf_at(leaf_path));
+    let steps = crate::containment::cgroup::fault::take_leaf_steps();
+    crate::containment::cgroup::fault::take_drain_blocking_notifier();
+    flipper.join().expect("flipper");
+
+    let killed_at = steps
+        .iter()
+        .position(|s| s == "kill")
+        .unwrap_or_else(|| panic!("an occupied armed leaf must be killed through, got {steps:?}"));
+    let after_kill = &steps[killed_at + 1..];
+    assert!(!after_kill.is_empty(), "the drop must retry the rmdir, got {steps:?}");
+    assert!(
+        after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
+        "every rmdir after the kill must wait for the drain, got {steps:?}"
+    );
+}
+
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
 /// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note

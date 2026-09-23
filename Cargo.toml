@@ -97,7 +97,7 @@ nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"
 command-fds = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["process", "event", "net"] }
+rustix = { version = "1", features = ["process", "event", "net", "fs"] }
 
 [[bin]]
 name = "cosca_testbin"

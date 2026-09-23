@@ -23,6 +23,40 @@ thread_local! {
     static FORCE_MEMBERSHIP_UNREADABLE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
+    static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Send on `notify` each time a leaf's drain wait on this thread is about to block: the watch is
+/// armed and `populated` last read 1. Kept until [`take_drain_blocking_notifier`].
+pub(crate) fn set_drain_blocking_notifier(notify: std::sync::mpsc::Sender<()>) {
+    DRAIN_BLOCKING.with(|d| *d.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_drain_blocking_notifier() {
+    DRAIN_BLOCKING.with(|d| d.borrow_mut().take());
+}
+pub(crate) fn notify_drain_blocking() {
+    DRAIN_BLOCKING.with(|d| {
+        if let Some(notify) = d.borrow().as_ref() {
+            let _ = notify.send(());
+        }
+    });
+}
+
+/// Record, on this thread, each `cgroup.kill` write (`"kill"`) and each `rmdir` of a leaf, the
+/// latter with its `cgroup.events` as read at that moment, until [`take_leaf_steps`].
+pub(crate) fn record_leaf_steps() {
+    LEAF_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+pub(crate) fn take_leaf_steps() -> Vec<String> {
+    LEAF_STEPS.with(|s| s.borrow_mut().take()).unwrap_or_default()
+}
+pub(crate) fn record_leaf_step(step: impl FnOnce() -> String) {
+    LEAF_STEPS.with(|s| {
+        if let Some(steps) = s.borrow_mut().as_mut() {
+            steps.push(step());
+        }
+    });
 }
 
 /// Treat the NEXT created leaf as exposing `cgroup.kill`. Supplies the single fact a temp
