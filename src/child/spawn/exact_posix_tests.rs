@@ -215,7 +215,10 @@ impl Drop for RestoreMode {
 /// Runs the fixture in `<root>/p/d` with `p` unsearchable, so its cwd has no path it can use —
 /// `getcwd` fails on macOS, and a `chdir` to the path fails everywhere. `d/tool` exits with
 /// [`CWD_TOOL_EXIT`] and `d/sub/tool` with [`PATH_TOOL_EXIT`], each only when run in its own
-/// directory. Returns the fixture's exit code and stderr.
+/// directory. Returns the fixture's exit code, and its stderr prefixed with the gate write's result.
+///
+/// The write can fail: a fixture that refused a precondition has exited before reading it. Its exit
+/// code and stderr then say why, so the write result is reported rather than panicked on.
 ///
 /// The fixture's cwd is set by the spawner, so no process in this test moves its own.
 fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_elevated: bool) -> (Option<i32>, String) {
@@ -248,14 +251,12 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     };
     let _restore = RestoreMode(p.clone());
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"x")
-        .expect("release the fixture");
+    let gate = child.stdin.take().expect("stdin").write_all(b"x");
     let out = child.wait_with_output().expect("wait");
-    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status.code(),
+        format!("gate write: {gate:?}\n{}", String::from_utf8_lossy(&out.stderr)),
+    )
 }
 
 /// A cwd with no usable path still runs a bare `raw_executable()`, as `./tool` does under std:
