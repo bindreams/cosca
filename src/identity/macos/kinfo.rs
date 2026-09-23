@@ -4,7 +4,10 @@
 //! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read; everything else is layout.
 //! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
-#![allow(non_camel_case_types)]
+#![allow(
+    non_camel_case_types,
+    reason = "mirrors the kernel's own kinfo_proc field/type names verbatim so the layout is checkable by inspection"
+)]
 
 use super::super::{RawPid, Resolved};
 

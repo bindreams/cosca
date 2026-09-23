@@ -278,7 +278,13 @@ pub(crate) fn holders(handle: u64, pids: &[RawPid]) -> Vec<Holder> {
 /// (including this file's own tests) want; folds `MarkerQuery::Denied` into `false` alongside
 /// `NotHeld`, which is correct for a caller that does not need to distinguish them. `kill_holder`
 /// uses `holds_marker_query` directly instead, because IT does need to.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "this file's own tests are the only production-code-external consumer; see comment above"
+    )
+)]
 pub(crate) fn holds_marker(pid: RawPid, handle: u64) -> bool {
     matches!(holds_marker_query(pid, handle), MarkerQuery::Held)
 }
@@ -518,7 +524,6 @@ pub(crate) struct PreparedMarker {
     pub read_handle: u64,
     /// The descriptor number the marker occupies in the child (`preserved_fds` does not
     /// renumber, so it is the parent's number too).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fd: RawFd,
 }
 
@@ -868,7 +873,10 @@ impl Marker {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Child::test_marker_handle (test-only)
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "consumed by Child::test_marker_handle (test-only)")
+    )]
     pub(crate) fn handle(&self) -> u64 {
         self.handle
     }

@@ -3,6 +3,10 @@
 //! never by sleep, poll loop, or wall-clock. Escalation tests use a SIGTERM-ignoring child +
 //! Duration::ZERO, so escalation is deterministic (the child is alive at the single poll).
 
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 #[path = "common/mod.rs"]
 mod common;
 

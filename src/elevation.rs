@@ -14,14 +14,26 @@ use zeroize::Zeroize;
 // Pure and cross-tested, so it is compiled everywhere — but its only in-crate
 // caller is `posix.rs`, which is `cfg(unix)`. Off-unix every item is therefore
 // test-only, exactly like the `command.rs` accessors it calls.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "off-unix, macos's only in-crate caller is cfg(unix) posix.rs, so every item here is test-only"
+    )
+)]
 pub(crate) mod macos;
 pub(crate) mod plan;
 #[cfg(unix)]
 #[path = "elevation/posix.rs"]
 pub(crate) mod posix;
 pub(crate) mod sanitize;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "shell_file gates the ShellExecuteEx launch path (Windows-only); nothing calls it off-windows"
+    )
+)]
 pub(crate) mod shell_file;
 #[cfg(windows)]
 #[path = "elevation/windows.rs"]
@@ -85,7 +97,13 @@ pub(crate) fn elevation_argv<'a>(
 /// What an elevation gate validated and the build then wraps: the program, its arguments, and the
 /// directory to run them in. Computed once per rewrite, so a `raw_executable()` program and its
 /// directory come from one reading of this process's cwd.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "Launch is only constructed by the unix-only macos.rs and posix.rs backends; dead off-unix"
+    )
+)]
 #[derive(Debug)]
 pub(crate) struct Launch {
     pub(crate) program: OsString,
@@ -290,7 +308,13 @@ impl Default for ElevationRequest {
 /// literal is never hand-copied.
 // Consumed by the Windows `RunAsIs` arms only (the POSIX rewrite reports
 // `AlreadyElevated` through `PosixRewrite`), hence the gated allow.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "consumed only by the Windows RunAsIs arms; the POSIX rewrite reports AlreadyElevated through PosixRewrite instead"
+    )
+)]
 pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport {
     ElevationReport {
         via: ElevatedVia::AlreadyElevated,
@@ -331,7 +355,10 @@ fn backend_unusable(backend_path: &std::path::Path) -> bool {
 }
 
 // Dead on non-unix: `remap_derived_spawn_error` has no non-unix production caller.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "remap_derived_spawn_error, its only caller, has no non-unix production call site"
+)]
 #[cfg(not(unix))]
 fn backend_unusable(backend_path: &std::path::Path) -> bool {
     !backend_path.exists()
@@ -345,7 +372,13 @@ fn backend_unusable(backend_path: &std::path::Path) -> bool {
 /// underlying `io::Error` and the backend path are embedded so the cause is never lost.
 // Consumed by the unix sync spawn arm (`crate::child::spawn::spawn`); dead on non-unix,
 // where the Windows arm delegates straight to `windows::spawn_elevated`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "consumed only by the unix sync spawn arm; the Windows arm delegates straight to windows::spawn_elevated"
+    )
+)]
 pub(crate) fn remap_derived_spawn_error(
     err: crate::error::Error,
     backend_path: &std::path::Path,

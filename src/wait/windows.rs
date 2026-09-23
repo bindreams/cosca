@@ -86,7 +86,13 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 /// An unnamed manual-reset event, initially unsignaled, for releasing
 /// `block_until_exit_or_cancel` early. Signal with [`signal_cancel`]; `OwnedHandle` closes it.
 // consumers: tokio::wait::grace_wait and the async raw backend (tokio::spawn::windows_raw).
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "consumers are tokio::wait::grace_wait and the async raw backend; see comment above"
+    )
+)]
 pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
     // SAFETY: creating an unnamed event has no preconditions; the handle is immediately
     // wrapped in an OwnedHandle, which closes it.
@@ -96,7 +102,13 @@ pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
 }
 
 // consumers: tokio::wait::grace_wait and the async raw backend (tokio::spawn::windows_raw).
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "consumers are tokio::wait::grace_wait and the async raw backend; see comment above"
+    )
+)]
 pub(crate) fn signal_cancel(event: &OwnedHandle) {
     // SAFETY: `event` is a live event handle (the OwnedHandle keeps it open).
     let set = unsafe { SetEvent(HANDLE(event.as_raw_handle())) };
@@ -118,7 +130,10 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
 /// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
 /// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`;
 /// `None` = unbounded.
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "only consumer is tokio::wait::grace_wait")
+)]
 pub(crate) fn block_until_exit_or_cancel(
     id: ProcessId,
     grace: Option<Duration>,

@@ -85,7 +85,10 @@ pub(crate) fn arm_proc_exit(id: ProcessId) -> Result<Option<Kqueue>, Error> {
 /// Drain one pending event from an armed kqueue without blocking. `Ok(Some(()))` = the exit
 /// event was observed; `Ok(None)` = nothing pending (spurious readiness — re-wait); `Err` =
 /// EV_ERROR (any, mirroring the blocking wait) or a kevent failure.
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // non-test consumer is tokio::wait's watch loop
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "non-test consumer is tokio::wait's watch loop")
+)]
 pub(crate) fn drain_proc_exit(kq: &Kqueue) -> Result<Option<()>, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [placeholder()];

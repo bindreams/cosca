@@ -51,8 +51,13 @@ pub(crate) enum ParentEnd {
 /// A pure function of already-resolved values, deliberately: it is unit-tested (`child_tests.rs`)
 /// with synthetic `ProcessId`s rather than by racing the kernel's own pid allocator to construct
 /// a genuine recycle — that would be synchronizing on luck, not a real test.
-#[cfg_attr(not(unix), allow(dead_code))] // only called from the `#[cfg(unix)]` debug_assert!s below
-                                         // and in `tokio/child.rs`; still unit-tested everywhere.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only called from the `#[cfg(unix)]` debug_assert!s below and in `tokio/child.rs`; still unit-tested everywhere"
+    )
+)]
 pub(crate) fn root_pid_was_recycled(
     original: ProcessId,
     current: crate::identity::Resolved<ProcessId>,
@@ -429,7 +434,10 @@ impl Child {
 
     /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
     #[cfg(all(test, target_os = "macos"))]
-    #[allow(dead_code)] // awaits a unit-test consumer; not visible to integration tests (pub(crate))
+    #[allow(
+        dead_code,
+        reason = "awaits a unit-test consumer; not visible to integration tests (pub(crate))"
+    )]
     pub(crate) fn test_marker_handle(&self) -> Option<u64> {
         match &self.attached {
             crate::containment::Attached::FdMarker(m) => Some(m.handle()),

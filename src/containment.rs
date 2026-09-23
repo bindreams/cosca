@@ -306,7 +306,10 @@ pub(crate) mod treewalk;
 
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
+)]
 pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared};
 
 #[cfg(target_os = "macos")]

@@ -6,9 +6,9 @@ use crate::error::Error;
 /// The pre-spawn containment decision produced by `prepare` (env-marker root
 /// detection plus per-OS pre-spawn setup).
 pub(crate) struct Prepared {
-    #[allow(dead_code)] // read in #[cfg(unix)] branch of attach()
+    #[allow(dead_code, reason = "read in the #[cfg(unix)] branch of attach()")]
     pub mode: Option<ContainMode>,
-    #[allow(dead_code)] // read in #[cfg(unix)] branch of attach()
+    #[allow(dead_code, reason = "read in the #[cfg(unix)] branch of attach()")]
     pub is_root: bool,
     /// Pre-created cgroup leaf (Linux only). `Some` means the child must be
     /// placed in the cgroup via the `pre_exec` closure; `None` means fall back
@@ -41,7 +41,13 @@ impl Prepared {
     /// End the placement exchange of a spawn that failed while the caller still holds its child
     /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
     /// never for the child the caller will reap. A no-op without a leaf, or once taken.
-    #[cfg_attr(not(any(test, feature = "tokio")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "tokio")),
+        allow(
+            dead_code,
+            reason = "consumers are #[cfg(test)] fixtures and the tokio spawn failure path"
+        )
+    )]
     pub(crate) fn settle_verdict(&mut self, pid: u32) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
@@ -55,7 +61,13 @@ impl Prepared {
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`].
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(
+            dead_code,
+            reason = "only the tokio spawn path can lose a handle before a verdict is settled"
+        )
+    )]
     pub(crate) fn abandon_before_verdict(&mut self) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
@@ -72,7 +84,13 @@ impl Prepared {
 
 /// What became of the child of a spawn that failed with no handle left on it (see
 /// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
-#[cfg_attr(not(all(target_os = "linux", feature = "tokio")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "tokio")),
+    allow(
+        dead_code,
+        reason = "only a Linux leaf under tokio produces more than MaybeUnreachable; see comment above"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
     /// Nothing of it runs, and it is reaped or will be.
@@ -394,10 +412,32 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 pub(crate) fn prepare(
     std_cmd: &mut std::process::Command,
     req: &ContainRequest,
-    #[cfg_attr(not(windows), allow(unused_variables))] flags: &crate::command::flags::FlagsRequest,
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] reserved_fds: &[i32],
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] marker_suppressed: bool,
-    #[cfg_attr(not(windows), allow(unused_variables))] env_ops: &[crate::command::EnvOp],
+    #[cfg_attr(
+        not(windows),
+        allow(
+            unused_variables,
+            reason = "only Windows can honour the caller's creation-flag request; see doc above"
+        )
+    )]
+    flags: &crate::command::flags::FlagsRequest,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "drives the macOS fd-marker install only; see doc above")
+    )]
+    reserved_fds: &[i32],
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_variables, reason = "drives the macOS fd-marker install only; see doc above")
+    )]
+    marker_suppressed: bool,
+    #[cfg_attr(
+        not(windows),
+        allow(
+            unused_variables,
+            reason = "only the Windows path composes env ops into the request; see doc above"
+        )
+    )]
+    env_ops: &[crate::command::EnvOp],
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
     // Read once, above every branch, so the word is composed exactly once per spawn and no two

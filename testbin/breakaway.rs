@@ -114,7 +114,13 @@ struct Spawned {
 /// being recycled while it is measured, and what tears the child down when this helper exits.
 enum ChildHandle {
     Raw(std::process::Child),
-    Cosca(#[allow(dead_code)] cosca::Child),
+    Cosca(
+        #[allow(
+            dead_code,
+            reason = "held only for its Drop side effect and to pin the pid; never read, see comment above"
+        )]
+        cosca::Child,
+    ),
 }
 
 impl Drop for ChildHandle {

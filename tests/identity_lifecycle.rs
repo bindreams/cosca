@@ -3,6 +3,10 @@
 //! timing: a hidden in-binary "test" blocks on stdin only when an env var is
 //! set, so the parent ends it deterministically by closing the pipe.
 
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};

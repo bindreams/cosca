@@ -54,7 +54,13 @@ impl std::error::Error for CwdUnreadable {
 
 /// `process_cwd`, with a failure explained as [`CwdUnreadable`] and its own error kept as the
 /// source — for every elevation sink that needs this process's cwd as a path.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "its only caller is elevation::macos, itself dead off-unix (see elevation.rs's `mod macos`)"
+    )
+)]
 pub(crate) fn explain_cwd_read(
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> impl FnOnce() -> std::io::Result<PathBuf> {
@@ -62,7 +68,13 @@ pub(crate) fn explain_cwd_read(
 }
 
 /// [`Command::posix_launch`]'s answer.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "posix_launch, its only producer, is itself dead off-unix; see its own allow below"
+    )
+)]
 pub(crate) struct PosixLaunch {
     pub(crate) program: Option<PathBuf>,
     pub(crate) cwd: Option<PathBuf>,
@@ -373,7 +385,10 @@ impl Command {
     }
 
     /// Carry another command's executable over whole, setter included.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "its only caller is elevation/posix.rs, cfg(unix)-only")
+    )]
     pub(crate) fn set_executable_spec(&mut self, spec: Option<ExecutableSpec>) {
         self.executable = spec;
     }
@@ -390,7 +405,13 @@ impl Command {
     /// failed read keeps its kind and says why a path was needed; see
     /// [`crate::resolve::exact::complete_posix`] for when a cwd with no path gets that far.
     // Off unix the only caller is the macOS elevation module, itself dead there.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "off unix the only caller is the macOS elevation module, itself dead there"
+        )
+    )]
     pub(crate) fn posix_launch(
         &self,
         process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
@@ -727,23 +748,35 @@ impl Command {
     // Consumed by the elevation paths: `elevation_request`/`fds` read the request;
     // `set_input_argv`/`set_env_ops`/`set_contain` build the POSIX DERIVED command
     // (hence the non-unix dead_code allows on the setters).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "read only by the POSIX elevation paths; see comment above")
+    )]
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "builds the POSIX DERIVED command; see comment above")
+    )]
     pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
         self.input = CommandInput::Argv(argv);
         self.executable = None;
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "builds the POSIX DERIVED command; see comment above")
+    )]
     pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
         self.env_ops = ops;
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "builds the POSIX DERIVED command; see comment above")
+    )]
     pub(crate) fn set_contain(&mut self, req: ContainRequest) {
         self.contain = req;
     }
@@ -753,7 +786,13 @@ impl Command {
     /// descriptor >= 3 before exec, so a marker installed here could never reach the tree.
     /// Not set on `RunAsIs`'s derived command (already elevated): that one spawns the
     /// original program directly, with no wrapper to destroy anything.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "only ElevatePosix's derived wrapper-spawn command calls this; see comment above"
+        )
+    )]
     pub(crate) fn suppress_fd_marker(&mut self) {
         self.fd_marker_suppressed = true;
     }
@@ -763,7 +802,13 @@ impl Command {
     }
 
     // ---- crate-internal accessors for the spawn engine -------------
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "read only by the POSIX elevation paths; see the elevation_request comment above"
+        )
+    )]
     pub(crate) fn fds(&self) -> &BTreeMap<Fd, ResolvedStdio> {
         &self.fds
     }

@@ -1,6 +1,9 @@
 //! macOS inherited-fd marker containment, end to end. Death is proven by control-socket EOF
 //! and life by a control-socket round trip — never by sleeping or polling.
 #![cfg(target_os = "macos")]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

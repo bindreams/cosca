@@ -3,6 +3,10 @@
 //! the real nested-member `kill_tree` path, and `spawn-dump-env-block`, to spawn through each
 //! Windows backend. Behavior is selected by argv[1].
 
+// See `src/lib.rs`'s header for why: this bin is its own clippy-linted crate root, so it needs
+// its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
 use std::io::{Read, Write};
@@ -302,7 +306,10 @@ fn main() {
             // then hold ours (tag "R"). Both die together iff containment works.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills it
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment kills it"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block", &addr, "G"])
                 .spawn()
@@ -323,8 +330,10 @@ fn main() {
             // needs the real round trip this mode gives both members.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)]
-            // intentional: grandchild must outlive us; containment (or not) decides its fate
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment (or not) decides its fate"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-echo-pid", &addr, "G"])
                 .spawn()
@@ -341,7 +350,10 @@ fn main() {
             // pgid addresses both.
             let addr = args[2].clone();
             let setuid_helper = args[3].clone();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills/refuses us
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment kills/refuses us"
+            )]
             let _gc = std::process::Command::new(setuid_helper)
                 .args(["setuid-control-block", &addr, "P"])
                 .spawn()
@@ -432,7 +444,7 @@ fn main() {
                 let _ = libc::setsid();
             }
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; TreeWalk kills it
+            #[allow(clippy::zombie_processes, reason = "grandchild must outlive us; TreeWalk kills it")]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block", &addr, "G"])
                 .spawn()
@@ -469,7 +481,7 @@ fn main() {
         "orphan-relay" => {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us
+            #[allow(clippy::zombie_processes, reason = "the grandchild must outlive us")]
             let _ = std::process::Command::new(&exe)
                 .args(["control-echo-pid", &addr, "G"])
                 .spawn()
@@ -486,7 +498,10 @@ fn main() {
             }
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ignore-term", &addr, "G"])
                 .spawn()
@@ -537,7 +552,10 @@ fn main() {
             // survivor only the post-grace hard sweep can reach.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ignore-term", &addr, "G"])
                 .spawn()
@@ -567,7 +585,10 @@ fn main() {
             install_ignore_break();
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ignore-break", &addr, "G"])
                 .spawn()
@@ -636,7 +657,10 @@ fn main() {
             install_ignore_break();
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ack-break", &addr, "G"])
                 .spawn()

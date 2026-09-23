@@ -3,7 +3,13 @@
 //! Kept separate and free of syscalls so it is compiled and EXECUTED on every host,
 //! including the Windows development machine — the Linux path would otherwise ship with
 //! compile-only coverage.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "compiled on every host for pure-logic test coverage; linux.rs is the only production caller"
+    )
+)]
 
 use super::{RawPid, Resolved};
 

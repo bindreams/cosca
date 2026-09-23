@@ -271,7 +271,13 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
     }
     cmd.contain();
-    #[allow(unused_mut)]
+    #[cfg_attr(
+        windows,
+        allow(
+            unused_mut,
+            reason = "on windows only .containment()/.graceful_shutdown_tree() are called below, both &self; unix's child.stdout() needs &mut"
+        )
+    )]
     let mut child = cmd.spawn().expect("spawn");
     #[cfg(unix)]
     {

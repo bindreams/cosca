@@ -11,7 +11,13 @@ use std::sync::Mutex;
 /// path it touched, and the kernel's own reason: the caller degrades to a process group
 /// either way, but it degrades *stating which precondition was missing*.
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "constructed only by cgroup::leaf::try_create_leaf, which is linux-gated; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) enum LeafError {
     /// `/proc/self/cgroup` could not be read (no procfs, or it is not mounted).
     #[error("could not read /proc/self/cgroup: {0}")]
@@ -74,7 +80,13 @@ pub(crate) enum LeafError {
 /// distinction is invisible there; several children sharing one leaf would share one channel, and
 /// the first report written would stand for all of them (see [`ReportChannel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "constructed only by the linux-gated cgroup leaf/channel machinery; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) enum PlacementReport {
     /// The child exited before reporting its placement outcome: its `pre_exec` may not have run,
     /// or may have been interrupted between the write and the send. It never exec'd either way.
@@ -104,7 +116,13 @@ impl fmt::Display for PlacementReport {
 
 /// What a child with nothing in its leaf reported: never a successful write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "constructed only by the linux-gated cgroup leaf machinery; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) enum NotEntered {
     /// It exited before reporting its placement outcome (see [`PlacementReport::NotReported`]).
     NotReported,
@@ -127,7 +145,13 @@ impl fmt::Display for NotEntered {
 /// `cgroup.procs` and the child's `/proc` state are read only to diagnose a child that
 /// reported no successful write.
 #[derive(Debug)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "constructed only by the linux-gated cgroup leaf machinery; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) enum NotPlaced {
     /// `cgroup.procs` was read.
     Absent {
@@ -210,7 +234,13 @@ impl fmt::Display for NotPlaced {
 
 /// The step a contained spawn degraded at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "populated only via DegradeCondition, itself produced only by the linux-gated cgroup leaf machinery"
+    )
+)]
 pub(crate) enum DegradeKind {
     ReadProcSelfCgroup,
     NoUnifiedLine,
@@ -232,14 +262,26 @@ pub(crate) enum DegradeKind {
 /// part of it because one step fails for different reasons that need different fixes: a
 /// transient `ENOMEM` from `mkdir` is not the standing `EACCES` of an undelegated slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "produced only by DegradeReason::condition() on the linux-gated cgroup leaf error/report types"
+    )
+)]
 pub(crate) struct DegradeCondition {
     pub(crate) kind: DegradeKind,
     pub(crate) errno: Option<i32>,
 }
 
 /// A reason a spawn degraded: its full text, plus which condition it is an instance of.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "implemented only by LeafError/NotPlaced, whose only production constructors are linux-gated"
+    )
+)]
 pub(crate) trait DegradeReason: fmt::Display {
     fn condition(&self) -> DegradeCondition;
 }
@@ -309,7 +351,13 @@ static WARNED: Mutex<BTreeSet<DegradeCondition>> = Mutex::new(BTreeSet::new());
 /// every degrading spawn on record. Below that they are gone, not merely hidden: `log!` tests
 /// `max_level()` before reaching any logger, so a `warn`-filtered process emits nothing for
 /// them and no amount of capturing downstream brings them back.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "dispatch.rs's only call sites are behind cgroup::try_create_leaf/CgroupLeaf::take_placement, both linux-gated"
+    )
+)]
 pub(crate) fn log_degrade(reason: &dyn DegradeReason) {
     log_degrade_into(&WARNED, reason);
 }

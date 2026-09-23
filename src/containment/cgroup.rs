@@ -68,12 +68,24 @@
 
 #[path = "cgroup/parse.rs"]
 mod parse;
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        unused_imports,
+        reason = "parse's items are dead off-linux (see parse.rs), so this glob re-export has nothing live to carry"
+    )
+)]
 pub(crate) use parse::*;
 
 #[path = "cgroup/degrade.rs"]
 mod degrade;
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        unused_imports,
+        reason = "degrade's items are dead off-linux (see degrade.rs), so this glob re-export has nothing live to carry"
+    )
+)]
 pub(crate) use degrade::*;
 
 #[cfg(target_os = "linux")]
