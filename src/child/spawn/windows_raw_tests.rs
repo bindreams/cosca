@@ -190,8 +190,6 @@ fn the_containment_marker_is_named_as_std_names_it() {
 
 // `image_for`: the Search/Exact distinction, at the one site that applies it ────────────
 //
-// This is the behaviour `raw_executable()` exists to create, and it had no test: the
-// `command_tests` cases exercise only the getters, and `spawn_tests` only backend routing.
 // These run on the Windows CI runner rather than the host, because `image_for` is inside the
 // `cfg(windows)` raw backend — the `Exact` arm touches no Win32 API, but it cannot be compiled
 // off Windows to be reached.

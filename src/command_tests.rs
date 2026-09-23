@@ -333,10 +333,10 @@ fn last_executable_setter_wins_in_either_order() {
     assert!(matches!(b.executable_spec(), Some(ExecutableSpec::Search(p)) if p == Path::new("search-me")));
 }
 
-/// `executable_path()` stays variant-agnostic on purpose. Twelve callers want only the path —
-/// the elevation `argv[0]` guards, backend routing, the argv and command-line builders — and
-/// none of them care which setter produced it. Keeping this getter working means the sites that
-/// must treat `Exact` differently are the two that actually resolve, not all twelve.
+/// `executable_path()` stays variant-agnostic on purpose: most callers (the elevation `argv[0]`
+/// guards, backend routing, the argv and command-line builders) want only the path and don't care
+/// which setter produced it. Keeping this getter working means only the sites that actually
+/// resolve need to special-case `Exact`.
 #[test]
 fn executable_path_is_variant_agnostic() {
     let mut a = Command::new();
