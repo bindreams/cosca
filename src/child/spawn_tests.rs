@@ -438,4 +438,3 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     file.read_to_end(&mut written).expect("read the file");
     assert_eq!(written, b"", "nothing reached the child's stdio");
 }
-
