@@ -52,3 +52,30 @@ pub(crate) fn childs_copy(
     };
     (end, slot)
 }
+
+/// Run the test `name` (its full path) alone, in a copy of this test binary, and assert it passed.
+/// `true` in the copy, which runs the test's body; `false` in the caller, which returns.
+///
+/// For a test that closes the parent's end of a channel and needs the child to see that close: any
+/// process another test forks meanwhile holds a copy of that end until its own `exec`, and keeps
+/// the socket open past the close.
+#[cfg(target_os = "linux")]
+pub(crate) fn alone(name: &str) -> bool {
+    const ALONE: &str = "COSCA_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+        .env(ALONE, name)
+        .output()
+        .expect("run the test alone");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}

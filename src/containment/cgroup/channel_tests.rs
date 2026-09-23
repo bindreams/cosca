@@ -1,4 +1,4 @@
-use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
+use crate::containment::cgroup::test_support::{alone, block_on, childs_copy, fork_running, reap};
 use crate::containment::cgroup::PlacementReport;
 
 /// The child's self-placement errno crosses `fork` into the parent. Deterministic and
@@ -194,4 +194,55 @@ fn a_send_after_the_abandonment_read_fails_rather_than_go_unread() {
         Some(crate::containment::cgroup::Delivery::Abandoned),
         "a send in the window must see the abandonment"
     );
+}
+
+/// A child end whose parent closed the channel with the child's intent still unread — leaving
+/// *proceed* queued first, when `proceed` — which gives the child's next send `ECONNRESET`, not
+/// `EPIPE`. Only in a test run [`alone`].
+#[cfg(target_os = "linux")]
+fn reset_by_the_parent(proceed: bool) -> (std::os::fd::OwnedFd, crate::containment::cgroup::ReportSlot) {
+    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    let (end, slot) = childs_copy(&channel);
+    // SAFETY: the channel is open.
+    let sent = unsafe { slot.send_intent() }.expect("send the intent");
+    assert_eq!(sent, crate::containment::cgroup::Delivery::Queued);
+    if proceed {
+        let sent = rustix::net::send(&channel.read, &[super::PROCEED], rustix::net::SendFlags::NOSIGNAL)
+            .expect("queue proceed");
+        assert_eq!(sent, 1);
+    }
+    drop(channel);
+    (end, slot)
+}
+
+/// The parent's close with a message unread resets the channel: the child's send fails with
+/// `ECONNRESET`, read as the end of the exchange exactly as `EPIPE` is — *proceed* queued is a
+/// decision, none an abandonment. A child that took it for an error would fail a decided spawn. Run
+/// [`alone`].
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
+    if !alone("containment::cgroup::channel::channel_tests::a_reset_channel_ends_the_exchange_as_a_closed_one_does") {
+        return;
+    }
+    // The setup gives a real `ECONNRESET`, which a plain send shows.
+    let (_end, slot) = reset_by_the_parent(false);
+    // SAFETY: `_end` keeps the child's end open; the buffer is on this frame.
+    let sent = unsafe { libc::send(slot.fd, [0u8; 16].as_ptr().cast(), 16, libc::MSG_NOSIGNAL) };
+    assert_eq!(sent, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECONNRESET));
+
+    for (proceed, fate) in [
+        (true, crate::containment::cgroup::Delivery::Decided),
+        (false, crate::containment::cgroup::Delivery::Abandoned),
+    ] {
+        let (_end, slot) = reset_by_the_parent(proceed);
+        // SAFETY: `_end` keeps the child's end open.
+        let sent = unsafe { slot.send_report(crate::containment::cgroup::REPORT_PLACED) };
+        assert_eq!(
+            sent.expect("a reset is not an error"),
+            fate,
+            "proceed queued: {proceed}"
+        );
+    }
 }
