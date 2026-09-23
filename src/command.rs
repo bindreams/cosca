@@ -268,6 +268,11 @@ impl Command {
     ///   so `1:tool` is refused too. So is a name that names no file at all (`C:\`, `.`,
     ///   `tools\dir\`, `\\server\share`), and one starting with two separators that names no
     ///   share (`\\tool.exe`), which Win32 reads as a UNC path rather than a file on this drive.
+    ///   On Windows, a rooted name (`\bin\tool.exe`) resolved against a verbatim (`\\?\`)
+    ///   working directory is refused too: Win32 completes it to `\\bin\tool.exe`, off that
+    ///   directory's volume (measured). So is a relative one whose `..` Win32 completes past a
+    ///   verbatim share, to a share root or no share at all. The `std` backend and cosca before
+    ///   this rule resolved such a rooted name onto the directory's own volume.
     /// - [`std::io::ErrorKind::NotFound`] — the name was acceptable, the search above ran,
     ///   and nothing matched.
     ///
@@ -334,7 +339,10 @@ impl Command {
     /// the platform answers it.
     ///
     /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
-    /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
+    /// with [`std::io::ErrorKind::InvalidInput`] on every platform. On Windows so is a rooted name
+    /// (`\bin\tool.exe`) when this process's cwd is verbatim (`\\?\`), which Win32 completes to
+    /// `\\bin\tool.exe`, off that cwd's volume (measured), and a relative one whose `..` Win32
+    /// completes past a verbatim share.
     ///
     /// On Windows a `.bat`/`.cmd` is refused with [`Error::Unsupported`] (CVE-2024-24576), judged
     /// on the name Win32 loads, so `setup.bat.` and `C:\t\.bat` are refused too.
