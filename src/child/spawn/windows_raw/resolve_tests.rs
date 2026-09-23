@@ -537,9 +537,9 @@ fn setting_eszett_keeps_an_inherited_ss() {
 type Entries = Vec<(OsString, OsString)>;
 
 /// The raw block for `ops` over an empty base, next to what std's `Command` holds after the same
-/// ops. With nothing inherited, std's block is exactly `get_envs`' set entries: same keys (with
-/// std's casing), same values, and `get_envs` iterates std's own `EnvKey` order, which is the
-/// order std writes its block in.
+/// ops. With nothing inherited, std's block is exactly `get_envs`' set entries, in std's own
+/// `EnvKey` order, which is the order std writes its block in. The raw side also takes its names
+/// from `get_envs`, so a comparison pins order, merges and values, not naming.
 fn block_vs_std(ops: &[EnvOp]) -> (Entries, Entries) {
     let mut std_cmd = std::process::Command::new("unused");
     crate::child::spawn::apply_env(&mut std_cmd, ops);
@@ -593,8 +593,9 @@ fn env_block_order_and_merges_match_std() {
     assert_eq!(ours, std);
 }
 
-/// Every non-NUL code unit as a one-unit key: the raw backend and std agree on every merge, every
-/// emitted key and the whole order.
+/// Every non-NUL code unit as a one-unit key: the raw backend and std agree on every merge and on
+/// the whole order. The emitted names come from std's own `get_envs` on both sides here, so they
+/// are pinned end to end in `tests/windows_env_block.rs` instead.
 #[test]
 fn env_block_matches_std_over_every_code_unit() {
     let keys: Vec<OsString> = (1..=u16::MAX).map(|u| wide(&[u])).collect();
@@ -642,9 +643,9 @@ fn an_inherited_key_keeps_its_casing() {
 // One environment snapshot per spawn =====
 
 /// `CreateProcessW` keeps duplicate names as given, and `GetEnvironmentVariableW` returns the first.
-/// Resolution must search the `PATH` the child will read from its block.
+/// `path()`, which resolution searches, must be the `PATH` the child reads from its block.
 #[test]
-fn resolution_reads_the_path_the_block_carries() {
+fn path_is_the_one_the_child_reads_from_its_block() {
     let base = [
         (OsString::from("PATH"), OsString::from("a")),
         (OsString::from("Path"), OsString::from("b")),
