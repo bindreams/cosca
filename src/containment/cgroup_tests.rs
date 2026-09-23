@@ -2104,3 +2104,24 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
     );
     assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EIO));
 }
+
+/// `rmdir` refuses a leaf that holds a child cgroup with the same `EBUSY` it gives a populated
+/// one, and killing through the leaf removes no directory. A leaf dropped with its report in
+/// flight must remove the empty child cgroups itself rather than kill-and-retry forever. A
+/// regression hangs this test in `drop`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    let leaf_path = leaf.leaf_path.clone();
+    std::fs::create_dir_all(leaf_path.join("nested").join("deeper")).expect("create child cgroups");
+
+    drop(leaf);
+
+    assert!(!leaf_path.exists(), "the leaf and its child cgroups must be removed");
+}

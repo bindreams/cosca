@@ -549,17 +549,54 @@ impl CgroupLeaf {
     /// nothing proves the child absent, so an occupied leaf is killed through, drained, and
     /// removed — again for as long as anything re-enters it before the removal lands. Once
     /// removed, it admits no member, so the in-flight report no longer matters.
+    ///
+    /// `rmdir` gives the same `EBUSY` for a leaf holding a child cgroup as for a populated one,
+    /// and killing removes no directory. So a drained leaf's empty child cgroups are removed too,
+    /// and a leaf `rmdir` still refuses with nothing left to kill or remove is reported, not
+    /// retried.
     fn remove_with_report_in_flight(&mut self) {
+        // Whether the last round killed, drained and removed no child cgroup: a refusal after
+        // that is progress only if something re-entered the leaf.
+        let mut stalled = false;
         loop {
             let occupied = match fs::remove_dir(&self.leaf_path) {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
                 Err(e) => e,
             };
+            if stalled {
+                match self.repopulated() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return warn_leaf_left_behind(
+                            &self.leaf_path,
+                            format_args!(
+                                "rmdir failed ({occupied}) with the child's report in flight; nothing \
+                                 was left to kill or remove"
+                            ),
+                        )
+                    }
+                    Err(e) => {
+                        return warn_leaf_left_behind(
+                            &self.leaf_path,
+                            format_args!(
+                                "rmdir failed ({occupied}) with the child's report in flight; whether \
+                                 it was re-entered could not be read ({e})"
+                            ),
+                        )
+                    }
+                }
+            }
             let why = match self.hard_kill() {
                 // Every member was just sent SIGKILL, so the leaf drains.
                 Ok(()) if occupied.raw_os_error() == Some(libc::EBUSY) => match self.wait_drained(None) {
-                    Ok(_) => continue,
+                    Ok(_) => match remove_child_cgroups(&self.leaf_path) {
+                        Ok(removed) => {
+                            stalled = removed == 0;
+                            continue;
+                        }
+                        Err(e) => format!("a child cgroup could not be removed ({e})"),
+                    },
                     Err(e) => format!("its drain could not be watched ({e})"),
                 },
                 // Not a leaf `rmdir` refuses for its members: killing again cannot remove it.
@@ -572,6 +609,34 @@ impl CgroupLeaf {
             );
         }
     }
+
+    /// Whether the leaf has members again, read once from `cgroup.events`.
+    fn repopulated(&self) -> Result<bool, crate::error::Error> {
+        let mut file = File::open(self.events_path()).map_err(crate::error::Error::Io)?;
+        read_populated(&mut file, &mut String::new())
+    }
+}
+
+/// Remove every child cgroup under `dir`, deepest first, and count those removed. A child that
+/// `rmdir` refuses as busy — something re-entered it — is left for the caller's next kill.
+#[cfg(target_os = "linux")]
+fn remove_child_cgroups(dir: &Path) -> io::Result<usize> {
+    let mut removed = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        // A cgroup's own interface files are files; its child cgroups are its directories.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let child = entry.path();
+        removed += remove_child_cgroups(&child)?;
+        match fs::remove_dir(&child) {
+            Ok(()) => removed += 1,
+            Err(e) if removed_after_drain(&e) || e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
 }
 
 /// Report a `cosca-*` leaf cosca failed to remove. Nothing revisits a leaf by name, so this
