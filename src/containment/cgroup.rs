@@ -1322,6 +1322,7 @@ pub(crate) mod fault {
         static FORCE_PIDFD_FAILURE: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
         static FORCE_SIGNAL_DENIED: Cell<bool> = const { Cell::new(false) };
         static FORCE_MEMBERSHIP_UNREADABLE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
         static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1394,6 +1395,15 @@ pub(crate) mod fault {
     }
     pub(crate) fn membership_unreadable_armed() -> bool {
         FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.get())
+    }
+
+    /// Replace the NEXT placement write's return value — 0, which no file this test can open
+    /// returns for a one-byte write. Called in the test's own process, never after a fork.
+    pub(crate) fn set_force_placement_write_result(ret: isize) {
+        FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.set(Some(ret)));
+    }
+    pub(crate) fn take_force_placement_write_result() -> Option<isize> {
+        FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.take())
     }
 
     /// Put a directory inside the NEXT leaf whose creation fails, just before its unwind runs, so
@@ -1567,6 +1577,9 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     static ZERO: &[u8] = b"0";
     // Safety: ZERO is a valid buffer; procs_fd is valid (caller guarantees).
     let ret = unsafe { libc::write(procs_fd, ZERO.as_ptr().cast(), ZERO.len()) };
+    // Test-only fault seam: replace the write's return value (take semantics — see `fault`).
+    #[cfg(test)]
+    let ret = fault::take_force_placement_write_result().unwrap_or(ret);
     // Read errno before `close`, which is free to clobber it.
     // Safety: errno is this thread's own; `__errno_location` is async-signal-safe.
     let errno = if ret == -1 {
@@ -1578,11 +1591,13 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     // Safety: procs_fd is valid; close is async-signal-safe.
     unsafe { libc::close(procs_fd) };
     let report = match ret {
+        // Only the whole write is a placement.
+        _ if ret == ZERO.len() as isize => REPORT_PLACED,
         // `write(2)` only ever sets a positive errno, but a report of -1 means "placed", so a
         // nonsensical value is mapped to EIO rather than read back as a fabricated placement.
         -1 if errno > 0 => errno,
-        -1 => libc::EIO,
-        _ => REPORT_PLACED,
+        // A write that returned without writing (0) sets no errno.
+        _ => libc::EIO,
     };
     // Safety: the caller guarantees the slot's channel is open.
     unsafe { slot.report(report) }

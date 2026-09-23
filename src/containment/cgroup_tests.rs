@@ -2060,3 +2060,24 @@ fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
     );
     assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
+
+/// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,
+/// where no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
+#[cfg(target_os = "linux")]
+#[test]
+fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
+    let channel = super::ReportChannel::new().expect("open the report channel");
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    super::fault::set_force_placement_write_result(0);
+    // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
+    let result = unsafe { super::place_self_in_cgroup_pre_exec(procs_fd, channel.slot()) };
+    assert!(
+        result.is_ok(),
+        "a failed placement must not abort the spawn: {result:?}"
+    );
+    assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EIO));
+}
