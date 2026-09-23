@@ -114,3 +114,29 @@ fn fixture_a_percent_from_path() {
         other => panic!("a % from a PATH entry: expected Io(InvalidInput), got {other:?}"),
     }
 }
+
+/// A `%` the caller wrote is refused on the string, before any search, so the verdict does not
+/// depend on whether the file exists.
+#[test]
+fn a_written_percent_is_refused_whether_or_not_the_file_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("%COSCA_V%");
+    let mut in_token = Command::new();
+    in_token
+        .executable(missing.join("tool.exe"))
+        .args([missing.join("tool.exe")])
+        .elevate();
+    assert_refused(
+        &in_token,
+        Path::new(r"C:\cosca-unused"),
+        "a % in the token, file absent",
+    );
+
+    let mut in_dir = Command::new();
+    in_dir.args([r".\tool.exe"]).current_dir(&missing).elevate();
+    assert_refused(
+        &in_dir,
+        Path::new(r"C:\cosca-unused"),
+        "a % in current_dir, file absent",
+    );
+}

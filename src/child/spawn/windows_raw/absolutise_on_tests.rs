@@ -228,7 +228,9 @@ fn the_raw_launch_dir_reads_nothing_for_a_bare_name() {
 /// share, and is refused rather than handed to the resolver, whose contract it would break.
 #[test]
 fn the_raw_launch_dir_refuses_a_share_less_unc_current_dir() {
-    for dir in [r"\\server", "//server", r"\\srv\\x"] {
+    // `\\srv\\x` is not among them: Win32 collapses the doubled separator (measured), so it names
+    // the share root `\\srv\x`.
+    for dir in [r"\\server", "//server"] {
         match super::launch_dir(Some(Path::new(dir)), OsStr::new(r".\t.exe"), &empty_env(), || {
             panic!("{dir:?} must not read the cwd")
         }) {
@@ -276,4 +278,15 @@ fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
     use std::os::windows::ffi::OsStringExt;
     let p = OsString::from_wide(&"C:\\a\0b".encode_utf16().collect::<Vec<u16>>());
     let _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
+}
+
+/// A verbatim path is taken as written, as `std::path::absolute` takes one: a trailing dot or a
+/// `..` in it names a real, verbatim-only file, which `GetFullPathNameW` could rewrite.
+#[test]
+fn a_verbatim_path_is_completed_as_written() {
+    for path in [r"\\?\C:\t\a.", r"\\?\C:\t\x\..\y", r"\\?\C:\t\a "] {
+        let got = complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive).unwrap();
+        assert_eq!(got.path, PathBuf::from(path), "{path:?}");
+        assert!(!got.used_cwd);
+    }
 }

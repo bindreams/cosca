@@ -345,7 +345,7 @@ pub(crate) fn target(cmd: &Command, env: &SpawnEnv) -> Result<Target, Error> {
 ///   line's first token, and THAT is resolved as `Search` is, which is what keeps
 ///   `lpApplicationName` non-NULL. See [`app_name_wide`] for why NULL is a security boundary.
 ///
-/// `current_dir` is NUL-checked before anything reads it. No arm is batch-checked here:
+/// `current_dir` is checked ([`resolve::check_current_dir`]) before anything reads it. No arm is batch-checked here:
 /// [`reject_batch_program`] has judged the token by the name Win32 normalises it to, and resolution
 /// only prefixes a directory and may append `.exe`, so it never turns a name the gate accepted into
 /// a `.bat`/`.cmd`.
@@ -364,7 +364,7 @@ pub(crate) fn target_with(
     };
     let as_written = |image: Option<PathBuf>| -> Result<Target, Error> {
         if let Some(c) = cmd.cwd() {
-            resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
+            resolve::check_current_dir(c)?;
         }
         Ok(Target {
             image,

@@ -331,3 +331,16 @@ fn a_verbatim_current_dir_resolves_a_dot_relative_name() {
     assert_eq!(unwide(&launch.file_w), Path::new(&verbatim).join("tool.exe"));
     assert_eq!(reader.reads.get(), 0);
 }
+
+/// `current_dir("")` at the consent launch names no directory, as on the raw backend.
+#[test]
+fn an_empty_current_dir_is_refused_at_the_consent_launch() {
+    let reader = Reader::new(Path::new(r"C:\cosca-must-not-be-read"));
+    let mut c = Command::new();
+    c.args(["whoami"]).current_dir("").elevate();
+    match plan_err(&c, &reader) {
+        crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}"),
+        other => panic!("expected Io(NotFound), got {other:?}"),
+    }
+    assert_eq!(reader.reads.get(), 0);
+}

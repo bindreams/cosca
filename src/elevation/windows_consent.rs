@@ -2,10 +2,12 @@
 //! `lpFile` and `lpDirectory` a `ShellExecuteEx(runas)` is handed, from one read of this process's
 //! cwd and environment.
 //!
-//! Nothing here may run for a caller that is already elevated, whose request re-spawns through the
-//! ordinary backend instead. That is enforced by type, not by call order: every step is private to
-//! this module and reachable only through [`Validated::launch`], which takes a [`ConsentCertain`]
-//! that only the planner's `ElevateWindows` transition yields.
+//! No resolution and no consent-launch check here may run for a caller that is already elevated,
+//! whose request re-spawns through the ordinary backend instead. That is enforced by type, not by
+//! call order: every such step is private to this module and reachable only through
+//! [`Validated::launch`], which takes a [`ConsentCertain`] that only the planner's `ElevateWindows`
+//! transition yields. [`ProcessOnce`] is the exception, by design: `validate` completes an `Exact`
+//! token above the short-circuit through the same one cwd read, so the launch cannot read it twice.
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -74,6 +76,14 @@ impl<'a> Validated<'a> {
             params_w,
             verb_w,
         } = self;
+        // The shape refusals on what the caller WROTE, before anything is searched, so their
+        // verdict does not depend on what is on disk. The checks after resolution below repeat
+        // them on what resolution added: a `PATH` entry, this process's cwd.
+        shell_file::reject_quote(Path::new(&program))?;
+        shell_file::reject_percent("program", Path::new(&program))?;
+        if let Some(dir) = cmd.cwd() {
+            shell_file::reject_percent_in_directory(dir)?;
+        }
         let base = consent_base(cmd, &program, exact_used_cwd, state)?;
         let program = lp_file_for(cmd, &program, base.as_deref(), state)?;
         // On the exact bytes `ShellExecuteEx` will see: a fully qualified `.exe`/`.com` path with
@@ -196,6 +206,7 @@ fn consent_base(
 ) -> Result<Option<PathBuf>, Error> {
     Ok(match cmd.cwd() {
         Some(dir) => {
+            crate::child::spawn::windows_raw::resolve::check_current_dir(dir)?;
             let done = crate::child::spawn::windows_raw::resolve::complete_on(dir, || cwd.cwd(), |d| cwd.drive_cwd(d))?;
             crate::child::spawn::windows_raw::resolve::reject_not_fully_qualified(
                 "elevated working directory",

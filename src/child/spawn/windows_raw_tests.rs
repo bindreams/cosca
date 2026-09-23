@@ -200,7 +200,7 @@ fn image(cmd: &Command) -> Result<Option<PathBuf>, Error> {
 }
 
 #[test]
-fn image_for_leaves_an_exact_program_completely_unresolved() {
+fn target_leaves_an_exact_program_completely_unresolved() {
     // The contract in one assertion: a BARE name, which `executable()` would look up on PATH and
     // turn absolute (and would append `.exe` to), survives byte-for-byte.
     let mut cmd = Command::new();
@@ -240,7 +240,7 @@ fn fixture_load_exact_probe() {
         .current_dir(current_dir);
     c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
-    assert_eq!(image(&c).expect("image_for").as_deref(), Some(Path::new(PROBE)));
+    assert_eq!(image(&c).expect("target").as_deref(), Some(Path::new(PROBE)));
     let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     let code = match c.spawn() {
         Ok(child) if child.wait().expect("wait").success() => LOADED,
@@ -289,7 +289,7 @@ fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
 }
 
 #[test]
-fn image_for_resolves_a_search_program_to_an_absolute_path() {
+fn target_resolves_a_search_program_to_an_absolute_path() {
     // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
     // the same bare name through `executable()` is resolved and absolute. `cmd` is chosen because
     // it lives in the System32 directory the bare-name search visits on any Windows host.
@@ -304,7 +304,7 @@ fn image_for_resolves_a_search_program_to_an_absolute_path() {
 }
 
 #[test]
-fn image_for_rejects_an_empty_exact_program() {
+fn target_rejects_an_empty_exact_program() {
     // An empty `lpApplicationName` is a pointer to a lone NUL, not the NULL pointer, and whether
     // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
     let mut cmd = Command::new();
@@ -337,7 +337,7 @@ fn a_spawn_of_a_program_that_names_no_file_is_invalid_input() {
 }
 
 #[test]
-fn image_for_rejects_an_exact_program_that_names_no_file() {
+fn target_rejects_an_exact_program_that_names_no_file() {
     // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
     // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but as an OS error
     // after the spawn is under way; refusing here makes it `InvalidInput`, as on the elevated
@@ -354,7 +354,7 @@ fn image_for_rejects_an_exact_program_that_names_no_file() {
 }
 
 #[test]
-fn image_for_passes_an_exact_program_as_written() {
+fn target_passes_an_exact_program_as_written() {
     // `absolutise_exact` reads Win32's normalisation; what reaches `lpApplicationName` must still
     // be the caller's token, relative and with its trailing dot, for the loader to complete.
     let mut cmd = Command::new();
@@ -383,7 +383,7 @@ fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
 
 /// Negative control: a name that merely contains `.bat` loads as written.
 #[test]
-fn image_for_passes_an_exact_program_that_is_not_a_batch_file() {
+fn target_passes_an_exact_program_that_is_not_a_batch_file() {
     for n in ["setup.exe", "setup.bat.exe"] {
         let mut cmd = Command::new();
         cmd.raw_executable(n).args(["tool"]);
@@ -392,7 +392,7 @@ fn image_for_passes_an_exact_program_that_is_not_a_batch_file() {
 }
 
 #[test]
-fn image_for_falls_back_to_the_program_token_when_no_executable_is_set() {
+fn target_falls_back_to_the_program_token_when_no_executable_is_set() {
     // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
     // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.
     let mut cmd = Command::new();
@@ -523,4 +523,22 @@ fn target_passes_an_exact_programs_current_dir_as_written() {
     cmd.raw_executable("tool.exe").args(["tool.exe"]).current_dir("sub");
     let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || panic!("must not read the cwd")).unwrap();
     assert_eq!(got.cwd.as_deref(), Some(Path::new("sub")));
+}
+
+/// `current_dir("")` gets one verdict on both arms: it names no directory.
+#[test]
+fn an_empty_current_dir_is_refused_on_both_arms() {
+    let mut search = Command::new();
+    search.executable("tool").args(["tool"]).current_dir("");
+    let mut exact = Command::new();
+    exact.raw_executable(r"C:\t\tool.exe").args(["tool"]).current_dir("");
+    for (arm, cmd) in [("Search", search), ("Exact", exact)] {
+        match target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
+            panic!("{arm}: must not read the cwd")
+        }) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{arm}: {e}"),
+            Err(other) => panic!("{arm}: expected Io(NotFound), got {other:?}"),
+            Ok(_) => panic!("{arm}: an empty current_dir must be refused"),
+        }
+    }
 }

@@ -41,7 +41,7 @@ pub(crate) fn reject_percent_in_directory(dir: &Path) -> Result<(), Error> {
 /// on a launch without a class, and whether the consent launch cosca makes does is unmeasured. An
 /// elevated caller's `exefile` launch takes it literally (measured), but cosca never makes that
 /// launch. The string is refused before any search, so `InvalidInput`.
-fn reject_percent(what: &str, path: &Path) -> Result<(), Error> {
+pub(crate) fn reject_percent(what: &str, path: &Path) -> Result<(), Error> {
     if !path.as_os_str().to_string_lossy().contains('%') {
         return Ok(());
     }
@@ -57,7 +57,7 @@ fn reject_percent(what: &str, path: &Path) -> Result<(), Error> {
 /// Refuse a program holding a `"`, a deliberate over-refusal: no Win32 file name contains one, and
 /// in `exefile`'s `"%1" %*` command it would close the quote around `%1` early, so the command line
 /// `CreateProcessW` parses names a file other than the one checked.
-fn reject_quote(program: &Path) -> Result<(), Error> {
+pub(crate) fn reject_quote(program: &Path) -> Result<(), Error> {
     if !program.as_os_str().to_string_lossy().contains('"') {
         return Ok(());
     }

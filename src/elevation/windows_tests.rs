@@ -737,7 +737,9 @@ fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_
 /// instead; see `windows_lp_file_tests`.
 #[test]
 fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
-    for probe in ["setup.lnk", "setup.msc", r"C:\tools\setup.exe.", r"C:\tools\%X%"] {
+    // Located, so each has exactly the one candidate it spells. A bare `setup.lnk` is searched as
+    // `setup.lnk.exe` instead, and is `NotFound` where none exists.
+    for probe in [r"C:\tools\setup.lnk", r"C:\tools\setup.msc", r"C:\tools\setup.exe."] {
         let mut c = Command::new();
         c.args([probe, "a&calc"]).elevate();
         assert!(
@@ -766,24 +768,21 @@ fn a_relative_program_is_resolved_or_refused_never_sent_relative() {
     }
 }
 
-/// A token ShellExecuteEx would rewrite before opening it is refused at the consent launch,
-/// whatever it rewrites to: a quoted batch path, a percent-encoded `file:` URL and a `shell:` name
-/// all name no `.exe`/`.com` file. The quoted one is refused by whichever gate reads it first, the
-/// batch gate or the allowlist, so only the refusal is pinned.
+/// A token ShellExecuteEx would rewrite before opening it never reaches it: a quoted batch path is
+/// refused as a quote, a percent-encoded `file:` URL for its `%`, and a `shell:` name, which the
+/// resolver reads as a bare name, is searched as `shell:startup.exe` and found nowhere.
 #[test]
 fn launch_runas_refuses_a_token_shell_execute_rewrites() {
-    let mut quoted = Command::new();
-    quoted.args([r#""C:\tools\setup.bat""#, "a&calc"]).elevate();
-    assert!(
-        super::plan_runas(&quoted, &win_host(false)).is_err(),
-        "a quoted batch path is refused"
-    );
-    for probe in ["file:///C:/tools/setup%2Ebat", "shell:startup"] {
+    for probe in [
+        r#""C:\tools\setup.bat""#,
+        "file:///C:/tools/setup%2Ebat",
+        "shell:startup",
+    ] {
         let mut c = Command::new();
         c.args([probe, "a&calc"]).elevate();
         assert!(
-            is_pathext_refusal(super::plan_runas(&c, &win_host(false)).map(|_| ())),
-            "{probe:?} is not a fully qualified image path"
+            super::plan_runas(&c, &win_host(false)).is_err(),
+            "{probe:?} must not reach ShellExecuteEx"
         );
     }
 }
@@ -994,5 +993,17 @@ fn a_failed_token_close_is_logged() {
     assert!(
         crate::log_capture::contains_since(mark, "CloseHandle of an owned token failed"),
         "a failed token close must be logged"
+    );
+}
+
+/// A `"` in a located token is refused on the string, before the search, whether or not a file
+/// could match: otherwise an absent file would report `NotFound` and a present one `Unsupported`.
+#[test]
+fn a_quote_in_a_located_token_is_refused_before_the_search() {
+    let mut c = Command::new();
+    c.args([r#"C:\cosca-missing\to"ol.exe"#]).elevate();
+    assert!(
+        is_unsupported(super::plan_runas(&c, &win_host(false)).map(|_| ())),
+        "a quote is refused as a quote"
     );
 }

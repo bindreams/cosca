@@ -64,7 +64,7 @@ pub(crate) fn launch_dir(
 ) -> Result<Option<PathBuf>, Error> {
     match cmd_cwd {
         Some(dir) => {
-            ensure_no_nul_wide("working directory", dir.as_os_str())?;
+            check_current_dir(dir)?;
             let done = complete_on(dir, process_cwd, |drive| Ok(snapshot.var(&drive_cwd_var(drive))))?;
             reject_not_fully_qualified("working directory", &done.path)?;
             Ok(Some(done.path))
@@ -72,6 +72,21 @@ pub(crate) fn launch_dir(
         None if crate::resolve::needs_base(token, true) => Ok(Some(process_cwd()?)),
         None => Ok(None),
     }
+}
+
+/// The checks every Windows spawn makes on a `current_dir` as written, before anything reads or
+/// completes it: no interior NUL, which Win32 would truncate at, and not empty. `""` names no
+/// directory, and completing it would silently yield this process's cwd; it is `NotFound`, as the
+/// POSIX spawn's `chdir("")` reports.
+pub(crate) fn check_current_dir(dir: &Path) -> Result<(), Error> {
+    ensure_no_nul_wide("working directory", dir.as_os_str())?;
+    if dir.as_os_str().is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "current_dir(\"\") names no directory",
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse a completed field that is still not fully qualified: Win32 reads a path starting with two
@@ -310,7 +325,7 @@ pub(crate) struct Completed {
 /// Complete `path` as `GetFullPathNameW` would, with this process's cwd read through
 /// `process_cwd` (at most once) and another drive's own current directory through `drive_cwd`,
 /// instead of by `GetFullPathNameW` itself. `GetFullPathNameW` then only normalises a path that is
-/// already fully qualified, which reads neither.
+/// already fully qualified, which reads neither; a verbatim (`\\?\`) path is not normalised at all.
 ///
 /// The path's type is [`crate::resolve::path_type`]'s, the one classifier the resolver uses too:
 ///
@@ -331,6 +346,12 @@ pub(crate) fn complete_on(
     drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
 ) -> Result<Completed, Error> {
     let anchored = anchor(path, process_cwd, drive_cwd)?;
+    // A verbatim path is taken as written, as `std::path::absolute` takes one: Win32 hands it to
+    // the filesystem unparsed, so it may name a file only a verbatim path reaches (`a.`, `a `),
+    // which normalising would rewrite.
+    if anchored.path.as_os_str().as_encoded_bytes().starts_with(br"\\?\") {
+        return Ok(anchored);
+    }
     Ok(Completed {
         path: full_path_name(&anchored.path)?,
         used_cwd: anchored.used_cwd,
@@ -654,7 +675,7 @@ pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
 /// - Resolved by [`resolve_executable`] — every one of its returns is gated on `fs::metadata`
 ///   (through `crate::resolve`'s `is_execable`), which fails for any path Win32 cannot encode, so
 ///   such a path is never returned.
-/// - Passed through verbatim by `raw_executable()`'s `Exact` arm of `windows_raw::image_for` —
+/// - Passed through verbatim by `raw_executable()`'s `Exact` arm of `windows_raw::target_with` —
 ///   caller input, but `reject_batch_program` runs FIRST in both raw backends and
 ///   [`ensure_no_nul_wide`]s that same token as the "program token".
 ///

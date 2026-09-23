@@ -337,8 +337,10 @@ fn elevated_program(cmd: &Command, argv: &[OsString], cwd: &ProcessOnce<'_>) -> 
 
     // An `Exact` token is completed, never passed through: `ShellExecuteEx` would search a
     // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
-    // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
-    // It is completed against `cwd`, the one read the consent launch's base also uses.
+    // `CreateProcessW` does not, and for the `PATHEXT` residue the consent launch's allowlist
+    // (`shell_file::reject_elevated_program`) covers. It is completed against `cwd`, the one read
+    // the consent launch's base also uses, and above the short-circuit, as it was before the
+    // consent phase existed: its refusals are the token's shape, whatever the caller's privilege.
     //
     // A `Search` token is NOT resolved here but at the consent launch, below the already-elevated
     // short-circuit: resolving is only correct once a consent launch is certain.
