@@ -23,6 +23,7 @@ on:
       - "src/tokio/spawn/windows_raw.rs"
       - "src/elevation/windows.rs"
       - "tests/windows_path_resolution.rs"
+      - "tests/windows_path_resolution/**"
       # The canary's payload is built from here.
       - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
