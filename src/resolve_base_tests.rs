@@ -20,6 +20,11 @@ fn absolute_names_by_grammar() {
         // After the verbatim marker only `\` separates, as the join reads it: `srv/shr` is the
         // server, and there is no share.
         (r"\\?\UNC\srv/shr", true, false),
+        // Nor is `/` the `UNC` marker's separator: NT reads `\\?\UNC/srv` as the verbatim namespace
+        // `UNC/srv`, which is fully qualified. std's `parse_prefix` rewrites `/` to `\` in the first
+        // eight bytes and so reads a share-less UNC there; cosca follows NT, which is what opens the
+        // path, and its own join, which reads the namespace.
+        (r"\\?\UNC/srv", true, true),
         (r"\\srv", true, false),
         (r"\t\tool", true, false),
         ("C:tool", true, false),

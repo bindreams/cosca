@@ -269,8 +269,10 @@ pub(crate) fn is_absolute_name(program: &OsStr, windows: bool) -> bool {
 /// names no share as the plain `\\srv` does. [`windows_prefix_len`] counts such a prefix whole,
 /// since nothing may be appended to it either way.
 ///
-/// Split on `\` alone, as [`join`] parses a verbatim prefix, so the path this admits is the one
-/// the join completes: `\\?\UNC\srv/shr` is server `srv/shr` with no share.
+/// Split on `\` alone, as [`join`] parses a verbatim prefix and NT reads one, so the path this
+/// admits is the one the join completes: `\\?\UNC\srv/shr` is server `srv/shr` with no share,
+/// and `\\?\UNC/srv` is no UNC path at all but the namespace `UNC/srv`. std's `parse_prefix`
+/// reads the latter as a share-less UNC path, since it rewrites `/` to `\` in the first eight bytes.
 fn is_verbatim_unc_without_share(bytes: &[u8]) -> bool {
     let is_verbatim_unc =
         bytes.len() >= 8 && bytes[..4] == *br"\\?\" && bytes[4..7].eq_ignore_ascii_case(b"UNC") && bytes[7] == b'\\';

@@ -63,7 +63,8 @@ pub(super) fn is_verbatim(bytes: &[u8]) -> bool {
 /// The length of a verbatim path's prefix as std parses it, its components split on `\` alone:
 /// `\\?\UNC\server\share`, or else `\\?\` and one component (a namespace). So `srv/shr` is one
 /// server name, where [`windows_prefix_len`] splits it for its own reasons. `UNC` is matched
-/// case-insensitively, as Win32 matches it, where std matches only `UNC`.
+/// case-insensitively and only before `\`, as NT matches it, where std matches only `UNC` and
+/// also takes `UNC/`: `\\?\UNC/srv` is the namespace `UNC/srv`.
 ///
 /// A drive is std's exception: an ASCII letter and `:` that end the path or precede either
 /// separator are the prefix `\\?\C:` alone, so `\\?\C:/x` is drive C, rooted at the `/`. A
