@@ -1618,14 +1618,16 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
 /// with `EBUSY`, and the child's own `/proc/<pid>/cgroup` shows the leaf.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     use std::os::unix::process::CommandExt;
 
     use crate::containment::TreeDrain;
 
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     let mut leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
     // The member reports through a channel of its own, so the leaf's has nothing queued.
     let own = super::ReportChannel::new().expect("open the member's channel");
@@ -1652,15 +1654,17 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
 /// nothing in the leaf is cosca's to kill: the occupant survives.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it() {
     use std::io::{Read, Write};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     use crate::containment::TreeDrain;
 
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     let mut leaf = super::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let own = super::ReportChannel::new().expect("open the occupant's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());

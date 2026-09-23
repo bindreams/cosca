@@ -201,7 +201,8 @@ jobs:
       # leaf. We move our shell into it and run only the cgroup-named tests there
       # (as root, single-threaded) — both the `spawn_io` integration binary and the
       # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
-      # coverage in src/containment/cgroup_tests.rs). With the marker set the tests
+      # coverage in src/containment/cgroup_tests.rs; its cgroup tests that cannot be a no-op
+      # are `#[ignore]`d, hence `--include-ignored`). With the marker set the tests
       # assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a
       # silent skip.
       - name: Run cgroup v2 containment tests (Linux)
@@ -226,7 +227,7 @@ jobs:
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
             "$0" cgroup --nocapture --test-threads=1
-            exec "$1" cgroup --nocapture --test-threads=1
+            exec "$1" cgroup --include-ignored --nocapture --test-threads=1
           ' "$BIN" "$LIB_BIN"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
