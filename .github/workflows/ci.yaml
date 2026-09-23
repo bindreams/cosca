@@ -156,9 +156,10 @@ jobs:
           esac
 
       # Release lane (debug_assertions off): exercises the calm-release arm of the
-      # should_panic oracles in the macOS-gated kinfo_tests.rs.
+      # should_panic oracles in the macOS-gated kinfo_tests.rs, and the Linux cgroup tests of what
+      # release builds do where debug builds assert a broken precondition instead.
       - name: Unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin'
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
         run: cargo test --locked --release --lib --target ${{ matrix.target }}
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
@@ -170,7 +171,7 @@ jobs:
       # gaps that only a default-features-only build exposes, which
       # --all-features alone never catches.
       #
-      # Placed after the test steps above (including the darwin-only release
+      # Placed after the test steps above (including the darwin and Linux release
       # lane just above), not right after Build: a clippy failure there would
       # skip every later step (their implicit `if: success()`), hiding test
       # results.
@@ -201,15 +202,17 @@ jobs:
       # leaf. We move our shell into it and run only the cgroup-named tests there
       # (as root, single-threaded) — both the `spawn_io` integration binary and the
       # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
-      # coverage in src/containment/cgroup_tests.rs). With the marker set the tests
+      # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
+      # post-fork failure path; its cgroup tests that cannot be a no-op
+      # are `#[ignore]`d, hence `--include-ignored`). With the marker set the tests
       # assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a
       # silent skip.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
-          cargo test --locked --features pty --target ${{ matrix.target }} --no-run
-          JSON=$(cargo test --locked --features pty --target ${{ matrix.target }} --no-run --message-format=json)
+          cargo test --locked --features pty,tokio --target ${{ matrix.target }} --no-run
+          JSON=$(cargo test --locked --features pty,tokio --target ${{ matrix.target }} --no-run --message-format=json)
           BIN=$(echo "$JSON" \
             | jq -r 'select(.profile.test == true and .target.name == "spawn_io") | .executable' \
             | grep -v '^null$' | grep . | head -n1)
@@ -225,8 +228,8 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
-            "$0" cgroup --nocapture --test-threads=1
-            exec "$1" cgroup --nocapture --test-threads=1
+            "$0" cgroup --include-ignored --nocapture --test-threads=1
+            exec "$1" cgroup --include-ignored --nocapture --test-threads=1
           ' "$BIN" "$LIB_BIN"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default

@@ -278,9 +278,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (prepared, mut child) = {
+    let (mut prepared, mut child) = {
         let _guard = crate::child::spawn::spawn_lock();
-        let prepared = crate::containment::prepare(
+        let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
             cmd.flags_request(),
@@ -310,13 +310,19 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 .expect("child fd numbers are unique (BTreeMap keys)");
         }
 
-        let c = tcmd.spawn().map_err(Error::Io)?;
+        let c = match tcmd.spawn().map_err(Error::Io) {
+            Ok(c) => c,
+            Err(e) => {
+                warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
+                return Err(e);
+            }
+        };
         drop(tcmd);
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (prepared, mut child) = {
-        let prepared = crate::containment::prepare(
+    let (mut prepared, mut child) = {
+        let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
             cmd.flags_request(),
@@ -360,11 +366,31 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             let _guard = crate::child::spawn::spawn_lock();
             // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
             // the wrong domain for this attribution.
+            //
+            // tokio can fail this spawn after its fork succeeded (its `build_child`: stdio
+            // registration, its pidfd reaper, its signal driver), dropping the child neither killed
+            // nor reaped, and it returns no pid. A cgroup leaf is still killed through when
+            // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
+            // other containment — a process group, a session, a tree walk, none, or a spawn that
+            // degraded — nothing reaches the child, and it keeps running.
             let spawned = tcmd.spawn().map_err(Error::Io);
             #[cfg(windows)]
             let spawned =
                 spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
-            spawned?
+            #[cfg(all(test, target_os = "linux"))]
+            let spawned = crate::child::spawn::fault::post_fork_failure(
+                spawned,
+                prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path_for_test()),
+            );
+            match spawned {
+                Ok(c) => c,
+                Err(e) => {
+                    // Whatever tokio did with the child, the leaf's exchange says what became of
+                    // it; without a leaf, nothing can tell.
+                    warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
+                    return Err(e);
+                }
+            }
         };
         (prepared, c)
     };
@@ -378,6 +404,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process.
         other => {
+            // The verdict first: tokio owns this child, so the leaf must not answer for it as an
+            // abandoned spawn's, reaping a pid tokio's own reap is about to.
+            prepared.settle_verdict(pid);
             reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
             return Err(crate::child::spawn::spawn_identity_error(other));
         }
@@ -430,3 +459,52 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+/// Say what a failed tokio spawn may have left behind of its child: nothing, a zombie nothing
+/// reaps, or a process nothing can reach.
+///
+/// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
+/// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
+/// told it who it is. The error cannot tell a failure before the fork from one after it, hence
+/// "may". Each is once per errno at `warn`, then at `debug`, as a degraded containment is
+/// reported.
+fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &Error) {
+    use crate::containment::AbandonedChild;
+
+    type Warned = std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>;
+    static UNREAPED: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    static UNREACHABLE: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let (warned, consequence) = match child {
+        AbandonedChild::Ended => return,
+        AbandonedChild::MaybeUnreaped => (
+            &UNREAPED,
+            "the child exits before `exec` but was left unreaped: it never reached the point where it \
+             names itself, so nothing holds its pid",
+        ),
+        AbandonedChild::MaybeUnreachable => (
+            &UNREACHABLE,
+            "the child was left running and nothing can reach it: only a cgroup v2 leaf is killed \
+             without the child's pid",
+        ),
+    };
+    warn_after_fork_into(warned, error, consequence);
+}
+
+/// Say that if the failed spawn forked, `consequence` — against an explicit "already warned" set,
+/// returning the level it chose.
+fn warn_after_fork_into(
+    warned: &std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>,
+    error: &Error,
+    consequence: &str,
+) -> log::Level {
+    let errno = match error {
+        Error::Io(e) => e.raw_os_error(),
+        _ => None,
+    };
+    let level = crate::warn_once::report_level(warned, errno);
+    log::log!(
+        level,
+        "tokio spawn failed ({error}); if it failed after forking, {consequence}"
+    );
+    level
+}

@@ -6,6 +6,54 @@ fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
+/// Route the library's `log` records to this test binary's stderr.
+///
+/// Without a logger installed, `log` drops every record on the floor — so a containment
+/// degrade explains itself into nothing and a failing `assert_eq!(…, CgroupV2)` is as
+/// undiagnosable from CI output as it was before the reason existed. libtest captures a
+/// failing test's stderr and prints it with the failure (and the CI cgroup step runs with
+/// `--nocapture`), so with this installed the reason lands directly above the assertion.
+///
+/// Unix-gated, not Linux-gated: BOTH Unix containment mechanisms that can degrade explain
+/// themselves through `log` — Linux's cgroup leaf (`cgroup::log_degrade`) and macOS's fd marker
+/// (`fdmarker::install`) — so routing only the Linux one leaves the macOS reasons on the floor
+/// on the host that has them.
+#[cfg(unix)]
+mod stderr_log {
+    use std::sync::OnceLock;
+
+    struct StderrLog;
+
+    impl log::Log for StderrLog {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    /// Idempotent: `log::set_logger` is once-per-process, so every test that wants the
+    /// library's reasoning calls this and the first one wins.
+    pub fn install() {
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&StderrLog).expect("first logger in this test binary");
+            // `Debug`, because a degrade reason is only reported at `warn` the FIRST time this
+            // process sees it — `cgroup::log_degrade` reports every repeat at `debug`. A
+            // narrower filter therefore keeps whichever test happened to degrade first and
+            // discards every repeat — `log!` checks `max_level()` before any logger is reached,
+            // so a filtered-out record is never emitted to capture in the first place.
+            //
+            // `Debug` is the full set and costs nothing beyond it: this crate emits no `trace`
+            // records at all, and libtest prints a passing test's stderr nowhere.
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+    }
+}
+
 // Basics =====
 
 #[test]
@@ -442,9 +490,9 @@ fn unix_fd3_file_round_trips() {
 /// Regression: `.contain()` + `.fd(3, pipe_out())` on Linux must NOT let the
 /// cgroup self-placement clobber (or be clobbered by) the command-fds dup2.
 ///
-/// The cgroup `pre_exec` opens `cgroup.procs` with CLOEXEC cleared and writes
-/// "0" to it. command-fds installs its own `pre_exec` that dup2's the user's
-/// fd 3 onto child fd 3. If command-fds runs FIRST, its dup2 can land on the
+/// The cgroup `pre_exec` writes "0" to a pre-opened `cgroup.procs` fd.
+/// command-fds installs its own `pre_exec` that dup2's the user's fd 3 onto
+/// child fd 3. If command-fds runs FIRST, its dup2 can land on the
 /// same fd number the cgroup `procs_fd` occupies — silently downgrading
 /// containment OR writing the cgroup's "0" into the user's fd 3 (corruption).
 /// We assert the parent reads EXACTLY the child-written token (no inserted "0",
@@ -455,6 +503,7 @@ fn unix_fd3_file_round_trips() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
+    stderr_log::install();
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
@@ -593,6 +642,10 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain();
+    // Every contained-tree test below goes through here, and each of them asserts an achieved
+    // mechanism that can silently be a weaker one. Route the reason for that.
+    #[cfg(unix)]
+    stderr_log::install();
     let child = cmd.spawn().expect("spawn");
     // Accept both connections; keep the grandchild's (tag 'G'). Accepting it is
     // proof the grandchild is alive — no is_alive() race.
@@ -1050,19 +1103,19 @@ fn drop_kills_contained_tree() {
     }
 }
 
-// cgroup v2 integration test =====
-// Runs only on Linux, and only when the CI provisions a delegated cgroup
-// (COSCA_TEST_CGROUP=1). The env guard means this is a true no-op when
-// unprovisioned, but FAILS loudly when the marker is set but the cgroup is
-// unavailable (the test asserts CgroupV2, so it won't silently pass).
+// cgroup v2 integration tests =====
+// Linux only, and `#[ignore]`d: they need a delegated cgroup, which CI provisions and then runs
+// them with `--include-ignored` and COSCA_TEST_CGROUP=1. Run without the marker, each fails
+// loudly rather than pass having tested nothing.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        // Unprovisioned: skip (not CI-cgroup environment). The live cgroup test
-        // requires COSCA_TEST_CGROUP=1 and a delegated cgroup slice.
-        return;
-    }
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     // COSCA_TEST_CGROUP is set: a usable delegated cgroup must exist.
     // If try_create_leaf() returns None, containment falls back to ProcessGroup
     // and the assert below will fail loudly — that's intentional.
@@ -1087,15 +1140,16 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
 /// `terminate_tree` under cgroup v2 containment. Mirrors the kill_tree cgroup
 /// test but exercises the SIGTERM path (`CgroupLeaf::terminate` SIGTERMs every
 /// pid in cgroup.procs). The control-block grandchild has no SIGTERM handler so
-/// the default action kills it. Gated on COSCA_TEST_CGROUP — a true no-op
-/// when unprovisioned, but FAILS loudly (CgroupV2 assertion) when the marker is
-/// set without a usable delegated cgroup. Proof of death: grandchild socket EOF.
+/// the default action kills it. Proof of death: grandchild socket EOF.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
-    }
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(
         child.containment(),
@@ -1112,4 +1166,500 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     let mut buf = [0u8; 1];
     let n = gc_stream.read(&mut buf).expect("read grandchild control socket");
     assert_eq!(n, 0, "cgroup terminate must SIGTERM the grandchild, not just the root");
+}
+
+/// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
+/// inside `f` inherits the pin, so parent and child share that CPU.
+#[cfg(target_os = "linux")]
+fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: `cpu_set_t` is plain data; zeroed is a valid (empty) set.
+    let mut original: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    // SAFETY: pid 0 is the calling thread; `original` is a valid, writable set of `size` bytes.
+    assert_eq!(
+        unsafe { libc::sched_getaffinity(0, size, &mut original) },
+        0,
+        "read affinity"
+    );
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        // SAFETY: `cpu` is below CPU_SETSIZE, so it indexes inside the set.
+        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &original) })
+        .expect("this thread may run on at least one CPU");
+    // SAFETY: as above.
+    let mut pinned: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `cpu` is below CPU_SETSIZE.
+    unsafe { libc::CPU_SET(cpu, &mut pinned) };
+    // SAFETY: pid 0 is the calling thread; `pinned` is a valid set of `size` bytes.
+    assert_eq!(
+        unsafe { libc::sched_setaffinity(0, size, &pinned) },
+        0,
+        "pin to one CPU"
+    );
+    let result = f();
+    // SAFETY: as above, restoring the set read at entry.
+    assert_eq!(
+        unsafe { libc::sched_setaffinity(0, size, &original) },
+        0,
+        "restore affinity"
+    );
+    result
+}
+
+/// A contained `sh -c 'worker & exit 0'` keeps its worker, and the worker is in the leaf.
+///
+/// The root can exit before cosca looks at the leaf, and `cgroup.procs` lists only live tasks,
+/// so the root is then absent from it although the kernel accepted its placement. Parent and
+/// child share one CPU here, which makes that the common outcome rather than a rare one.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
+    use std::io::BufRead;
+
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    // `sh` backgrounds the worker without waiting for its exec, so the root exits at once.
+    let mut cmd = Command::new();
+    cmd.executable("/bin/sh")
+        .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & exit 0"#, testbin(), &addr]);
+    cmd.contain();
+    // The pin makes the race this guards likely — the root exiting before cosca looks at the
+    // leaf — but orders nothing: the assertions below hold whichever side wins it.
+    let child = on_one_cpu(|| cmd.spawn()).expect("spawn");
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::CgroupV2,
+        "a root whose placement the kernel accepted is cgroup-contained, whether or not it is \
+         still alive to be listed"
+    );
+
+    let (worker, _) = listener.accept().expect("accept the worker");
+    let mut worker = std::io::BufReader::new(worker);
+    let mut hello = String::new();
+    worker.read_line(&mut hello).expect("read the worker's hello");
+    assert!(hello.starts_with('G'), "expected the worker's tag, got {hello:?}");
+    // Proof of life, after the spawn returned: a round trip only a live worker completes.
+    worker.get_mut().write_all(b"x").expect("write to the worker");
+    let mut echo = [0u8; 1];
+    worker
+        .read_exact(&mut echo)
+        .expect("the worker must still be alive to echo — cosca killed it at spawn time");
+    assert_eq!(&echo, b"x");
+
+    // The leaf owns the worker: its kill reaches it.
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    let mut buf = [0u8; 1];
+    let n = worker.read(&mut buf).expect("read the worker's control socket");
+    assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
+}
+
+/// The unified-hierarchy path in the contents of a `/proc/<pid>/cgroup` file.
+#[cfg(target_os = "linux")]
+fn unified_cgroup(proc_cgroup: &str) -> &str {
+    proc_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("a cgroup v2 `0::` line")
+}
+
+/// Closed descriptors among 0, 1 and 2 can neither capture the child's placement write nor
+/// hide its placement report.
+///
+/// A descriptor the supervisor opens takes the lowest free number, and `std` `dup2`s the child's
+/// stdio onto 0/1/2 before any `pre_exec` runs. So with slots closed at spawn time:
+/// - a `cgroup.procs` fd opened in a gap would be replaced by the child's stdio, and the placement
+///   write would land in the user's file and report a placement that never happened;
+/// - with two or more closed, `std`'s own error channel lands its child end on one of them, the
+///   child's stdio closes it, and `spawn` returns before the child has placed itself. Reading the
+///   report then would miss the placement, degrade to a process group, and leave the child in a
+///   leaf nothing kills through.
+///
+/// A `Stdio::from_file` end is a dup numbered 3 or above, so it does not fill a gap first.
+///
+/// Every case also runs with `pidfd_open` denied by a seccomp filter, where cosca cannot wait
+/// for the report: the child may then land on either side of its leaf, but cosca must report the
+/// side it is on.
+///
+/// Each case runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
+/// is process-wide, so in a binary with other tests running it would hand their next `open` the
+/// slot, and with 2 closed a failing assertion's message would go nowhere.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
+    const NAME: &str = "linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child";
+
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    if let Ok(slots) = std::env::var(CLOSED_SLOTS_ENV) {
+        let deny_pidfd = std::env::var_os(DENY_PIDFD_ENV).is_some();
+        return spawn_with_slots_closed(&parse_closed_slots(&slots), deny_pidfd);
+    }
+    // "" is the control: the same spawn with every slot open.
+    let slot_cases = ["", "0", "1", "2", "1,2", "0,1", "0,2", "0,1,2"];
+    let failures: Vec<String> = [false, true]
+        .into_iter()
+        .flat_map(|deny| slot_cases.map(|slots| (slots, deny)))
+        .filter_map(|(slots, deny)| {
+            let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+            run.args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+                .env(CLOSED_SLOTS_ENV, slots);
+            if deny {
+                run.env(DENY_PIDFD_ENV, "1");
+            }
+            let out = run.output().expect("run this test with the slots closed");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
+                format!(
+                    "slots [{slots}], pidfd denied: {deny}: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Selects the slots one case of
+/// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`] closes:
+/// comma-separated, empty for none.
+#[cfg(target_os = "linux")]
+const CLOSED_SLOTS_ENV: &str = "COSCA_TEST_CLOSED_SLOTS";
+
+/// Set to deny `pidfd_open` in one case of
+/// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`].
+#[cfg(target_os = "linux")]
+const DENY_PIDFD_ENV: &str = "COSCA_TEST_DENY_PIDFD";
+
+/// Make `pidfd_open` fail with `EPERM` on the calling thread and every process it forks, as a
+/// seccomp-filtered container does.
+#[cfg(target_os = "linux")]
+fn deny_pidfd_open_on_this_thread() {
+    // `seccomp_data.nr`, the syscall number, is at offset 0.
+    let filter = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_pidfd_open as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // SAFETY: plain prctl calls; `program` and `filter` outlive the second, which copies them.
+    unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs");
+        assert_eq!(
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+            0,
+            "seccomp: {}",
+            std::io::Error::last_os_error()
+        );
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0);
+        assert_eq!(pidfd, -1, "pidfd_open must be denied");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_closed_slots(slots: &str) -> Vec<i32> {
+    slots
+        .split(',')
+        .filter(|slot| !slot.is_empty())
+        .map(|slot| {
+            let slot: i32 = slot.parse().unwrap_or_else(|_| panic!("bad slot {slot:?}"));
+            assert!((0..=2).contains(&slot), "slot {slot} is not a std slot");
+            slot
+        })
+        .collect()
+}
+
+/// Block until the cgroup at `leaf` has no live member, on the kernel's `populated` edge.
+#[cfg(target_os = "linux")]
+fn wait_unpopulated(leaf: &std::path::Path) {
+    use std::io::Seek;
+    use std::os::fd::AsRawFd;
+
+    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open cgroup.events");
+    loop {
+        let mut text = String::new();
+        events.rewind().expect("rewind cgroup.events");
+        events.read_to_string(&mut text).expect("read cgroup.events");
+        if text.lines().any(|line| line == "populated 0") {
+            return;
+        }
+        let mut fd = libc::pollfd {
+            fd: events.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; -1 blocks until the kernel reports a transition.
+        let ret = unsafe { libc::poll(&mut fd, 1, -1) };
+        assert!(
+            ret >= 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
+            "poll cgroup.events: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Spawn `cmd` with `slots` closed in this process across the spawn, and restore them.
+#[cfg(target_os = "linux")]
+fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
+    // Everything this process needs open is opened already, so nothing fills the gaps but the
+    // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
+    // SAFETY: each slot is one of this process's own std descriptors; it is closed only across
+    // the spawn and restored from its saved copy before anything else runs.
+    let saved: Vec<(i32, i32)> = slots
+        .iter()
+        .map(|&slot| unsafe {
+            let saved = libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3);
+            assert!(saved >= 3, "dup({slot}): {}", std::io::Error::last_os_error());
+            (slot, saved)
+        })
+        .collect();
+    for &(slot, _) in &saved {
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::close(slot) }, 0, "close({slot})");
+    }
+    // One CPU for parent and child makes it likely that `spawn` returns before the child has
+    // reported — the case a report read at `spawn`'s return would get wrong. It orders nothing:
+    // the verdict below compares cosca's answer with where the child really is, and holds
+    // whichever side runs first.
+    let spawned = on_one_cpu(|| cmd.spawn());
+    for &(slot, saved) in &saved {
+        // SAFETY: `saved` is this process's own open descriptor, duplicated above.
+        unsafe {
+            assert_eq!(libc::dup2(saved, slot), slot, "restore fd {slot}");
+            libc::close(saved);
+        }
+    }
+    spawned
+}
+
+/// Accept one connection on `listener`, or fail at once if the process `pid` — this process's
+/// child, whose tree is to connect — exits first. No timeout: one of the two always happens.
+#[cfg(target_os = "linux")]
+fn accept_while_alive(listener: &std::net::TcpListener, pid: u32) -> std::net::TcpStream {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: a plain syscall; its result is checked before use.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(pidfd >= 0, "pidfd_open({pid}): {}", std::io::Error::last_os_error());
+    // SAFETY: `pidfd` is a fresh descriptor this function owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    let mut fds = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: two valid pollfds; -1 blocks until one is ready.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ready >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "poll: {e}");
+    }
+    assert_ne!(
+        fds[0].revents & libc::POLLIN,
+        0,
+        "child {pid} exited before its tree connected"
+    );
+    listener.accept().expect("accept the worker").0
+}
+
+/// One case of [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`]:
+/// spawn a contained `sh` with `slots` closed in this process and each wired to a file in the
+/// child, then check what cosca reports against where the child really is.
+#[cfg(target_os = "linux")]
+fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
+    use std::io::{BufRead, Seek};
+
+    const CONTENTS: &[u8] = b"untouched\n";
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+    let own = unified_cgroup(&own).to_string();
+    let mut file = tempfile::tempfile().expect("tempfile");
+    file.write_all(CONTENTS).expect("fill the file");
+    file.rewind().expect("rewind the file");
+
+    let mut cmd = Command::new();
+    // The root stays alive in `wait` for as long as the worker does.
+    cmd.executable("/bin/sh")
+        .args(["sh", "-c", r#""$0" control-echo-pid "$1" G & wait"#, testbin(), &addr]);
+    for &slot in slots {
+        cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
+            .expect("wire the slot to the file");
+    }
+    cmd.contain();
+
+    // The spawn runs on a thread of its own: a seccomp filter is per thread, so this one keeps
+    // the `pidfd_open` it needs to watch the child below.
+    let spawned = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                if deny_pidfd {
+                    deny_pidfd_open_on_this_thread();
+                }
+                spawn_with_std_slots_closed(&mut cmd, slots)
+            })
+            .join()
+            .expect("the spawning thread")
+    });
+    let child = spawned.expect("spawn");
+    let containment = child.containment();
+    // Printed once 0, 1 and 2 are back, for a caller counting outcomes across runs.
+    println!("closed-slots outcome: {containment:?}");
+
+    let worker = accept_while_alive(&listener, child.id().pid());
+    let mut worker = std::io::BufReader::new(worker);
+    let mut hello = String::new();
+    worker.read_line(&mut hello).expect("read the worker's hello");
+    let worker_pid: u32 = hello
+        .trim()
+        .strip_prefix('G')
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("expected the worker's tagged pid, got {hello:?}"));
+
+    // The worker is `sh`'s own fork, made after `sh` exec'd, so the root's placement — whichever
+    // way it went — is settled. The root is alive in `wait`, so its cgroup is readable.
+    let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
+    let root_cgroup = unified_cgroup(&root_cgroup).to_string();
+    let leaf_prefix = format!("{own}/cosca-{}-", std::process::id());
+    let in_leaf = root_cgroup
+        .strip_prefix(&leaf_prefix)
+        .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
+    let expected = if deny_pidfd && slots.len() >= 2 {
+        // `spawn` can return before the report, which cannot be waited for: either side of the
+        // leaf is right, as long as it is reported.
+        (
+            if in_leaf {
+                cosca::Containment::CgroupV2
+            } else {
+                cosca::Containment::ProcessGroup
+            },
+            in_leaf,
+        )
+    } else {
+        (cosca::Containment::CgroupV2, true)
+    };
+    assert_eq!(
+        (containment, in_leaf),
+        expected,
+        "slots {slots:?}, pidfd denied: {deny_pidfd}: cosca reports {containment:?}, and the \
+         child is in {root_cgroup} (its leaf would be {leaf_prefix}<seq>)"
+    );
+    let worker_cgroup = std::fs::read_to_string(format!("/proc/{worker_pid}/cgroup")).expect("worker cgroup");
+    assert_eq!(
+        unified_cgroup(&worker_cgroup),
+        root_cgroup,
+        "the worker is in the root's cgroup"
+    );
+
+    let mut written = Vec::new();
+    file.rewind().expect("rewind the file");
+    file.read_to_end(&mut written).expect("read the file back");
+    assert_eq!(
+        String::from_utf8_lossy(&written),
+        String::from_utf8_lossy(CONTENTS),
+        "slots {slots:?}: the placement write landed in the child's stdio file"
+    );
+
+    // Proof of life before the kill: a round trip only a live worker completes.
+    worker.get_mut().write_all(b"x").expect("write to the worker");
+    let mut echo = [0u8; 1];
+    worker.read_exact(&mut echo).expect("the worker echoes while alive");
+    assert_eq!(&echo, b"x");
+
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    let mut buf = [0u8; 1];
+    let n = worker.read(&mut buf).expect("read the worker's control socket");
+    assert_eq!(n, 0, "cgroup.kill must kill the worker");
+
+    // The leaf is removed with the child: nothing is left behind once its members have exited.
+    let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+    if in_leaf {
+        wait_unpopulated(&own_dir.join(root_cgroup.rsplit('/').next().expect("a leaf name")));
+    }
+    drop(child);
+    let prefix = format!("cosca-{}-", std::process::id());
+    let left: Vec<String> = std::fs::read_dir(&own_dir)
+        .expect("list this process's cgroup")
+        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    assert!(left.is_empty(), "slots {slots:?}: {left:?} left behind");
+}
+
+/// Once a spawn has returned, the supervisor holds no descriptor for the child's leaf
+/// `cgroup.procs`: it is needed only for the child's own placement write, and one held per
+/// live child would spend the supervisor's fd limit on children it no longer needs it for.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let (child, mut gc_stream) = spawn_contained_tree();
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+
+    // The root is alive (it holds its control socket), so its cgroup is readable.
+    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
+    let procs = format!("{}/cgroup.procs", unified_cgroup(&cgroup));
+    let held: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .expect("list this process's fds")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .map(|target| target.to_string_lossy().into_owned())
+        .filter(|target| target.ends_with(&procs))
+        .collect();
+    assert!(held.is_empty(), "the supervisor still holds {held:?}");
+
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    let mut buf = [0u8; 1];
+    assert_eq!(gc_stream.read(&mut buf).expect("read the grandchild's socket"), 0);
 }

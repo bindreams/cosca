@@ -37,6 +37,50 @@ impl Prepared {
         #[cfg(not(windows))]
         return crate::graceful::GracefulMechanism::Process;
     }
+
+    /// End the placement exchange of a spawn that failed while the caller still holds its child
+    /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
+    /// never for the child the caller will reap. A no-op without a leaf, or once taken.
+    #[cfg_attr(not(any(test, feature = "tokio")), allow(dead_code))]
+    pub(crate) fn settle_verdict(&mut self, pid: u32) {
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
+            // The spawn fails either way; an undecidable verdict has already killed the child.
+            let _ = leaf.take_placement(pid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+
+    /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
+    /// can drop one it forked — and say what became of that child. Without a leaf nothing can
+    /// tell, so [`AbandonedChild::MaybeUnreachable`].
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn abandon_before_verdict(&mut self) -> AbandonedChild {
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = self.cgroup_leaf.as_mut() {
+            use crate::containment::cgroup::Abandoned;
+            return match leaf.abandon_before_verdict() {
+                Abandoned::Ended => AbandonedChild::Ended,
+                Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
+                Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
+            };
+        }
+        AbandonedChild::MaybeUnreachable
+    }
+}
+
+/// What became of the child of a spawn that failed with no handle left on it (see
+/// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
+#[cfg_attr(not(all(target_os = "linux", feature = "tokio")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbandonedChild {
+    /// Nothing of it runs, and it is reaped or will be.
+    Ended,
+    /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
+    MaybeUnreaped,
+    /// If it was forked, it may be running where nothing can reach it.
+    MaybeUnreachable,
 }
 
 /// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the
@@ -113,10 +157,7 @@ impl Attached {
             #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid),
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => {
-                leaf.hard_kill();
-                Ok(())
-            }
+            Attached::Cgroup(leaf) => leaf.hard_kill(),
             #[cfg(windows)]
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
@@ -450,22 +491,32 @@ pub(crate) fn prepare(
                 }
             }
 
-            let leaf = crate::containment::cgroup::try_create_leaf();
+            // A failed leaf creation degrades this spawn to the process group set above. The
+            // decision is unchanged; only the silence is — `log_degrade` names the step that
+            // failed and the kernel's reason for it.
+            let leaf = match crate::containment::cgroup::try_create_leaf() {
+                Ok(leaf) => Some(leaf),
+                Err(e) => {
+                    crate::containment::cgroup::log_degrade(&e);
+                    None
+                }
+            };
             if let Some(ref l) = leaf {
                 // Wire the pre_exec self-placement. The closure captures the raw
                 // fd integer (Copy) — not the leaf itself (which stays in Prepared).
-                // On error (e.g. EBUSY — "no internal processes" rule), the closure
-                // returns Ok so the spawn proceeds and `attach` falls back to the
-                // already-configured process group rather than aborting the spawn.
+                // A failed placement (e.g. EBUSY — "no internal processes" rule) returns Ok,
+                // so the spawn proceeds and `attach` falls back to the already-configured
+                // process group. Only a report the child cannot send fails the spawn. Both the
+                // sync and the tokio spawn register this one closure through `prepare`.
                 // Safety: pre_exec runs post-fork, pre-exec; the function is
-                // async-signal-safe (libc::write + libc::close, no alloc).
+                // async-signal-safe (libc::write + libc::close + libc::send, no alloc).
                 let procs_fd = l.procs_fd();
+                // The child's own outcome — success, or the write's errno — is sent here; it
+                // is the only channel out of a post-fork, pre-exec address space.
+                let slot = l.placement_slot();
                 unsafe {
                     use std::os::unix::process::CommandExt;
-                    std_cmd.pre_exec(move || {
-                        let _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd);
-                        Ok(())
-                    });
+                    std_cmd.pre_exec(move || crate::containment::cgroup::placement_hook(procs_fd, slot));
                 }
             }
             return Ok(Prepared {
@@ -578,18 +629,25 @@ fn attach_tree(
                 }
 
                 // Strongest: cgroup v2 if available, else process group.
-                if let Some(leaf) = prepared.cgroup_leaf {
-                    // Verify placement: the pre_exec write can silently fail
-                    // (EBUSY — "no internal processes" rule when the supervisor
-                    // is itself an undelegated leaf). Read cgroup.procs to
-                    // confirm the child's pid is actually present.
-                    if leaf.contains_pid(raw_pid) {
-                        return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)));
+                if let Some(mut leaf) = prepared.cgroup_leaf {
+                    // The pre_exec write can fail (EBUSY — the "no internal processes" rule
+                    // when the supervisor is itself an undelegated leaf). The child's own
+                    // report of that write decides membership; re-reading cgroup.procs cannot,
+                    // because it lists only live tasks and a placed child may already have
+                    // exited. Taking the verdict waits for that report — `spawn` returning does
+                    // not mean the child has made it — then releases the leaf's fd and pipe.
+                    // An undecidable verdict fails the spawn: the child is already killed.
+                    match leaf.take_placement(raw_pid)? {
+                        Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
+                        // Nothing of the child's is in the leaf: its final report is not Placed. The
+                        // process group set pre-spawn is the real container; the leaf is
+                        // removed without writing cgroup.kill.
+                        Err(reason) => {
+                            crate::containment::cgroup::log_degrade(&reason);
+                            leaf.remove_unentered();
+                            return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
+                        }
                     }
-                    // Placement failed — the leaf is empty; drop it (triggers
-                    // rmdir). The process group set pre-spawn is the real container.
-                    drop(leaf);
-                    return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
                 }
                 // No cgroup leaf: fall back to process group (set pre-spawn).
                 return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));

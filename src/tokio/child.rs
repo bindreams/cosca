@@ -760,12 +760,26 @@ impl Drop for Child {
 pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
     // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
     // whose argument is stripped in release). A no-op on an already-exited child.
-    let killed = child.start_kill();
-    debug_assert!(killed.is_ok(), "start_kill of an owned child should not fail");
-    // A failed start_kill means this is not a live process to wait on (ESRCH = already exited;
-    // EPERM is impossible for our own child) — skip, so a kill failure can never turn the bounded
-    // exit-wait into an unbounded block. tokio's field-drop reaps any leftover zombie.
-    if killed.is_err() {
+    #[cfg(test)]
+    let forced = crate::child::spawn::fault::take_force_kill_failure();
+    #[cfg(not(test))]
+    let forced: Option<(&str, std::io::ErrorKind, bool)> = None;
+    let killed = match forced {
+        // The sync seam's "leave it alive" form is the only one this path honours: it replaces the
+        // kill, so the child really is left unsignalled.
+        Some((marker, kind, _)) => Err(std::io::Error::new(kind, marker)),
+        None => child.start_kill(),
+    };
+    // A failed start_kill means this is not a live process to wait on to a bound — ESRCH, it has
+    // already exited; EPERM, a setuid child refused the kill — so skip, and a kill failure never
+    // turns the bounded exit-wait into an unbounded block. tokio's own `Child` drop hands whatever
+    // is left to the runtime's orphan reaper. EPERM is reachable without a bug, so it alone is not
+    // asserted.
+    if let Err(e) = &killed {
+        debug_assert!(
+            e.kind() == std::io::ErrorKind::PermissionDenied,
+            "start_kill of an owned child failed: {e}"
+        );
         return;
     }
     wait_and_reap(child, pid, done_ok);

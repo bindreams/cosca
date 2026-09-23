@@ -45,6 +45,8 @@ pub use command::Command;
 
 mod wait;
 
+mod warn_once;
+
 #[cfg(test)]
 mod log_capture;
 

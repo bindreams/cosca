@@ -488,3 +488,164 @@ fn uac_elevated_attachment_has_no_in_process_route() {
     assert!(matches!(a.attached, Attached::None), "got {:?}", a.attached);
     assert_eq!(a.graceful, GracefulMechanism::Unknown);
 }
+
+// The cgroup placement decision =====
+// `attach_tree` decides whether a Strongest root's leaf owns its tree. The child's own
+// self-placement report is the oracle: a later `cgroup.procs` read lists only LIVE tasks, so a
+// placed child that has already exited reads back as absent. Real filesystem, no cgroupfs: each
+// leaf is a temp directory shaped with ordinary files. These tests are about what the decision
+// does with a report, not how a child earns one: a failed write is made for real, in-process,
+// but `Placed` is stored directly, since a successful write to anything but a real `cgroup.procs`
+// is the very false report the live cgroup lane guards against.
+
+/// What the child's `pre_exec` closure reported, if it ran at all.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum ChildReport {
+    Placed,
+    WriteFailed,
+    NotReported,
+}
+
+/// Run the decision for a leaf at `leaf_path` whose child reported `report`.
+#[cfg(target_os = "linux")]
+fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containment::Containment, super::Attached) {
+    use crate::containment::cgroup::{place_self_in_cgroup_pre_exec, CgroupLeaf};
+
+    let leaf = CgroupLeaf::for_test_at(leaf_path.to_path_buf());
+    match report {
+        // SAFETY: the slot's pipe lives as long as `leaf`.
+        ChildReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
+        ChildReport::WriteFailed => {
+            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
+            // no-op. The slot's pipe lives as long as `leaf`.
+            let _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+        }
+        ChildReport::NotReported => {}
+    }
+    let prepared = super::Prepared {
+        mode: Some(crate::containment::ContainMode::Strongest),
+        is_root: true,
+        cgroup_leaf: Some(leaf),
+    };
+    super::attach_tree(std::process::id(), prepared).expect("attach_tree")
+}
+
+/// A leaf directory whose `cgroup.procs` lists some OTHER pid, never this test's.
+#[cfg(target_os = "linux")]
+fn leaf_listing_another_pid(dir: &std::path::Path) -> std::path::PathBuf {
+    let leaf_path = dir.join("cosca-decision-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let other = std::process::id().wrapping_add(1);
+    std::fs::write(leaf_path.join("cgroup.procs"), format!("{other}\n")).expect("write cgroup.procs");
+    leaf_path
+}
+
+/// A child that reported its write accepted, and has since exited: `cgroup.procs` no longer
+/// lists it. Anything it forked is still in the leaf, so the leaf owns the tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = leaf_listing_another_pid(dir.path());
+
+    let (containment, attached) = decide(&leaf_path, ChildReport::Placed);
+
+    assert_eq!(containment, crate::containment::Containment::CgroupV2);
+    let super::Attached::Cgroup(leaf) = &attached else {
+        panic!("got {attached:?}");
+    };
+    assert!(
+        !leaf.holds_spawn_resources(),
+        "a live child's leaf must not hold its cgroup.procs fd or report pipe past the verdict"
+    );
+    assert!(
+        !leaf_path.join("cgroup.kill").exists(),
+        "the leaf owns a live tree; nothing may kill it at spawn time"
+    );
+}
+
+/// Membership that cannot be read is unknown, not absent — and the child's own report already
+/// answers it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_placed_report_outranks_an_unreadable_cgroup_procs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-decision-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf (no cgroup.procs inside)");
+
+    let (containment, attached) = decide(&leaf_path, ChildReport::Placed);
+
+    assert_eq!(containment, crate::containment::Containment::CgroupV2);
+    assert!(matches!(attached, super::Attached::Cgroup(_)), "got {attached:?}");
+}
+
+/// A child whose write failed never entered the leaf, so neither did anything it forked: the
+/// spawn degrades and the empty leaf is removed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_write_degrades_and_removes_the_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-decision-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+    let (containment, attached) = decide(&leaf_path, ChildReport::WriteFailed);
+
+    assert_eq!(containment, crate::containment::Containment::ProcessGroup);
+    assert!(matches!(attached, super::Attached::ProcessGroup(_)), "got {attached:?}");
+    assert!(!leaf_path.exists(), "the degrade must remove the leaf it created");
+}
+
+/// Removing a leaf the child never entered must never write `cgroup.kill`, even when the leaf
+/// will not go away: whatever is in it, cosca did not put there. The leaf left behind is
+/// reported.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_degrade_never_kills_through_the_leaf() {
+    crate::log_capture::install();
+    for report in [ChildReport::WriteFailed, ChildReport::NotReported] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A `cgroup.procs` file makes the directory non-empty, so its `rmdir` fails.
+        let leaf_path = leaf_listing_another_pid(dir.path());
+
+        let mark = crate::log_capture::mark();
+        let (containment, _attached) = decide(&leaf_path, report);
+
+        assert_eq!(containment, crate::containment::Containment::ProcessGroup);
+        assert!(
+            !leaf_path.join("cgroup.kill").exists(),
+            "a degrade wrote cgroup.kill: it would kill a tree cosca had just been asked to contain"
+        );
+        let left_behind: Vec<String> = crate::log_capture::records_since(mark, &leaf_path.to_string_lossy())
+            .into_iter()
+            .filter(|record| record.contains("was not removed"))
+            .collect();
+        assert_eq!(
+            left_behind.len(),
+            1,
+            "the unremoved leaf is reported once: {left_behind:?}"
+        );
+    }
+}
+
+/// A leaf whose report cannot be waited for (no pidfd) and was never entered degrades the spawn
+/// to its process group, removes the leaf, and never writes `cgroup.kill`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_leaf_without_a_pidfd_degrades_without_a_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unwaitable");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let prepared = super::Prepared {
+        mode: Some(crate::containment::ContainMode::Strongest),
+        is_root: true,
+        cgroup_leaf: Some(crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone())),
+    };
+
+    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
+    let (containment, attached) = super::attach_tree(std::process::id(), prepared).expect("attach_tree");
+
+    assert_eq!(containment, crate::containment::Containment::ProcessGroup);
+    assert!(matches!(attached, super::Attached::ProcessGroup(_)), "got {attached:?}");
+    assert!(!leaf_path.exists(), "the leaf must be removed");
+}
