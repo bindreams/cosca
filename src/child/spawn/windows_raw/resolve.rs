@@ -217,8 +217,9 @@ pub(crate) fn build_env_block(ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> 
 /// in [`EnvKey`] order and closed by a trailing `\0` (a double-NUL terminator).
 /// Keys collide when [`EnvKey`] says they are equal and the last write wins.
 ///
-/// The emitted name is the one std's `CommandEnv::{set, remove, clear, capture}`
-/// produces, because this replays them step for step:
+/// The ops are recorded by std's own `Command` (via `apply_env`, exactly as the std
+/// backend records them), so the emitted name is the one std's
+/// `CommandEnv::{set, remove, clear, capture}` produces:
 /// - With no `Clear` in `ops`, a variable in `base` keeps its first name there,
 ///   whatever ops removed or re-set it; any other variable takes the name of the
 ///   first op that named it, a `Remove` included.
@@ -232,40 +233,25 @@ pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp])
         return Ok(None);
     }
 
-    // std's `CommandEnv::{set, remove, clear}`, then `capture`. `BTreeMap::insert`
-    // keeps an existing equal key, which is what makes the first name stick.
-    let mut clear = false;
-    let mut changes: BTreeMap<EnvKey, Option<OsString>> = BTreeMap::new();
-    for op in ops {
-        match op {
-            EnvOp::Set(key, val) => {
-                changes.insert(EnvKey::new(key), Some(val.clone()));
-            }
-            EnvOp::Remove(key) if clear => {
-                changes.remove(&EnvKey::new(key));
-            }
-            EnvOp::Remove(key) => {
-                changes.insert(EnvKey::new(key), None);
-            }
-            EnvOp::Clear => {
-                clear = true;
-                changes.clear();
-            }
-        }
-    }
+    // std records the ops; `get_envs` yields its first-name keys and pending values.
+    // What std does not expose is `capture`, the merge with `base`, replayed here.
+    let mut changes = std::process::Command::new("");
+    crate::child::spawn::apply_env(&mut changes, ops);
     let mut vars: BTreeMap<EnvKey, OsString> = BTreeMap::new();
-    if !clear {
+    // std's `clear` flag is only ever set, never reset, so any `Clear` drops `base`.
+    if !ops.iter().any(|op| matches!(op, EnvOp::Clear)) {
         for (key, val) in base {
+            // `BTreeMap::insert` keeps an existing equal key: the first name sticks.
             vars.insert(EnvKey::new(key), val.clone());
         }
     }
-    for (key, change) in changes {
+    for (key, change) in changes.get_envs() {
         match change {
             Some(val) => {
-                vars.insert(key, val);
+                vars.insert(EnvKey::new(key), val.to_os_string());
             }
             None => {
-                vars.remove(&key);
+                vars.remove(&EnvKey::new(key));
             }
         }
     }
