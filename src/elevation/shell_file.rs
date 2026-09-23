@@ -15,10 +15,15 @@ use std::path::Path;
 use crate::error::Error;
 
 /// Refuse an elevated program unless it is a fully qualified `.exe`/`.com` path with no `"`:
-/// [`reject_quote`], [`reject_non_image`] and [`reject_not_fully_qualified`], in that order.
+/// [`reject_quote`], [`crate::resolve::reject_unloadable_image`] and
+/// [`reject_not_fully_qualified`], in that order.
+///
+/// `%` is not refused: an `exefile` launch takes it literally in `lpFile` and `lpDirectory`, which
+/// the elevating probes in `tests/windows_shell_execute.rs` re-measure on every pull request
+/// touching this code.
 pub(crate) fn reject_elevated_program(program: &Path) -> Result<(), Error> {
     reject_quote(program)?;
-    reject_non_image(program)?;
+    crate::resolve::reject_unloadable_image(program, true)?;
     reject_not_fully_qualified(program)
 }
 
@@ -41,23 +46,6 @@ fn unsupported(program: &Path, detail: &str) -> Error {
         platform: "windows",
         detail: detail.into(),
     }
-}
-
-/// Refuse an elevated program whose final component does not end, case-insensitively, in `.exe` or
-/// `.com`: `exefile` is the class for an image, and without the class ShellExecuteEx would complete
-/// any other token by lookup (`PathResolveW`, `PathFileExistsDefExtW`, both trying `.bat` and
-/// `.cmd`) or dispatch it through its own association. A string rule, so it needs no resolution.
-fn reject_non_image(program: &Path) -> Result<(), Error> {
-    let lower = program.as_os_str().to_string_lossy().to_ascii_lowercase();
-    if lower.ends_with(".exe") || lower.ends_with(".com") {
-        return Ok(());
-    }
-    Err(unsupported(
-        program,
-        "an elevated program must name its image, ending in .exe or .com: ShellExecuteEx completes \
-         any other token by lookup, which can reach a .bat, and dispatches other extensions through \
-         their association",
-    ))
 }
 
 /// Refuse an elevated program that is not fully qualified: a drive and a root (`C:\`), or two

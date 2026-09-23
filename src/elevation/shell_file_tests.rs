@@ -3,10 +3,11 @@ use std::path::Path;
 use crate::error::Error;
 
 fn refused(token: &str) -> bool {
-    matches!(
-        super::reject_elevated_program(Path::new(token)),
-        Err(Error::Unsupported { .. })
-    )
+    match super::reject_elevated_program(Path::new(token)) {
+        Err(Error::Unsupported { .. }) => true,
+        Err(Error::Io(e)) => e.kind() == std::io::ErrorKind::InvalidInput,
+        other => panic!("{token:?}: unexpected {other:?}"),
+    }
 }
 
 /// A `"` would end the `"%1"` quote in `exefile`'s `runas` command early, and no Win32 file name
@@ -66,7 +67,9 @@ fn a_fully_qualified_image_path_passes() {
 
 /// ShellExecuteEx completes an extension-less token by lookup (`PathResolveW` with
 /// `PRF_TRYPROGRAMEXTENSIONS`, `PathFileExistsDefExtW`), trying `.bat` and `.cmd` among others, so
-/// the elevated path takes only a token that already names an image.
+/// the elevated path takes only a token that already names an image. The rule is
+/// [`crate::resolve::reject_unloadable_image`]'s, so it refuses with `InvalidInput` and names
+/// `PATHEXT`, ahead of the fully-qualified rule.
 #[test]
 fn an_elevated_token_must_end_in_exe_or_com() {
     for token in [
@@ -77,7 +80,7 @@ fn an_elevated_token_must_end_in_exe_or_com() {
         "a.b.exe",
     ] {
         assert!(
-            super::reject_non_image(Path::new(token)).is_ok(),
+            !matches!(super::reject_elevated_program(Path::new(token)), Err(Error::Io(_))),
             "{token:?} names an image"
         );
     }
@@ -93,15 +96,16 @@ fn an_elevated_token_must_end_in_exe_or_com() {
         "setup.exe:s",
         r"C:\tools\",
         r"C:\tools\setup.exe\",
+        // A UNC root names a share, not a file.
+        r"\\server\share.exe",
         "",
     ] {
-        assert!(
-            matches!(
-                super::reject_non_image(Path::new(token)),
-                Err(Error::Unsupported { .. })
-            ),
-            "{token:?} does not end in .exe or .com"
-        );
+        match super::reject_elevated_program(Path::new(token)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                assert!(e.to_string().contains("PATHEXT"), "{token:?}: {e}");
+            }
+            other => panic!("{token:?} does not name an .exe or .com image, got {other:?}"),
+        }
     }
 }
 

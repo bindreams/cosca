@@ -467,11 +467,6 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
         Transition::ElevateWindows { .. } => {}
     }
 
-    // Every arm, since `ShellExecuteEx` applies PATHEXT to any `lpFile`. Below the short-circuit:
-    // an already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
-    // extension, so an extensionless image is not plantable there.
-    crate::resolve::reject_unloadable_image(std::path::Path::new(&program), true)?;
-
     Ok(RunasStep::Launch(Box::new(RunasLaunch {
         file_w,
         class_w: wide_nul("class", OsStr::new("exefile"))?,

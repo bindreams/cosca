@@ -269,15 +269,13 @@ impl Command {
     ///
     /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
     /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
-    /// backend (and this resolver) described above, so a bare or relative
-    /// `executable` there is neither searched in `PATH` nor refused for a
-    /// drive-relative name — it reaches `ShellExecuteEx`'s own `lpFile` search
-    /// unresolved. That search applies `PATHEXT` and file associations even to an absolute name,
-    /// so where a consent prompt is used, [`elevate`](Self::elevate) on Windows refuses with
-    /// [`std::io::ErrorKind::InvalidInput`] any name not ending in `.exe` or `.com`: both
-    /// `executable(r"C:\tools\setup")` and `executable("whoami")` are refused, and
-    /// `whoami.exe` is not. Whether `PATHEXT` is also applied to a name that already ends in
-    /// `.exe` is unmeasured.
+    /// backend (and this resolver) described above, and nothing resolves the name there. So
+    /// [`elevate`](Self::elevate) on Windows takes only a fully qualified path to an image:
+    /// `ShellExecuteEx` applies `PATHEXT` and file associations even to an absolute name, so a
+    /// name not ending in `.exe` or `.com` is refused with
+    /// [`std::io::ErrorKind::InvalidInput`] — both `executable(r"C:\tools\setup")` and
+    /// `executable("whoami")` — and a bare or relative one such as `whoami.exe` is refused with
+    /// [`Error::Unsupported`]. Both hold whether or not the caller is already elevated.
     ///
     /// Every Windows spawn, elevated or not, refuses a `.bat`/`.cmd` that only Win32's
     /// normalisation exposes, such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one
@@ -334,11 +332,10 @@ impl Command {
     ///
     /// On Windows the elevated path goes through `ShellExecuteEx`, which searches a path-less
     /// `lpFile` and applies `PATHEXT` even to an absolute one. cosca completes the name to an
-    /// absolute path first, by the same rules as above, and where a consent prompt is used refuses
-    /// it with [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
+    /// absolute path first, by the same rules as above, and refuses it with
+    /// [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
     /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
-    /// `C:\tools\setup`. Whether `PATHEXT` is also applied to a name that already ends in `.exe`
-    /// is unmeasured.
+    /// `C:\tools\setup`.
     ///
     /// Every elevation backend derives the child's `argv[0]` from the program it is handed
     /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under

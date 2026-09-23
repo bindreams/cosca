@@ -38,6 +38,11 @@ fn is_unsupported<T>(r: Result<T, Error>) -> bool {
     matches!(r, Err(Error::Unsupported { .. }))
 }
 
+/// `Io(InvalidInput)` naming `PATHEXT`: [`crate::resolve::reject_unloadable_image`]'s refusal.
+fn is_pathext_refusal<T>(r: Result<T, Error>) -> bool {
+    matches!(r, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput && e.to_string().contains("PATHEXT"))
+}
+
 /// The refusal's `detail`, for the tests that assert on the message and not only the variant.
 fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
     match r {
@@ -301,16 +306,14 @@ fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// An already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
-/// extension, so the allowlist is not applied there. Kills moving the gate above the short-circuit.
+/// The allowlist is part of `shell_file::reject_elevated_program`, which runs above the
+/// short-circuit, so an already-elevated caller gets the same refusal though it re-spawns through
+/// `CreateProcessW`, which assumes no default extension.
 #[test]
-fn an_extensionless_exact_program_is_not_refused_when_already_elevated() {
+fn an_extensionless_exact_program_is_refused_when_already_elevated_too() {
     let mut c = Command::new();
     c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
-    assert!(matches!(
-        super::plan_runas(&c, &win_host(true)),
-        Ok(super::RunasStep::AlreadyElevated)
-    ));
+    assert!(is_pathext_refusal(super::plan_runas(&c, &win_host(true)).map(|_| ())));
 }
 
 /// Negative control: a loadable image name still plans a launch.
@@ -344,10 +347,11 @@ fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// Negative control for the `Search` and argv[0] arms.
+/// Negative control for the `Search` and argv[0] arms. Fully qualified: a bare `whoami.exe` is
+/// refused (see `launch_runas_refuses_a_program_that_is_not_fully_qualified`).
 #[test]
 fn a_search_exe_or_com_program_plans_a_launch() {
-    for (via, c) in search_commands(&[r"C:\tools\setup.exe", "whoami.exe", "WHOAMI.COM"]) {
+    for (via, c) in search_commands(&[r"C:\tools\setup.exe", r"C:\Windows\System32\WHOAMI.COM"]) {
         assert!(
             matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
             "{via} must plan a launch"
@@ -676,7 +680,7 @@ fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
             let mut c = Command::new();
             c.args([probe, "a&calc"]).elevate();
             assert!(
-                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
                 "elevated={elevated}: {probe:?} may be completed or dispatched by ShellExecuteEx"
             );
         }
@@ -701,20 +705,22 @@ fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
 }
 
 /// A token ShellExecuteEx rewrites before it opens it is refused, whatever it rewrites to: a
-/// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`.
+/// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`. The quote is refused
+/// as a quote; the rest end in no `.exe`/`.com`.
 #[test]
 fn launch_runas_refuses_a_token_shell_execute_rewrites() {
     for elevated in [false, true] {
-        for probe in [
-            r#""C:\tools\setup.bat""#,
-            "file:///C:/tools/setup%2Ebat",
-            "shell:startup",
-            r"C:\tools\%X%",
-        ] {
+        let mut c = Command::new();
+        c.args([r#""C:\tools\setup.bat""#, "a&calc"]).elevate();
+        assert!(
+            is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+            "elevated={elevated}: a quote is refused"
+        );
+        for probe in ["file:///C:/tools/setup%2Ebat", "shell:startup", r"C:\tools\%X%"] {
             let mut c = Command::new();
             c.args([probe, "a&calc"]).elevate();
             assert!(
-                is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
+                is_pathext_refusal(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
                 "elevated={elevated}: {probe:?} is not a fully qualified image path without a quote"
             );
         }
