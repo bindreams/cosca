@@ -21,8 +21,8 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPTION_VOLATILE, REG_SZ,
-    RRF_RT_REG_DWORD,
+    HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS,
+    REG_OPTION_NON_VOLATILE, REG_OPTION_VOLATILE, REG_SZ, RRF_RT_REG_DWORD,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
@@ -40,23 +40,23 @@ fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain([0]).collect()
 }
 
-/// The HKCU App Paths key for [`APP`], deleted on drop. Created VOLATILE and only if absent, so a
-/// key this probe did not make is never touched.
-struct AppPathKey(Vec<u16>);
+/// An App Paths key for [`APP`], deleted on drop. Created only if absent, so a key this probe did
+/// not make is never touched.
+struct AppPathKey(HKEY, Vec<u16>);
 
 impl AppPathKey {
-    fn register(target: &Path) -> Result<Self, String> {
+    fn register(hive: HKEY, options: REG_OPEN_CREATE_OPTIONS, target: &Path) -> Result<Self, String> {
         let name = wide(OsStr::new(KEY));
         let mut hkey = HKEY::default();
         let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
         // SAFETY: `name` is NUL-terminated and outlives the call; the out-pointers are live locals.
         let rc = unsafe {
             RegCreateKeyExW(
-                HKEY_CURRENT_USER,
+                hive,
                 PCWSTR(name.as_ptr()),
                 None,
                 PCWSTR::null(),
-                REG_OPTION_VOLATILE,
+                options,
                 KEY_WRITE,
                 None,
                 &mut hkey,
@@ -70,10 +70,10 @@ impl AppPathKey {
             // SAFETY: `hkey` was opened above.
             let _ = unsafe { RegCloseKey(hkey) };
             return Err(format!(
-                "HKCU\\{KEY} already existed; refusing to overwrite a key this probe did not make"
+                "{KEY} already existed; refusing to overwrite a key this probe did not make"
             ));
         }
-        let guard = AppPathKey(name);
+        let guard = AppPathKey(hive, name);
         let value: Vec<u8> = wide(target.as_os_str()).iter().flat_map(|u| u.to_le_bytes()).collect();
         // SAFETY: `hkey` is open for writing; `value` is a NUL-terminated UTF-16 string as bytes.
         let set = unsafe { RegSetValueExW(hkey, PCWSTR::null(), None, REG_SZ, Some(&value)) };
@@ -89,9 +89,9 @@ impl AppPathKey {
 impl Drop for AppPathKey {
     fn drop(&mut self) {
         // SAFETY: the name is NUL-terminated and owned by `self`.
-        let rc = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(self.0.as_ptr())) };
+        let rc = unsafe { RegDeleteKeyW(self.0, PCWSTR(self.1.as_ptr())) };
         if rc != ERROR_SUCCESS {
-            println!("CLEANUP: RegDeleteKeyW(HKCU\\{KEY}) failed: {rc:?}");
+            println!("CLEANUP: RegDeleteKeyW({KEY}) failed: {rc:?}");
         }
     }
 }
@@ -143,11 +143,11 @@ fn uac_policy(name: &str) -> String {
     }
 }
 
-/// Elevate `file` in `dir` through `ShellExecuteExW(runas)`, optionally as `class`, and return the
+/// Launch `file` in `dir` through `ShellExecuteExW(verb)`, optionally as `class`, and return the
 /// `image=` line the payload wrote, or why there is none.
-fn launch(file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<String, String> {
+fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<String, String> {
     let _ = std::fs::remove_file(report);
-    let verb = wide(OsStr::new("runas"));
+    let verb = wide(OsStr::new(verb));
     let file_w = wide(file);
     let params = wide(OsStr::new(&format!("--report-to \"{}\"", report.display())));
     let dir_w = wide(dir.as_os_str());
@@ -200,14 +200,19 @@ fn same_file(image: &str, want: &Path) -> bool {
     image.eq_ignore_ascii_case(&want.display().to_string())
 }
 
-/// Canary: without `SEE_MASK_CLASSNAME`, `runas` on a bare name App Paths knows loads the
-/// REGISTERED image; with `SEE_MASK_CLASSNAME` and `lpClass = "exefile"`, it loads the file the
-/// name finds in `lpDirectory`, and a name found nowhere is not redirected to the registered image.
-/// Also prints, without asserting, how `.com` and a `PATH` search behave under each.
-#[test]
-#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
-fn classname_launch_skips_app_paths() {
-    let mut failures: Vec<String> = Vec::new();
+/// The scratch layout both tests use: `a\cosca_probe_a.exe`, `b\cosca_probe_b.exe`,
+/// `a\cosca_probe_c.com`, `onpath\cosca_probe_p.exe` (copies of the payload) and an empty dir.
+struct Layout {
+    root: tempfile::TempDir,
+    dir_a: PathBuf,
+    dir_empty: PathBuf,
+    dir_path: PathBuf,
+    b: PathBuf,
+    c: PathBuf,
+    report: PathBuf,
+}
+
+fn layout() -> Layout {
     match is_elevated() {
         Ok(true) => {}
         Ok(false) => panic!(
@@ -223,7 +228,6 @@ fn classname_launch_skips_app_paths() {
         uac_policy("EnableLUA"),
         uac_policy("ConsentPromptBehaviorAdmin")
     );
-
     let root = tempfile::tempdir().expect("tempdir");
     let dir = |name: &str| -> PathBuf {
         let d = root.path().join(name);
@@ -232,58 +236,146 @@ fn classname_launch_skips_app_paths() {
     };
     let (dir_a, dir_b, dir_empty, dir_path) = (dir("a"), dir("b"), dir("empty"), dir("onpath"));
     let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
-    let a = dir_a.join(APP);
     let b = dir_b.join("cosca_probe_b.exe");
     let c = dir_a.join("cosca_probe_c.com");
-    let p = dir_path.join("cosca_probe_p.exe");
-    for copy in [&a, &b, &c, &p] {
+    for copy in [&dir_a.join(APP), &b, &c, &dir_path.join("cosca_probe_p.exe")] {
         std::fs::copy(source, copy).expect("copy the payload");
     }
     let report = root.path().join("report.txt");
-    let _key = AppPathKey::register(&b).unwrap_or_else(|e| panic!("the measurement could not be taken: {e}"));
-    println!("registered HKCU\\{KEY} -> {}", b.display());
+    Layout {
+        root,
+        dir_a,
+        dir_empty,
+        dir_path,
+        b,
+        c,
+        report,
+    }
+}
 
-    let app = OsStr::new(APP);
-    let run = |label: &str, file: &OsStr, dir: &Path, class: Option<&str>| {
-        let got = launch(file, dir, class, &report);
-        println!(
-            "{label}: file={file:?} dir={} class={class:?} -> {got:?}",
-            dir.display()
-        );
-        got
+fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Option<&str>) -> Result<String, String> {
+    let got = launch(verb, file, dir, class, &l.report);
+    println!(
+        "{label}: verb={verb} file={file:?} dir={} class={class:?} -> {got:?}",
+        dir.display()
+    );
+    got
+}
+
+fn ends_with(got: &Result<String, String>, path: &Path) -> bool {
+    got.as_deref().is_ok_and(|i| same_file(i, path))
+}
+
+/// Canary: with `SEE_MASK_CLASSNAME` and `lpClass = "exefile"`, `runas` runs a FULL path — an
+/// `.exe`, and a `.com` too — and finds nothing by a bare name, in `lpDirectory` or on `PATH`,
+/// where the same launch without the class finds both. `comfile` has no `runas` verb.
+#[test]
+#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
+fn classname_runas_needs_a_full_path() {
+    let l = layout();
+    let mut failures: Vec<String> = Vec::new();
+    let mut check = |ok: bool, what: &str, got: &Result<String, String>| {
+        if !ok {
+            failures.push(format!("{what}: {got:?}"));
+        }
     };
+    let app = OsStr::new(APP);
+    let a = l.dir_a.join(APP);
+    let got = run(&l, "no class, bare, in lpDirectory", "runas", app, &l.dir_a, None);
+    check(
+        ends_with(&got, &a),
+        "without a class, a bare name is found in lpDirectory",
+        &got,
+    );
+    let got = run(
+        &l,
+        "exefile, bare, in lpDirectory",
+        "runas",
+        app,
+        &l.dir_a,
+        Some("exefile"),
+    );
+    check(
+        got.is_err(),
+        "with exefile, a bare name is not found in lpDirectory",
+        &got,
+    );
+    let got = run(
+        &l,
+        "exefile, full path",
+        "runas",
+        a.as_os_str(),
+        &l.dir_empty,
+        Some("exefile"),
+    );
+    check(ends_with(&got, &a), "with exefile, a full .exe path runs", &got);
+    let got = run(
+        &l,
+        "exefile, .com by full path",
+        "runas",
+        l.c.as_os_str(),
+        &l.dir_empty,
+        Some("exefile"),
+    );
+    check(ends_with(&got, &l.c), "with exefile, a full .com path runs", &got);
+    let got = run(
+        &l,
+        "comfile, .com by full path",
+        "runas",
+        l.c.as_os_str(),
+        &l.dir_empty,
+        Some("comfile"),
+    );
+    check(got.is_err(), "comfile has no runas verb", &got);
 
-    // The lookup is live: a name found nowhere else loads the registered image.
-    let appaths_only = run("no class, not in lpDirectory", app, &dir_empty, None);
-    if !appaths_only.as_deref().is_ok_and(|i| same_file(i, &b)) {
-        failures.push(format!("without CLASSNAME, App Paths should load b: {appaths_only:?}"));
-    }
-    run("no class, in lpDirectory", app, &dir_a, None).ok();
-
-    let class_found = run("exefile, in lpDirectory", app, &dir_a, Some("exefile"));
-    if !class_found.as_deref().is_ok_and(|i| same_file(i, &a)) {
-        failures.push(format!(
-            "with CLASSNAME, the file in lpDirectory should load: {class_found:?}"
-        ));
-    }
-    let class_nowhere = run("exefile, not in lpDirectory", app, &dir_empty, Some("exefile"));
-    if class_nowhere.as_deref().is_ok_and(|i| same_file(i, &b)) {
-        failures.push("with CLASSNAME, App Paths still redirected to b".into());
-    }
-
-    // Printed only.
-    run("comfile, .com by full path", c.as_os_str(), &dir_empty, Some("comfile")).ok();
-    run("exefile, .com by full path", c.as_os_str(), &dir_empty, Some("exefile")).ok();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = OsString::from(dir_path.as_os_str());
+    let mut new_path = OsString::from(l.dir_path.as_os_str());
     new_path.push(";");
     new_path.push(&old_path);
     std::env::set_var("PATH", &new_path);
     let p_name = OsStr::new("cosca_probe_p.exe");
-    run("no class, on PATH", p_name, &dir_empty, None).ok();
-    run("exefile, on PATH", p_name, &dir_empty, Some("exefile")).ok();
+    let p = l.dir_path.join("cosca_probe_p.exe");
+    let without = run(&l, "no class, on PATH", "runas", p_name, &l.dir_empty, None);
+    let with = run(&l, "exefile, on PATH", "runas", p_name, &l.dir_empty, Some("exefile"));
     std::env::set_var("PATH", &old_path);
+    check(
+        ends_with(&without, &p),
+        "without a class, a bare name is found on PATH",
+        &without,
+    );
+    check(with.is_err(), "with exefile, a bare name is not found on PATH", &with);
 
+    drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
     mark_passed();
+}
+
+/// Survey: which App Paths registrations `ShellExecuteExW` consults for a bare name found nowhere
+/// else, by hive and by verb, with and without `exefile`. Prints only.
+#[test]
+#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
+fn app_paths_survey() {
+    let l = layout();
+    let app = OsStr::new(APP);
+    for (label, hive, options) in [
+        ("HKCU volatile", HKEY_CURRENT_USER, REG_OPTION_VOLATILE),
+        ("HKCU persistent", HKEY_CURRENT_USER, REG_OPTION_NON_VOLATILE),
+        ("HKLM volatile", HKEY_LOCAL_MACHINE, REG_OPTION_VOLATILE),
+    ] {
+        let key = match AppPathKey::register(hive, options, &l.b) {
+            Ok(key) => key,
+            Err(e) => {
+                println!("{label}: could not register: {e}");
+                continue;
+            }
+        };
+        println!("--- {label}: {KEY} -> {}", l.b.display());
+        for verb in ["runas", "open"] {
+            for class in [None, Some("exefile")] {
+                let got = run(&l, label, verb, app, &l.dir_empty, class);
+                println!("  => redirected to b: {}", ends_with(&got, &l.b));
+            }
+        }
+        drop(key);
+    }
 }
