@@ -22,8 +22,13 @@
 /// own assertions failed.
 pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
     let _guard = crate::child::spawn::spawn_lock();
+    // No `"cosca_unit_tests"` placeholder in slot 0: that convention belongs to [`fixture_argv`],
+    // whose own doc says it is for `cosca::Command`'s `args`, which is the **full** argv because
+    // `cosca::Command` never runs the platform's own arg0 convention. `std::process::Command`
+    // below already supplies its own argv[0] from `Command::new`'s program path, so repeating a
+    // placeholder here would only ride along as a harmless-but-stray extra positional filter.
     let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["cosca_unit_tests", "--test-threads=1", "--exact", fixture])
+        .args(["--test-threads=1", "--exact", fixture])
         .env(marker_env, "1")
         .current_dir(cwd)
         .output()
