@@ -86,12 +86,15 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     let leaf = fault::take_forgotten_leaf().expect("the dropped spawn was contained in a leaf");
 
+    let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+
     // Nothing owns the child any more, so the dropped leaf must both kill and reap it.
     let reaped = crate::containment::cgroup::fault::take_reaped_orphans();
     assert!(
         reaped.contains(&(pid, Some(libc::SIGKILL))),
-        "the child {pid} in the dropped leaf must be killed through it and reaped, got {reaped:?}"
+        "the child {pid} in the dropped leaf must be killed, got {reaped:?}"
     );
+    assert!(reaped_through(&pidfd), "the child {pid} must be reaped");
     // An empty leaf `Drop` could not remove right after its kill is a known exit-lag gap, not this:
     // no leaf of this spawn may still hold a live process.
     if leaf.exists() {
@@ -189,10 +192,27 @@ fn the_unreachable_child_warning_is_once_per_errno() {
     );
 }
 
-/// A post-fork tokio failure warns exactly when the child may be running out of reach. Without a
-/// pidfd (denied here in the child through an inherited seam) cosca cannot kill the child itself,
-/// so only its leaf can: a placed child is killed through it — ended, no warning — while a child
-/// whose placement failed is outside it — out of reach, warned about.
+/// Whether the child `pidfd` names has been reaped — which a pidfd, unlike a pid, can answer after
+/// the reap.
+#[cfg(target_os = "linux")]
+fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsFd;
+
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+
+    matches!(
+        waitid(
+            WaitId::PidFd(pidfd.as_fd()),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ),
+        Err(rustix::io::Errno::CHILD)
+    )
+}
+
+/// A post-fork tokio failure ends its child whether or not the child could send a pidfd — denied
+/// here in the child through an inherited seam — and whether or not it entered its leaf: cosca
+/// kills and reaps it by its checked pid, and warns about nothing. Only a child that refuses the
+/// kill and is outside its leaf is out of reach, and warned about; it is reaped once it exits.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
@@ -204,7 +224,7 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() 
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
     crate::log_capture::install();
-    for placed in [true, false] {
+    for (placed, refuses) in [(true, false), (false, false), (false, true)] {
         let mut cmd = blocker();
         cmd.contain();
         let mark = crate::log_capture::mark();
@@ -213,23 +233,37 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() 
         if !placed {
             cgroup_fault::set_force_placement_write_result(0);
         }
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+        if refuses {
+            cgroup_fault::set_force_child_kill_denied(true);
+            cgroup_fault::set_background_reap_notifier(reaped_tx);
+        }
         fault::set_force_post_fork_failure(true);
         assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
-        // This thread's own copies were never taken.
+        // This thread's own copies of the child's seams were never taken.
         cgroup_fault::set_force_child_pidfd_failure(false);
         let _ = cgroup_fault::take_force_placement_write_result();
         let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+        let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
         let _ = fault::take_forgotten_leaf();
 
+        let case = format!("placed: {placed}, refuses the kill: {refuses}");
         assert_eq!(
             crate::log_capture::contains_since(mark, "nothing can reach it"),
-            !placed,
-            "placed: {placed}: the warning must fire exactly when the child is out of reach"
+            refuses,
+            "{case}: the warning must fire exactly when the child is out of reach"
         );
-        // With no pidfd nothing reaped the child; it is still this process's unreaped child.
-        let pid = nix::unistd::Pid::from_raw(pid as i32);
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-        nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
+        if refuses {
+            assert!(!reaped_through(&pidfd), "{case}: the child is still running");
+            rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+            reaped_rx.recv().expect("the background reaper must reap it");
+        } else {
+            assert!(
+                cgroup_fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
+                "{case}: the child must be killed by its pid"
+            );
+        }
+        assert!(reaped_through(&pidfd), "{case}: the child must be reaped");
     }
 }
 

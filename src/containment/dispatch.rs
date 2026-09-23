@@ -498,7 +498,11 @@ pub(crate) fn prepare(
                 let slot = l.placement_slot();
                 unsafe {
                     use std::os::unix::process::CommandExt;
-                    std_cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+                    std_cmd.pre_exec(move || {
+                        // The forked child's inherited copy of the parent's end goes first.
+                        slot.close_parents_end();
+                        crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)
+                    });
                 }
             }
             return Ok(Prepared {

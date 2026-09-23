@@ -1086,6 +1086,8 @@ pub(crate) mod fault {
         static FORGOTTEN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Fail the NEXT tokio spawn after its fork succeeded, the way tokio's own `build_child` can
@@ -1101,6 +1103,12 @@ pub(crate) mod fault {
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     pub(crate) fn take_forgotten_pid() -> Option<u32> {
         FORGOTTEN_PID.with(|f| f.take())
+    }
+
+    /// A pidfd for the child the last forced post-fork failure dropped.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn take_forgotten_pidfd() -> Option<std::os::fd::OwnedFd> {
+        FORGOTTEN_PIDFD.with(|f| f.borrow_mut().take())
     }
 
     /// The cgroup leaf of the spawn the last forced post-fork failure dropped, if it had one.
@@ -1120,6 +1128,13 @@ pub(crate) mod fault {
         FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
         let child = spawned?;
         FORGOTTEN_PID.with(|f| f.set(child.id()));
+        // A handle on the child that cannot come to name another process, taken while tokio still
+        // pins its pid, so a test can prove the child reaped without probing a freed pid.
+        let pidfd = child
+            .id()
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+            .and_then(|pid| rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok());
+        FORGOTTEN_PIDFD.with(|f| *f.borrow_mut() = pidfd);
         std::mem::forget(child);
         Err(crate::error::Error::Io(std::io::Error::other(
             "forced post-fork spawn failure (test seam)",

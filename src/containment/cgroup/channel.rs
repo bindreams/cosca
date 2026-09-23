@@ -10,9 +10,13 @@ use super::*;
 #[cfg(target_os = "linux")]
 pub(super) const REPORT_PLACED: i32 = -1;
 
+/// A message's length: its tag, its value, and — in an intent — the child's start time.
+#[cfg(target_os = "linux")]
+const MESSAGE_LEN: usize = 16;
+
 /// The tag of a child's intent message; its value is the child's pid.
 #[cfg(target_os = "linux")]
-const TAG_INTENT: i32 = 1;
+pub(super) const TAG_INTENT: i32 = 1;
 /// The tag of a child's report message; its value is [`REPORT_PLACED`] or the write's errno.
 #[cfg(target_os = "linux")]
 const TAG_REPORT: i32 = 2;
@@ -80,6 +84,9 @@ pub(crate) struct Received {
     pub(crate) pid: Option<u32>,
     /// The pidfd its intent carried, when it could open one.
     pub(crate) pidfd: Option<OwnedFd>,
+    /// Its start time in clock ticks since boot (`/proc/<pid>/stat` field 22), when it could read
+    /// it: with its pid, an identity no other process can share.
+    pub(crate) start: Option<u64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -121,6 +128,7 @@ impl ReportChannel {
                 .as_ref()
                 .expect("the child's end is open until the wait")
                 .as_raw_fd(),
+            parent_fd: self.read.as_raw_fd(),
         }
     }
 
@@ -203,7 +211,7 @@ impl ReportChannel {
         use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 
         loop {
-            let mut message = [0u8; 8];
+            let mut message = [0u8; MESSAGE_LEN];
             let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
             let mut control = RecvAncillaryBuffer::new(&mut space);
             let received = recvmsg(
@@ -222,9 +230,10 @@ impl ReportChannel {
             if bytes == 0 {
                 return true;
             }
-            debug_assert_eq!(bytes, message.len(), "a message is two i32s");
+            debug_assert_eq!(bytes, message.len(), "a message is two i32s and a u64");
             let tag = i32::from_ne_bytes(message[..4].try_into().expect("four bytes"));
-            let value = i32::from_ne_bytes(message[4..].try_into().expect("four bytes"));
+            let value = i32::from_ne_bytes(message[4..8].try_into().expect("four bytes"));
+            let start = u64::from_ne_bytes(message[8..].try_into().expect("eight bytes"));
             let mut pidfd = None;
             for ancillary in control.drain() {
                 if let RecvAncillaryMessage::ScmRights(fds) = ancillary {
@@ -236,6 +245,7 @@ impl ReportChannel {
             match tag {
                 TAG_INTENT => {
                     self.received.pid = u32::try_from(value).ok();
+                    self.received.start = (start != 0).then_some(start);
                     self.received.pidfd = pidfd;
                 }
                 TAG_REPORT => {
@@ -261,7 +271,9 @@ impl ReportChannel {
 
     /// End the exchange by deciding: send *proceed*, then close. A child whose send then fails
     /// finds *proceed* queued, and carries on to `exec`.
-    pub(super) fn proceed(self) {
+    pub(super) fn proceed(mut self) {
+        // Drained first: closing with messages unread gives the child `ECONNRESET`, not `EPIPE`.
+        self.drain();
         // Nothing to do if nobody holds the child's end any more.
         let _ = rustix::net::send(
             &self.read,
@@ -317,6 +329,9 @@ pub(crate) enum Delivery {
 #[derive(Clone, Copy)]
 pub(crate) struct ReportSlot {
     pub(super) fd: RawFd,
+    /// The parent's end, which a forked child inherits a copy of until `exec`: see
+    /// [`ReportSlot::close_parents_end`].
+    pub(super) parent_fd: RawFd,
 }
 
 #[cfg(target_os = "linux")]
@@ -328,6 +343,7 @@ impl ReportSlot {
     pub(super) unsafe fn send_intent(self) -> io::Result<Delivery> {
         // Safety: async-signal-safe syscalls on this process's own pid.
         let pid = unsafe { libc::getpid() };
+        let start = own_start_time();
         #[cfg(test)]
         let denied = fault::take_force_child_pidfd_failure();
         #[cfg(not(test))]
@@ -339,12 +355,26 @@ impl ReportSlot {
             unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd }
         };
         // Safety: the caller's guarantee; `pidfd` is this process's own or -1.
-        let sent = unsafe { self.send(TAG_INTENT, pid, pidfd) };
+        let sent = unsafe { self.send(TAG_INTENT, pid, start, pidfd) };
         if pidfd >= 0 {
             // Safety: the descriptor opened above, closed once.
             unsafe { libc::close(pidfd) };
         }
         sent
+    }
+
+    /// Close this child's inherited copy of the parent's end, before anything else in the hook.
+    ///
+    /// Until `exec` the child holds that copy, so the parent's own close would not end the
+    /// socket, and a decided parent's close would never reach the child as `EPIPE`. It also
+    /// frees a descriptor for the `pidfd_open` that follows, in a table that may be full.
+    ///
+    /// # Safety
+    /// Only in a forked child, where `parent_fd` is its own inherited copy — never in the parent,
+    /// whose end it would close.
+    pub(crate) unsafe fn close_parents_end(self) {
+        // Safety: the caller's guarantee; close is async-signal-safe.
+        unsafe { libc::close(self.parent_fd) };
     }
 
     /// Send the report: [`REPORT_PLACED`] or the placement write's errno.
@@ -353,25 +383,27 @@ impl ReportSlot {
     /// As [`ReportSlot::send`].
     pub(super) unsafe fn send_report(self, value: i32) -> io::Result<Delivery> {
         // Safety: the caller's guarantee.
-        unsafe { self.send(TAG_REPORT, value, -1) }
+        unsafe { self.send(TAG_REPORT, value, 0, -1) }
     }
 
     /// Send one message, with `pidfd` attached as `SCM_RIGHTS` unless it is -1. Async-signal-safe:
     /// one `sendmsg(2)` from buffers on the stack, then at most one `recv(2)`.
     ///
-    /// `EPIPE` means the parent has ended the exchange (see the module's contract): *proceed*
-    /// queued means it decided, and this child carries on; none means it abandoned the spawn.
+    /// `EPIPE` (or `ECONNRESET`) means the parent has ended the exchange (see the module's
+    /// contract): *proceed* queued means it decided, and this child carries on; none means it
+    /// abandoned the spawn.
     ///
     /// # Safety
     /// The child's end must still be open at this number, which holds from the leaf's creation
     /// until the parent has taken the verdict.
-    unsafe fn send(self, tag: i32, value: i32, pidfd: RawFd) -> io::Result<Delivery> {
+    pub(super) unsafe fn send(self, tag: i32, value: i32, start: u64, pidfd: RawFd) -> io::Result<Delivery> {
         #[repr(C, align(8))]
         struct Control([u8; 64]);
 
-        let mut message = [0u8; 8];
+        let mut message = [0u8; MESSAGE_LEN];
         message[..4].copy_from_slice(&tag.to_ne_bytes());
-        message[4..].copy_from_slice(&value.to_ne_bytes());
+        message[4..8].copy_from_slice(&value.to_ne_bytes());
+        message[8..].copy_from_slice(&start.to_ne_bytes());
         let mut iov = libc::iovec {
             iov_base: message.as_mut_ptr().cast(),
             iov_len: message.len(),
@@ -406,7 +438,8 @@ impl ReportSlot {
             return match (sent, errno) {
                 (-1, libc::EINTR) => continue,
                 // Safety: the caller's guarantee.
-                (-1, libc::EPIPE) => Ok(if unsafe { self.proceed_queued() } {
+                // `ECONNRESET` is the same close, made with a message still unread.
+                (-1, libc::EPIPE | libc::ECONNRESET) => Ok(if unsafe { self.proceed_queued() } {
                     Delivery::Decided
                 } else {
                     Delivery::Abandoned
@@ -447,4 +480,31 @@ impl ReportSlot {
         let sent = unsafe { self.send_report(REPORT_PLACED) }.expect("send the report");
         assert_eq!(sent, Delivery::Queued, "the parent must still be listening");
     }
+}
+
+/// This process's start time in clock ticks since boot, or 0 when `/proc/self/stat` cannot be
+/// read. Async-signal-safe: `open`, `read` and `close` into a buffer on the stack, and a parse
+/// that allocates nothing.
+#[cfg(target_os = "linux")]
+fn own_start_time() -> u64 {
+    let mut stat = [0u8; 1024];
+    // Safety: a NUL-terminated path; the result is checked.
+    let fd = unsafe { libc::open(c"/proc/self/stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return 0;
+    }
+    let mut len = 0;
+    while len < stat.len() {
+        // Safety: the rest of `stat` is a valid, writable buffer; `fd` is open.
+        let got = unsafe { libc::read(fd, stat[len..].as_mut_ptr().cast(), stat.len() - len) };
+        match got {
+            // Safety: errno is this thread's own.
+            -1 if unsafe { *libc::__errno_location() } == libc::EINTR => continue,
+            n if n <= 0 => break,
+            n => len += n as usize,
+        }
+    }
+    // Safety: the descriptor opened above, closed once.
+    unsafe { libc::close(fd) };
+    crate::identity::stat_parse::parse_starttime_jiffies(&stat[..len]).unwrap_or(0)
 }

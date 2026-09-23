@@ -1,5 +1,7 @@
 use std::cell::Cell;
 thread_local! {
+    static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
+    static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -127,7 +129,6 @@ pub(crate) fn notify_wait_polling() {
 
 /// Have the NEXT intent sent on this thread — or in a child forked from it, which inherits the
 /// flag — go without a pidfd, as when `pidfd_open` is denied in the child.
-#[cfg(feature = "tokio")]
 pub(crate) fn set_force_child_pidfd_failure(on: bool) {
     FORCE_CHILD_PIDFD_FAILURE.with(|f| f.set(on));
 }
@@ -144,4 +145,21 @@ pub(crate) fn run_after_shut_read() {
     if let Some(hook) = AFTER_SHUT_READ.with(|h| h.borrow_mut().take()) {
         hook();
     }
+}
+
+/// Deny the NEXT abandoned child's kill with `EPERM`, as a child that exec'd a setuid program
+/// denies an unprivileged supervisor — which a root test lane cannot reproduce for real.
+pub(crate) fn set_force_child_kill_denied(on: bool) {
+    FORCE_CHILD_KILL_DENIED.with(|f| f.set(on));
+}
+pub(crate) fn take_force_child_kill_denied() -> bool {
+    FORCE_CHILD_KILL_DENIED.with(|f| f.replace(false))
+}
+
+/// Have the NEXT background reap started on this thread report on `notify` once it has reaped.
+pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<()>) {
+    BACKGROUND_REAP_NOTIFY.with(|n| *n.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<()>> {
+    BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
 }

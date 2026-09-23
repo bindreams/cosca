@@ -1758,7 +1758,7 @@ fn placement_hook_fails_when_its_report_cannot_be_sent() {
         .expect("open /dev/null");
     let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
     // fd -1 is never open, so the send fails with EBADF.
-    let slot = super::ReportSlot { fd: -1 };
+    let slot = super::ReportSlot { fd: -1, parent_fd: -1 };
     // SAFETY: `procs_fd` is open and closed by the hook; the slot's fd is deliberately invalid.
     let result = unsafe { super::place_self_in_cgroup_pre_exec(procs_fd, slot) };
     assert_eq!(
@@ -1778,28 +1778,57 @@ fn childs_copy(channel: &super::ReportChannel) -> (std::os::fd::OwnedFd, super::
     let end = unsafe { BorrowedFd::borrow_raw(channel.slot().fd) }
         .try_clone_to_owned()
         .expect("dup the child's end");
-    let slot = super::ReportSlot { fd: end.as_raw_fd() };
+    let slot = super::ReportSlot {
+        fd: end.as_raw_fd(),
+        parent_fd: -1,
+    };
     (end, slot)
 }
 
-/// A parent that decided without the exchange sends *proceed* and closes its end: the child's
-/// send then fails with `EPIPE`, finds *proceed*, and carries on — without `SIGPIPE`, and without
-/// touching the leaf it no longer needs.
+/// A parent that decided without the exchange sends *proceed* and closes its end. In a real
+/// spawn the child's own inherited copy of that end would keep the socket open, so the hook closes
+/// it first; the child's send then fails, finds *proceed*, and the child carries on to `exec` —
+/// without `SIGPIPE`, and without touching the leaf it no longer needs.
+///
+/// Ordered by primitives: the forked child signals, then waits on a gate that the deciding thread
+/// opens only after it has decided.
 #[cfg(target_os = "linux")]
 #[test]
 fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::unix::process::CommandExt;
+
     let channel = super::ReportChannel::new().expect("open the report channel");
-    let (_end, slot) = childs_copy(&channel);
+    let slot = channel.slot();
     let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
-    channel.proceed();
-    // SAFETY: the write end is open and closed by the hook; the child's end of the channel is
-    // still open in `slot`'s channel, whose parent end `proceed` closed.
-    let result =
-        unsafe { super::place_self_in_cgroup_pre_exec(std::os::fd::IntoRawFd::into_raw_fd(procs_write), slot) };
-    assert!(
-        result.is_ok(),
-        "a decided exchange must not abort the spawn: {result:?}"
-    );
+    let procs_fd = procs_write.into_raw_fd();
+    let (mut forked_read, forked_write) = std::io::pipe().expect("open the forked signal");
+    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
+    let (forked_fd, gate_fd) = (forked_write.as_raw_fd(), gate_read.as_raw_fd());
+    let decider = std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        forked_read.read_exact(&mut byte).expect("the child forked");
+        channel.proceed();
+        gate_write.write_all(b"x").expect("release the child");
+    });
+    let mut cmd = std::process::Command::new("/bin/true");
+    // SAFETY: the closure runs between fork and exec, and makes only async-signal-safe calls on
+    // descriptors this test keeps open across the spawn.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::write(forked_fd, b"x".as_ptr().cast(), 1);
+            block_on(gate_fd);
+            slot.close_parents_end();
+            super::place_self_in_cgroup_pre_exec(procs_fd, slot)
+        })
+    };
+    let status = cmd.spawn().expect("a decided exchange must not abort the spawn").wait();
+    // SAFETY: the parent's own copy, closed once.
+    unsafe { libc::close(procs_fd) };
+    decider.join().expect("the deciding thread");
+    drop(forked_write);
+    assert!(status.expect("wait").success(), "the child must have exec'd");
     assert_eq!(
         std::io::read_to_string(procs_read).expect("read the pipe"),
         "",
@@ -1935,7 +1964,7 @@ fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
         .open("/dev/null")
         .expect("open /dev/null");
     let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    let slot = super::ReportSlot { fd: -1 };
+    let slot = super::ReportSlot { fd: -1, parent_fd: -1 };
     let mut cmd = std::process::Command::new("/bin/true");
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls.
     unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
@@ -2088,6 +2117,7 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
     unsafe { cmd.pre_exec(move || super::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
     let child = cmd.spawn().expect("spawn");
     let pid = child.id();
+    let pidfd = pidfd_of(pid);
     // SAFETY: the parent's own copy, closed once.
     unsafe { libc::close(procs_fd) };
     // No handle owns the child once its spawn is abandoned: the leaf reaps it.
@@ -2097,8 +2127,173 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
 
     assert!(
         super::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
-        "the child must be killed by its pidfd and reaped"
+        "the child must be killed by its pidfd"
     );
+    assert!(reaped(&pidfd), "and reaped");
+}
+
+/// A pidfd for `pid`, this process's own unreaped child, taken while its pid is pinned.
+#[cfg(target_os = "linux")]
+fn pidfd_of(pid: u32) -> std::os::fd::OwnedFd {
+    rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid as i32).expect("a positive pid"),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("open a pidfd")
+}
+
+/// Whether the child `pidfd` names has been reaped — a question a pidfd, unlike a pid, can answer
+/// after the reap, since it cannot come to name another process.
+#[cfg(target_os = "linux")]
+fn reaped(pidfd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsFd;
+
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+
+    matches!(
+        waitid(
+            WaitId::PidFd(pidfd.as_fd()),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ),
+        Err(rustix::io::Errno::CHILD)
+    )
+}
+
+/// Spawn `argv` as a child that leads its own group and places itself through `leaf`'s channel,
+/// reporting `Placed` (`/dev/null` stands in for `cgroup.procs`) or, with `fail`, the write's
+/// `EBADF`. `before` runs in the forked child first. Returns the child, never waited on here.
+#[cfg(target_os = "linux")]
+fn spawn_placing(
+    leaf: &super::CgroupLeaf,
+    argv: &[&str],
+    fail: bool,
+    stdout: std::process::Stdio,
+) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    let procs_fd = if fail {
+        -1
+    } else {
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        std::os::fd::IntoRawFd::into_raw_fd(sink)
+    };
+    let slot = leaf.placement_slot();
+    let mut cmd = std::process::Command::new(argv[0]);
+    cmd.args(&argv[1..]).stdout(stdout).process_group(0);
+    // SAFETY: the closure runs between fork and exec, and makes only async-signal-safe calls on
+    // descriptors this test and `leaf` keep open across the spawn.
+    unsafe {
+        cmd.pre_exec(move || {
+            slot.close_parents_end();
+            super::place_self_in_cgroup_pre_exec(procs_fd, slot)
+        })
+    };
+    let child = cmd.spawn().expect("spawn");
+    if procs_fd >= 0 {
+        // SAFETY: the parent's own copy, closed once.
+        unsafe { libc::close(procs_fd) };
+    }
+    child
+}
+
+/// An abandoned child whose intent carried no pidfd — `pidfd_open` denied in the child — is still
+/// killed and reaped: by its pid, once `waitid` confirms an unreaped child of this process with the
+/// intent's start time.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_by_its_checked_pid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-no-pidfd");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    // Inherited by the child forked from this thread, which takes it.
+    super::fault::set_force_child_pidfd_failure(true);
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], false, std::process::Stdio::null());
+    super::fault::set_force_child_pidfd_failure(false);
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    drop(child);
+
+    drop(leaf);
+
+    assert!(
+        super::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
+        "the child must be killed by its pid"
+    );
+    assert!(reaped(&pidfd), "and reaped");
+}
+
+/// An intent whose pid names a live child of this process that is not the one it claims — a start
+/// time that does not match — is never signalled: that number may have been reused.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_intent_whose_pid_names_another_child_is_not_signalled() {
+    use std::io::{Read, Write};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-wrong-start");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    let mut other = std::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn another child");
+    // SAFETY: the leaf's channel is open; the intent claims `other`'s pid with a start time it
+    // never had.
+    unsafe {
+        leaf.placement_slot()
+            .send(super::TAG_INTENT, other.id() as i32, 1, -1)
+            .expect("send a forged intent");
+    }
+
+    assert_eq!(leaf.abandon_before_verdict(), super::Abandoned::OutOfReach);
+
+    let mut echo = [0u8; 1];
+    other
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"x")
+        .expect("write to the other child");
+    other
+        .stdout
+        .as_mut()
+        .expect("stdout")
+        .read_exact(&mut echo)
+        .expect("the other child must be alive to echo");
+    other.kill().expect("kill the other child");
+    other.wait().expect("reap the other child");
+}
+
+/// An abandoned child cosca may not kill is out of reach, and still never left a zombie: a
+/// background reaper waits for its exit, however that comes — here, the test's own kill.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-refuses");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path);
+    // Its placement write fails, so the leaf does not hold it either.
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    drop(child);
+    let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    super::fault::set_force_child_kill_denied(true);
+    super::fault::set_background_reap_notifier(reaped_tx);
+
+    assert_eq!(leaf.abandon_before_verdict(), super::Abandoned::OutOfReach);
+    assert!(!reaped(&pidfd), "the child refused the kill and is still running");
+
+    // Its pid is pinned while it is unreaped.
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    reaped_rx.recv().expect("the background reaper must reap it");
+    assert!(reaped(&pidfd), "the child must be reaped once it exits");
 }
 
 /// A child cosca gives up on is killed as a group: between the last look at its report and the

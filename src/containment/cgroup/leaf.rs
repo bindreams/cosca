@@ -771,26 +771,36 @@ impl CgroupLeaf {
     }
 }
 
-/// Answer for an abandoned spawn's child, by the pidfd its intent carried: kill it and the group
-/// it leads, then reap it — it is killed directly, so the wait ends with its exit, and no handle
-/// owns it (see [`CgroupLeaf::abandon_before_verdict`]).
+/// Answer for an abandoned spawn's child: kill it and the group it leads, then reap it — it is
+/// killed directly, so the wait ends with its exit, and no handle owns it (see
+/// [`CgroupLeaf::abandon_before_verdict`]).
+///
+/// The child is named by the pidfd its intent carried, or — without one — by its pid, trusted
+/// only once `waitid` confirms an unreaped child of this process and its start time matches the
+/// intent's: an unreaped child's pid cannot be reused, and a reused one would start later. A
+/// child it may not signal (`EPERM`) is handed to a background reaper, so it is reaped once it
+/// exits, however that comes.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received) -> ChildFate {
     use std::os::fd::AsFd;
 
     use rustix::process::{pidfd_send_signal, waitid, WaitId, WaitIdOptions};
 
-    let Some(pidfd) = &received.pidfd else {
-        return if received.pid.is_some() {
-            ChildFate::Unkillable
-        } else {
-            ChildFate::NeverReached
-        };
+    let Some(pid) = received
+        .pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return ChildFate::NeverReached;
+    };
+    let id = || match &received.pidfd {
+        Some(pidfd) => WaitId::PidFd(pidfd.as_fd()),
+        None => WaitId::Pid(pid),
     };
     // Still this process's unreaped child? Reaped means `std` failed the spawn and reaped it.
     let unreaped = loop {
         match waitid(
-            WaitId::PidFd(pidfd.as_fd()),
+            id(),
             WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
         ) {
             Err(rustix::io::Errno::INTR) => continue,
@@ -801,17 +811,39 @@ fn end_child(received: &Received) -> ChildFate {
     if !unreaped {
         return ChildFate::Gone;
     }
-    let killed = pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
+    // By pid alone, the number must still be this child's: an unreaped child of this process
+    // with a different start time is another one that got the number after `std` reaped it.
+    if received.pidfd.is_none() {
+        let start = fs::read(format!("/proc/{}/stat", pid.as_raw_nonzero()))
+            .ok()
+            .and_then(|stat| crate::identity::stat_parse::parse_starttime_jiffies(&stat));
+        if start.is_none() || start != received.start {
+            log::warn!(
+                "cgroup v2: an abandoned spawn's child cannot be told from its pid ({pid:?}); it is not signalled"
+            );
+            return ChildFate::Unkillable;
+        }
+    }
+    #[cfg(test)]
+    let denied = fault::take_force_child_kill_denied();
+    #[cfg(not(test))]
+    let denied = false;
+    let killed = match &received.pidfd {
+        _ if denied => Err(rustix::io::Errno::PERM),
+        Some(pidfd) => pidfd_send_signal(pidfd, rustix::process::Signal::KILL),
+        None => rustix::process::kill_process(pid, rustix::process::Signal::KILL),
+    };
     // The group it leads: an unreaped leader pins the group's id, so this names its group alone.
-    if let Some(pid) = received.pid.and_then(|pid| i32::try_from(pid).ok()) {
-        let _ = nix::sys::signal::killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    if !denied {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
     if let Err(e) = killed {
-        log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}); it is left running");
+        log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}); it is reaped once it exits");
+        reap_in_background(id_owned(received, pid));
         return ChildFate::Unkillable;
     }
     let status = loop {
-        match waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED) {
+        match waitid(id(), WaitIdOptions::EXITED) {
             Err(rustix::io::Errno::INTR) => continue,
             other => break other,
         }
@@ -832,6 +864,57 @@ fn end_child(received: &Received) -> ChildFate {
         }
     }
     ChildFate::Killed
+}
+
+/// What names a child to its reaper: its own pidfd, or its pid once checked as [`end_child`] does.
+#[cfg(target_os = "linux")]
+enum ChildId {
+    PidFd(OwnedFd),
+    Pid(rustix::process::Pid),
+}
+
+#[cfg(target_os = "linux")]
+fn id_owned(received: &Received, pid: rustix::process::Pid) -> ChildId {
+    match received.pidfd.as_ref().and_then(|pidfd| pidfd.try_clone().ok()) {
+        Some(pidfd) => ChildId::PidFd(pidfd),
+        None => ChildId::Pid(pid),
+    }
+}
+
+/// Reap `child` on a detached thread once it exits on its own — a child cosca could not kill.
+/// The thread blocks on the child's exit, an event outside this process's control; nothing waits
+/// for the thread. This stands in until the crate's spawn teardown has one shared reaper.
+#[cfg(target_os = "linux")]
+fn reap_in_background(child: ChildId) {
+    use std::os::fd::AsFd;
+
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+
+    #[cfg(test)]
+    let notify = fault::take_background_reap_notifier();
+    let spawned = std::thread::Builder::new().name("cosca-reap".into()).spawn(move || {
+        let id = || match &child {
+            ChildId::PidFd(pidfd) => WaitId::PidFd(pidfd.as_fd()),
+            ChildId::Pid(pid) => WaitId::Pid(*pid),
+        };
+        loop {
+            match waitid(id(), WaitIdOptions::EXITED) {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => log::warn!("cgroup v2: background reap of an abandoned spawn's child failed: {e}"),
+                Ok(_) =>
+                {
+                    #[cfg(test)]
+                    if let Some(notify) = &notify {
+                        let _ = notify.send(());
+                    }
+                }
+            }
+            break;
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("cgroup v2: could not start a thread to reap an abandoned spawn's child, which stays unreaped: {e}");
+    }
 }
 
 /// Remove every child cgroup under `dir`, deepest first, and count those removed. A child that
