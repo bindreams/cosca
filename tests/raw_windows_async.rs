@@ -1,6 +1,9 @@
 //! Async (tokio) raw-`CreateProcessW` backend tests (Plan 12 Tasks 7-8). Windows + tokio only: the
 //! raw backend is a Windows concern, and its async mirror needs the tokio runtime.
 #![cfg(all(windows, feature = "tokio"))]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

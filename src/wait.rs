@@ -441,7 +441,10 @@ pub(crate) mod read_probe {
     pub(crate) struct Guard(Option<Sender<Event>>, PhantomData<*const ()>);
 
     // Windows `tokio` tests are the only non-portable-test consumers.
-    #[cfg_attr(not(all(windows, feature = "tokio")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(windows, feature = "tokio")),
+        allow(dead_code, reason = "Windows tokio tests are the only non-portable-test consumers")
+    )]
     pub(crate) fn install(tx: Sender<Event>) -> Guard {
         let prev = LOG.with(|log| log.replace(Some(tx)));
         debug_assert!(prev.is_none(), "read_probe::install nested on the same thread");
@@ -455,7 +458,10 @@ pub(crate) mod read_probe {
     }
 
     /// This thread's installed log, cloned so the installation survives.
-    #[cfg_attr(not(all(windows, feature = "tokio")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(windows, feature = "tokio")),
+        allow(dead_code, reason = "Windows tokio tests are the only non-portable-test consumers")
+    )]
     pub(crate) fn current() -> Option<Sender<Event>> {
         LOG.with(|log| log.borrow().clone())
     }
@@ -470,7 +476,7 @@ pub(crate) mod read_probe {
     }
 
     /// Drop a named marker into this thread's log, if one is installed.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows call sites drop markers"))]
     pub(crate) fn mark(name: &'static str) {
         record(Event::Mark(name));
     }
@@ -527,13 +533,25 @@ pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
 /// `d` rounded UP to whole milliseconds. `Duration::as_millis()` floors, so a sub-millisecond
 /// remainder would arm a non-blocking `0` poll instead of a wait. Pure and portable; call
 /// [`win32_timeout_ms`], which adds the clamp every call site needs.
-#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, windows)),
+    allow(
+        dead_code,
+        reason = "called only by win32_timeout_ms and tests; win32_timeout_ms is itself dead off-windows"
+    )
+)]
 fn ceil_millis(d: Duration) -> u128 {
     d.as_nanos().div_ceil(1_000_000)
 }
 
 /// Win32 `INFINITE` (`u32::MAX`); local because this module is portable.
-#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, windows)),
+    allow(
+        dead_code,
+        reason = "used only by win32_timeout_ms and tests; win32_timeout_ms is itself dead off-windows"
+    )
+)]
 const WIN32_INFINITE: u32 = u32::MAX;
 
 /// The millisecond timeout ONE Win32 wait call (`WaitForSingleObject`/`WaitForMultipleObjects`)
@@ -549,7 +567,10 @@ const WIN32_INFINITE: u32 = u32::MAX;
 /// deadline after each `WAIT_TIMEOUT` and re-arms, which `wait_until` does for all of them.
 ///
 /// [Wait Functions and Time-out Intervals]: https://learn.microsoft.com/en-us/windows/win32/sync/wait-functions
-#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, windows)),
+    allow(dead_code, reason = "only the Windows backend and portable tests call it")
+)]
 pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
     match remaining {
         None => WIN32_INFINITE,
@@ -624,7 +645,13 @@ pub(crate) fn wait_until(
 
 /// The clamp [`win32_timeout_ms`] applies to a finite `remaining` (production:
 /// `WIN32_INFINITE - 1`); [`wait_clamp_seam`] lowers it so tests reach the re-arm path quickly.
-#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, windows)),
+    allow(
+        dead_code,
+        reason = "called only by win32_timeout_ms and tests; win32_timeout_ms is itself dead off-windows"
+    )
+)]
 fn win32_wait_clamp() -> u32 {
     #[cfg(test)]
     if let Some(v) = wait_clamp_seam::get() {
@@ -730,14 +757,14 @@ pub(crate) mod wait_ms_probe {
     /// Run `hook` when the SECOND arm is recorded: ends a wait through a real event exactly when
     /// the site has re-armed past its first `WAIT_TIMEOUT`.
     // Only Windows tests register a hook.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows tests register a hook"))]
     pub(crate) fn on_second_arm(hook: impl FnOnce() + 'static) {
         HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// Drain everything recorded on this thread, and drop any unconsumed hook.
     // Only Windows tests read the probe back.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows tests read the probe back"))]
     pub(crate) fn take() -> Vec<Arm> {
         HOOK.with(|h| *h.borrow_mut() = None);
         RECORDED.with(|r| r.take())
@@ -746,7 +773,7 @@ pub(crate) mod wait_ms_probe {
     /// Assert a clamped wait re-armed (at least two arms), that each armed exactly
     /// `expected_ms(remaining, clamp)`, and that `remaining` shrank strictly across arms.
     // Only Windows tests call it.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows tests call it"))]
     #[track_caller]
     pub(crate) fn assert_rearmed_with_fresh_remaining(arms: &[Arm], clamp: u32) {
         assert!(arms.len() >= 2, "expected a re-arm, got {} arm(s)", arms.len());
@@ -766,7 +793,7 @@ pub(crate) mod wait_ms_probe {
     /// The `ms` a site must arm for `remaining` under `clamp`: `ceil(remaining)` in whole
     /// milliseconds, capped at `clamp`. Independent of `ceil_millis`.
     // Only Windows tests call it.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows tests call it"))]
     pub(crate) fn expected_ms(remaining: Duration, clamp: u32) -> u32 {
         let ceil = remaining.as_nanos().div_ceil(1_000_000);
         u32::try_from(ceil.min(u128::from(clamp))).expect("capped at a u32 clamp")

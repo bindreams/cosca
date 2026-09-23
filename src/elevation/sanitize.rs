@@ -118,7 +118,13 @@ impl EnvSanitizer {
     /// Partition `env` into `(kept, stripped)`, both sorted by key.
     // Consumed by the POSIX spawn arms via `posix::rewrite` (sync + async); the Windows elevation
     // path sanitizes nothing here, so it is dead on non-unix.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "consumed by the POSIX spawn arms via posix::rewrite; see comment above"
+        )
+    )]
     pub(crate) fn apply(&self, env: Vec<(OsString, OsString)>) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
         let mut kept: Vec<(OsString, OsString)> = Vec::new();
         let mut stripped: Vec<OsString> = Vec::new();

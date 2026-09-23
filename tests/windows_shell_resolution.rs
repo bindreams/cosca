@@ -97,6 +97,9 @@
 //! UAC prompt and no elevated child — so these run unattended, and a failed probe cannot leave an
 //! elevated process behind.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted crate root, so it
+// needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 #[path = "common/windows_probe.rs"]
 mod windows_probe;

@@ -22,7 +22,10 @@ impl Fd {
 
     /// Rebuild an `Fd` from a raw descriptor number. Used by the Windows raw spawn backend to
     /// walk a dense `0..=maxfd` fd-table; unused (hence `dead_code`-allowed) on Unix.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "used by the Windows raw spawn backend to walk a dense fd-table; unused on Unix"
+    )]
     pub(crate) fn from_raw(n: i32) -> Fd {
         Fd(n)
     }

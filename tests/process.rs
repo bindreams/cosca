@@ -5,6 +5,10 @@
 //! fire while the kernel is still tearing the process down, before it is marked a zombie —
 //! the state `is_alive` reads.
 
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 use std::io::{Read, Write};
 use std::time::Duration;
 

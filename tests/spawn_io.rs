@@ -1,3 +1,7 @@
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 use std::io::{Read, Write};
 
 use cosca::{Command, Fd, Stdio};
@@ -767,7 +771,13 @@ fn uncontained_child_reports_containment_none() {
 /// Spawn a contained `spawn-grandchild` and return (child, grandchild_stream).
 /// The grandchild's connected socket is proof it is alive; reading it to EOF
 /// later is the deterministic proof it died.
-#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(unix, windows)),
+    allow(
+        dead_code,
+        reason = "every caller below is unconditional; only a hypothetical non-unix, non-windows target would leave this unused"
+    )
+)]
 fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -803,7 +813,10 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
 /// still running both fail to produce a byte, and the write that precedes the read succeeds
 /// against a dead peer too (the first write into a socket whose peer is gone is buffered, not
 /// refused). See `spawn-grandchild-echo` in `testbin/main.rs`.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "linux")),
+    allow(dead_code, reason = "used only by the windows and linux tests")
+)]
 struct EchoTree {
     child: cosca::Child,
     root: std::net::TcpStream,
@@ -813,7 +826,10 @@ struct EchoTree {
     grand_pid: u32,
 }
 
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, target_os = "linux")),
+    allow(dead_code, reason = "used only by the windows and linux tests")
+)]
 fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");

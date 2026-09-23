@@ -29,6 +29,9 @@
 //! group, capped at one concurrent test, is what actually keeps these from racing each other
 //! under nextest.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 #[path = "common/windows_probe.rs"]
 mod windows_probe;

@@ -320,7 +320,13 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
 /// unreachable without it — `#[allow(dead_code)]` reflects that honestly for a `tokio`-disabled
 /// build instead of leaving the lib target to fail `cargo clippy --all-targets -D warnings`
 /// there.
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "only caller is wait_tree_deadline behind the tokio feature; see doc above"
+    )
+)]
 pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
     let kq = arm(read_end, false)?;
     Ok(drain_kqueue(&kq, read_end, true)?

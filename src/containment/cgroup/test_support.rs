@@ -476,7 +476,11 @@ pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
 #[cfg(target_os = "linux")]
 pub(crate) struct Member(
     pub(crate) std::process::Child,
-    #[allow(dead_code)] pub(crate) std::process::ChildStdin,
+    #[allow(
+        dead_code,
+        reason = "held only so dropping the Member closes the child's stdin; never read"
+    )]
+    pub(crate) std::process::ChildStdin,
 );
 
 #[cfg(target_os = "linux")]

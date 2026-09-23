@@ -12,6 +12,9 @@
 //! independent reading of the job's limits, so a shape that was not built the way the test names
 //! it fails loudly instead of measuring something else.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::net::TcpListener;
 

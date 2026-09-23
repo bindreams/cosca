@@ -58,7 +58,13 @@ impl std::error::Error for CwdUnreadable {
 /// `process_cwd`, with a failure explained as [`CwdUnreadable`] and its own error kept as the
 /// source — for the macOS graphical elevation, the one sink that needs this process's cwd as a
 /// path.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "its only caller is elevation::macos, itself dead off-unix (see elevation.rs's `mod macos`)"
+    )
+)]
 pub(crate) fn explain_cwd_read(
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> impl FnOnce() -> std::io::Result<PathBuf> {
@@ -418,14 +424,26 @@ impl Command {
     }
 
     /// Carry another command's executable over whole, setter included.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
+        )
+    )]
     pub(crate) fn set_executable_spec(&mut self, spec: Option<ExecutableSpec>) {
         self.executable = spec;
     }
 
     /// Keep `file` open for as long as this command, so a path through it stays valid until the
     /// spawn.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
+        )
+    )]
     pub(crate) fn hold(&mut self, file: std::sync::Arc<std::fs::File>) {
         self.held.push(file);
     }
@@ -792,23 +810,44 @@ impl Command {
     // Consumed by the elevation paths: `elevation_request`/`fds` read the request;
     // `set_input_argv`/`set_env_ops`/`set_contain` build the POSIX DERIVED command
     // (hence the non-unix dead_code allows on the setters).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "read by the POSIX derived-command build, dead off unix")
+    )]
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
+        )
+    )]
     pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
         self.input = CommandInput::Argv(argv);
         self.executable = None;
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
+        )
+    )]
     pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
         self.env_ops = ops;
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
+        )
+    )]
     pub(crate) fn set_contain(&mut self, req: ContainRequest) {
         self.contain = req;
     }
@@ -818,7 +857,13 @@ impl Command {
     /// descriptor >= 3 before exec, so a marker installed here could never reach the tree.
     /// Not set on `RunAsIs`'s derived command (already elevated): that one spawns the
     /// original program directly, with no wrapper to destroy anything.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
+        )
+    )]
     pub(crate) fn suppress_fd_marker(&mut self) {
         self.fd_marker_suppressed = true;
     }
@@ -828,7 +873,10 @@ impl Command {
     }
 
     // ---- crate-internal accessors for the spawn engine -------------
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "accessor for the spawn engine's POSIX path; dead off unix")
+    )]
     pub(crate) fn fds(&self) -> &BTreeMap<Fd, ResolvedStdio> {
         &self.fds
     }

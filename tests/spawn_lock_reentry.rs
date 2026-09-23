@@ -3,12 +3,18 @@
 //! hang. The check is compiled in only under `debug_assertions`, so this file is too; nothing in
 //! CI runs the integration binaries in release.
 #![cfg(debug_assertions)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted crate root, so it
+// needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 /// `#[expect]` fails the build if the guard stops being `#[must_use]`. The `let _ =` form is
 /// covered by the lib crate's lint (`spawn_lock_tests`), which this crate does not enable.
 #[test]
 fn discarding_the_test_guard_is_linted() {
-    #[expect(unused_must_use)]
+    #[expect(
+        unused_must_use,
+        reason = "the point of this test: discarding the guard must be flagged; the `let _ =` form is covered by the lib crate's lint"
+    )]
     cosca::test_spawn_lock();
 }
 

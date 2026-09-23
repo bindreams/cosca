@@ -24,7 +24,13 @@ use crate::error::Error;
 ///
 /// Refused with `InvalidInput` as [`complete_posix`] refuses.
 // Off unix the std spawn never has an `Exact` program: it routes to the raw backend.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "off-unix the std spawn never has an Exact program - it routes to the raw backend; see comment above"
+    )
+)]
 pub(crate) fn anchor_posix(program: &OsStr, child_cwd: Option<&Path>) -> Result<Anchored, Error> {
     refuse_unnameable(program)?;
     let cwd = child_cwd.map(Path::to_path_buf);
@@ -49,7 +55,13 @@ pub(crate) fn anchor_posix(program: &OsStr, child_cwd: Option<&Path>) -> Result<
 
 /// [`anchor_posix`]'s answer.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "off-unix the std spawn never has an Exact program - it routes to the raw backend; see comment above"
+    )
+)]
 pub(crate) struct Anchored {
     pub(crate) program: PathBuf,
     /// `current_dir()` as given.

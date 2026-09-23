@@ -12,7 +12,10 @@ use crate::error::Error;
 // variant, and previously a plain `Child` field, so keeping it inline is no regression. Boxing it
 // to shrink the rare Windows-only `Raw` variant would add a heap allocation + indirection to every
 // async spawn, so the size difference is accepted deliberately.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing Raw to shrink it would add an allocation to every async spawn on the common Tokio path; see comment above"
+)]
 #[derive(Debug)]
 pub(crate) enum ProcSource {
     /// A `::tokio::process::Child` (the default path).

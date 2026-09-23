@@ -175,7 +175,13 @@ impl Scope {
     /// Consumed only by the Windows and macOS backends, whose tokens are absolute and so
     /// need no scope; the Linux backend builds a populated `Scope` directly. Dead on a
     /// Linux build, which is the platform the `-D warnings` lint job runs on.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(
+        target_os = "linux",
+        allow(
+            dead_code,
+            reason = "only the Windows/macOS backends call this; the Linux backend builds a populated Scope directly, see doc above"
+        )
+    )]
     pub(crate) fn none() -> Scope {
         Scope::default()
     }

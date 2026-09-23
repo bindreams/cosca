@@ -5,7 +5,7 @@
 //! marker-write, file-name-comparison and COM-apartment-wrapper patterns are defined once instead
 //! of hand-copied into each probe file.
 #![cfg(windows)]
-#![allow(dead_code)] // each consumer uses only the subset it needs
+#![allow(dead_code, reason = "each consumer uses only the subset it needs")]
 
 use std::path::Path;
 

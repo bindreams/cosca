@@ -381,7 +381,7 @@ struct DenyAclGuard {
     /// moment `GetNamedSecurityInfoW` returns.
     // Never read after construction — kept alive purely for this `Drop`, which `-D warnings`
     // cannot tell from an accidentally-unused field.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "never read after construction; kept alive purely for its Drop")]
     original_sd: Owned<HLOCAL>,
     original_dacl: *mut ACL,
 }

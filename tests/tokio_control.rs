@@ -2,6 +2,9 @@
 //! Same death-proof discipline as tests/graceful.rs: control-socket EOF or an inspected
 //! ExitStatus signal — never sleep/poll/wall-clock.
 #![cfg(feature = "tokio")]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 #[path = "common/mod.rs"]
 mod common;

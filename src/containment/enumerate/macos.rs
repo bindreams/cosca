@@ -103,7 +103,10 @@ struct Filled {
     pids: Vec<libc::c_int>,
     /// How many fills it took. `1` means [`capacity_for`] asked for enough room the first
     /// time.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "read only by macos_tests' grow_loop/live_pid_list assertions")
+    )]
     rounds: usize,
 }
 

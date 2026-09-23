@@ -686,7 +686,10 @@ impl CgroupLeaf {
                     check.round();
                     #[cfg(test)]
                     let call_start = std::time::Instant::now();
-                    #[cfg_attr(not(test), allow(unused_variables))]
+                    #[cfg_attr(
+                        not(test),
+                        allow(unused_variables, reason = "`woken` is read only by the test-only recording below")
+                    )]
                     let woken = wait_deadline_seamed(listener, at);
                     // Bounds what would otherwise be an unbounded spin under a mock clock a test
                     // forgot to advance: `at` is a real `Instant`, so once real time passes it

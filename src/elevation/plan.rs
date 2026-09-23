@@ -11,10 +11,16 @@ use crate::error::{ElevationErrorKind, Error};
 // The planner models EVERY platform's decision on ANY host (that is the whole point — a
 // Windows-shaped `Host` is planned on Linux and vice versa), so in a non-test single-platform
 // build the other platform's variant is never constructed. That is by design, not dead logic.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the other platform's Os variant is never constructed in a single-platform non-test build; see comment above"
+)]
 // The enum is named `Os` and `MacOs` names an OS, so the variant unavoidably ends
 // with the enum's name. Renaming either to satisfy the lint would make both worse.
-#[allow(clippy::enum_variant_names)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "MacOs necessarily ends with the enum's own name Os; renaming either would make both worse, see comment above"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     /// Every POSIX host except macOS and Linux — the BSDs, illumos. Planned as Linux is, except
@@ -82,13 +88,13 @@ pub struct Host {
     /// ([`super::pkexec::PkexecVersion::Unresolved`]); asked only for a request that launches pkexec
     /// — `Backend::Pkexec` with `Auth::Gui`, from a non-root caller, on Linux.
     // Read only by the POSIX rewrite.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the POSIX rewrite"))]
     pub pkexec_version: super::pkexec::PkexecVersion,
     /// [`BackendSet::pkexec`], opened by detection: the version probe and the launch both exec this
     /// descriptor's file (`/proc/self/fd/N`), so a file renamed over the path between them is
     /// never run. `Some` exactly for a request that launches pkexec, when its file was opened.
     // Read only by the POSIX rewrite.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the POSIX rewrite"))]
     pub pkexec_pin: Option<std::sync::Arc<std::fs::File>>,
 }
 
@@ -96,7 +102,10 @@ pub struct Host {
 /// [`Error`]; tests use `matches!` and inspect fields.
 // Cross-platform like [`Os`]: the effect arm for the other platform (and its fields) is never
 // constructed in a single-platform non-test build, but is exercised by the cross-OS planner tests.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the other platform's effect arm is never constructed in a single-platform non-test build; see comment above"
+)]
 #[derive(Debug)]
 pub enum Transition {
     RunAsIs,
@@ -233,7 +242,7 @@ impl Host {
 /// yields `ElevatePosix` for it. Detection opens and probes pkexec only then, and asks the planner
 /// itself rather than restating its rules.
 // Only the POSIX detection calls it.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code, reason = "only the POSIX detection calls it"))]
 pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: bool) -> bool {
     let host = Host {
         elevated,

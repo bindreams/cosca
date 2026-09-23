@@ -11,6 +11,9 @@
 //! crate-internal function both routers read, pinned by
 //! `child::spawn::spawn_tests::routes_to_raw_backend_answers_for_executables_and_high_descriptors`.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::net::{TcpListener, TcpStream};
 

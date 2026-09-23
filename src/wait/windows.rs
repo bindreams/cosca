@@ -83,7 +83,13 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 /// An unnamed manual-reset event, initially unsignaled, for releasing
 /// `block_until_exit_or_cancel` early. Signal with [`signal_cancel`]; `OwnedHandle` closes it.
 // consumers: tokio::wait::grace_wait and the async raw backend (tokio::spawn::windows_raw).
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+    )
+)]
 pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
     // SAFETY: creating an unnamed event has no preconditions; the handle is immediately
     // wrapped in an OwnedHandle, which closes it.
@@ -93,7 +99,13 @@ pub(crate) fn new_cancel_event() -> Result<OwnedHandle, Error> {
 }
 
 // consumers: tokio::wait::grace_wait and the async raw backend (tokio::spawn::windows_raw).
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+    )
+)]
 pub(crate) fn signal_cancel(event: &OwnedHandle) {
     // SAFETY: `event` is a live event handle (the OwnedHandle keeps it open).
     let set = unsafe { SetEvent(HANDLE(event.as_raw_handle())) };
@@ -116,7 +128,13 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
 /// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited by `deadline`;
 /// `None` = unbounded. `deadline` is an absolute instant on the real clock, fixed by the caller
 /// before any hop to another thread; every re-arm recomputes against it.
-#[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+    )
+)] // only consumer is tokio::wait::grace_wait
 pub(crate) fn block_until_exit_or_cancel(
     id: ProcessId,
     deadline: Option<Instant>,
@@ -363,10 +381,22 @@ pub(crate) mod armed_probe {
     // clears the thread-local slot IT WAS INSTALLED ON. A `Guard` sent to another thread and
     // dropped there would restore `self.0` into THAT thread's cell instead — corrupting an
     // unrelated thread's (possibly a live test's) observer state.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(
+            dead_code,
+            reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+        )
+    )]
     pub(crate) struct Guard(Option<Sender<()>>, std::marker::PhantomData<*const ()>);
 
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(
+            dead_code,
+            reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+        )
+    )]
     pub(crate) fn install(tx: Sender<()>) -> Guard {
         let prev = ARMED_TX.with(|cell| cell.replace(Some(tx)));
         debug_assert!(prev.is_none(), "armed_probe::install nested on the same thread");
@@ -384,7 +414,13 @@ pub(crate) mod armed_probe {
     /// taken: the arming thread's own installation must survive for its guard's whole
     /// lifetime, which may span more than one `blocking_watch` call (e.g. `wait_exit`'s retry
     /// loop).
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(
+            dead_code,
+            reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+        )
+    )]
     pub(crate) fn current() -> Option<Sender<()>> {
         ARMED_TX.with(|cell| cell.borrow().clone())
     }
