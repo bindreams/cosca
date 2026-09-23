@@ -2125,3 +2125,35 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
 
     assert!(!leaf_path.exists(), "the leaf and its child cgroups must be removed");
 }
+
+/// A child cosca may not signal, but whose report says `Placed`, is killed through its leaf — no
+/// credential check stands in `cgroup.kill`'s way. The error must say so, not that it is left
+/// running.
+#[cfg(target_os = "linux")]
+#[test]
+fn abandon_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_placed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandon-eperm-placed");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = super::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn");
+    let mut channel = leaf.report.take().expect("the channel");
+    // SAFETY: `channel` is open.
+    unsafe { channel.slot().report_placed_for_test() };
+
+    super::fault::set_force_signal_denied(true);
+    let err = leaf.abandon(child.id(), &mut channel, "the test cannot decide");
+    let err = err.to_string();
+    assert!(err.contains("killed through its leaf"), "got {err}");
+    assert!(!err.contains("left running"), "got {err}");
+    assert_eq!(
+        std::fs::read_to_string(leaf_path.join("cgroup.kill")).expect("cgroup.kill"),
+        "1"
+    );
+
+    child.kill().expect("kill the child");
+    child.wait().expect("reap the child");
+}

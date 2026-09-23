@@ -303,7 +303,16 @@ impl CgroupLeaf {
             ours,
             "{child} is not an unreaped child of this process: something else reaped it"
         );
-        let fate = if ours {
+        // How the child itself was signalled.
+        enum Signalled {
+            Killed,
+            // cosca changes no credentials before the placement hook, so a child it may not
+            // signal has exec'd a program that runs as someone else, and its report, sent before
+            // `exec`, is final. Waiting for it would last that program's whole life.
+            Denied(nix::errno::Errno),
+            NotOurs,
+        }
+        let signalled = if ours {
             #[cfg(test)]
             let denied = fault::take_force_signal_denied();
             #[cfg(not(test))]
@@ -323,38 +332,58 @@ impl CgroupLeaf {
                     while let Err(nix::errno::Errno::EINTR) =
                         waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
                     {}
-                    "the child and its process group were killed"
+                    Signalled::Killed
                 }
-                // cosca changes no credentials before the placement hook, so a child it may not
-                // signal has exec'd a program that runs as someone else, and its report, sent
-                // before `exec`, is final. Waiting for it would last that program's whole life.
-                Err(nix::errno::Errno::EPERM) => {
-                    "the child could not be signalled (EPERM): it exec'd a program this process may \
-                     not kill, and is left running"
-                }
-                // ESRCH cannot happen to an unreaped child; nothing else is a kill(2) errno.
-                Err(_) => "the child could not be signalled",
+                // ESRCH cannot happen to an unreaped child, so this is EPERM.
+                Err(e) => Signalled::Denied(e),
             }
         } else {
-            // Reaped, so it has exited — but its number may already be another process's.
-            "the child was already reaped by something else in this process, so it was not signalled"
+            Signalled::NotOurs
         };
-        // The child has exited, so its report is final.
+        // The child has exited or exec'd, so its report is final.
         self.entered = channel.read_final() == PlacementReport::Placed;
-        let leaf = if self.entered {
-            match self.hard_kill() {
-                Ok(()) => {
-                    // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
-                    let _ = self.wait_drained(None);
-                    "its leaf was killed through".to_string()
-                }
-                Err(e) => format!("killing through its leaf failed ({e})"),
+        // Only a placed child's tree is in the leaf; `cgroup.kill` needs no credential to kill it.
+        let through_leaf = self.entered.then(|| {
+            let kill = self.hard_kill();
+            if kill.is_ok() {
+                // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
+                let _ = self.wait_drained(None);
             }
-        } else {
-            "it had not entered its leaf".to_string()
+            kill
+        });
+        let fate = match (signalled, through_leaf) {
+            (Signalled::Killed, None) => {
+                "the child and its process group were killed, and it had not entered its leaf".to_string()
+            }
+            (Signalled::Killed, Some(Ok(()))) => {
+                "the child and its process group were killed, and its leaf was killed through".to_string()
+            }
+            (Signalled::Killed, Some(Err(e))) => {
+                format!("the child and its process group were killed, but killing through its leaf failed ({e})")
+            }
+            (Signalled::Denied(e), Some(Ok(()))) => {
+                format!("the child could not be signalled ({e}), but was killed through its leaf")
+            }
+            (Signalled::Denied(e), Some(Err(leaf))) => format!(
+                "the child could not be signalled ({e}), and killing through its leaf failed ({leaf}): it is \
+                 left running"
+            ),
+            (Signalled::Denied(e), None) => format!(
+                "the child could not be signalled ({e}): it exec'd a program this process may not kill, and \
+                 is left running outside its leaf"
+            ),
+            (Signalled::NotOurs, leaf) => format!(
+                "the child was already reaped by something else in this process, so it was not signalled, \
+                 and {}",
+                match leaf {
+                    None => "it had not entered its leaf".to_string(),
+                    Some(Ok(())) => "its leaf was killed through".to_string(),
+                    Some(Err(e)) => format!("killing through its leaf failed ({e})"),
+                }
+            ),
         };
         crate::error::Error::Containment {
-            detail: format!("cannot tell whether child {pid} entered its cgroup leaf: {why}; {fate}, and {leaf}"),
+            detail: format!("cannot tell whether child {pid} entered its cgroup leaf: {why}; {fate}"),
         }
     }
 
