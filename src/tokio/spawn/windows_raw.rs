@@ -11,7 +11,6 @@
 //! a [`RawAsyncChild`] whose waits run on the blocking pool over a cancellable handle wait.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -24,7 +23,7 @@ use windows::Win32::System::Threading::{
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock};
-use crate::command::{Command, EnvOp};
+use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
@@ -261,8 +260,11 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .executable_path()
         .map(PathBuf::from)
         .or_else(|| sync_raw::program_token(cmd));
+    // The one read of this process's environment, as on the sync path.
+    let base = sync_raw::resolve::env_snapshot();
+    let child_env = sync_raw::resolve::ChildEnv::capture(&base, cmd.env_ops());
     let image = program
-        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), cmd.env_ops()))
+        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), &child_env))
         .transpose()?;
     if let Some(p) = &image {
         sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
@@ -281,7 +283,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // (flags 0, `mode: None`/`is_root: false`); a Strongest root spawns CREATE_SUSPENDED and is
     // job-assigned + resumed in `attach_or_fault`.
     let req = cmd.contain_request();
-    let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
+    let marker_present = sync_raw::resolve::snapshot_has(&base, crate::containment::NESTED_ENV);
     let is_root = !crate::containment::dispatch::is_nested(marker_present);
     // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
     // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
@@ -297,18 +299,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    // Append the inherited root marker AFTER the user's env ops so it survives a user `env_clear()`
-    // (mirrors the sync path).
-    let env_block = if marker_env {
-        let mut ops = cmd.env_ops().to_vec();
-        ops.push(EnvOp::Set(
-            OsString::from(crate::containment::NESTED_ENV),
-            OsString::from("1"),
-        ));
-        sync_raw::resolve::build_env_block(&ops)?
-    } else {
-        sync_raw::resolve::build_env_block(cmd.env_ops())?
-    };
+    let env_block = sync_raw::with_marker(child_env, &base, cmd.env_ops(), marker_env).block()?;
     let cwd_w = cmd.cwd().map(|c| sync_raw::to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.

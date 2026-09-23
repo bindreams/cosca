@@ -10,15 +10,8 @@ fn spawn_long_lived_runas() -> RawChild {
     // `EXTENDED_STARTUPINFO_PRESENT` satisfies create_process's contract (it sizes the
     // struct as extended, so CreateProcessW must be told to treat it as such).
     let mut si = STARTUPINFOEXW::default();
-    let (proc, pid) = create_process(
-        None,
-        &mut cmdline,
-        &mut si,
-        &None,
-        &None,
-        EXTENDED_STARTUPINFO_PRESENT.0,
-    )
-    .expect("spawn");
+    let (proc, pid) =
+        create_process(None, &mut cmdline, &mut si, None, &None, EXTENDED_STARTUPINFO_PRESENT.0).expect("spawn");
     RawChild::new_runas(proc, pid)
 }
 

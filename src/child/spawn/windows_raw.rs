@@ -64,8 +64,12 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // search for the image ITSELF, including the current directory, reopening the binary-planting
     // hole this resolver otherwise closes.
     let program: Option<PathBuf> = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
+    // The one read of this process's environment: resolution, the containment marker check and the
+    // child's block all derive from it (see `resolve::env_snapshot`).
+    let base = resolve::env_snapshot();
+    let child_env = resolve::ChildEnv::capture(&base, cmd.env_ops());
     let image: Option<PathBuf> = program
-        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), cmd.env_ops()))
+        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), &child_env))
         .transpose()?;
     if let Some(p) = &image {
         resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
@@ -91,7 +95,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // the defaults (`contain_flags` 0, a `mode: None`/`is_root: false` `Prepared`); a Strongest root
     // spawns CREATE_SUSPENDED and is job-assigned + resumed in `attach_or_fault`.
     let req = cmd.contain_request();
-    let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
+    let marker_present = resolve::snapshot_has(&base, crate::containment::NESTED_ENV);
     let is_root = !crate::containment::dispatch::is_nested(marker_present);
     // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
     // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
@@ -107,18 +111,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    // Append the inherited root marker AFTER the user's env ops so it survives a user `env_clear()`
-    // (mirrors the std path setting the marker after the user's env).
-    let env_block = if marker_env {
-        let mut ops = cmd.env_ops().to_vec();
-        ops.push(EnvOp::Set(
-            OsString::from(crate::containment::NESTED_ENV),
-            OsString::from("1"),
-        ));
-        resolve::build_env_block(&ops)?
-    } else {
-        resolve::build_env_block(cmd.env_ops())?
-    };
+    let env_block = with_marker(child_env, &base, cmd.env_ops(), marker_env).block()?;
     let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
@@ -247,6 +240,31 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 /// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller
 /// can close the child ends + attribute list before releasing the spawn lock on either arm.
 /// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
+/// `child_env`, plus the inherited root marker when `marker_env`. The marker is appended AFTER the
+/// user's env ops so it survives a user `env_clear()`, as the std path sets it after the user's
+/// env; recapturing from the same `base` names it exactly as std would.
+pub(crate) fn with_marker(
+    child_env: resolve::ChildEnv,
+    base: &[(OsString, OsString)],
+    ops: &[EnvOp],
+    marker_env: bool,
+) -> resolve::ChildEnv {
+    if !marker_env {
+        return child_env;
+    }
+    let mut ops = ops.to_vec();
+    ops.push(EnvOp::Set(
+        OsString::from(crate::containment::NESTED_ENV),
+        OsString::from("1"),
+    ));
+    let marked = resolve::ChildEnv::capture(base, &ops);
+    debug_assert!(
+        marked.path() == child_env.path(),
+        "the containment marker changed the PATH the image was resolved against"
+    );
+    marked
+}
+
 // `CreateProcessW`'s own parameter list, plus the request its failure is classified against.
 // Bundling them would only rename the same values one call site deep.
 #[allow(clippy::too_many_arguments)]
@@ -255,7 +273,7 @@ pub(crate) fn spawn_step(
     app: &[u16],
     cmdline: &mut [u16],
     si: &mut STARTUPINFOEXW,
-    env: &Option<Vec<u16>>,
+    env: &[u16],
     cwd: &Option<Vec<u16>>,
     flags: u32,
     request: crate::command::flags::FlagsRequest,
@@ -268,8 +286,10 @@ pub(crate) fn spawn_step(
     // `Some`, never `None`: `app` is non-optional here precisely so a NULL `lpApplicationName`
     // cannot be expressed at this layer. `proc::create_process` keeps the `Option` because it is
     // the thin, faithful Win32 wrapper; the policy that this backend never passes NULL lives here.
-    // See [`app_name_wide`] for why NULL is a security boundary and not a convenience.
-    proc::create_process(Some(app), cmdline, si, env, cwd, flags)
+    // See [`app_name_wide`] for why NULL is a security boundary and not a convenience. `env` is
+    // non-optional for the same reason: a NULL block would give the child this process's
+    // environment as of NOW, not the snapshot its image was resolved against.
+    proc::create_process(Some(app), cmdline, si, Some(env), cwd, flags)
         .map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, request))
 }
 

@@ -2,6 +2,15 @@ use super::*;
 use crate::command::EnvOp;
 use std::ffi::OsString;
 
+/// Resolve against the PATH `ops` give a child of this process, as a spawn does.
+fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
+    resolve_executable(exe, cmd_cwd, &ChildEnv::capture(&env_snapshot(), ops))
+}
+
+fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Vec<u16>, Error> {
+    ChildEnv::capture(base, ops).block()
+}
+
 /// The name was accepted and searched, and nothing matched — `NotFound`, never a shape refusal.
 /// A bare `is_err()` cannot tell the two apart, which is how the kind drifted unnoticed before;
 /// see `crate::resolve`'s module doc for the rule.
@@ -23,7 +32,7 @@ fn assert_not_found(got: Result<PathBuf, Error>) {
 #[test]
 fn resolve_an_absolute_path_to_an_existing_image_yields_that_path() {
     let me = std::env::current_exe().unwrap();
-    assert_eq!(resolve_executable(&me, None, &[]).unwrap(), me);
+    assert_eq!(resolve_with(&me, None, &[]).unwrap(), me);
 }
 #[test]
 fn resolve_bare_name_is_not_taken_from_base_cwd() {
@@ -47,7 +56,7 @@ fn resolve_bare_extensionless_name_appends_exe() {
     // Pins the `.exe`-append rule only, not which directory supplies the match: `cmd` lives in
     // `System32`, so system-directory search (`crate::resolve::ResolveInput::system_dirs`) may
     // satisfy it before the ambient `PATH` is ever consulted.
-    let p = resolve_executable(std::path::Path::new("cmd"), None, &[]).unwrap();
+    let p = resolve_with(std::path::Path::new("cmd"), None, &[]).unwrap();
     assert!(
         p.is_absolute() && p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
         "{p:?}"
@@ -67,13 +76,13 @@ fn resolve_executable_honors_an_env_set_path_override() {
     let want = dir.path().join("sp_env_path.exe");
     // Positive control: with no env ops, the fabricated name is not on the ambient PATH at all, so
     // a pass below cannot be an accident of the ambient PATH already containing it.
-    assert_not_found(resolve_executable(std::path::Path::new("sp_env_path"), None, &[]));
+    assert_not_found(resolve_with(std::path::Path::new("sp_env_path"), None, &[]));
 
     let ops = [EnvOp::Set(
         OsString::from("PATH"),
         dir.path().as_os_str().to_os_string(),
     )];
-    let got = resolve_executable(std::path::Path::new("sp_env_path"), None, &ops);
+    let got = resolve_with(std::path::Path::new("sp_env_path"), None, &ops);
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 #[test]
@@ -87,7 +96,7 @@ fn resolve_executable_path_key_match_is_case_insensitive() {
         OsString::from("Path"),
         dir.path().as_os_str().to_os_string(),
     )];
-    let got = resolve_executable(std::path::Path::new("sp_env_path_ci"), None, &ops);
+    let got = resolve_with(std::path::Path::new("sp_env_path_ci"), None, &ops);
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 // A fabricated name, never "cmd" or another well-known system binary, is required by both tests
@@ -107,18 +116,17 @@ fn resolve_executable_env_clear_defeats_ambient_path() {
     )];
     // Positive control: with PATH pointed at the fabricated name's directory, it resolves — so a
     // failure below is really about env_clear, not merely that this name can never resolve.
-    assert!(resolve_executable(std::path::Path::new("sp_env_clear"), None, &set).is_ok());
+    assert!(resolve_with(std::path::Path::new("sp_env_clear"), None, &set).is_ok());
     // `Command::env_clear()` means the child sees NO environment at all, PATH included — the
     // resolver must not silently fall back to searching the PARENT's PATH once the child's own is
     // cleared.
     //
-    // `[Set(PATH, dir), Clear]`, not bare `[Clear]`: with `EnvOp::Clear => path = None` deleted from
-    // `effective_path_var` (silently absorbed by its `_ => {}` arm), a bare `[Clear]` leaves the
-    // AMBIENT `PATH` in force, which never happens to contain this fabricated tempdir — so `is_err()`
-    // held for the wrong reason. Setting PATH to a directory that WOULD resolve, then clearing it,
+    // `[Set(PATH, dir), Clear]`, not bare `[Clear]`: if `Clear` stopped dropping the base, a bare
+    // `[Clear]` would leave the AMBIENT `PATH` in force, which never happens to contain this
+    // fabricated tempdir — so `is_err()` would hold for the wrong reason. Setting PATH to a directory that WOULD resolve, then clearing it,
     // means Clear must actually discard a PATH that works, mirroring the sibling
     // `..._env_remove_path_defeats_ambient_path` test's shape below.
-    let got = resolve_executable(
+    let got = resolve_with(
         std::path::Path::new("sp_env_clear"),
         None,
         &[
@@ -137,11 +145,11 @@ fn resolve_executable_env_remove_path_defeats_ambient_path() {
         dir.path().as_os_str().to_os_string(),
     )];
     // Positive control, same reasoning as the env_clear test above.
-    assert!(resolve_executable(std::path::Path::new("sp_env_remove"), None, &set).is_ok());
+    assert!(resolve_with(std::path::Path::new("sp_env_remove"), None, &set).is_ok());
     // `EnvOp::Remove` on the just-`Set` key (case-folded, per `Command::env_remove`'s contract)
     // must take the child's PATH away again — the resolver must not keep searching a directory the
     // env ops explicitly removed.
-    let got = resolve_executable(
+    let got = resolve_with(
         std::path::Path::new("sp_env_remove"),
         None,
         &[
@@ -177,7 +185,7 @@ fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
     .unwrap();
 
     // Located name (contains a separator) — resolves against the given cwd with no PATH search.
-    let got = resolve_executable(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()), &[]);
+    let got = resolve_with(std::path::Path::new("./sp_b1_helper.exe"), Some(cmd_dir.path()), &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
@@ -213,13 +221,16 @@ fn fixture_resolve_executable_falls_back_to_process_cwd() {
         want.is_file(),
         "the parent must have planted `sp_b1_fallback.exe` here: {want:?}"
     );
-    let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
+    let got = resolve_with(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
 }
+/// No ops still passes an explicit block, never NULL: the child must get exactly the snapshot its
+/// image was resolved against, not whatever this process's environment is at `CreateProcessW`.
 #[test]
-fn empty_ops_inherit() {
-    assert!(build_env_block(&[]).unwrap().is_none());
+fn empty_ops_pass_the_snapshot_explicitly() {
+    let block = build_env_block_from(&[(OsString::from("A"), OsString::from("1"))], &[]).unwrap();
+    assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0\0");
 }
 #[test]
 fn set_sorts_ci_and_double_nul() {
@@ -230,7 +241,6 @@ fn set_sorts_ci_and_double_nul() {
             EnvOp::Set("alpha".into(), "2".into()),
         ],
     )
-    .unwrap()
     .unwrap();
     assert_eq!(&b[b.len() - 2..], &[0u16, 0u16]);
     let s = String::from_utf16(&b).unwrap();
@@ -242,7 +252,6 @@ fn remove_is_case_insensitive() {
         &[(OsString::from("SP_R"), OsString::from("x"))],
         &[EnvOp::Remove("sp_r".into())],
     )
-    .unwrap()
     .unwrap();
     assert!(!String::from_utf16(&b).unwrap().to_uppercase().contains("SP_R="));
 }
@@ -252,7 +261,6 @@ fn clear_then_set_yields_only_the_set_var() {
         &[(OsString::from("PATH"), OsString::from("x"))],
         &[EnvOp::Clear, EnvOp::Set("ONLYME".into(), "1".into())],
     )
-    .unwrap()
     .unwrap();
     let s = String::from_utf16(&b).unwrap();
     assert!(s.contains("ONLYME=1") && !s.to_uppercase().contains("PATH="));
@@ -329,11 +337,9 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
 }
 #[test]
 fn clear_only_yields_empty_double_nul_block() {
-    // An empty-but-present environment is a bare double-NUL, distinct from the
-    // `None` "inherit" signal — pins the leading-NUL push.
-    let b = build_env_block_from(&[(OsString::from("A"), OsString::from("1"))], &[EnvOp::Clear])
-        .unwrap()
-        .unwrap();
+    // An empty environment is a bare double-NUL, never a lone terminator — pins the leading-NUL
+    // push.
+    let b = build_env_block_from(&[(OsString::from("A"), OsString::from("1"))], &[EnvOp::Clear]).unwrap();
     assert_eq!(b, vec![0u16, 0u16]);
 }
 // ── real Windows system directories, end to end ─────────────────────────────────────
@@ -461,9 +467,7 @@ fn block_entries(block: &[u16]) -> Vec<(OsString, OsString)> {
 
 /// Whether setting `b` over an inherited `a` replaces it (the same variable) or adds a second one.
 fn same_var(a: &OsStr, b: &OsStr) -> bool {
-    let block = build_env_block_from(&[(a.into(), "base".into())], &[EnvOp::Set(b.into(), "op".into())])
-        .unwrap()
-        .unwrap();
+    let block = build_env_block_from(&[(a.into(), "base".into())], &[EnvOp::Set(b.into(), "op".into())]).unwrap();
     match block_entries(&block).len() {
         1 => true,
         2 => false,
@@ -511,7 +515,6 @@ fn setting_eszett_keeps_an_inherited_ss() {
         &[(OsString::from("SS"), OsString::from("inherited"))],
         &[EnvOp::Set(OsString::from("ß"), OsString::from("set"))],
     )
-    .unwrap()
     .unwrap();
     let mut got = block_entries(&block);
     got.sort();
@@ -527,7 +530,7 @@ type Entries = Vec<(OsString, OsString)>;
 fn block_vs_std(ops: &[EnvOp]) -> (Entries, Entries) {
     let mut std_cmd = std::process::Command::new("unused");
     crate::child::spawn::apply_env(&mut std_cmd, ops);
-    let ours = block_entries(&build_env_block_from(&[], ops).unwrap().unwrap());
+    let ours = block_entries(&build_env_block_from(&[], ops).unwrap());
     let std = std_cmd
         .get_envs()
         .filter_map(|(k, v)| Some((k.to_os_string(), v?.to_os_string())))
@@ -591,7 +594,7 @@ fn env_block_matches_std_over_every_code_unit() {
     );
 }
 
-/// Colliding keys emit the name `build_env_block_from`'s doc states, which is std's.
+/// Colliding keys emit the name `ChildEnv::capture`'s doc states, which is std's.
 #[test]
 fn colliding_keys_keep_std_casing() {
     let set = |k: &str, v: &str| EnvOp::Set(k.into(), v.into());
@@ -618,7 +621,46 @@ fn an_inherited_key_keeps_its_casing() {
         vec![EnvOp::Set("PATH".into(), "x".into())],
         vec![EnvOp::Remove("PATH".into()), EnvOp::Set("pAth".into(), "x".into())],
     ] {
-        let block = build_env_block_from(&base, &ops).unwrap().unwrap();
+        let block = build_env_block_from(&base, &ops).unwrap();
         assert_eq!(block_entries(&block), [("Path".into(), "x".into())], "{ops:?}");
     }
+}
+
+// One environment snapshot per spawn =====
+
+/// `CreateProcessW` keeps duplicate names as given, and `GetEnvironmentVariableW` returns the first.
+/// Resolution must search the `PATH` the block gives the child, so both read one capture.
+#[test]
+fn resolution_reads_the_path_the_block_carries() {
+    let base = [
+        (OsString::from("PATH"), OsString::from("a")),
+        (OsString::from("Path"), OsString::from("b")),
+    ];
+    for ops in [vec![], vec![EnvOp::Set("K".into(), "1".into())]] {
+        let env = ChildEnv::capture(&base, &ops);
+        let block = block_entries(&env.block().unwrap());
+        let in_block = block.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_os_str());
+        assert_eq!(env.path(), in_block, "{ops:?}");
+        assert_eq!(env.path(), Some(OsStr::new("b")), "{ops:?}");
+    }
+}
+
+/// Resolution searches the snapshot it is given, not a fresh read of this process's environment.
+#[test]
+fn resolution_searches_the_given_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_snapshot.exe")).unwrap();
+    let base = [(OsString::from("PATH"), dir.path().as_os_str().to_os_string())];
+    let got = resolve_executable(Path::new("sp_snapshot"), None, &ChildEnv::capture(&base, &[])).unwrap();
+    assert_eq!(
+        got.canonicalize().unwrap(),
+        dir.path().join("sp_snapshot.exe").canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn snapshot_has_matches_names_as_windows_does() {
+    let base = [(OsString::from("__cosca_group_root"), OsString::new())];
+    assert!(snapshot_has(&base, "__COSCA_GROUP_ROOT"));
+    assert!(!snapshot_has(&base, "__COSCA_GROUP_ROOTS"));
 }

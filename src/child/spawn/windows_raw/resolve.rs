@@ -11,8 +11,9 @@
 //! `CreateProcessW`'s own NULL-`lpApplicationName` search order minus the current directory: see
 //! [`crate::resolve::ResolveInput::system_dirs`] for why dropping only the cwd (and not also the
 //! system directories' precedence over `PATH`) is what keeps this a strict narrowing of that
-//! order rather than trading one hazard for another. [`build_env_block`] produces the sorted,
-//! wide, double-NUL block `CreateProcessW` expects from a recorded [`EnvOp`] sequence.
+//! order rather than trading one hazard for another. [`ChildEnv`] is the child's environment,
+//! captured once per spawn from an [`env_snapshot`] and a recorded [`EnvOp`] sequence; resolution
+//! reads its `PATH` and [`ChildEnv::block`] serializes it for `CreateProcessW`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -37,16 +38,14 @@ use crate::error::Error;
 /// directory, and that promise is also the documented escape hatch for reaching "the current
 /// directory explicitly" — reaching the parent's instead defeats it.
 ///
-/// `env_ops` is `Command::env_ops()` — the same recorded `env()`/`env_remove()`/`env_clear()`
-/// sequence [`build_env_block`] turns into the child's actual environment block. `PATH` is looked
-/// up through [`effective_path_var`], which replays those ops over the ambient `PATH` the same
-/// way [`build_env_block_from`] replays them over the ambient environment, so the directories
-/// searched here are the ones the CHILD will actually have — not silently the parent's, which
-/// [`crate::resolve::ResolveInput::path_var`]'s own doc already promises.
+/// `env` is the child's environment, the same [`ChildEnv`] whose [`ChildEnv::block`] the child
+/// is spawned with. `PATH` is read from it, so the directories searched here are the ones the
+/// CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc promises — and
+/// no second read of this process's environment can disagree with the block.
 ///
 /// Convenience wrapper over [`resolve_executable_in`] seeded from `cmd_cwd` (or
-/// [`std::env::current_dir`]), the real system directories, and the child's effective `PATH`.
-pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env_ops: &[EnvOp]) -> Result<PathBuf, Error> {
+/// [`std::env::current_dir`]), the real system directories, and the child's `PATH`.
+pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env: &ChildEnv) -> Result<PathBuf, Error> {
     let base_cwd;
     let base_cwd: &Path = match cmd_cwd {
         Some(dir) => dir,
@@ -55,9 +54,8 @@ pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, env_ops: &[
             &base_cwd
         }
     };
-    let path = effective_path_var(env_ops);
     let system_dirs = windows_system_dirs();
-    resolve_executable_in(exe, base_cwd, &system_dirs, path.as_deref())
+    resolve_executable_in(exe, base_cwd, &system_dirs, env.path())
 }
 
 /// The real system directories, in `CreateProcessW`'s NULL-`lpApplicationName` search order minus
@@ -134,24 +132,6 @@ fn wide_dir_buffer(f: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
     }
 }
 
-/// The `PATH` value the child will actually see, replaying `env_ops` over the ambient `PATH` —
-/// `Set`/`Remove` match the key as [`EnvKey`] does (Windows' own case-insensitive rule), and `Clear` wipes
-/// it outright, mirroring [`build_env_block_from`]'s own base-then-ops replay exactly so the two
-/// never disagree about what the child's `PATH` ends up being.
-fn effective_path_var(env_ops: &[EnvOp]) -> Option<OsString> {
-    let path_key = EnvKey::new(OsStr::new("PATH"));
-    let mut path = std::env::var_os("PATH");
-    for op in env_ops {
-        match op {
-            EnvOp::Set(key, val) if EnvKey::new(key) == path_key => path = Some(val.clone()),
-            EnvOp::Remove(key) if EnvKey::new(key) == path_key => path = None,
-            EnvOp::Clear => path = None,
-            _ => {}
-        }
-    }
-    path
-}
-
 /// Resolve `exe` against an explicit `base_cwd`, system directories, and `PATH` string.
 ///
 /// A name containing a path separator resolves against `base_cwd` with no search at
@@ -202,77 +182,88 @@ pub(crate) fn resolve_executable_in(
 
 // Environment block =====
 
-/// Build the `CreateProcessW` environment block for `ops`, inheriting the parent
-/// environment as the base.
-pub(crate) fn build_env_block(ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> {
-    let base: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    build_env_block_from(&base, ops)
+/// This process's environment, read once per spawn. Every environment-dependent step of a raw
+/// spawn derives from this one read, so none can see a different environment than the child gets.
+pub(crate) fn env_snapshot() -> Vec<(OsString, OsString)> {
+    std::env::vars_os().collect()
 }
 
-/// Build the `CreateProcessW` environment block from an explicit `base` plus
-/// `ops`.
-///
-/// Returns `Ok(None)` when `ops` is empty — the child inherits the parent
-/// environment. Otherwise the block is a UTF-16 sequence of `KEY=VAL\0` entries
-/// in [`EnvKey`] order and closed by a trailing `\0` (a double-NUL terminator).
-/// Keys collide when [`EnvKey`] says they are equal and the last write wins.
-///
-/// The ops are recorded by std's own `Command` (via `apply_env`, exactly as the std
-/// backend records them), so the emitted name is the one std's
-/// `CommandEnv::{set, remove, clear, capture}` produces:
-/// - With no `Clear` in `ops`, a variable in `base` keeps its first name there,
-///   whatever ops removed or re-set it; any other variable takes the name of the
-///   first op that named it, a `Remove` included.
-/// - With a `Clear`, `base` and every op before the last `Clear` are dropped, and
-///   a `Remove` deletes the variable's entry, so the name is that of the first
-///   `Set` after both the last `Clear` and the variable's last `Remove`.
-///
-/// An embedded NUL in any key or value is [`std::io::ErrorKind::InvalidInput`].
-pub(crate) fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Option<Vec<u16>>, Error> {
-    if ops.is_empty() {
-        return Ok(None);
-    }
+/// Whether `base` has a variable named `name`, matched as [`EnvKey`] matches.
+pub(crate) fn snapshot_has(base: &[(OsString, OsString)], name: &str) -> bool {
+    let name = EnvKey::new(OsStr::new(name));
+    base.iter().any(|(key, _)| EnvKey::new(key) == name)
+}
 
-    // std records the ops; `get_envs` yields its first-name keys and pending values.
-    // What std does not expose is `capture`, the merge with `base`, replayed here.
-    let mut changes = std::process::Command::new("");
-    crate::child::spawn::apply_env(&mut changes, ops);
-    let mut vars: BTreeMap<EnvKey, OsString> = BTreeMap::new();
-    // std's `clear` flag is only ever set, never reset, so any `Clear` drops `base`.
-    if !ops.iter().any(|op| matches!(op, EnvOp::Clear)) {
-        for (key, val) in base {
-            // `BTreeMap::insert` keeps an existing equal key: the first name sticks.
-            vars.insert(EnvKey::new(key), val.clone());
-        }
-    }
-    for (key, change) in changes.get_envs() {
-        match change {
-            Some(val) => {
-                vars.insert(EnvKey::new(key), val.to_os_string());
-            }
-            None => {
-                vars.remove(&EnvKey::new(key));
+/// A child's environment: `base` with `ops` applied.
+pub(crate) struct ChildEnv(BTreeMap<EnvKey, OsString>);
+
+impl ChildEnv {
+    /// Capture the environment `ops` give a child that inherits `base`.
+    /// Keys collide when [`EnvKey`] says they are equal and the last write wins.
+    ///
+    /// The ops are recorded by std's own `Command` (via `apply_env`, exactly as the std
+    /// backend records them), so the emitted name is the one std's
+    /// `CommandEnv::{set, remove, clear, capture}` produces:
+    /// - With no `Clear` in `ops`, a variable in `base` keeps its first name there,
+    ///   whatever ops removed or re-set it; any other variable takes the name of the
+    ///   first op that named it, a `Remove` included.
+    /// - With a `Clear`, `base` and every op before the last `Clear` are dropped, and
+    ///   a `Remove` deletes the variable's entry, so the name is that of the first
+    ///   `Set` after both the last `Clear` and the variable's last `Remove`.
+    pub(crate) fn capture(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Self {
+        // std records the ops; `get_envs` yields its first-name keys and pending values.
+        // What std does not expose is `capture`, the merge with `base`, replayed here.
+        let mut changes = std::process::Command::new("");
+        crate::child::spawn::apply_env(&mut changes, ops);
+        let mut vars: BTreeMap<EnvKey, OsString> = BTreeMap::new();
+        // std's `clear` flag is only ever set, never reset, so any `Clear` drops `base`.
+        if !ops.iter().any(|op| matches!(op, EnvOp::Clear)) {
+            for (key, val) in base {
+                // `BTreeMap::insert` keeps an existing equal key: the first name sticks.
+                vars.insert(EnvKey::new(key), val.clone());
             }
         }
+        for (key, change) in changes.get_envs() {
+            match change {
+                Some(val) => {
+                    vars.insert(EnvKey::new(key), val.to_os_string());
+                }
+                None => {
+                    vars.remove(&EnvKey::new(key));
+                }
+            }
+        }
+        Self(vars)
     }
 
-    let mut block: Vec<u16> = Vec::new();
-    // An empty-but-present environment is signalled by a leading NUL, so the
-    // block is never a lone terminator that `CreateProcessW` reads as "inherit".
-    if vars.is_empty() {
-        block.push(0);
+    /// The child's `PATH`.
+    pub(crate) fn path(&self) -> Option<&OsStr> {
+        self.0.get(&EnvKey::new(OsStr::new("PATH"))).map(OsString::as_os_str)
     }
-    for (key, val) in &vars {
-        let key = key.name();
-        ensure_no_nul_wide("environment key", key)?;
-        ensure_no_nul_wide("environment value", val)?;
-        block.extend(key.encode_wide());
-        block.push(u16::from(b'='));
-        block.extend(val.encode_wide());
+
+    /// The `CreateProcessW` block: `KEY=VAL\0` entries in [`EnvKey`] order, closed by a trailing
+    /// `\0` (a double-NUL terminator). Always passed explicitly, never as NULL, so the child gets
+    /// exactly this environment. An embedded NUL in any key or value is
+    /// [`std::io::ErrorKind::InvalidInput`].
+    pub(crate) fn block(&self) -> Result<Vec<u16>, Error> {
+        let mut block: Vec<u16> = Vec::new();
+        // An empty-but-present environment is signalled by a leading NUL, so the
+        // block is never a lone terminator that `CreateProcessW` reads as "inherit".
+        if self.0.is_empty() {
+            block.push(0);
+        }
+        for (key, val) in &self.0 {
+            let key = key.name();
+            ensure_no_nul_wide("environment key", key)?;
+            ensure_no_nul_wide("environment value", val)?;
+            block.extend(key.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(val.encode_wide());
+            block.push(0);
+        }
         block.push(0);
+        Ok(block)
     }
-    block.push(0);
-    Ok(Some(block))
 }
 
 /// Reject a string carrying an embedded NUL, which Win32 would silently truncate at.
