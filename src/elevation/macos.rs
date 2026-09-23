@@ -194,7 +194,17 @@ pub(crate) fn program_and_args(
     let launch = cmd.posix_launch(process_cwd)?;
     let program = match cmd.executable_spec() {
         Some(crate::command::ExecutableSpec::Exact(p)) if launch.cwd.is_some() => {
-            crate::resolve::exact::anchor_posix(p.as_os_str(), None)?.program
+            let anchored = crate::resolve::exact::anchor_posix(p.as_os_str(), None)?.program;
+            // `./` in front of every relative name, not only a bare one: `-x/tool` would otherwise
+            // reach `exec` as an option (bash reads `-x`), whatever shell `/bin/sh` is.
+            if is_posix_absolute(anchored.as_os_str())? || anchored.as_os_str().as_encoded_bytes().starts_with(b"./") {
+                anchored
+            } else {
+                // Byte-level, like the rest of this module: the target grammar is `/bin/sh`'s.
+                let mut prefixed = OsString::from("./");
+                prefixed.push(anchored.as_os_str());
+                PathBuf::from(prefixed)
+            }
         }
         _ => launch.program.unwrap_or_else(|| PathBuf::from(&argv[0])),
     };

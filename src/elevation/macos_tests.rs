@@ -707,3 +707,59 @@ end timeout"
         "the payload was cut short by the Apple event timeout: {stderr}"
     );
 }
+
+/// Every relative `raw_executable()` reaches the script `./`-prefixed, so none is read as an
+/// option to `exec` — bash's `exec` takes `-x/tool` for its own `-x` flag.
+#[test]
+fn a_relative_exact_program_reaches_the_script_dot_slash_prefixed() {
+    for (program, want) in [("-x/tool", "./-x/tool"), ("bin/tool", "./bin/tool"), ("tool", "./tool")] {
+        let mut c = Command::new();
+        c.raw_executable(program)
+            .args([program])
+            .elevation_auth(crate::elevation::Auth::Gui);
+        let launch = super::program_and_args(&c, || Ok("/proc-cwd".into())).unwrap();
+        assert_eq!(launch.program, OsString::from(want), "{program}");
+    }
+}
+
+/// Runs `script` through the real `/bin/sh`, as `do shell script` does, and returns its exit code.
+#[cfg(unix)]
+fn sh_exit_code(script: &[u8]) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let _guard = crate::child::spawn::spawn_lock();
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(OsStr::from_bytes(script))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run /bin/sh")
+        .code()
+}
+
+/// An executable script at `path` that exits with `code`.
+#[cfg(unix)]
+fn exit_tool(path: &Path, code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    // Under the lock, as every tool written in this binary is: see `test_child::cwd_and_path_tools`.
+    let _guard = crate::child::spawn::spawn_lock();
+    std::fs::write(path, format!("#!/bin/sh\nexit {code}\n")).expect("write tool");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+}
+
+/// The composed script runs a leading-dash program through the real `/bin/sh`.
+#[cfg(unix)]
+#[test]
+fn a_leading_dash_program_survives_the_real_shell() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    exit_tool(&dir.path().join("-x").join("tool"), 11);
+    let mut c = Command::new();
+    c.raw_executable("-x/tool")
+        .args(["-x/tool"])
+        .elevation_auth(crate::elevation::Auth::Gui);
+    let dir_path = dir.path().to_path_buf();
+    let launch = super::program_and_args(&c, || Ok(dir_path)).unwrap();
+    let script = build_shell_command(&launch.program, &launch.args, launch.cwd.as_deref()).unwrap();
+    assert_eq!(sh_exit_code(&script), Some(11), "{}", String::from_utf8_lossy(&script));
+}
