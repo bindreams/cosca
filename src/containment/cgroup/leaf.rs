@@ -516,6 +516,11 @@ impl CgroupLeaf {
         }
     }
 
+    /// The leaf's directory, for a test that must find this leaf and no other.
+    pub(crate) fn path_for_test(&self) -> &Path {
+        &self.leaf_path
+    }
+
     /// Whether the leaf still holds its `cgroup.procs` fd or its report channel.
     pub(crate) fn holds_spawn_resources(&self) -> bool {
         self.procs_fd.is_some() || self.report.is_some()

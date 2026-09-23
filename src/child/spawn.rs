@@ -1082,6 +1082,8 @@ pub(crate) mod fault {
         static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PID: Cell<Option<u32>> = const { Cell::new(None) };
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Fail the NEXT tokio spawn after its fork succeeded, the way tokio's own `build_child` can
@@ -1099,13 +1101,21 @@ pub(crate) mod fault {
         FORGOTTEN_PID.with(|f| f.take())
     }
 
+    /// The cgroup leaf of the spawn the last forced post-fork failure dropped, if it had one.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn take_forgotten_leaf() -> Option<std::path::PathBuf> {
+        FORGOTTEN_LEAF.with(|f| f.take())
+    }
+
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     pub(crate) fn post_fork_failure(
         spawned: Result<::tokio::process::Child, crate::error::Error>,
+        leaf: Option<&std::path::Path>,
     ) -> Result<::tokio::process::Child, crate::error::Error> {
         if !FORCE_POST_FORK_FAIL.with(|f| f.replace(false)) {
             return spawned;
         }
+        FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
         let child = spawned?;
         FORGOTTEN_PID.with(|f| f.set(child.id()));
         std::mem::forget(child);

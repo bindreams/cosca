@@ -365,7 +365,10 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             let spawned =
                 spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
             #[cfg(all(test, target_os = "linux"))]
-            let spawned = crate::child::spawn::fault::post_fork_failure(spawned);
+            let spawned = crate::child::spawn::fault::post_fork_failure(
+                spawned,
+                prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path_for_test()),
+            );
             spawned?
         };
         (prepared, c)
