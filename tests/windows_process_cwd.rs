@@ -66,6 +66,10 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
         r"exe_nested=ok,image=<d>\sub\tool.exe",
         r"raw_sub=ok,cwd=<vd>\sub",
         r"std_sub=ok,cwd=<vd>\sub",
+        r"gfpn_rooted=\\t.exe",
+        r"gfpn_up_past_root=\\?\C:\t.exe",
+        "cosca_rooted_cwd=err(InvalidInput)",
+        "std_rooted_cwd=err=53",
     ];
     assert_eq!(facts, expected, "full report:\n{report}");
 }
@@ -77,30 +81,22 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does() {
     let report = probe("drive-dir", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
-    let expected = [
-        "cwd_set=ok",
-        r"gfpn_unset=X:\sub",
-        r"cosca_unset=ok,cwd=X:\sub",
-        r"std_unset=ok,cwd=X:\sub",
-        r"gfpn_exists=X:\exists\sub",
-        r"cosca_exists=ok,cwd=X:\exists\sub",
-        r"std_exists=ok,cwd=X:\exists\sub",
-        r"gfpn_gone=X:\sub",
-        r"cosca_gone=ok,cwd=X:\sub",
-        r"std_gone=ok,cwd=X:\sub",
-        r"gfpn_drive_rel=X:\sub",
-        r"cosca_drive_rel=ok,cwd=X:\sub",
-        r"std_drive_rel=ok,cwd=X:\sub",
-        r"gfpn_relative=X:\sub",
-        r"cosca_relative=ok,cwd=X:\sub",
-        r"std_relative=ok,cwd=X:\sub",
-        r"gfpn_rooted=X:\sub",
-        r"cosca_rooted=ok,cwd=X:\sub",
-        r"std_rooted=ok,cwd=X:\sub",
-        r"gfpn_other_drive=<d>\exists\sub",
-        r"cosca_other_drive=ok,cwd=<d>\exists\sub",
-        r"std_other_drive=ok,cwd=<d>\exists\sub",
-    ];
+    let mut expected = vec!["cwd_set=ok".to_owned()];
+    for (label, cwd) in [
+        ("unset", r"X:\sub"),
+        ("exists", r"X:\exists\sub"),
+        ("gone", r"X:\sub"),
+        ("file", r"X:\sub"),
+        ("drive_rel", r"X:\sub"),
+        ("relative", r"X:\sub"),
+        ("rooted", r"X:\sub"),
+        ("other_drive", r"<d>\exists\sub"),
+    ] {
+        expected.push(format!("cosca_{label}=ok,cwd={cwd}"));
+        expected.push(format!("gfpn_{label}={cwd}"));
+        expected.push(format!("kept_{label}=true"));
+        expected.push(format!("std_{label}=ok,cwd={cwd}"));
+    }
     assert_eq!(facts, expected, "full report:\n{report}");
 }
 
@@ -114,14 +110,20 @@ fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does()
         "cosca_unc_cwd=ok,cwd=<unc>",
         "std_unc_cwd=ok,cwd=<unc>",
         "cosca_vunc_cwd=ok,cwd=<vd>",
-        "std_vunc_cwd=ok,cwd=<vd>",
+        // std runs a verbatim `current_dir` as its plain spelling; cosca passes it as written.
+        "std_vunc_cwd=ok,cwd=<unc>",
         "set=ok",
-        r"gfpn_rooted=\\?\UNC\t.exe",
+        "cosca_rooted_cwd=err(InvalidInput)",
+        "std_rooted_cwd=err=53",
+        // Win32 completes a rooted name off the verbatim cwd's volume, and a `..` run past the
+        // share rather than stopping at it: its floor is after `\\?\UNC\`. A written verbatim
+        // `..` is collapsed the same way.
+        r"gfpn_rooted=\\t.exe",
         r"gfpn_up_depth=<vshare>\t.exe",
         r"gfpn_up_depth_1=\\?\UNC\localhost\t.exe",
         r"gfpn_up_depth_2=\\?\UNC\t.exe",
-        r"gfpn_written_up=<vd>\..\t.exe",
-        r"gfpn_written_past_share=<vd>\..\t.exe",
+        r"gfpn_written_up=<vparent>\t.exe",
+        r"gfpn_written_past_share=\\?\UNC\localhost\t.exe",
     ];
     assert_eq!(facts, expected, "full report:\n{report}");
 }

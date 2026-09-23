@@ -80,16 +80,23 @@ fn set_drive_dir(drive: &str, value: Option<&str>) -> Result<(), String> {
     unsafe { SetEnvironmentVariableW(PCWSTR(name.as_ptr()), value) }.map_err(|e| format!("{e}"))
 }
 
-/// `drive-dir <base> <image-child>`: maps a free drive letter `X:` to `<d>`, holding `sub` and
-/// `exists\sub`, and runs from `<d>` on another drive. For each value of `=X:` it reports what
-/// `GetFullPathNameW` makes of `X:sub`, and where cosca's raw backend and std run a child given
-/// `current_dir("X:sub")`.
+/// Whether `=<drive>` is set in this process's environment.
+fn has_drive_dir(drive: &str) -> bool {
+    std::env::vars_os().any(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(&format!("={drive}")))
+}
+
+/// `drive-dir <base> <image-child>`: maps a free drive letter `X:` to `<d>`, holding `sub`,
+/// `exists\sub` and the file `afile`, and runs from `<d>` on another drive. For each value of
+/// `=X:`, set afresh before each route, it reports where cosca's raw backend runs a child given
+/// `current_dir("X:sub")`, what `GetFullPathNameW` makes of `X:sub` and whether the variable
+/// survives that, and where std runs the child.
 pub fn drive_dir(base: &str, image: &str) {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let d = canonical(base);
     for sub in ["sub", r"exists\sub"] {
         std::fs::create_dir_all(d.join(sub)).expect("create the drive's directories");
     }
+    std::fs::write(d.join("afile"), b"x").expect("create <d>\\afile");
     // SAFETY: no arguments; reads the mounted drives.
     let mask = unsafe { GetLogicalDrives() };
     let letter = (b'M'..=b'Z')
@@ -108,23 +115,42 @@ pub fn drive_dir(base: &str, image: &str) {
         ("unset", None),
         ("exists", Some(format!(r"{drive}\exists"))),
         ("gone", Some(format!(r"{drive}\gone"))),
+        ("file", Some(format!(r"{drive}\afile"))),
         ("drive_rel", Some(format!("{drive}exists"))),
         ("relative", Some("exists".to_owned())),
         ("rooted", Some(r"\exists".to_owned())),
         ("other_drive", Some(other.clone())),
     ] {
-        if let Err(e) = set_drive_dir(&drive, value.as_deref()) {
-            println!("{label}=setenv err {e}");
-            continue;
-        }
+        let set = || set_drive_dir(&drive, value.as_deref()).expect("set =X:");
         let name = format!("{drive}sub");
-        println!("gfpn_{label}={}", render.apply(&gfpn(OsStr::new(&name))));
+        set();
         let mut raw = cosca::Command::new();
         raw.executable(image).commandline("x").current_dir(&name);
         println!("cosca_{label}={}", spawned(cosca_output(&mut raw), "cwd=", &render));
+        set();
+        println!("gfpn_{label}={}", render.apply(&gfpn(OsStr::new(&name))));
+        println!("kept_{label}={}", has_drive_dir(&drive) == value.is_some());
+        set();
         let std_run = std_output(std::process::Command::new(image).current_dir(&name));
         println!("std_{label}={}", spawned(std_run, "cwd=", &render));
     }
+}
+
+/// Where cosca and std run a child given the rooted `current_dir(r"\x")` from this process's cwd.
+pub fn rooted_cwd(image: &str, render: &Render) {
+    let mut raw = cosca::Command::new();
+    raw.executable(image).commandline("x").current_dir(r"\x");
+    println!("cosca_rooted_cwd={}", spawned(cosca_output(&mut raw), "cwd=", render));
+    let std_run = std_output(std::process::Command::new(image).current_dir(r"\x"));
+    println!("std_rooted_cwd={}", spawned(std_run, "cwd=", render));
+}
+
+/// `GetFullPathNameW` of a rooted name and of a `..` run one past the root, on this process's cwd,
+/// `depth` components below its root.
+pub fn past_the_root(depth: usize, render: &Render) {
+    println!("gfpn_rooted={}", render.apply(&gfpn(OsStr::new(r"\t.exe"))));
+    let up = format!(r"{}t.exe", r"..\".repeat(depth + 1));
+    println!("gfpn_up_past_root={}", render.apply(&gfpn(OsStr::new(&up))));
 }
 
 /// `verbatim-unc <base> <image-child>`: reaches `<d>` through the `\\localhost\<drive>$` share.
@@ -143,8 +169,10 @@ pub fn verbatim_unc(base: &str, image: &str) {
     let unc = format!("{share}{rest}");
     let vd = verbatim_of(Path::new(&format!(r"UNC\localhost\{letter}${rest}")));
     let vd = vd.to_str().unwrap().to_owned();
+    let vparent = vd[..vd.rfind('\\').unwrap()].to_owned();
     let render = Render(vec![
         (vd.clone(), "<vd>"),
+        (vparent, "<vparent>"),
         (unc.clone(), "<unc>"),
         (vshare.clone(), "<vshare>"),
         (share.clone(), "<share>"),
@@ -164,6 +192,7 @@ pub fn verbatim_unc(base: &str, image: &str) {
     }
     let depth = rest.split('\\').filter(|c| !c.is_empty()).count();
     let up = |n: usize| format!(r"{}t.exe", r"..\".repeat(n));
+    rooted_cwd(image, &render);
     for (key, name) in [
         ("rooted", r"\t.exe".to_owned()),
         ("up_depth", up(depth)),

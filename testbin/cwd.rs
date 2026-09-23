@@ -12,7 +12,8 @@
 //!   NULL `lpCurrentDirectory`, main's route) and `std` with the long `current_dir`. The children
 //!   are this binary (long-path aware) and `<unaware-child>` (`cosca_testbin_image`, which is not).
 //! - `verbatim <base> <image-child>`: enters `\\?\<d>`, then reports what Win32 and cosca make of
-//!   `tool.exe.`, `sub.` and `sub.\tool.exe` against that cwd.
+//!   `tool.exe.`, `sub.` and `sub.\tool.exe` against that cwd, and of a rooted name and a `..` run
+//!   past its root.
 //! - `drive-dir` and `verbatim-unc`: see [`completion`].
 //! - `report-cwd`: prints `cwd=` and this process's cwd; the long-path-aware child.
 //!
@@ -198,6 +199,9 @@ mod probe {
         println!("raw_sub={}", spawned(cosca_output(&mut raw_sub), "cwd=", &render));
         let std_sub = std_output(std::process::Command::new(image).current_dir("sub."));
         println!("std_sub={}", spawned(std_sub, "cwd=", &render));
+        let depth = d.components().count() - 2;
+        crate::completion::past_the_root(depth, &render);
+        crate::completion::rooted_cwd(image, &render);
     }
 
     /// `CreateProcessW` given `tool.exe.` as a relative `lpApplicationName`, as main's raw backend
