@@ -227,7 +227,7 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 /// The environment-derived inputs of a raw spawn, all from ONE read of this process's environment,
 /// so resolution, the containment decision and the child's block cannot see different ones.
 pub(crate) struct SpawnEnv {
-    /// This process's environment as read for this spawn, for anything else it decides from.
+    /// This process's environment as read for this spawn.
     pub(crate) snapshot: env_snapshot::EnvSnapshot,
     /// The child's `PATH`, which resolution searches.
     pub(crate) path: Option<OsString>,

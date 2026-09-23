@@ -127,9 +127,8 @@ fn embedded_nul_in_cwd_is_rejected() {
     assert!(e.to_string().contains("working directory"), "{e}");
 }
 
-/// `current_dir("")` fails on both Windows backends, with different kinds until #156 routes every
-/// spawn through one: the raw backend refuses it as `NotFound`, and the std backend hands `""` to
-/// `CreateProcessW`. The raw backend takes a command with an `executable()`, a `raw_executable()` or
+/// `current_dir("")` fails on both Windows backends, with different kinds: the raw backend refuses
+/// it as `NotFound`, and the std backend hands `""` to `CreateProcessW`. The raw backend takes a command with an `executable()`, a `raw_executable()` or
 /// a descriptor from 3 up, even one whose program is only its argv.
 #[test]
 fn an_empty_current_dir_fails_on_both_backends() {
