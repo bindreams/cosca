@@ -31,16 +31,31 @@
 /// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
 /// filter; this stdout check is the remaining backstop for whatever that still lets through.
 pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
+    run_fixture(fixture, |c| {
+        c.env(marker_env, cwd).current_dir(cwd);
+    });
+}
+
+/// [`run_fixture_with_cwd`]'s re-exec with `envs` added to the child's environment instead of a
+/// cwd set, for a fixture that must see an environment this shared test binary must not be given.
+/// One of `envs` should be the fixture's marker, so it no-ops in an ordinary suite run.
+#[cfg(windows)]
+pub(crate) fn run_fixture_with_env(fixture: &str, envs: &[(&str, &std::ffi::OsStr)]) {
+    run_fixture(fixture, |c| {
+        c.envs(envs.iter().copied());
+    });
+}
+
+fn run_fixture(fixture: &str, configure: impl FnOnce(&mut std::process::Command)) {
     // No `"cosca_unit_tests"` placeholder in slot 0 (that's [`fixture_argv`]'s convention for
     // `cosca::Command`, see its doc): `std::process::Command` below already supplies its own
     // argv[0] from `Command::new`'s program path.
     let child = {
         let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args(["--test-threads=1", "--exact", fixture])
-            .env(marker_env, cwd)
-            .current_dir(cwd)
-            .stdout(std::process::Stdio::piped())
+        let mut c = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        c.args(["--test-threads=1", "--exact", fixture]);
+        configure(&mut c);
+        c.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn fixture child")

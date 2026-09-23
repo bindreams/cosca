@@ -1,4 +1,5 @@
-//! This process's environment block, read once per raw spawn.
+//! This process's environment block, read once per raw spawn, and once per elevated consent
+//! launch for the `PATH` its program is resolved on.
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStringExt;
@@ -12,7 +13,7 @@ use crate::error::Error;
 /// A copy of this process's environment block, exactly as `GetEnvironmentStringsW` returned it:
 /// `KEY=VAL\0` entries in the OS's order, closed by an empty entry. Every environment-dependent
 /// step of a raw spawn reads this one copy, so none can see a different environment than the
-/// child gets.
+/// child gets. The elevated consent launch reads only its `PATH`.
 pub(crate) struct EnvSnapshot(Vec<u16>);
 
 impl EnvSnapshot {

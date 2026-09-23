@@ -1,0 +1,356 @@
+//! [`ResolveInput::cwd`]: which names need a base, and that `None` resolves those that do not.
+
+use super::*;
+
+#[test]
+fn absolute_names_by_grammar() {
+    for (name, windows, want) in [
+        (r"C:\t\tool", true, true),
+        ("C:/t/tool", true, true),
+        (r"\\srv\shr\tool", true, true),
+        (r"\\?\C:\t\tool", true, true),
+        (r"\\.\dev\tool", true, true),
+        (r"\t\tool", true, false),
+        ("C:tool", true, false),
+        (r"t\tool", true, false),
+        ("tool", true, false),
+        ("/t/tool", false, true),
+        ("t/tool", false, false),
+        (r"C:\t\tool", false, false),
+    ] {
+        assert_eq!(
+            is_absolute_name(OsStr::new(name), windows),
+            want,
+            "{name:?} (windows: {windows})"
+        );
+    }
+}
+
+/// An absolute name resolves with no base at all: joining it onto any directory yields it again.
+#[test]
+fn an_absolute_name_needs_no_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("tool");
+    std::fs::write(&tool, b"x").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let got = resolve(ResolveInput {
+        program: &tool,
+        cwd: None,
+        system_dirs: &[],
+        path_var: None,
+        windows: cfg!(windows),
+        loadable_only: false,
+    });
+    assert_eq!(got.unwrap(), tool);
+}
+
+/// A bare name is searched on `PATH` alone, so it needs no base either.
+#[test]
+fn a_bare_name_needs_no_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = if cfg!(windows) { "tool.exe" } else { "tool" };
+    let tool = dir.path().join(name);
+    std::fs::write(&tool, b"x").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: None,
+        system_dirs: &[],
+        path_var: Some(dir.path().as_os_str()),
+        windows: cfg!(windows),
+        loadable_only: false,
+    });
+    assert_eq!(got.unwrap(), tool);
+}
+
+/// Win32 reads a name starting with two separators as UNC. One that parses no share names no
+/// local file, so it is refused rather than joined onto a base, which would load a file on the
+/// base's own drive (`\\tool.exe` onto `C:\d` is `C:\tool.exe`).
+#[test]
+fn a_unc_shaped_name_with_no_share_is_refused() {
+    for name in [
+        r"\\tool.exe",
+        "//tool.exe",
+        r"\/tool.exe",
+        r"/\tool.exe",
+        r"\\srv\\x.exe",
+    ] {
+        let got = resolve(ResolveInput {
+            program: Path::new(name),
+            cwd: None,
+            system_dirs: &[],
+            path_var: None,
+            windows: true,
+            loadable_only: false,
+        });
+        match got {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{name:?}: {e}"),
+            other => panic!("{name:?} must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// Exactly the names the resolver reads a base for: a relative located name. A bare name, an
+/// absolute one, and the two refused shapes do not.
+#[test]
+fn which_names_need_a_base() {
+    for (name, want) in [
+        (r"sub\tool.exe", true),
+        (r".\tool.exe", true),
+        (r"\tool.exe", true),
+        ("tool.exe", false),
+        (r"C:\t\tool.exe", false),
+        (r"\\srv\shr\tool.exe", false),
+        ("C:tool.exe", false),
+        (r"\\tool.exe", false),
+    ] {
+        assert_eq!(needs_base(OsStr::new(name), true), want, "{name:?}");
+    }
+    assert!(needs_base(OsStr::new("sub/tool"), false));
+    assert!(!needs_base(OsStr::new("/t/tool"), false));
+}
+
+/// Win32's path type (`RtlDetermineDosPathNameType_U`): separators first, then a drive of any one
+/// UTF-16 unit before `:`.
+#[test]
+fn path_types_as_win32_reads_them() {
+    use PathType::*;
+    for (name, want) in [
+        (r"\\srv\shr\x", Unc),
+        ("//x", Unc),
+        (r"\/x", Unc),
+        (r"\\?\C:\x", Unc),
+        (r"C:\x", DriveAbsolute),
+        ("C:/x", DriveAbsolute),
+        ("C:x", DriveRelative),
+        ("1:tool.exe", DriveRelative),
+        ("\u{e9}:x", DriveRelative),
+        (r"C:D:\x", DriveRelative),
+        ("::x", DriveRelative),
+        (r"\x", Rooted),
+        (r"\:x.exe", Rooted),
+        ("/:x.exe", Rooted),
+        (r"\:\x.exe", Rooted),
+        ("x", Relative),
+        (r"sub\x", Relative),
+        // A supplementary character is two UTF-16 units, so the `:` is not in slot 1.
+        ("\u{1f600}:x", Relative),
+    ] {
+        assert_eq!(path_type(OsStr::new(name)), want, "{name:?}");
+    }
+}
+
+/// Every classifier agrees with the path type: `1:tool.exe` is drive-relative to all of them, so
+/// the resolver refuses it rather than searching `PATH` for `1:tool.exe.exe`.
+#[test]
+fn a_digit_drive_is_drive_relative_everywhere() {
+    let name = OsStr::new("1:tool.exe");
+    assert_eq!(classify(name, true), Shape::Located);
+    assert!(is_drive_relative(name, true));
+    assert!(!is_absolute_name(name, true));
+    assert!(!needs_base(name, true));
+    let got = resolve(ResolveInput {
+        program: Path::new(name),
+        cwd: None,
+        system_dirs: &[],
+        path_var: None,
+        windows: true,
+        loadable_only: false,
+    });
+    match got {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+/// A separator in slot 0 is never a drive, so `\:x` has no prefix.
+#[test]
+fn a_leading_separator_is_never_a_drive_prefix() {
+    assert_eq!(windows_prefix_len(br"\:x"), 0);
+    assert_eq!(windows_prefix_len(b"1:x"), 2);
+    assert_eq!(windows_prefix_len("\u{e9}:x".as_bytes()), 3);
+}
+
+/// A name that needs a base resolved without one is a caller's contract violation, never a
+/// second, untracked read of this process's cwd.
+#[test]
+#[should_panic(expected = "needs a base")]
+fn a_located_name_without_a_base_is_a_contract_violation() {
+    let _ = resolve(ResolveInput {
+        program: Path::new("sub/tool"),
+        cwd: None,
+        system_dirs: &[],
+        path_var: None,
+        windows: false,
+        loadable_only: false,
+    });
+}
+
+/// A candidate is joined by the one classifier, never by `PathBuf::join`, which parses the base
+/// with std's letter-only drive rule: a Rooted name on a digit-drive base keeps that drive.
+#[test]
+fn candidates_join_by_the_one_classifier() {
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    for (dir, candidate, want) in [
+        (r"1:\work", r"\tool.exe", r"1:\tool.exe".to_owned()),
+        (r"1:\work", "tool.exe", format!(r"1:\work{sep}tool.exe")),
+        (r"1:\work\", "tool.exe", r"1:\work\tool.exe".to_owned()),
+        (r"\\srv\shr\d", r"\t.exe", r"\\srv\shr\t.exe".to_owned()),
+        // A bare drive is that drive's current directory, so the result stays drive-relative.
+        ("C:", "tool.exe", "C:tool.exe".to_owned()),
+        ("", r"C:\t.exe", r"C:\t.exe".to_owned()),
+        // A verbatim base is normalised as std normalises one, whatever the host separator.
+        (r"\\?\C:\work", "./t.exe", r"\\?\C:\work\t.exe".to_owned()),
+        (r"\\?\C:\work", "sub/../t.exe", r"\\?\C:\work\t.exe".to_owned()),
+        (r"\\?\C:\work", "/t.exe", r"\\?\C:\t.exe".to_owned()),
+    ] {
+        assert_eq!(
+            join_candidate(Path::new(dir), OsStr::new(candidate), true),
+            PathBuf::from(&want),
+            "{dir:?} + {candidate:?}"
+        );
+    }
+}
+
+/// Acceptance asks the one classifier too: `1:\tool.exe` is fully qualified to Win32 though std
+/// knows no drive `1`.
+#[test]
+fn a_candidate_is_accepted_when_fully_qualified() {
+    for (joined, want) in [
+        (r"1:\tool.exe", true),
+        (r"C:\tool.exe", true),
+        (r"\\srv\shr\tool.exe", true),
+        ("C:tool.exe", false),
+        (r"\tool.exe", false),
+        ("tool.exe", false),
+    ] {
+        assert_eq!(accepted(Path::new(joined), true), want, "{joined:?}");
+    }
+}
+
+/// Restores a directory's permissions on drop, so the tempdir can be removed whatever the test's
+/// outcome.
+#[cfg(unix)]
+struct Locked(PathBuf);
+
+#[cfg(unix)]
+impl Locked {
+    fn new(dir: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Locked(dir)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)) {
+            log::warn!("could not unlock {:?}: {e}", self.0);
+        }
+    }
+}
+
+/// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
+#[cfg(unix)]
+fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
+    let root = tempfile::tempdir().unwrap();
+    let locked = root.path().join("locked");
+    let open = root.path().join("open");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::create_dir(&open).unwrap();
+    std::fs::write(open.join("tool.exe"), b"x").unwrap();
+    let mut path = locked.clone().into_os_string();
+    path.push(";");
+    path.push(&open);
+    (root, Locked::new(locked), open, path)
+}
+
+#[cfg(unix)]
+fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> {
+    resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: None,
+        system_dirs: &[],
+        path_var: Some(path_var),
+        windows: true,
+        loadable_only,
+    })
+}
+
+/// On the consent launch, a candidate whose existence cannot be determined fails the search closed:
+/// the entry after it must not win because a check errored. Fails loudly under root, which can
+/// search the locked directory.
+#[cfg(unix)]
+#[test]
+fn an_undeterminable_candidate_fails_the_consent_search_closed() {
+    let (_root, _locked, _open, path) = locked_then_open();
+    match search_tool(&path, true) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        other => panic!("the consent search must not skip an undeterminable candidate: {other:?}"),
+    }
+}
+
+/// An ordinary spawn skips it and goes on, as before, so one unreadable `PATH` directory does not
+/// break every unelevated spawn.
+#[cfg(unix)]
+#[test]
+fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
+    let (_root, _locked, open, path) = locked_then_open();
+    assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
+}
+
+/// Which metadata errors are a definite "not here": absence, a non-directory in the path, or no
+/// such drive. A denied or failed check is not.
+#[test]
+fn only_definite_misses_count_as_absent() {
+    #[cfg(windows)]
+    let cases = [
+        (2, true),
+        (3, true),
+        (15, true),
+        (123, true),
+        (161, true),
+        (267, true),
+        (5, false),
+        (21, false),
+        // Unreachable share: std calls it `NotFound`, but it may only be unreachable for now.
+        (53, false),
+        (67, false),
+    ];
+    #[cfg(unix)]
+    let cases = [
+        (libc::ENOENT, true),
+        (libc::ENOTDIR, true),
+        (libc::EACCES, false),
+        (libc::EIO, false),
+    ];
+    for (code, want) in cases {
+        let e = std::io::Error::from_raw_os_error(code);
+        assert_eq!(is_absence(&e), want, "{e}");
+    }
+}
+
+/// The execute-permission answer: only "denied" and a definite absence are "not executable"; any
+/// other failure is undeterminable and reaches `resolve`'s disposition.
+#[cfg(unix)]
+#[test]
+fn only_a_denied_or_absent_execute_check_is_a_no() {
+    assert!(execute_permission(0, 0).unwrap());
+    for errno in [libc::EACCES, libc::ENOENT, libc::ENOTDIR] {
+        assert!(!execute_permission(-1, errno).unwrap(), "errno {errno}");
+    }
+    for errno in [libc::EIO, libc::ELOOP, libc::ENOMEM] {
+        let e = execute_permission(-1, errno).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(errno));
+    }
+}

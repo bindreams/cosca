@@ -1,4 +1,4 @@
-use crate::error::{Error, QuoteError, QuoteErrorKind};
+use crate::error::{ElevationErrorKind, Error, QuoteError, QuoteErrorKind};
 
 #[test]
 fn containment_error_displays_detail() {
@@ -166,4 +166,44 @@ fn unassessable_carries_no_source_when_there_is_no_os_error() {
         source: None,
     };
     assert!(std::error::Error::source(&e).is_none());
+}
+
+/// A replayed error keeps its variant, its message, and an I/O error's OS code, so a cached
+/// failure handed out again is indistinguishable from the first.
+#[test]
+fn replay_keeps_the_variant_message_and_os_code() {
+    let cases = [
+        Error::Io(std::io::Error::from_raw_os_error(5)),
+        Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad")),
+        Error::Unsupported {
+            op: "op".into(),
+            platform: "windows",
+            detail: "detail".into(),
+        },
+        Error::Containment { detail: "c".into() },
+        Error::NoConsole { detail: "n".into() },
+        Error::Elevation {
+            kind: ElevationErrorKind::AuthFailed,
+            detail: "e".into(),
+        },
+        Error::Unassessable {
+            detail: "u".into(),
+            source: Some(std::io::Error::from_raw_os_error(2)),
+        },
+    ];
+    for e in cases {
+        let r = e.replay();
+        assert_eq!(r.to_string(), e.to_string());
+        assert_eq!(std::mem::discriminant(&r), std::mem::discriminant(&e));
+        if let (Error::Io(a), Error::Io(b)) = (&r, &e) {
+            assert_eq!(a.raw_os_error(), b.raw_os_error());
+            assert_eq!(a.kind(), b.kind());
+        }
+        if let (Error::Unassessable { source: a, .. }, Error::Unassessable { source: b, .. }) = (&r, &e) {
+            assert_eq!(
+                a.as_ref().and_then(std::io::Error::raw_os_error),
+                b.as_ref().and_then(std::io::Error::raw_os_error)
+            );
+        }
+    }
 }

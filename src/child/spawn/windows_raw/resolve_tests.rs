@@ -64,6 +64,7 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
         dir.path(),
         &[],
         None,
+        false,
     ));
 }
 #[test]
@@ -305,6 +306,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
         base.path(),
         &[],
         Some(joined.as_os_str()),
+        false,
     )
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), path_copy.canonicalize().unwrap());
@@ -322,7 +324,8 @@ fn resolve_absolute_directory_is_not_returned() {
     // tell the two checks apart.
     let sub = dir.path().join("sp_dir_shadow.exe");
     std::fs::create_dir(&sub).unwrap();
-    assert_not_found(resolve_executable_in(&sub, std::path::Path::new("."), &[], None));
+    // The base must be fully qualified; an absolute program never reads it.
+    assert_not_found(resolve_executable_in(&sub, dir.path(), &[], None, false));
 }
 #[test]
 fn path_wins_over_base_cwd_when_both_have_exe() {
@@ -340,6 +343,7 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
         base.path(),
         &[],
         Some(other.path().as_os_str()),
+        false,
     )
     .unwrap();
     let want = other.path().join("sp_pref.exe");
@@ -411,7 +415,7 @@ fn resolve_finds_a_real_system32_binary_through_system_dirs() {
     // that `windows_system_dirs()` returns plausible-looking paths.
     let dirs = windows_system_dirs();
     let cwd = tempfile::tempdir().unwrap();
-    let got = resolve_executable_in(std::path::Path::new("notepad"), cwd.path(), &dirs, None).unwrap();
+    let got = resolve_executable_in(std::path::Path::new("notepad"), cwd.path(), &dirs, None, false).unwrap();
     assert!(got.to_string_lossy().to_lowercase().contains("system32"), "{got:?}");
 }
 

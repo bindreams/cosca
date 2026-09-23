@@ -103,7 +103,7 @@ fn inherit_only_is_accepted() {
 /// `launch_runas_with_host`: on an `elevated: false` host the latter's fall-through is a real
 /// `ShellExecuteExW(runas)`, so a probe that slipped past a check under test would raise a UAC
 /// prompt and elevate the probe program under a plain `cargo test`.
-fn win_host(elevated: bool) -> crate::elevation::plan::Host {
+pub(super) fn win_host(elevated: bool) -> crate::elevation::plan::Host {
     crate::elevation::plan::Host {
         elevated,
         has_tty: false,
@@ -271,7 +271,9 @@ fn elevated_exact_program_is_completed_to_an_absolute_path() {
     let mut c = Command::new();
     c.raw_executable("tool.exe").args(["tool.exe"]).elevate();
     let argv = super::elevated_argv(&c).expect("an argv command");
-    let program = super::elevated_program(&c, argv).expect("a relative Exact program completes");
+    let program = super::elevated_program(&c, argv, &super::ProcessOnce::new(&super::ProcessDirs::real()))
+        .expect("a relative Exact program completes")
+        .0;
     let p = std::path::Path::new(&program);
     assert!(
         p.is_absolute(),
@@ -331,12 +333,19 @@ fn an_exact_exe_or_com_program_plans_a_launch() {
 }
 
 /// The allowlist is the consent path's, not `raw_executable()`'s: an `executable()` or argv[0]
-/// token is passed to `ShellExecuteEx` as written, so an extensionless one could be
-/// PATHEXT-completed. The bare `whoami` is not fully qualified either; the allowlist refuses it
-/// first.
+/// token with no `.exe`/`.com` candidate is refused on its shape, whether or not the file exists.
+/// An extensionless one is `NotFound` instead; see `windows_lp_file_tests`.
 #[test]
-fn an_extensionless_search_program_is_refused_on_the_consent_path() {
-    for (via, c) in search_commands(&[r"C:\tools\setup", "whoami"]) {
+fn a_search_program_with_no_loadable_candidate_is_refused_on_the_consent_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut names = Vec::new();
+    for f in ["payload.tmp", "shortcut.lnk", "tool."] {
+        std::fs::write(dir.path().join(f), b"x").unwrap();
+        names.push(dir.path().join(f).into_os_string().into_string().unwrap());
+    }
+    names.push(r"C:\cosca-missing\payload.tmp".to_owned());
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    for (via, c) in search_commands(&names) {
         match super::plan_runas(&c, &win_host(false)) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
                 assert!(
@@ -349,15 +358,45 @@ fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     }
 }
 
-/// Negative control for the `Search` and argv[0] arms. Fully qualified: a bare `whoami.exe` is
-/// refused (see `launch_runas_refuses_a_program_that_is_not_fully_qualified`).
+/// Negative control for the `Search` and argv[0] arms: each resolves to an existing `.exe`/`.com`
+/// and plans a launch whose `lpFile` is that file. A bare `whoami` is resolved to
+/// `System32\whoami.exe` rather than refused for lacking an extension.
 #[test]
 fn a_search_exe_or_com_program_plans_a_launch() {
-    for (via, c) in search_commands(&[r"C:\tools\setup.exe", r"C:\Windows\System32\WHOAMI.COM"]) {
-        assert!(
-            matches!(super::plan_runas(&c, &win_host(false)), Ok(super::RunasStep::Launch(_))),
-            "{via} must plan a launch"
-        );
+    use std::os::windows::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("setup.exe");
+    let com = dir.path().join("SETUP.COM");
+    for f in [&exe, &com] {
+        std::fs::write(f, b"x").unwrap();
+    }
+    let whoami = std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set"))
+        .join("System32")
+        .join("whoami.exe");
+    let cases = [
+        (exe.to_str().unwrap(), exe.clone()),
+        (com.to_str().unwrap(), com.clone()),
+        ("whoami.exe", whoami.clone()),
+        ("whoami", whoami),
+    ];
+    for (name, want) in cases {
+        for (via, c) in search_commands(&[name]) {
+            match super::plan_runas(&c, &win_host(false)) {
+                Ok(super::RunasStep::Launch(launch)) => {
+                    let got = std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                        &launch.file_w[..launch.file_w.len() - 1],
+                    ));
+                    assert!(got.is_absolute(), "{via}: lpFile must be absolute, got {got:?}");
+                    assert_eq!(
+                        got.canonicalize().unwrap(),
+                        want.canonicalize().unwrap(),
+                        "{via}: lpFile must be the resolved image"
+                    );
+                }
+                Ok(super::RunasStep::AlreadyElevated) => panic!("{via}: an unelevated host must not short-circuit"),
+                Err(e) => panic!("{via} must plan a launch: {e:?}"),
+            }
+        }
     }
 }
 
@@ -382,8 +421,7 @@ fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privile
     }
 }
 
-/// Each name as an `executable()` and as a bare argv[0], the two ways a token reaches `lpFile`
-/// unresolved.
+/// Each name as an `executable()` and as a bare argv[0], the two ways a `Search` token is recorded.
 fn search_commands(names: &[&str]) -> Vec<(String, Command)> {
     let mut out = Vec::new();
     for &n in names {
@@ -418,6 +456,30 @@ fn runas_shows_the_window_by_default() {
     use crate::command::flags::FlagsRequest;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     assert_eq!(super::runas_show_command(&FlagsRequest::default()), SW_SHOWNORMAL);
+}
+
+// ===== which lpFile the consent launch gets =====
+
+/// Validation is privilege-independent; completion is not. `elevated_program` must therefore
+/// leave the token AS WRITTEN — if it resolved, cosca's `PATH`-only policy would become a
+/// precondition on the already-elevated path, which discards the result and re-spawns the
+/// original command through `CreateProcessW`'s own (wider) search.
+#[test]
+fn validation_does_not_resolve_the_token() {
+    let mut c = Command::new();
+    c.args(["cmd"]).elevate();
+    let token = super::elevated_program(
+        &c,
+        super::elevated_argv(&c).unwrap(),
+        &super::ProcessOnce::new(&super::ProcessDirs::real()),
+    )
+    .expect("validation passes")
+    .0;
+    assert_eq!(
+        token,
+        std::ffi::OsString::from("cmd"),
+        "the token must survive validation unresolved, got {token:?}"
+    );
 }
 
 /// The consent launch accepts no creation flags at all, so a raw word is refused rather than
@@ -475,9 +537,9 @@ fn elevation_accepts_no_window() {
 /// a different image loads, a different working directory applies, or the argument line is cut
 /// short. The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so
 /// leaving them unchecked here would make THIS divergence depend on whether `.elevate()` was
-/// called. A separate, still-open divergence — `ShellExecuteEx` resolving a program
-/// `CreateProcessW` would refuse, whether by PATHEXT-completing an extension-less token or by
-/// another registered `runas` association (`.lnk`, `.vbs`, `.msc`, …) — is not closed here.
+/// called. A separate divergence — `ShellExecuteEx` resolving a program `CreateProcessW` would
+/// refuse, whether by PATHEXT-completing an extension-less token or by another registered `runas`
+/// association (`.lnk`, `.vbs`, `.msc`, …) — is the allowlist's, not this builder's.
 ///
 /// Tested directly on the builder rather than through `ShellExecuteExW`, so it needs no UAC
 /// prompt and no elevated child.

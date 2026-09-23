@@ -227,8 +227,6 @@ use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
 use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
-use crate::elevation::plan::Transition;
-use crate::elevation::shell_file;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
@@ -249,8 +247,8 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 /// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
 /// closes the interior-NUL divergence between the elevated and unelevated paths. `ShellExecuteEx`
 /// RESOLVING a program `CreateProcessW` would refuse — completing an extension-less token, or
-/// dispatching `.lnk`, `.vbs`, `.msc`, … through an association — is closed by the gates in
-/// `plan_runas`, not here.
+/// dispatching `.lnk`, `.vbs`, `.msc`, … through an association — is closed at the consent launch
+/// by `shell_file::reject_elevated_program` on the resolved `lpFile`, not here.
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -328,7 +326,9 @@ fn elevated_argv(cmd: &Command) -> Result<&[OsString], Error> {
 
 /// The loaded image. Honors `executable()`. A `raw_executable()` program is additionally COMPLETED to an absolute
 /// path — see the `Exact` arm below for why that is the opposite of searching for it.
-fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error> {
+///
+/// Returns the program with whether the one cwd read went into it.
+fn elevated_program(cmd: &Command, argv: &[OsString], cwd: &ProcessOnce<'_>) -> Result<(OsString, bool), Error> {
     // The token AS WRITTEN, before any completion: argv[0], or the explicit executable.
     // `elevated_argv` refused an argv[0] distinct from a set executable, so the two agree.
     let token = cmd
@@ -338,23 +338,26 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     // An `Exact` token is completed, never passed through: `ShellExecuteEx` would search a
     // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
     // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
+    // It is completed against `cwd`, the one read the consent launch's base also uses.
     //
-    // A `Search` token is passed as written, not resolved: [`plan_runas`] refuses it unless it is a
-    // fully qualified `.exe`/`.com` path (`shell_file::reject_elevated_program`), so
-    // `ShellExecuteEx` has no search to make.
+    // A `Search` token is NOT resolved here but at the consent launch, below the already-elevated
+    // short-circuit: resolving is only correct once a consent launch is certain.
     //
-    // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
-    // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the
-    // same "program path" name, ahead of every other field and of its own shape checks.
+    // Completion runs BEFORE [`plan_runas`]'s `ensure_no_nul_wide("program path", ..)`, so it must
+    // not blunt that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself,
+    // under the same "program path" name, ahead of every other field and of its own shape checks.
     //
     // Spelled out rather than `_ =>`: the discriminant IS the feature here, and this is the
     // security sink. A future `ExecutableSpec` variant must not compile silently into the
     // SEARCHING branch, which is the unsafe default.
     match cmd.executable_spec() {
         Some(ExecutableSpec::Exact(p)) => {
-            Ok(crate::child::spawn::windows_raw::resolve::absolutise_exact(p)?.into_os_string())
+            let done =
+                crate::child::spawn::windows_raw::resolve::absolutise_exact_on(p, || cwd.cwd(), |d| cwd.drive_cwd(d))?;
+            reject_not_fully_qualified("program path", &done.path)?;
+            Ok((done.path.into_os_string(), done.used_cwd))
         }
-        Some(ExecutableSpec::Search(_)) | None => Ok(token),
+        Some(ExecutableSpec::Search(_)) | None => Ok((token, false)),
     }
 }
 
@@ -403,37 +406,54 @@ pub(crate) enum RunasStep {
 /// verb `runas` — raising a UAC prompt and elevating the probe program on the developer's own
 /// machine. Returning the decision instead makes that outcome unreachable from a test.
 pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error> {
+    plan_runas_with(cmd, host, &ProcessDirs::real())
+}
+
+/// [`plan_runas`] with this process's directory state read through `dirs`, which the tests inject.
+///
+/// Two phases, and the types keep them apart: [`validate`] runs every privilege-independent check
+/// on every caller; only a [`ConsentCertain`] proof, which only the planner's `ElevateWindows`
+/// transition yields, lets [`Validated::launch`] resolve the program and build the launch. So no
+/// consent-launch step can run above the already-elevated short-circuit.
+pub(crate) fn plan_runas_with(cmd: &Command, host: &Host, dirs: &ProcessDirs<'_>) -> Result<RunasStep, Error> {
     let req = cmd.elevation_request();
     let (backend, auth) = (req.backend, req.auth.clone());
-    // Structural config gate FIRST — privilege-independent (before the short-circuit), so
-    // an already-elevated caller gets the same verdict for piped/env/contain/commandline.
+    let state = ProcessOnce::new(dirs);
+    let validated = validate(cmd, &state)?;
+    match ConsentCertain::from_plan(host.plan(Privilege::Elevated, backend, auth))? {
+        None => Ok(RunasStep::AlreadyElevated),
+        Some(proof) => Ok(RunasStep::Launch(Box::new(validated.launch(proof, &state)?))),
+    }
+}
+
+/// Every check that holds whatever the caller's privilege: the same `Command` gets the same
+/// verdict from an unelevated and an already-elevated caller.
+fn validate<'a>(cmd: &'a Command, state: &ProcessOnce<'_>) -> Result<Validated<'a>, Error> {
+    // Structural config gate FIRST, so an already-elevated caller gets the same verdict for
+    // piped/env/contain/commandline.
     reject_unsupported_config(cmd)?;
     let argv = elevated_argv(cmd)?; // validates commandline()/empty argv too
-    let program = elevated_program(cmd, argv)?;
-
-    // Input validation stays with `reject_unsupported_config`, ABOVE the short-circuit, so every
-    // verdict here is a property of the REQUEST rather than of the caller's ambient privilege.
-    // Putting it below would make the same `Command` refused when unelevated and accepted when
-    // already elevated — the exact "depends which path ran" divergence these checks exist to
-    // remove.
+                                    // A `Search` token is resolved only at the consent launch.
+    let (program, exact_used_cwd) = elevated_program(cmd, argv, state)?;
 
     // Ahead of EVERY other field's check, including the per-element argv loop, because this is the
     // field that decides which image runs ELEVATED: `C:\tools\setup` + NUL + `.bat` launches
     // `C:\tools\setup`, a program the caller never named, and a request poisoning the program and
     // an argument together would otherwise come back naming only `argument 1`. `reject_batch_path`
     // below refuses an interior NUL too, but it runs after those fields, so this ordering is the
-    // elevated path's own.
-    let file_w = wide_nul("program path", program.as_os_str())?;
+    // elevated path's own. Checked here rather than on the `lpFile` built at the launch, because a
+    // `Search` token is resolved only there, and resolving a NUL-bearing token would probe the
+    // filesystem with a truncated string.
+    ensure_no_nul_wide("program path", &program)?;
 
     // Then EVERY remaining field, and only then the batch gate: a truncating argument or working
     // directory is a defect the caller can fix, and "batch escaping is not implemented" would hide
     // it — a clean `.bat` next to a poisoned `current_dir()` would never mention that `lpDirectory`
     // truncates too. `params` is checked per element, by index, inside `elevated_params`.
     let params = elevated_params(argv)?;
-    let dir = cmd
-        .cwd()
-        .map(|d| wide_nul("working directory", d.as_os_str()))
-        .transpose()?;
+    if let Some(d) = cmd.cwd() {
+        ensure_no_nul_wide("working directory", d.as_os_str())?;
+    }
     let params_w = wide_nul("argument line", params.as_os_str())?;
     let verb_w = wide_nul("verb", OsStr::new("runas"))?;
 
@@ -446,40 +466,13 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // both refuse outright.
     //
     // The batch gate judges the name Win32 resolves the token to — trailing dots and spaces, `..`
-    // collapse, drive and UNC and device roots, and data-stream pieces. The launch is `exefile`
-    // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on
-    // `lpFile`. Measured only for an ELEVATED caller, which cosca never launches from: no App
-    // Paths, no bare-name search, `%` literal. The consent route an unelevated caller takes is
-    // unmeasured, so the rest is conservative (see `shell_file`): a fully qualified `.exe`/`.com`
-    // path, which leaves no extensionless name for `PATHEXT` to complete (whether it applies to a
-    // name already ending in `.exe` is unmeasured on every route), with no `"` or `%`, and a
-    // `current_dir()` with no `%`. A relative or bare token is refused until the image is resolved
-    // before the launch.
-    let program_path = std::path::Path::new(&program);
-    crate::child::spawn::reject_batch_path(program_path)?;
-    shell_file::reject_elevated_program(program_path)?;
-    if let Some(dir) = cmd.cwd() {
-        shell_file::reject_percent_in_directory(dir)?;
-    }
+    // collapse, drive and UNC and device roots, and data-stream pieces. On the `Exact` arm
+    // `program` is already completed; on the others it is the token as written, which the consent
+    // launch resolves, and then `shell_file::reject_elevated_program` holds to a fully qualified
+    // `.exe`/`.com` path with no `"` or `%`.
+    crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
 
-    match host.plan(Privilege::Elevated, backend, auth) {
-        Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
-        Transition::Reject { error } => return Err(error),
-        Transition::ElevatePosix { .. } => unreachable!("planner never yields ElevatePosix on a windows host"),
-        Transition::ElevateMacosGui { .. } => {
-            unreachable!("planner never yields ElevateMacosGui on a windows host")
-        }
-        Transition::ElevateWindows { .. } => {}
-    }
-
-    Ok(RunasStep::Launch(Box::new(RunasLaunch {
-        file_w,
-        class_w: wide_nul("class", OsStr::new("exefile"))?,
-        params_w,
-        dir_w: dir,
-        verb_w,
-        show: runas_show_command(cmd.flags_request()),
-    })))
+    Ok(Validated::new(cmd, program, exact_used_cwd, params_w, verb_w))
 }
 
 /// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
@@ -594,6 +587,23 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
     }
 }
 
+#[path = "windows_consent.rs"]
+mod consent;
+use consent::{reject_not_fully_qualified, ConsentCertain, Validated};
+pub(crate) use consent::{ProcessDirs, ProcessOnce};
+
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
+
+#[cfg(test)]
+#[path = "windows_lp_file_tests.rs"]
+mod windows_lp_file_tests;
+
+#[cfg(test)]
+#[path = "windows_cwd_tests.rs"]
+mod windows_cwd_tests;
+
+#[cfg(test)]
+#[path = "windows_percent_tests.rs"]
+mod windows_percent_tests;

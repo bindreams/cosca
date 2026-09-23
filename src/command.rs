@@ -229,7 +229,8 @@ impl Command {
     /// - a **pathed name** is checked against the exact name the caller wrote, first and
     ///   always. `CreateProcessW` documents "no default extension is assumed" for the
     ///   `lpApplicationName` this backend sets, and the PE format makes no extension
-    ///   normative, so `executable(r"C:\tools\payload.tmp")` names exactly that file.
+    ///   normative, so `executable(r"C:\tools\payload.tmp")` names exactly that file —
+    ///   on every path except a consent `.elevate()`, which refuses it (see below).
     ///   A second `name.exe` candidate follows only when the name carries no extension at
     ///   all, so `tools\thing.bin` has exactly one candidate. Where both `bin\tool` and
     ///   `bin\tool.exe` exist, the extensionless one wins. A name that names no file —
@@ -259,26 +260,64 @@ impl Command {
     ///   its shape and nothing was searched for, so no filesystem result is being reported.
     ///   A drive-relative name such as `C:tool` is refused this way rather than loaded from
     ///   the working directory: resolving it would need drive C's own current directory,
-    ///   which cosca does not track. So is a name that names no file at all (`C:\`, `.`,
-    ///   `tools\dir\`, `\\server\share`).
+    ///   which cosca does not track. As in Win32, any one character before the `:` is a drive,
+    ///   so `1:tool` is refused too. So is a name that names no file at all (`C:\`, `.`,
+    ///   `tools\dir\`, `\\server\share`), and one starting with two separators that names no
+    ///   share (`\\tool.exe`), which Win32 reads as a UNC path rather than a file on this drive.
     /// - [`std::io::ErrorKind::NotFound`] — the name was acceptable, the search above ran,
     ///   and nothing matched.
     ///
     /// The dividing line is whether a different filesystem could make the name succeed: if
     /// no disk ever could, the refusal is a property of the string, and it is `InvalidInput`.
     ///
-    /// This resolution rule does NOT apply to an ELEVATED spawn: that path goes through
-    /// `ShellExecuteEx` instead of `CreateProcessW`, entirely bypassing the raw
-    /// backend (and this resolver) described above, and nothing resolves the name there. So
-    /// [`elevate`](Self::elevate) on Windows takes only a fully qualified path to an image.
-    /// `ShellExecuteEx` can apply `PATHEXT` and file associations even to an absolute name
-    /// (measured without a class; for cosca's `exefile` launch on the consent route it is
-    /// unmeasured), so a name not ending in `.exe` or `.com` is refused with
-    /// [`std::io::ErrorKind::InvalidInput`] — both `executable(r"C:\tools\setup")` and
-    /// `executable("whoami")` — and a bare or relative one such as `whoami.exe` is refused with
-    /// [`Error::Unsupported`]. A `%` in the name or in [`current_dir`](Self::current_dir) is refused
-    /// with [`std::io::ErrorKind::InvalidInput`], since whether the launch expands it is unmeasured.
-    /// All of these hold whether or not the caller is already elevated.
+    /// # Under `.elevate()`
+    ///
+    /// A CONSENT launch — `.elevate()` from an unelevated process — goes through `ShellExecuteEx`
+    /// rather than `CreateProcessW`, as an `exefile` launch (`SEE_MASK_CLASSNAME`). cosca resolves
+    /// the program by the rules above and hands over a fully qualified `lpFile`, so `ShellExecuteEx`
+    /// has no lookup to make. The rules apply with one addition: **only candidates ending in `.exe`
+    /// or `.com` count**. Without a class `ShellExecuteEx` applies `PATHEXT` and file associations
+    /// even to an absolute `lpFile`, and `PATHEXT` outranks an existing file, so a planted
+    /// `tool.bat` beside a real extensionless `tool` would run instead (measured); whether the
+    /// `exefile` launch on the consent route does is unmeasured, so the rule stays. Whether
+    /// `PATHEXT` applies to an `lpFile` already ending in `.exe` is unmeasured on every route.
+    /// Observable consequences:
+    ///
+    /// - `executable("whoami")` launches `System32\whoami.exe`. A bare name is searched in
+    ///   System32, `Windows\System`, the Windows directory and then `PATH` — not in the running
+    ///   program's own directory, which a per-user install lets any same-user process write.
+    /// - `bin\tool` beside `bin\tool.exe` launches `bin\tool.exe`; with only `bin\tool` present
+    ///   it is `NotFound`.
+    /// - A pathed name with no `.exe`/`.com` candidate (`C:\tools\payload.tmp`, `bin\tool.lnk`,
+    ///   `bin\tool.`) is [`std::io::ErrorKind::InvalidInput`].
+    /// - A drive-relative `executable("C:tool")` is refused, as everywhere else.
+    /// - A relative [`current_dir`](Self::current_dir), or a relative located name with none, is
+    ///   completed against ONE read of this process's cwd, and the child runs in that directory.
+    ///   A drive-relative `current_dir` (`C:sub`) is completed as Win32 completes it, and one
+    ///   starting with two separators that names no share (`\\server`) is
+    ///   [`std::io::ErrorKind::InvalidInput`].
+    /// - A resolved program or working directory containing `%` is
+    ///   [`std::io::ErrorKind::InvalidInput`]: `ShellExecuteEx` without a class expands
+    ///   environment variables in both, and whether the consent launch does is unmeasured.
+    /// - A resolved program containing `"` is [`Error::Unsupported`].
+    /// - The child's `argv[0]` is the resolved absolute path rather than the name written,
+    ///   because `lpFile` supplies both.
+    ///
+    /// An ALREADY-ELEVATED caller gets none of this: its request re-spawns through the ordinary
+    /// backend, where `CreateProcessW` assumes no default extension, so the `PATHEXT` hazard the
+    /// requirement addresses does not arise and the ordinary rules above apply unchanged. The
+    /// same `Command` can therefore succeed when already elevated and fail at the consent launch
+    /// (`bin\tool` with no `tool.exe` beside it).
+    ///
+    /// Resolution runs in the CALLER's security context, before the consent prompt. The existence
+    /// check is `std::fs::metadata`, which on Windows opens with `access_mode(0)` and falls back to
+    /// `FindFirstFileExW` on `ERROR_ACCESS_DENIED`, so an Administrators-only image still resolves
+    /// when its directory is listable. A candidate whose existence cannot be determined at all
+    /// (access denied with an unlistable directory, an unreachable share, a drive that is not
+    /// ready) STOPS the consent search with that error rather than being skipped, so a later
+    /// directory cannot supply the image. An unelevated spawn skips such a candidate with a
+    /// warning. The `PATH` searched is this process's, since `.elevate()` on Windows accepts no
+    /// environment changes.
     ///
     /// Every Windows spawn, elevated or not, refuses a `.bat`/`.cmd` that only Win32's
     /// normalisation exposes, such as `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one
@@ -336,10 +375,15 @@ impl Command {
     /// On Windows the elevated path goes through `ShellExecuteEx`, which can search a path-less
     /// `lpFile` and apply `PATHEXT` even to an absolute one (measured without a class; for cosca's
     /// `exefile` launch on the consent route it is unmeasured). cosca completes the name to an
-    /// absolute path first, by the same rules as above, and refuses it with
-    /// [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
+    /// absolute path first, by the same rules as above. A relative name is completed against one
+    /// read of this process's cwd, which is also the child's working directory unless
+    /// [`current_dir`](Self::current_dir) names another. Where a consent prompt is used, cosca refuses
+    /// it with [`std::io::ErrorKind::InvalidInput`] unless it ends in `.exe` or `.com` — so
     /// `raw_executable(r"C:\tools\setup").elevate()` is refused where the unelevated spawn loads
-    /// `C:\tools\setup`.
+    /// `C:\tools\setup`. `PATHEXT` outranks an existing file, so without this rule a planted
+    /// `tool.bat` beside a real `tool` would win — elevated, behind a consent dialog that names
+    /// the signed batch handler rather than the planted script. Whether `PATHEXT` is also applied
+    /// to a name that already ends in `.exe` is unmeasured.
     ///
     /// Every elevation backend derives the child's `argv[0]` from the program it is handed
     /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under

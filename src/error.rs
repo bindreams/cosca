@@ -166,6 +166,47 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// This error again, for a result read once and handed out more than once. Every variant is
+    /// rebuilt as itself; `std::io::Error` does not clone, so one is rebuilt from its OS code when
+    /// it has one, else from its kind and message.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn replay(&self) -> Error {
+        match self {
+            Error::Quote(e) => Error::Quote(e.clone()),
+            Error::Io(e) => Error::Io(replay_io(e)),
+            Error::Unsupported { op, platform, detail } => Error::Unsupported {
+                op: op.clone(),
+                platform,
+                detail: detail.clone(),
+            },
+            Error::Containment { detail } => Error::Containment { detail: detail.clone() },
+            Error::NoConsole { detail } => Error::NoConsole { detail: detail.clone() },
+            Error::Elevation { kind, detail } => Error::Elevation {
+                kind: *kind,
+                detail: detail.clone(),
+            },
+            Error::Unassessable { detail, source } => Error::Unassessable {
+                detail: detail.clone(),
+                source: source.as_ref().map(replay_io),
+            },
+            Error::IdentityRecord { kind, detail, source } => Error::IdentityRecord {
+                kind: *kind,
+                detail: detail.clone(),
+                source: source.as_ref().map(replay_io),
+            },
+        }
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn replay_io(e: &std::io::Error) -> std::io::Error {
+    match e.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(e.kind(), e.to_string()),
+    }
+}
+
 /// Test-only: assert a user-facing `detail` carries no run of two or more spaces.
 ///
 /// A hard-wrapped string literal that loses its `\` line-continuation bakes the source
