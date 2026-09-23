@@ -836,9 +836,8 @@ fn windows_child_is_inside_our_job_after_spawn() {
 }
 
 /// `detach()` must NOT kill the tree: `KILL_ON_JOB_CLOSE` has to be cleared before the job
-/// handle is released. Proof is a real byte round trip through BOTH members, taken AFTER the
-/// detach — a write alone proves nothing (the first write into a socket whose peer is gone is
-/// buffered, not refused) and a subsequent EOF proves only death.
+/// handle is released. Proof is a real byte round trip through BOTH members (see `EchoTree`),
+/// taken AFTER the detach.
 #[cfg(windows)]
 #[test]
 fn windows_detach_leaves_the_tree_running() {
@@ -1240,10 +1239,8 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
 /// `kill_on_drop` says, and its first `rmdir` fails `EBUSY` over a live detached tree — so
 /// without a disarm it fires `cgroup.kill` and both members below are already dead.
 ///
-/// Same proof as `windows_detach_leaves_the_tree_running`: a real byte round trip through both
-/// members, taken AFTER the detach. A write alone proves nothing (the first write into a socket
-/// whose peer is gone is buffered, not refused) and the EOF that follows proves only death —
-/// which is why this test used to pass with the disarm reverted.
+/// Same proof as `windows_detach_leaves_the_tree_running` (see there for why a write alone
+/// isn't enough) — this test used to pass with the disarm reverted.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]

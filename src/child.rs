@@ -403,17 +403,9 @@ impl Child {
     }
 
     /// Consume the handle without killing or waiting for the child (opt out of
-    /// kill-on-drop).
-    ///
-    /// Opting out of kill-on-drop is not by itself enough for every mechanism: a containment
-    /// resource whose own `Drop` kills has to be disarmed too, since it drops with this handle
-    /// whatever `kill_on_drop` says. `disarm()` does that — it clears `KILL_ON_JOB_CLOSE` on a
-    /// Job Object, and stops a cgroup leaf's `Drop` firing `cgroup.kill` — so the tree keeps
-    /// running after `detach` under every mechanism.
-    ///
-    /// Under [`Containment::CgroupV2`](crate::Containment::CgroupV2) a tree still running when
-    /// the handle drops keeps its cgroup leaf; see
-    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
+    /// kill-on-drop). Also disarms the containment resource, so its own `Drop` doesn't kill the
+    /// tree either; see [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what that
+    /// leaves behind.
     pub fn detach(mut self) {
         self.attached.disarm();
         self.kill_on_drop = false;
