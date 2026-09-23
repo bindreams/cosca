@@ -722,3 +722,125 @@ fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
     c.args([with_interior_nul(r"C:\tools\setup", ".bat")]);
     invalid_input_message(super::build_std_command(&c));
 }
+
+/// A sync spawn whose verdict fails closed while its child is still held at its hook — here one
+/// that refuses the kill — writes nothing into the child's stdio. With fds 1 and 2 closed, `std`'s
+/// error channel takes them, the child's stdio `dup2` closes its end, and `spawn` returns before the
+/// hook runs; the child, released once its report has been read, finds the exchange shut and exits
+/// with `ABANDONED_EXIT` rather than return an error `std` would write to that channel's fd number —
+/// by now the child's stderr.
+///
+/// The sync path's only abandonment of a live child: `std` fails a spawn only once it has reaped
+/// the child, and every later failure takes the verdict with the child in hand.
+///
+/// Runs in a copy of this test binary: closing 1 and 2 is process-wide.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+
+    use crate::containment::cgroup::fault as cgroup_fault;
+
+    const NAME: &str =
+        "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
+    const INNER: &str = "COSCA_TEST_FAILED_CLOSED_STDIO_INNER";
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    if std::env::var_os(INNER).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+            .env(INNER, "1")
+            .output()
+            .expect("run the case");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let mut file = tempfile::tempfile().expect("tempfile");
+    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
+    let mut release = gate_write.try_clone().expect("dup the gate");
+    let mut cmd = blocker();
+    for slot in [1, 2] {
+        cmd.fd(
+            slot,
+            crate::stdio::Stdio::from_file(file.try_clone().expect("clone the file")),
+        )
+        .expect("wire the slot to the file");
+    }
+    cmd.contain();
+    // The verdict cannot wait (no pidfd) and finds the leaf busy with something not the child, so
+    // it fails closed; the child refuses its kill.
+    cgroup_fault::set_force_pidfd_failure(true);
+    cgroup_fault::set_force_leaf_busy(true);
+    cgroup_fault::set_force_signal_denied(true);
+    let status = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = status.clone();
+    cgroup_fault::set_after_final_read(move |pid| {
+        release.write_all(b"x").expect("release the child");
+        // Its exit, not its reaping: the spawn's teardown reaps it.
+        let pid = rustix::process::Pid::from_raw(pid as i32).expect("a positive pid");
+        let exited = loop {
+            match rustix::process::waitid(
+                rustix::process::WaitId::Pid(pid),
+                rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) => continue,
+                other => break other.expect("wait for the child").expect("it exited"),
+            }
+        };
+        seen.set(Some(exited.exit_status()));
+    });
+    // SAFETY: this process's own std slots, closed only across the spawn and restored from copies
+    // above 2 before anything else runs.
+    let saved: Vec<(i32, i32)> = [1, 2]
+        .into_iter()
+        .map(|slot| unsafe { (slot, libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3)) })
+        .collect();
+    for &(slot, _) in &saved {
+        // SAFETY: as above.
+        unsafe { libc::close(slot) };
+    }
+    // Inherited by the child, which waits on it at its hook; this thread's copy is cleared.
+    cgroup_fault::set_hook_gate(gate_read.as_raw_fd());
+    let spawned = cmd.spawn();
+    let _ = cgroup_fault::take_hook_gate();
+    for &(slot, saved) in &saved {
+        // SAFETY: as above.
+        unsafe {
+            libc::dup2(saved, slot);
+            libc::close(saved);
+        }
+    }
+    // Released whatever happened, before any assert: a child held forever holds this process's
+    // stdout, and would hang the outer run.
+    gate_write.write_all(b"x").expect("release the child");
+    let leftover = (
+        cgroup_fault::take_force_leaf_busy(),
+        cgroup_fault::take_force_signal_denied(),
+    );
+
+    let Err(err) = spawned else {
+        panic!("a verdict failed closed must fail the spawn");
+    };
+    assert!(err.to_string().contains("could not be signalled"), "got {err}");
+    assert_eq!(leftover, (false, false), "the verdict must take its seams");
+    assert_eq!(
+        status.get(),
+        Some(Some(crate::containment::cgroup::ABANDONED_EXIT)),
+        "the child must exit from its hook"
+    );
+    let mut written = Vec::new();
+    file.rewind().expect("rewind the file");
+    file.read_to_end(&mut written).expect("read the file");
+    assert_eq!(written, b"", "nothing reached the child's stdio");
+}

@@ -1811,7 +1811,7 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
     drop(gate_read);
 
     crate::containment::cgroup::fault::set_force_signal_denied(true);
-    crate::containment::cgroup::fault::set_after_final_read(move || {
+    crate::containment::cgroup::fault::set_after_final_read(move |pid| {
         let mut gate_write = gate_write;
         std::io::Write::write_all(&mut gate_write, b"x").expect("release the child");
         // Its exit, not its reaping: the test reaps it below.

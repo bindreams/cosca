@@ -1,6 +1,11 @@
 use std::cell::Cell;
+
+/// A seam's hook, run with the child's pid.
+type PidHook = Box<dyn FnOnce(u32)>;
+
 thread_local! {
-    static AFTER_FINAL_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static FORCE_LEAF_BUSY: Cell<bool> = const { Cell::new(false) };
+    static AFTER_FINAL_READ: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
     static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
@@ -141,14 +146,15 @@ pub(crate) fn take_force_child_pidfd_failure() -> bool {
     FORCE_CHILD_PIDFD_FAILURE.with(|f| f.replace(false))
 }
 
-/// Run `hook` in the NEXT `fail_closed` on this thread, once it has read the child's final report
-/// and before it acts on it — the window a late send must not slip through unread.
-pub(crate) fn set_after_final_read(hook: impl FnOnce() + 'static) {
+/// Run `hook` with the child's pid in the NEXT `fail_closed` on this thread, once it has read the
+/// child's final report and before it acts on it — the window a late send must not slip through
+/// unread.
+pub(crate) fn set_after_final_read(hook: impl FnOnce(u32) + 'static) {
     AFTER_FINAL_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
 }
-pub(crate) fn run_after_final_read() {
+pub(crate) fn run_after_final_read(pid: u32) {
     if let Some(hook) = AFTER_FINAL_READ.with(|h| h.borrow_mut().take()) {
-        hook();
+        hook(pid);
     }
 }
 
@@ -180,9 +186,17 @@ pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<
     BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
 }
 
+/// Have the NEXT verdict on this thread that cannot wait find its leaf busy (`EBUSY`), as one
+/// holding another process would, without that process.
+pub(crate) fn set_force_leaf_busy(on: bool) {
+    FORCE_LEAF_BUSY.with(|f| f.set(on));
+}
+pub(crate) fn take_force_leaf_busy() -> bool {
+    FORCE_LEAF_BUSY.with(|f| f.replace(false))
+}
+
 /// Hold the NEXT placement hook run by a child forked from this thread — which inherits the flag —
 /// until a byte arrives on `gate`, so a test can order the child's hook after the parent's act.
-#[cfg(feature = "tokio")]
 pub(crate) fn set_hook_gate(gate: std::os::fd::RawFd) {
     HOOK_GATE.with(|g| g.set(Some(gate)));
 }

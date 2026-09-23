@@ -227,7 +227,16 @@ impl CgroupLeaf {
         mut channel: ReportChannel,
         source: io::Error,
     ) -> Result<Result<(), NotPlaced>, crate::error::Error> {
-        let why = match fs::remove_dir(&self.leaf_path) {
+        let remove = || fs::remove_dir(&self.leaf_path);
+        // Test-only fault seam: a leaf that is busy with another process.
+        #[cfg(test)]
+        let removed = match fault::take_force_leaf_busy() {
+            true => Err(io::Error::from_raw_os_error(libc::EBUSY)),
+            false => remove(),
+        };
+        #[cfg(not(test))]
+        let removed = remove();
+        let why = match removed {
             Ok(()) => None,
             Err(e) if removed_after_drain(&e) => None,
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => match self.holds(pid) {
@@ -352,7 +361,7 @@ impl CgroupLeaf {
         self.entered = channel.shut().placement() == PlacementReport::Placed;
         // Test-only fault seam: a child's send landing after the read.
         #[cfg(test)]
-        fault::run_after_final_read();
+        fault::run_after_final_read(pid);
         // Only a placed child's tree is in the leaf; `cgroup.kill` needs no credential to kill it.
         let through_leaf = self.entered.then(|| {
             self.hard_kill()
