@@ -311,7 +311,10 @@ fn image_for_rejects_an_empty_exact_program() {
     // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
     let mut cmd = Command::new();
     cmd.raw_executable("").args(["tool"]);
-    assert!(image(&cmd).is_err(), "an empty exact program must be refused");
+    match image(&cmd) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        other => panic!("an empty exact program must be Io(InvalidInput), got {other:?}"),
+    }
 }
 
 #[test]

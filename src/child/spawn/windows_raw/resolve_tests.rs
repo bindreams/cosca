@@ -764,7 +764,10 @@ fn absolutise_exact_leaves_an_absolute_path_absolute() {
 /// NULL pointer, and whether `CreateProcessW` treats those alike is undocumented.
 #[test]
 fn absolutise_exact_refuses_an_empty_program() {
-    assert!(absolutise_exact(Path::new("")).is_err());
+    match absolutise_exact(Path::new("")) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        other => panic!("an empty program must be Io(InvalidInput), got {other:?}"),
+    }
 }
 
 /// Kills dropping EITHER of `absolutise_exact`'s two shape checks (see its comments):
@@ -783,8 +786,10 @@ fn absolutise_exact_refuses_a_program_that_names_no_file() {
         r"C:\t\...",
         r"C:\t\. ",
     ] {
-        let got = absolutise_exact(Path::new(n));
-        assert!(got.is_err(), "{n:?} names no file and must be refused, got {got:?}");
+        match absolutise_exact(Path::new(n)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!("{n:?} names no file and must be Io(InvalidInput), got {other:?}"),
+        }
     }
 }
 
@@ -799,10 +804,10 @@ fn absolutise_exact_refuses_an_interior_nul() {
     use std::os::windows::ffi::OsStringExt;
     for units in [vec![0u16], "a.exe\0b".encode_utf16().collect::<Vec<u16>>()] {
         let p = std::ffi::OsString::from_wide(&units);
-        assert!(
-            absolutise_exact(Path::new(&p)).is_err(),
-            "an interior NUL must be refused, not truncated: {p:?}"
-        );
+        match absolutise_exact(Path::new(&p)) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!("an interior NUL must be Io(InvalidInput), not truncated: {p:?}, got {other:?}"),
+        }
     }
 }
 
