@@ -238,6 +238,12 @@ fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
             let image = suspended_image(&verbatim);
             println!("  planted identity {planted:?}; std::process created {image:?}");
             match (planted, image) {
+                // std refusing the spawn is the std change this canary watches for.
+                (Ok(_), Err(SuspendedSpawn::Refused(e))) => facts.check(
+                    false,
+                    &format!("std::process spawns verbatim {name:?}"),
+                    format_args!("spawn refused: {e}"),
+                ),
                 (Ok(planted), Ok(image)) => match file_identity(&verbatim_spelling(&image)) {
                     Ok(loaded) if runs_itself => facts.check(
                         loaded == planted,
@@ -251,7 +257,9 @@ fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
                     ),
                     Err(why) => failures.push(format!("the created image {image:?}: {why}")),
                 },
-                (planted, image) => failures.extend(planted.err().into_iter().chain(image.err())),
+                (planted, image) => {
+                    failures.extend(planted.err().into_iter().chain(image.err().map(|e| e.to_string())))
+                }
             }
             if let Err(e) = std::fs::remove_file(&verbatim) {
                 println!("  CLEANUP: {verbatim:?} could not be removed: {e}");
@@ -260,9 +268,27 @@ fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
     });
 }
 
+/// Why [`suspended_image`] has no image to report.
+#[derive(Debug)]
+pub(crate) enum SuspendedSpawn {
+    /// `std::process` refused to spawn: a fact about std, not a broken probe.
+    Refused(std::io::Error),
+    /// Querying, terminating or reaping the child failed: the measurement could not be taken.
+    Measurement(String),
+}
+
+impl std::fmt::Display for SuspendedSpawn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) => write!(f, "std::process refused the spawn: {e}"),
+            Self::Measurement(why) => f.write_str(why),
+        }
+    }
+}
+
 /// Spawn `program` through `std::process` SUSPENDED, read the image the new process was created
-/// from, and terminate it before it runs. `Err` if any step fails.
-pub(crate) fn suspended_image(program: &str) -> Result<String, String> {
+/// from, and terminate it before it runs.
+pub(crate) fn suspended_image(program: &str) -> Result<String, SuspendedSpawn> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
@@ -273,7 +299,7 @@ pub(crate) fn suspended_image(program: &str) -> Result<String, String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("std::process could not spawn {program:?}: {e}"))?;
+        .map_err(SuspendedSpawn::Refused)?;
     let mut buf = vec![0u16; 32 * 1024];
     let mut len = buf.len() as u32;
     // SAFETY: the process handle is owned by `child` and alive; `buf` is a live allocation of
@@ -297,7 +323,8 @@ pub(crate) fn suspended_image(program: &str) -> Result<String, String> {
     // never be hidden behind a failed query.
     let steps = std::iter::once(("QueryFullProcessImageNameW", queried.map_err(|e| e.to_string())))
         .chain(reap_after_terminate(terminate, reap));
-    all_succeeded(steps).map_err(|why| format!("the suspended child of {program:?}: {why}"))?;
+    all_succeeded(steps)
+        .map_err(|why| SuspendedSpawn::Measurement(format!("the suspended child of {program:?}: {why}")))?;
     Ok(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
