@@ -55,9 +55,6 @@ impl Disagreements {
         }
     }
 
-    /// Fail the test if any fact disagreed, or if none was checked: a canary whose loops never ran
-    /// has measured nothing. Call after the measurement-failure assert, so a broken probe is
-    /// reported as one rather than as a platform change.
     /// Require `covered`, or report `shortfall` as a measurement that could not be taken.
     pub(crate) fn require(&mut self, covered: bool, shortfall: String) {
         if !covered {
@@ -73,6 +70,9 @@ impl Disagreements {
         );
     }
 
+    /// Fail the test if any fact disagreed, or if none was checked: a canary whose loops never ran
+    /// has measured nothing. Call after the measurement-failure assert, so a broken probe is
+    /// reported as one rather than as a platform change.
     fn assert_none(&self) {
         println!("facts checked: {}", self.checked);
         assert!(
