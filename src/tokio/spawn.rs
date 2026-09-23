@@ -476,7 +476,7 @@ fn warn_child_may_be_unreachable_into(
         Error::Io(e) => e.raw_os_error(),
         _ => None,
     };
-    let level = crate::containment::cgroup::report_level(warned, errno);
+    let level = crate::warn_once::report_level(warned, errno);
     log::log!(
         level,
         "tokio spawn failed ({error}); if it failed after forking, the child was left running and \

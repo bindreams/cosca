@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 
 /// Why a cgroup v2 leaf could not be created. Each variant names the step that failed, the
 /// path it touched, and the kernel's own reason: the caller degrades to a process group
@@ -320,22 +320,7 @@ pub(crate) fn log_degrade(reason: &dyn DegradeReason) {
 /// transition against its own state instead of racing every other test in the binary for the
 /// process-wide one.
 pub(super) fn log_degrade_into(warned: &Mutex<BTreeSet<DegradeCondition>>, reason: &dyn DegradeReason) -> log::Level {
-    let level = report_level(warned, reason.condition());
+    let level = crate::warn_once::report_level(warned, reason.condition());
     log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
     level
-}
-
-/// The level to report `condition` at: `Warn` the first time `seen` meets it, `Debug` after.
-///
-/// Generic over the condition so every once-per-condition report in the crate shares this one
-/// policy while keying on its own conditions.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn report_level<C: Ord>(seen: &Mutex<BTreeSet<C>>, condition: C) -> log::Level {
-    // A panic elsewhere while holding the lock cannot leave a set half-inserted; recover it
-    // rather than turn a log call into a second panic.
-    if seen.lock().unwrap_or_else(PoisonError::into_inner).insert(condition) {
-        log::Level::Warn
-    } else {
-        log::Level::Debug
-    }
 }
