@@ -102,5 +102,17 @@ class ParseRunArgvTests(unittest.TestCase):
         self.assertEqual(cmd_tail, [])
 
 
+class PowershellQuoteTests(unittest.TestCase):
+    def test_plain_token_is_wrapped_in_single_quotes(self) -> None:
+        quoted = devvm.powershell_quote("cargo")
+        self.assertTrue(quoted.startswith("'"))
+        self.assertTrue(quoted.endswith("'"))
+        self.assertIn("cargo", quoted)
+
+    def test_embedded_single_quote_is_doubled(self) -> None:
+        quoted = devvm.powershell_quote("it's")
+        self.assertIn("it''s", quoted)
+
+
 if __name__ == "__main__":
     unittest.main()
