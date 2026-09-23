@@ -476,13 +476,21 @@ impl Command {
     /// uncontained child — see [`contain`](Command::contain)), then kill the ROOT. There is no
     /// cooperative signal first; use
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
-    /// child needs one. Descendants are killed, not waited for.
+    /// child needs one.
+    ///
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the drop waits for the tree to be gone**
+    /// before it removes the tree's leaf. This is almost always instant: it stalls only while a
+    /// member is stuck in uninterruptible I/O (D state), and then the drop waits too. Under every
+    /// other mechanism descendants are killed, not waited for. To wait explicitly, call
+    /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
     /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
     /// until the root has exited, so after `drop` returns the child is gone. The async
     /// [`Child`](crate::tokio::Child) signals and returns — parking a runtime worker in a
     /// destructor is not something the caller can await or cancel — and hands the wait to reaper
-    /// threads of its own, so the reap happens later and off this thread.
+    /// threads of its own, so the reap happens later and off this thread. Its cgroup leaf's wait
+    /// happens there too, unless the drop releases the handle on the dropping thread: for a root
+    /// already reaped, or one it could not signal.
     ///
     /// The async reap is **not** unconditional: a host too thread-starved to start the pool falls
     /// back to the runtime's orphan handling, and a process that forks without `exec` loses it

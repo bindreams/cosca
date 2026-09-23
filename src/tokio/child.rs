@@ -629,7 +629,8 @@ impl Child {
 }
 
 impl Child {
-    /// Leave the child (and its contained tree) running after this handle drops.
+    /// Leave the child (and its contained tree) running after this handle drops. The drop then
+    /// neither kills the tree nor waits for it.
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
         self.os.attached.disarm();

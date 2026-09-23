@@ -403,9 +403,9 @@ impl Child {
     }
 
     /// Consume the handle without killing or waiting for the child (opt out of
-    /// kill-on-drop). Also disarms the containment resource, so its own `Drop` doesn't kill the
-    /// tree either; see [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what that
-    /// leaves behind.
+    /// kill-on-drop). Also disarms the containment resource, so its own `Drop` neither kills the
+    /// tree nor waits for it; see [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what
+    /// that leaves behind.
     pub fn detach(mut self) {
         self.attached.disarm();
         self.kill_on_drop = false;

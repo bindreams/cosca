@@ -89,8 +89,8 @@ fn proc_state(pid: u32) -> Option<char> {
 /// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report channel: the child
 /// needs them only until its `exec`.
 ///
-/// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill` and
-/// retries — but only if the child reported entering it and the leaf was not
+/// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill`, waits
+/// for the leaf to drain, and retries — but only if the child reported entering it and the leaf was not
 /// [`disarm`](Self::disarm)ed.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {

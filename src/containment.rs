@@ -27,8 +27,10 @@ use std::fmt;
 pub enum Containment {
     /// Linux cgroup v2 leaf + `cgroup.kill`. Fork-proof; a confined child can't leave.
     ///
-    /// Dropping the handle kills the tree and removes the leaf directory, and reports at `warn`
-    /// a leaf it cannot remove. A handle that opted out — [`Child::detach`](crate::Child::detach)
+    /// Dropping the handle kills the tree, waits for it to be gone, and removes the leaf
+    /// directory, reporting at `warn` a leaf it cannot remove. The wait is almost always
+    /// instant: it stalls only while a member is stuck in uninterruptible I/O (D state), and then
+    /// the drop waits too. A handle that opted out — [`Child::detach`](crate::Child::detach)
     /// or [`kill_on_drop(false)`](crate::Command::kill_on_drop) — never kills, and removes the
     /// leaf only if the tree has already exited; see `kill_on_drop` for when it stays.
     CgroupV2,
