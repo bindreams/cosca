@@ -272,8 +272,9 @@ fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
 
 /// `lpCurrentDirectory` takes no part in image lookup: a relative `Exact` image loads from the
 /// process's cwd whatever `current_dir()` says. The Windows counterpart of the POSIX
-/// `a_relative_exact_program_and_relative_cwd_come_from_one_process_cwd_reading`, where the
-/// child's directory decides instead.
+/// `a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path` and
+/// `a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path`, where the child's directory
+/// decides instead.
 #[test]
 fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
     let (with, without) = (
