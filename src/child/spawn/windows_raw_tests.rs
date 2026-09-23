@@ -215,6 +215,58 @@ fn image_for_leaves_an_exact_program_completely_unresolved() {
     );
 }
 
+/// Load `cmd`'s image the way the raw backend does — `image_for` into `lpApplicationName`,
+/// `current_dir()` into `lpCurrentDirectory` — with `process_cwd` as this process's cwd, and wait.
+///
+/// Race-free: the cwd move, `image_for`'s reading and `CreateProcessW`'s completion all happen
+/// under `spawn_lock`, which every cwd-moving test in this binary holds (see
+/// [`crate::test_child::RestoreCwd`]), so none can interleave. `spawn_raw` is not used because it
+/// takes that lock itself. A reader outside the lock can observe the moved cwd, but the only file
+/// in it has a name no other test resolves.
+fn load_from(cmd: &Command, process_cwd: &Path) -> Result<std::process::ExitStatus, Error> {
+    let (proc, pid) = {
+        let _guard = crate::child::spawn::spawn_lock();
+        let _restore = crate::test_child::RestoreCwd::capture();
+        std::env::set_current_dir(process_cwd).expect("cd");
+        let app = app_name_wide(image_for(cmd)?.as_deref())?;
+        let mut line = raw_program_and_line(cmd)?;
+        line.push(0);
+        let dir = cmd.cwd().map(|d| to_wide_nul(d.as_os_str()));
+        let mut si = STARTUPINFOEXW::default();
+        let flags = windows::Win32::System::Threading::CREATE_NO_WINDOW.0;
+        super::proc::create_process(Some(&app), &mut line, &mut si, &None, &dir, flags)?
+    };
+    super::proc::RawChild::new(proc, pid).wait().map_err(Error::Io)
+}
+
+/// `lpCurrentDirectory` takes no part in image lookup: a relative `Exact` image loads from this
+/// process's cwd whatever `current_dir()` says. The Windows counterpart of the POSIX
+/// `a_relative_exact_program_and_relative_cwd_come_from_one_process_cwd_reading`, where the
+/// child's directory decides instead.
+#[test]
+fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
+    const PROBE: &str = "cosca_exact_cwd_probe.exe";
+    let (with, without) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    // This test binary, run with a filter that matches nothing, exits 0.
+    std::fs::copy(std::env::current_exe().expect("current_exe"), with.path().join(PROBE)).expect("copy");
+    let exact = |current_dir: &Path| {
+        let mut c = Command::new();
+        c.raw_executable(PROBE)
+            .args([PROBE, "--exact", "__cosca_no_such_test__"])
+            .current_dir(current_dir);
+        c
+    };
+    let loaded = load_from(&exact(without.path()), with.path()).expect("loaded from the process cwd");
+    assert!(loaded.success(), "{loaded:?}");
+    assert!(
+        load_from(&exact(with.path()), without.path()).is_err(),
+        "current_dir() holds the image but the process cwd does not, so nothing may load"
+    );
+}
+
 #[test]
 fn image_for_resolves_a_search_program_to_an_absolute_path() {
     // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
