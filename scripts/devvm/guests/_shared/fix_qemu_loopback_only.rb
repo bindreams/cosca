@@ -19,12 +19,36 @@
 #
 # Loaded unconditionally from every guest Vagrantfile via require_relative, before `vagrant
 # up` starts QEMU, so no guest can accidentally expose SSH/WinRM/RDP to the LAN.
+#
+# This patch reaches into vagrant-qemu's Driver#execute by prepending a module — there is no
+# public extension point for this. That makes it silently stop working if a future
+# vagrant-qemu release changes Driver#execute's argv shape (e.g. no longer building the
+# hostfwd string this way at all) or the hardcoded SSH-forward construction described above.
+# Two independent guards against that:
+#   1. A version pin checked at load time, below — refuses to load at all against any
+#      vagrant-qemu other than the one this patch was verified against.
+#   2. A fail-closed post-rewrite assertion inside execute() itself, so even an in-range
+#      version whose behavior somehow doesn't match what's documented above turns into a hard
+#      `vagrant up` failure instead of a silent loopback-only guarantee that no longer holds.
+PINNED_VAGRANT_QEMU_VERSION = "0.6.3"
+installed_version = Vagrant::Plugin::Manager.instance.installed_plugins.dig("vagrant-qemu", "installed_gem_version")
+if installed_version != PINNED_VAGRANT_QEMU_VERSION
+  raise "devvm: fix_qemu_loopback_only.rb is pinned to vagrant-qemu #{PINNED_VAGRANT_QEMU_VERSION}, " \
+        "but #{installed_version.inspect} is installed. This file patches a private method " \
+        "(VagrantPlugins::QEMU::Driver#execute) by name; re-verify the hostfwd rewrite still " \
+        "applies against the new version, then update PINNED_VAGRANT_QEMU_VERSION."
+end
 
 module VagrantPlugins
   module QEMU
     class Driver
       module ForceLoopbackHostfwd
         LOOPBACK = "127.0.0.1"
+        # Matches a hostfwd clause's host-address segment as actually rewritten above:
+        # hostfwd=tcp:127.0.0.1:2222-:22 → captures "127.0.0.1". Anything the gsub above
+        # didn't touch, or touched incorrectly, shows up here as an empty or "0.0.0.0"
+        # capture.
+        HOSTFWD_HOSTADDR = /hostfwd=(?:tcp|udp):([^:]*):/
 
         def execute(*cmd, **opts, &block)
           cmd = cmd.map do |arg|
@@ -34,6 +58,21 @@ module VagrantPlugins
               arg
             end
           end
+
+          cmd.each do |arg|
+            next unless arg.is_a?(String)
+
+            arg.scan(HOSTFWD_HOSTADDR).each do |(hostaddr)|
+              if hostaddr.nil? || hostaddr.empty? || hostaddr == "0.0.0.0"
+                raise "devvm: QEMU hostfwd loopback rewrite did not take - found a " \
+                      "non-loopback host address in: #{arg.inspect}. This means " \
+                      "vagrant-qemu's Driver#execute argv shape no longer matches what this " \
+                      "patch expects; refusing to start QEMU rather than silently exposing a " \
+                      "forwarded port to the LAN."
+              end
+            end
+          end
+
           super(*cmd, **opts, &block)
         end
       end
