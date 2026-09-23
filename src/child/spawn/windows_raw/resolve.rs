@@ -205,13 +205,13 @@ pub(crate) fn reject_unnameable_program(program: &Path) -> Result<(), Error> {
 /// file, depend only on the token's own final component, not on the directory it was completed
 /// against.
 pub(crate) fn absolutise_exact(program: &Path) -> Result<PathBuf, Error> {
-    // FIRST, ahead of the shape check, so the refusal names the NUL. `to_wide_nul` appends a
-    // terminator, and `PCWSTR` stops at the FIRST NUL — so an interior NUL silently truncates the
-    // path Win32 sees. `raw_executable("C:\\a\\b.exe\0x")` would become `lpFile = C:\a\b.exe`,
-    // loading a file the caller did not name, elevated. The raw backend already fails such a path
-    // closed (`spawn_raw` NUL-checks the image); without this the same `Command` would error
-    // unelevated and silently load a different file elevated. Ahead of the shape check so that
-    // `x` + NUL + `\` is blamed on its NUL, not on a trailing separator Win32 would never see.
+    // FIRST, ahead of the shape check, so the refusal names the NUL, not a trailing separator Win32
+    // would never see (`x` + NUL + `\`). `to_wide_nul` appends a terminator, and `PCWSTR` stops at
+    // the FIRST NUL — so an interior NUL silently truncates the path Win32 sees.
+    // `raw_executable("C:\\a\\b.exe\0x")` would become `lpFile = C:\a\b.exe`, loading a file the
+    // caller did not name, elevated. The raw backend already fails such a path closed (`spawn_raw`
+    // NUL-checks the image); without this the same `Command` would error unelevated and silently
+    // load a different file elevated.
     ensure_no_nul_wide("program path", program.as_os_str())?;
     // The shape is checked TWICE, on purpose, because the two checks catch different things.
     //
