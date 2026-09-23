@@ -185,7 +185,7 @@ pub(crate) fn resolve_executable_in(
 
 /// A child's environment: a snapshot of this process's, with ops applied.
 pub(crate) enum ChildEnv {
-    /// No ops: the snapshot's block verbatim, duplicates and `=`-less entries included, as std's
+    /// No ops: the snapshot's block verbatim, duplicates and order included, as std's
     /// NULL block hands a child this process's own. `path` is what `GetEnvironmentVariableW`
     /// reads from it.
     Inherited { block: Vec<u16>, path: Option<OsString> },

@@ -87,12 +87,14 @@ fn raw_and_std_backends_give_a_child_the_same_environment_block() {
 }
 
 /// With no ops the raw backend passes this process's block on byte for byte, as std's NULL block
-/// does: an `=`-less entry and an `EnvKey`-equal duplicate reach both children unchanged. The
+/// does: unsorted entries and an `EnvKey`-equal duplicate reach both children unchanged. The
 /// intermediate's block is built by `spawn-with-env-block`, since std's `Command` would clean it.
+/// No `=`-less entry: `CreateProcessW` refuses one (see `create_process_block_acceptance`), so no
+/// parent can hand its child such a block.
 #[test]
 fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
     let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
-    let entries = [system_root.as_str(), "Path=a", "JUNK", "PATH=b", "ß=1", "SS=2"];
+    let entries = [system_root.as_str(), "Path=a", "zz=1", "PATH=b", "ß=1", "SS=2"];
     let run = |backend: &str| {
         let mut cmd = std::process::Command::new(common::testbin());
         cmd.arg("spawn-with-env-block").arg(backend).args(entries);
@@ -107,4 +109,21 @@ fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
         "std's child is the control: it must see the parent block verbatim"
     );
     assert_eq!(run("raw"), std);
+}
+
+/// What `CreateProcessW` accepts as a child's block, measured: which parent blocks can exist.
+#[test]
+fn create_process_block_acceptance() {
+    let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    let probe = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(common::testbin());
+        cmd.arg("try-env-block").arg(&system_root).args(extra);
+        let out = common::output_locked(&mut cmd).expect("spawn");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(probe(&[]), "ok", "control");
+    assert_eq!(probe(&["Path=a", "zz=1", "PATH=b"]), "ok", "duplicates, unsorted");
+    assert_eq!(probe(&["=C:=C:\\x"]), "ok", "a drive-cwd entry");
+    assert_eq!(probe(&["JUNK"]), "err=87", "an entry with no `=`");
 }

@@ -66,9 +66,28 @@ pub fn spawn(backend: &str, ops: &[String]) {
 }
 
 /// Run `spawn-dump-env-block <backend>` (no ops) in a child whose environment block is exactly
-/// `entries`, in order. std's `Command` cannot build such a block (it dedupes, sorts and drops
-/// `=`-less entries), so this calls `CreateProcessW` itself. Relays the child's exit code.
+/// `entries`, in order, and relay its exit code.
 pub fn spawn_with_block(backend: &str, entries: &[String]) {
+    let code = create_with_block(entries, &format!("spawn-dump-env-block {backend}")).expect("CreateProcessW");
+    std::process::exit(code as i32);
+}
+
+/// Report whether `CreateProcessW` accepts `entries` as a child's block: `ok`, or `err=<code>`
+/// with the Win32 error code.
+pub fn try_block(entries: &[String]) {
+    match create_with_block(entries, "exit 0") {
+        Ok(code) => {
+            assert_eq!(code, 0, "the probe child failed");
+            println!("ok");
+        }
+        Err(e) => println!("err={}", e.code().0 & 0xFFFF),
+    }
+}
+
+/// Run `cosca_testbin <args>` with an environment block of exactly `entries`, in order, and wait for
+/// its exit code. std's `Command` cannot build such a block (it dedupes and sorts), so this calls
+/// `CreateProcessW` itself.
+fn create_with_block(entries: &[String], args: &str) -> windows::core::Result<u32> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE_FLAG_INHERIT};
@@ -86,9 +105,7 @@ pub fn spawn_with_block(backend: &str, entries: &[String]) {
         .encode_wide()
         .chain([0])
         .collect();
-    let mut cmdline: Vec<u16> = format!("cosca_testbin spawn-dump-env-block {backend}\0")
-        .encode_utf16()
-        .collect();
+    let mut cmdline: Vec<u16> = format!("cosca_testbin {args}\0").encode_utf16().collect();
     let mut si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         dwFlags: STARTF_USESTDHANDLES,
@@ -122,8 +139,7 @@ pub fn spawn_with_block(backend: &str, entries: &[String]) {
             &si,
             &mut pi,
         )
-    }
-    .expect("CreateProcessW");
+    }?;
     let mut code = 0u32;
     // SAFETY: `pi`'s handles are owned here and closed once.
     unsafe {
@@ -132,5 +148,5 @@ pub fn spawn_with_block(backend: &str, entries: &[String]) {
         CloseHandle(pi.hThread).expect("close thread");
         CloseHandle(pi.hProcess).expect("close process");
     }
-    std::process::exit(code as i32);
+    Ok(code)
 }
