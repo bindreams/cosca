@@ -148,9 +148,7 @@ impl CgroupLeaf {
     /// Dropping a `CgroupLeaf` is NOT inert, which is what makes this necessary: `Drop` fires
     /// `cgroup.kill` whenever the first `rmdir` fails, and over a live detached tree that
     /// `rmdir` always fails (`EBUSY`). `Child::drop` opting out via `kill_on_drop` does not
-    /// help — the leaf is a field of that `Child` and its own `Drop` runs regardless. So the
-    /// strongest mechanism was the one that broke `detach`'s "the tree keeps running", and it
-    /// takes real state to keep it.
+    /// help — the leaf is a field of that `Child` and its own `Drop` runs regardless.
     ///
     /// A disarmed `Drop` still tries the `rmdir` once — detach gives up the kill, not the
     /// tidying — and notes at `debug`, never `warn`, when the live tree keeps the leaf.

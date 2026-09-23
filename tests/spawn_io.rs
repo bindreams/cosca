@@ -859,10 +859,8 @@ fn windows_detach_leaves_the_tree_running() {
     drop(grand);
 }
 
-/// `kill_on_drop(false)` must leave a contained tree running, exactly as `detach()` does —
-/// `Command::kill_on_drop` documents the two as the same opt-out. The Job Object is a field of
-/// the handle and closes with it whatever the flag says, so this holds only because the spawn
-/// disarmed it.
+/// `kill_on_drop(false)` must leave a contained tree running, exactly as `detach()` does (see
+/// `Attached::honor_kill_on_drop`).
 #[cfg(windows)]
 #[test]
 fn windows_kill_on_drop_false_leaves_the_tree_running() {

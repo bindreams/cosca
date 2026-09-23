@@ -651,9 +651,7 @@ fn a_leaf_without_a_pidfd_degrades_without_a_kill() {
 }
 
 // kill_on_drop's reach into the containment resource =====
-// `Command::kill_on_drop(false)` and `Child::detach()` are documented as the same opt-out.
-// They are only the same if both reach the resource whose OWN `Drop` kills: it is a field of
-// the handle and drops with it whatever the flag says.
+// See `Attached::honor_kill_on_drop`.
 
 /// A leaf standing in for a live contained tree: occupied (so `rmdir` fails and `Drop` would
 /// reach for `cgroup.kill`) and carrying an empty `cgroup.kill` to read the write back from.

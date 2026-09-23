@@ -348,12 +348,8 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
 
 #[tokio::test]
 async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
-    // The containment resource is a FIELD of the handle and drops with it whatever
-    // `kill_on_drop` says — a Job Object's close fires KILL_ON_JOB_CLOSE, a cgroup leaf's Drop
-    // fires cgroup.kill. So a contained `kill_on_drop(false)` tree survives only because the
-    // spawn disarmed the resource (`Attachment::honor_kill_on_drop`), which is what makes
-    // `Command::kill_on_drop`'s "or detach() to opt one out after the fact" true. On Linux
-    // outside the cgroup lane this is a process group, whose disarm is a no-op;
+    // The spawn disarms the resource (see `Attached::honor_kill_on_drop`). On Linux outside the
+    // cgroup lane this is a process group, whose disarm is a no-op;
     // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
     use std::io::{Read as _, Write as _};
     let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false);
@@ -390,8 +386,8 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
     assert_async_opted_out_tree_survives(true, |mut child| child.detach());
 }
 
-/// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does. Only
-/// `Attachment::honor_kill_on_drop` at handle construction disarms the leaf here.
+/// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does (see
+/// `Attached::honor_kill_on_drop`).
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]

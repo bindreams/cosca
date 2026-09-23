@@ -369,9 +369,7 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     );
 }
 
-/// `terminate` reads the same already-removed leaf as the same completed teardown. A caller
-/// doing terminate-then-kill must not get an error from the graceful half and success from the
-/// hard one over the identical leaf.
+/// `terminate` reads an already-removed leaf as a completed teardown, as `hard_kill` does.
 #[cfg(target_os = "linux")]
 #[test]
 fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
@@ -477,9 +475,7 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
 }
 
 // detach's disarm -----
-// `detach()` promises the tree keeps running. `Child::drop` returns early on it, but the leaf
-// is a field of that `Child` and its own `Drop` still runs — so the promise is only kept if
-// `disarm` reaches the leaf.
+// See `CgroupLeaf::disarm`.
 
 /// A disarmed leaf never writes `cgroup.kill`, and leaves the occupied directory alone. The
 /// occupant stands in for the detached tree; a real leaf refuses both `rmdir`s while one runs.
@@ -634,8 +630,7 @@ fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
 }
 
 // Drop's two flags -----
-// `entered` is whether the child entered the leaf, so it can hold anything at all; `armed` is
-// whether the caller still wants cosca to manage the tree. `Drop` kills only when both hold.
+// See the truth table in `CgroupLeaf`'s `Drop`.
 
 /// All four combinations, each against an occupied leaf whose verdict is taken: only both-set
 /// writes `cgroup.kill`.
