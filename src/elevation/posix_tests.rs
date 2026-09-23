@@ -1016,7 +1016,7 @@ mod rewrite_tests {
             assert!(
                 argv.iter().any(|a| {
                     let a = a.to_string_lossy();
-                    a == "/proc-cwd/tool" || a.contains("cd -- /proc-cwd && exec ./tool")
+                    a == "/proc-cwd/tool" || a.contains("cd -P -- /proc-cwd && exec ./tool")
                 }),
                 "{via:?}: {argv:?}"
             );

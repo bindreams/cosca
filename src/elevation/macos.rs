@@ -84,7 +84,10 @@ fn is_posix_absolute(s: &OsStr) -> Result<bool, Error> {
 /// authorization trampoline.
 ///
 /// Requiring the cwd to be absolute makes osascript's directory and the script's
-/// `cd --` resolve the same PATH. It does not make them resolve the same OUTCOME:
+/// `cd -P --` resolve the same PATH. `-P` makes the `cd` read it as the kernel's `chdir` does —
+/// osascript's own cwd, and the unelevated spawn's: a shell's default logical `cd` takes
+/// `link/..` to the directory holding `link`, not to the parent of its target, and would run a
+/// different `./tool`. It does not make them resolve the same OUTCOME:
 /// the `cd` runs as root on the far side of the trampoline, so a directory the
 /// caller can traverse but root cannot (NFS `root_squash`) fails there, `&&`
 /// short-circuits, and the payload never runs. That surfaces as a bare non-zero
@@ -109,7 +112,7 @@ pub(crate) fn build_shell_command(program: &OsStr, args: &[OsString], cwd: Optio
 
     let mut out = Vec::new();
     if let Some(dir) = cwd {
-        out.extend_from_slice(b"cd -- ");
+        out.extend_from_slice(b"cd -P -- ");
         out.extend_from_slice(&crate::quote::posix::quote(os_bytes(dir.as_os_str())?));
         out.extend_from_slice(b" && ");
     }
@@ -225,7 +228,7 @@ pub(crate) fn program_and_args(
 /// a panic.
 /// Reads nothing: an already-root caller runs no osascript, and needs no path to its cwd.
 pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
-    // The caller's cwd is applied twice — to osascript, and as `cd --` inside the
+    // The caller's cwd is applied twice — to osascript, and as `cd -P --` inside the
     // script — and the trampoline does not carry a cwd across, so a RELATIVE path
     // resolves against two different bases and the two silently disagree. Absolute
     // makes them name the same directory.
@@ -357,7 +360,7 @@ pub(crate) fn build_rewrite(
     ]);
     // The cwd is set on osascript AS WELL AS stated in the script: setting it here
     // turns a bogus directory into a precise spawn-time `Io` error instead of an
-    // opaque non-zero exit, and the script's `cd --` makes the payload's cwd
+    // opaque non-zero exit, and the script's `cd -P --` makes the payload's cwd
     // deterministic either way. The two name the same directory by construction.
     if let Some(d) = cwd {
         derived.current_dir(d);

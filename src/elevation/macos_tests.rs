@@ -66,7 +66,7 @@ fn a_working_directory_becomes_an_explicit_cd() {
     // so the cwd is stated in the command rather than assumed.
     assert_eq!(
         shell("/usr/bin/id", &[], Some("/tmp/a dir")),
-        "cd -- '/tmp/a dir' && exec /usr/bin/id"
+        "cd -P -- '/tmp/a dir' && exec /usr/bin/id"
     );
 }
 
@@ -232,7 +232,7 @@ fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
 #[test]
 fn a_relative_working_directory_is_rejected() {
     // It would resolve against two different bases: this process's directory for
-    // osascript, and the trampoline's for the `cd --` inside the script.
+    // osascript, and the trampoline's for the `cd -P --` inside the script.
     let mut c = gui_cmd();
     c.current_dir("subdir");
     assert_rejected(&c, "absolute");
@@ -452,7 +452,7 @@ fn a_bare_exact_program_is_completed_rather_than_refused() {
         unreachable!()
     };
     assert!(
-        argv[2].to_str().unwrap().contains("cd -- /work && exec ./tool -u"),
+        argv[2].to_str().unwrap().contains("cd -P -- /work && exec ./tool -u"),
         "{:?}",
         argv[2]
     );
@@ -473,7 +473,10 @@ fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_aga
         unreachable!()
     };
     assert!(
-        argv[2].to_str().unwrap().contains("\"cd -- /proc-cwd && exec ./tool\""),
+        argv[2]
+            .to_str()
+            .unwrap()
+            .contains("\"cd -P -- /proc-cwd && exec ./tool\""),
         "{:?}",
         argv[2]
     );
@@ -493,7 +496,7 @@ fn the_cwd_reaches_both_osascript_and_the_payload() {
     // …and stated in the script, so the payload's cwd does not depend on whether
     // the trampoline happens to carry it.
     assert!(
-        argv[2].to_str().unwrap().contains("cd -- /tmp && exec"),
+        argv[2].to_str().unwrap().contains("cd -P -- /tmp && exec"),
         "{:?}",
         argv[2]
     );
@@ -761,5 +764,22 @@ fn a_leading_dash_program_survives_the_real_shell() {
     let dir_path = dir.path().to_path_buf();
     let launch = super::program_and_args(&c, || Ok(dir_path)).unwrap();
     let script = build_shell_command(&launch.program, &launch.args, launch.cwd.as_deref()).unwrap();
+    assert_eq!(sh_exit_code(&script), Some(11), "{}", String::from_utf8_lossy(&script));
+}
+
+/// The script enters the directory the kernel's `chdir` would: `cd -P`, not the shell's logical
+/// `cd`, which reads `link/..` as the directory holding `link` rather than the target's parent.
+/// osascript itself, and the unelevated spawn, `chdir` by the kernel's rule.
+#[cfg(unix)]
+#[test]
+fn the_script_enters_a_symlink_dotdot_directory_as_the_kernel_does() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(root.path().join("real").join("inner")).expect("mkdir");
+    std::fs::create_dir_all(root.path().join("a")).expect("mkdir");
+    std::os::unix::fs::symlink("../real/inner", root.path().join("a").join("link")).expect("symlink");
+    exit_tool(&root.path().join("real").join("tool"), 11);
+    exit_tool(&root.path().join("a").join("tool"), 22);
+    let dir = root.path().join("a").join("link").join("..");
+    let script = build_shell_command(OsStr::new("./tool"), &[], Some(&dir)).unwrap();
     assert_eq!(sh_exit_code(&script), Some(11), "{}", String::from_utf8_lossy(&script));
 }
