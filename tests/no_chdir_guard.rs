@@ -55,10 +55,12 @@ const NEEDLE_FRAGMENTS: &[(&str, &str)] = &[
     ("set_current", "_dir"),
     ("ch", "dir"),
     ("fch", "dir"),
+    ("_ch", "dir"),
     ("_wch", "dir"),
     ("wch", "dir"),
     ("SetCurrentDirectory", "A"),
     ("SetCurrentDirectory", "W"),
+    ("RtlSetCurrentDirectory", "_U"),
 ];
 
 fn spell(fragments: (&str, &str)) -> String {
@@ -90,10 +92,12 @@ fn needle_matcher_catches_every_known_bypass() {
     let cd_word = spell(NEEDLE_FRAGMENTS[0]);
     let chdir_word = spell(NEEDLE_FRAGMENTS[1]);
     let fchdir_word = spell(NEEDLE_FRAGMENTS[2]);
-    let leading_underscore_wchdir_word = spell(NEEDLE_FRAGMENTS[3]);
-    let wchdir_word = spell(NEEDLE_FRAGMENTS[4]);
-    let set_dir_a_word = spell(NEEDLE_FRAGMENTS[5]);
-    let set_dir_w_word = spell(NEEDLE_FRAGMENTS[6]);
+    let leading_underscore_chdir_word = spell(NEEDLE_FRAGMENTS[3]);
+    let leading_underscore_wchdir_word = spell(NEEDLE_FRAGMENTS[4]);
+    let wchdir_word = spell(NEEDLE_FRAGMENTS[5]);
+    let set_dir_a_word = spell(NEEDLE_FRAGMENTS[6]);
+    let set_dir_w_word = spell(NEEDLE_FRAGMENTS[7]);
+    let rtl_set_dir_word = spell(NEEDLE_FRAGMENTS[8]);
 
     let bypass_lines = [
         format!("use std::env::{cd_word} as cd; cd(d)"),
@@ -105,8 +109,12 @@ fn needle_matcher_catches_every_known_bypass() {
         format!("libc::{fchdir_word}"),
         format!("windows_sys::Win32::Storage::FileSystem::{set_dir_a_word}(path)"),
         format!("windows_sys::Win32::Storage::FileSystem::{set_dir_w_word}(path)"),
+        // libc's Windows `chdir` links to the CRT's `_chdir`; a bare `\bchdir\b` needle cannot
+        // match inside it, since `_` is a word character and leaves no boundary before the `c`.
+        format!("libc::{leading_underscore_chdir_word}(path)"),
         format!("libc::{leading_underscore_wchdir_word}(path)"),
         format!("libc::{wchdir_word}(path)"),
+        format!("windows_sys::Wdk::System::SystemServices::{rtl_set_dir_word}(path)"),
     ];
     for line in &bypass_lines {
         assert!(line_matches_needle(line), "needle matcher must catch: {line}");
