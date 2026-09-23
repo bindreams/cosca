@@ -1,5 +1,8 @@
 use std::cell::Cell;
 thread_local! {
+    static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -173,4 +176,33 @@ pub(crate) fn set_hook_gate(gate: std::os::fd::RawFd) {
 }
 pub(crate) fn take_hook_gate() -> Option<std::os::fd::RawFd> {
     HOOK_GATE.with(|g| g.take())
+}
+
+/// Have the NEXT intent sent on this thread — or in a child forked from it — go without its
+/// `/proc/self` directory, as when `/proc` is not mounted.
+pub(crate) fn set_force_child_proc_dir_failure(on: bool) {
+    FORCE_CHILD_PROC_DIR_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_child_proc_dir_failure() -> bool {
+    FORCE_CHILD_PROC_DIR_FAILURE.with(|f| f.replace(false))
+}
+
+/// Run `hook` in the NEXT abandonment on this thread, between the check that its child is
+/// unreaped and the kill.
+pub(crate) fn set_between_check_and_kill(hook: impl FnOnce() + 'static) {
+    BETWEEN_CHECK_AND_KILL.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn run_between_check_and_kill() {
+    if let Some(hook) = BETWEEN_CHECK_AND_KILL.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Count an abandoned child signalled by its bare pid on this thread.
+pub(crate) fn record_signalled_by_pid() {
+    SIGNALLED_BY_PID.with(|c| c.set(c.get() + 1));
+}
+/// How many abandoned children this thread signalled by bare pid since the last call.
+pub(crate) fn take_signalled_by_pid() -> usize {
+    SIGNALLED_BY_PID.with(|c| c.replace(0))
 }

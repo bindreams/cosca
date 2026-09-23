@@ -769,14 +769,17 @@ impl CgroupLeaf {
 /// killed directly, so the wait ends with its exit, and no handle owns it (see
 /// [`CgroupLeaf::abandon_before_verdict`]).
 ///
-/// The child is named by the pidfd its intent carried, or — without one — by its pid, trusted
-/// only once `waitid` confirms an unreaped child of this process and its start time matches the
-/// intent's: an unreaped child's pid cannot be reused, and a reused one would start later. A
-/// child it may not signal (`EPERM`) is handed to a background reaper, so it is reaped once it
+/// The child is named by the handle its intent carried — a pidfd, or its `/proc/<pid>` directory —
+/// never by its number alone. Which path failed the spawn does not need knowing: `std` reaps the
+/// child of a spawn it fails, and tokio's post-fork failure never does, but tokio reports both as
+/// one error. The handle answers instead: a process `std` reaped opens nothing through it, however
+/// its number has been reused since. An intent with no handle names nothing cosca may signal.
+///
+/// A child it may not signal (`EPERM`) is handed to a background reaper, so it is reaped once it
 /// exits, however that comes.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received) -> ChildFate {
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd};
 
     use rustix::process::{pidfd_send_signal, waitid, WaitId, WaitIdOptions};
 
@@ -787,45 +790,66 @@ fn end_child(received: &Received) -> ChildFate {
     else {
         return ChildFate::NeverReached;
     };
+    let Some(handle) = received.pidfd.as_ref().or(received.proc_dir.as_ref()) else {
+        log::warn!("cgroup v2: an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled");
+        return ChildFate::Unkillable;
+    };
+    // The reap names the child by its pidfd, or — with its `/proc` directory proving the number is
+    // still its own, and it unreaped — by its pid.
     let id = || match &received.pidfd {
         Some(pidfd) => WaitId::PidFd(pidfd.as_fd()),
         None => WaitId::Pid(pid),
     };
-    // Still this process's unreaped child? Reaped means `std` failed the spawn and reaped it.
-    let unreaped = loop {
-        match waitid(
-            id(),
-            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-        ) {
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::CHILD) => break false,
-            _ => break true,
+    // Still unreaped? A process `std` reaped is gone: its pidfd waits on nothing, its `/proc`
+    // directory opens nothing.
+    let unreaped = match &received.pidfd {
+        Some(_) => loop {
+            match waitid(
+                id(),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::CHILD) => break false,
+                _ => break true,
+            }
+        },
+        None => {
+            // Safety: a NUL-terminated name relative to an open directory; the result is closed.
+            let stat = unsafe { libc::openat(handle.as_raw_fd(), c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if stat >= 0 {
+                // Safety: the descriptor just opened, closed once.
+                unsafe { libc::close(stat) };
+            }
+            stat >= 0
         }
     };
     if !unreaped {
         return ChildFate::Gone;
     }
-    // By pid alone, the number must still be this child's: an unreaped child of this process
-    // with a different start time is another one that got the number after `std` reaped it.
-    if received.pidfd.is_none() {
-        let start = fs::read(format!("/proc/{}/stat", pid.as_raw_nonzero()))
-            .ok()
-            .and_then(|stat| crate::identity::stat_parse::parse_starttime_jiffies(&stat));
-        if start.is_none() || start != received.start {
-            log::warn!(
-                "cgroup v2: an abandoned spawn's child cannot be told from its pid ({pid:?}); it is not signalled"
-            );
-            return ChildFate::Unkillable;
-        }
-    }
+    #[cfg(test)]
+    fault::run_between_check_and_kill();
     #[cfg(test)]
     let denied = fault::take_force_child_kill_denied();
     #[cfg(not(test))]
     let denied = false;
-    let killed = match &received.pidfd {
-        _ if denied => Err(rustix::io::Errno::PERM),
-        Some(pidfd) => pidfd_send_signal(pidfd, rustix::process::Signal::KILL),
-        None => rustix::process::kill_process(pid, rustix::process::Signal::KILL),
+    // Through the handle: the kernel takes a `/proc/<pid>` directory as a pidfd here.
+    let killed = if denied {
+        Err(rustix::io::Errno::PERM)
+    } else {
+        pidfd_send_signal(handle, rustix::process::Signal::KILL)
+    };
+    let killed = match killed {
+        // Reaped since the check — only a reaper the crate's contract forbids can have — so it is
+        // gone, and its number is not signalled.
+        Err(rustix::io::Errno::SRCH) => return ChildFate::Gone,
+        // `pidfd_send_signal` itself refused, as a seccomp filter can: the identity was proven a
+        // moment ago, and only this process may reap the child, so its pid still names it.
+        Err(rustix::io::Errno::NOSYS) | Err(rustix::io::Errno::PERM) if !denied => {
+            #[cfg(test)]
+            fault::record_signalled_by_pid();
+            rustix::process::kill_process(pid, rustix::process::Signal::KILL)
+        }
+        other => other,
     };
     // The group it leads: an unreaped leader pins the group's id, so this names its group alone.
     if !denied {
@@ -860,7 +884,8 @@ fn end_child(received: &Received) -> ChildFate {
     ChildFate::Killed
 }
 
-/// What names a child to its reaper: its own pidfd, or its pid once checked as [`end_child`] does.
+/// What names a child to its reaper: its own pidfd, or its pid once its `/proc` directory proved
+/// the number its own (see [`end_child`]).
 #[cfg(target_os = "linux")]
 enum ChildId {
     PidFd(OwnedFd),

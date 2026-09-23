@@ -1,4 +1,4 @@
-use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running};
+use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
 use crate::containment::cgroup::{LeafError, NotEntered, NotPlaced, PlacementReport};
 
 // removed_after_drain tests -----
@@ -1325,11 +1325,11 @@ fn spawn_placing(
 }
 
 /// An abandoned child whose intent carried no pidfd — `pidfd_open` denied in the child — is still
-/// killed and reaped: by its pid, once `waitid` confirms an unreaped child of this process with the
-/// intent's start time.
+/// killed and reaped, named by the `/proc/self` directory it sent: a handle on that process, not on
+/// its number.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_by_its_checked_pid() {
+fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-no-pidfd");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -1346,20 +1346,22 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_by_its_checked_pid() 
 
     assert!(
         crate::containment::cgroup::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
-        "the child must be killed by its pid"
+        "the child must be killed through its /proc directory"
     );
     assert!(reaped(&pidfd), "and reaped");
 }
 
-/// An intent whose pid names a live child of this process that is not the one it claims — a start
-/// time that does not match — is never signalled: that number may have been reused.
+/// An intent that carries no handle on its sender — neither a pidfd nor a `/proc` directory — names
+/// its child by a number alone, which `std` may have freed by reaping it. It is never signalled, even
+/// when the number names a live child of this process: that child is not this spawn's. Out of
+/// reach, and said so.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_abandoned_intent_whose_pid_names_another_child_is_not_signalled() {
+fn an_abandoned_intent_without_a_handle_is_never_signalled() {
     use std::io::{Read, Write};
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-wrong-start");
+    let leaf_path = dir.path().join("cosca-abandoned-no-handle");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     let mut other = std::process::Command::new("/bin/cat")
@@ -1367,11 +1369,10 @@ fn an_abandoned_intent_whose_pid_names_another_child_is_not_signalled() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn another child");
-    // SAFETY: the leaf's channel is open; the intent claims `other`'s pid with a start time it
-    // never had.
+    // SAFETY: the leaf's channel is open; the intent claims `other`'s pid and carries no handle.
     unsafe {
         leaf.placement_slot()
-            .send(crate::containment::cgroup::TAG_INTENT, other.id() as i32, 1, -1)
+            .send(crate::containment::cgroup::TAG_INTENT, other.id() as i32, 0, -1)
             .expect("send a forged intent");
     }
 
@@ -1379,6 +1380,7 @@ fn an_abandoned_intent_whose_pid_names_another_child_is_not_signalled() {
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
+    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
 
     let mut echo = [0u8; 1];
     other
@@ -1395,6 +1397,93 @@ fn an_abandoned_intent_whose_pid_names_another_child_is_not_signalled() {
         .expect("the other child must be alive to echo");
     other.kill().expect("kill the other child");
     other.wait().expect("reap the other child");
+}
+
+/// A real spawn whose child could open neither a pidfd nor its `/proc` directory sends an intent
+/// with no handle: its abandoned child is out of reach, and is not signalled.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-no-handle-spawn");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // Inherited by the child forked from this thread, which takes them.
+    crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
+    crate::containment::cgroup::fault::set_force_child_proc_dir_failure(true);
+    let mut child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
+    crate::containment::cgroup::fault::set_force_child_proc_dir_failure(false);
+
+    assert_eq!(
+        leaf.abandon_before_verdict(),
+        crate::containment::cgroup::Abandoned::OutOfReach
+    );
+    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the child was not signalled"
+    );
+    child.kill().expect("kill the child");
+    child.wait().expect("reap the child");
+}
+
+/// `std` reaps the child of a spawn it failed before returning the error, freeing its pid. The
+/// abandoned exchange then holds that child's `/proc` directory, which no longer opens anything:
+/// the child is gone, and nothing is signalled — whatever process the number names by now.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_std_already_reaped_is_never_signalled() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-reaped");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let slot = leaf.placement_slot();
+    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
+    let gate = gate_read.as_raw_fd();
+    crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
+    let pid = fork_running(move || {
+        // SAFETY: this child's inherited copy of the channel's child end.
+        let _ = unsafe { slot.send_intent() };
+        block_on(gate);
+    });
+    crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
+    gate_write.write_all(b"x").expect("release the child");
+    // Reaped as `std` reaps it: before the exchange is abandoned.
+    reap(pid);
+
+    assert_eq!(
+        leaf.abandon_before_verdict(),
+        crate::containment::cgroup::Abandoned::Ended
+    );
+    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
+}
+
+/// A child reaped between the check that it lives and the kill — only by a reaper the crate's
+/// contract forbids — is signalled through its handle, which now names nothing: no other process
+/// can be hit. The kill finds it gone, and nothing is reaped twice.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-window");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let child = spawn_placing(&leaf, &["/bin/true"], false, std::process::Stdio::null());
+    let pid = child.id();
+    drop(child);
+    crate::containment::cgroup::fault::set_between_check_and_kill(move || reap(pid));
+
+    assert_eq!(
+        leaf.abandon_before_verdict(),
+        crate::containment::cgroup::Abandoned::Ended
+    );
+    assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
+    assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
 }
 
 /// An abandoned child cosca may not kill is out of reach, and still never left a zombie: a

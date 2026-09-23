@@ -10,9 +10,21 @@ use super::*;
 #[cfg(target_os = "linux")]
 pub(super) const REPORT_PLACED: i32 = -1;
 
-/// A message's length: its tag, its value, and — in an intent — the child's start time.
+/// A message's length: its tag, its value, and — in an intent — the kind of handle it carries.
 #[cfg(target_os = "linux")]
 const MESSAGE_LEN: usize = 16;
+
+/// An intent's handle on its sender: none.
+#[cfg(target_os = "linux")]
+const HANDLE_NONE: u64 = 0;
+/// An intent's handle on its sender: a pidfd.
+#[cfg(target_os = "linux")]
+const HANDLE_PIDFD: u64 = 1;
+/// An intent's handle on its sender: its `/proc/<pid>` directory, open — for when `pidfd_open` is
+/// denied. It names that process, not its number: once the process is reaped, nothing opens
+/// through it, whatever process the number names by then.
+#[cfg(target_os = "linux")]
+const HANDLE_PROC_DIR: u64 = 2;
 
 /// The tag of a child's intent message; its value is the child's pid.
 #[cfg(target_os = "linux")]
@@ -84,9 +96,8 @@ pub(crate) struct Received {
     pub(crate) pid: Option<u32>,
     /// The pidfd its intent carried, when it could open one.
     pub(crate) pidfd: Option<OwnedFd>,
-    /// Its start time in clock ticks since boot (`/proc/<pid>/stat` field 22), when it could read
-    /// it: with its pid, an identity no other process can share.
-    pub(crate) start: Option<u64>,
+    /// Its `/proc/<pid>` directory, open, when it had no pidfd to send.
+    pub(crate) proc_dir: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -233,7 +244,7 @@ impl ReportChannel {
             debug_assert_eq!(bytes, message.len(), "a message is two i32s and a u64");
             let tag = i32::from_ne_bytes(message[..4].try_into().expect("four bytes"));
             let value = i32::from_ne_bytes(message[4..8].try_into().expect("four bytes"));
-            let start = u64::from_ne_bytes(message[8..].try_into().expect("eight bytes"));
+            let handle = u64::from_ne_bytes(message[8..].try_into().expect("eight bytes"));
             let mut pidfd = None;
             for ancillary in control.drain() {
                 if let RecvAncillaryMessage::ScmRights(fds) = ancillary {
@@ -245,8 +256,11 @@ impl ReportChannel {
             match tag {
                 TAG_INTENT => {
                     self.received.pid = u32::try_from(value).ok();
-                    self.received.start = (start != 0).then_some(start);
-                    self.received.pidfd = pidfd;
+                    match handle {
+                        HANDLE_PIDFD => self.received.pidfd = pidfd,
+                        HANDLE_PROC_DIR => self.received.proc_dir = pidfd,
+                        _ => {}
+                    }
                 }
                 TAG_REPORT => {
                     self.received.report.get_or_insert(match value {
@@ -336,29 +350,48 @@ pub(crate) struct ReportSlot {
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
-    /// Send the intent: this process's pid, and a pidfd for it when one can be opened.
+    /// Send the intent: this process's pid, and a handle on this process — a pidfd, or, when
+    /// `pidfd_open` is denied, its `/proc/self` directory.
     ///
     /// # Safety
     /// As [`ReportSlot::send`].
     pub(super) unsafe fn send_intent(self) -> io::Result<Delivery> {
         // Safety: async-signal-safe syscalls on this process's own pid.
         let pid = unsafe { libc::getpid() };
-        let start = own_start_time();
         #[cfg(test)]
-        let denied = fault::take_force_child_pidfd_failure();
+        let (pidfd_denied, proc_denied) = (
+            fault::take_force_child_pidfd_failure(),
+            fault::take_force_child_proc_dir_failure(),
+        );
         #[cfg(not(test))]
-        let denied = false;
-        let pidfd = if denied {
+        let (pidfd_denied, proc_denied) = (false, false);
+        // Safety: as above; a pidfd is opened close-on-exec.
+        let pidfd = if pidfd_denied {
             -1
         } else {
-            // Safety: as above; a pidfd is opened close-on-exec.
             unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd }
         };
-        // Safety: the caller's guarantee; `pidfd` is this process's own or -1.
-        let sent = unsafe { self.send(TAG_INTENT, pid, start, pidfd) };
-        if pidfd >= 0 {
+        let (handle, kind) = if pidfd >= 0 {
+            (pidfd, HANDLE_PIDFD)
+        } else {
+            // Safety: a NUL-terminated path; the result is checked.
+            let dir = if proc_denied {
+                -1
+            } else {
+                unsafe {
+                    libc::open(
+                        c"/proc/self".as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                }
+            };
+            (dir, if dir >= 0 { HANDLE_PROC_DIR } else { HANDLE_NONE })
+        };
+        // Safety: the caller's guarantee; `handle` is this process's own or -1.
+        let sent = unsafe { self.send(TAG_INTENT, pid, kind, handle) };
+        if handle >= 0 {
             // Safety: the descriptor opened above, closed once.
-            unsafe { libc::close(pidfd) };
+            unsafe { libc::close(handle) };
         }
         sent
     }
@@ -396,14 +429,14 @@ impl ReportSlot {
     /// # Safety
     /// The child's end must still be open at this number, which holds from the leaf's creation
     /// until the parent has taken the verdict.
-    pub(super) unsafe fn send(self, tag: i32, value: i32, start: u64, pidfd: RawFd) -> io::Result<Delivery> {
+    pub(super) unsafe fn send(self, tag: i32, value: i32, handle: u64, pidfd: RawFd) -> io::Result<Delivery> {
         #[repr(C, align(8))]
         struct Control([u8; 64]);
 
         let mut message = [0u8; MESSAGE_LEN];
         message[..4].copy_from_slice(&tag.to_ne_bytes());
         message[4..8].copy_from_slice(&value.to_ne_bytes());
-        message[8..].copy_from_slice(&start.to_ne_bytes());
+        message[8..].copy_from_slice(&handle.to_ne_bytes());
         let mut iov = libc::iovec {
             iov_base: message.as_mut_ptr().cast(),
             iov_len: message.len(),
@@ -480,33 +513,6 @@ impl ReportSlot {
         let sent = unsafe { self.send_report(REPORT_PLACED) }.expect("send the report");
         assert_eq!(sent, Delivery::Queued, "the parent must still be listening");
     }
-}
-
-/// This process's start time in clock ticks since boot, or 0 when `/proc/self/stat` cannot be
-/// read. Async-signal-safe: `open`, `read` and `close` into a buffer on the stack, and a parse
-/// that allocates nothing.
-#[cfg(target_os = "linux")]
-fn own_start_time() -> u64 {
-    let mut stat = [0u8; 1024];
-    // Safety: a NUL-terminated path; the result is checked.
-    let fd = unsafe { libc::open(c"/proc/self/stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return 0;
-    }
-    let mut len = 0;
-    while len < stat.len() {
-        // Safety: the rest of `stat` is a valid, writable buffer; `fd` is open.
-        let got = unsafe { libc::read(fd, stat[len..].as_mut_ptr().cast(), stat.len() - len) };
-        match got {
-            // Safety: errno is this thread's own.
-            -1 if unsafe { *libc::__errno_location() } == libc::EINTR => continue,
-            n if n <= 0 => break,
-            n => len += n as usize,
-        }
-    }
-    // Safety: the descriptor opened above, closed once.
-    unsafe { libc::close(fd) };
-    crate::identity::stat_parse::parse_starttime_jiffies(&stat[..len]).unwrap_or(0)
 }
 
 #[cfg(test)]
