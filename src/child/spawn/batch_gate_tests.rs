@@ -6,8 +6,8 @@ use crate::error::Error;
 
 /// The NTFS normalisation, as pure string logic — runs on every host.
 ///
-/// Windows resolves `x.bat `, `x.bat.` and `x.bat:s` all to `x.bat`. This pins the PIECES, which
-/// is not the verdict — `is_batch_program` is where the pieces become one.
+/// `x.bat ` and `x.bat.` resolve to `x.bat`, and `x.bat:s` names a stream of it. This pins the
+/// PIECES, which is not the verdict — `is_batch_program` is where the pieces become one.
 #[test]
 fn ntfs_stream_names_splits_off_every_stream_then_trims_space_and_dot() {
     for (probe, want) in [
@@ -30,9 +30,9 @@ fn ntfs_stream_names_splits_off_every_stream_then_trims_space_and_dot() {
         // Any one UTF-16 unit before the colon is a drive, as `RtlDetermineDosPathNameType_U` has it.
         (".:x.bat", vec!["x.bat"]),
         ("é:x.bat", vec!["x.bat"]),
-        // ORDER witnesses. `x.bat:s ` does NOT discriminate — both orders yield `x.bat`, because
-        // trim-then-split still splits. These three do: trim-then-split would leave the trailing
-        // character attached and the extension check would miss it.
+        // Split before trimming, though `GetFullPathNameW` keeps `x.bat.:s` and `x.bat :s` as they
+        // are (measured): reading them as `x.bat` is the conservative choice, and trim-then-split
+        // would leave the trailing character attached for the extension check to miss.
         ("x.bat.:s", vec!["x.bat", "s"]),
         ("x.bat :s", vec!["x.bat", "s"]),
         ("x.bat. :s", vec!["x.bat", "s"]),
@@ -1101,8 +1101,8 @@ fn win32_effective_file_name_collapses_the_way_win32_resolves() {
         (r"/\?\C:\dir\x.bat.", Some("x.bat")),
         (r"\/?\C:\dir\x.bat.", Some("x.bat")),
         ("//?/C:/..", None),
-        // Collapsed onto the root, a batch-named SERVER is judged too — whether `..` inside the
-        // root collapses is unmeasured, and if it does this is `\\x.bat`.
+        // Collapsed onto the root, a batch-named SERVER is judged too — an over-refusal, since a
+        // `..` inside the root is never collapsed (measured).
         (r"\\x.bat\y\..", Some("x.bat")),
         // ...and so it is with no `..` at all: `\\x.bat\y` is a share root, which is a directory.
         (r"\\x.bat\y", Some("x.bat")),
@@ -1472,8 +1472,8 @@ fn oracle_refuses(components: &[Comp]) -> bool {
 }
 
 /// The one over-refusal the gate declares and the oracle does not share: a path collapsed onto its
-/// UNC root is refused for a batch-named SERVER as well as a batch-named share, because whether
-/// `..` inside the root is collapsed is unmeasured. It may only ever LICENSE a refusal — an
+/// UNC root is refused for a batch-named SERVER as well as a batch-named share, though a `..`
+/// inside the root is never collapsed (measured). It may only ever LICENSE a refusal — an
 /// acceptance the oracle refuses is a failure whatever this says.
 fn declared_unc_over_refusal(components: &[Comp]) -> bool {
     let [Comp::Empty, Comp::Empty, server, _share, rest @ ..] = components else {

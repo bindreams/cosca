@@ -290,8 +290,9 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// does no I/O, so the share need not exist for that to happen.
 ///
 /// Server and share are POSITIONAL: Win32 takes the two segments after the `\\` without reading
-/// them, so a `..`, dots-only or empty segment there is part of the root rather than an operation
-/// on it. A lone `.` or `?` in the server slot is the exception: that is a device root, below.
+/// them, so a `..`, dots-only, empty or one-space segment there is part of the root rather than an
+/// operation on it (measured by the Windows path probe's
+/// `dotdot_stops_at_the_unc_share_but_not_at_a_device_name`). A lone `.` or `?` in the server slot is the exception: that is a device root, below.
 /// That position has to be exact, not merely deep enough. A floor set one component too DEEP
 /// suppresses a pop Win32 performs, and the final name moves to a later component: skip the
 /// dots-only server in `\\...\x.bat\y\..` and the root becomes `x.bat\y`, the pop is clamped
@@ -403,10 +404,10 @@ pub(super) enum Interior {
 /// The name a path collapsed onto its UNC root resolves to, judged conservatively.
 ///
 /// Win32 resolves it to `\\server\share`, so the share is the name std tests. The server is
-/// judged as well: whether `..` spelled INSIDE the root is collapsed is not something this crate
-/// has measured, and were it collapsed `\\x.bat\..` would resolve to `\\x.bat`. So a batch-named
-/// server is returned in preference to the share, and a share that trims away to nothing names no
-/// file — both over-refusals, and both in the direction this gate may err.
+/// judged as well, and a batch-named server is returned in preference to the share: an
+/// over-refusal, since a `..` inside the root is never collapsed and the server keeps its trailing
+/// dots and spaces (measured: `\\...\x.bat\y\..` resolves to `\\...\x.bat` and `\\srv.\x.bat\y\..`
+/// to `\\srv.\x.bat`). A share that trims away to nothing names no file, which is refused too.
 fn unc_root_name(server: &str, share: &str) -> Option<String> {
     let server = server.trim_end_matches([' ', '.']);
     if is_batch_program(server) {
@@ -463,11 +464,13 @@ pub(super) fn is_batch_by_shell(name: &str) -> bool {
 /// The file name and every data-stream name inside a path component, each trimmed the way Win32
 /// trims a component.
 ///
-/// Two normalisations, and the ORDER matters: split at the stream separators FIRST, then trim.
-/// Note `x.bat:s ` does NOT discriminate — it yields `x.bat` either way, because trim-then-split
-/// still splits. The witnesses are a trailing space or dot BEFORE the separator: `x.bat.:s`,
-/// `x.bat :s`, `x.bat. :s`. Split-then-trim yields `x.bat` for all three; trim-then-split leaves
-/// `x.bat.` / `x.bat ` / `x.bat. `, which the extension check then misses.
+/// Split at the stream separators FIRST, then trim each piece — which is NOT what
+/// `GetFullPathNameW` does. Measured on x64 and arm64 (the Windows path probe's
+/// `a_stream_suffix_stays_in_the_final_component`), it trims only the end of the whole component:
+/// `x.bat.:s` and `x.bat :s` come back unchanged. Split-then-trim reads both as the file `x.bat`,
+/// and refuses them; whether the filesystem opens stream `s` of `x.bat` or of a file named
+/// `x.bat.` for them is unmeasured, so that refusal is conservative. Trim-then-split would leave
+/// `x.bat.` / `x.bat `, which the extension check misses.
 ///
 /// EVERY piece, not just the one before the first separator: taking only the first read
 /// `x.exe:payload.bat:` as the file `x.exe`, losing the batch name, while the same stream spelled
