@@ -985,6 +985,8 @@ fn main() {
         #[cfg(windows)]
         "spawn-dump-env-block" => env_block::spawn(&args[2], &args[3..]),
         #[cfg(windows)]
+        "spawn-with-env-block" => env_block::spawn_with_block(&args[2], &args[3..]),
+        #[cfg(windows)]
         "report-breakaway" => {
             breakaway::run(&args[2], &args[3], &args[4]);
         }

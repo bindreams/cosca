@@ -33,7 +33,12 @@ fn child_block(backend: &str, ops: &[String]) -> Vec<OsString> {
         "intermediate failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout)
+    parse_block(&out.stdout)
+}
+
+/// `dump-env-block`'s output: one entry per line, each UTF-16 unit as four hex digits.
+fn parse_block(stdout: &[u8]) -> Vec<OsString> {
+    std::str::from_utf8(stdout)
         .unwrap()
         .lines()
         .map(|hex| {
@@ -79,4 +84,27 @@ fn raw_and_std_backends_give_a_child_the_same_environment_block() {
         }
         assert_eq!(child_block("raw", &ops), std, "{ops:?}");
     }
+}
+
+/// With no ops the raw backend passes this process's block on byte for byte, as std's NULL block
+/// does: an `=`-less entry and an `EnvKey`-equal duplicate reach both children unchanged. The
+/// intermediate's block is built by `spawn-with-env-block`, since std's `Command` would clean it.
+#[test]
+fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
+    let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    let entries = [system_root.as_str(), "Path=a", "JUNK", "PATH=b", "ß=1", "SS=2"];
+    let run = |backend: &str| {
+        let mut cmd = std::process::Command::new(common::testbin());
+        cmd.arg("spawn-with-env-block").arg(backend).args(entries);
+        let out = common::output_locked(&mut cmd).expect("spawn");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        parse_block(&out.stdout)
+    };
+    let std = run("std");
+    let want: Vec<OsString> = entries.iter().map(OsString::from).collect();
+    assert_eq!(
+        std, want,
+        "std's child is the control: it must see the parent block verbatim"
+    );
+    assert_eq!(run("raw"), std);
 }

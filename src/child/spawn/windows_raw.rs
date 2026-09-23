@@ -13,6 +13,9 @@ mod crt_fds;
 #[path = "windows_raw/env_key.rs"]
 mod env_key;
 
+#[path = "windows_raw/env_snapshot.rs"]
+mod env_snapshot;
+
 // `pub(crate)`: the async raw backend (`crate::tokio::spawn::windows_raw`) reuses program/env/NUL
 // resolution verbatim.
 #[path = "windows_raw/resolve.rs"]
@@ -29,6 +32,7 @@ pub(crate) use proc::RawChild;
 #[cfg(feature = "tokio")]
 pub(crate) use proc::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -64,12 +68,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // search for the image ITSELF, including the current directory, reopening the binary-planting
     // hole this resolver otherwise closes.
     let program: Option<PathBuf> = cmd.executable_path().map(PathBuf::from).or_else(|| program_token(cmd));
-    // The one read of this process's environment: resolution, the containment marker check and the
-    // child's block all derive from it (see `resolve::env_snapshot`).
-    let base = resolve::env_snapshot();
-    let child_env = resolve::ChildEnv::capture(&base, cmd.env_ops());
+    let spawn_env = spawn_env(cmd)?;
     let image: Option<PathBuf> = program
-        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), &child_env))
+        .map(|p| resolve::resolve_executable(&p, cmd.cwd(), &spawn_env.child_env))
         .transpose()?;
     if let Some(p) = &image {
         resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
@@ -95,23 +96,21 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // the defaults (`contain_flags` 0, a `mode: None`/`is_root: false` `Prepared`); a Strongest root
     // spawns CREATE_SUSPENDED and is job-assigned + resumed in `attach_or_fault`.
     let req = cmd.contain_request();
-    let marker_present = resolve::snapshot_has(&base, crate::containment::NESTED_ENV);
-    let is_root = !crate::containment::dispatch::is_nested(marker_present);
     // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
     // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
     // must not have mutated the parent.
     let plan = crate::command::flags::windows_spawn(
         &req,
         *cmd.flags_request(),
-        is_root,
+        spawn_env.is_root,
         crate::command::flags::SpawnBackend::Raw,
     )?;
-    let marker_env = plan.marker_env;
+    debug_assert_eq!(plan.marker_env, spawn_env.marker_env, "the marker decision drifted");
     if req.mode.is_some() {
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    let env_block = with_marker(child_env, &base, cmd.env_ops(), marker_env).block()?;
+    let env_block = spawn_env.child_env.into_block()?;
     let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
@@ -176,7 +175,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // (Strongest root) or the TreeWalk/Delegated mechanism exactly as the std path does.
     let prepared = crate::containment::Prepared {
         mode: req.mode,
-        is_root,
+        is_root: spawn_env.is_root,
         // From the COMPOSED word, which carries the caller's flags as well as the containment
         // decision: a derivation reading only the containment half would report an in-process
         // route for a child this spawn deliberately put in another console.
@@ -237,29 +236,43 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
     Ok(crt_fds::encode(&entries))
 }
 
-/// `child_env`, plus the inherited root marker when `marker_env`. The marker is appended AFTER the
-/// user's env ops so it survives a user `env_clear()`, as the std path sets it after the user's
-/// env; recapturing from the same `base` names it exactly as std would.
-pub(crate) fn with_marker(
-    child_env: resolve::ChildEnv,
-    base: &[(OsString, OsString)],
-    ops: &[EnvOp],
-    marker_env: bool,
-) -> resolve::ChildEnv {
+/// The environment-derived inputs of a raw spawn, all from ONE read of this process's environment,
+/// so resolution, the containment decision and the child's block cannot see different ones.
+pub(crate) struct SpawnEnv {
+    pub(crate) child_env: resolve::ChildEnv,
+    pub(crate) is_root: bool,
+    pub(crate) marker_env: bool,
+}
+
+/// Read this process's environment once and derive `cmd`'s [`SpawnEnv`] from it. The containment
+/// marker decision is the pure `windows_contain_setup` that `flags::windows_spawn` also makes, taken
+/// early so the image is resolved against the final environment, marker included.
+pub(crate) fn spawn_env(cmd: &Command) -> Result<SpawnEnv, Error> {
+    let snapshot = env_snapshot::EnvSnapshot::read()?;
+    let marker_present = snapshot.var(OsStr::new(crate::containment::NESTED_ENV)).is_some();
+    let is_root = !crate::containment::dispatch::is_nested(marker_present);
+    let marker_env = crate::containment::dispatch::windows_contain_setup(&cmd.contain_request(), is_root).marker_env;
+    let ops = child_ops(cmd.env_ops(), marker_env);
+    Ok(SpawnEnv {
+        child_env: resolve::ChildEnv::capture(&snapshot, &ops),
+        is_root,
+        marker_env,
+    })
+}
+
+/// `ops`, plus the inherited root marker when `marker_env`. Appended AFTER the user's ops so it
+/// survives a user `env_clear()` and is named as std names it, as the std path sets it after the
+/// user's env.
+fn child_ops(ops: &[EnvOp], marker_env: bool) -> Cow<'_, [EnvOp]> {
     if !marker_env {
-        return child_env;
+        return Cow::Borrowed(ops);
     }
     let mut ops = ops.to_vec();
     ops.push(EnvOp::Set(
         OsString::from(crate::containment::NESTED_ENV),
         OsString::from("1"),
     ));
-    let marked = resolve::ChildEnv::capture(base, &ops);
-    debug_assert!(
-        marked.path() == child_env.path(),
-        "the containment marker changed the PATH the image was resolved against"
-    );
-    marked
+    Cow::Owned(ops)
 }
 
 /// Mark each listed handle inheritable, then spawn. Returns a Result WITHOUT `?`-ing so the caller

@@ -260,11 +260,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         .executable_path()
         .map(PathBuf::from)
         .or_else(|| sync_raw::program_token(cmd));
-    // The one read of this process's environment, as on the sync path.
-    let base = sync_raw::resolve::env_snapshot();
-    let child_env = sync_raw::resolve::ChildEnv::capture(&base, cmd.env_ops());
+    let spawn_env = sync_raw::spawn_env(cmd)?;
     let image = program
-        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), &child_env))
+        .map(|p| sync_raw::resolve::resolve_executable(&p, cmd.cwd(), &spawn_env.child_env))
         .transpose()?;
     if let Some(p) = &image {
         sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
@@ -283,23 +281,21 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // (flags 0, `mode: None`/`is_root: false`); a Strongest root spawns CREATE_SUSPENDED and is
     // job-assigned + resumed in `attach_or_fault`.
     let req = cmd.contain_request();
-    let marker_present = sync_raw::resolve::snapshot_has(&base, crate::containment::NESTED_ENV);
-    let is_root = !crate::containment::dispatch::is_nested(marker_present);
     // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
     // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
     // must not have mutated the parent.
     let plan = crate::command::flags::windows_spawn(
         &req,
         *cmd.flags_request(),
-        is_root,
+        spawn_env.is_root,
         crate::command::flags::SpawnBackend::Raw,
     )?;
-    let marker_env = plan.marker_env;
+    debug_assert_eq!(plan.marker_env, spawn_env.marker_env, "the marker decision drifted");
     if req.mode.is_some() {
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    let env_block = sync_raw::with_marker(child_env, &base, cmd.env_ops(), marker_env).block()?;
+    let env_block = spawn_env.child_env.into_block()?;
     let cwd_w = cmd.cwd().map(|c| sync_raw::to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.
@@ -363,7 +359,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // park and reap in between.
     let prepared = crate::containment::Prepared {
         mode: req.mode,
-        is_root,
+        is_root: spawn_env.is_root,
         // From the COMPOSED word, which carries the caller's flags as well as the containment
         // decision: a derivation reading only the containment half would report an in-process
         // route for a child this spawn deliberately put in another console.

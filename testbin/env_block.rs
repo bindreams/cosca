@@ -64,3 +64,73 @@ pub fn spawn(backend: &str, ops: &[String]) {
     );
     std::io::stdout().write_all(&out.stdout).unwrap();
 }
+
+/// Run `spawn-dump-env-block <backend>` (no ops) in a child whose environment block is exactly
+/// `entries`, in order. std's `Command` cannot build such a block (it dedupes, sorts and drops
+/// `=`-less entries), so this calls `CreateProcessW` itself. Relays the child's exit code.
+pub fn spawn_with_block(backend: &str, entries: &[String]) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    use windows::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+
+    let mut block: Vec<u16> = entries.iter().flat_map(|e| e.encode_utf16().chain([0])).collect();
+    block.push(0);
+    let exe: Vec<u16> = std::env::current_exe()
+        .expect("current_exe")
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut cmdline: Vec<u16> = format!("cosca_testbin spawn-dump-env-block {backend}\0")
+        .encode_utf16()
+        .collect();
+    let mut si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        ..Default::default()
+    };
+    // SAFETY: querying and marking this process's own std handles inheritable; this process is
+    // single-threaded and spawns nothing else.
+    unsafe {
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE).expect("stdin");
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE).expect("stdout");
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE).expect("stderr");
+        for h in [si.hStdInput, si.hStdOutput, si.hStdError] {
+            if !h.is_invalid() && !h.0.is_null() {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT).expect("mark inheritable");
+            }
+        }
+    }
+    let mut pi = PROCESS_INFORMATION::default();
+    // SAFETY: every pointer is live for the call; `cmdline` is mutable and NUL-terminated; `block`
+    // is a double-NUL-terminated UTF-16 block, as CREATE_UNICODE_ENVIRONMENT declares.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(exe.as_ptr()),
+            Some(PWSTR(cmdline.as_mut_ptr())),
+            None,
+            None,
+            true,
+            CREATE_UNICODE_ENVIRONMENT,
+            Some(block.as_ptr().cast()),
+            PCWSTR::null(),
+            &si,
+            &mut pi,
+        )
+    }
+    .expect("CreateProcessW");
+    let mut code = 0u32;
+    // SAFETY: `pi`'s handles are owned here and closed once.
+    unsafe {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        GetExitCodeProcess(pi.hProcess, &mut code).expect("GetExitCodeProcess");
+        CloseHandle(pi.hThread).expect("close thread");
+        CloseHandle(pi.hProcess).expect("close process");
+    }
+    std::process::exit(code as i32);
+}

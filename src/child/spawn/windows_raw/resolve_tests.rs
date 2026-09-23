@@ -4,11 +4,24 @@ use std::ffi::OsString;
 
 /// Resolve against the PATH `ops` give a child of this process, as a spawn does.
 fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
-    resolve_executable(exe, cmd_cwd, &ChildEnv::capture(&env_snapshot(), ops))
+    resolve_executable(exe, cmd_cwd, &ChildEnv::capture(&EnvSnapshot::read().unwrap(), ops))
+}
+
+/// A snapshot holding `base` in order.
+fn snapshot(base: &[(OsString, OsString)]) -> EnvSnapshot {
+    let mut block = Vec::new();
+    for (key, val) in base {
+        block.extend(key.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(val.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    EnvSnapshot::from_block(block)
 }
 
 fn build_env_block_from(base: &[(OsString, OsString)], ops: &[EnvOp]) -> Result<Vec<u16>, Error> {
-    ChildEnv::capture(base, ops).block()
+    ChildEnv::capture(&snapshot(base), ops).into_block()
 }
 
 /// The name was accepted and searched, and nothing matched — `NotFound`, never a shape refusal.
@@ -629,20 +642,47 @@ fn an_inherited_key_keeps_its_casing() {
 // One environment snapshot per spawn =====
 
 /// `CreateProcessW` keeps duplicate names as given, and `GetEnvironmentVariableW` returns the first.
-/// Resolution must search the `PATH` the block gives the child, so both read one capture.
+/// Resolution must search the `PATH` the child will read from its block.
 #[test]
 fn resolution_reads_the_path_the_block_carries() {
     let base = [
         (OsString::from("PATH"), OsString::from("a")),
         (OsString::from("Path"), OsString::from("b")),
     ];
-    for ops in [vec![], vec![EnvOp::Set("K".into(), "1".into())]] {
-        let env = ChildEnv::capture(&base, &ops);
-        let block = block_entries(&env.block().unwrap());
-        let in_block = block.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_os_str());
-        assert_eq!(env.path(), in_block, "{ops:?}");
-        assert_eq!(env.path(), Some(OsStr::new("b")), "{ops:?}");
+    for (ops, want) in [(vec![], "a"), (vec![EnvOp::Set("K".into(), "1".into())], "b")] {
+        let env = ChildEnv::capture(&snapshot(&base), &ops);
+        let path = env.path().map(OsStr::to_os_string);
+        let block = EnvSnapshot::from_block(env.into_block().unwrap());
+        assert_eq!(path, block.var(OsStr::new("PATH")), "{ops:?}");
+        assert_eq!(path.as_deref(), Some(OsStr::new(want)), "{ops:?}");
     }
+}
+
+/// With no ops the child gets the snapshot byte for byte, as a std child inheriting a NULL block
+/// gets this process's: duplicates and entries with no `=` included.
+#[test]
+fn empty_ops_pass_the_snapshot_verbatim() {
+    let block: Vec<u16> = ["Path=a", "JUNK", "PATH=b", "=C:=C:\\x"]
+        .iter()
+        .flat_map(|e| e.encode_utf16().chain([0]))
+        .chain([0])
+        .collect();
+    let env = ChildEnv::capture(&EnvSnapshot::from_block(block.clone()), &[]);
+    assert_eq!(env.into_block().unwrap(), block);
+}
+
+/// With ops the base is the snapshot parsed as `vars_os` parses it: `=`-less entries dropped,
+/// duplicates merged under their first name with their last value.
+#[test]
+fn ops_rebuild_from_the_snapshot_as_std_does() {
+    let block: Vec<u16> = ["Path=a", "JUNK", "PATH=b"]
+        .iter()
+        .flat_map(|e| e.encode_utf16().chain([0]))
+        .chain([0])
+        .collect();
+    let env = ChildEnv::capture(&EnvSnapshot::from_block(block), &[EnvOp::Set("K".into(), "1".into())]);
+    let got = block_entries(&env.into_block().unwrap());
+    assert_eq!(got, [("K".into(), "1".into()), ("Path".into(), "b".into())]);
 }
 
 /// Resolution searches the snapshot it is given, not a fresh read of this process's environment.
@@ -651,16 +691,10 @@ fn resolution_searches_the_given_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_snapshot.exe")).unwrap();
     let base = [(OsString::from("PATH"), dir.path().as_os_str().to_os_string())];
-    let got = resolve_executable(Path::new("sp_snapshot"), None, &ChildEnv::capture(&base, &[])).unwrap();
+    let env = ChildEnv::capture(&snapshot(&base), &[]);
+    let got = resolve_executable(Path::new("sp_snapshot"), None, &env).unwrap();
     assert_eq!(
         got.canonicalize().unwrap(),
         dir.path().join("sp_snapshot.exe").canonicalize().unwrap()
     );
-}
-
-#[test]
-fn snapshot_has_matches_names_as_windows_does() {
-    let base = [(OsString::from("__cosca_group_root"), OsString::new())];
-    assert!(snapshot_has(&base, "__COSCA_GROUP_ROOT"));
-    assert!(!snapshot_has(&base, "__COSCA_GROUP_ROOTS"));
 }

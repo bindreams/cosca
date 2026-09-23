@@ -19,7 +19,7 @@ use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREAT
 /// The key keeps the name it was created with. A map insert of an equal key keeps the existing
 /// key, so a map keeps the first name it saw for each variable, as std's does.
 #[derive(Clone, Debug)]
-pub(super) struct EnvKey {
+pub(crate) struct EnvKey {
     name: OsString,
     wide: Vec<u16>,
 }
