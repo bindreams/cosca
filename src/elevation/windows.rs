@@ -444,33 +444,18 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // `crate::child::spawn::batch_refusal`; here the `runas` `batfile` association substitutes
     // `lpParameters` into `%*` unescaped, so the injected command runs ELEVATED.
     //
-    // The batch gate reads the caller's STRING, so a token `ShellExecuteEx` REWRITES before opening
-    // is refused first: quoted, a URL (`file:` is percent-decoded), a `shell:`/`::{CLSID}` name,
-    // one starting with `www` (relaunched as `http://www…`), or one holding a `%` — and so is a
-    // `current_dir()` holding a `%` or `"`, which it expands before searching a relative token
-    // there. On what is left, the gate judges the name Win32 resolves the token to — trailing dots
-    // and spaces, `..` collapse, drive and UNC and device roots, and data-stream pieces. See
-    // `shell_file`.
-    //
-    // Then what `ShellExecuteEx` would find by LOOKUP: it does none. The launch is `exefile`
+    // The batch gate judges the name Win32 resolves the token to — trailing dots and spaces, `..`
+    // collapse, drive and UNC and device roots, and data-stream pieces. The launch is `exefile`
     // (`SEE_MASK_CLASSNAME`), which runs `HKCR\exefile\shell\runas\command` (`"%1" %*`) on `lpFile`
-    // as given, skipping `SHELL_FindExecutable` — App Paths, `PathResolveW`, the default-extension
-    // search (Wine `shlexec.c` `SHELL_execute`'s class branch returns before them;
-    // `tests/windows_shell_execute.rs` measures that an HKLM App Paths key redirects a bare name
-    // without the class and not with it). Such a launch finds nothing by a bare name, so the token
-    // must be fully qualified, and it must end in `.exe` or `.com` so `exefile` is the right class.
-    //
-    // What stays open: none of the lookup. A relative or bare token is refused until the image is
-    // resolved before the launch.
+    // as given: no App Paths, no default-extension search, no `%` expansion in `lpFile` or
+    // `lpDirectory` (measured; see `shell_file`). So the only other requirement is a fully
+    // qualified `.exe`/`.com` path with no `"` in it, which also excludes every spelling shell32
+    // rewrites without a class. A relative or bare token is refused until the image is resolved
+    // before the launch.
     let program_path = std::path::Path::new(&program);
-    shell_file::reject_shell_rewrite(program_path)?;
-    if let Some(dir) = cmd.cwd() {
-        shell_file::reject_directory_rewrite(dir)?;
-    }
     crate::child::spawn::reject_batch_path(program_path)?;
     crate::child::spawn::reject_normalised_batch_path(program_path)?;
-    shell_file::reject_non_image(program_path)?;
-    shell_file::reject_not_fully_qualified(program_path)?;
+    shell_file::reject_elevated_program(program_path)?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),

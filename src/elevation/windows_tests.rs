@@ -208,6 +208,25 @@ fn a_clean_unelevated_request_plans_a_launch() {
     assert_eq!(launch.show, SW_SHOWNORMAL);
 }
 
+/// A `%` in `current_dir()` is taken literally by the `exefile` launch (measured), so it is passed
+/// through as given rather than refused.
+#[test]
+fn a_percent_in_current_dir_reaches_lp_directory_literally() {
+    let mut c = Command::new();
+    c.args([r"C:\Windows\System32\whoami.exe"])
+        .current_dir(r"C:\work\%TEMP%")
+        .elevate();
+    let launch = match super::plan_runas(&c, &win_host(false)) {
+        Ok(super::RunasStep::Launch(launch)) => launch,
+        Ok(super::RunasStep::AlreadyElevated) => panic!("an unelevated host must not short-circuit"),
+        Err(e) => panic!("a % in current_dir() must not be refused: {e:?}"),
+    };
+    assert_eq!(
+        launch.dir_w,
+        Some(r"C:\work\%TEMP%".encode_utf16().chain([0]).collect::<Vec<u16>>())
+    );
+}
+
 /// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
 #[test]
 fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
@@ -696,7 +715,7 @@ fn launch_runas_refuses_a_token_shell_execute_rewrites() {
             c.args([probe, "a&calc"]).elevate();
             assert!(
                 is_unsupported(super::plan_runas(&c, &win_host(elevated)).map(|_| ())),
-                "elevated={elevated}: {probe:?} is rewritten by ShellExecuteEx before it is opened"
+                "elevated={elevated}: {probe:?} is not a fully qualified image path without a quote"
             );
         }
     }
