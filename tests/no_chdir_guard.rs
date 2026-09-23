@@ -136,7 +136,7 @@ fn no_test_mutates_the_process_cwd() {
 
     for (i, (file, text, expected)) in ALLOWLIST.iter().enumerate() {
         let found = allowlist_hits[i];
-        if found == 0 || found > *expected {
+        if found != *expected {
             offenders.push(format!(
                 "allowlist entry {file}:{text:?} expects exactly {expected} match(es), found {found}"
             ));
