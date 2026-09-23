@@ -277,9 +277,9 @@ impl CgroupLeaf {
         Ok(is_at_or_under(path, leaf))
     }
 
-    /// Fail a spawn whose membership cannot be decided: kill the child as a group, which ends its
-    /// chance to enter the leaf and makes its report final, then apply the module's report
-    /// contract — kill through the leaf only on `Placed`.
+    /// Fail a spawn whose membership cannot be decided: kill the child as a group and shut the
+    /// channel, which end its chance to enter the leaf and make its report final, then apply the
+    /// module's report contract — kill through the leaf only on `Placed`.
     ///
     /// The group, not only the pid: between the last look at the report and the kill, the child
     /// can report, exec and fork, and its descendants start in its process group, outside the
@@ -291,7 +291,7 @@ impl CgroupLeaf {
     /// process-group id, while any task holds it, and the unreaped child does. A child something
     /// else already reaped is detected and never signalled; one reaped between that check and the
     /// kill — only possible when the precondition is broken — is not.
-    pub(super) fn fail_closed(&mut self, pid: u32, mut channel: ReportChannel, why: &str) -> crate::error::Error {
+    pub(super) fn fail_closed(&mut self, pid: u32, channel: ReportChannel, why: &str) -> crate::error::Error {
         use nix::sys::wait::{waitid, Id, WaitPidFlag};
 
         let child = Pid::from_raw(i32::try_from(pid).expect("a spawned child's pid is a positive i32"));
@@ -347,8 +347,12 @@ impl CgroupLeaf {
         } else {
             Signalled::NotOurs
         };
-        // The child has exited or exec'd, so its report is final.
-        self.entered = channel.read_final() == PlacementReport::Placed;
+        // Shut, then read: a send after the read fails with no *proceed* queued, and its child exits
+        // without `exec` — so the report read is final, whether or not the kill landed.
+        self.entered = channel.shut().placement() == PlacementReport::Placed;
+        // Test-only fault seam: a child's send landing after the read.
+        #[cfg(test)]
+        fault::run_after_final_read();
         // Only a placed child's tree is in the leaf; `cgroup.kill` needs no credential to kill it.
         let through_leaf = self.entered.then(|| {
             self.hard_kill()

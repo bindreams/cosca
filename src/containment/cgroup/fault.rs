@@ -1,5 +1,6 @@
 use std::cell::Cell;
 thread_local! {
+    static AFTER_FINAL_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
@@ -138,6 +139,17 @@ pub(crate) fn set_force_child_pidfd_failure(on: bool) {
 }
 pub(crate) fn take_force_child_pidfd_failure() -> bool {
     FORCE_CHILD_PIDFD_FAILURE.with(|f| f.replace(false))
+}
+
+/// Run `hook` in the NEXT `fail_closed` on this thread, once it has read the child's final report
+/// and before it acts on it — the window a late send must not slip through unread.
+pub(crate) fn set_after_final_read(hook: impl FnOnce() + 'static) {
+    AFTER_FINAL_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn run_after_final_read() {
+    if let Some(hook) = AFTER_FINAL_READ.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// Run `hook` in the NEXT abandonment on this thread, after it has read what the child sent and

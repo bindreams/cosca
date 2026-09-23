@@ -1771,6 +1771,59 @@ fn fail_closed_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when
     child.wait().expect("reap the child");
 }
 
+/// A child `fail_closed` may not signal, and whose report it has read, can still send: its report
+/// is final only because nothing it sends later is accepted. Its late intent fails, so it exits with
+/// `ABANDONED_EXIT` before touching the leaf, rather than enter a leaf the spawn was told it had not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_send_after_fail_closed_read_the_report_is_refused() {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-fail-closed-late-send");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let channel = leaf.report.take().expect("the channel");
+    let slot = channel.slot();
+    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
+    let procs_fd = procs_write.into_raw_fd();
+    let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
+    let gate = gate_read.as_raw_fd();
+    let pid = fork_running(move || {
+        block_on(gate);
+        // SAFETY: this child's inherited copies of the channel's ends and the pipe.
+        let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
+    });
+    // SAFETY: the parent's own copy, closed once.
+    unsafe { libc::close(procs_fd) };
+    drop(gate_read);
+
+    crate::containment::cgroup::fault::set_force_signal_denied(true);
+    crate::containment::cgroup::fault::set_after_final_read(move || {
+        let mut gate_write = gate_write;
+        std::io::Write::write_all(&mut gate_write, b"x").expect("release the child");
+        // Its exit, not its reaping: the test reaps it below.
+        let pid = rustix::process::Pid::from_raw(pid as i32).expect("a positive pid");
+        while let Err(rustix::io::Errno::INTR) = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+        ) {}
+    });
+    let err = leaf.fail_closed(pid, channel, "the test cannot decide").to_string();
+    assert!(err.contains("could not be signalled"), "got {err}");
+
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
+    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
+    assert!(libc::WIFEXITED(status), "status {status:#x}");
+    assert_eq!(libc::WEXITSTATUS(status), crate::containment::cgroup::ABANDONED_EXIT);
+    assert_eq!(
+        std::io::read_to_string(procs_read).expect("read the pipe"),
+        "",
+        "no placement write"
+    );
+}
+
 /// After killing through a placed child's leaf, a drain `fail_closed` cannot watch is reported, as
 /// `Drop`'s own kill-and-drain reports it — never dropped. A `cgroup.events` that is a directory
 /// opens but cannot be read, so the watch fails for real.
