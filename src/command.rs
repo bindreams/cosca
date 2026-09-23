@@ -249,7 +249,7 @@ impl Command {
     /// deliberately excluded from the exact-match allowlist: resolving to a script is a
     /// separate, not-yet-implemented feature (planned as its own follow-up), not a
     /// judgement that scripts are unsafe — this crate's existing, separate batch-path
-    /// rejection ([CVE-2024-24576](https://nvd.nist.gov/vuln/detail/CVE-2024-24576)) is unaffected either way.
+    /// rejection (CVE-2024-24576) is unaffected either way.
     ///
     /// # Error kinds
     ///
@@ -280,9 +280,8 @@ impl Command {
     /// exposes. The batch check reads the name as written, so `C:\t\setup.bat.` (trailing
     /// dot), `C:\t\setup.bat ` (one trailing space) and `C:\t\.bat` pass it, and `.elevate()`
     /// can still run the batch file through `cmd.exe` with its arguments unescaped
-    /// ([CVE-2024-24576](https://nvd.nist.gov/vuln/detail/CVE-2024-24576)) — whether through
-    /// `ShellExecuteEx` or, from an already-elevated caller, through `CreateProcessW`.
-    /// [`raw_executable`](Self::raw_executable) refuses all three.
+    /// (CVE-2024-24576) — whether through `ShellExecuteEx` or, from an already-elevated caller,
+    /// through `CreateProcessW`. [`raw_executable`](Self::raw_executable) refuses all three.
     ///
     /// [`raw_executable`](Self::raw_executable) is the unresolved alternative; calling either
     /// replaces the other.
@@ -328,9 +327,8 @@ impl Command {
     /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
     /// with [`std::io::ErrorKind::InvalidInput`] on every platform.
     ///
-    /// On Windows a `.bat`/`.cmd` is refused with [`Error::Unsupported`]
-    /// ([CVE-2024-24576](https://nvd.nist.gov/vuln/detail/CVE-2024-24576)), judged on the name
-    /// Win32 loads, so `setup.bat.` and `C:\t\.bat` are refused too.
+    /// On Windows a `.bat`/`.cmd` is refused with [`Error::Unsupported`] (CVE-2024-24576), judged
+    /// on the name Win32 loads, so `setup.bat.` and `C:\t\.bat` are refused too.
     ///
     /// # Elevation
     ///
