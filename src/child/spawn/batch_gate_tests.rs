@@ -103,8 +103,15 @@ fn is_batch_program_on_windows_refuses_every_stream_piece() {
             "{probe:?} hides the batch name in the first stream piece"
         );
     }
-    // A middle piece: neither first nor last.
+    // After a drive prefix, which is stripped: `x.bat` is the FIRST piece here.
     assert!(super::is_batch_program("a:x.bat:s"));
+    // A middle piece: neither first nor last, with and without a drive prefix before it.
+    for probe in ["a:x.exe:x.bat:s", "x.exe:x.bat:s"] {
+        assert!(
+            super::is_batch_program(probe),
+            "{probe:?} hides the batch name in a middle piece"
+        );
+    }
     // The stream name alone is the batch file; the file it hangs off is not.
     for probe in ["x.exe:payload.bat", "notepad.exe:p.cmd", "tool:go.bat", "x.txt:a.bat"] {
         assert!(
