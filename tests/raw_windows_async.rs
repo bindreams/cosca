@@ -73,9 +73,8 @@ async fn async_fd3_pipe_in_feeds_child() {
 
 /// Async twin of the sync `argv_only_fd3_routes_through_the_raw_backend_and_works`: an argv-only
 /// tokio `Command` (no `.executable()`) that maps fd >= 3 still routes through the ASYNC raw
-/// backend. std has no way to hand a child fd >= 3 on Windows at all: `spawn_unelevated`'s fd >= 3
-/// collection loop is `#[cfg(unix)]`-gated (`src/child/spawn.rs`), so fd 3 actually delivering the
-/// marker bytes below is itself proof this went through the raw backend.
+/// backend. Same proof shape as the sync `argv_only_fd3_routes_through_the_raw_backend_and_works`
+/// (see its doc for why fd 3 delivery proves raw-backend routing).
 #[tokio::test]
 async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut c = cosca::tokio::Command::new();
@@ -93,10 +92,9 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
 /// Async twin of the sync `commandline_only_fd3_routes_through_the_raw_backend_and_works`: a tokio
 /// `Command` built with `.commandline(...)` instead of `.args(...)`, no `.executable()`, that maps
 /// fd >= 3 — exercising `program_token`'s `CommandLine` arm (`first_token_wide`) through the ASYNC
-/// raw backend, a different code path from the argv-only test above. Same proof shape: std has no
-/// way to hand a child fd >= 3 on Windows at all (`spawn_unelevated`'s fd >= 3 collection loop is
-/// `#[cfg(unix)]`-gated, `src/child/spawn.rs`), so fd 3 delivering the marker bytes below is itself
-/// proof this went through the raw backend via the `CommandLine` token.
+/// raw backend, a different code path from the argv-only test above. Same proof shape as
+/// `argv_only_fd3_routes_through_the_raw_backend_and_works` (see its doc for why fd 3 delivery
+/// proves raw-backend routing).
 #[tokio::test]
 async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);

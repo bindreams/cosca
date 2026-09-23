@@ -366,10 +366,8 @@ fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
 /// instead of `.args(...)`) that maps fd >= 3: a different code path from the argv-only test
 /// above — `program_token` re-derives its token via `first_token_wide` on this arm rather than
 /// reusing `Argv`'s `argv.first()` (see `program_token`'s doc in `src/child/spawn/windows_raw.rs`).
-/// Same proof shape as above: std has no way to hand a child fd >= 3 on Windows at all
-/// (`spawn_unelevated`'s fd >= 3 collection loop is `#[cfg(unix)]`-gated, `src/child/spawn.rs`), so
-/// fd 3 delivering the marker bytes below is itself proof this went through the raw backend via
-/// the `CommandLine` token.
+/// Same proof shape as `argv_only_fd3_routes_through_the_raw_backend_and_works` (see its doc for
+/// why fd 3 delivery proves raw-backend routing).
 #[test]
 fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
