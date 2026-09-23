@@ -215,6 +215,20 @@ fn a_relative_program_is_rejected_so_roots_path_never_chooses_the_binary() {
 }
 
 #[test]
+fn an_elevated_exact_program_that_names_no_file_is_refused() {
+    for n in ["", ".", "dir/"] {
+        let mut c = Command::new();
+        c.raw_executable(n)
+            .args([n])
+            .elevation_auth(crate::elevation::Auth::Gui);
+        match gate(&c) {
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!("{n:?} names no file and must be Io(InvalidInput), got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
     // `/usr/bin/id` must be accepted and `C:\tool.exe` rejected on EVERY host —
     // `Path::is_absolute` gets both backwards on Windows.
