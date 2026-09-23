@@ -243,11 +243,11 @@ const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0
 ///   elevated program acts on.
 ///
 /// The raw `CreateProcessW` backend already refuses all three via its own NUL checks, so this
-/// closes the interior-NUL divergence between the elevated and unelevated paths. A separate,
-/// still-open divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse —
-/// both by an extension this gate never sees (PATHEXT completion of an extension-less token) and
-/// by other registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). Neither is
-/// closed here; see the batch gate and the image allowlist in [`plan_runas`].
+/// closes the interior-NUL divergence between the elevated and unelevated paths. A separate
+/// divergence is `ShellExecuteEx` RESOLVING a program `CreateProcessW` would refuse — both by an
+/// extension this gate never sees (PATHEXT completion of an extension-less token) and by other
+/// registered `runas` associations (`.lnk`, `.vbs`/`.js`/`.wsf`, `.msc`, …). Neither is closed
+/// here; the image allowlist in [`plan_runas`] closes both.
 ///
 /// Fallible rather than a check at each call site, so the unchecked sink does not exist: every
 /// string field of the `SHELLEXECUTEINFOW` is built here. `what` names the field for the error.
@@ -336,8 +336,9 @@ fn elevated_program(cmd: &Command, argv: &[OsString]) -> Result<OsString, Error>
     // relative `lpFile`. See `absolutise_exact`'s doc for why this sink needs that and
     // `CreateProcessW` does not, and for the `PATHEXT` residue [`plan_runas`]'s allowlist covers.
     //
-    // A `Search` token is NOT resolved here yet: `executable()` on the elevated path still reaches
-    // `ShellExecuteEx`'s own search unresolved, as `executable()`'s doc says.
+    // A `Search` token is NOT resolved here: `executable()` on the elevated path reaches
+    // `ShellExecuteEx`'s own search unresolved, as `executable()`'s doc says, and
+    // [`plan_runas`]'s allowlist bounds what that search can pick.
     //
     // Completion runs BEFORE [`plan_runas`]'s `wide_nul("program path", ..)`, so it must not blunt
     // that field's NUL attribution: `absolutise_exact` refuses an interior NUL itself, under the
@@ -437,26 +438,22 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // `crate::child::spawn::batch_refusal`; here the `runas` `batfile` association substitutes
     // `lpParameters` into `%*` unescaped, so the injected command runs ELEVATED.
     //
-    // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE. It therefore does NOT
-    // close the batch vector. Two of the open surfaces are `wide_nul`'s doc's to name — PATHEXT
-    // completion of an extension-less token, and the other registered `runas` associations. On
-    // the consent path's `Exact` arm the image allowlist below the planner closes both for a name
-    // not ending in `.exe`/`.com`. The `Search` arm's stay open in this tree: #146 closes them for
-    // every elevated token, `Search` included, by launching with `SEE_MASK_CLASSNAME`/`exefile`
-    // (no lookup, no PATHEXT) and requiring a fully qualified `.exe`/`.com` program, and #139 then
-    // restores bare names by resolving them first.
+    // This gate reads the caller's STRING; `ShellExecuteEx` resolves the FILE, so two surfaces
+    // get past it — PATHEXT completion of an extension-less token, and the other registered
+    // `runas` associations (see `wide_nul`'s doc). The image allowlist below the planner closes
+    // both on the consent path, for every arm.
     //
     // The third is token NORMALIZATION before the load. Win32 strips trailing dots and spaces and
     // resolves the token as a path, so `setup.bat.`, `setup.bat ` (one trailing space) and
     // `C:\tools\.bat` all reach a batch file while `Path::extension()` reads `None` or something
-    // that is not `bat`. On the `Exact` arm `program` IS Win32's normalisation, and
-    // `reject_normalised_batch_path` refuses all three — as `image_for` does for the raw backend's
-    // unelevated `raw_executable()`. The `Search` arm's token is not normalised here, so the class
-    // stays open for it.
+    // that is not `bat`. `reject_normalised_batch_path` refuses all three, as `image_for` does for
+    // the raw backend's unelevated `raw_executable()`. On the `Exact` arm `program` IS Win32's
+    // normalisation. On the others it is the token as written, and for a token the allowlist
+    // admits the two agree on the final component: one ending in `.exe`/`.com` has no trailing
+    // dot or space to strip. It is still the only batch gate that reads a stream piece
+    // (`setup.bat:.exe`).
     crate::child::spawn::reject_batch_path(std::path::Path::new(&program))?;
-    if let Some(ExecutableSpec::Exact(_)) = cmd.executable_spec() {
-        crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
-    }
+    crate::child::spawn::reject_normalised_batch_path(std::path::Path::new(&program))?;
 
     match host.plan(Privilege::Elevated, backend, auth) {
         Transition::RunAsIs => return Ok(RunasStep::AlreadyElevated),
@@ -468,12 +465,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
         Transition::ElevateWindows { .. } => {}
     }
 
-    // Below the short-circuit: an already-elevated caller re-spawns through `CreateProcessW`,
-    // which assumes no default extension, so an extensionless image is not plantable there. The
-    // `Search` arm is not gated here; see the batch gate's comment above for what closes it.
-    if let Some(ExecutableSpec::Exact(_)) = cmd.executable_spec() {
-        crate::resolve::reject_unloadable_image(std::path::Path::new(&program), true)?;
-    }
+    // Every arm, since `ShellExecuteEx` applies PATHEXT to any `lpFile`. Below the short-circuit:
+    // an already-elevated caller re-spawns through `CreateProcessW`, which assumes no default
+    // extension, so an extensionless image is not plantable there.
+    crate::resolve::reject_unloadable_image(std::path::Path::new(&program), true)?;
 
     Ok(RunasStep::Launch(Box::new(RunasLaunch {
         file_w,
