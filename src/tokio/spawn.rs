@@ -360,6 +360,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             let _guard = crate::child::spawn::spawn_lock();
             // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
             // the wrong domain for this attribution.
+            //
+            // tokio can fail this spawn after its fork succeeded (its `build_child`: stdio
+            // registration, its pidfd reaper, its signal driver), dropping the child neither killed
+            // nor reaped, and it returns no pid. A cgroup leaf is still killed through when
+            // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
+            // other containment — a process group, a session, a tree walk, none, or a spawn that
+            // degraded — nothing reaches the child, and it keeps running.
             let spawned = tcmd.spawn().map_err(Error::Io);
             #[cfg(windows)]
             let spawned =

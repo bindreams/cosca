@@ -103,6 +103,11 @@ impl Command {
     /// Contain the child's tree with the strongest available mechanism. The same Linux
     /// precondition applies as for [`Command::contain`](crate::Command::contain): nothing else
     /// in the process may reap the child.
+    ///
+    /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
+    /// reaped, without reporting its pid. Only a child contained in a cgroup leaf
+    /// ([`Containment::CgroupV2`](crate::Containment::CgroupV2)) is still killed then; under any
+    /// other containment it keeps running.
     pub fn contain(&mut self) -> &mut Command {
         self.inner.contain();
         self
