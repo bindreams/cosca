@@ -21,8 +21,7 @@ fn ntfs_stream_names_splits_off_every_stream_then_trims_space_and_dot() {
         ("x.exe:payload.bat:", vec!["x.exe", "payload.bat", ""]),
         // A leading drive prefix is a drive, not a stream separator, so it is not among the names
         // yielded. No verdict rides on that today — a drive is one UTF-16 unit and so is never
-        // a batch name — but it did when only the first piece was read, which is how `C:x.bat:s`
-        // came to be allowed while `x.bat:s` was refused.
+        // a batch name.
         ("C:x.bat:s", vec!["x.bat", "s"]),
         ("c:x.bat", vec!["x.bat"]),
         // Two letters before the colon is a file name, not a drive.

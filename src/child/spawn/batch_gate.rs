@@ -321,8 +321,8 @@ pub(super) fn is_batch_program(file_name: &str) -> bool {
 /// the gate refuses every one rather than guess. And a path whose final component drops out
 /// resolves to a name with a trailing separator — `x.bat\...` is `…\x.bat\`, which std's
 /// `has_bat_extension` does NOT read as a batch file — yet the gate judges the exposed `x.bat` and
-/// refuses. Moving resolution ahead of the gate (#143, #156) collapses both into a suffix test on
-/// the resolved path and leaves nothing left to predict.
+/// refuses. Moving resolution ahead of the gate collapses both into a suffix test on the resolved
+/// path and leaves nothing left to predict.
 pub(super) fn win32_effective_file_name(prog: &std::path::Path, interior: Interior) -> Option<String> {
     let text = prog.as_os_str().to_string_lossy();
     // Each surviving component, paired with whether it is the path's FIRST segment — the only
@@ -479,9 +479,7 @@ pub(super) fn is_batch_by_shell(name: &str) -> bool {
 /// A leading drive prefix (`C:`, or any one UTF-16 unit and `:`; see [`drive_prefix_len`]) is a
 /// drive, not a separator. Skipping it changes NO VERDICT — the only piece it suppresses is one
 /// UTF-16 unit, which is never a batch name — and it is kept for the contract rather than the
-/// verdict: every piece this yields is a name Win32 would open, and a drive is not one. The skip
-/// WAS load-bearing when only the first piece was read, which is how `C:x.bat:s` came to be
-/// allowed while `x.bat:s` was refused.
+/// verdict: every piece this yields is a name Win32 would open, and a drive is not one.
 pub(super) fn ntfs_stream_names(name: &str) -> impl Iterator<Item = &str> {
     let rest = match drive_prefix_len(name) {
         Some(len) => &name[len..],

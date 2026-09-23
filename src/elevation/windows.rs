@@ -507,7 +507,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     // redirect to a batch file (HKCU is writable by the user); and WHICH image a relative token
     // loads — the search in `lpDirectory` and on the path, and ReactOS's substitution of the drive
     // root or Windows directory for a missing `lpDirectory` — which is always an `.exe` or `.com`,
-    // though not necessarily the one meant, until the image is resolved before the launch (#139).
+    // though not necessarily the one meant, until the image is resolved before the launch.
     let program_path = std::path::Path::new(&program);
     shell_file::reject_shell_rewrite(program_path)?;
     if let Some(dir) = cmd.cwd() {
