@@ -112,8 +112,7 @@ fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
 }
 
 /// `entries` as a child receives them from the OS. On ARM64 Windows the OS prepends
-/// `PROCESSOR_ARCHITECTURE=ARM64` to a child's block that lacks it (measured on the windows/arm64
-/// lane, run 35811227749); on x64 it adds nothing (the windows/amd64 lane of the same run).
+/// `PROCESSOR_ARCHITECTURE=ARM64` to a child's block that lacks it; on x64 it adds nothing.
 fn as_the_os_delivers(entries: &[&str]) -> Vec<OsString> {
     let mut want: Vec<OsString> = entries.iter().map(OsString::from).collect();
     let has_arch = entries
