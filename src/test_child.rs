@@ -1,42 +1,118 @@
 //! Test-only child processes shared across the crate's unit tests.
 
-/// RAII guard for a unit test that must mutate the process's (global) current directory: restores
-/// it on drop, including mid-unwind, so a panicking assertion never leaves the (multithreaded)
-/// test binary in a corrupted cwd for every other test that runs afterward.
+/// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
+/// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
+/// cwd is `cwd` — proving whatever the fixture's body proves about a process's REAL cwd without
+/// ever mutating THIS (shared, multithreaded) test binary's own cwd, which every other
+/// concurrently running test in this binary would otherwise race. `Command::current_dir` sets the
+/// CHILD's cwd before its own `exec`/`CreateProcessW`, so no window exists where this process's
+/// cwd is anything other than what it always was.
 ///
-/// The cwd is process-global, so an unguarded `set_current_dir` races every concurrent spawn AND
-/// every other cwd-sensitive test in the same binary. Callers MUST additionally hold
-/// `crate::child::spawn::spawn_lock()` for the guard's whole lifetime, declaring the lock guard
-/// FIRST so it drops LAST (after this restores the cwd). Note precisely what that lock does and
-/// does not buy: it is the lock every spawn's `CreateProcessW`/fork call itself serializes on, but
-/// program *resolution* (`resolve_executable`, which reads `std::env::current_dir()` for the
-/// `cmd_cwd: None` fallback) runs BEFORE that lock is taken — see
-/// `child::spawn::windows_raw::resolve::resolve_executable` and `spawn_raw`. So this pairing
-/// serializes cwd-mutating tests against each other and against most of a concurrent spawn's own
-/// window, but not against another thread's resolution step specifically; there is no stronger
-/// lock in this crate to pair with instead.
+/// `marker_env` is set to `cwd` itself in the child only, so the fixture can both (a) tell this
+/// deliberate re-exec apart from being picked up by an ordinary, unfiltered suite run — where it
+/// must no-op rather than assert against whatever the suite's own ambient cwd happens to be — and
+/// (b) assert its OWN `std::env::current_dir()` against that same value, rather than trusting
+/// that this function's `.current_dir(cwd)` call below actually took effect. Carrying the
+/// directory in the marker, rather than a bare `"1"`, is what lets a fixture catch this helper's
+/// OWN cwd-setting being silently dropped — a mutation that a caller checking only the fixture's
+/// pass/fail outcome cannot otherwise see, since the fixture would still be asserting something
+/// true about *some* directory, just not necessarily the one the parent prepared.
 ///
-/// `Drop` deliberately does NOT `.expect()`/panic on a failed restore: aborting the whole test
-/// binary (a panic during unwinding is panic-in-panic, which aborts the process) would discard
-/// every other test's result along with it — far worse than a stale cwd, which is at least visible
-/// once logged.
-pub(crate) struct RestoreCwd(std::path::PathBuf);
-impl RestoreCwd {
-    /// Captures the CURRENT process cwd to restore later. Call this BEFORE mutating it.
-    pub(crate) fn capture() -> RestoreCwd {
-        RestoreCwd(std::env::current_dir().expect("read the process cwd so it can be restored"))
-    }
+/// Spawns under `spawn_lock()`, matching every other raw `std::process::Command` re-exec of this
+/// test binary (see [`spawn_a_process_that_exits`]'s doc for the macOS fd-marker hazard that
+/// convention guards against).
+///
+/// Panics with the child's captured stdout/stderr on a non-zero exit, i.e. whenever the fixture's
+/// own assertions failed — OR when the child's own libtest banner does not show that exactly the
+/// one intended fixture ran. `--exact <fixture>` naming a test that does not exist (a typo, or a
+/// rename on one side of the caller/fixture pair) makes libtest match ZERO tests and still exit
+/// 0, which a bare `status.success()` check cannot tell apart from "the fixture ran and passed" —
+/// build `fixture` with [`fixture_path!`] rather than a hand-typed string literal, so a mismatch
+/// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
+/// filter; this stdout check is the remaining backstop for whatever that still lets through.
+pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
+    // No `"cosca_unit_tests"` placeholder in slot 0 (that's [`fixture_argv`]'s convention for
+    // `cosca::Command`, see its doc): `std::process::Command` below already supplies its own
+    // argv[0] from `Command::new`'s program path.
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--test-threads=1", "--exact", fixture])
+            .env(marker_env, cwd)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fixture child")
+    };
+    let output = child.wait_with_output().expect("wait for fixture child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "fixture {fixture} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
+        "fixture {fixture} exited 0 but its libtest banner shows something other than exactly \
+         one test run and passed — most likely `--exact {fixture}` matched ZERO tests (a stale \
+         name on one side of a caller/fixture pair), which libtest also exits 0 for:\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+    );
 }
-impl Drop for RestoreCwd {
-    fn drop(&mut self) {
-        if let Err(e) = std::env::set_current_dir(&self.0) {
-            // Best-effort: see the struct doc for why this does not panic.
-            eprintln!(
-                "RestoreCwd: failed to restore the process cwd to {}: {e}",
-                self.0.display()
-            );
-        }
-    }
+
+/// Reads `marker_env`'s value as the directory [`run_fixture_with_cwd`]'s caller prepared, and
+/// returns `None` when it is unset — a fixture is picked up by an ordinary, unfiltered suite run
+/// too, where it must no-op rather than assert against whatever the suite's own ambient cwd
+/// happens to be.
+///
+/// When set, also asserts this fixture's OWN `std::env::current_dir()` actually IS that
+/// directory: `run_fixture_with_cwd`'s `.current_dir(cwd)` call is what is supposed to guarantee
+/// that, but a fixture that never checks it would keep passing even if that call were silently
+/// dropped — an assertion the fixture's OWN body happened to still satisfy in whatever the
+/// process's REAL ambient cwd was, for reasons that have nothing to do with the directory under
+/// test. Every fixture in this file that takes a `marker_env` argument calls this instead of
+/// reading `std::env::current_dir()` directly, so that check is never skippable by omission.
+pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
+    let expected = std::path::PathBuf::from(std::env::var_os(marker_env)?);
+    let actual = std::env::current_dir().expect("current_dir");
+    assert_eq!(
+        actual.canonicalize().expect("canonicalize actual cwd"),
+        expected.canonicalize().expect("canonicalize expected cwd"),
+        "this fixture's OS-level cwd must be the directory run_fixture_with_cwd's caller prepared",
+    );
+    Some(expected)
+}
+
+/// Builds the fully-qualified libtest `--exact` path of the `#[test] fn` named `$name`, for
+/// [`run_fixture_with_cwd`]'s `fixture` argument. Two things tie the call site to the fixture
+/// instead of letting them drift apart as two independently hand-typed strings:
+///
+/// - `let _: fn() = $name;` forces the compiler to resolve `$name` as an item in scope — a typo
+///   or a stale name after a rename is a compile error here, not a filter that silently matches
+///   zero tests at runtime (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
+///   this macro exists to rule out).
+/// - `module_path!()` derives the module portion at compile time, so it can never fall out of
+///   sync with a file move or a module rename; libtest's `--exact` filter never includes the
+///   crate-name component `module_path!()` always carries as its own first segment, hence the
+///   [`strip_crate_prefix`] call.
+macro_rules! fixture_path {
+    ($name:ident) => {{
+        let _: fn() = $name;
+        crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
+    }};
+}
+pub(crate) use fixture_path;
+
+/// Strips the crate-name segment `module_path!()` always carries as its own first component
+/// (e.g. `"cosca::resolve::resolve_tests"`), since libtest's `--exact` filter never includes it
+/// (e.g. `"resolve::resolve_tests"`). Panics if `path` does not start with that segment, which
+/// would mean `module_path!()`'s documented contract no longer holds.
+pub(crate) fn strip_crate_prefix(path: &'static str) -> &'static str {
+    let prefix = concat!(env!("CARGO_PKG_NAME"), "::");
+    path.strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("{path:?} does not start with {prefix:?} — module_path!()'s contract changed"))
 }
 
 /// A child that exits promptly and needs no external binary: this same test binary, run

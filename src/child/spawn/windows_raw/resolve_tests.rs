@@ -185,18 +185,34 @@ fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
 fn resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_b1_fallback.exe")).unwrap();
-    let want = dir.path().join("sp_b1_fallback.exe");
 
     // `cmd_cwd: None` mirrors an unset `Command::cwd()` — the doc says that means "the parent's",
     // i.e. the real process cwd, so the `None` fallback must still reach it rather than resolving
-    // nothing. Exercising that fallback needs an actual process-cwd mutation, which is
-    // process-global: serialize against `spawn_lock()` (see `crate::test_child::RestoreCwd`'s doc
-    // for exactly what that lock does and does not buy) and restore via `RestoreCwd`'s `Drop`,
-    // declared AFTER the lock guard so it runs — and un-does the mutation — BEFORE the lock
-    // releases, even if an assertion below panics.
-    let _guard = crate::child::spawn::spawn_lock();
-    let _restore = crate::test_child::RestoreCwd::capture();
-    std::env::set_current_dir(dir.path()).unwrap();
+    // nothing. See `crate::resolve::resolve_tests::empty_path_elements_are_skipped`'s doc for why
+    // exercising that needs a re-exec'd child.
+    crate::test_child::run_fixture_with_cwd(
+        crate::test_child::fixture_path!(fixture_resolve_executable_falls_back_to_process_cwd),
+        dir.path(),
+        FIXTURE_RESOLVE_FALLBACK_MARKER,
+    );
+}
+
+const FIXTURE_RESOLVE_FALLBACK_MARKER: &str = "COSCA_FIXTURE_RESOLVE_FALLBACK";
+
+/// The child half of [`resolve_executable_falls_back_to_the_process_cwd_when_no_cwd_is_given`].
+/// Reconstructs `want` from its own (already-`dir.path()`) cwd rather than receiving it from the
+/// parent, since the two are guaranteed equal by construction. Mirrors
+/// `crate::resolve::resolve_tests::fixture_empty_path_elements_are_skipped`'s shape.
+#[test]
+fn fixture_resolve_executable_falls_back_to_process_cwd() {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RESOLVE_FALLBACK_MARKER) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    let want = cwd.join("sp_b1_fallback.exe");
+    assert!(
+        want.is_file(),
+        "the parent must have planted `sp_b1_fallback.exe` here: {want:?}"
+    );
     let got = resolve_executable(std::path::Path::new("./sp_b1_fallback.exe"), None, &[]);
 
     assert_eq!(got.unwrap().canonicalize().unwrap(), want.canonicalize().unwrap());
