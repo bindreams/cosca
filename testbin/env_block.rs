@@ -35,7 +35,7 @@ pub fn dump() {
 }
 
 /// Spawn `dump-env-block` through cosca's `backend` (`raw` or `std`) after replaying `ops`, and
-/// relay its output. An op is `set:KEY=VAL`, `remove:KEY` or `clear`.
+/// relay its output. An op is `set:KEY=VAL`, `remove:KEY`, `clear`, or `contain`.
 pub fn spawn(backend: &str, ops: &[String]) {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = cosca::Command::new();
@@ -46,7 +46,9 @@ pub fn spawn(backend: &str, ops: &[String]) {
         other => panic!("unknown backend {other:?}"),
     };
     for op in ops {
-        if op == "clear" {
+        if op == "contain" {
+            cmd.contain();
+        } else if op == "clear" {
             cmd.env_clear();
         } else if let Some(key) = op.strip_prefix("remove:") {
             cmd.env_remove(key);
@@ -65,10 +67,10 @@ pub fn spawn(backend: &str, ops: &[String]) {
     std::io::stdout().write_all(&out.stdout).unwrap();
 }
 
-/// Run `spawn-dump-env-block <backend>` (no ops) in a child whose environment block is exactly
-/// `entries`, in order, and relay its exit code.
-pub fn spawn_with_block(backend: &str, entries: &[String]) {
-    let code = create_with_block(entries, &format!("spawn-dump-env-block {backend}")).expect("CreateProcessW");
+/// Run `spawn-dump-env-block <dump_args>` in a child whose environment block is exactly `entries`,
+/// in order, and relay its exit code. `dump_args` is the backend and any ops, space-separated.
+pub fn spawn_with_block(dump_args: &str, entries: &[String]) {
+    let code = create_with_block(entries, &format!("spawn-dump-env-block {dump_args}")).expect("CreateProcessW");
     std::process::exit(code as i32);
 }
 

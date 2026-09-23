@@ -14,7 +14,7 @@ mod crt_fds;
 mod env_key;
 
 #[path = "windows_raw/env_snapshot.rs"]
-mod env_snapshot;
+pub(crate) mod env_snapshot;
 
 // `pub(crate)`: the async raw backend (`crate::tokio::spawn::windows_raw`) reuses program/env/NUL
 // resolution verbatim.
@@ -256,7 +256,14 @@ pub(crate) fn spawn_env(cmd: &Command) -> Result<SpawnEnv, Error> {
     let is_root = !crate::containment::dispatch::is_nested(marker_present);
     let marker_env = crate::containment::dispatch::windows_contain_setup(&cmd.contain_request(), is_root).marker_env;
     let ops = child_ops(cmd.env_ops(), marker_env);
-    let child_env = resolve::ChildEnv::capture(&snapshot, &ops);
+    // Verbatim only when nothing reads the environment for a decision: a contained spawn's
+    // environment must be the one std would build from the same snapshot, and std cannot pass a
+    // block verbatim.
+    let child_env = if ops.is_empty() && cmd.contain_request().mode.is_none() {
+        resolve::ChildEnv::inherit(&snapshot)
+    } else {
+        resolve::ChildEnv::capture(&snapshot, &ops)
+    };
     Ok(SpawnEnv {
         path: child_env.path().map(OsStr::to_os_string),
         block: child_env.into_block()?,
@@ -268,7 +275,7 @@ pub(crate) fn spawn_env(cmd: &Command) -> Result<SpawnEnv, Error> {
 /// `ops`, plus the inherited root marker when `marker_env`. Appended AFTER the user's ops so it
 /// survives a user `env_clear()` and is named as std names it, as the std path sets it after the
 /// user's env.
-fn child_ops(ops: &[EnvOp], marker_env: bool) -> Cow<'_, [EnvOp]> {
+pub(crate) fn child_ops(ops: &[EnvOp], marker_env: bool) -> Cow<'_, [EnvOp]> {
     if !marker_env {
         return Cow::Borrowed(ops);
     }

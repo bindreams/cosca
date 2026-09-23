@@ -185,17 +185,25 @@ pub(crate) fn resolve_executable_in(
 
 /// A child's environment: a snapshot of this process's, with ops applied.
 pub(crate) enum ChildEnv {
-    /// No ops: the snapshot's block verbatim, duplicates and order included, as std's
-    /// NULL block hands a child this process's own. `path` is what `GetEnvironmentVariableW`
-    /// reads from it.
+    /// The snapshot's block verbatim, duplicates and order included, as std's NULL block hands a
+    /// child this process's own. `path` is what `GetEnvironmentVariableW` reads from it.
     Inherited { block: Vec<u16>, path: Option<OsString> },
-    /// Ops: rebuilt from the snapshot's variables, as std's `CommandEnv::capture` rebuilds from
+    /// Rebuilt from the snapshot's variables, as std's `CommandEnv::capture` rebuilds from
     /// `vars_os`.
     Captured(BTreeMap<EnvKey, OsString>),
 }
 
 impl ChildEnv {
-    /// Capture the environment `ops` give a child that inherits `snapshot`.
+    /// The environment of a child that inherits `snapshot` unchanged.
+    pub(crate) fn inherit(snapshot: &EnvSnapshot) -> Self {
+        Self::Inherited {
+            block: snapshot.block().to_vec(),
+            path: snapshot.var(OsStr::new("PATH")),
+        }
+    }
+
+    /// Capture the environment `ops` give a child that inherits `snapshot`, rebuilt even when
+    /// `ops` is empty.
     ///
     /// With ops, keys collide when [`EnvKey`] says they are equal and the last write wins.
     ///
@@ -209,12 +217,6 @@ impl ChildEnv {
     ///   a `Remove` deletes the variable's entry, so the name is that of the first
     ///   `Set` after both the last `Clear` and the variable's last `Remove`.
     pub(crate) fn capture(snapshot: &EnvSnapshot, ops: &[EnvOp]) -> Self {
-        if ops.is_empty() {
-            return Self::Inherited {
-                block: snapshot.block().to_vec(),
-                path: snapshot.var(OsStr::new("PATH")),
-            };
-        }
         // std records the ops; `get_envs` yields its first-name keys and pending values.
         // What std does not expose is `capture`, the merge with `base`, replayed here.
         let mut changes = std::process::Command::new("");
@@ -238,6 +240,14 @@ impl ChildEnv {
             }
         }
         Self::Captured(vars)
+    }
+
+    /// The variables of a captured environment, in block order; `None` for an inherited one.
+    pub(crate) fn captured_vars(&self) -> Option<impl Iterator<Item = (&OsStr, &OsStr)>> {
+        match self {
+            Self::Inherited { .. } => None,
+            Self::Captured(vars) => Some(vars.iter().map(|(key, val)| (key.name(), val.as_os_str()))),
+        }
     }
 
     /// The child's `PATH`, as it will read it.

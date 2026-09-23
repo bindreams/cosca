@@ -124,6 +124,30 @@ fn as_the_os_delivers(entries: &[&str]) -> Vec<OsString> {
     want
 }
 
+/// A contained spawn's environment is the snapshot its containment decision was read from, on both
+/// backends. std cannot pass a block verbatim, so both rebuild it: the duplicate `PATH` collapses to
+/// one entry, first name and last value. The inherited marker makes the spawn nested, so no marker
+/// op is added and no ops at all are recorded.
+#[test]
+fn a_contained_child_gets_the_rebuilt_snapshot_on_both_backends() {
+    let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
+    let entries = [system_root.as_str(), "Path=a", "zz=1", "PATH=b", "__COSCA_GROUP_ROOT=1"];
+    let run = |dump_args: &str| {
+        let mut cmd = std::process::Command::new(common::testbin());
+        cmd.arg("spawn-with-env-block").arg(dump_args).args(entries);
+        let out = common::output_locked(&mut cmd).expect("spawn");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        parse_block(&out.stdout)
+    };
+    let std = run("std contain");
+    let paths: Vec<&OsString> = std
+        .iter()
+        .filter(|e| e.to_string_lossy().to_ascii_uppercase().starts_with("PATH="))
+        .collect();
+    assert_eq!(paths, [&OsString::from("Path=b")], "{std:?}");
+    assert_eq!(run("raw contain"), std);
+}
+
 /// What `CreateProcessW` accepts as a child's block, measured: which parent blocks can exist.
 #[test]
 fn create_process_block_acceptance() {

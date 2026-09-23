@@ -356,12 +356,23 @@ pub(crate) fn prepare(
     #[cfg_attr(not(windows), allow(unused_variables))] flags: &crate::command::flags::FlagsRequest,
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] reserved_fds: &[i32],
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] marker_suppressed: bool,
+    #[cfg_attr(not(windows), allow(unused_variables))] env_ops: &[crate::command::EnvOp],
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
     // Read once, above every branch, so the word is composed exactly once per spawn and no two
-    // compositions can disagree. cosca never sets this variable in its own process, so it can only
-    // change here if the user `set_var`s it concurrently, which is the user's data race. Reading it
-    // for an uncontained spawn too is therefore unobservable.
+    // compositions can disagree. Reading it for an uncontained spawn too is unobservable.
+    //
+    // On Unix cosca never sets this variable in its own process, so it can only change here if the
+    // user `set_var`s it concurrently, which is the user's data race. On Windows `set_var` is sound
+    // from any thread, so the marker comes from one snapshot, and a contained child's whole
+    // environment is built from that same snapshot below: the decision and the child agree.
+    #[cfg(windows)]
+    let snapshot = crate::child::spawn::windows_raw::env_snapshot::EnvSnapshot::read()?;
+    #[cfg(windows)]
+    let marker_present = snapshot
+        .var(std::ffi::OsStr::new(crate::containment::NESTED_ENV))
+        .is_some();
+    #[cfg(not(windows))]
     let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
     let is_root = !is_nested(marker_present);
 
@@ -390,9 +401,21 @@ pub(crate) fn prepare(
             graceful,
         });
     }
-    if is_root && req.nesting == Nesting::Mark {
-        // Set AFTER any user env ops (env_clear) have been applied to std_cmd by
-        // the spawn engine, so the marker survives env_clear. `env` appends.
+    let marker_env = is_root && req.nesting == Nesting::Mark;
+    // Windows: hand std the whole environment, rebuilt from the snapshot the marker was read from,
+    // so std does not read this process's environment again at `CreateProcessW`. The marker is an
+    // op after the user's, named as std names it; it survives a user `env_clear`.
+    #[cfg(windows)]
+    {
+        use crate::child::spawn::windows_raw::{child_ops, resolve::ChildEnv};
+        let env = ChildEnv::capture(&snapshot, &child_ops(env_ops, marker_env));
+        std_cmd.env_clear();
+        std_cmd.envs(env.captured_vars().expect("a capture is never inherited"));
+    }
+    // Elsewhere: set AFTER any user env ops (env_clear) have been applied to std_cmd by the spawn
+    // engine, so the marker survives env_clear. `env` appends.
+    #[cfg(not(windows))]
+    if marker_env {
         std_cmd.env(crate::containment::NESTED_ENV, "1");
     }
 

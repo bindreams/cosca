@@ -651,26 +651,43 @@ fn path_is_the_one_the_child_reads_from_its_block() {
         (OsString::from("PATH"), OsString::from("a")),
         (OsString::from("Path"), OsString::from("b")),
     ];
-    for (ops, want) in [(vec![], "a"), (vec![EnvOp::Set("K".into(), "1".into())], "b")] {
-        let env = ChildEnv::capture(&snapshot(&base), &ops);
+    for (env, want) in [
+        (ChildEnv::inherit(&snapshot(&base)), "a"),
+        (ChildEnv::capture(&snapshot(&base), &[]), "b"),
+        (
+            ChildEnv::capture(&snapshot(&base), &[EnvOp::Set("K".into(), "1".into())]),
+            "b",
+        ),
+    ] {
         let path = env.path().map(OsStr::to_os_string);
         let block = EnvSnapshot::from_block(env.into_block().unwrap());
-        assert_eq!(path, block.var(OsStr::new("PATH")), "{ops:?}");
-        assert_eq!(path.as_deref(), Some(OsStr::new(want)), "{ops:?}");
+        assert_eq!(path, block.var(OsStr::new("PATH")));
+        assert_eq!(path.as_deref(), Some(OsStr::new(want)));
     }
 }
 
-/// With no ops the child gets the snapshot byte for byte, as a std child inheriting a NULL block
+/// Inheriting gives the child the snapshot byte for byte, as a std child inheriting a NULL block
 /// gets this process's: duplicates and entries with no `=` included.
 #[test]
-fn empty_ops_pass_the_snapshot_verbatim() {
+fn inherit_passes_the_snapshot_verbatim() {
     let block: Vec<u16> = ["Path=a", "JUNK", "PATH=b", "=C:=C:\\x"]
         .iter()
         .flat_map(|e| e.encode_utf16().chain([0]))
         .chain([0])
         .collect();
-    let env = ChildEnv::capture(&EnvSnapshot::from_block(block.clone()), &[]);
+    let env = ChildEnv::inherit(&EnvSnapshot::from_block(block.clone()));
     assert_eq!(env.into_block().unwrap(), block);
+}
+
+/// Capturing rebuilds even with no ops: a contained spawn's environment is always the snapshot
+/// as std's `capture` rebuilds it, since std cannot pass a block verbatim.
+#[test]
+fn capture_rebuilds_even_with_no_ops() {
+    let env = ChildEnv::capture(
+        &snapshot(&[("Path".into(), "a".into()), ("PATH".into(), "b".into())]),
+        &[],
+    );
+    assert_eq!(block_entries(&env.into_block().unwrap()), [("Path".into(), "b".into())]);
 }
 
 /// With ops the base is the snapshot parsed as `vars_os` parses it: `=`-less entries dropped,
