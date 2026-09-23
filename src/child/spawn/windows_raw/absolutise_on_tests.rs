@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::{absolutise_exact, absolutise_exact_on, complete_on, drive_cwd_var, Completed};
 use crate::child::spawn::windows_raw::env_snapshot::EnvSnapshot;
 use crate::error::Error;
+use std::ffi::OsStr;
 
 fn no_drive(_: &std::ffi::OsStr) -> Result<Option<OsString>, Error> {
     Ok(None)
@@ -171,10 +172,15 @@ fn only_a_fully_qualified_drive_directory_is_used() {
     }
 }
 
-/// The raw backend's base is completed by the same rule, so a digit-drive process cwd keeps its
-/// drive for a rooted or relative `current_dir`, and another drive takes its own directory.
+/// An empty environment snapshot: no drive has a directory of its own.
+fn empty_env() -> EnvSnapshot {
+    EnvSnapshot::from_block(vec![0])
+}
+
+/// The raw backend's directory is completed by the same rule, so a digit-drive process cwd keeps
+/// its drive for a rooted or relative `current_dir`, and another drive takes its own directory.
 #[test]
-fn the_raw_base_completes_current_dir_as_win32_does() {
+fn the_raw_launch_dir_completes_current_dir_as_win32_does() {
     for (cmd_cwd, want) in [
         (None, r"1:\x"),
         (Some(r"\work"), r"1:\work"),
@@ -182,8 +188,70 @@ fn the_raw_base_completes_current_dir_as_win32_does() {
         (Some("D:sub"), r"D:\sub"),
         (Some(r"C:\abs"), r"C:\abs"),
     ] {
-        let got = super::raw_base(cmd_cwd.map(Path::new), || Ok(PathBuf::from(r"1:\x")), no_drive).unwrap();
-        assert_eq!(got, PathBuf::from(want), "{cmd_cwd:?}");
+        let reads = Cell::new(0);
+        let got = super::launch_dir(
+            cmd_cwd.map(Path::new),
+            OsStr::new(r".\t.exe"),
+            &empty_env(),
+            counted(r"1:\x", &reads),
+        )
+        .unwrap();
+        assert_eq!(got, Some(PathBuf::from(want)), "{cmd_cwd:?}");
+        assert!(reads.get() <= 1, "{cmd_cwd:?}");
+    }
+}
+
+/// A drive's own directory comes from the spawn's snapshot, not a second read of the environment.
+#[test]
+fn the_raw_launch_dir_reads_a_drive_directory_from_the_given_snapshot() {
+    let block: Vec<u16> = "=Q:=Q:\\qcwd\0\0".encode_utf16().collect();
+    let got = super::launch_dir(
+        Some(Path::new("Q:sub")),
+        OsStr::new("t.exe"),
+        &EnvSnapshot::from_block(block),
+        || Ok(PathBuf::from(r"C:\x")),
+    )
+    .unwrap();
+    assert_eq!(got, Some(PathBuf::from(r"Q:\qcwd\sub")));
+}
+
+/// A bare name needs no base, so no cwd is read and the child's directory stays null.
+#[test]
+fn the_raw_launch_dir_reads_nothing_for_a_bare_name() {
+    let got = super::launch_dir(None, OsStr::new("tool"), &empty_env(), || {
+        panic!("must not read the cwd")
+    });
+    assert_eq!(got.unwrap(), None);
+}
+
+/// A `current_dir` Win32 reads as UNC with no share completes to itself, a path on no drive or
+/// share, and is refused rather than handed to the resolver, whose contract it would break.
+#[test]
+fn the_raw_launch_dir_refuses_a_share_less_unc_current_dir() {
+    for dir in [r"\\server", "//server", r"\\srv\\x"] {
+        match super::launch_dir(Some(Path::new(dir)), OsStr::new(r".\t.exe"), &empty_env(), || {
+            panic!("{dir:?} must not read the cwd")
+        }) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{dir:?}: {e}"),
+            other => panic!("{dir:?}: expected Io(InvalidInput), got {other:?}"),
+        }
+    }
+}
+
+/// A NUL in `current_dir` is refused as a NUL in the working directory before anything completes
+/// it, which would otherwise search a truncated directory the caller never named.
+#[test]
+fn the_raw_launch_dir_refuses_a_nul_before_completing() {
+    use std::os::windows::ffi::OsStringExt;
+    let dir = OsString::from_wide(&"sub\0x".encode_utf16().collect::<Vec<u16>>());
+    match super::launch_dir(Some(Path::new(&dir)), OsStr::new(r".\t.exe"), &empty_env(), || {
+        panic!("a NUL-bearing directory must not read the cwd")
+    }) {
+        Err(Error::Io(e)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+            assert!(e.to_string().contains("working directory"), "{e}");
+        }
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
 }
 

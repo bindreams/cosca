@@ -354,7 +354,7 @@ fn elevated_program(cmd: &Command, argv: &[OsString], cwd: &ProcessOnce<'_>) -> 
         Some(ExecutableSpec::Exact(p)) => {
             let done =
                 crate::child::spawn::windows_raw::resolve::absolutise_exact_on(p, || cwd.cwd(), |d| cwd.drive_cwd(d))?;
-            reject_not_fully_qualified("program path", &done.path)?;
+            crate::child::spawn::windows_raw::resolve::reject_not_fully_qualified("elevated program path", &done.path)?;
             Ok((done.path.into_os_string(), done.used_cwd))
         }
         Some(ExecutableSpec::Search(_)) | None => Ok((token, false)),
@@ -589,7 +589,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
 
 #[path = "windows_consent.rs"]
 mod consent;
-use consent::{reject_not_fully_qualified, ConsentCertain, Validated};
+use consent::{ConsentCertain, Validated};
 pub(crate) use consent::{ProcessDirs, ProcessOnce};
 
 #[cfg(test)]

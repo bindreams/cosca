@@ -12,7 +12,6 @@
 
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
-use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
@@ -255,12 +254,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let spawn_env = sync_raw::spawn_env(cmd)?;
     // THE SAME function the sync raw backend uses, not a mirror of it — the `raw_executable()`
     // contract must not depend on which API you spawned through, and a copy here could drift.
-    let image: Option<PathBuf> = sync_raw::image_for(cmd, spawn_env.path.as_deref())?;
+    let sync_raw::Target { image, cwd } = sync_raw::target(cmd, &spawn_env)?;
     if let Some(p) = &image {
         sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
-    }
-    if let Some(c) = cmd.cwd() {
-        sync_raw::resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
     }
     let mut cmdline = sync_raw::raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
@@ -287,7 +283,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    let cwd_w = cmd.cwd().map(|c| sync_raw::to_wide_nul(c.as_os_str()));
+    let cwd_w = cwd.map(|c| sync_raw::to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.
     sync_raw::ensure_fd_table_fits(&fds)?;

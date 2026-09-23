@@ -31,45 +31,61 @@ use crate::error::Error;
 
 // Program resolution =====
 
-/// Resolve `exe` against the CHILD's cwd and the CHILD's `PATH`.
+/// Resolve `exe` for the raw backend against `base`, the CHILD's directory, and the CHILD's `PATH`.
 ///
-/// `cmd_cwd` is `Command::cwd()` — the directory the child will actually run in. When it is
-/// `None` (no override was set), the child inherits the parent's cwd, so
-/// [`std::env::current_dir`] is the correct fallback. Seeding resolution from the parent's cwd
-/// UNCONDITIONALLY (ignoring a `Command::cwd()` override) would resolve `./helper` against the
-/// wrong directory: the doc on [`crate::resolve::ResolveInput::cwd`] promises the CHILD's
-/// directory, and that promise is also the documented escape hatch for reaching "the current
-/// directory explicitly" — reaching the parent's instead defeats it.
+/// `base` is fully qualified, or `None` for a name [`crate::resolve::needs_base`] says needs none:
+/// the caller completes `current_dir` once, with [`launch_dir`], and passes the same value to
+/// `CreateProcessW` as `lpCurrentDirectory`, so the file resolved and the directory run in come from
+/// one read of this process's state.
 ///
 /// `path` is the child's `PATH`, [`ChildEnv::path`] of the same [`ChildEnv`] whose
 /// [`ChildEnv::into_block`] the child is spawned with, so the directories searched here are the
 /// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
 /// promises — and no second read of this process's environment can disagree with the block.
-///
-/// Convenience wrapper over [`resolve_executable_in`] seeded from [`raw_base`], the real system
-/// directories, and the child's `PATH`.
-pub(crate) fn resolve_executable(exe: &Path, cmd_cwd: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    let base = raw_base(
-        cmd_cwd,
-        || std::env::current_dir().map_err(Error::Io),
-        |drive| Ok(super::env_snapshot::EnvSnapshot::read()?.var(&drive_cwd_var(drive))),
-    )?;
-    let system_dirs = windows_system_dirs();
-    resolve_executable_in(exe, &base, &system_dirs, path, false)
+pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
+    resolve_executable_in(exe, base, &windows_system_dirs(), path, false)
 }
 
-/// The fully qualified base [`resolve_executable`] resolves against: `cmd_cwd` completed as Win32
-/// completes the child's `lpCurrentDirectory` ([`complete_on`]), or this process's cwd when unset.
-/// The readers are injected for the tests.
-pub(crate) fn raw_base(
+/// The fully qualified directory a raw spawn resolves `token` against and runs the child in:
+///
+/// - a `current_dir` is NUL-checked, then completed as Win32 completes it ([`complete_on`]), with a
+///   drive's own directory (`=Q:`) read from `snapshot`, the spawn's one environment read. It must
+///   then be fully qualified, so `current_dir(r"\\server")` is refused;
+/// - with none, this process's cwd when `token` needs a base, so the child runs where its image was
+///   found rather than wherever the cwd is by the time `CreateProcessW` reads it;
+/// - otherwise `None`, and `lpCurrentDirectory` stays null.
+///
+/// `process_cwd` is called at most once.
+pub(crate) fn launch_dir(
     cmd_cwd: Option<&Path>,
+    token: &OsStr,
+    snapshot: &super::env_snapshot::EnvSnapshot,
     process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
-    drive_cwd: impl FnOnce(&OsStr) -> Result<Option<OsString>, Error>,
-) -> Result<PathBuf, Error> {
+) -> Result<Option<PathBuf>, Error> {
     match cmd_cwd {
-        Some(dir) => Ok(complete_on(dir, process_cwd, drive_cwd)?.path),
-        None => process_cwd(),
+        Some(dir) => {
+            ensure_no_nul_wide("working directory", dir.as_os_str())?;
+            let done = complete_on(dir, process_cwd, |drive| Ok(snapshot.var(&drive_cwd_var(drive))))?;
+            reject_not_fully_qualified("working directory", &done.path)?;
+            Ok(Some(done.path))
+        }
+        None if crate::resolve::needs_base(token, true) => Ok(Some(process_cwd()?)),
+        None => Ok(None),
     }
+}
+
+/// Refuse a completed field that is still not fully qualified: Win32 reads a path starting with two
+/// separators as UNC, and one naming no share (`\\tool.exe`) completes to itself, a path neither
+/// on a drive nor on a share. Judged by the resolver's classifier, not `Path::is_absolute`, which
+/// knows only letter drives.
+pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), Error> {
+    if crate::resolve::is_absolute_name(path.as_os_str(), true) {
+        return Ok(());
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("the {what} names no drive or share once completed: {path:?}"),
+    )))
 }
 
 /// [`resolve_executable`] for the elevated consent launch: only `.exe`/`.com` candidates, per
@@ -408,6 +424,9 @@ pub(crate) fn absolutise_exact_on(
 
 /// `GetFullPathNameW` on `path`.
 fn full_path_name(path: &Path) -> Result<PathBuf, Error> {
+    // `to_wide_nul` would truncate at an interior NUL, so `GetFullPathNameW` would complete a path
+    // the caller never named. Every caller NUL-checks, naming its field, first.
+    debug_assert_no_nul_wide("path to complete", path.as_os_str());
     let wide = super::to_wide_nul(path.as_os_str());
     grow_wide_buffer(|buf| unsafe {
         // SAFETY: `wide` is NUL-terminated; `GetFullPathNameW` writes into the given buffer or
@@ -485,14 +504,14 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 /// `CreateProcessW` an unlaunchable path with no fallback).
 pub(crate) fn resolve_executable_in(
     exe: &Path,
-    base_cwd: &Path,
+    base_cwd: Option<&Path>,
     system_dirs: &[PathBuf],
     path: Option<&OsStr>,
     loadable_only: bool,
 ) -> Result<PathBuf, Error> {
     crate::resolve::resolve(crate::resolve::ResolveInput {
         program: exe,
-        cwd: Some(base_cwd),
+        cwd: base_cwd,
         system_dirs,
         path_var: path,
         windows: true,

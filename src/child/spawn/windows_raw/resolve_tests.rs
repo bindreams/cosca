@@ -5,8 +5,12 @@ use std::path::Path;
 
 /// Resolve against the PATH `ops` give a child of this process, as a spawn does.
 fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
-    let env = ChildEnv::capture(&EnvSnapshot::read().unwrap(), ops);
-    resolve_executable(exe, cmd_cwd, env.path())
+    let snapshot = EnvSnapshot::read().unwrap();
+    let env = ChildEnv::capture(&snapshot, ops);
+    let base = launch_dir(cmd_cwd, exe.as_os_str(), &snapshot, || {
+        std::env::current_dir().map_err(Error::Io)
+    })?;
+    resolve_executable(exe, base.as_deref(), env.path())
 }
 
 /// A snapshot holding `base` in order.
@@ -61,7 +65,7 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
     // Explicit base dir — no process-global SetCurrentDirectory, so parallel tests can't race.
     assert_not_found(resolve_executable_in(
         std::path::Path::new("sp_shadow"),
-        dir.path(),
+        Some(dir.path()),
         &[],
         None,
         false,
@@ -303,7 +307,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
     let joined = std::env::join_paths([shadow_dir.path(), other.path()]).unwrap();
     let got = resolve_executable_in(
         std::path::Path::new("sp_dirtool"),
-        base.path(),
+        Some(base.path()),
         &[],
         Some(joined.as_os_str()),
         false,
@@ -325,7 +329,7 @@ fn resolve_absolute_directory_is_not_returned() {
     let sub = dir.path().join("sp_dir_shadow.exe");
     std::fs::create_dir(&sub).unwrap();
     // The base must be fully qualified; an absolute program never reads it.
-    assert_not_found(resolve_executable_in(&sub, dir.path(), &[], None, false));
+    assert_not_found(resolve_executable_in(&sub, Some(dir.path()), &[], None, false));
 }
 #[test]
 fn path_wins_over_base_cwd_when_both_have_exe() {
@@ -340,7 +344,7 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
     // base_cwd vs PATH, not system-directory precedence.
     let got = resolve_executable_in(
         std::path::Path::new("sp_pref"),
-        base.path(),
+        Some(base.path()),
         &[],
         Some(other.path().as_os_str()),
         false,
@@ -415,7 +419,7 @@ fn resolve_finds_a_real_system32_binary_through_system_dirs() {
     // that `windows_system_dirs()` returns plausible-looking paths.
     let dirs = windows_system_dirs();
     let cwd = tempfile::tempdir().unwrap();
-    let got = resolve_executable_in(std::path::Path::new("notepad"), cwd.path(), &dirs, None, false).unwrap();
+    let got = resolve_executable_in(std::path::Path::new("notepad"), Some(cwd.path()), &dirs, None, false).unwrap();
     assert!(got.to_string_lossy().to_lowercase().contains("system32"), "{got:?}");
 }
 

@@ -654,12 +654,17 @@ fn fixture_relative_cwd_is_absolutised() {
     assert!(want.is_file(), "the parent must have planted `tool` here: {want:?}");
     // On Windows the base is completed by the caller, as the raw backend does, before `resolve`.
     #[cfg(windows)]
-    let got = crate::child::spawn::windows_raw::resolve::resolve_executable(
-        Path::new("./tool"),
-        Some(Path::new("sub")),
-        None,
-    )
-    .unwrap();
+    let got = {
+        use crate::child::spawn::windows_raw::{env_snapshot::EnvSnapshot, resolve};
+        let base = resolve::launch_dir(
+            Some(Path::new("sub")),
+            std::ffi::OsStr::new("./tool"),
+            &EnvSnapshot::read().unwrap(),
+            || std::env::current_dir().map_err(Error::Io),
+        )
+        .unwrap();
+        resolve::resolve_executable(Path::new("./tool"), base.as_deref(), None).unwrap()
+    };
     #[cfg(not(windows))]
     let got = go("./tool", Path::new("sub"), None).unwrap();
     assert!(got.is_absolute(), "{got:?}");

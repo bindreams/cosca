@@ -63,12 +63,9 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     reject_batch_program(cmd)?;
 
     let spawn_env = spawn_env(cmd)?;
-    let image: Option<PathBuf> = image_for(cmd, spawn_env.path.as_deref())?;
+    let Target { image, cwd } = target(cmd, &spawn_env)?;
     if let Some(p) = &image {
         resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
-    }
-    if let Some(c) = cmd.cwd() {
-        resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
     }
     let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
     cmdline.push(0);
@@ -102,7 +99,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         crate::containment::windows::clear_std_handle_inheritance();
     }
 
-    let cwd_w = cmd.cwd().map(|c| to_wide_nul(c.as_os_str()));
+    let cwd_w = cwd.map(|c| to_wide_nul(c.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
     ensure_fd_table_fits(&fds)?;
@@ -230,6 +227,8 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 /// The environment-derived inputs of a raw spawn, all from ONE read of this process's environment,
 /// so resolution, the containment decision and the child's block cannot see different ones.
 pub(crate) struct SpawnEnv {
+    /// This process's environment as read for this spawn, for anything else it decides from.
+    pub(crate) snapshot: env_snapshot::EnvSnapshot,
     /// The child's `PATH`, which resolution searches.
     pub(crate) path: Option<OsString>,
     /// The child's finished block. Built here, so a refused environment (an embedded NUL) is
@@ -258,6 +257,7 @@ pub(crate) fn spawn_env(cmd: &Command) -> Result<SpawnEnv, Error> {
     };
     Ok(SpawnEnv {
         path: child_env.path().map(OsStr::to_os_string),
+        snapshot,
         block: child_env.into_block()?,
         is_root,
         marker_env,
@@ -310,43 +310,79 @@ pub(crate) fn spawn_step(
         .map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, request))
 }
 
-/// Which file this backend will load, applying cosca's resolution policy to a `Search` program
-/// and deliberately NOT applying it to an `Exact` one.
+/// The file a raw spawn loads and the directory it runs in, from one read of this process's cwd.
+pub(crate) struct Target {
+    /// `lpApplicationName`; `None` only when no program was given, which [`app_name_wide`] refuses.
+    pub(crate) image: Option<PathBuf>,
+    /// `lpCurrentDirectory`; `None` leaves the child in this process's cwd.
+    pub(crate) cwd: Option<PathBuf>,
+}
+
+/// [`target_with`] on this process's cwd.
+pub(crate) fn target(cmd: &Command, env: &SpawnEnv) -> Result<Target, Error> {
+    target_with(cmd, env, || std::env::current_dir().map_err(Error::Io))
+}
+
+/// Which file this backend will load and where the child runs, applying cosca's resolution policy
+/// to a `Search` program and deliberately NOT applying it to an `Exact` one.
 ///
 /// `pub(crate)`: shared verbatim with the async raw backend so the two cannot silently diverge.
 ///
 /// The three arms:
 ///
-/// - `Search` — from `executable()`. Resolved through [`resolve::resolve_executable`]: the
-///   child's cwd, the child's `PATH`, the `.exe` rules. Always absolute on success.
+/// - `Search` — from `executable()`. Resolved through [`resolve::resolve_executable`] against
+///   [`resolve::launch_dir`]: `current_dir` completed once, or this process's cwd read once when
+///   the name needs a base. That same directory is the child's `lpCurrentDirectory`, so a
+///   `set_current_dir` elsewhere cannot load one directory's file and run the child in another.
+///   Always absolute on success.
 /// - `Exact` — from `raw_executable()`. Passed through untouched once
-///   [`resolve::absolutise_exact`] has found that it names a file. This is the ONE site on
-///   Windows that would otherwise resolve it, silently turning a bare `raw_executable("tool")`
-///   into a `PATH` lookup and breaking the contract at its only user. A relative value keeps
+///   [`resolve::absolutise_exact`] has found that it names a file, with `current_dir` as written.
+///   `CreateProcessW` completes both itself, in one call. A relative value keeps
 ///   `lpApplicationName`'s own meaning, which completes it against the CALLING process's current
 ///   directory (see `Command::raw_executable`'s doc).
 /// - neither setter — a route here never implies either was called (it can be reached purely by
 ///   `fd >= 3`, see `routes_to_raw_backend`). [`program_token`] supplies argv[0] or the command
-///   line's first token, and THAT is resolved, which is what keeps `lpApplicationName` non-NULL.
-///   See [`app_name_wide`] for why NULL is a security boundary.
+///   line's first token, and THAT is resolved as `Search` is, which is what keeps
+///   `lpApplicationName` non-NULL. See [`app_name_wide`] for why NULL is a security boundary.
 ///
-/// No arm is batch-checked here: [`reject_batch_program`] has judged the token by the name Win32
-/// normalises it to, and resolution only prefixes a directory and may append `.exe`, so it never
-/// turns a name the gate accepted into a `.bat`/`.cmd`.
-pub(crate) fn image_for(cmd: &Command, path: Option<&OsStr>) -> Result<Option<PathBuf>, Error> {
-    let image = match cmd.executable_spec() {
-        Some(ExecutableSpec::Search(p)) => resolve::resolve_executable(p, cmd.cwd(), path)?,
+/// `current_dir` is NUL-checked before anything reads it. No arm is batch-checked here:
+/// [`reject_batch_program`] has judged the token by the name Win32 normalises it to, and resolution
+/// only prefixes a directory and may append `.exe`, so it never turns a name the gate accepted into
+/// a `.bat`/`.cmd`.
+pub(crate) fn target_with(
+    cmd: &Command,
+    env: &SpawnEnv,
+    process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
+) -> Result<Target, Error> {
+    let searched = |token: &Path| -> Result<Target, Error> {
+        let cwd = resolve::launch_dir(cmd.cwd(), token.as_os_str(), &env.snapshot, process_cwd)?;
+        let image = resolve::resolve_executable(token, cwd.as_deref(), env.path.as_deref())?;
+        Ok(Target {
+            image: Some(image),
+            cwd,
+        })
+    };
+    let as_written = |image: Option<PathBuf>| -> Result<Target, Error> {
+        if let Some(c) = cmd.cwd() {
+            resolve::ensure_no_nul_wide("working directory", c.as_os_str())?;
+        }
+        Ok(Target {
+            image,
+            cwd: cmd.cwd().map(Path::to_path_buf),
+        })
+    };
+    match cmd.executable_spec() {
+        Some(ExecutableSpec::Search(p)) => searched(p),
         // Completed only for its refusals: the loader completes the token itself.
         Some(ExecutableSpec::Exact(p)) => {
             resolve::absolutise_exact(p)?;
-            p.to_path_buf()
+            as_written(Some(p.to_path_buf()))
         }
         None => match program_token(cmd) {
-            Some(t) => resolve::resolve_executable(&t, cmd.cwd(), path)?,
-            None => return Ok(None),
+            Some(t) => searched(&t),
+            None => as_written(None),
         },
-    };
-    Ok(Some(image))
+    }
 }
 
 /// The resolved image as the NUL-terminated wide string `CreateProcessW` takes for

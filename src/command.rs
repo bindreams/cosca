@@ -215,6 +215,12 @@ impl Command {
     /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
     /// `executable` set at all.
     ///
+    /// The directory resolved against is the one the child runs in. A relative `current_dir`, or
+    /// this process's cwd for a relative name with none, is read once and handed to
+    /// `CreateProcessW` completed, so a concurrent `set_current_dir` cannot load one directory's
+    /// file and run the child in another. A `current_dir` starting with two separators and naming
+    /// no share (`\\server`) is [`std::io::ErrorKind::InvalidInput`].
+    ///
     /// The `.exe` rule is a property of names that get SEARCHED, not of files that get
     /// LOADED, so it differs by shape. If the name's final path component already ends
     /// in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is left alone, never doubled

@@ -105,21 +105,6 @@ impl<'a> Validated<'a> {
     }
 }
 
-/// Refuse a completed field that is still not fully qualified: Win32 reads a path starting with two
-/// separators as UNC, and one naming no share (`\\tool.exe`) completes to itself, a path neither
-/// on a drive nor on a share.
-pub(super) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), Error> {
-    // The resolver's classifier, not `Path::is_absolute`: `std` knows only letter drives, so it
-    // would refuse `1:\tool.exe`, which Win32 reads as drive `1`'s root.
-    if crate::resolve::is_absolute_name(path.as_os_str(), true) {
-        return Ok(());
-    }
-    Err(Error::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!("the elevated {what} names no drive or share once completed: {path:?}"),
-    )))
-}
-
 /// Where the consent launch reads this process's state from: its cwd and its environment. The
 /// tests inject both.
 pub(crate) struct ProcessDirs<'a> {
@@ -208,7 +193,10 @@ fn consent_base(
     Ok(match cmd.cwd() {
         Some(dir) => {
             let done = crate::child::spawn::windows_raw::resolve::complete_on(dir, || cwd.cwd(), |d| cwd.drive_cwd(d))?;
-            reject_not_fully_qualified("working directory", &done.path)?;
+            crate::child::spawn::windows_raw::resolve::reject_not_fully_qualified(
+                "elevated working directory",
+                &done.path,
+            )?;
             Some(done.path)
         }
         None if exact_used_cwd || crate::resolve::needs_base(program, true) => Some(cwd.cwd()?),

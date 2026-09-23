@@ -188,15 +188,15 @@ fn the_containment_marker_is_named_as_std_names_it() {
     assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0__cosca_group_root=1\0\0");
 }
 
-// `image_for`: the Search/Exact distinction, at the one site that applies it ────────────
+// `target`: the Search/Exact distinction, at the one site that applies it ────────────
 //
-// These run on the Windows CI runner rather than the host, because `image_for` is inside the
+// These run on the Windows CI runner rather than the host, because `target` is inside the
 // `cfg(windows)` raw backend — the `Exact` arm touches no Win32 API, but it cannot be compiled
 // off Windows to be reached.
 
-/// [`image_for`] against the `PATH` a spawn of `cmd` would give its child.
+/// [`target`]'s image, against the environment a spawn of `cmd` would read.
 fn image(cmd: &Command) -> Result<Option<PathBuf>, Error> {
-    image_for(cmd, spawn_env(cmd)?.path.as_deref())
+    Ok(target(cmd, &spawn_env(cmd)?)?.image)
 }
 
 #[test]
@@ -469,4 +469,58 @@ fn a_high_fd_spawn_without_an_executable_is_gated_on_its_program_token() {
         let err = c.spawn().expect_err("a batch program token must be refused");
         assert!(matches!(err, Error::Unsupported { .. }), "{via}: got {err:?}");
     }
+}
+
+/// The raw backend runs the child in the directory its image was resolved against: one read of the
+/// process cwd serves both, so a `set_current_dir` in between cannot split them.
+#[test]
+fn target_pins_the_resolved_directory_as_the_childs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("tool.exe"), b"x").unwrap();
+    for (cmd_cwd, want_dir) in [(Some("sub"), dir.path().join("sub")), (None, dir.path().to_path_buf())] {
+        let token = if cmd_cwd.is_some() {
+            r".\tool.exe"
+        } else {
+            r"sub\tool.exe"
+        };
+        let mut cmd = Command::new();
+        cmd.executable(token).args([token]);
+        if let Some(c) = cmd_cwd {
+            cmd.current_dir(c);
+        }
+        let reads = std::cell::Cell::new(0);
+        let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || {
+            reads.set(reads.get() + 1);
+            Ok(dir.path().to_path_buf())
+        })
+        .unwrap();
+        assert_eq!(reads.get(), 1, "{cmd_cwd:?}");
+        assert_eq!(got.cwd.as_deref(), Some(want_dir.as_path()), "{cmd_cwd:?}");
+        let image = got.image.unwrap();
+        assert!(image.starts_with(&want_dir), "{cmd_cwd:?}: {image:?}");
+    }
+}
+
+/// A share-less UNC `current_dir` is refused with `InvalidInput`, never a panic in the resolver.
+#[test]
+fn target_refuses_a_share_less_unc_current_dir() {
+    let mut cmd = Command::new();
+    cmd.executable(r".\tool.exe")
+        .args([r".\tool.exe"])
+        .current_dir(r"\\server");
+    match target(&cmd, &spawn_env(&cmd).unwrap()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
+        Err(other) => panic!("expected Io(InvalidInput), got {other:?}"),
+        Ok(_) => panic!("a share-less UNC directory must be refused"),
+    }
+}
+
+/// `raw_executable()` keeps `current_dir` as written: `CreateProcessW` completes both in one call.
+#[test]
+fn target_passes_an_exact_programs_current_dir_as_written() {
+    let mut cmd = Command::new();
+    cmd.raw_executable("tool.exe").args(["tool.exe"]).current_dir("sub");
+    let got = target_with(&cmd, &spawn_env(&cmd).unwrap(), || panic!("must not read the cwd")).unwrap();
+    assert_eq!(got.cwd.as_deref(), Some(Path::new("sub")));
 }
