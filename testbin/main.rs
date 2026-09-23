@@ -3,6 +3,10 @@
 //! the real nested-member `kill_tree` path, and `spawn-dump-env-block`, to spawn through each
 //! Windows backend. Behavior is selected by argv[1].
 
+// See `src/lib.rs`'s header for why: this bin is its own clippy-linted crate root, so it needs
+// its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
 use std::io::{Read, Write};
@@ -69,6 +73,20 @@ fn install_ignore_break() {
     }
     // SAFETY: installing a console ctrl handler has no preconditions.
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
+}
+
+/// `set_current_dir`s THIS process — never a spawned child — to `dir`. The one legitimate call
+/// site `clippy.toml`'s `disallowed-methods` exempts here: `cosca_testbin` is a freshly spawned,
+/// single-purpose PROCESS per invocation, never the shared multithreaded `cargo test` binary, so
+/// mutating its own cwd races nothing. Both `report-bare-argv0-cwd-spawn*` arms route through
+/// this one function so the `#[expect]` lives in exactly one place.
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "testbin is a dedicated single-purpose process per invocation; mutating its own cwd races no concurrent test — see this function's doc"
+)]
+fn chdir_this_process(dir: impl AsRef<std::path::Path>) {
+    std::env::set_current_dir(dir).expect("chdir to the decoy directory");
 }
 
 /// Shared body of `control-echo-pid` and the grandchild arm of `spawn-orphan-escapee`'s
@@ -288,7 +306,10 @@ fn main() {
             // then hold ours (tag "R"). Both die together iff containment works.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills it
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment kills it"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block", &addr, "G"])
                 .spawn()
@@ -309,8 +330,10 @@ fn main() {
             // needs the real round trip this mode gives both members.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)]
-            // intentional: grandchild must outlive us; containment (or not) decides its fate
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment (or not) decides its fate"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-echo-pid", &addr, "G"])
                 .spawn()
@@ -327,7 +350,10 @@ fn main() {
             // pgid addresses both.
             let addr = args[2].clone();
             let setuid_helper = args[3].clone();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills/refuses us
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment kills/refuses us"
+            )]
             let _gc = std::process::Command::new(setuid_helper)
                 .args(["setuid-control-block", &addr, "P"])
                 .spawn()
@@ -418,7 +444,7 @@ fn main() {
                 let _ = libc::setsid();
             }
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; TreeWalk kills it
+            #[allow(clippy::zombie_processes, reason = "grandchild must outlive us; TreeWalk kills it")]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block", &addr, "G"])
                 .spawn()
@@ -455,7 +481,7 @@ fn main() {
         "orphan-relay" => {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us
+            #[allow(clippy::zombie_processes, reason = "the grandchild must outlive us")]
             let _ = std::process::Command::new(&exe)
                 .args(["control-echo-pid", &addr, "G"])
                 .spawn()
@@ -472,7 +498,10 @@ fn main() {
             }
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ignore-term", &addr, "G"])
                 .spawn()
@@ -523,7 +552,10 @@ fn main() {
             // survivor only the post-grace hard sweep can reach.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ignore-term", &addr, "G"])
                 .spawn()
@@ -553,7 +585,10 @@ fn main() {
             install_ignore_break();
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ignore-break", &addr, "G"])
                 .spawn()
@@ -622,7 +657,10 @@ fn main() {
             install_ignore_break();
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; see spawn-grandchild above"
+            )]
             let _gc = std::process::Command::new(exe)
                 .args(["control-block-ack-break", &addr, "G"])
                 .spawn()
@@ -785,7 +823,7 @@ fn main() {
             // else, so a caller sees the real cause instead of a silent miscount.
             let dir = &args[2];
             let program = args[3].as_str();
-            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+            chdir_this_process(dir);
 
             let mut c = cosca::Command::new();
             c.args([program, "exit", "0"]).fd(3, cosca::Stdio::pipe_out()).unwrap();
@@ -814,7 +852,7 @@ fn main() {
             // process builds one just for this probe.
             let dir = &args[2];
             let program = args[3].clone();
-            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+            chdir_this_process(dir);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

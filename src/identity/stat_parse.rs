@@ -6,7 +6,13 @@
 //
 // Compiled on every target (for host unit tests); only `linux.rs` calls these,
 // so they are dead on non-Linux builds.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "compiled on every host for pure-logic test coverage; linux.rs is the only production caller"
+    )
+)]
 
 fn tail(stat: &[u8]) -> Option<&str> {
     let close = stat.iter().rposition(|&b| b == b')')?;

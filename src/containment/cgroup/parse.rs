@@ -3,7 +3,13 @@
 
 /// Whether the cgroup at `path` is `leaf` itself or nested under it. Both are unified-hierarchy
 /// paths as `/proc/<pid>/cgroup` prints them.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) fn is_at_or_under(path: &str, leaf: &str) -> bool {
     path.strip_prefix(leaf)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -12,7 +18,13 @@ pub(crate) fn is_at_or_under(path: &str, leaf: &str) -> bool {
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
 /// success, or `None` when no such line is present (v1-only or empty).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
     for line in proc_self_cgroup.lines() {
         // The v2 unified line has the form `0::<path>` — hierarchy id 0, empty
@@ -46,7 +58,13 @@ pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
 /// A line the documented `<id>:<controllers>:<path>` shape does not explain is reported as
 /// unparseable rather than quoted: an unrecognized line is precisely the case where cosca
 /// cannot know which part of it is a path.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) fn summarize_cgroup_controllers(proc_self_cgroup: &str) -> (usize, String) {
     let mut controllers: Vec<&str> = Vec::new();
     for line in proc_self_cgroup.lines() {
@@ -67,7 +85,13 @@ pub(crate) fn summarize_cgroup_controllers(proc_self_cgroup: &str) -> (usize, St
 /// (`populated 0`/`populated 1`, one `key value` pair per line, order not guaranteed).
 /// `None` means the file had no `populated` line, or an unrecognized value — the caller
 /// must treat this as "could not be assessed", never silently default to either state.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("populated ") {
@@ -89,7 +113,13 @@ pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
 /// and parentheses, so splitting on whitespace from the start misplaces every later field.
 /// The scan therefore begins after the LAST `)` in the line, which is where the kernel's
 /// fixed-shape, whitespace-separated tail starts; field 3 there is the state.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+    )
+)]
 pub(crate) fn parse_proc_stat_state(stat: &str) -> Option<char> {
     let tail = &stat[stat.rfind(')')? + 1..];
     tail.split_whitespace().next()?.chars().next()

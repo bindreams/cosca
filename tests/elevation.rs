@@ -11,6 +11,10 @@
 //! unavailable. The pure tiers cover all logic unconditionally; only the privilege-gain
 //! (and the cross-process controlling-terminal probes) run here.
 
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
+
 use std::path::PathBuf;
 
 fn gated() -> bool {

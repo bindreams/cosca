@@ -4,6 +4,9 @@
 //! These prove the four modes EXIST and emit their documented output over std pipes; the
 //! executable-vs-argv[0] independence itself is proven later via the crate's own `Command`.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::io::Write;
 use std::process::{Command, Stdio};

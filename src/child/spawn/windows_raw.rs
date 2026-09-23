@@ -284,7 +284,10 @@ pub(crate) fn child_ops(ops: &[EnvOp], marker_env: bool) -> Cow<'_, [EnvOp]> {
 /// `pub(crate)`: the async raw backend reuses the inheritable-mark + `create_process` window.
 // `CreateProcessW`'s own parameter list, plus the request its failure is classified against.
 // Bundling them would only rename the same values one call site deep.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors CreateProcessW's own parameter list plus the request its failure is classified against; see comment above"
+)]
 pub(crate) fn spawn_step(
     handles: &[HANDLE],
     app: &[u16],

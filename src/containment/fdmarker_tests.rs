@@ -877,7 +877,10 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // P is deliberately left unreaped for the rest of the test — see the doc above ("P is left
     // an unreaped zombie throughout"). That's what keeps `pgid` allocated across the gap, so
     // clippy's zombie-processes lint is a false positive here, not a real leak.
-    #[allow(clippy::zombie_processes)]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "P is deliberately left unreaped for the rest of the test, which is what keeps pgid allocated; see comment above"
+    )]
     let mut p_child = p_cmd.spawn().expect("spawn P");
     drop(p_cmd);
     await_member_ready(&mut p_child); // P's own group exists before T and Q ask to join it.

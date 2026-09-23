@@ -9,6 +9,9 @@
 //! It also serves `report-console-identity`, sharing that mode's body with the
 //! console-subsystem testbin so the two differ in exactly one thing: the image's subsystem.
 #![cfg_attr(windows, windows_subsystem = "windows")]
+// See `src/lib.rs`'s header for why: this bin is its own clippy-linted crate root, so it needs
+// its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 /// The `report-console-identity` mode, shared verbatim with `testbin/main.rs`.
 #[cfg(windows)]

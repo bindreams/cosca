@@ -1,6 +1,9 @@
 //! The raw and std Windows backends hand a child the same environment block — names, values and
 //! order — for the same inherited environment and env ops.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;

@@ -191,7 +191,10 @@ fn fixture_survives_group_signal() {
     // `windows`-crate import: `std::os::windows::process::CommandExt::creation_flags` takes it
     // as a plain `u32`.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment kills it
+    #[allow(
+        clippy::zombie_processes,
+        reason = "intentional: the grandchild must outlive us; containment kills it"
+    )]
     let _survivor = std::process::Command::new("ping")
         .args(["-n", "30", "127.0.0.1"])
         .creation_flags(CREATE_NEW_PROCESS_GROUP)

@@ -7,6 +7,9 @@
 //! settle about console membership, and their discriminating power comes from the control legs
 //! disagreeing with the exclusion legs — not from a before/after.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::io::Read;
 use std::net::TcpListener;

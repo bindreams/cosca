@@ -16,6 +16,9 @@
 //! job; locally, run this suite from a fresh terminal. No test here asserts the absence of a pid
 //! it did not just spawn.
 #![cfg(windows)]
+// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
+// crate root, so it needs its own copy of the deny.
+#![deny(clippy::allow_attributes_without_reason)]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -5,6 +5,14 @@
 //! pid via [`Process`]. Sync by default; async counterparts live in the `tokio`
 //! module behind the `tokio` feature.
 
+// A silenced lint must say why: an unreasoned `#[allow(...)]` anywhere in this crate (including
+// its `#[cfg(test)]`-only modules, which are still part of this same crate) is itself a build
+// failure. See `clippy.toml`'s header for the sibling policy this backs: `disallowed-methods`'s
+// own exemptions are `#[expect]`, not `#[allow]`, precisely so a stale one also fails loudly; this
+// deny is what keeps every OTHER lint's `#[allow]` equally accountable, without requiring the
+// stronger (and here, per-target-fragile) `#[expect]` for all of them.
+#![deny(clippy::allow_attributes_without_reason)]
+
 pub mod containment;
 pub mod elevation;
 pub mod error;
@@ -39,7 +47,13 @@ mod command;
 // the search policy as dead. The module is deliberately NOT cfg-gated: keeping it platform-independent is what makes
 // its policy testable from a POSIX host, which is where most of this work happens. The allow
 // goes away when the POSIX and default spawn paths route through it too.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "off-windows only resolve::exact is consumed, so the lib build sees the search policy as dead"
+    )
+)]
 mod resolve;
 pub use command::Command;
 

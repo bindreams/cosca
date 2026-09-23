@@ -42,7 +42,10 @@ pub(crate) struct FlagsRequest {
     /// "Do not put a console window on the user's screen" — the one portable intent. Lowered to
     /// a creation flag on the ordinary Windows backends, to a show-command on the consent-prompt
     /// elevation launch, and to nothing at all on Unix.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "lowered to nothing at all on Unix, see doc above")
+    )]
     pub no_window: bool,
     #[cfg(windows)]
     pub detached: bool,

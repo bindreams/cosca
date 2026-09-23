@@ -619,7 +619,13 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     std::fs::create_dir(&sub).unwrap();
     // Only `cfg(unix)` reads `want` (to set the execute bit) — the fixture below reconstructs the
     // same path independently, so a non-unix build never uses this binding at all.
-    #[cfg_attr(not(unix), allow(unused_variables))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            unused_variables,
+            reason = "only cfg(unix) reads `want` (to set the execute bit); see comment above"
+        )
+    )]
     let want = touch(&sub, &exe_name("tool"));
     #[cfg(unix)]
     {

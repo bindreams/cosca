@@ -5,7 +5,11 @@
 // Each test crate compiles the whole module but uses only the subset it needs (e.g.
 // `lifecycle` never calls `spawn_blocker`), so per-crate dead code and unused imports (e.g. the
 // log-capture re-exports, which only `macos_fdmarker.rs` uses) are expected here.
-#![allow(dead_code, unused_imports)]
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "each integration test crate compiles this whole shared module but uses only its own subset; see comment above"
+)]
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};

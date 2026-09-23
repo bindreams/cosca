@@ -9,7 +9,13 @@ use std::sync::{Mutex, PoisonError};
 ///
 /// Generic over the condition so every once-per-condition report in the crate shares this one
 /// policy while keying on its own conditions.
-#[cfg_attr(not(any(target_os = "linux", feature = "tokio")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", feature = "tokio")),
+    allow(
+        dead_code,
+        reason = "callers are the linux cgroup degrade path and the tokio spawn errno path; dead without either"
+    )
+)]
 pub(crate) fn report_level<C: Ord>(seen: &Mutex<BTreeSet<C>>, condition: C) -> log::Level {
     // A panic elsewhere while holding the lock cannot leave a set half-inserted; recover it
     // rather than turn a log call into a second panic.

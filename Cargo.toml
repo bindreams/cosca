@@ -44,8 +44,6 @@ crossbeam-channel = { version = "0.5", optional = true }
 tempfile = "3"
 # A concrete format to pin the persisted wire form against.
 serde_json = "1"
-# Word-boundary matching for tests/no_chdir_guard.rs's chdir-call scanner.
-regex = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
 # Integration tests cannot reach the crate's own dependencies, and `windows_path_resolution` calls

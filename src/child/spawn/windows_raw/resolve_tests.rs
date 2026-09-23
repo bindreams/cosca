@@ -731,7 +731,8 @@ fn resolution_searches_the_given_snapshot() {
 #[test]
 fn absolutise_exact_completes_a_bare_name_against_the_processes_cwd() {
     // Two readings of the process cwd — one inside `GetFullPathNameW`, one in the assertion —
-    // agree because no test in this binary moves it (`tests/no_chdir_guard.rs`).
+    // agree because no test in this binary moves it (clippy's `disallowed-methods`, configured
+    // in `clippy.toml`, forbids it).
     let got = absolutise_exact(Path::new("tool")).unwrap();
     assert_eq!(got, std::env::current_dir().unwrap().join("tool"), "{got:?}");
     assert!(got.is_absolute());
