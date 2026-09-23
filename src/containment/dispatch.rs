@@ -359,8 +359,9 @@ pub(crate) fn prepare(
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
     // Read once, above every branch, so the word is composed exactly once per spawn and no two
-    // compositions can disagree. This is this process's own environment variable — read-only and
-    // constant for the run — so reading it for an uncontained spawn too is unobservable.
+    // compositions can disagree. cosca never sets this variable in its own process, so it can only
+    // change here if the user `set_var`s it concurrently, which is the user's data race. Reading it
+    // for an uncontained spawn too is therefore unobservable.
     let marker_present = std::env::var_os(crate::containment::NESTED_ENV).is_some();
     let is_root = !is_nested(marker_present);
 
