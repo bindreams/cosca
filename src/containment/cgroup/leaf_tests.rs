@@ -873,6 +873,42 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
     (leaf, member)
 }
 
+/// Give the calling thread alone a mount namespace, private, so that every mount it makes stays in
+/// it and is gone with the thread.
+#[cfg(target_os = "linux")]
+fn enter_a_private_mount_namespace() {
+    // SAFETY: plain syscalls on valid NUL-terminated strings.
+    unsafe {
+        assert_eq!(
+            libc::unshare(libc::CLONE_NEWNS),
+            0,
+            "unshare: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null()
+            ),
+            0,
+            "make / private: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Mount a tmpfs over `over`, in the calling thread's mount namespace.
+#[cfg(target_os = "linux")]
+fn mount_a_tmpfs_over(over: &std::path::Path) {
+    let over = std::ffi::CString::new(over.as_os_str().as_encoded_bytes()).expect("no NUL");
+    // SAFETY: a plain syscall on valid NUL-terminated strings.
+    let mounted = unsafe { libc::mount(c"tmpfs".as_ptr(), over.as_ptr(), c"tmpfs".as_ptr(), 0, std::ptr::null()) };
+    assert_eq!(mounted, 0, "mount a tmpfs: {}", std::io::Error::last_os_error());
+}
+
 /// Drop `leaf` on a thread of its own mount namespace, private to it, with a tmpfs mounted over
 /// `over`, and return the levels and texts of the records its `Drop` made about `marker`. The mount is
 /// gone with the thread.
@@ -884,44 +920,8 @@ fn drop_under_a_mount(
 ) -> (Vec<log::Level>, Vec<String>) {
     crate::log_capture::install();
     std::thread::spawn(move || {
-        use std::ffi::CString;
-
-        let c = |s: &str| CString::new(s).expect("no NUL");
-        let over = CString::new(over.into_os_string().into_encoded_bytes()).expect("no NUL");
-        // SAFETY: plain syscalls on valid NUL-terminated strings. `unshare` gives this thread
-        // alone a mount namespace; making it private first keeps every mount below in it.
-        unsafe {
-            assert_eq!(
-                libc::unshare(libc::CLONE_NEWNS),
-                0,
-                "unshare: {}",
-                std::io::Error::last_os_error()
-            );
-            assert_eq!(
-                libc::mount(
-                    std::ptr::null(),
-                    c("/").as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_PRIVATE,
-                    std::ptr::null()
-                ),
-                0,
-                "make / private: {}",
-                std::io::Error::last_os_error()
-            );
-            assert_eq!(
-                libc::mount(
-                    c("tmpfs").as_ptr(),
-                    over.as_ptr(),
-                    c("tmpfs").as_ptr(),
-                    0,
-                    std::ptr::null()
-                ),
-                0,
-                "mount a tmpfs: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        enter_a_private_mount_namespace();
+        mount_a_tmpfs_over(&over);
         let mark = crate::log_capture::mark();
         drop(leaf);
         (
@@ -947,6 +947,46 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
 
     let (levels, records) = drop_under_a_mount(leaf, leaf_path.clone(), name);
+    let status = member.wait().expect("reap the member");
+    // Outside the dropping thread's namespace nothing is mounted over the leaf.
+    std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");
+
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the real tree must be killed");
+    assert_eq!(levels, vec![log::Level::Warn], "the leaf left behind is reported, once");
+    assert!(
+        records[0].contains("mount"),
+        "the report must name a mount as a cause: {}",
+        records[0]
+    );
+}
+
+/// A mount over the leaf's name in the namespace its held descriptors were opened in: the name
+/// no longer reaches the leaf, which says nothing about whether the leaf is gone. `Drop` kills the
+/// real tree through the held leaf, and reports the leaf it cannot remove.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    crate::log_capture::install();
+    let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
+        enter_a_private_mount_namespace();
+        let (leaf, member) = entered_real_leaf();
+        let leaf_path = leaf.leaf_path.clone();
+        let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+        mount_a_tmpfs_over(&leaf_path);
+        let mark = crate::log_capture::mark();
+        drop(leaf);
+        (
+            leaf_path,
+            member,
+            crate::log_capture::levels_since(mark, &name),
+            crate::log_capture::records_since(mark, &name),
+        )
+    })
+    .join()
+    .expect("the dropping thread");
     let status = member.wait().expect("reap the member");
     // Outside the dropping thread's namespace nothing is mounted over the leaf.
     std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");

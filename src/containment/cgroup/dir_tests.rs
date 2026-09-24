@@ -165,33 +165,59 @@ fn rmdir_removes_the_held_leaf() {
     assert!(!leaf.exists());
 }
 
-/// A leaf whose name now names another directory is already gone: `rmdir` leaves that directory
-/// alone and answers as for a removed leaf.
-#[test]
-fn rmdir_spares_a_directory_that_took_the_leafs_name() {
+/// A leaf at `<tempdir>/<name>` with a `cgroup.events`, held.
+fn held_leaf(name: &str) -> (tempfile::TempDir, std::path::PathBuf, LeafDir) {
     let parent = tempfile::tempdir().expect("tempdir");
-    let leaf = parent.path().join("cosca-swapped");
+    let leaf = parent.path().join(name);
     std::fs::create_dir(&leaf).expect("make the leaf");
+    std::fs::write(leaf.join("cgroup.events"), "populated 0\n").expect("write cgroup.events");
     let dir = LeafDir::open_for_test(&leaf);
+    (parent, leaf, dir)
+}
+
+/// A leaf removed by another party is `ENOENT`.
+#[test]
+fn rmdir_of_a_leaf_removed_since_is_enoent() {
+    let (_parent, leaf, dir) = held_leaf("cosca-removed");
+    std::fs::remove_dir_all(&leaf).expect("remove the leaf");
+    assert_eq!(dir.rmdir().expect_err("gone").raw_os_error(), Some(libc::ENOENT));
+}
+
+/// A leaf removed, and its name taken by another directory since: `ENOENT`, and the other
+/// directory is left alone.
+#[test]
+fn rmdir_spares_a_directory_that_took_a_removed_leafs_name() {
+    let (_parent, leaf, dir) = held_leaf("cosca-replaced");
+    std::fs::remove_dir_all(&leaf).expect("remove the leaf");
+    std::fs::create_dir(&leaf).expect("make a stranger under the leaf's name");
+
+    assert_eq!(dir.rmdir().expect_err("gone").raw_os_error(), Some(libc::ENOENT));
+    assert!(leaf.exists(), "the stranger under the leaf's name must survive");
+}
+
+/// A live leaf whose name now names another directory: an error, not `Ok` or `ENOENT`, since the
+/// leaf is still there; the other directory is left alone.
+#[test]
+fn rmdir_spares_a_directory_that_took_a_live_leafs_name() {
+    let (parent, leaf, dir) = held_leaf("cosca-swapped");
     std::fs::rename(&leaf, parent.path().join("elsewhere")).expect("move the leaf away");
     std::fs::create_dir(&leaf).expect("make a stranger under the leaf's name");
 
-    dir.rmdir().expect("the leaf is already gone");
+    let e = dir.rmdir().expect_err("the leaf is still there");
+    assert_ne!(e.raw_os_error(), Some(libc::ENOENT), "{e}");
     assert!(leaf.exists(), "the stranger under the leaf's name must survive");
 }
 
 /// The same holds for a symlink that took the name: it is not followed.
 #[test]
-fn rmdir_spares_a_symlink_that_took_the_leafs_name() {
-    let parent = tempfile::tempdir().expect("tempdir");
-    let leaf = parent.path().join("cosca-linked");
-    std::fs::create_dir(&leaf).expect("make the leaf");
-    let dir = LeafDir::open_for_test(&leaf);
+fn rmdir_spares_a_symlink_that_took_a_live_leafs_name() {
+    let (parent, leaf, dir) = held_leaf("cosca-linked");
     let moved = parent.path().join("moved");
     std::fs::rename(&leaf, &moved).expect("move the leaf away");
     std::os::unix::fs::symlink(&moved, &leaf).expect("link the leaf's name to it");
 
-    dir.rmdir().expect("the name no longer names the leaf");
+    let e = dir.rmdir().expect_err("the leaf is still there");
+    assert_ne!(e.raw_os_error(), Some(libc::ENOENT), "{e}");
     assert!(
         moved.exists(),
         "the leaf behind the link must not be removed through it"

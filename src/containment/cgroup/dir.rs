@@ -117,15 +117,49 @@ impl LeafDir {
         std::fs::File::from(fd).write_all(bytes)
     }
 
-    /// `rmdir` the leaf from its parent, if its name still names it. `unlinkat` goes by name, so
-    /// the name's inode is checked against the held leaf's first; if they differ, the leaf is
-    /// already gone and whatever holds its name is left alone. A random part in every leaf name
-    /// ([`leaf_name`](super::leaf_name)) keeps anyone else from taking the name in between.
+    /// `rmdir` the leaf from its parent. `Ok` only once it removed the leaf; `ENOENT` if the leaf
+    /// is gone, removed by another party; any other error leaves the leaf in place.
+    ///
+    /// `unlinkat` goes by name, so the name is first looked up on the parent's own mount, and
+    /// removed only if it leads to the held leaf. A mount on the name is `EBUSY`, as `rmdir` of a
+    /// mount point is. A name leading elsewhere, or nowhere, is `ENOENT` if the held leaf is gone,
+    /// and an error otherwise.
+    ///
+    /// The lookup and the `unlinkat` are two steps, and nothing removes a directory through a
+    /// descriptor. The random part of the leaf's name ([`leaf_name`](super::leaf_name)) keeps the
+    /// name from recurring by accident; a party with write access to the delegated parent can
+    /// still remove the leaf and make another under its name between the two, and have that
+    /// removed instead. Such a party already controls the subtree.
     pub(crate) fn rmdir(&self) -> io::Result<()> {
-        let held = rustix::fs::fstat(&self.dir)?;
-        let named = rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino) {
-            return Ok(());
+        use rustix::fs::ResolveFlags;
+        use rustix::io::Errno;
+
+        let named = rustix::fs::openat2(
+            &self.parent,
+            &self.name,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+        );
+        let ours = match named {
+            Ok(named) => {
+                let (named, held) = (rustix::fs::fstat(&named)?, rustix::fs::fstat(&self.dir)?);
+                (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
+            }
+            Err(Errno::XDEV) => return Err(io::Error::from_raw_os_error(libc::EBUSY)),
+            // Nothing there, a symlink, or not a directory: not the leaf.
+            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !ours {
+            return Err(match self.open("cgroup.events", OFlags::PATH) {
+                Err(e) if super::removed_after_drain(&e) => io::Error::from_raw_os_error(libc::ENOENT),
+                Err(e) => e,
+                Ok(_) => io::Error::other(format!(
+                    "{} no longer names the leaf, which is still there",
+                    self.name.to_string_lossy()
+                )),
+            });
         }
         Ok(rustix::fs::unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR)?)
     }
