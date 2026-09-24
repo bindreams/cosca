@@ -6,6 +6,19 @@ Unified cross-platform subprocess management: spawning, stdio, process trees, st
 
 The API is not stable; expect breaking changes in any 0.x release.
 
+## Running tests
+
+Use [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`), run as `cargo nextest
+run`. It's what CI runs, and it's the recommended way to run cosca's suite locally.
+
+Once cosca's suite moves onto Skuld, plain `cargo test` will be able to hang when a child process
+outlives its test: Skuld captures each test's stdout/stderr and waits for those pipes to close, and
+a stray child holding one open under `cargo test`'s shared-process model blocks the run. `cargo
+nextest run` avoids this by isolating each test in its own process.
+
+nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
+today.
+
 ## License
 
 <img align="right" width="150px" height="150px" src="https://www.apache.org/foundation/press/kit/img/the-apache-way-badge/ASF_Badge_apacheway-purple.png">
