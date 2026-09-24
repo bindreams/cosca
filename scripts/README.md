@@ -184,9 +184,17 @@ at the LIMITED (non-elevated) run level even though the account is itself an Adm
 member.
 Combined with `--allow-elevation` (`ConsentPromptBehaviorAdmin=0`), a `runas` child launched
 from that probe takes the consent path with no click required. Verify this is measuring what
-it claims to by checking `whoami /groups` inside the probe (expect `Mandatory Label\Medium
-Mandatory Level`) and inside a `runas`-elevated child of it (expect `...\High Mandatory
-Level`).
+it claims to by running the probe's own integrity check:
+
+```sh
+uv run scripts/devvm.py run windows-x64 --unelevated -- whoami /groups
+```
+
+Look for `Mandatory Label\Medium Mandatory Level` in the output — that's the unelevated probe
+itself, not a `runas` child. To confirm a `runas`-elevated child of that probe actually reaches
+High integrity, run the same command against a script that shells out via `runas`/
+`ShellExecuteEx` and checks its own `whoami /groups`; look for `Mandatory Label\High Mandatory
+Level` in its output instead.
 
 **A `--unelevated` command that itself starts `powershell.exe` is fine — the wrapper already
 routes around a PowerShell 5.1 quirk for you.** PowerShell 5.1 parses a native child's stderr
@@ -202,10 +210,16 @@ a direct child of another PowerShell process elsewhere in this tooling, use the 
 `Start-Process` redirection rather than any PowerShell redirection operator.
 
 If a probe genuinely needs a human (or UI automation) to see and answer the secure-desktop
-prompt itself — rather than just observing its outcome — give the guest a display instead: add
-e.g. `qe.other_default = %w(-parallel null -monitor none -vga std -display cocoa)` to the
-`qemu` provider block in the Windows Vagrantfile, and connect to the console, or RDP into the
-guest.
+prompt itself — rather than just observing its outcome — give the guest a display instead:
+
+```sh
+uv run scripts/devvm.py up windows-x64 --display
+```
+
+This opens a real, local QEMU window on this Mac (`-display cocoa -vga std`) — not VNC or any
+other network-exposed display, so it doesn't touch the loopback-only port-forwarding guarantee
+above. Off by default; pass it again on every `up` that needs it (not persisted). RDP into the
+guest is the other option if a window on this Mac specifically isn't what's needed.
 
 **Measured timings on this host** (Apple Silicon Mac, so `windows-x64` runs under TCG
 cross-arch emulation; one-time data point on 2026-09-23, not a guarantee):
