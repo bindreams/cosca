@@ -22,9 +22,9 @@ fn sizing_answer() -> usize {
 /// must still ask for more room than that answer. Not a hard `rounds == 1`: `fill_all()`'s
 /// sizing call and its fill are two separate syscalls with a live host between them, and
 /// unrelated process churn during that window can legitimately push a correct
-/// implementation to a second round (parallel `cargo test` itself spawns processes), so a
-/// round-count assertion would be flaky against correct code, not just against the
-/// regression it exists to catch.
+/// implementation to a second round (parallel test runs, or tests sharing a process via
+/// `cargo test -- --nocapture`, themselves spawn processes), so a round-count assertion would be
+/// flaky against correct code, not just against the regression it exists to catch.
 #[test]
 fn the_first_buffer_is_large_enough() {
     let n = sizing_answer();

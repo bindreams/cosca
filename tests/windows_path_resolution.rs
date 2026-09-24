@@ -25,10 +25,10 @@
 //! # How to run it
 //!
 //! ```text
-//! cargo test --test windows_path_resolution -- --ignored --nocapture --test-threads=1
+//! cargo nextest run --test windows_path_resolution --run-ignored only --no-capture
 //! ```
 //!
-//! `#[ignore]`d so that an ordinary `cargo test` never mistakes a platform measurement for coverage
+//! `#[ignore]`d so that an ordinary `cargo nextest run` never mistakes a platform measurement for coverage
 //! of cosca. The canary's own string logic and verdict are tested by `windows_path_logic`, which
 //! runs by default on every host. `GetFullPathNameW` works on the string alone and touches no disk
 //! or network, so UNC and device inputs here reach no server or device. The file and spawn tests

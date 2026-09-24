@@ -747,9 +747,10 @@ pub(crate) mod fault {
     /// (`fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`
     /// and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one`)
     /// would otherwise be able to satisfy each other's `contains_since` check across
-    /// threads, since `log_capture` is one process-global buffer and `cargo test` runs each
-    /// `#[test]` on its own thread. `FAULT` itself is thread-local (race-free), but the LOG
-    /// ASSERTION is not, so both tests must hold this for their whole body instead.
+    /// threads, since `log_capture` is one process-global buffer and, when tests share a process
+    /// (`cargo test -- --nocapture`), each `#[test]` runs on its own thread. `FAULT` itself is
+    /// thread-local (race-free), but the LOG ASSERTION is not, so both tests must hold this for
+    /// their whole body instead.
     static LOG_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn lock_for_log_assertion() -> std::sync::MutexGuard<'static, ()> {

@@ -118,7 +118,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 fn caller_has_console_is_true_under_cargo_test() {
     assert!(
         matches!(super::caller_has_console(), Ok(true)),
-        "cargo test is expected to run with a console attached"
+        "the test runner is expected to run with a console attached"
     );
 }
 

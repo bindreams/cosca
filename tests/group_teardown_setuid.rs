@@ -25,12 +25,13 @@
 //! regardless.
 //!
 //! # Gating
-//! This test is `#[ignore]`d by default, so an ordinary `cargo test` — locally, or in every CI
-//! step that doesn't explicitly ask for it — prints `... ignored`, never `... ok`. A vacuous pass
-//! that merely returned early (the shape this file used at first) is indistinguishable in the log
-//! from a real one, which is exactly the failure this rule exists to prevent: a test name reading
-//! "ok" must mean the scenario it describes was actually exercised. Only the one CI step that has
-//! provisioned the helper runs it, via `cargo test --test group_teardown_setuid -- --ignored` (see
+//! This test is `#[ignore]`d by default, so an ordinary `cargo nextest run` — locally, or in every
+//! CI step that doesn't explicitly ask for it — prints `... ignored`, never `... ok`. A vacuous
+//! pass that merely returned early (the shape this file used at first) is indistinguishable in the
+//! log from a real one, which is exactly the failure this rule exists to prevent: a test name
+//! reading "ok" must mean the scenario it describes was actually exercised. Only the one CI step
+//! that has provisioned the helper runs it, via `cargo nextest run --test group_teardown_setuid
+//! --run-ignored only` (see
 //! `.github/workflows/ci.yaml`, the "Run setuid-root process-group teardown test" step, which
 //! follows "Set up setuid-root helper").
 //!
@@ -125,12 +126,12 @@ fn accept_one(listener: &TcpListener) -> Handshake {
 /// `Child::kill_tree` path (not a pure helper, not a fault-injection seam) against a REAL mixed
 /// process group.
 ///
-/// `#[ignore]`d by default so an ordinary `cargo test` reports it honestly as `ignored`, not a
-/// vacuous `ok` — see the module docs' "Gating" section for why, and for the one CI step that
-/// runs it with `--ignored` after provisioning `COSCA_TEST_SETUID_HELPER`.
+/// `#[ignore]`d by default so an ordinary `cargo nextest run` reports it honestly as `ignored`, not
+/// a vacuous `ok` — see the module docs' "Gating" section for why, and for the one CI step that
+/// runs it with `--run-ignored only` after provisioning `COSCA_TEST_SETUID_HELPER`.
 #[test]
-#[ignore = "requires COSCA_TEST_SETUID_HELPER (a real setuid-root helper); run with `cargo test \
-            --test group_teardown_setuid -- --ignored` — see this file's module docs"]
+#[ignore = "requires COSCA_TEST_SETUID_HELPER (a real setuid-root helper); run with `cargo nextest \
+            run --test group_teardown_setuid --run-ignored only` — see this file's module docs"]
 fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     let helper = gated();
     assert!(
@@ -150,7 +151,7 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     // The pgid-based mechanism specifically — NOT cgroup v2 (whose `cgroup.kill` bypasses the
     // ordinary kill(2) permission check entirely and would not reproduce the bug at all) and NOT
     // Delegated/None. `.contain()`'s cgroup path only activates given a delegated cgroup v2
-    // slice, which this lane's ordinary (unprivileged) `cargo test` invocation does not have —
+    // slice, which this lane's ordinary (unprivileged) `cargo nextest run` invocation does not have —
     // asserted, not assumed, exactly like this suite's existing `unix_kill_tree_reaps_the_
     // grandchild` (tests/spawn_io.rs).
     assert_eq!(

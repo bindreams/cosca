@@ -67,7 +67,7 @@ fn posix_child_self_detects_elevation() {
 }
 
 // UNGATED but `#[cfg(feature = "pty")]`: NON-VACUOUS proof that the probe consults the
-// session's controlling terminal (/dev/tty), not isatty(STDIN). Under a plain `cargo test`
+// session's controlling terminal (/dev/tty), not isatty(STDIN). Under the test runner
 // there is no controlling terminal, so we ALLOCATE a real pty and have the child acquire it
 // as its controlling terminal (setsid + TIOCSCTTY on the inherited slave fd 3) WHILE its
 // stdin is /dev/null. The probe must then report `1` — impossible for an isatty(STDIN) impl,

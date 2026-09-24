@@ -464,7 +464,7 @@ fn unix_fd3_file_round_trips() {
 
     // Write a payload to a unique temp file, then rewind for the child to read.
     // `tempfile()` gives a process-unique, auto-cleaned file so two concurrent
-    // `cargo test` runs cannot collide on a shared fixed name.
+    // test runs cannot collide on a shared fixed name.
     let mut tmp = tempfile::tempfile().expect("create tmpfile");
     tmp.write_all(b"from file via fd3").expect("write tmpfile");
     tmp.seek(std::io::SeekFrom::Start(0)).expect("seek");

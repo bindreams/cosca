@@ -102,7 +102,7 @@ fn inherit_only_is_accepted() {
 /// A Windows-shaped host for the pure seam. Tests below drive [`super::plan_runas`] and never
 /// `launch_runas_with_host`: on an `elevated: false` host the latter's fall-through is a real
 /// `ShellExecuteExW(runas)`, so a probe that slipped past a check under test would raise a UAC
-/// prompt and elevate the probe program under a plain `cargo test`.
+/// prompt and elevate the probe program under the test runner.
 fn win_host(elevated: bool) -> crate::elevation::plan::Host {
     crate::elevation::plan::Host {
         elevated,
@@ -531,7 +531,8 @@ fn wide_nul_accepts_an_ordinary_value_and_terminates_it() {
 ///
 /// A call site that ESCAPED the check comes back `Ok(Launch)`, which the fall-through arm below
 /// panics on. That is the whole reason this drives the pure seam: on `launch_runas_with_host` the
-/// same escape would hand the probe to `ShellExecuteExW` and raise a UAC prompt under `cargo test`.
+/// same escape would hand the probe to `ShellExecuteExW` and raise a UAC prompt under the test
+/// runner.
 ///
 /// One leg per field a caller can poison — `lpFile`, `lpParameters`, `lpDirectory`. A single-argv,
 /// no-cwd probe only reaches `lpFile`: with an empty joined parameter line and `cmd.cwd() == None`,
