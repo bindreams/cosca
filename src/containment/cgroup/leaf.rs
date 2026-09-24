@@ -99,9 +99,9 @@ pub(crate) struct CgroupLeaf {
     pub(super) leaf_path: PathBuf,
     /// The leaf's directory and its parent, held from creation.
     dir: LeafDir,
-    /// The leaf's drain watch, held from creation so that its teardown never lacks one. `None`
-    /// only for a test leaf with no `cgroup.events`, which reads as drained.
-    watch: Option<DrainWatch>,
+    /// The leaf's drain watch, held from creation so that no wait on it ever lacks one, and
+    /// shared by concurrent waits in turn.
+    watch: WatchTurns,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
     /// between `fork` and `exec`, and no program this process starts may inherit it. Numbered
     /// 3 or above, so it never shares a number with the child's stdio. `None` once the
@@ -478,29 +478,54 @@ impl CgroupLeaf {
 
     /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
     /// `populated` reads 0, or the leaf is removed — or until `deadline` (see
-    /// [`crate::wait::remaining`]). The wait is a [`DrainWatch`]: no interval, and it wakes on the
-    /// leaf's removal as well as on `populated`, since the kernel can cancel the one notification
-    /// a drain sends. A removed leaf holds nothing: `rmdir` succeeds only on a drained leaf
-    /// ([`removed_after_drain`]).
+    /// [`crate::wait::remaining`]). The wait is on the leaf's own held [`DrainWatch`], taken in
+    /// turn with any concurrent wait ([`WatchTurns`]); time queued counts against `deadline`, and a
+    /// wait queued past it answers from the leaf's state then. No interval, and the watch wakes on
+    /// the leaf's removal as well as on `populated`, since the kernel can cancel the one
+    /// notification a drain sends. A removed leaf holds nothing: `rmdir` succeeds only on a
+    /// drained leaf ([`removed_after_drain`]).
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        match self.drain_watch()? {
+        let Some(turn) = self.watch.take_until(deadline) else {
+            return self.drain_now();
+        };
+        let mut watch = turn.watch();
+        match watch.as_mut() {
+            Some(watch) => watch.wait(deadline),
             None => Ok(crate::containment::TreeDrain::AllMembersExited),
-            Some(mut watch) => watch.wait(deadline),
         }
     }
 
-    /// Arm a new [`DrainWatch`] on this leaf, for a caller's own wait. `None`: the leaf is
-    /// already gone.
-    pub(crate) fn drain_watch(&self) -> Result<Option<DrainWatch>, crate::error::Error> {
-        DrainWatch::arm(&self.dir).map_err(crate::error::Error::Io)
+    /// The leaf's turns on its drain watch, for the async wait.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn watch_turns(&self) -> &WatchTurns {
+        &self.watch
+    }
+
+    /// Whether the leaf has drained, read now without the watch: for a wait whose deadline passed
+    /// while it queued for the watch.
+    pub(crate) fn drain_now(&self) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        use crate::containment::TreeDrain;
+
+        let events = match self.dir.read("cgroup.events") {
+            Ok(events) => events,
+            Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
+            Err(e) => return Err(crate::error::Error::Io(e)),
+        };
+        match parse_populated(&events) {
+            Some(true) => Ok(TreeDrain::MembersRemain),
+            Some(false) => Ok(TreeDrain::AllMembersExited),
+            None => Err(crate::error::Error::Io(io::Error::other(
+                "cgroup.events has no 'populated' field — unexpected kernel format",
+            ))),
+        }
     }
 
     /// Block until the leaf drains, on the watch held since creation.
     fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
-        match self.watch.as_mut() {
+        match self.watch.get_mut() {
             Some(watch) => watch.wait(None).map(drop),
             None => Ok(()),
         }
@@ -560,7 +585,7 @@ impl CgroupLeaf {
     pub(crate) fn for_test_at(leaf_path: PathBuf) -> CgroupLeaf {
         let dir = LeafDir::open_for_test(&leaf_path);
         CgroupLeaf {
-            watch: DrainWatch::arm(&dir).expect("arm a test leaf's drain watch"),
+            watch: WatchTurns::new(DrainWatch::arm(&dir).expect("arm a test leaf's drain watch")),
             dir,
             leaf_path,
             procs_fd: None,
@@ -1139,7 +1164,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     Ok(CgroupLeaf {
         leaf_path,
         dir,
-        watch: Some(watch),
+        watch: WatchTurns::new(Some(watch)),
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,

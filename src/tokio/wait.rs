@@ -354,23 +354,46 @@ async fn wait_tree_drained_inner(
 ///
 /// [`DrainWatch`]: crate::containment::cgroup::DrainWatch
 #[cfg(target_os = "linux")]
-async fn cgroup_wait_tree_drained(
+pub(crate) async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
+    use std::os::fd::{AsRawFd, RawFd};
+
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
 
     use crate::containment::TreeDrain;
 
-    let Some(watch) = leaf.drain_watch()? else {
-        return Ok(TreeDrain::AllMembersExited);
+    /// The watch's descriptor, registered for as long as this waiter holds its turn: the leaf,
+    /// which owns it, outlives this future, and the registration is dropped before the turn.
+    struct Registered(RawFd);
+    impl AsRawFd for Registered {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0
+        }
+    }
+
+    let turns = leaf.watch_turns();
+    let turn = match crate::wait::remaining(deadline) {
+        None => turns.take().await,
+        Some(left) => match ::tokio::time::timeout(left, turns.take()).await {
+            Ok(turn) => turn,
+            Err(_queued_past_deadline) => return leaf.drain_now(),
+        },
     };
-    let interest = Interest::READABLE;
-    let mut afd = AsyncFd::with_interest(watch, interest).map_err(Error::Io)?;
+    let fd = match turn.watch().as_ref() {
+        Some(watch) => watch.as_raw_fd(),
+        None => return Ok(TreeDrain::AllMembersExited),
+    };
+    let afd = AsyncFd::with_interest(Registered(fd), Interest::READABLE).map_err(Error::Io)?;
     loop {
-        if !afd.get_mut().populated()? {
-            return Ok(TreeDrain::AllMembersExited);
+        {
+            let mut watch = turn.watch();
+            let watch = watch.as_mut().expect("the watch was there when the turn began");
+            if !watch.populated()? {
+                return Ok(TreeDrain::AllMembersExited);
+            }
         }
         let remaining = crate::wait::remaining(deadline);
         if remaining == Some(std::time::Duration::ZERO) {
@@ -379,13 +402,19 @@ async fn cgroup_wait_tree_drained(
         #[cfg(test)]
         crate::containment::cgroup::fault::notify_drain_blocking();
         let mut ready = match remaining {
-            None => afd.ready_mut(interest).await.map_err(Error::Io)?,
-            Some(d) => match ::tokio::time::timeout(d, afd.ready_mut(interest)).await {
+            None => afd.ready(Interest::READABLE).await.map_err(Error::Io)?,
+            Some(d) => match ::tokio::time::timeout(d, afd.ready(Interest::READABLE)).await {
                 Ok(r) => r.map_err(Error::Io)?,
                 Err(_elapsed) => return Ok(TreeDrain::MembersRemain),
             },
         };
-        ready.get_inner_mut().consume()?;
+        {
+            let mut watch = turn.watch();
+            watch
+                .as_mut()
+                .expect("the watch was there when the turn began")
+                .consume()?;
+        }
         ready.clear_ready();
     }
 }

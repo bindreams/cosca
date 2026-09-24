@@ -28,6 +28,7 @@ thread_local! {
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static TURN_QUEUED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
 }
 
@@ -317,4 +318,34 @@ pub(crate) fn record_signalled_by_pid() {
 /// How many abandoned children this thread signalled by bare pid since the last call.
 pub(crate) fn take_signalled_by_pid() -> usize {
     SIGNALLED_BY_PID.with(|c| c.replace(0))
+}
+
+/// Send on `notify` each time a wait on this thread queues for a leaf's drain watch, for the
+/// rest of the thread's life.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_turn_queued_notifier(notify: std::sync::mpsc::Sender<()>) {
+    TURN_QUEUED.with(|t| *t.borrow_mut() = Some(notify));
+}
+pub(crate) fn notify_turn_queued() {
+    TURN_QUEUED.with(|t| {
+        if let Some(notify) = t.borrow().as_ref() {
+            let _ = notify.send(());
+        }
+    });
+}
+
+/// How many drain watches were armed on each leaf name, process-wide.
+static ARMS: std::sync::Mutex<Vec<std::ffi::OsString>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_arm(name: &std::ffi::OsStr) {
+    ARMS.lock().unwrap_or_else(|e| e.into_inner()).push(name.to_os_string());
+}
+/// How many drain watches were armed on the leaf named `name`.
+#[cfg(feature = "tokio")]
+pub(crate) fn arms_of(name: &str) -> usize {
+    ARMS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|n| n.as_os_str() == name)
+        .count()
 }

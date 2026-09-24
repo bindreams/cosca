@@ -15,6 +15,9 @@
 //! `IN_DELETE` on the parent, for the leaf's own name. Both bind to the held inodes, through
 //! `/proc/self/fd`, never to a path a mount could redirect.
 //!
+//! Each leaf arms one watch, at creation, and every wait on the leaf uses it in turn (see
+//! `turn.rs`).
+//!
 //! An inotify instance counts against `fs.inotify.max_user_instances` (128 per user by default),
 //! and each watch against `fs.inotify.max_user_watches`. Arming one can therefore fail, and a
 //! failure is returned, never replaced by a weaker wait.
@@ -59,6 +62,8 @@ impl DrainWatch {
             Err(e) if removed_after_drain(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
+        #[cfg(test)]
+        super::fault::record_arm(dir.name());
         #[cfg(test)]
         if super::fault::take_force_inotify_failure() {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));

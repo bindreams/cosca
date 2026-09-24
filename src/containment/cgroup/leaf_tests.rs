@@ -1016,6 +1016,142 @@ fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
     assert!(!leaf.exists(), "the half-made leaf must be removed: {}", leaf.display());
 }
 
+// Turns on the held watch -----
+// A leaf holds one inotify instance, and concurrent waits take turns on it.
+
+/// Signals from waiter threads: each sets these as its own thread-local notifiers.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+struct WaiterSignals {
+    blocking: std::sync::mpsc::Sender<()>,
+    queued: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+impl WaiterSignals {
+    fn install(&self) {
+        crate::containment::cgroup::fault::set_drain_blocking_notifier(self.blocking.clone());
+        crate::containment::cgroup::fault::set_turn_queued_notifier(self.queued.clone());
+    }
+}
+
+/// A sync and an async wait on one leaf both return once it drains, and share the leaf's one
+/// watch: no second inotify instance is armed.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn a_sync_and_an_async_wait_take_turns_on_the_leafs_one_watch() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-two-waiters", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+    let (queued, queued_rx) = std::sync::mpsc::channel();
+    let signals = || WaiterSignals {
+        blocking: blocking.clone(),
+        queued: queued.clone(),
+    };
+
+    let (sync_leaf, sync_signals) = (leaf.clone(), signals());
+    let sync_waiter = std::thread::spawn(move || {
+        sync_signals.install();
+        sync_leaf.wait_drained(None)
+    });
+    let (async_leaf, async_signals) = (leaf.clone(), signals());
+    let async_waiter = std::thread::spawn(move || {
+        async_signals.install();
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(crate::tokio::wait::cgroup_wait_tree_drained(&async_leaf, None))
+    });
+
+    // One holds the turn and blocks on the watch; the other queues for it.
+    blocking_rx.recv().expect("a waiter blocks on the watch");
+    queued_rx.recv().expect("a waiter queues for the watch");
+    FakeLeaf::set_populated(&fake.events, false);
+
+    assert_eq!(
+        sync_waiter.join().expect("sync waiter").expect("sync wait"),
+        TreeDrain::AllMembersExited
+    );
+    assert_eq!(
+        async_waiter.join().expect("async waiter").expect("async wait"),
+        TreeDrain::AllMembersExited
+    );
+    assert_eq!(
+        crate::containment::cgroup::fault::arms_of("cosca-two-waiters"),
+        1,
+        "only the leaf's own watch is armed, at creation"
+    );
+}
+
+/// An async wait cancelled while it holds the turn hands the watch on.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn a_cancelled_async_wait_hands_the_watch_on() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-cancelled-waiter", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+    let (cancel, cancelled) = ::tokio::sync::oneshot::channel::<()>();
+
+    let async_leaf = leaf.clone();
+    let async_waiter = std::thread::spawn(move || {
+        crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking);
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            ::tokio::select! {
+                drained = crate::tokio::wait::cgroup_wait_tree_drained(&async_leaf, None) => {
+                    panic!("the leaf was never drained, got {drained:?}")
+                }
+                _ = cancelled => {}
+            }
+        });
+    });
+    blocking_rx.recv().expect("the async wait blocks on the watch");
+    cancel.send(()).expect("cancel the async wait");
+    async_waiter.join().expect("the async waiter");
+
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(leaf.wait_drained(None).expect("wait"), TreeDrain::AllMembersExited);
+}
+
+/// A wait's deadline counts its time queued: one queued past its deadline answers from the
+/// leaf's state then, without the watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_wait_queued_past_its_deadline_answers_from_the_leafs_state() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-queued-past-deadline", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+    let holder_leaf = leaf.clone();
+    let holder = std::thread::spawn(move || {
+        crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking);
+        holder_leaf.wait_drained(None)
+    });
+    blocking_rx.recv().expect("the holder blocks on the watch");
+
+    assert_eq!(
+        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        TreeDrain::MembersRemain,
+        "queued past its deadline, with the leaf populated"
+    );
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(
+        holder.join().expect("holder").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+}
+
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
 /// other party removed it, which on a cgroup v2 leaf can only happen once it was empty. There
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note
