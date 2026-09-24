@@ -262,15 +262,25 @@ fn env_variable_reaches_child() {
 
 #[test]
 fn current_dir_sets_working_directory() {
-    let tmpdir = std::env::temp_dir();
+    let dir = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new();
-    // Use exit 0 — simplest child that honors cwd without writing to stdout.
     cmd.executable(testbin())
-        .args(["cosca_testbin", "exit", "0"])
-        .current_dir(&tmpdir);
-    let child = cmd.spawn().expect("spawn with cwd");
-    let status = child.wait().expect("wait");
-    assert_eq!(status.code(), Some(0));
+        .args(["cosca_testbin", "cwd"])
+        .current_dir(dir.path())
+        .stdout(Stdio::pipe())
+        .expect("stdout pipe");
+    let mut child = cmd.spawn().expect("spawn with cwd");
+    let mut out = String::new();
+    child
+        .stdout()
+        .expect("stdout reader")
+        .read_to_string(&mut out)
+        .expect("read");
+    assert_eq!(child.wait().expect("wait").code(), Some(0));
+    assert_eq!(
+        std::fs::canonicalize(out.trim()).expect("the child's cwd exists"),
+        std::fs::canonicalize(dir.path()).expect("canonicalize"),
+    );
 }
 
 // Windows commandline path =====
