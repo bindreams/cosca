@@ -111,7 +111,8 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
 /// A failed kill in the async spawn's error teardown is not waited on, and EPERM — a setuid
 /// child refusing SIGKILL — is not asserted, because it is reachable without a bug; any other
 /// kind is. The child is left alive, blocked on stdin, and exits when the failed spawn drops the
-/// pipe's parent end; tokio's own `Child` drop hands it to the runtime's orphan reaper.
+/// pipe's parent end; tokio's own `Child` drop hands it to the runtime's orphan reaper, which the
+/// test drives until the child is reaped.
 #[test]
 fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
     use crate::stdio::Stdio;
@@ -149,6 +150,28 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         if let Ok(err) = outcome {
             err.expect("the forced arm must fail the spawn");
         }
+        let captured = fault::take_captured().expect("seam captured the child's identity");
+        drive_until_reaped(&runtime, &captured);
+        fault::assert_child_reaped(captured);
+    }
+}
+
+/// Turn `runtime`'s driver, whose every turn reaps tokio's exited orphans, until the child
+/// `captured` names is reaped (Windows: has exited). Ends on the child's own exit, and never
+/// before: no interval, no bound.
+fn drive_until_reaped(
+    runtime: &::tokio::runtime::Runtime,
+    captured: &crate::identity::Resolved<crate::identity::ProcessId>,
+) {
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    #[cfg(unix)]
+    let pending = || id.exists() == crate::identity::Existence::Present;
+    #[cfg(windows)]
+    let pending = || id.is_alive() != crate::identity::Liveness::Dead;
+    while pending() {
+        runtime.block_on(::tokio::task::yield_now());
     }
 }
 
