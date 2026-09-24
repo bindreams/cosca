@@ -27,9 +27,35 @@
 # scripted probes and inspect their results (return codes, event logs, spawned process
 # trees), but a WinRM/PowerShell-remoting session is not the interactive console session, so
 # it cannot itself render or click through the secure-desktop UAC prompt. For a probe that
-# needs a human (or UI automation) to see the prompt, add a display to the `qemu` provider
-# block below (e.g. `qe.other_default = %w(-parallel null -monitor none -vga std -display
-# cocoa)`) and connect to the console, or RDP into the guest.
+# needs a human (or UI automation) to see the prompt, pass `devvm.py up windows-x64
+# --display`, which sets DEVVM_WINDOWS_DISPLAY below and opens a local QEMU window
+# (`-display cocoa -vga std`) on this Mac instead — a real local window, not VNC or any other
+# network-exposed display, so it doesn't touch the loopback-only guarantee
+# fix_qemu_loopback_only.rb enforces for forwarded ports. Off by default; RDP into the guest
+# is the other option if a window on this Mac specifically isn't what's needed.
+#
+# Provisioning: this Vagrantfile deliberately declares only ONE provisioner below (the "file"
+# upload). Every other Windows provisioning step (clean-stage, mirror-tree, lock-tree,
+# account-and-uac, rust) is driven directly by scripts/devvm.py over `vagrant winrm`
+# (provision_windows_guest / run_windows_script there), not through Vagrant's `config.vm.
+# provision "shell", ...`. Reason: vagrant 2.4.9's own shell-provisioner WinRM path
+# (provision_winrm) calls the `wait_for_reboot` guest capability UNCONDITIONALLY at the start
+# of every single shell-provisioner run — including this box's former reboot-if-needed
+# provisioner — and that capability's actual "is a reboot pending?" test
+# (reboot_detect.ps1) is a real `shutdown -f -r -t 60` followed by `shutdown -a`: a genuine,
+# if usually self-cancelled, 60-second forced-restart fuse on every ordinary provisioning
+# step. Measured directly (2026-09-24): every `vagrant provision`/`vagrant up --provision`
+# against this guest produced a matching System-log event 1074 ("wininit.exe has initiated
+# restart") followed by 1075 ("aborted") pair — once per shell provisioner in the block below,
+# as it stood before this comment — and the owner twice saw the guest's real "you're about to
+# be signed out" sign-off splash live during an otherwise-ordinary `devvm.py sync`. Driving
+# each script over `vagrant winrm -c` instead sidesteps `provision_winrm`/`wait_for_reboot`
+# entirely — confirmed by reading vagrant's plugins/commands/winrm/command.rb and
+# communicators/winrm/{communicator,shell}.rb end to end, none of which reference
+# `wait_for_reboot` or `reboot_detect`. The one legitimate reboot this guest ever needs
+# (EnableLUA/autologon changes only take effect at the next boot) is now issued and waited on
+# directly by devvm.py's reboot_windows_guest_and_wait, not Vagrant's `reboot: true` shell-
+# provisioner capability, which carries the exact same fuse plus its own `sleep 10` poll loop.
 
 require_relative "../_shared/fix_macos_port_check"
 require_relative "../_shared/fix_qemu_loopback_only"
@@ -83,47 +109,48 @@ Vagrant.configure("2") do |config|
     # This host may already have unrelated VMs (this tool's or not) holding the default
     # forwarded port; let Vagrant pick a free one instead of failing `up`.
     qe.ssh_auto_correct = true
+    # Opt-in only, via `devvm.py up windows-x64 --display` -> DEVVM_WINDOWS_DISPLAY: overrides
+    # vagrant-qemu's own headless default (`-display none -vga none`, see config.rb's
+    # `other_default`) with a local macOS window. `-vga std` is needed alongside `-display
+    # cocoa` because `-display` alone doesn't attach a framebuffer device for QEMU to render
+    # into. This is a LOCAL window only (no `-display vnc=...` or other network-exposed
+    # display) - it doesn't touch fix_qemu_loopback_only.rb's hostfwd-only loopback guarantee,
+    # and doesn't disturb the monitor/serial chardev setup vagrant-qemu's driver.rb adds
+    # independently of (and before) this array is appended.
+    #
+    # no_daemonize is NOT optional alongside -display cocoa - measured directly (2026-09-24):
+    # without it, driver.rb's default path appends `-daemonize`, which makes QEMU call fork()
+    # itself *after* Cocoa/AppKit has already begun initializing on its main thread; the
+    # Objective-C runtime detects a Cocoa call following that internal fork() and deliberately
+    # crashes the process ("may have been in progress in another thread when fork() was
+    # called... Crashing instead"), 100% reproducible. `no_daemonize: true` instead has
+    # driver.rb spawn qemu-system-x86_64 as a normal detached child via Ruby's ChildProcess
+    # (ChildProcess#leader/#detach) - a fork()+exec() pair where the fork happens in the Ruby
+    # process, before qemu-system-x86_64 (and its Cocoa state) exists at all, so there is no
+    # already-initialized Cocoa runtime for the fork to strand. QEMU still writes its own
+    # `-pidfile` either way, so vagrant-qemu's own running?/stop lifecycle tracking (which
+    # reads that pidfile and the monitor socket, not any Ruby parent/child relationship) is
+    # unaffected by which path started the process.
+    if ENV.fetch("DEVVM_WINDOWS_DISPLAY", "0") == "1"
+      qe.other_default = %w(-parallel none -monitor none -display cocoa -vga std)
+      qe.no_daemonize = true
+    end
   end
 
   # No live synced folder for Windows (no rsync binary on the box, and SMB needs a macOS
   # File Sharing toggle + password prompt). Instead, `devvm.py sync` stages a git-tracked-only
   # copy of the tree on the host (see stage_tree() in scripts/devvm.py), the "file"
-  # provisioner uploads it over WinRM into a scratch staging directory, and
-  # windows-mirror-tree.ps1 mirrors it into C:\cosca with robocopy /MIR — the WinRM upload
-  # alone is additive-only (never deletes), so without the mirror step a `devvm.py sync`
-  # after deleting a host file would leave it behind in the guest.
+  # provisioner below uploads it over WinRM into a scratch staging directory, and
+  # windows-mirror-tree.ps1 (devvm.py-driven, see the comment above) mirrors it into C:\cosca
+  # with robocopy /MIR — the WinRM upload alone is additive-only (never deletes), so without
+  # the mirror step a `devvm.py sync` after deleting a host file would leave it behind in the
+  # guest.
+  #
+  # This is the ONLY provisioner declared here — confirmed clean of any wait_for_reboot call
+  # by reading plugins/provisioners/file/provisioner.rb, so there's no reason to reimplement
+  # WinRM file upload by hand the way the former shell provisioners were replaced. `run:
+  # "always"` overrides Vagrant's normal already-ran-on-this-machine skip so a plain `vagrant
+  # provision` re-uploads every time devvm.py calls it (on every `up`/`sync`), not just once.
   config.vm.synced_folder ".", "/vagrant", disabled: true
-  config.vm.provision "shell", path: "../../provision/windows-clean-stage.ps1", privileged: true, run: "always"
   config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca-stage", run: "always"
-  config.vm.provision "shell", path: "../../provision/windows-mirror-tree.ps1", privileged: true, run: "always"
-  config.vm.provision "shell", path: "../../provision/windows-lock-tree.ps1", privileged: true, run: "always"
-  # Vagrant's shell provisioner only sees the host env vars explicitly listed here (via
-  # `env:`) — DEVVM_WINDOWS_AUTO_CONSENT living in the host subprocess env that ran `vagrant`
-  # does NOT reach the guest on its own. This is what makes `devvm.py up --allow-elevation`
-  # actually take effect inside the guest.
-  config.vm.provision "shell",
-    path: "../../provision/windows-account-and-uac.ps1",
-    privileged: true,
-    run: "always",
-    env: { "DEVVM_WINDOWS_AUTO_CONSENT" => ENV.fetch("DEVVM_WINDOWS_AUTO_CONSENT", "0") }
-  # No `run: "always"` — matches linux-rust.sh's guests: devvm.py always passes `--provision`
-  # on `up` and always runs `vagrant provision` (not just `up`) for `sync`, so this runs on
-  # every provisioning pass either way; it doesn't need Vagrant's normal
-  # already-ran-on-this-machine skip overridden the way the staging/lock/account steps above
-  # do, since installing into $env:USERPROFILE\.cargo is independent of the C:\cosca tree
-  # those steps manage.
-  config.vm.provision "shell", path: "../../provision/windows-rust.ps1", privileged: false
-
-  # Named, run: "never" provisioner — only invoked explicitly by devvm.py (`vagrant provision
-  # --provision-with reboot-if-needed`) when windows-account-and-uac.ps1's last output line
-  # was DEVVM_REBOOT_REQUIRED=1 (an EnableLUA or autologon change that only takes effect at
-  # the next boot). Vagrant's own `reboot: true` shell-provisioner capability triggers
-  # unconditionally on every run of the provisioner block it's attached to regardless of the
-  # script's own logic, so a real reboot-only-when-something-changed policy has to live at
-  # this host-driven, two-phase level instead of inside a single always-run provisioner.
-  config.vm.provision "reboot-if-needed",
-    type: "shell",
-    inline: "exit 0",
-    reboot: true,
-    run: "never"
 end

@@ -20,16 +20,36 @@
 # this script's own probe process reports Medium Mandatory Level (`whoami /groups`) and that
 # a runas child launched from it reports High.
 #
-# Completion is signalled over a named pipe, not a poll: the task's wrapper script writes its
-# own $PID to a file first (so a timeout can kill the whole process tree, not just the
-# wrapper's own root), runs the caller's command with output redirected to a file, then
-# connects to a named pipe this script is already blocked reading from and writes its exit
-# code before closing. This script's own wait is a single blocking read that only returns once
-# the wrapper's pipe client actually connects and writes — a real completion signal, not
-# `Start-Sleep` in a loop. The one timeout in this script (`-TimeoutSeconds`, below) is a
-# genuine external-event failure bound: the task might never run at all (no interactive
-# session to borrow) or the probe might hang, and there is no way to distinguish "still
-# running" from "never started" other than waiting up to some bound before giving up.
+# Completion is signalled over a named pipe, not a poll, and the pipe connection's own lifetime
+# is the liveness signal: the wrapper connects to a named pipe this script is already blocked
+# reading from as its very first action and keeps that connection open for its whole life,
+# recording its own $PID to a file along the way (so a timeout can kill the whole process
+# tree, not just the wrapper's own root), running the caller's command with output redirected
+# to a file, and writing its exit code to the still-open pipe as its very last action. This
+# script's wait has two real, non-`Start-Sleep` completion events, not one: first the pipe
+# connection itself (BeginWaitForConnection/WaitOne), then a blocking read on that connection.
+# If the wrapper dies anywhere after connecting — an unhandled error, being killed, a crash —
+# the OS tears down its end of the pipe the moment the process goes away, and the blocking read
+# unblocks immediately with EOF, reported as "exited without reporting a result", rather than
+# this script waiting out the rest of -TimeoutSeconds for a result that will never arrive. The
+# one timeout in this script (`-TimeoutSeconds`, below) only has to bound the one case with no
+# other observable event: the task might never run at all (no interactive session to borrow) or
+# Task Scheduler itself might hang before the wrapper ever gets far enough to connect, and there
+# is no primitive that distinguishes that from "still running" other than waiting up to some
+# bound before giving up.
+#
+# That bound has to cover every blocking Task Scheduler RPC call, not just the final pipe
+# wait: Register-ScheduledTask, Start-ScheduledTask, and Unregister-ScheduledTask have no
+# timeout parameter of their own and can block indefinitely if the Task Scheduler service is
+# stuck — measured directly (2026-09-24): a guest wedged inside Register-ScheduledTask for
+# the better part of an hour with no error and no output, because -TimeoutSeconds previously
+# only wrapped the wait *after* Start-ScheduledTask fired, not the calls before it. $deadline
+# and Invoke-Bounded (below) close that gap: every blocking Task Scheduler call shares one
+# wall-clock deadline derived from -TimeoutSeconds, run on an in-process runspace via
+# [PowerShell]::BeginInvoke()/AsyncWaitHandle.WaitOne() — the same real-completion-event
+# pattern as the named-pipe wait, not a poll, and no new process spawned (this guest is
+# already resource-constrained under TCG emulation, so avoiding Start-Job's extra
+# powershell.exe per call matters here).
 Param(
     [Parameter(Mandatory = $true)]
     [string]$EncodedCommand,
@@ -40,9 +60,96 @@ Param(
 $ErrorActionPreference = "Stop"
 $taskName = "DevvmUnelevatedRun-" + [Guid]::NewGuid().ToString("N")
 $outputPath = "$env:TEMP\$taskName.out"
+$errorPath = "$env:TEMP\$taskName.err"
 $exitCodePath = "$env:TEMP\$taskName.exitcode"
 $scriptPath = "$env:TEMP\$taskName.ps1"
 $pidPath = "$env:TEMP\$taskName.pid"
+# Measured directly (2026-09-24): the wrapper is a whole separate powershell.exe process (see
+# -File $scriptPath below), so it does NOT inherit this script's $ErrorActionPreference = Stop
+# — its own default is Continue, and an error thrown before the pipe-write step (e.g. by
+# something the wrapper itself does, as opposed to the caller's redirected command) prints to
+# that process's own console and is otherwise lost: the window this task runs in is only
+# visible in the interactive session devvm.py's own host can't see, and closes with the task.
+# Start-Transcript on the wrapper captures everything that would have printed there — including
+# red terminating/non-terminating error text — to a file this script reads back below,
+# regardless of whether the wrapper's main body throws.
+$transcriptPath = "$env:TEMP\$taskName.transcript.txt"
+
+# New-ScheduledTaskPrincipal -LogonType Interactive requires an explicit -UserId: it does not
+# default to "whoever is currently logged on", so without this Register-ScheduledTask throws
+# "missing mandatory parameter: UserId" (measured 2026-09-24). Win32_ComputerSystem.UserName
+# already comes back machine-qualified (e.g. "DESKTOP-RPVSB2I\vagrant"), which is exactly what
+# -UserId needs. Fail loudly, not silently substitute a guess, if nobody is logged on
+# interactively - a task registered against no session-1 logon to borrow would just fail later
+# with a less legible error inside Start-ScheduledTask instead.
+$currentUser = (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
+if ([string]::IsNullOrWhiteSpace($currentUser)) {
+    throw "devvm: no interactive (session 1, console) user is currently logged on - Win32_ComputerSystem.UserName is empty, so there is no logon for a scheduled task to borrow. See windows-account-and-uac.ps1's autologon setup."
+}
+
+# Shared wall-clock deadline for every blocking Task Scheduler call below (Register-, Start-,
+# and the pipe-wait's own timeout) — see Invoke-Bounded. One shared deadline instead of a
+# fresh $TimeoutSeconds per phase bounds total worst-case runtime to ~$TimeoutSeconds, not
+# some multiple of it.
+$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+function Get-RemainingSeconds {
+    $remaining = [Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
+    if ($remaining -lt 0) { return 0 }
+    return $remaining
+}
+
+# Best-effort: the wrapper's Start-Transcript writes incrementally, so even a killed-on-timeout
+# wrapper has usually flushed something useful here - read it whenever it exists, on both the
+# success and timeout paths below, rather than only on success.
+function Read-WrapperTranscript {
+    if (Test-Path $transcriptPath) {
+        try { return Get-Content -Path $transcriptPath -Raw } catch { return "" }
+    }
+    return ""
+}
+
+function Invoke-Bounded {
+    <#
+      Runs $ScriptBlock on a separate in-process runspace and waits up to $TimeoutSeconds for
+      it to finish, via BeginInvoke()/AsyncWaitHandle.WaitOne() — the same real-completion-
+      event pattern the named-pipe wait below uses, not a poll. $ScriptBlock must be
+      self-contained (only $Parameters in scope, no closures over this script's variables):
+      AddScript(scriptblock) re-parses it from its string form in the new runspace.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock,
+        [Parameter()]
+        [hashtable]$Parameters = @{},
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)]
+        [string]$TimeoutMessage
+    )
+    if ($TimeoutSeconds -le 0) {
+        throw $TimeoutMessage
+    }
+    $ps = [PowerShell]::Create()
+    try {
+        [void]$ps.AddScript($ScriptBlock)
+        foreach ($key in $Parameters.Keys) {
+            [void]$ps.AddParameter($key, $Parameters[$key])
+        }
+        $asyncResult = $ps.BeginInvoke()
+        $signaled = $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        if (-not $signaled) {
+            $ps.Stop() | Out-Null
+            throw $TimeoutMessage
+        }
+        $ps.EndInvoke($asyncResult) | Out-Null
+        if ($ps.HadErrors) {
+            throw $ps.Streams.Error[0].Exception
+        }
+    } finally {
+        $ps.Dispose()
+    }
+}
 
 # The scheduled task's action: record the wrapper's own PID (for a full process-tree kill on
 # timeout), decode and run the caller's command, redirecting its combined output to a file (a
@@ -73,26 +180,85 @@ $pidPath = "$env:TEMP\$taskName.pid"
 # replacement semantics are a hazard here) - the here-string being single-quoted means none of
 # its `$`-prefixed PowerShell variables are expanded in THIS script's scope; they stay literal
 # text for the wrapper's own process to evaluate when it runs.
+# $exitCode starts at -1 (not 0) so that if the wrapper crashes before the caller's command
+# ever runs, the caller sees a nonzero/sentinel status rather than a false "succeeded". Connect()
+# is the wrapper's very first action, called with NO timeout, deliberately - not a chosen-
+# interval guess: the outer script's BeginWaitForConnection() is already listening before
+# Start-ScheduledTask ever fires (see that ordering above), so this Connect() has a real server
+# waiting on the other end from the moment this wrapper process exists at all; there is no
+# "might the server never show up" case for it to bound. If the outer script's own server-side
+# wait times out first (its -TimeoutSeconds, the genuine external-event bound - the task might
+# never run, or the probe might hang), it kills this whole process tree via taskkill /T, which
+# ends this wrapper - including a still-blocked Connect() - as a side effect. So an unbounded
+# Connect() here is still covered by a real failure bound; it's just enforced from the other
+# side of the pipe.
+#
+# The pipe connection is kept open for the wrapper's entire life and only written to once, at
+# the very end - not reopened per write. That means the outer script's read of this connection
+# doubles as the wrapper's liveness signal: if the wrapper dies for any reason after connecting
+# (an error escaping the inner try/catch, being killed, a crash) without ever reaching the
+# final WriteLine, the OS tears down this end of the pipe as the process exits, and the outer
+# script's blocking read unblocks immediately with EOF - a real, immediate signal, not another
+# timeout to wait out. The outer try/catch here only guards the connect step itself; the inner
+# try/catch/finally guards the caller's command and guarantees the exit-code file and the pipe
+# write both happen exactly once for every way the inner block can end.
 $wrapperTemplate = @'
-$PID | Out-File -FilePath '__PID_PATH__' -Encoding ascii
-powershell -NoProfile -NonInteractive -EncodedCommand __ENCODED_COMMAND__ *> '__OUTPUT_PATH__'
-$exitCode = $LASTEXITCODE
-$exitCode | Out-File -FilePath '__EXITCODE_PATH__' -Encoding ascii
-$pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', '__TASK_NAME__', [System.IO.Pipes.PipeDirection]::Out)
-$pipe.Connect()
-$writer = New-Object System.IO.StreamWriter($pipe)
-$writer.WriteLine($exitCode)
-$writer.Flush()
-$writer.Close()
-$pipe.Close()
+Start-Transcript -Path '__TRANSCRIPT_PATH__' | Out-Null
+$exitCode = -1
+$pipe = $null
+$writer = $null
+try {
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', '__TASK_NAME__', [System.IO.Pipes.PipeDirection]::Out)
+    $pipe.Connect()
+    $writer = New-Object System.IO.StreamWriter($pipe)
+    try {
+        $PID | Out-File -FilePath '__PID_PATH__' -Encoding ascii
+        # The child runs via Start-Process with -RedirectStandardOutput/-RedirectStandardError, NOT
+        # a PowerShell redirection operator. PowerShell 5.1 parses a native child's stderr through
+        # its own stream reader regardless of which operator is used (`*>`, `2>&1`, even a plain
+        # `2>` alone) or -OutputFormat, and treats a `#< CLIXML` prefix (written by a nested
+        # non-interactive powershell.exe with redirected output) as serialized records to
+        # deserialize - throwing if what follows isn't well-formed CLIXML. Start-Process's
+        # -RedirectStandardOutput/-RedirectStandardError are real OS-level file handles, so that
+        # reader never sees the stream at all (see scripts/README.md).
+        $childProcess = Start-Process -FilePath 'powershell' `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '__ENCODED_COMMAND__') `
+            -RedirectStandardOutput '__OUTPUT_PATH__' `
+            -RedirectStandardError '__ERROR_PATH__' `
+            -NoNewWindow -Wait -PassThru
+        $exitCode = $childProcess.ExitCode
+    } catch {
+        Write-Host "devvm wrapper: caught $($_.Exception.GetType().FullName): $($_.Exception.Message)"
+        Write-Host $_.ScriptStackTrace
+    }
+} catch {
+    Write-Host "devvm wrapper: pipe connect failed: $($_.Exception.Message)"
+} finally {
+    $exitCode | Out-File -FilePath '__EXITCODE_PATH__' -Encoding ascii
+    if ($writer) {
+        try {
+            $writer.WriteLine($exitCode)
+            $writer.Flush()
+            $writer.Close()
+        } catch {
+            Write-Host "devvm wrapper: pipe signal failed: $($_.Exception.Message)"
+        }
+    }
+    if ($pipe) {
+        $pipe.Close()
+    }
+    Stop-Transcript | Out-Null
+}
 '@
 
 $taskCommand = $wrapperTemplate.
     Replace('__PID_PATH__', $pidPath).
     Replace('__ENCODED_COMMAND__', $EncodedCommand).
     Replace('__OUTPUT_PATH__', $outputPath).
+    Replace('__ERROR_PATH__', $errorPath).
     Replace('__EXITCODE_PATH__', $exitCodePath).
-    Replace('__TASK_NAME__', $taskName)
+    Replace('__TASK_NAME__', $taskName).
+    Replace('__TRANSCRIPT_PATH__', $transcriptPath)
 Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 
 # Register-ScheduledTask with NO -Trigger at all: this task is only ever fired on demand via
@@ -101,65 +267,199 @@ Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 # satisfy schtasks' own required-field validation, and a fixed "00:00" wrapped/failed for any
 # invocation after midnight - Register-ScheduledTask has no such requirement, so that failure
 # mode is structurally impossible here, not just less likely.
-$action = New-ScheduledTaskAction -Execute "powershell" -Argument "-NoProfile -NonInteractive -File $scriptPath"
-$principal = New-ScheduledTaskPrincipal -LogonType Interactive -RunLevel Limited
 try {
-    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+    Invoke-Bounded -TimeoutSeconds (Get-RemainingSeconds) `
+        -TimeoutMessage "devvm: Register-ScheduledTask did not complete within ${TimeoutSeconds}s - Task Scheduler may be stuck." `
+        -Parameters @{ TaskName = $taskName; ScriptPath = $scriptPath; UserId = $currentUser } `
+        -ScriptBlock {
+            param($TaskName, $ScriptPath, $UserId)
+            # -ExecutionPolicy Bypass: the LIMITED-run-level principal's own effective execution
+            # policy is untested/unknown territory (a different, filtered token than the
+            # High-integrity WinRM session that registers this task) - forcing Bypass for this
+            # one task action removes that as a variable entirely rather than relying on
+            # whatever CurrentUser/LocalMachine policy happens to be configured on the guest.
+            $action = New-ScheduledTaskAction -Execute "powershell" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ScriptPath"
+            $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Force | Out-Null
+        }
 } catch {
     throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup."
 }
 
-$pipeServer = New-Object System.IO.Pipes.NamedPipeServerStream($taskName, [System.IO.Pipes.PipeDirection]::In)
+# The 2-arg NamedPipeServerStream(name, direction) constructor defaults to
+# PipeOptions.None (synchronous); BeginWaitForConnection() below is the async API and throws
+# "Pipe is not opened in asynchronous mode" against a stream opened that way - measured
+# directly (2026-09-24, live against this guest, 100% reproducible on the very first
+# --unelevated run after the wait_for_reboot refactor). [PipeOptions]::Asynchronous on the full
+# 5-arg constructor is what actually enables Begin/End-style calls.
+#
+# An explicit PipeSecurity is required, not optional: this script itself runs over `vagrant
+# winrm`, a High-integrity session (LocalAccountTokenFilterPolicy=1 - see cmd_run's comment),
+# so a pipe created here with no explicit security descriptor implicitly inherits a High
+# mandatory label from the creating process/token. The wrapper's client-side Connect() runs
+# under the scheduled task's LIMITED run level, i.e. a Medium-integrity token - and Windows'
+# Mandatory Integrity Control denies a lower-integrity process write access to a
+# higher-integrity object by default ("no write up"), regardless of the DACL. Measured
+# directly (2026-09-24): with no explicit security descriptor, the wrapper's Connect() failed
+# every time with "Access to the path is denied." The fix is to hand the pipe its own explicit
+# DACL plus a SACL mandatory label of Medium with the no-write-up flag, so a Medium-integrity
+# client is not "writing up": SYSTEM and Administrators get full control (GA) for completeness,
+# and Authenticated Users gets read/write (GRGW) - the actual access path for the LIMITED task,
+# since a UAC-filtered/standard token's Administrators membership is deny-only and won't match
+# a DACL entry for BUILTIN\Administrators. Setting a SACL at object-creation time (as opposed
+# to modifying an existing object's SACL afterwards) does not require SeSecurityPrivilege, so
+# this needs no extra privilege grant on top of the High-integrity WinRM session already in use
+# here - confirmed directly against this guest.
+$pipeSecuritySddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)S:(ML;;NW;;;ME)"
+$pipeSecurity = New-Object System.IO.Pipes.PipeSecurity
+$pipeSecurity.SetSecurityDescriptorSddlForm($pipeSecuritySddl)
+$pipeServer = New-Object System.IO.Pipes.NamedPipeServerStream(
+    $taskName,
+    [System.IO.Pipes.PipeDirection]::In,
+    1,
+    [System.IO.Pipes.PipeTransmissionMode]::Byte,
+    [System.IO.Pipes.PipeOptions]::Asynchronous,
+    0,
+    0,
+    $pipeSecurity
+)
 try {
     # Start waiting for the wrapper's pipe connection BEFORE starting the task, so the
     # wrapper's client-side Connect() can never race ahead of a server that isn't listening
     # yet.
     $connectResult = $pipeServer.BeginWaitForConnection($null, $null)
 
-    Start-ScheduledTask -TaskName $taskName
+    Invoke-Bounded -TimeoutSeconds (Get-RemainingSeconds) `
+        -TimeoutMessage "devvm: Start-ScheduledTask did not complete within ${TimeoutSeconds}s - Task Scheduler may be stuck." `
+        -Parameters @{ TaskName = $taskName } `
+        -ScriptBlock {
+            param($TaskName)
+            Start-ScheduledTask -TaskName $TaskName
+        }
 
-    # The one acceptable timeout in this script: a genuine external-event failure bound, not
-    # a poll. The task might never run at all (no interactive session to borrow) or the probe
-    # might hang; there is no primitive that distinguishes those from "still running" other
-    # than waiting up to some bound.
-    $signaled = $connectResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+    # The one *original* acceptable timeout in this script, now sharing $deadline with
+    # Register-/Start-ScheduledTask above instead of getting its own fresh $TimeoutSeconds: a
+    # genuine external-event failure bound, not a poll. The task might never run at all (no
+    # interactive session to borrow) or the probe might hang; there is no primitive that
+    # distinguishes those from "still running" other than waiting up to some bound.
+    $signaled = $connectResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds((Get-RemainingSeconds)))
     if (-not $signaled) {
         if (Test-Path $pidPath) {
             $taskPid = (Get-Content -Path $pidPath -Raw).Trim()
             if ($taskPid) {
-                # taskkill is a native command: any stderr it writes would make PowerShell
-                # 5.1 set $? to $false regardless of its own exit code, which the script-wide
-                # $ErrorActionPreference = "Stop" above would otherwise escalate into a
-                # terminating NativeCommandError - masking the real timeout error below with
-                # an unrelated one. Scoped to "Continue" for just this call, matching the same
-                # native-command-stderr hazard windows-rust.ps1 documents and works around.
-                $previousEap = $ErrorActionPreference
-                $ErrorActionPreference = "Continue"
+                # taskkill.exe via Start-Process + WaitForExit(30000): bounded (fixed 30s,
+                # independent of the main $deadline which has already elapsed here - this is
+                # best-effort cleanup, not a new failure to report) and, launched this way
+                # rather than invoked directly, its stderr goes to a file instead of into this
+                # script's own error stream - sidestepping the PowerShell 5.1 hazard where ANY
+                # stderr from a directly-invoked native command sets $? to $false under
+                # $ErrorActionPreference = "Stop", which would otherwise turn a successful kill
+                # into a NativeCommandError masking the real timeout error thrown below (the
+                # same hazard windows-rust.ps1 documents and works around for a direct
+                # invocation).
+                $killOutPath = "$env:TEMP\$taskName.taskkill.out"
+                $killErrPath = "$env:TEMP\$taskName.taskkill.err"
                 try {
-                    taskkill /F /T /PID $taskPid | Out-Null
+                    $killProcess = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/F", "/T", "/PID", $taskPid) `
+                        -PassThru -NoNewWindow -RedirectStandardOutput $killOutPath -RedirectStandardError $killErrPath
+                    if (-not $killProcess.WaitForExit(30000)) {
+                        $killProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+                    }
                 } finally {
-                    $ErrorActionPreference = $previousEap
+                    Remove-Item -Path $killOutPath, $killErrPath -ErrorAction SilentlyContinue
                 }
             }
         }
-        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - killed its whole process tree. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow."
+        $transcriptNote = Read-WrapperTranscript
+        if ($transcriptNote) {
+            $transcriptNote = "`n--- wrapper transcript (captures anything the wrapper itself printed/threw before or instead of signaling completion) ---`n$transcriptNote"
+        }
+        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - killed its whole process tree. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$transcriptNote"
     }
 
     $pipeServer.EndWaitForConnection($connectResult)
     $reader = New-Object System.IO.StreamReader($pipeServer)
     try {
-        $exitCode = [int]$reader.ReadLine()
-    } catch {
-        throw "devvm: unelevated probe connected but sent no valid exit code - it may have failed to start under the scheduled task"
+        # ReadLine() blocks until either a full line arrives or the connection is torn down.
+        # The wrapper holds this connection open for its entire life and writes to it only once,
+        # at the very end (see the wrapper template above) - so if it dies anywhere after
+        # connecting (an error outside its own try/catch, killed, a crash), the OS closes its
+        # end of the pipe the instant the process goes away, and this read unblocks immediately
+        # instead of blocking for the rest of -TimeoutSeconds. That is a real, immediate
+        # kernel-level event, not a chosen-interval wait - the same kind of primitive as the
+        # connection wait above, just for "the wrapper is still alive" rather than "the wrapper
+        # started at all". A torn-down connection can surface here as a clean EOF ($null) or,
+        # depending on OS timing if the process dies while a read is already in flight, as a
+        # broken-pipe IOException - both mean exactly the same thing (the wrapper is gone
+        # without having written anything), so both are treated as $null below rather than as
+        # this script's own error.
+        try {
+            $resultLine = $reader.ReadLine()
+        } catch [System.IO.IOException] {
+            $resultLine = $null
+        }
     } finally {
         $reader.Close()
     }
 
+    if ($null -eq $resultLine) {
+        $transcriptNote = Read-WrapperTranscript
+        if ($transcriptNote) {
+            $transcriptNote = "`n--- wrapper transcript ---`n$transcriptNote"
+        }
+        throw "devvm: unelevated probe's wrapper exited without reporting a result - it connected to the pipe but the connection was closed (crashed, was killed, or otherwise exited abnormally) before it wrote an exit code$transcriptNote"
+    }
+    try {
+        $exitCode = [int]$resultLine
+    } catch {
+        $transcriptNote = Read-WrapperTranscript
+        if ($transcriptNote) {
+            $transcriptNote = "`n--- wrapper transcript ---`n$transcriptNote"
+        }
+        throw "devvm: unelevated probe connected but sent no valid exit code - it may have failed to start under the scheduled task$transcriptNote"
+    }
+
     $output = if (Test-Path $outputPath) { Get-Content -Path $outputPath -Raw } else { "" }
+    $errorOutput = if (Test-Path $errorPath) { Get-Content -Path $errorPath -Raw } else { "" }
+    if ($errorOutput) {
+        # Kept as its own file/section rather than merged back into $output here: merging is
+        # exactly the operation that triggers PowerShell's CLIXML-deserializing ProcessStreamReader
+        # (see the wrapper template's comment above `1>`/`2>`) - re-merging as plain text after
+        # both streams have already safely landed on disk as bytes is not that operation, but the
+        # separation is kept anyway so a caller can tell stdout from stderr instead of the two
+        # being interleaved in unpredictable order.
+        $output = "$output`n--- stderr ---`n$errorOutput"
+    }
+    $transcript = Read-WrapperTranscript
+    if ($transcript) {
+        # Always appended, even on a zero exit code: Write-Host lines from the wrapper's own
+        # catch blocks land here too, so a caller re-running to double-check success still sees
+        # them instead of them being silently available only on failure.
+        $output = "$output`n--- wrapper transcript ---`n$transcript"
+    }
 } finally {
     $pipeServer.Dispose()
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-Item -Path $outputPath, $exitCodePath, $scriptPath, $pidPath -ErrorAction SilentlyContinue
+    try {
+        # 120s, not 30s: measured directly (2026-09-24, isolated via Stopwatch around a bare
+        # Unregister-ScheduledTask call, outside this script) that Unregister-ScheduledTask on
+        # this guest routinely takes ~32s even when Register-/Start-ScheduledTask for the same
+        # task each took under 3s - a fixed 30s bound was clipping real, successful cleanups
+        # essentially every time, which is why plain `Get-ScheduledTask` kept finding leftover
+        # DevvmUnelevatedRun-* tasks from runs that had otherwise succeeded. 120s gives real
+        # margin above the measured ~32s rather than another too-tight guess.
+        Invoke-Bounded -TimeoutSeconds 120 `
+            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' may be left behind; a future run's Register-ScheduledTask -Force will overwrite it." `
+            -Parameters @{ TaskName = $taskName } `
+            -ScriptBlock {
+                param($TaskName)
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            }
+    } catch {
+        # Best-effort cleanup only: never let a stuck/failed Unregister-ScheduledTask replace
+        # the real outcome of the probe above (success, or the timeout already thrown).
+        Write-Warning $_.Exception.Message
+    }
+    Remove-Item -Path $outputPath, $errorPath, $exitCodePath, $scriptPath, $pidPath, $transcriptPath -ErrorAction SilentlyContinue
 }
 
 if ($output) {

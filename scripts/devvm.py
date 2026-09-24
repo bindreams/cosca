@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,9 +32,22 @@ from pathlib import Path
 REBOOT_MARKER_TRUE = "DEVVM_REBOOT_REQUIRED=1"
 REBOOT_MARKER_FALSE = "DEVVM_REBOOT_REQUIRED=0"
 
+# SoftwareLicensingProduct.LicenseStatus: 1 means Licensed. Anything else (5 = Notification is
+# what a TIMEBASED_EVAL image reports once its evaluation period elapses - measured directly,
+# 2026-09-24, on stromweld/windows-10 202503.09.0) means the guest is not currently licensed
+# and needs a rearm before it's safe to leave unattended - see ensure_windows_license_current.
+WINDOWS_LICENSE_STATUS_LICENSED = 1
+# Rearm proactively within this many minutes of the eval period actually running out, not
+# just once it's already hit zero - a guest that dies mid-provisioning run (see
+# ensure_windows_license_current's docstring for the incident this is fixing) is worse than
+# spending a rearm slightly early. One day's buffer is cheap next to the box's eval window
+# (on the order of months) and the two rearms this image ships with.
+WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES = 24 * 60
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 GUESTS_DIR = SCRIPT_DIR / "devvm" / "guests"
+WINDOWS_PROVISION_DIR = SCRIPT_DIR / "devvm" / "provision"
 
 # All mutable Vagrant/QEMU state lives here, under the worktree and gitignored — never in
 # the developer's home directory. The one exception is the downloaded box cache itself: see
@@ -138,16 +152,19 @@ def require_tool(name: str) -> None:
         sys.exit(1)
 
 
-def vagrant_env(guest: Guest, *, auto_consent: bool = False) -> dict[str, str]:
+def vagrant_env(guest: Guest, *, auto_consent: bool = False, display: bool = False) -> dict[str, str]:
     env = dict(os.environ)
     env["VAGRANT_DOTFILE_PATH"] = str(dotfile_dir(guest))
     env["DEVVM_REPO_ROOT"] = str(REPO_ROOT)
     env["DEVVM_STAGE_DIR"] = str(stage_dir(guest))
     env["DEVVM_WINDOWS_AUTO_CONSENT"] = "1" if auto_consent else "0"
+    env["DEVVM_WINDOWS_DISPLAY"] = "1" if display else "0"
     return env
 
 
-def run_vagrant(guest: Guest, args: list[str], *, auto_consent: bool = False, check: bool = True) -> int:
+def run_vagrant(
+    guest: Guest, args: list[str], *, auto_consent: bool = False, display: bool = False, check: bool = True
+) -> int:
     # For `vagrant winrm -c ...` specifically: measured directly (2026-09-23) by running a
     # remote command that exited {0, 1, 2, 42, 255} in turn — `vagrant winrm`'s own process
     # exit code was 0 for the zero case and exactly 1 for every nonzero case, never the
@@ -157,14 +174,19 @@ def run_vagrant(guest: Guest, args: list[str], *, auto_consent: bool = False, ch
     cwd = guest_dir(guest)
     cmd = ["vagrant", *args]
     print(f"+ (cd {cwd} && {shlex.join(cmd)})", file=sys.stderr)
-    result = subprocess.run(cmd, cwd=cwd, env=vagrant_env(guest, auto_consent=auto_consent))
+    result = subprocess.run(cmd, cwd=cwd, env=vagrant_env(guest, auto_consent=auto_consent, display=display))
     if check and result.returncode != 0:
         sys.exit(result.returncode)
     return result.returncode
 
 
 def run_vagrant_streaming(
-    guest: Guest, args: list[str], *, auto_consent: bool = False, check: bool = True
+    guest: Guest,
+    args: list[str],
+    *,
+    auto_consent: bool = False,
+    display: bool = False,
+    check: bool = True,
 ) -> tuple[int, str]:
     """Like run_vagrant, but also returns everything printed to stdout/stderr.
 
@@ -182,7 +204,7 @@ def run_vagrant_streaming(
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
-        env=vagrant_env(guest, auto_consent=auto_consent),
+        env=vagrant_env(guest, auto_consent=auto_consent, display=display),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -343,22 +365,282 @@ def cmd_list(_args: argparse.Namespace) -> None:
         print(f"{guest.name:14s} {state:14s} {guest.box}  (communicator: {guest.communicator})")
 
 
-def run_windows_provision(guest: Guest, vagrant_args: list[str], *, auto_consent: bool) -> None:
-    """Run a `vagrant up`/`vagrant provision` on a winrm guest, and act on the
-    DEVVM_REBOOT_REQUIRED marker windows-account-and-uac.ps1 prints as its last output line:
-    trigger the named reboot-if-needed provisioner and re-verify, or fail loudly if the
-    marker is simply missing (a provisioner bug, not something to silently proceed past).
+def run_windows_script(
+    guest: Guest,
+    script_path: Path,
+    *,
+    elevated: bool = True,
+    env: dict[str, str] | None = None,
+    display: bool = False,
+) -> str:
+    """Run a Windows provisioning .ps1 script directly over `vagrant winrm`, instead of
+    through Vagrant's WinRM shell provisioner.
+
+    Why: Vagrant's shell provisioner's WinRM path (`provision_winrm` in vagrant 2.4.9's own
+    plugins/provisioners/shell/provisioner.rb) calls `@machine.guest.capability(:wait_for_reboot)`
+    UNCONDITIONALLY at the very start of every invocation, before it even uploads the script.
+    That capability (plugins/guests/windows/cap/reboot.rb, scripts/reboot_detect.ps1) doesn't
+    just check for a pending reboot — it actively PROBES for one by running a real
+    `shutdown -f -r -t 60` (a genuine 60-second-out forced restart) and then, if nothing was
+    already scheduled, immediately `shutdown -a` to cancel it. That is a real, if usually
+    aborted-in-time, standing restart fuse on every ordinary provisioning step — confirmed via
+    guest System-log event 1074/1075 pairs lining up with `vagrant provision` runs (measured
+    2026-09-24; see scripts/README.md's root-cause note). `vagrant winrm -c` never reaches
+    that capability — confirmed by reading plugins/commands/winrm/command.rb,
+    communicators/winrm/communicator.rb, and communicators/winrm/shell.rb end to end: none of
+    them reference `wait_for_reboot` or `reboot_detect` — so driving each script through it
+    removes the fuse entirely. `-e`/`--elevated` requests the `winrm-elevated` shell type,
+    matching the shell provisioner's `privileged: true` without going anywhere near
+    `wait_for_reboot`.
+
+    Sends the script's content itself (optionally prefixed with `$env:NAME = 'value'; `
+    assignments) as a base64/UTF-16LE `-EncodedCommand`, matching the same technique
+    `cmd_run`'s `--unelevated` path already uses to sidestep re-quoting a multi-line script
+    with embedded quotes through vagrant's own argv handling.
+
+    Returns the combined stdout/stderr so callers (e.g. windows-account-and-uac.ps1's
+    DEVVM_REBOOT_REQUIRED marker) can scan it. Raises via `run_vagrant_streaming`'s own
+    check=True on a nonzero exit, same as a failing shell provisioner previously would.
     """
-    _, output = run_vagrant_streaming(guest, vagrant_args, auto_consent=auto_consent)
-    if REBOOT_MARKER_TRUE in output:
+    env_prefix = "".join(f"$env:{name} = {powershell_quote(value)}; " for name, value in (env or {}).items())
+    combined = env_prefix + script_path.read_text()
+    encoded = base64.b64encode(combined.encode("utf-16-le")).decode("ascii")
+    inner = f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}; exit $LASTEXITCODE"
+    args = ["winrm"]
+    if elevated:
+        args.append("-e")
+    args += ["-c", inner]
+    _, output = run_vagrant_streaming(guest, args, display=display)
+    return output
+
+
+def get_windows_boot_time(guest: Guest) -> str | None:
+    """The guest's current LastBootUpTime (an ISO-8601-ish CIM datetime string), or None if
+    WinRM isn't answering right now. Used by reboot_windows_guest_and_wait to detect a real
+    boot-time change rather than just "WinRM answered" (which can spuriously be true in the
+    few seconds between issuing `shutdown /r` and the guest actually going down)."""
+    try:
+        result = subprocess.run(
+            ["vagrant", "winrm", "-c", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o')"],
+            cwd=guest_dir(guest),
+            env=vagrant_env(guest),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def reboot_windows_guest_and_wait(guest: Guest, *, timeout_seconds: int = 600) -> None:
+    """Issue a real guest reboot ourselves and block until the guest reports a new boot time.
+
+    Deliberately does NOT go through Vagrant's named `reboot-if-needed` shell provisioner /
+    `Reboot.reboot` capability: that path is itself a shell provisioner, so it still runs
+    through `provision_winrm`'s unconditional `wait_for_reboot` fuse first, and its own
+    `wait_for_reboot` wait loop (plugins/guests/windows/cap/reboot.rb) is a `sleep 10` poll on
+    top of that same reboot_detect.ps1 probe. Issuing `shutdown /r` directly (the same command
+    `Reboot.reboot` itself runs, confirmed by reading cap/reboot.rb) and then waiting for a
+    genuine boot-time change avoids both.
+
+    No `time.sleep()` anywhere in the wait loop, and no chosen retry interval: each iteration
+    IS the wait — a real, bounded WinRM round-trip (get_windows_boot_time's own subprocess
+    timeout) — and failure just means "ask again immediately," not "nap, then ask again."
+    `timeout_seconds` is the overall failure bound surfaced to the human if the guest never
+    comes back, not a synchronization interval.
+
+    Default is 600s, matching the Windows Vagrantfile's own `graceful_halt_timeout` — measured
+    directly (2026-09-24, applying a license rearm on this host) that a plain 300s default was
+    NOT enough: a real, successful reboot (new boot time confirmed moments later) still hadn't
+    reported back by the 300s deadline under this host's TCG emulation. This is a warm reboot
+    of an already-imported guest, not a cold `up`, so it doesn't need `boot_timeout`/
+    `winrm.timeout`'s 3600s, but it needs more than a first guess gave it.
+    """
+    before = get_windows_boot_time(guest)
+    if before is None:
+        raise RuntimeError(
+            f"devvm: could not read guest '{guest.name}' current boot time before rebooting "
+            "it — is WinRM answering at all?"
+        )
+    print(f"+ rebooting guest '{guest.name}' directly (shutdown /r) and waiting for a new boot time", file=sys.stderr)
+    run_vagrant(guest, ["winrm", "-c", 'shutdown /r /t 0 /f /d p:4:1 /c "devvm reboot"'], check=False)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"devvm: guest '{guest.name}' did not report a new boot time within "
+                f"{timeout_seconds}s of issuing the reboot — check the QEMU window/guest console."
+            )
+        after = get_windows_boot_time(guest)
+        if after is not None and after != before:
+            return
+
+
+def get_windows_license_state(guest: Guest) -> tuple[int, float, int]:
+    """Read the guest's Windows license status via WMI/CIM: (LicenseStatus,
+    GracePeriodRemaining in minutes, RemainingWindowsReArmCount).
+
+    Reads the same underlying data `slmgr.vbs /dlv` prints, but structured: no parsing of
+    slmgr's free-text human-readable output, just the WMI properties behind it
+    (SoftwareLicensingProduct for the active product entry - the one with a non-null
+    PartialProductKey - and SoftwareLicensingService for the rearm counter).
+    """
+    cmd = (
+        "$p = Get-CimInstance SoftwareLicensingProduct | "
+        "Where-Object { $_.PartialProductKey } | Select-Object -First 1; "
+        "$s = Get-CimInstance SoftwareLicensingService; "
+        'Write-Host ("DEVVM_LICENSE_STATUS=" + $p.LicenseStatus); '
+        'Write-Host ("DEVVM_LICENSE_GRACE_MINUTES=" + $p.GracePeriodRemaining); '
+        'Write-Host ("DEVVM_LICENSE_REARM_REMAINING=" + $s.RemainingWindowsReArmCount)'
+    )
+    _, output = run_vagrant_streaming(guest, ["winrm", "-c", cmd])
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" in line and line.split("=", 1)[0] in (
+            "DEVVM_LICENSE_STATUS",
+            "DEVVM_LICENSE_GRACE_MINUTES",
+            "DEVVM_LICENSE_REARM_REMAINING",
+        ):
+            key, value = line.split("=", 1)
+            values[key] = value.strip()
+    try:
+        return (
+            int(values["DEVVM_LICENSE_STATUS"]),
+            float(values["DEVVM_LICENSE_GRACE_MINUTES"]),
+            int(values["DEVVM_LICENSE_REARM_REMAINING"]),
+        )
+    except (KeyError, ValueError) as e:
+        raise RuntimeError(
+            f"devvm: could not read guest '{guest.name}' Windows license state via WMI - "
+            f"missing or unparsable marker(s) in output ({e}):\n{output}"
+        ) from e
+
+
+def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> None:
+    """Rearm the guest's time-based Windows evaluation license if it's expired or within
+    WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES of expiring, then reboot for the rearm to take effect.
+
+    Why this exists: measured directly (2026-09-24) that the stromweld/windows-10 box's eval
+    image self-terminates once its evaluation period elapses - guest System event log ID 1074,
+    initiator C:\\Windows\\system32\\wlms\\wlms.exe (the Windows License Manager Service)
+    running as NT AUTHORITY\\SYSTEM, "The license period for this installation of Windows has
+    expired. The operating system is shutting down." That is a genuine ACPI shutdown - not a
+    devvm.py/cosca command, not a crash - so it ends the whole QEMU process regardless of
+    `-no-reboot` (which only ever concerns guest-initiated *reboots*, not power-offs).
+    Confirmed via `slmgr /dlv` at the time: License Status: Notification, Notification Reason:
+    0xC004FC07 (evaluation period exceeded). It took the guest down mid-provisioning, with no
+    warning beyond the ID 1074 event a few seconds ahead of the actual shutdown.
+
+    Runs once per fresh `up` (create=True in provision_windows_guest) - not on every `sync` -
+    because Windows evaluation rearms are a limited, consumable resource (this image ships
+    with 2), not something to spend on every provisioning pass.
+
+    Direct `vagrant winrm -c` (no `-e`/elevated shell) is enough for `slmgr /rearm`, the same
+    as `reboot_windows_guest_and_wait`'s `shutdown /r`: this box already hands WinRM sessions a
+    full, unfiltered High-integrity token (LocalAccountTokenFilterPolicy=1 - see cmd_run's
+    comment on the same fact), so no separate elevation request is needed for a
+    privileged operation issued over WinRM.
+    """
+    status, grace_minutes, rearm_remaining = get_windows_license_state(guest)
+    needs_rearm = status != WINDOWS_LICENSE_STATUS_LICENSED or grace_minutes < WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES
+    if not needs_rearm:
         print(
-            "note: an EnableLUA or autologon change needs a reboot to take effect — "
-            "rebooting the guest now via Vagrant's own reboot-and-wait capability.",
+            f"note: guest '{guest.name}' Windows evaluation license is current "
+            f"(status={status}, grace={grace_minutes:.0f}min) - no rearm needed.",
             file=sys.stderr,
         )
-        run_vagrant(guest, ["provision", "--provision-with", "reboot-if-needed"])
+        return
+    if rearm_remaining <= 0:
+        print(
+            f"error: guest '{guest.name}' Windows evaluation license is expired or near "
+            f"expiry (status={status}, grace={grace_minutes:.0f}min) and has 0 rearms "
+            "remaining - the box's evaluation can no longer be extended; use a newer box.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(
+        f"note: guest '{guest.name}' Windows evaluation license is expired or near expiry "
+        f"(status={status}, grace={grace_minutes:.0f}min, {rearm_remaining} rearm(s) "
+        "remaining) - running slmgr /rearm and rebooting for it to take effect.",
+        file=sys.stderr,
+    )
+    run_vagrant(guest, ["winrm", "-c", "cscript.exe //nologo C:\\Windows\\System32\\slmgr.vbs /rearm"], display=display)
+    reboot_windows_guest_and_wait(guest)
+    new_status, new_grace_minutes, _ = get_windows_license_state(guest)
+    if new_status != WINDOWS_LICENSE_STATUS_LICENSED:
+        print(
+            f"error: guest '{guest.name}' Windows evaluation license still not current after "
+            f"rearm and reboot (status={new_status}, grace={new_grace_minutes:.0f}min) - the "
+            "rearm did not take effect as expected. This is a bug (or the box's own rearm "
+            "budget silently didn't reset), not something to proceed past.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(
+        f"note: guest '{guest.name}' Windows evaluation license rearmed successfully "
+        f"(status={new_status}, grace={new_grace_minutes:.0f}min).",
+        file=sys.stderr,
+    )
+
+
+def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool = False, create: bool) -> None:
+    """Create (if `create`) and/or provision a Windows guest, driving each provisioning
+    script directly over `vagrant winrm` (see run_windows_script) instead of Vagrant's WinRM
+    shell provisioner — see that function's docstring for why.
+
+    Order matches the original Vagrantfile-declared provisioner order exactly, since later
+    steps depend on earlier ones: windows-clean-stage.ps1 must run before the "file"
+    provisioner (still Vagrant-driven — plugins/provisioners/file/provisioner.rb is confirmed
+    clean of any wait_for_reboot call, so there's no reason to reimplement WinRM file upload
+    by hand) re-populates C:\\cosca-stage; windows-mirror-tree.ps1 and windows-lock-tree.ps1
+    depend on that upload; windows-account-and-uac.ps1 and windows-rust.ps1 are independent of
+    each other but both come last, matching the original order (rust installs before the
+    reboot-required check, same as before this refactor).
+
+    The license-rearm check (create only) runs before every other provisioning step,
+    including windows-clean-stage.ps1: an expired-eval shutdown can land mid-step regardless
+    of which step it is (measured 2026-09-24: it hit during windows-lock-tree.ps1), so there's
+    no later step that's actually safer to run first - checking immediately, before spending
+    any time on the rest, is strictly better than finding out partway through.
+    """
+    if create:
+        # --no-provision: a fresh `up` would otherwise auto-run the one remaining
+        # Vagrantfile-declared provisioner (the "file" upload) as part of creation, and then
+        # the explicit `vagrant provision` call two lines down would run it a second,
+        # redundant time. Skipping it here makes exactly one invocation happen either way
+        # (create or not), driven explicitly below.
+        run_vagrant(guest, ["up", "--provider", "qemu", "--no-provision"], auto_consent=auto_consent, display=display)
+        ensure_windows_license_current(guest, display=display)
+    run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-clean-stage.ps1", elevated=True, display=display)
+    # The lone remaining Vagrantfile-declared provisioner: uploads the staged tree into
+    # C:/cosca-stage. `run: "always"` on it means a plain `vagrant provision` re-runs it every
+    # time, same as before this refactor.
+    run_vagrant(guest, ["provision"], display=display)
+    run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-mirror-tree.ps1", elevated=True, display=display)
+    run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-lock-tree.ps1", elevated=True, display=display)
+    account_output = run_windows_script(
+        guest,
+        WINDOWS_PROVISION_DIR / "windows-account-and-uac.ps1",
+        elevated=True,
+        display=display,
+        env={"DEVVM_WINDOWS_AUTO_CONSENT": "1" if auto_consent else "0"},
+    )
+    run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-rust.ps1", elevated=False, display=display)
+
+    if REBOOT_MARKER_TRUE in account_output:
+        print(
+            "note: an EnableLUA or autologon change needs a reboot to take effect — "
+            "rebooting the guest now directly (devvm.py-driven; see reboot_windows_guest_and_wait, "
+            "not Vagrant's wait_for_reboot fuse).",
+            file=sys.stderr,
+        )
+        reboot_windows_guest_and_wait(guest)
         verify_windows_account_settings(guest)
-    elif REBOOT_MARKER_FALSE not in output:
+    elif REBOOT_MARKER_FALSE not in account_output:
         print(
             "error: windows-account-and-uac.ps1 did not print a DEVVM_REBOOT_REQUIRED "
             "marker — can't tell whether a reboot is needed, so refusing to guess. This is a "
@@ -395,8 +677,12 @@ def cmd_up(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
+    display = bool(getattr(args, "display", False))
     if args.allow_elevation and guest.communicator != "winrm":
         print("error: --allow-elevation only applies to Windows guests", file=sys.stderr)
+        sys.exit(1)
+    if display and guest.communicator != "winrm":
+        print("error: --display only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
     if guest.communicator == "winrm":
         # `--allow-elevation`/`--no-allow-elevation` explicitly sets and persists the choice;
@@ -416,13 +702,19 @@ def cmd_up(args: argparse.Namespace) -> None:
             "scripts/README.md#windows-guests.",
             file=sys.stderr,
         )
+    if display:
+        print(
+            "note: --display is ON for this guest — QEMU will open a local window on this Mac "
+            "(-display cocoa -vga std) instead of running headless. This is a local window "
+            "only, not VNC or any other network-exposed display; the loopback-only port "
+            "forwarding guarantee is unaffected.",
+            file=sys.stderr,
+        )
     # Every guest's synced folder (Linux: rsync synced_folder; Windows: "file" provisioner)
     # sources from this staged, git-tracked-only copy — it must exist before `vagrant up`.
     stage_tree(guest)
     if guest.communicator == "winrm":
-        run_windows_provision(
-            guest, ["up", "--provider", "qemu", "--provision"], auto_consent=auto_consent
-        )
+        provision_windows_guest(guest, auto_consent=auto_consent, display=display, create=True)
     else:
         run_vagrant(guest, ["up", "--provider", "qemu", "--provision"], auto_consent=auto_consent)
     if guest.communicator == "ssh":
@@ -444,7 +736,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         # Reuse the persisted auto-consent choice (set by `up --allow-elevation`) rather than
         # implicitly defaulting to off and silently resetting a guest that had it on.
         auto_consent = read_persisted_auto_consent(guest)
-        run_windows_provision(guest, ["provision"], auto_consent=auto_consent)
+        provision_windows_guest(guest, auto_consent=auto_consent, create=False)
 
 
 def cmd_ssh(args: argparse.Namespace) -> None:
@@ -588,6 +880,14 @@ def build_parser() -> argparse.ArgumentParser:
         "by default. Persisted per guest — omit the flag on a later `up`/`sync` to keep "
         "reusing whatever was last set; pass --no-allow-elevation to explicitly turn it "
         "back off.",
+    )
+    p.add_argument(
+        "--display",
+        action="store_true",
+        help="(Windows only) open a local QEMU window on this Mac (-display cocoa -vga std) "
+        "instead of running headless, e.g. so a human can watch the guest's console live. "
+        "Headless remains the default; this is a local window only, never VNC or any other "
+        "network-exposed display. Not persisted — pass it again on every `up` that needs it.",
     )
     p.set_defaults(func=cmd_up)
 

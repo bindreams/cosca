@@ -14,9 +14,10 @@
 # at the NEXT LOGON — changing them live does nothing for an already-running session. This
 # script only detects and applies changes (never blindly reboots on every run) and reports
 # whether one is needed via a DEVVM_REBOOT_REQUIRED marker on its last output line;
-# devvm.py's cmd_up scans for that marker and, if set, runs the "reboot-if-needed" named
-# provisioner (see windows-x64/Vagrantfile) to actually reboot and wait for the guest to come
-# back, then re-verifies the settings.
+# provision_windows_guest (scripts/devvm.py) scans for that marker and, if set, calls
+# reboot_windows_guest_and_wait to actually reboot (issued directly, not via Vagrant's
+# reboot-if-needed/wait_for_reboot capability — see the Vagrantfile's provisioning comment for
+# why) and wait for the guest to come back, then re-verifies the settings.
 
 $ErrorActionPreference = "Stop"
 $policyKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"

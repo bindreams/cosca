@@ -85,10 +85,68 @@ qcow2" example) — this tool has no automation for that conversion.
 **Licensing.** `stromweld/windows-10` is a "vanilla Windows 10" box built with
 [Bento](https://github.com/chef/bento) from Microsoft's free evaluation media. Evaluation
 Windows installs activate on a timer and _expire_ (Windows 10 Enterprise eval is commonly
-90 days from the image's build date). When this box's install expires, the fix is bumping
-`config.vm.box_version` in `scripts/devvm/guests/windows-x64/Vagrantfile` to a newer build —
-not disabling activation checks. This is throwaway dev tooling; don't rely on this VM
-outliving a single investigation.
+90 days from the image's build date) — and expiry is not benign: measured directly
+(2026-09-24), once the eval period elapses `wlms.exe` (Windows License Manager Service,
+running as `NT AUTHORITY\SYSTEM`) issues a real ACPI shutdown on its own (guest System-log
+event 1074, "The license period for this installation of Windows has expired. The
+operating system is shutting down."), which takes the whole QEMU process down with it —
+mid-provisioning, if that's when it fires, with no crash report on the host side.
+
+`devvm.py up` guards against this itself: on every fresh VM creation (not on `sync` or a
+plain `provision` against an existing guest — evaluation rearms are a limited, consumable
+resource, not something to spend every pass), before any other provisioning step, it reads
+the guest's license state via WMI (`SoftwareLicensingProduct.LicenseStatus`/
+`GracePeriodRemaining`, `SoftwareLicensingService.RemainingWindowsReArmCount` —
+`get_windows_license_state`/`ensure_windows_license_current` in `scripts/devvm.py`; no
+parsing of `slmgr`'s free-text output). If the license is expired or within a day of
+expiring, it runs `slmgr /rearm` and reboots (via `reboot_windows_guest_and_wait`) for the
+rearm to take effect, then re-checks via WMI and fails loudly if the license still isn't
+current. `stromweld/windows-10` 202503.09.0 ships with 2 rearms; once those are spent,
+`devvm.py` refuses to proceed with a clear error rather than silently leaving a guest that
+can die mid-run — at that point the fix is bumping `config.vm.box_version` in
+`scripts/devvm/guests/windows-x64/Vagrantfile` to a newer build, not disabling activation
+checks. This is throwaway dev tooling; don't rely on this VM outliving a single
+investigation.
+
+**No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
+declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning
+step (`windows-clean-stage.ps1`, `windows-mirror-tree.ps1`, `windows-lock-tree.ps1`,
+`windows-account-and-uac.ps1`, `windows-rust.ps1`) is driven directly by `devvm.py` over
+`vagrant winrm` (`provision_windows_guest`/`run_windows_script` in `scripts/devvm.py`), not
+through Vagrant's `config.vm.provision "shell", ...`. This was a deliberate fix, not a style
+choice: vagrant 2.4.9's shell-provisioner WinRM path (`provision_winrm`) calls the guest's
+`wait_for_reboot` capability **unconditionally**, at the start of every single shell-
+provisioner invocation, before it even uploads the script. That capability's actual "is a
+reboot pending?" test (`reboot_detect.ps1`, vendored inside the `vagrant` gem) doesn't just
+check — it _schedules a real forced restart_ (`shutdown -f -r -t 60`) and then, if nothing was
+already pending, immediately cancels it (`shutdown -a`). That's a genuine, if normally
+self-cancelled, 60-second restart fuse on every ordinary `up`/`sync`, once per shell
+provisioner that used to be declared here. Measured directly (2026-09-24): every
+`vagrant provision` against this guest produced a matching guest System-log event 1074
+("wininit.exe has initiated restart") followed by event 1075 ("aborted") — the owner watching
+the guest's console twice saw the real "you're about to be signed out" sign-off splash flash
+during an otherwise-ordinary `devvm.py sync`, which is exactly what a scheduled-then-cancelled
+restart looks like from the console. `vagrant winrm -c` (with or without `-e`/`--elevated`)
+never reaches that capability — confirmed by reading vagrant's
+`plugins/commands/winrm/command.rb` and `plugins/communicators/winrm/{communicator,shell}.rb`
+end to end — so driving each script that way removes the fuse entirely. The one legitimate
+reboot this guest ever needs (`EnableLUA`/autologon changes only take effect at the next boot)
+is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py`
+(a real `shutdown /r`, then a bounded wait for the guest to report a new boot time — no
+`sleep`, no arbitrarily-chosen poll interval, just an immediate retry bounded by an overall
+failure timeout), not Vagrant's own `reboot-if-needed`/`Reboot.reboot` capability, which
+carries the exact same fuse plus its own `sleep 10` wait loop.
+
+Whether this fuse explains any _specific_ historical "QEMU just disappeared" failure during
+`devvm.py run windows-x64 --unelevated` is **inferred, not measured**: `run`'s own code path
+(`vagrant winrm -c`) never touched `wait_for_reboot` either, before or after this fix, so a
+death during `run` itself isn't directly this mechanism. But every `up`/`sync` immediately
+before such a `run` — which is the normal workflow — did carry this fuse (one scheduled+
+aborted restart per shell provisioner, five per pass), so a leftover or mistimed abort from
+that immediately-preceding provisioning pass is a plausible contributing cause for a guest
+that goes away with no crash report shortly after. No specific historical failure was
+correlated against a specific event-1074 timestamp to confirm this; it's a plausible
+mechanism, not a demonstrated one.
 
 **Account and UAC.** The box's default `vagrant` account is an ordinary `Administrators`
 member — not the built-in Administrator (SID ending `-500`), which Windows elevates
@@ -119,13 +177,29 @@ unelevated-user-clicks-through-UAC path this guest exists to probe.
 with no display or UI automation needed: `scripts/devvm/provision/windows-account-and-uac.ps1`
 configures the `vagrant` account to autolog in at boot, giving the guest a genuine active
 interactive (session 1, console) logon; `windows-run-unelevated.ps1` then runs the command via
-`schtasks /Create /IT /RL LIMITED`, which borrows that logon's actual filtered token at the
-LIMITED (non-elevated) run level even though the account is itself an Administrators member.
+a scheduled task (`Register-ScheduledTask` with a `New-ScheduledTaskPrincipal -LogonType
+Interactive -RunLevel Limited` principal — the PowerShell cmdlets replaced an earlier
+`schtasks.exe`-based version of this script), which borrows that logon's actual filtered token
+at the LIMITED (non-elevated) run level even though the account is itself an Administrators
+member.
 Combined with `--allow-elevation` (`ConsentPromptBehaviorAdmin=0`), a `runas` child launched
 from that probe takes the consent path with no click required. Verify this is measuring what
 it claims to by checking `whoami /groups` inside the probe (expect `Mandatory Label\Medium
 Mandatory Level`) and inside a `runas`-elevated child of it (expect `...\High Mandatory
 Level`).
+
+**A `--unelevated` command that itself starts `powershell.exe` is fine — the wrapper already
+routes around a PowerShell 5.1 quirk for you.** PowerShell 5.1 parses a native child's stderr
+through its own stream reader regardless of the redirection operator used (`*>`, `2>&1`, even a
+plain `2>` alone) or `-OutputFormat`, and treats a `#< CLIXML` prefix (written by a nested
+non-interactive powershell.exe with redirected output) as serialized records to deserialize —
+throwing `Cannot process the XML from the 'Error' stream of '...': Data at the root level is
+invalid` if what follows isn't well-formed CLIXML. `windows-run-unelevated.ps1` avoids this by
+running its direct child via `Start-Process -RedirectStandardOutput ... -RedirectStandardError
+...`: those are real OS-level file handles, so PowerShell's stream reader never sees the
+stream. If you write your own variant of this wrapper, or invoke `powershell.exe`/`pwsh.exe` as
+a direct child of another PowerShell process elsewhere in this tooling, use the same
+`Start-Process` redirection rather than any PowerShell redirection operator.
 
 If a probe genuinely needs a human (or UI automation) to see and answer the secure-desktop
 prompt itself — rather than just observing its outcome — give the guest a display instead: add
@@ -147,8 +221,11 @@ nowhere near that ceiling.
 
 ## Read-only working tree
 
-`up` and `sync` get a filtered copy of the working tree (`.git/`, `target/`, `.tmp/`
-excluded) into the guest without letting the guest write back into your actual source tree:
+`up` and `sync` get a copy of the working tree into the guest without letting the guest write
+back into your actual source tree. The copy is an allow-list, not an exclude-list: it's exactly
+the files `git ls-files` reports as tracked, filtered to those that still exist on disk — so
+untracked files (`CLAUDE.local.md`, `.claude/`, build output, etc.) and `.git` itself never
+reach the guest, without needing to enumerate what to leave out.
 
 - **Linux guests** (`linux-x64`, `linux-arm64`): a one-shot `rsync` push to
   `~/cosca`, files landing mode `444` (directories stay `755` so later syncs can still
@@ -156,10 +233,17 @@ excluded) into the guest without letting the guest write back into your actual s
   mount — the guest never writes through to the host.
 - **Windows guest** (`windows-x64`): no rsync binary on the box, and Vagrant's SMB synced
   folder needs a one-time macOS _System Settings → Sharing → File Sharing_ toggle plus a
-  password prompt on every mount — too much friction for a throwaway VM. Instead,
-  `scripts/devvm.py sync` stages a filtered copy under `.tmp/devvm/windows-x64/tree/` on the
-  host, and Vagrant's `file` provisioner uploads it to `C:\cosca` over WinRM; a follow-up
-  provisioner (`windows-lock-tree.ps1`) strips write access with `icacls`.
+  password prompt on every mount — too much friction for a throwaway VM. Instead, the pipeline
+  is four steps, always run in this order (see [Windows guests](#windows-guests) above for why
+  only the second is an actual Vagrant provisioner, not a `devvm.py`-driven `vagrant winrm`
+  call): `windows-clean-stage.ps1` wipes the guest's scratch staging directory
+  (`C:\cosca-stage`); Vagrant's `file` provisioner uploads `scripts/devvm.py sync`'s host-side
+  staged copy (`.tmp/devvm/windows-x64/tree/`, see above) into that staging directory over
+  WinRM; `windows-mirror-tree.ps1` robocopy-`/MIR`s it from there into `C:\cosca`;
+  `windows-lock-tree.ps1` strips write access from `C:\cosca` with `icacls`. Wiping the
+  staging directory first (rather than mirroring the upload straight into `C:\cosca`) keeps a
+  file deleted on the host from lingering in the guest after an upload,
+  since `file` itself only adds/overwrites, and `/MIR` needs a clean source to mirror from.
 
 Either way this is a **convention, not a security boundary**: the connecting account is an
 administrator (Linux: passwordless `sudo`; Windows: `Administrators` membership) and can
@@ -207,6 +291,23 @@ about, including ones no longer backed by an actual `.tmp/devvm/` directory.
 before `up`-ing a Windows guest, and don't keep more than one Windows box downloaded at a
 time (`vagrant box list`, then `vagrant box remove` the one you're done with) if space is
 tight.
+
+## Forwarded ports are loopback-only, always
+
+Every guest's forwarded ports (WinRM, RDP, SSH) are bound to `127.0.0.1` on the host, never
+`0.0.0.0`/every interface — nothing here is meant to be reachable from your LAN. This is
+enforced, not just configured: `scripts/devvm/guests/_shared/fix_qemu_loopback_only.rb` is
+loaded unconditionally by every guest Vagrantfile and patches
+`VagrantPlugins::QEMU::Driver#execute` to rewrite any empty-hostaddr `hostfwd=` clause in the
+constructed QEMU command line to loopback before QEMU ever starts — needed because
+vagrant-qemu 0.6.3 hardcodes the SSH forward with no `host_ip` seam a Vagrantfile can reach at
+all, so `host_ip: "127.0.0.1"` in the Vagrantfile alone doesn't cover SSH.
+
+Because this reaches into a private method by name, it's pinned to exactly vagrant-qemu
+`0.6.3` (checked at load time — `vagrant up`/`vagrant provision` refuse to run against any
+other installed version) and fails closed with a hard error if a rewritten forward is ever
+found still bound to a non-loopback address, rather than silently starting QEMU with a port
+exposed to the LAN.
 
 ## Known host issue: forwarded-port collisions on some macOS hosts
 
