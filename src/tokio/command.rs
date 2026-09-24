@@ -196,11 +196,21 @@ impl Command {
     /// typed error.
     /// `status`/`output`/`read` and the [`run`](crate::tokio::run)/[`run_line`](crate::tokio::run_line)
     /// free functions spawn eagerly, so the same applies to them.
+    ///
+    /// # Blocking under elevation
+    ///
+    /// An [`elevate`](Self::elevate)d spawn does its setup on the calling thread, blocking that
+    /// runtime worker (and, on a `current_thread` runtime, every task) until it finishes:
+    ///
+    /// - `Backend::Pkexec` with `Auth::Gui` runs `pkexec --version` first, a few milliseconds;
+    /// - Windows waits for the user to answer the UAC consent prompt;
+    /// - `Auth::Stdin` delivers the password to `sudo -S`, waiting until sudo reads it.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         super::spawn::spawn(&mut self.inner)
     }
 
     /// Run to completion with inherited stdio, returning the exit status.
+    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
     pub async fn status(&mut self) -> Result<std::process::ExitStatus, Error> {
         self.inner.stdin(Stdio::inherit())?;
         self.inner.stdout(Stdio::inherit())?;
@@ -210,6 +220,7 @@ impl Command {
     }
 
     /// Run to completion, capturing stdout and stderr (stdin is `/dev/null`).
+    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
     pub async fn output(&mut self) -> Result<crate::Output, Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
@@ -219,6 +230,7 @@ impl Command {
     }
 
     /// Run to completion, capturing stdout as a UTF-8 string (stdin is `/dev/null`).
+    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
     pub async fn read(&mut self) -> Result<String, Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;

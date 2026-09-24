@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
-use super::plan::{BackendSet, Host, Os, Transition};
+use super::pkexec::PkexecVersion;
+use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
@@ -52,7 +53,8 @@ fn preserve_env_flag(env: &[(OsString, OsString)]) -> Result<OsString, Error> {
 
 /// Build the full elevated argv. argv[0] is the injected ABSOLUTE `backend_path`.
 /// `env` MUST be pre-sanitized and sorted (see [`super::sanitize::EnvSanitizer::apply`]).
-/// Pure — no installed backend required.
+/// `pkexec` and `run0` are told to run the program in the directory they are started in, as `sudo`
+/// and `doas` do unasked. Pure — no installed backend required.
 pub(crate) fn build_argv(
     backend: Backend,
     backend_path: &OsStr,
@@ -90,17 +92,18 @@ pub(crate) fn build_argv(
             );
             // Fail loud if the graphical agent is missing, instead of a blocking text prompt.
             argv.push("--disable-internal-agent".into());
-            // pkexec has no `--` terminator, so a leading-dash program cannot be shielded.
-            if program_starts_with_dash(program) {
-                return Err(Error::Unsupported {
-                    op: "elevating a leading-dash program under pkexec".into(),
-                    platform: "unix",
-                    detail: "pkexec cannot parse a `--` terminator, so a program starting with `-` would be taken as a pkexec option; use sudo/doas/run0, or a non-dash program path".into(),
-                });
-            }
+            // polkit 121 and later; the rewrite refuses an older pkexec ([`super::pkexec`]).
+            argv.push("--keep-cwd".into());
+            debug_assert!(
+                !program_starts_with_dash(program),
+                "pkexec has no `--`; the structural gate refuses a leading-dash program"
+            );
         }
         Backend::Run0 => {
             argv.push("--pipe".into());
+            // `-D .`: run0 completes `.` against its own cwd.
+            argv.push("-D".into());
+            argv.push(".".into());
             if matches!(auth, Auth::NonInteractive) {
                 argv.push("--no-ask-password".into());
             }
@@ -119,7 +122,7 @@ pub(crate) fn build_argv(
     }
     // Terminate option/assignment parsing before the program — every backend EXCEPT
     // pkexec, whose option loop mis-parses `--` (a leading-dash pkexec program is
-    // rejected above instead).
+    // refused by the structural gate instead).
     if backend != Backend::Pkexec {
         argv.push("--".into());
     }
@@ -170,11 +173,6 @@ fn is_executable(path: &Path) -> bool {
     path.is_file() && unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
 }
 
-/// Resolve `program` to its ABSOLUTE path on `$PATH`.
-pub(super) fn resolve_on_path(program: &str) -> Option<PathBuf> {
-    resolve_in_path_var(&std::env::var_os("PATH")?, program)
-}
-
 /// Path resolution over an explicit PATH value: check the exec bit and SKIP every
 /// non-absolute element. An empty element means the cwd, and any relative one (`bin`, `.`)
 /// names a directory under it: a backend found there would be exec-checked against the cwd at
@@ -214,15 +212,160 @@ fn kern_argmax() -> Option<usize> {
     Some(value as usize)
 }
 
-pub(super) fn detect() -> Host {
+/// [`Host::pkexec_version`]: `run` `pkexec --version` on the `pinned` file, with `path` (its
+/// canonical path) as `argv[0]`.
+pub(crate) fn probe_pkexec(
+    path: &Path,
+    pinned: &File,
+    run: impl FnOnce(std::process::Command) -> PkexecVersion,
+) -> PkexecVersion {
+    use std::os::unix::process::CommandExt;
+    let mut probe = std::process::Command::new(pinned_exec_path(pinned));
+    probe.arg0(path).arg("--version");
+    run(probe)
+}
+
+/// `/proc/self/fd/N` for `pinned`: exec'd, it runs the pinned file itself, setuid honoured
+/// (measured, polkit 121–127). Resolved before the close-on-exec descriptor closes, so it serves an
+/// ELF; a script's interpreter would find it gone. Linux only, as pkexec's `/proc` use is.
+fn pinned_exec_path(pinned: &File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+}
+
+/// Open `real` for [`Host::pkexec_pin`]: `O_PATH` on Linux (exec needs no read permission),
+/// read-only elsewhere, close-on-exec, non-blocking (a FIFO renamed in cannot stall the open), not
+/// through a symlink, and only a regular file. Moved to 3 or above when it
+/// lands lower, so no child's stdio setup can replace it before the exec.
+fn pin(real: &Path) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "linux")]
+    let path_only = libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let path_only = 0;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(path_only | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(real)?;
+    // Linux's `O_PATH | O_NOFOLLOW` opens a symlink as itself rather than failing.
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if file.as_raw_fd() >= 3 {
+        return Ok(file);
+    }
+    // SAFETY: duplicating a descriptor this function owns; the result is checked.
+    let moved = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if moved < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `moved` is a fresh descriptor owned by nothing else.
+    Ok(unsafe { File::from_raw_fd(moved) })
+}
+
+/// Run `probe` with an empty environment and read its stdout as [`super::pkexec::parse`] does.
+pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersion {
+    probe
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let spawned = {
+        // Every fork in this process holds it; see `crate::child::spawn::spawn_lock`.
+        let _guard = crate::child::spawn::spawn_lock();
+        probe.spawn()
+    };
+    match spawned.and_then(std::process::Child::wait_with_output) {
+        Err(e) => PkexecVersion::SpawnFailed(e.to_string()),
+        Ok(out) if !out.status.success() => PkexecVersion::Failed {
+            status: out.status.to_string(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        },
+        Ok(out) => super::pkexec::parse(&out.stdout),
+    }
+}
+
+/// `pkexec` on `path_var` ([`resolve_in_path_var`]), with every symlink followed to the real file
+/// by `canonicalize`, which detection then pins ([`pin`]): the probe and the launch exec that
+/// file. `None` if `PATH` has no pkexec; `Err` with the match if its real file cannot be found.
+pub(crate) fn pkexec_on(
+    path_var: &OsStr,
+    canonicalize: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+) -> Option<Result<PathBuf, (PathBuf, std::io::Error)>> {
+    let found = resolve_in_path_var(path_var, "pkexec")?;
+    Some(canonicalize(&found).map_err(|e| (found, e)))
+}
+
+/// The [`Os`] this build runs on.
+fn host_os() -> Os {
+    if cfg!(target_os = "macos") {
+        Os::MacOs
+    } else if cfg!(target_os = "linux") {
+        Os::Linux
+    } else {
+        Os::Unix
+    }
+}
+
+pub(super) fn detect(backend: Backend, auth: &Auth) -> Host {
+    detect_with(
+        std::env::var_os("PATH").as_deref(),
+        host_os(),
+        is_elevated(),
+        backend,
+        auth,
+        |p| std::fs::canonicalize(p),
+        run_version_probe,
+    )
+}
+
+/// [`detect`] over an explicit `PATH`, OS and privilege, resolving pkexec's real file with
+/// `canonicalize` and `run`ning the pkexec probe. The pkexec it stores is the one it probed.
+pub(crate) fn detect_with(
+    path_var: Option<&OsStr>,
+    os: Os,
+    elevated: bool,
+    backend: Backend,
+    auth: &Auth,
+    canonicalize: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+    run: impl FnOnce(std::process::Command) -> PkexecVersion,
+) -> Host {
+    let on_path = |program| path_var.and_then(|p| resolve_in_path_var(p, program));
+    let unresolved = |found: &Path, error: String| PkexecVersion::Unresolved {
+        path: found.display().to_string(),
+        error,
+    };
+    let (pkexec, pkexec_pin, pkexec_version) = if !launches_pkexec(os, backend, auth, elevated) {
+        (on_path("pkexec"), None, PkexecVersion::NotProbed)
+    } else {
+        match path_var.and_then(|p| pkexec_on(p, canonicalize)) {
+            None => (None, None, PkexecVersion::NotProbed),
+            Some(Err((found, e))) => (None, None, unresolved(&found, e.to_string())),
+            Some(Ok(real)) => match pin(&real) {
+                Ok(pinned) => {
+                    let version = probe_pkexec(&real, &pinned, run);
+                    (Some(real), Some(std::sync::Arc::new(pinned)), version)
+                }
+                Err(e) => {
+                    let error = format!("opening {}: {e}", real.display());
+                    (None, None, unresolved(&real, error))
+                }
+            },
+        }
+    };
     Host {
-        elevated: is_elevated(),
+        elevated,
         has_tty: controlling_terminal_present(),
         available: BackendSet {
-            run0: resolve_on_path("run0"),
-            sudo: resolve_on_path("sudo"),
-            doas: resolve_on_path("doas"),
-            pkexec: resolve_on_path("pkexec"),
+            run0: on_path("run0"),
+            sudo: on_path("sudo"),
+            doas: on_path("doas"),
+            pkexec,
             // A fixed system path, never PATH-resolved: a PATH lookup would let a
             // shadowing `osascript` earlier on PATH receive an elevation request.
             osascript: {
@@ -237,7 +380,7 @@ pub(super) fn detect() -> Host {
                 }
             },
         },
-        os: if cfg!(target_os = "macos") { Os::MacOs } else { Os::Unix },
+        os,
         arg_max: {
             #[cfg(target_os = "macos")]
             {
@@ -248,6 +391,8 @@ pub(super) fn detect() -> Host {
                 None
             }
         },
+        pkexec_version,
+        pkexec_pin,
     }
 }
 
@@ -449,44 +594,18 @@ fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
     )
 }
 
-/// Program + args + the directory to run them in, for a backend that moves its cwd; a
-/// `raw_executable()` program comes back absolute ([`Command::posix_launch`]), so the wrapper
-/// cannot search for it. The path is re-resolved after authentication, so a rename of an ancestor
-/// during the prompt can still swap the file: these backends take no directory object.
-fn program_and_args(cmd: &Command, process_cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<Launch, Error> {
-    let argv = checked_argv(cmd)?;
-    let launch = cmd.posix_launch(process_cwd)?;
-    Ok(Launch {
-        program: launch.program.map_or_else(|| argv[0].clone(), PathBuf::into_os_string),
-        args: argv[1..].to_vec(),
-        cwd: launch.cwd,
-    })
-}
-
-/// Whether `backend` runs the program in the directory it was itself started in. The wrapper is
-/// then started in the caller's directory, and inherits it as a directory OBJECT, not a path.
+/// Program + args + directory for a POSIX backend: a `raw_executable()` program in the unelevated
+/// spawn's form ([`crate::resolve::exact::anchor_posix`] — `./tool`), and `current_dir()` as
+/// given, entered by the wrapper at `fork`. Reads nothing. Every backend runs the program in the
+/// directory it is started in: `sudo` and `doas` unasked, `pkexec` told `--keep-cwd` and `run0`
+/// `-D .` ([`build_argv`]).
 ///
-/// Measured: `sudo` (1.9.13, 1.9.17) keeps it unless a sudoers `runcwd` moves it, `doas`
-/// (OpenDoas, Debian 12) keeps it, and `pkexec` always moves it to the target's home. `run0`,
-/// not measured, hands the service manager its directory as a `WorkingDirectory=` path, re-resolved
-/// after authentication, so it is treated like `pkexec`.
-fn keeps_cwd(backend: Backend) -> bool {
-    match backend {
-        Backend::Sudo | Backend::Doas => true,
-        Backend::Pkexec | Backend::Run0 => false,
-        Backend::Auto => unreachable!("the planner resolves Auto"),
-    }
-}
-
-/// Program + args + directory for a backend that [keeps its cwd](keeps_cwd): a
-/// `raw_executable()` program in the unelevated spawn's form ([`crate::resolve::exact::anchor_posix`]
-/// — `./tool`), and `current_dir()` as given, entered by the wrapper at `fork`. Reads nothing.
-///
-/// The backend reads `./tool` against the directory object it inherited, after authenticating,
-/// so a rename of an ancestor during the prompt cannot swap the file loaded; an absolute path
-/// would be re-resolved then. Measured under `sudo -S`, blocked on its password while an
-/// ancestor was renamed and another tree moved into its place: the absolute path ran the
-/// substitute, `./tool` the original.
+/// `sudo` and `doas` read `./tool` against the directory object they inherited, after
+/// authenticating, so a rename of an ancestor during the prompt cannot swap the file loaded; an
+/// absolute path would be re-resolved then. Measured under `sudo -S`, blocked on its password
+/// while an ancestor was renamed and another tree moved into its place: the absolute path ran the
+/// substitute, `./tool` the original. `pkexec` and `run0` complete `./tool` against their cwd's
+/// path themselves, before authenticating, so under them that rename can still redirect it.
 ///
 /// A sudoers `runcwd` moves `sudo`'s child before the exec, and `./tool` is then read there —
 /// measured: `sudo: unable to execute ./tool: No such file or directory` under `runcwd=~`. That
@@ -522,6 +641,32 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
     checked_argv(cmd)?;
     if let Some(crate::command::ExecutableSpec::Exact(p)) = cmd.executable_spec() {
         crate::resolve::exact::refuse_unnameable(p.as_os_str())?;
+        use std::os::unix::ffi::OsStrExt;
+        // pkexec runs a relative program only if the caller itself can execute it (GLib's
+        // `g_find_program_in_path`: `access(X_OK)` with the real uid), so a root-only one fails.
+        if backend == Backend::Pkexec && p.as_os_str().as_bytes().first() != Some(&b'/') {
+            return Err(Error::Unsupported {
+                op: "a relative raw_executable() under pkexec".into(),
+                platform: "unix",
+                detail: format!("pkexec requires an absolute program path; pass one instead of {p:?}"),
+            });
+        }
+    }
+    // pkexec has no `--` terminator, so a program starting with `-` would be taken for an option.
+    if backend == Backend::Pkexec {
+        let program = match cmd.executable_spec() {
+            Some(spec) => spec.path().as_os_str(),
+            None => checked_argv(cmd)?[0].as_os_str(),
+        };
+        if program_starts_with_dash(program) {
+            return Err(Error::Unsupported {
+                op: "elevating a leading-dash program under pkexec".into(),
+                platform: "unix",
+                detail: "pkexec cannot parse a `--` terminator, so a program starting with `-` would be taken \
+                         as a pkexec option; use sudo/doas/run0, or a path such as ./-x"
+                    .into(),
+            });
+        }
     }
     if cmd.fds().keys().any(|f| f.raw() >= 3) {
         return Err(Error::Unsupported {
@@ -585,20 +730,38 @@ fn transfer_process_attrs(derived: &mut Command, cmd: &Command, cwd: Option<Path
 // Consumed by the sync POSIX spawn arm (`crate::child::spawn::spawn`); the pure
 // `rewrite_with_host` is what the tests drive directly.
 pub(crate) fn rewrite(cmd: &mut Command) -> Result<PosixRewrite, Error> {
-    rewrite_with_host(cmd, &Host::detect())
+    // Before detection, so a request refused for its shape never runs pkexec's version probe.
+    reject_structural(cmd, host_os())?;
+    let request = cmd.elevation_request();
+    let host = Host::detect(request.backend, &request.auth);
+    rewrite_with_host(cmd, &host)
 }
 
-/// PURE given `host` (and, for a relative `raw_executable()`, this process's cwd): gate + plan +
-/// sanitize + build a DERIVED command. The caller's
-/// `Command` `input`/`env_ops` are left untouched (non-destructive): the caller's fd 0-2
-/// stdio is MOVED into the derived command (`ResolvedStdio::File` is not `Clone`).
+/// Structural config gates — privilege-independent, so run before the already-elevated
+/// short-circuit. Which gate applies is a property of the REQUEST, not the run — see
+/// `is_macos_gui_auto`'s doc and the ambient-privilege invariant `structural_posix` documents.
+/// Keying on the resolved `Transition` instead would break it: `plan()` yields `RunAsIs` under
+/// root, so the same request would be accepted as root and rejected as a normal user.
+fn reject_structural(cmd: &Command, os: Os) -> Result<(), Error> {
+    let request = cmd.elevation_request();
+    if super::plan::is_macos_gui_auto(os, request.backend, &request.auth) {
+        super::macos::reject_structural_gui_config(cmd)
+    } else {
+        reject_structural_posix_config(cmd, request.backend, &request.auth)
+    }
+}
+
+/// PURE given `host` (and, for a relative `raw_executable()` under osascript, this process's cwd):
+/// gate + plan + sanitize + build a DERIVED command. The caller's `Command` `input`/`env_ops` are
+/// left untouched (non-destructive): the caller's fd 0-2 stdio is MOVED into the derived command
+/// (`ResolvedStdio::File` is not `Clone`).
 pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixRewrite, Error> {
     rewrite_with_host_and_cwd(cmd, host, std::env::current_dir)
 }
 
 /// [`rewrite_with_host`], reading this process's cwd through `process_cwd` — at most once, so
 /// the program and the directory it runs in cannot come from two different readings, and only
-/// for a backend, which runs in another process and so needs a path.
+/// for osascript, whose trampoline carries no cwd and so needs a path.
 pub(crate) fn rewrite_with_host_and_cwd(
     cmd: &mut Command,
     host: &Host,
@@ -606,20 +769,7 @@ pub(crate) fn rewrite_with_host_and_cwd(
 ) -> Result<PosixRewrite, Error> {
     let requested_backend = cmd.elevation_request().backend;
     let requested_auth = cmd.elevation_request().auth.clone();
-
-    // Structural config gates FIRST — privilege-independent (before the short-circuit).
-    //
-    // Which gate applies is a property of the REQUEST, not the run — see
-    // `is_macos_gui_auto`'s doc and the ambient-privilege invariant
-    // `structural_posix` documents. Keying on the resolved `Transition` instead
-    // would break it: `plan()` yields `RunAsIs` under root, so the same request
-    // would be accepted as root and rejected as a normal user.
-    let macos_gui = super::plan::is_macos_gui_auto(host.os, requested_backend, &requested_auth);
-    if macos_gui {
-        super::macos::reject_structural_gui_config(cmd)?;
-    } else {
-        reject_structural_posix_config(cmd, requested_backend, &requested_auth)?;
-    }
+    reject_structural(cmd, host.os)?;
 
     match host.plan(Privilege::Elevated, requested_backend, requested_auth) {
         Transition::Reject { error } => Err(error),
@@ -676,11 +826,28 @@ pub(crate) fn rewrite_with_host_and_cwd(
                             .into(),
                 });
             }
-            let Launch { program, args, cwd } = if keeps_cwd(backend) {
-                anchored_program_and_args(cmd)?
-            } else {
-                program_and_args(cmd, process_cwd)?
+            if backend == Backend::Pkexec {
+                debug_assert!(
+                    host.pkexec_version != PkexecVersion::NotProbed,
+                    "detect asks a pkexec request's pkexec its version"
+                );
+                if let Some(refusal) = host.pkexec_version.refusal() {
+                    return Err(refusal);
+                }
+            }
+            // The launch execs the file detection pinned and probed, not whatever the path names now.
+            let pinned = match (backend, &host.pkexec_pin) {
+                (Backend::Pkexec, Some(pin)) => Some(pin.clone()),
+                (Backend::Pkexec, None) => {
+                    debug_assert!(false, "detect pins every pkexec it stores");
+                    return Err(Error::Elevation {
+                        kind: ElevationErrorKind::BackendUnavailable,
+                        detail: "pkexec was not opened at detection".into(),
+                    });
+                }
+                _ => None,
             };
+            let Launch { program, args, cwd } = anchored_program_and_args(cmd)?;
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
@@ -697,6 +864,14 @@ pub(crate) fn rewrite_with_host_and_cwd(
             }
             let mut derived = Command::new();
             derived.set_input_argv(argv);
+            // An exec failure is judged on the file exec'd: the pinned one, while `derived` holds it.
+            let mut backend_path = path;
+            if let Some(pin) = pinned {
+                // argv[0] stays the canonical path; `hold` keeps the descriptor open until the spawn.
+                backend_path = pinned_exec_path(&pin);
+                derived.set_executable_spec(Some(crate::command::ExecutableSpec::Exact(backend_path.clone())));
+                derived.hold(pin);
+            }
             derived.set_env_ops(new_ops);
             transfer_process_attrs(&mut derived, cmd, cwd);
             // Only THIS arm's derived command is a real wrapper spawn (`sudo`/`doas`/`pkexec`
@@ -740,7 +915,7 @@ pub(crate) fn rewrite_with_host_and_cwd(
                     stdio,
                 }),
                 password_write,
-                backend_path: Some(path),
+                backend_path: Some(backend_path),
             })
         }
     }

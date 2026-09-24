@@ -191,6 +191,8 @@ fn already_elevated(c: &mut Command) -> Result<Command, Error> {
         },
         os: Os::Unix,
         arg_max: None,
+        pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
     };
     let rw = crate::elevation::posix::rewrite_with_host(c, &host)?;
     Ok(rw.derived.expect("the already-elevated rewrite derives a command"))

@@ -8,8 +8,8 @@
 //! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through
 //! [`resolve`]: "load exactly this file" is the absence of this module's SEARCH policy, not an
 //! application of it. Where a sink would search a relative name, it is put in a form no sink
-//! searches: on the unelevated POSIX spawn a `./`-anchored name ([`exact::anchor_posix`]), on the
-//! POSIX elevation backends an absolute path ([`exact::complete_posix`]), and on the Windows
+//! searches: on the unelevated POSIX spawn and the CLI elevation backends a `./`-anchored name
+//! ([`exact::anchor_posix`]), under `osascript` an absolute path ([`exact::complete_posix`]), and on the Windows
 //! elevated path an absolute path from `windows_raw::resolve::absolutise_exact` — see its doc for
 //! why `ShellExecuteEx` forces that step where `CreateProcessW` does not.
 //!
@@ -745,8 +745,7 @@ fn split_path_var_windows(bytes: &[u8]) -> Vec<PathBuf> {
 ///
 /// Note the `windows` parameter is a runtime flag while the `faccessat` call sits behind
 /// `#[cfg(unix)]`: simulating POSIX on a Windows HOST therefore skips the execute-bit check
-/// entirely. See #143 — that mismatch is the concrete motivation for replacing this flag with a
-/// platform trait.
+/// entirely.
 ///
 /// `Err` when the filesystem could not say whether `path` exists (a permission, I/O or network
 /// failure), as distinct from saying it does not: see [`resolve`] for what each caller does with

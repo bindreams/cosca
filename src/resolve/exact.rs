@@ -1,7 +1,7 @@
 //! `raw_executable()` on POSIX: making an `Exact` program unsearchable, which is the opposite of
-//! searching for it. The unelevated spawn anchors it to the child's inherited cwd
-//! ([`anchor_posix`]); the elevation backends, which run in another process, need it completed to
-//! an absolute path ([`complete_posix`]).
+//! searching for it. The unelevated spawn and the CLI elevation backends anchor it to the cwd
+//! they inherit ([`anchor_posix`]); `osascript`, whose trampoline carries no cwd, needs it
+//! completed to an absolute path ([`complete_posix`]).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -59,8 +59,8 @@ pub(crate) struct Anchored {
 }
 
 /// Complete an `Exact` program to an absolute path against the CHILD's working directory —
-/// **without searching, appending anything, or touching the filesystem**. For the elevation
-/// backends, which run the program in another process and so need a path.
+/// **without searching, appending anything, or touching the filesystem**. For `osascript`, whose
+/// trampoline runs the program in another process and carries no cwd, so needs a path.
 ///
 /// Needs this process's cwd as a PATH when the program is relative and `child_cwd` is not
 /// absolute, so a cwd with no usable path fails where the unelevated [`anchor_posix`] would
@@ -77,9 +77,9 @@ pub(crate) struct Anchored {
 /// child would read this process's cwd again at `fork`, and a `set_current_dir` in between would
 /// load one directory's file while running in another.
 ///
-/// Absolute is the point: `sudo`, `doas`, `pkexec`, `run0` and root's `/bin/sh` each look up a
-/// name they are handed bare, and none of them searches an absolute path. A `./` prefix would not
-/// do there — the backend reads it against a directory of its own choosing.
+/// Absolute is the point: root's `/bin/sh` looks up a name it is handed bare, and does not search
+/// an absolute path. A `./` prefix alone would not do — the trampoline starts the shell in a
+/// directory of its own choosing.
 ///
 /// POSIX grammar, byte-level, on every host: `/` is the only separator and a leading `/` the only
 /// absolute form, so the macOS elevation path — compiled and tested everywhere — gets one answer.

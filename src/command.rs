@@ -28,9 +28,12 @@ pub struct Command {
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
     flags: FlagsRequest,
+    /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
+    /// `/proc/self/fd/N`.
+    held: Vec<std::sync::Arc<std::fs::File>>,
 }
 
-/// [`Command::posix_launch`]'s error when this process's cwd cannot be read: says why a path was
+/// [`explain_cwd_read`]'s error when this process's cwd cannot be read: says why a path was
 /// needed, and keeps the read's own error — errno included — as its source.
 #[derive(Debug)]
 struct CwdUnreadable(std::io::Error);
@@ -53,19 +56,13 @@ impl std::error::Error for CwdUnreadable {
 }
 
 /// `process_cwd`, with a failure explained as [`CwdUnreadable`] and its own error kept as the
-/// source — for every elevation sink that needs this process's cwd as a path.
+/// source — for the macOS graphical elevation, the one sink that needs this process's cwd as a
+/// path.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn explain_cwd_read(
     process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> impl FnOnce() -> std::io::Result<PathBuf> {
     move || process_cwd().map_err(|e| std::io::Error::new(e.kind(), CwdUnreadable(e)))
-}
-
-/// [`Command::posix_launch`]'s answer.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) struct PosixLaunch {
-    pub(crate) program: Option<PathBuf>,
-    pub(crate) cwd: Option<PathBuf>,
 }
 
 /// Which setter recorded the executable path, and therefore whether cosca resolves it before
@@ -113,6 +110,7 @@ impl Default for Command {
             contain: ContainRequest::default(),
             elevation: crate::elevation::ElevationRequest::default(),
             fd_marker_suppressed: false,
+            held: Vec::new(),
             flags: FlagsRequest::default(),
         }
     }
@@ -359,8 +357,10 @@ impl Command {
     ///
     /// Every elevation backend derives the child's `argv[0]` from the program it is handed
     /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under
-    /// `sudo`, `doas` and `osascript`, and the completed absolute path under `pkexec`, `run0` and
-    /// `ShellExecuteEx`. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
+    /// `sudo`, `doas` and `osascript`; the path run0 completes `./tool` to (`/dir/tool`, measured on
+    /// 257–259); and the completed absolute path under `ShellExecuteEx`. `pkexec` refuses a relative
+    /// `raw_executable()` (see [`elevate`](Self::elevate)), and an absolute one is its `argv[0]` as
+    /// given. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
     /// only unelevated, or from an already-elevated caller, which runs no backend and spawns
     /// with argv verbatim. Handing a backend the bare name instead would let it search for the
     /// image.
@@ -394,39 +394,11 @@ impl Command {
         self.executable = spec;
     }
 
-    /// The program and working directory a POSIX elevation backend is handed. An `Exact` program
-    /// is completed to an absolute path by [`crate::resolve::exact::complete_posix`] against the
-    /// child's working directory, so no backend can search for it; a `Search` one is as written.
-    /// `program` is `None` when neither setter was called. The unelevated spawn does not come
-    /// here: it needs no path (see [`crate::resolve::exact::anchor_posix`]).
-    ///
-    /// Reads this process's cwd through `process_cwd` only for a relative `Exact` program with no
-    /// absolute [`current_dir`](Self::current_dir), and then `cwd` is the absolute directory that
-    /// one reading produced. Otherwise `cwd` is [`current_dir`](Self::current_dir) as given. A
-    /// failed read keeps its kind and says why a path was needed; see
-    /// [`crate::resolve::exact::complete_posix`] for when a cwd with no path gets that far.
-    // Off unix the only caller is the macOS elevation module, itself dead there.
+    /// Keep `file` open for as long as this command, so a path through it stays valid until the
+    /// spawn.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn posix_launch(
-        &self,
-        process_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
-    ) -> Result<PosixLaunch, Error> {
-        let process_cwd = explain_cwd_read(process_cwd);
-        let as_given = |program| PosixLaunch {
-            program,
-            cwd: self.cwd().map(Path::to_path_buf),
-        };
-        match self.executable_spec() {
-            Some(ExecutableSpec::Exact(p)) => {
-                let done = crate::resolve::exact::complete_posix(p.as_os_str(), self.cwd(), process_cwd)?;
-                Ok(PosixLaunch {
-                    program: Some(done.program),
-                    cwd: done.child_cwd,
-                })
-            }
-            Some(ExecutableSpec::Search(p)) => Ok(as_given(Some(p.clone()))),
-            None => Ok(as_given(None)),
-        }
+    pub(crate) fn hold(&mut self, file: std::sync::Arc<std::fs::File>) {
+        self.held.push(file);
     }
 
     /// Wire descriptor `slot` to `target`. Errors now if the target's direction
@@ -692,28 +664,35 @@ impl Command {
     /// `Auth::Interactive` + the default `EnvSanitizer`. Elevation wraps the
     /// CHILD, never this process.
     ///
-    /// On POSIX the backend, not cosca, decides the directory the child runs in. The backend is
-    /// started in [`current_dir`](Self::current_dir), or this process's cwd; `pkexec` then
-    /// switches to the target user's home, and a sudoers `runcwd` moves `sudo`'s child the same
-    /// way — measured: pkexec 0.105–127 and sudo 1.9.5–1.9.17 with `runcwd=~` ran it in `/root`.
+    /// On POSIX the backend is started in [`current_dir`](Self::current_dir), or this process's
+    /// cwd, and told to run the child there:
     ///
-    /// A relative [`raw_executable`](Self::raw_executable) reaches each backend in a form it
-    /// cannot search:
+    /// - `sudo` and `doas` keep it by default; a sudoers `runcwd` moves `sudo`'s child —
+    ///   measured, sudo 1.9.5–1.9.17 with `runcwd=~` ran it in `/root`.
+    /// - `run0` is passed `-D .`, its working-directory option (measured, systemd 257 and 259).
+    /// - `pkexec` is passed `--keep-cwd`, and so requires Linux and polkit 121 or later; see
+    ///   [`Backend::Pkexec`](crate::elevation::Backend::Pkexec).
     ///
-    /// - `sudo` and `doas` are handed `./tool` in the directory they are started in, and read it
-    ///   there after authenticating; under a sudoers `runcwd`, `./tool` is then not found.
-    /// - `pkexec` and `run0` pick their own directory, so they are handed an absolute path
-    ///   completed against this process's cwd (read once); a rename of an ancestor during
-    ///   authentication can redirect it.
-    /// - `osascript`'s shell `cd -P`s to that absolute directory and runs `./tool` there, so this
-    ///   path runs the child in the directory whatever the trampoline does.
+    /// A relative [`raw_executable`](Self::raw_executable) reaches each backend but pkexec in a form
+    /// it does not search:
     ///
-    /// On the three that need a path, a cwd with no usable path fails the spawn. An unlinked
-    /// directory fails the reading everywhere, with `NotFound` and an error saying why a path was
-    /// needed. An unsearchable ancestor fails it on macOS, with `PermissionDenied` and the same
-    /// explanation; on Linux the reading succeeds and entering the path fails later with a plain
-    /// `PermissionDenied`. An already-root caller runs no backend and spawns as it would
-    /// unelevated.
+    /// - `sudo` and `doas` are handed `./tool`, and read it against the directory they inherited,
+    ///   after authenticating, so a rename of an ancestor during authentication cannot swap the
+    ///   file; under a sudoers `runcwd`, `./tool` is not found.
+    /// - `run0` is handed `./tool` and completes it against its cwd's path before authenticating,
+    ///   so such a rename can redirect it.
+    /// - `osascript`'s trampoline carries no cwd, so its shell `cd -P`s to the directory as an
+    ///   absolute path completed against this process's cwd (read once), and runs `./tool` there.
+    ///   A cwd with no usable path fails the spawn: an unlinked directory with `NotFound`, an
+    ///   unsearchable ancestor with `PermissionDenied`, each with an error saying why a path was
+    ///   needed.
+    ///
+    /// `pkexec` runs a relative program only if the caller itself can execute it, so under
+    /// `Backend::Pkexec` a relative `raw_executable()` is refused with [`Error::Unsupported`],
+    /// root or not: pass an absolute path. A program named by [`executable`](Self::executable) or
+    /// `argv[0]` reaches pkexec as written, and pkexec's own lookup resolves it.
+    ///
+    /// An already-root caller runs no backend and spawns as it would unelevated.
     pub fn elevate(&mut self) -> &mut Command {
         self.elevation.enabled = true;
         self

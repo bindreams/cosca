@@ -106,6 +106,8 @@ pub(super) fn detect() -> Host {
         available: BackendSet::default(),
         os: Os::Windows,
         arg_max: None,
+        pkexec_version: crate::elevation::pkexec::PkexecVersion::NotProbed,
+        pkexec_pin: None,
     }
 }
 
@@ -372,7 +374,8 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
 
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
 pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
-    launch_runas_with_host(cmd, &Host::detect())
+    let request = cmd.elevation_request();
+    launch_runas_with_host(cmd, &Host::detect(request.backend, &request.auth))
 }
 
 /// The validated `SHELLEXECUTEINFOW` payload: every string field, NUL-terminated, plus the show
