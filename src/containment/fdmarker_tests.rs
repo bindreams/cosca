@@ -1,7 +1,8 @@
 //! Sweep tests. Every one runs against the real host process table with real descriptors —
 //! nothing here is faked, because a sweep fired at a synthetic table proves nothing.
 //!
-//! Three rules these tests obey, because the unit suite runs in parallel in ONE process:
+//! Three rules these tests obey, because under a plain `cargo test`, which runs every test in
+//! this crate in one shared process, the unit suite runs in parallel in ONE process:
 //! never clear `FD_CLOEXEC` on a descriptor of the test process (a concurrent fork+exec on
 //! another thread would leak it into an unrelated child); never key a log assertion on the
 //! shared pid alone (every test shares it) — key on the marker handle; and every test that
@@ -43,7 +44,8 @@ fn all_pids() -> Vec<crate::identity::RawPid> {
 
 /// See the module docs above: held for the WHOLE body of every test that both installs a
 /// marker and spawns a real child, so no such test's fork can land inside another's marker
-/// window in this shared, parallel-test process. Delegates to the SAME lock production code
+/// window in this shared, parallel-test process (under a plain `cargo test`, which runs every
+/// test in this crate in one shared process). Delegates to the SAME lock production code
 /// uses, not a private one, so it also excludes every other cosca-originated spawn elsewhere
 /// in this test binary.
 fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -76,7 +78,8 @@ fn a_live_pipe_has_a_nonzero_handle_distinct_per_end() {
 /// handles) on an unconstrained shell (see the final report). THIS test deliberately uses far
 /// fewer: macOS's launchd-inherited soft `RLIMIT_NOFILE` defaults to 256 (measured on this host
 /// via `launchctl limit maxfiles`), which is what a CI runner gets unless a step raises it, and
-/// this suite runs every unit test in parallel in ONE process — parking thousands of
+/// under a plain `cargo test`, which runs every test in this crate in one shared process, this
+/// suite runs every unit test in parallel in ONE process — parking thousands of
 /// descriptors here would both risk this test's own `pipe()` calls panicking with `EMFILE` and
 /// starve concurrently-running sibling tests' `pipe()`/`File::open` calls into spurious `EMFILE`
 /// failures. `N = 50` (100 descriptors) leaves comfortable headroom under even the unraised
@@ -84,7 +87,7 @@ fn a_live_pipe_has_a_nonzero_handle_distinct_per_end() {
 /// pairwise" — weaker statistical power than the one-off 20,000-pipe measurement, but a
 /// regression-pinning unit test's job here is to catch a REVERSION of the property (e.g. a
 /// kernel/SDK change that reintroduces collisions), not to reproduce the full-scale measurement
-/// inside a shared, resource-constrained test process.
+/// inside a shared, resource-constrained test process (again, under a plain `cargo test`).
 #[test]
 fn many_simultaneously_live_pipes_never_share_a_handle() {
     const N: usize = 50;
@@ -245,8 +248,8 @@ fn holds_marker_query_reports_denied_not_not_held_for_an_unqueryable_pid() {
 /// A handle naming no live pipe finds nobody, and must not panic or mis-match. `0` is never a
 /// valid `pipe_handle` (established above by `a_live_pipe_has_a_nonzero_handle_distinct_per_end`)
 /// and cannot become one through any amount of churn (this suite churns pipes across many tests
-/// running in parallel in ONE process), so this is race-free by construction rather than by
-/// timing luck.
+/// running in parallel in ONE process, under a plain `cargo test`), so this is race-free by
+/// construction rather than by timing luck.
 #[test]
 fn a_dead_handle_finds_no_holders() {
     assert!(
@@ -395,7 +398,8 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
 /// un-CLOEXEC'd) rather than by mutating this process's own fd table, which a concurrent
 /// fork+exec on another thread would leak. The assertion keys on the per-pid message
 /// (`fd marker {handle:#x}: holder pid {kid} will lose the marker…`), not on the handle alone:
-/// unit tests run in parallel in ONE process, and the marker write end is open in that shared
+/// under a plain `cargo test`, which runs every test in this crate in one shared process, unit
+/// tests run in parallel in ONE process, and the marker write end is open in that shared
 /// process from `install()` until `drop(cmd)` — a SIBLING test's `Command::spawn()` forking in
 /// that window transiently inherits this fd into a not-yet-`exec`'d bystander (documented in
 /// "Holding the read end is a precondition of soundness"), whose CLOEXEC-armed copy of THIS
@@ -541,7 +545,8 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
 /// three syscalls (`pipe()`, `F_DUPFD_CLOEXEC`, and "the marker pipe has no readable handle")
 /// are genuinely hard to fail for real inside this suite without collateral damage.
 /// `RLIMIT_NOFILE` (the textbook way to force `pipe()`/`fcntl` to fail) is PROCESS-WIDE, and
-/// this suite runs every unit test in parallel in ONE process — lowering it would spuriously
+/// under a plain `cargo test`, which runs every test in this crate in one shared process, this
+/// suite runs every unit test in parallel in ONE process — lowering it would spuriously
 /// fail any concurrently-running sibling test that happens to open a file or pipe at that
 /// moment. The third arm (`pipe_handle_of` returning `None`) has no realistic real-world
 /// trigger at all on a healthy pipe. The seam exercises exactly the code adjacent to each

@@ -120,7 +120,7 @@ fn sysctl_token_matches_libproc_for_a_live_process() {
 // `p->p_ppid` (that is what this very oracle exists to confirm), so either syscall can serve
 // the pre-fork()-fill `0` for a live, non-pid-1 pid. Excluding it on one side only would make
 // an untrusted libproc `0` hard-fail this test via `assert_eq!(0, <real ppid>)` on whatever
-// host process happens to be mid-fork() during a parallel `cargo test` run - a latent flake
+// host process happens to be mid-fork() during a parallel test run - a latent flake
 // whose message would point at layout drift instead of the race.
 //
 // `identity::macos::trusted_ppid`'s doc has the full evidence for why this is a REAL,

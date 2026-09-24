@@ -1,6 +1,7 @@
 //! Windows: the console-group graceful signal (`CTRL_BREAK`) is delivered only within the
-//! CALLING process's console. Everything under `cargo test` has a console, so the
-//! console-less caller is reached by re-launching the testbin with `DETACHED_PROCESS`.
+//! CALLING process's console. Every test process the test runner spawns inherits its console (it
+//! sets neither `DETACHED_PROCESS` nor `CREATE_NO_WINDOW`), so the console-less caller is reached
+//! by re-launching the testbin with `DETACHED_PROCESS`.
 //! Each console-less/with-console pair drives the SAME helper mode; the pair must disagree.
 //!
 //! The flag-matrix tests at the top measure what the creation-flag word does and does not

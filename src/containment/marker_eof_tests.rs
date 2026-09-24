@@ -25,10 +25,11 @@ fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// A marker pipe: `(read_end, write_end)`, both owned by this process. Built with
 /// `std::io::pipe()` (CLOEXEC by default, matching `fdmarker::create_pipe`'s own convention) —
-/// NOT `nix::unistd::pipe()` (raw POSIX semantics, not CLOEXEC) — because `cargo test --lib`
-/// runs every test in this crate concurrently in one process, and a non-CLOEXEC test pipe fd
-/// would be inherited by any OTHER concurrently-running test's spawned child, keeping that
-/// child a spurious extra "holder" of a pipe this test never intended to share.
+/// NOT `nix::unistd::pipe()` (raw POSIX semantics, not CLOEXEC) — because under a plain `cargo
+/// test --lib`, which runs every test in this crate in one shared process, tests run concurrently
+/// on separate threads of that process, and a non-CLOEXEC test pipe fd would be inherited by any
+/// OTHER concurrently-running test's spawned child, keeping that child a spurious extra "holder"
+/// of a pipe this test never intended to share.
 fn marker_pipe() -> (OwnedFd, OwnedFd) {
     let (r, w) = std::io::pipe().expect("pipe");
     (OwnedFd::from(r), OwnedFd::from(w))
@@ -167,9 +168,9 @@ fn a_retained_supervisor_write_end_is_refused_not_waited_on() {
         "expected Error::Containment, got {err:?}"
     );
     drop(w);
-    // NOT `assert_eq!(..., Clear)`: `cargo test` runs concurrently, and this process's fd
-    // table is being churned by every other test running at the same moment. The property
-    // under test is that a CLEARED write end is never mistaken for a still-held one.
+    // NOT `assert_eq!(..., Clear)`: under a plain `cargo test` (see `marker_pipe`'s doc), this
+    // process's fd table is being churned by every other test running at the same moment. The
+    // property under test is that a CLEARED write end is never mistaken for a still-held one.
     assert_ne!(super::write_end_check(r.as_fd()), super::WriteEndCheck::HeldByUs);
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
@@ -504,9 +505,9 @@ fn a_quiet_live_holder_blocks_without_spending_cpu() {
     // "no synchronisation via time" global constraint, for exactly this reason.
     //
     // CPU is measured on THIS THREAD specifically (`CLOCK_THREAD_CPUTIME_ID`, not
-    // `getrusage(RUSAGE_SELF)`, which is process-wide and would fold in whatever CPU work
-    // `cargo test`'s other concurrently-running tests do on other threads during the same
-    // window).
+    // `getrusage(RUSAGE_SELF)`, which is process-wide and would fold in whatever CPU work other
+    // tests do on other threads during the same window under a plain `cargo test` — see
+    // `marker_pipe`'s doc).
     let (child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
     let deadline = Duration::from_millis(300);
     let cpu_before = self_thread_cpu_time();
@@ -615,8 +616,8 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
 
 /// This CALLING THREAD's own CPU time, via `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` — NOT
 /// `getrusage(RUSAGE_SELF)`, which is process-wide and would be contaminated by whatever other
-/// tests `cargo test`'s concurrent thread pool happens to be running during the same
-/// measurement window. Used only to distinguish "blocked" from "busy-polled" in the
+/// tests are running concurrently during the same measurement window under a plain `cargo test`
+/// (see `marker_pipe`'s doc). Used only to distinguish "blocked" from "busy-polled" in the
 /// quiet-holder test above — no production code depends on it.
 fn self_thread_cpu_time() -> Duration {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };

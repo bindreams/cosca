@@ -9,7 +9,7 @@ repository = "https://github.com/bindreams/cosca"
 readme = "README.md"
 keywords = ["subprocess", "process", "spawn", "elevation", "cross-platform"]
 categories = ["os", "development-tools", "asynchronous"]
-exclude = ["/build.rs", "/testbin", "/tests", "/.github", "/.claude", "/prek.toml"]
+exclude = ["/build.rs", "/testbin", "/tests", "/.github", "/.claude", "/.config", "/prek.toml"]
 
 [package.metadata.docs.rs]
 all-features = true

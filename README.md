@@ -6,6 +6,17 @@ Unified cross-platform subprocess management: spawning, stdio, process trees, st
 
 The API is not stable; expect breaking changes in any 0.x release.
 
+## Running tests
+
+Use [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`), run as `cargo nextest
+run`. It's what CI runs, and it's the recommended way to run cosca's suite locally: nextest
+isolates each test in its own process, rather than sharing one process across the whole run the
+way plain `cargo test` does.
+
+nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
+today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an
+agent can't run that step locally either — it only runs in CI.
+
 ## License
 
 <img align="right" width="150px" height="150px" src="https://www.apache.org/foundation/press/kit/img/the-apache-way-badge/ASF_Badge_apacheway-purple.png">

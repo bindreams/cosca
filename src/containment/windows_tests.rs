@@ -118,7 +118,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 fn caller_has_console_is_true_under_cargo_test() {
     assert!(
         matches!(super::caller_has_console(), Ok(true)),
-        "cargo test is expected to run with a console attached"
+        "the test runner is expected to run with a console attached"
     );
 }
 
@@ -283,11 +283,61 @@ fn probe_reports_unknown_when_the_query_fails() {
     );
 }
 
+/// The env var that tells [`fixture_reports_job_breakaway_probe`] it was re-exec'd deliberately
+/// by [`probe_agrees_with_an_independent_is_process_in_job_measurement`], rather than picked up
+/// by an ordinary, unfiltered suite run.
+const JOB_BREAKAWAY_PROBE_FIXTURE_MARKER: &str = "COSCA_FIXTURE_JOB_BREAKAWAY_PROBE";
+
 /// A RELATIONSHIP, never an absolute: whether CI runs test processes inside a job object is not
 /// ours to control. It fails if the probe's first branch is inverted, which is the bug that would
 /// make every ambient job read as "no job" and silently disable the typed containment error.
+///
+/// The measurement itself runs in [`fixture_reports_job_breakaway_probe`], a freshly spawned
+/// re-exec of this binary — never in this (top-level) test process. Under nextest, this process
+/// is spawned and only ASSIGNED to its job object afterward: nextest's own job-assignment call
+/// trails the spawn rather than preceding or blocking on it. Two reads taken directly in this
+/// process, moments apart, could straddle that assignment and disagree with each other even
+/// though no real job is actually racing. A freshly spawned child inherits its parent's job
+/// membership atomically at `CreateProcess`, and nothing assigns it to a job afterward, so both
+/// reads taken INSIDE it always agree with each other, whichever way the ambient membership
+/// happens to fall.
 #[test]
 fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let fixture = crate::test_child::fixture_path!(fixture_reports_job_breakaway_probe);
+    let child = std::process::Command::new(&exe)
+        .args(["--test-threads=1", "--exact", fixture])
+        .env(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the job-breakaway probe fixture");
+    let output = child.wait_with_output().expect("wait for the fixture child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "job-breakaway probe fixture failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
+        "fixture exited 0 but its libtest banner shows something other than exactly one test run \
+         and passed — most likely the `--exact` filter matched ZERO tests, which libtest also \
+         exits 0 for:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+    );
+}
+
+/// The child half of [`probe_agrees_with_an_independent_is_process_in_job_measurement`]: a no-op
+/// when picked up by an ordinary, unfiltered suite run ([`JOB_BREAKAWAY_PROBE_FIXTURE_MARKER`] is
+/// unset there). Re-executed via `current_exe() --exact` with that var set, it performs the real
+/// measurement — see the driver's own doc for why it must run here, in a freshly spawned process,
+/// rather than in the driver itself.
+#[test]
+fn fixture_reports_job_breakaway_probe() {
+    if std::env::var_os(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER).is_none() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
     use crate::containment::windows::{probe_job_breakaway, JobBreakaway};
     use windows::Win32::System::JobObjects::IsProcessInJob;
     use windows::Win32::System::Threading::GetCurrentProcess;

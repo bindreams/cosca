@@ -29,6 +29,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # tools/skuld-migrate and tools/no-libtest also run their own tests under nextest.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
       - uses: j178/prek-action@v2
@@ -101,30 +107,41 @@ jobs:
           # matrix.lint lanes get the component
           components: ${{ matrix.lint && 'clippy' || '' }}
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --locked --target ${{ matrix.target }}
+        run: cargo nextest run --locked --target ${{ matrix.target }} --profile ci
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
       # logon session) is `#[ignore]`d everywhere else. This step opts in to exactly that test.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
         run: >-
-          cargo test --locked --target ${{ matrix.target }} --test windows_process_cwd --
-          --include-ignored --exact a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does
+          cargo nextest run --locked --target ${{ matrix.target }} --profile ci
+          --test windows_process_cwd --run-ignored all
+          -E 'test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does)'
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Run tests (pty feature)
-        run: cargo test --locked --features pty --target ${{ matrix.target }}
+        run: cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
-        run: cargo test --locked --features tokio --target ${{ matrix.target }}
+        run: cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
       - name: Run tests (serde feature)
-        run: cargo test --locked --features serde --target ${{ matrix.target }}
+        run: cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
+
+      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16); this is
+      # the only step in this job that still uses plain `cargo test`. cosca has no doctests today.
+      - name: Run doctests
+        run: cargo test --locked --doc --all-features --target ${{ matrix.target }}
 
       - name: Check rustdoc
         shell: bash
@@ -146,14 +163,14 @@ jobs:
           cargo package --list --locked --target "$TARGET" > "$LIST"
 
           set +e
-          grep -qE '^(testbin/|tests/|\.github/|\.claude/|prek\.toml$)' "$LIST"
+          grep -qE '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
           grep_status=$?
           set -e
 
           case "$grep_status" in
             0)
               echo "::error::Excluded paths leaked into the package:"
-              grep -E '^(testbin/|tests/|\.github/|\.claude/|prek\.toml$)' "$LIST"
+              grep -E '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
               exit 1
               ;;
             1) echo "no excluded paths in the package" ;;
@@ -168,7 +185,7 @@ jobs:
       # release builds do where debug builds assert a broken precondition instead.
       - name: Unit tests (release — debug_assertions off)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
-        run: cargo test --locked --release --lib --target ${{ matrix.target }}
+        run: cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
       # backend) and `cfg(target_os = "macos")` code are otherwise never
@@ -208,43 +225,35 @@ jobs:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
       # rule does not apply and a cgroup may hold BOTH the test process and a child
       # leaf. We move our shell into it and run only the cgroup-named tests there
-      # (as root, single-threaded) — both the `spawn_io` integration binary and the
+      # (as root, single-threaded) — across the `spawn_io` integration binary, the
       # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
       # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
-      # post-fork failure path; its cgroup tests that cannot be a no-op
-      # are `#[ignore]`d, hence `--include-ignored`). With the marker set the tests
-      # assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a
-      # silent skip.
+      # post-fork failure path), and `tokio_io`; its cgroup tests that
+      # cannot be a no-op are `#[ignore]`d, hence `--run-ignored all`. With the marker
+      # set the tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable
+      # — never a silent skip.
+      #
+      # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
+      # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
+      # passed in as positional arguments rather than looked up again inside the root shell.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
-          cargo test --locked --features pty,tokio --target ${{ matrix.target }} --no-run
-          JSON=$(cargo test --locked --features pty,tokio --target ${{ matrix.target }} --no-run --message-format=json)
-          BIN=$(echo "$JSON" \
-            | jq -r 'select(.profile.test == true and .target.name == "spawn_io") | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -n "$BIN"
-          echo "cgroup test binary: $BIN"
-          LIB_BIN=$(echo "$JSON" \
-            | jq -r 'select(.profile.test == true and .target.name == "cosca" and (.target.kind | contains(["lib"]))) | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -n "$LIB_BIN"
-          echo "cgroup lib unit test binary: $LIB_BIN"
+          cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
           sudo bash -euxc '
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
-            "$0" cgroup --include-ignored --nocapture --test-threads=1
-            exec "$1" cgroup --include-ignored --nocapture --test-threads=1
-          ' "$BIN" "$LIB_BIN"
+            exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(binary(cosca) | binary(spawn_io) | binary(tokio_io)) & test(/cgroup/)"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
-      # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo test`
-      # anywhere, including the steps above, reports it as `ignored`, never a vacuous `ok`.
-      # This is the one step that opts in, via `-- --ignored`, after provisioning a COPY of
-      # cosca_testbin that is genuinely setuid-root (owned by root, mode u+s) so the spawned
+      # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo nextest run`
+      # anywhere, including the steps above, counts it as `skipped`, never runs it to a vacuous
+      # `ok`. This is the one step that opts in, via `--run-ignored only`, after provisioning a
+      # COPY of cosca_testbin that is genuinely setuid-root (owned by root, mode u+s) so the spawned
       # helper process can call setuid(0) itself and become truly unsignalable by this job's
       # ordinary unprivileged user — proving #61's fix against a REAL mixed process group
       # (one signalable member, one genuinely not), not a synthetic one. Only preparing the
@@ -267,4 +276,4 @@ jobs:
 
       - name: Run setuid-root process-group teardown test (Linux)
         if: matrix.os == 'linux'
-        run: cargo test --locked --target ${{ matrix.target }} --test group_teardown_setuid -- --ignored
+        run: cargo nextest run --locked --target ${{ matrix.target }} --test group_teardown_setuid --run-ignored only --profile ci

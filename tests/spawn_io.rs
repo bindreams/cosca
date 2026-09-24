@@ -464,7 +464,7 @@ fn unix_fd3_file_round_trips() {
 
     // Write a payload to a unique temp file, then rewind for the child to read.
     // `tempfile()` gives a process-unique, auto-cleaned file so two concurrent
-    // `cargo test` runs cannot collide on a shared fixed name.
+    // test runs cannot collide on a shared fixed name.
     let mut tmp = tempfile::tempfile().expect("create tmpfile");
     tmp.write_all(b"from file via fd3").expect("write tmpfile");
     tmp.seek(std::io::SeekFrom::Start(0)).expect("seek");
@@ -1105,8 +1105,8 @@ fn drop_kills_contained_tree() {
 
 // cgroup v2 integration tests =====
 // Linux only, and `#[ignore]`d: they need a delegated cgroup, which CI provisions and then runs
-// them with `--include-ignored` and COSCA_TEST_CGROUP=1. Run without the marker, each fails
-// loudly rather than pass having tested nothing.
+// them with `nextest run --run-ignored all` and COSCA_TEST_CGROUP=1. Run without the marker, each
+// fails loudly rather than pass having tested nothing.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]

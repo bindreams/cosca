@@ -191,7 +191,7 @@ fn resolve_executable_uses_the_given_cwd_not_the_process_cwd() {
     // `resolve_executable`'s `Some(dir)` arm never reads `std::env::current_dir()` (see its match
     // on `cmd_cwd`), so an explicit `cmd_cwd` needs no particular process cwd to prove it is
     // honoured. The decoy below proves the given cwd wins over the process's real one, which is
-    // wherever `cargo test` started this binary, almost certainly not `cmd_dir`.
+    // wherever the test runner started this binary, almost certainly not `cmd_dir`.
     let cmd_dir = tempfile::tempdir().unwrap();
     let want = std::fs::copy(
         std::env::current_exe().unwrap(),
@@ -386,14 +386,23 @@ fn windows_system_dirs_are_real_existing_directories() {
     // the aggregate: a bound like `dirs.len() >= 2` survives deleting EITHER the `app_dir()` or
     // the `get_windows_directory()` line from `windows_system_dirs`, even though this test's own
     // preamble claims to cover all three. All three should resolve
-    // under `cargo test` on a real Windows runner, so each is asserted present outright rather than
-    // loosely.
+    // under the test runner on a real Windows runner, so each is asserted present outright rather
+    // than loosely.
     let app = app_dir();
     let sys32 = get_system_directory();
     let win = get_windows_directory();
-    assert!(app.is_some(), "current_exe()'s parent should resolve under cargo test");
-    assert!(sys32.is_some(), "GetSystemDirectoryW should succeed under cargo test");
-    assert!(win.is_some(), "GetWindowsDirectoryW should succeed under cargo test");
+    assert!(
+        app.is_some(),
+        "current_exe()'s parent should resolve under the test runner"
+    );
+    assert!(
+        sys32.is_some(),
+        "GetSystemDirectoryW should succeed under the test runner"
+    );
+    assert!(
+        win.is_some(),
+        "GetWindowsDirectoryW should succeed under the test runner"
+    );
     let (app, sys32, win) = (app.unwrap(), sys32.unwrap(), win.unwrap());
     assert!(dirs.contains(&app), "app dir {app:?} missing from {dirs:?}");
     assert!(dirs.contains(&sys32), "System32 {sys32:?} missing from {dirs:?}");
