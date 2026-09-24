@@ -15,6 +15,10 @@ pub(crate) mod pump;
 #[path = "child/spawn.rs"]
 pub(crate) mod spawn;
 
+#[path = "child/unreaped.rs"]
+pub(crate) mod unreaped;
+pub use unreaped::Unreaped;
+
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
 use proc_handle::ProcHandle;
@@ -106,6 +110,30 @@ impl Child {
         self.attached.honor_kill_on_drop(self.kill_on_drop);
     }
 
+    /// Take this child apart for [`Unreaped`](crate::Unreaped), without its `Drop`'s teardown:
+    /// the std child to hold, and the containment to release after its reap. Its pipes' parent
+    /// ends close here: one held on would keep the child waiting on it.
+    #[cfg(unix)]
+    pub(crate) fn into_unreaped_parts(self) -> (crate::child::unreaped::Held, crate::child::unreaped::Retained) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: each field that owns anything is read out exactly once, and `this` is never used
+        // or dropped again; the rest (`id`, `kill_on_drop`, `containment`, `graceful`) are `Copy`.
+        let (proc, pipes, attached, elevation) = unsafe {
+            (
+                std::ptr::read(&this.proc),
+                std::ptr::read(&this.pipes),
+                std::ptr::read(&this.attached),
+                std::ptr::read(&this.elevation),
+            )
+        };
+        drop((pipes, elevation));
+        let ProcHandle::Std(shared) = proc;
+        (
+            crate::child::unreaped::Held::Std(shared.into_inner()),
+            crate::child::unreaped::Retained { attached },
+        )
+    }
+
     // Set by the elevation spawn arms.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.elevation = report;
@@ -188,7 +216,8 @@ impl Child {
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
-        // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed `Unkillable`.
+        // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed
+        // `ElevationErrorKind::Unkillable`.
         self.proc
             .kill()
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
@@ -556,6 +585,12 @@ fn take_reader(pipes: &mut BTreeMap<Fd, ParentEnd>, fd: Fd) -> Option<PipeReader
 
 impl Command {
     /// Spawn the configured command.
+    ///
+    /// # A child the failed spawn could not kill
+    ///
+    /// A spawn that fails after creating its child kills and reaps it. One the kill cannot end — a
+    /// setuid child refuses it with `EPERM` — comes back in [`Error::Unreaped`](crate::error::Error::Unreaped) as an
+    /// [`Unreaped`](crate::Unreaped), still running: dropping the error blocks until it exits.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         spawn::spawn(self)
     }

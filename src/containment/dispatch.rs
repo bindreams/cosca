@@ -63,6 +63,7 @@ impl Prepared {
             return match leaf.abandon_before_verdict() {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
+                Abandoned::HandedBack { kill, child } => AbandonedChild::HandedBack { kill, child },
                 Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
             };
         }
@@ -73,10 +74,15 @@ impl Prepared {
 /// What became of the child of a spawn that failed with no handle left on it (see
 /// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
 #[cfg_attr(not(all(target_os = "linux", feature = "tokio")), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum AbandonedChild {
     /// Nothing of it runs, and it is reaped or will be.
     Ended,
+    /// It refused the kill and may run on, held by its handle: for the caller to hand back.
+    HandedBack {
+        kill: std::io::Error,
+        child: crate::child::unreaped::Unreaped,
+    },
     /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
@@ -392,7 +398,7 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
             marker_env: false,
         };
     };
-    let creation_flags = if is_root && !matches!(mode, ContainMode::TreeWalk) {
+    let creation_flags = if suspends(mode, is_root) {
         // Strongest root: suspend + new process group (job assigned in attach).
         crate::containment::windows::root_flags()
     } else {
@@ -403,6 +409,22 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     WindowsContain {
         creation_flags,
         marker_env: is_root && req.nesting == Nesting::Mark,
+    }
+}
+
+/// Whether a contained spawn in `mode` creates its child `CREATE_SUSPENDED`, for `attach` to
+/// resume once it is in its job: a root that is not `TreeWalk`.
+#[cfg(windows)]
+fn suspends(mode: ContainMode, is_root: bool) -> bool {
+    is_root && !matches!(mode, ContainMode::TreeWalk)
+}
+
+#[cfg(windows)]
+impl Prepared {
+    /// Whether this spawn created its child `CREATE_SUSPENDED`. Until `attach` succeeds, such a
+    /// child may still be suspended — `attach` alone resumes it — and so cannot exit on its own.
+    pub(crate) fn created_suspended(&self) -> bool {
+        self.mode.is_some_and(|mode| suspends(mode, self.is_root))
     }
 }
 

@@ -128,6 +128,23 @@ impl Child {
         self.os.attached.hard_kill()
     }
 
+    /// Take this child apart for [`Unreaped`](crate::tokio::Unreaped), without its `Drop`'s
+    /// teardown: tokio's child to hold, and the containment to release after its reap. Its pipes'
+    /// parent ends close here: one held on would keep the child waiting on it.
+    #[cfg(unix)]
+    pub(crate) fn into_unreaped_parts(mut self) -> (crate::child::unreaped::Held, crate::child::unreaped::Retained) {
+        // `Drop` does nothing once disarmed, and everything it would release is taken out.
+        self.kill_on_drop = false;
+        let os = std::mem::take(&mut self.os);
+        drop(self);
+        let ProcSource::Tokio(child) = os.proc.expect(PROC_TAKEN);
+        drop((os.pipes, os.owned_std));
+        (
+            crate::child::unreaped::Held::Tokio(Box::new(child)),
+            crate::child::unreaped::Retained { attached: os.attached },
+        )
+    }
+
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
     /// a cleanup `kill` in the write-failure path already sees the elevated state.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
@@ -413,24 +430,24 @@ impl Child {
 
     /// Block until the child exits, returning its status. For a bounded wait use
     /// `tokio::time::timeout(d, child.wait())`.
-    pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
-        self.proc_mut().wait().await
+    pub async fn wait(&mut self) -> Result<ExitStatus, crate::tokio::Error> {
+        self.proc_mut().wait().await.map_err(Into::into)
     }
     /// Exit status if the child has already exited (non-blocking).
-    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
-        self.proc_mut().try_wait()
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, crate::tokio::Error> {
+        self.proc_mut().try_wait().map_err(Into::into)
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
     /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
-    pub fn kill(&mut self) -> Result<(), Error> {
+    pub fn kill(&mut self) -> Result<(), crate::tokio::Error> {
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
         match self.proc_mut().start_kill() {
-            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
-            other => other,
+            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()).into()),
+            other => other.map_err(Into::into),
         }
     }
 
@@ -455,7 +472,7 @@ impl Child {
     /// classified, never signaled, and the group can report cleared regardless. No fix
     /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
     /// value is not trustworthy evidence either.
-    pub fn kill_tree(&mut self) -> Result<(), Error> {
+    pub fn kill_tree(&mut self) -> Result<(), crate::tokio::Error> {
         self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
         // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
@@ -477,7 +494,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        let group_result = self.os.attached.hard_kill();
+        let group_result = self.os.attached.hard_kill().map_err(crate::tokio::Error::from);
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
         // covers that, so its failure is contract-relevant.
@@ -543,13 +560,13 @@ impl Child {
     /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
     /// pid; [`kill_tree`](Child::kill_tree) addresses no pid and still reaches the survivors.
     /// The sync [`Child`](crate::Child) pins for its whole life and is unaffected.
-    pub fn terminate_tree(&self) -> Result<(), Error> {
+    pub fn terminate_tree(&self) -> Result<(), crate::tokio::Error> {
         self.require_contained()?;
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]
         if !self.proc().pins_pid() {
-            return Err(self.unpinned_pid_refusal("terminate_tree"));
+            return Err(self.unpinned_pid_refusal("terminate_tree").into());
         }
         // See kill_tree's identical precondition assert for the full rationale, including the
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
@@ -570,7 +587,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        self.os.attached.terminate(self.id.pid())
+        self.os.attached.terminate(self.id.pid()).map_err(Into::into)
     }
 
     /// The refusal both cooperative ops answer with once this handle has stopped pinning the
@@ -611,9 +628,11 @@ impl Child {
     /// by the first wait that blocks and joined when the child is dropped; Windows hands the wait to `spawn_blocking` (job
     /// objects have no pollable handle) with a cancel event so a dropped future releases the
     /// blocking watcher promptly instead of parking out the wait.
-    pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
+    pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, crate::tokio::Error> {
         self.require_drainable()?;
-        super::wait::wait_tree_drained_dispatch(&self.os.attached, None).await
+        super::wait::wait_tree_drained_dispatch(&self.os.attached, None)
+            .await
+            .map_err(Into::into)
     }
 
     /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`.
@@ -622,10 +641,12 @@ impl Child {
     pub async fn wait_tree_timeout(
         &self,
         timeout: std::time::Duration,
-    ) -> Result<crate::containment::TreeDrain, Error> {
+    ) -> Result<crate::containment::TreeDrain, crate::tokio::Error> {
         self.require_drainable()?;
         let deadline = crate::wait::deadline_from(timeout);
-        super::wait::wait_tree_drained_dispatch(&self.os.attached, deadline).await
+        super::wait::wait_tree_drained_dispatch(&self.os.attached, deadline)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -635,6 +656,25 @@ impl Child {
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
         self.os.attached.disarm();
+    }
+}
+
+/// Fault seams for [`wait_and_reap`]. Take-semantics, matching `crate::wait::fault`.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_WAIT_FAILURE: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// Make the NEXT [`wait_and_reap`](super::wait_and_reap) on THIS thread fail its wait with
+    /// `marker` as the error, without waiting.
+    pub(crate) fn set_force_wait_failure(marker: &'static str) {
+        FORCE_WAIT_FAILURE.with(|f| f.set(Some(marker)));
+    }
+    pub(crate) fn take_force_wait_failure() -> Option<&'static str> {
+        FORCE_WAIT_FAILURE.with(|f| f.take())
     }
 }
 
@@ -770,37 +810,82 @@ impl Drop for Child {
     }
 }
 
-/// Guaranteed synchronous teardown for `Drop`: kill the child, then block until it has exited.
-/// The kill here is what bounds the wait, so a caller that has ALREADY killed must use
-/// [`wait_and_reap`] instead — re-killing would make its reap conditional on a second kill that
-/// can be refused.
+/// The async spawn's error teardown: kill the child, then block until it has exited. The kill
+/// here is what bounds the wait, so a caller that has ALREADY killed must use [`wait_and_reap`]
+/// instead — re-killing would make its reap conditional on a second kill that can be refused.
 /// **Invariant:** no `wait()` future for this child is in flight when this runs.
-pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
+///
+/// A child the kill cannot end — EPERM from a setuid child — is not waited on, which would block
+/// for as long as it runs. Its one ownership check decides what becomes of it (see
+/// `crate::child::unreaped`): one that had exited is reaped; one whose check fails is released
+/// without a wait or tokio's `Drop`, and logged; one still running is returned with the kill's
+/// error, for the caller to hand back in [`Error::Unreaped`](crate::error::Error). Its own
+/// stdio handles are closed first: one the caller holds would keep a child waiting on it.
+///
+/// On Windows a `suspended` child — created `CREATE_SUSPENDED`, and not yet resumed by a
+/// successful attach — cannot exit on its own, so it is never handed back: a failed kill is
+/// retried through the handle tokio holds, as `crate::child::spawn::retry_terminate_suspended`
+/// describes, and waited for only if that terminates it.
+#[must_use]
+pub(crate) fn reap_now(
+    mut child: ::tokio::process::Child,
+    pid: u32,
+    done_ok: bool,
+    #[cfg(windows)] suspended: bool,
+) -> Option<(std::io::Error, crate::Unreaped)> {
+    use crate::child::unreaped::{Checked, Held};
     // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
     // whose argument is stripped in release). A no-op on an already-exited child.
     #[cfg(test)]
     let forced = crate::child::spawn::fault::take_force_kill_failure();
     #[cfg(not(test))]
-    let forced: Option<(&str, std::io::ErrorKind, bool)> = None;
+    let forced: Option<(&str, std::io::ErrorKind)> = None;
     let killed = match forced {
-        // The sync seam's "leave it alive" form is the only one this path honours: it replaces the
-        // kill, so the child really is left unsignalled.
-        Some((marker, kind, _)) => Err(std::io::Error::new(kind, marker)),
+        // It replaces the kill, so the child really is left unsignalled.
+        Some((marker, kind)) => Err(std::io::Error::new(kind, marker)),
         None => child.start_kill(),
     };
-    // A failed start_kill means this is not a live process to wait on to a bound — ESRCH, it has
-    // already exited; EPERM, a setuid child refused the kill — so skip, and a kill failure never
-    // turns the bounded exit-wait into an unbounded block. tokio's own `Child` drop hands whatever
-    // is left to the runtime's orphan reaper. EPERM is reachable without a bug, so it alone is not
-    // asserted.
-    if let Err(e) = &killed {
-        debug_assert!(
-            e.kind() == std::io::ErrorKind::PermissionDenied,
-            "start_kill of an owned child failed: {e}"
-        );
-        return;
+    let Err(kill) = killed else {
+        wait_and_reap(&mut child, pid, done_ok);
+        return None;
+    };
+    drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+    match Held::Tokio(Box::new(child)).check() {
+        Checked::Running(mut held) => {
+            #[cfg(windows)]
+            if suspended {
+                let terminated = match &mut held {
+                    Held::Tokio(child) => child
+                        .raw_handle()
+                        .is_some_and(|handle| crate::child::spawn::retry_terminate_suspended(handle, pid)),
+                    _ => false,
+                };
+                if terminated {
+                    if let Held::Tokio(child) = &mut held {
+                        wait_and_reap(child, pid, done_ok);
+                    }
+                    log::warn!(
+                        "async spawn teardown failed to kill pid {pid}: {kill}; terminated it through its handle"
+                    );
+                } else {
+                    held.release();
+                }
+                return None;
+            }
+            #[cfg(unix)]
+            let _ = &mut held;
+            Some((kill, crate::Unreaped::new(held)))
+        }
+        // It had exited, which makes the kill's failure moot.
+        Checked::Reaped => None,
+        Checked::Uncertain(e) => {
+            log::warn!(
+                "async spawn teardown could not kill pid {pid} ({kill}), and its ownership is uncertain \
+                 ({e}); released it without waiting"
+            );
+            None
+        }
     }
-    wait_and_reap(child, pid, done_ok);
 }
 
 /// The wait-then-reap half of [`reap_now`], with **no kill of its own**: the caller's own
@@ -831,35 +916,62 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
         // target and the identical syscall.
         debug_assert!(pid <= i32::MAX as u32, "pid {pid} exceeds i32::MAX");
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        #[cfg(test)]
+        let mut forced = fault::take_force_wait_failure();
         loop {
-            // SAFETY: a well-formed `waitid` call; `info` is a valid, owned, zeroed `siginfo_t` the
-            // kernel fills in. WNOWAIT leaves the child reapable for tokio's in-drop reap.
-            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-            if rc == 0 {
-                break;
-            }
-            let err = std::io::Error::last_os_error();
+            #[cfg(test)]
+            let forced_err = forced.take().map(std::io::Error::other);
+            #[cfg(not(test))]
+            let forced_err: Option<std::io::Error> = None;
+            let err = match forced_err {
+                Some(e) => e,
+                None => {
+                    // SAFETY: a well-formed `waitid` call; `info` is a valid, owned, zeroed
+                    // `siginfo_t` the kernel fills in. WNOWAIT leaves the child reapable for tokio's
+                    // in-drop reap.
+                    let rc = unsafe {
+                        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+                    };
+                    if rc == 0 {
+                        break;
+                    }
+                    std::io::Error::last_os_error()
+                }
+            };
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             // id() was Some above (tokio un-reaped ⇒ pid pinned), so no ECHILD / other errno should
-            // occur — a debug tripwire, with a safe release `break`.
+            // occur — a debug tripwire, with a safe release `break`. warn first: the assert is
+            // compiled out in release.
+            log::warn!("waiting for pid {pid} to exit in teardown failed: {err}; leaving its reap to tokio");
             debug_assert!(false, "waitid in wait_and_reap failed unexpectedly: {err}");
             break;
         }
     }
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
-        let _ = pid;
         let h = child.raw_handle().expect("tokio owns the handle while id() is Some");
-        // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
-        // INFINITE is bounded by the kill the caller already issued.
-        let waited = unsafe { WaitForSingleObject(HANDLE(h), INFINITE) };
-        debug_assert!(
-            waited == WAIT_OBJECT_0,
-            "wait_and_reap did not observe the child's exit: {waited:?}"
-        );
+        #[cfg(test)]
+        let forced = fault::take_force_wait_failure().map(std::io::Error::other);
+        #[cfg(not(test))]
+        let forced: Option<std::io::Error> = None;
+        let failure = forced.or_else(|| {
+            // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
+            // INFINITE is bounded by the kill the caller already issued.
+            let waited = unsafe { WaitForSingleObject(HANDLE(h), INFINITE) };
+            match waited {
+                WAIT_OBJECT_0 => None,
+                WAIT_FAILED => Some(std::io::Error::last_os_error()),
+                other => Some(std::io::Error::other(format!("unexpected wait result {other:?}"))),
+            }
+        });
+        if let Some(e) = failure {
+            // warn first: the assert is compiled out in release.
+            log::warn!("waiting for pid {pid} to exit in teardown failed: {e}");
+            debug_assert!(false, "wait_and_reap did not observe the child's exit: {e}");
+        }
     }
 }

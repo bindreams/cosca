@@ -160,7 +160,7 @@ impl CgroupLeaf {
         self.entered
     }
 
-    /// Neutralize `Drop`'s kill, for `detach()`.
+    /// Neutralize `Drop`'s kill, for `detach()`, `kill_on_drop(false)` and a leaked `Unreaped`.
     ///
     /// Dropping a `CgroupLeaf` is NOT inert, which is what makes this necessary: `Drop` fires
     /// `cgroup.kill` whenever the first `rmdir` fails, and over a live detached tree that
@@ -666,9 +666,25 @@ impl Drop for CgroupLeaf {
         // uses the watch itself.
         self.watch.stop_pump();
         self.procs_fd = None;
-        // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
+        // Before the verdict — a spawn that failed, maybe after its fork — end the exchange. Every
+        // spawn path that can leave a child unreaped abandons it itself and hands back a child that
+        // refused its kill, so one reaching here breaks that contract. It is never waited for: a
+        // `Drop` can run on a runtime worker, and the child's exit has no bound. It is leaked, with
+        // a warning, and asserted. The only wait on the child in this `Drop` is for one its
+        // kill reached, which that kill bounds.
         if self.report.is_some() {
-            self.abandon_before_verdict();
+            if let Abandoned::HandedBack { kill, child } = self.abandon_before_verdict() {
+                let pid = child.pid();
+                child.leak();
+                log::warn!(
+                    "cgroup v2: a dropped leaf's child refused its kill ({kill}); it is leaked, since \
+                     nothing holds it to wait for"
+                );
+                debug_assert!(
+                    false,
+                    "a leaf was dropped with an unkillable child {pid} no spawn path handed back"
+                );
+            }
         }
         if self.abandoned {
             return;
@@ -728,33 +744,44 @@ impl Drop for CgroupLeaf {
 
 /// How an abandoned spawn's child ended up (see [`CgroupLeaf::abandon_before_verdict`]).
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Abandoned {
-    /// Nothing of the child's runs, and it is reaped or will be: it was killed, or had already
-    /// exited and been reaped.
+    /// Nothing of the child's runs, and it is reaped: it was killed, or had already exited and
+    /// been reaped.
     Ended,
     /// The child sent nothing, so nothing names it: there may be none, or one that exits at its
     /// first send, before `exec` and outside the leaf — but that nothing here holds the pid to reap.
     MaybeUnreaped,
-    /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
-    /// signal, and its leaf does not hold it.
+    /// The child refused the kill, and its leaf does not hold it: it may run on. It is still this
+    /// process's unreaped child, held by its handle, for the abandoning spawn to hand back to
+    /// its caller. The leaf's own `Drop` has no caller to return it to, and never waits for it:
+    /// reaching one there is a contract breach, asserted in debug builds and leaked with a warning.
+    HandedBack {
+        kill: std::io::Error,
+        child: crate::child::unreaped::Unreaped,
+    },
+    /// The child may be running, and nothing holds it: it sent no handle on itself.
     OutOfReach,
 }
 
 /// What became of the child itself when its spawn was abandoned.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildFate {
     /// Never sent its intent: if it exists, it exits at its first send, never entering the leaf,
     /// and nothing here can reap it.
     NeverReached,
-    /// Already exited and reaped by whoever failed the spawn (std reaps the child of a spawn it
-    /// failed).
+    /// Already exited and reaped: by whoever failed the spawn (std reaps the child of a spawn it
+    /// failed), by the ownership check of a child that refused its kill, or by something else.
     Gone,
     /// Killed through its pidfd, with its process group, and reaped.
     Killed,
-    /// Could not be killed: no pidfd, or the signal was refused.
-    Unkillable,
+    /// Could not be killed: the signal was refused. The child is held, still running.
+    Unkillable {
+        kill: std::io::Error,
+        child: crate::child::unreaped::Unreaped,
+    },
+    /// Could not be named: it sent no handle on itself, so nothing may signal or hold it.
+    Unnamed,
 }
 
 #[cfg(target_os = "linux")]
@@ -792,9 +819,12 @@ impl CgroupLeaf {
         match (fate, through_leaf) {
             (ChildFate::NeverReached, _) => Abandoned::MaybeUnreaped,
             (ChildFate::Gone | ChildFate::Killed, _) => Abandoned::Ended,
-            // `cgroup.kill` needs no credential, so a placed child is killed through its leaf.
-            (ChildFate::Unkillable, Some(Ok(()))) => Abandoned::Ended,
-            (ChildFate::Unkillable, _) => Abandoned::OutOfReach,
+            // Handed back even when the kill through its leaf succeeded: that reaches only what is
+            // still in the leaf, and a child moved out of it — `pam_systemd` moves a `sudo -i` into
+            // its session scope — survives, so a wait for it here would last as long as it runs.
+            (ChildFate::Unkillable { kill, child }, _) => Abandoned::HandedBack { kill, child },
+            (ChildFate::Unnamed, Some(Ok(()))) => Abandoned::Ended,
+            (ChildFate::Unnamed, _) => Abandoned::OutOfReach,
         }
     }
 
@@ -883,8 +913,8 @@ impl CgroupLeaf {
 /// one error. The handle answers instead: a process `std` reaped opens nothing through it, however
 /// its number has been reused since. An intent with no handle names nothing cosca may signal.
 ///
-/// A child it may not signal (`EPERM`) is handed to a background reaper, so it is reaped once it
-/// exits, however that comes.
+/// A child it may not signal (`EPERM`) is held, still running, for the caller to wait for: its
+/// check above found it this process's unreaped child. cosca keeps no thread to reap it with.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received) -> ChildFate {
     use std::os::fd::{AsFd, AsRawFd};
@@ -900,7 +930,7 @@ fn end_child(received: &Received) -> ChildFate {
     };
     let Some(handle) = received.pidfd.as_ref().or(received.proc_dir.as_ref()) else {
         log::warn!("cgroup v2: an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled");
-        return ChildFate::Unkillable;
+        return ChildFate::Unnamed;
     };
     // The reap names the child by its pidfd, or — with its `/proc` directory proving the number is
     // still its own, and it unreaped — by its pid.
@@ -961,12 +991,55 @@ fn end_child(received: &Received) -> ChildFate {
     };
     // The group it leads: an unreaped leader pins the group's id, so this names its group alone.
     if !denied {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        #[cfg(test)]
+        let forced = fault::take_force_group_kill_failure();
+        #[cfg(not(test))]
+        let forced: Option<&str> = None;
+        let group_killed = match forced {
+            Some(marker) => Err(std::io::Error::other(marker)),
+            None => rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).map_err(Into::into),
+        };
+        // The child's own kill is what ends it; the group's is for what it forked, and a group
+        // already gone (ESRCH) is the ordinary case, so a failure is recorded, not raised.
+        if let Err(e) = group_killed {
+            log::debug!("cgroup v2: could not kill an abandoned spawn's process group ({e})");
+        }
     }
     if let Err(e) = killed {
-        log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}); it is reaped once it exits");
-        reap_in_background(id_owned(received, pid));
-        return ChildFate::Unkillable;
+        use crate::child::unreaped::{Checked, Held, Unreaped};
+        // Its own pidfd, or — its `/proc` directory having just proved the pid its own and
+        // unreaped — one opened on that pid, so an async holder can await it.
+        let pidfd = match received.pidfd.as_ref().and_then(|pidfd| pidfd.try_clone().ok()) {
+            Some(pidfd) => Some(pidfd),
+            None => match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+                Ok(pidfd) => Some(pidfd),
+                Err(open) => {
+                    log::debug!("cgroup v2: no pidfd for an abandoned spawn's child ({open}); held by its pid");
+                    None
+                }
+            },
+        };
+        let held = Held::Bare {
+            pid: pid.as_raw_nonzero().get() as u32,
+            pidfd,
+        };
+        // Its one ownership check: only a child still running is held, and not waited on here,
+        // where the wait would last as long as it runs.
+        return match held.check() {
+            Checked::Running(held) => ChildFate::Unkillable {
+                kill: e.into(),
+                child: Unreaped::new(held),
+            },
+            // It had exited, and the check reaped it.
+            Checked::Reaped => ChildFate::Gone,
+            Checked::Uncertain(uncertain) => {
+                log::warn!(
+                    "cgroup v2: an abandoned spawn's child refused its kill ({e}), and its ownership is \
+                     uncertain ({uncertain}); released it without waiting"
+                );
+                ChildFate::Gone
+            }
+        };
     }
     let status = loop {
         match waitid(id(), WaitIdOptions::EXITED) {
@@ -990,58 +1063,6 @@ fn end_child(received: &Received) -> ChildFate {
         }
     }
     ChildFate::Killed
-}
-
-/// What names a child to its reaper: its own pidfd, or its pid once its `/proc` directory proved
-/// the number its own (see [`end_child`]).
-#[cfg(target_os = "linux")]
-enum ChildId {
-    PidFd(OwnedFd),
-    Pid(rustix::process::Pid),
-}
-
-#[cfg(target_os = "linux")]
-fn id_owned(received: &Received, pid: rustix::process::Pid) -> ChildId {
-    match received.pidfd.as_ref().and_then(|pidfd| pidfd.try_clone().ok()) {
-        Some(pidfd) => ChildId::PidFd(pidfd),
-        None => ChildId::Pid(pid),
-    }
-}
-
-/// Reap `child` on a detached thread once it exits on its own — a child cosca could not kill.
-/// The thread blocks on the child's exit, an event outside this process's control; nothing waits
-/// for the thread. This stands in until the crate's spawn teardown has one shared reaper.
-#[cfg(target_os = "linux")]
-fn reap_in_background(child: ChildId) {
-    use std::os::fd::AsFd;
-
-    use rustix::process::{waitid, WaitId, WaitIdOptions};
-
-    #[cfg(test)]
-    let notify = fault::take_background_reap_notifier();
-    let spawned = std::thread::Builder::new().name("cosca-reap".into()).spawn(move || {
-        let id = || match &child {
-            ChildId::PidFd(pidfd) => WaitId::PidFd(pidfd.as_fd()),
-            ChildId::Pid(pid) => WaitId::Pid(*pid),
-        };
-        loop {
-            match waitid(id(), WaitIdOptions::EXITED) {
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => log::warn!("cgroup v2: background reap of an abandoned spawn's child failed: {e}"),
-                Ok(_) =>
-                {
-                    #[cfg(test)]
-                    if let Some(notify) = &notify {
-                        let _ = notify.send(());
-                    }
-                }
-            }
-            break;
-        }
-    });
-    if let Err(e) = spawned {
-        log::warn!("cgroup v2: could not start a thread to reap an abandoned spawn's child, which stays unreaped: {e}");
-    }
 }
 
 /// What can make a leaf refuse its `rmdir` after its tree was killed and drained and its child
