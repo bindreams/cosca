@@ -134,3 +134,34 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
         "the child was reaped by the wait() above"
     );
 }
+
+// An unexpected wait failure leaves the reap to tokio and is asserted, so release — where the
+// assert is compiled out — must still say so. The forced failure replaces the wait; the child is
+// reaped by the `wait()` below.
+#[tokio::test]
+async fn a_failed_teardown_wait_is_logged() {
+    let marker = "cosca-teardown-wait-fail-2e6d";
+    crate::log_capture::install();
+    let mut child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mark = crate::log_capture::mark();
+    super::fault::set_force_wait_failure(marker);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::wait_and_reap(&mut child, pid, false);
+    }));
+    assert_eq!(
+        super::fault::take_force_wait_failure(),
+        None,
+        "the wait must consume the forced failure"
+    );
+    assert_eq!(
+        outcome.is_err(),
+        cfg!(debug_assertions),
+        "the debug_assert fires in exactly the builds that keep it"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, marker),
+        "a failed teardown wait must be logged"
+    );
+    child.wait().await.expect("reap the child");
+}

@@ -219,7 +219,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
-use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
+use windows::Win32::System::Threading::GetProcessId;
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
@@ -549,19 +549,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         None
     };
     let Some(id) = id else {
-        // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
-        // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        // SAFETY: `handle` is live; terminating our own launched child.
-        let terminated = unsafe { TerminateProcess(handle, 1) }.is_ok();
-        let detail = if terminated {
-            "the elevated child launched but its identity could not be resolved; it was terminated".into()
-        } else {
-            format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running")
-        };
-        return Err(Error::Elevation {
-            kind: ElevationErrorKind::Untracked,
-            detail,
-        });
+        return Err(untracked(proc, pid));
     };
 
     let report = ElevationReport {
@@ -570,6 +558,88 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         stdio: ElevatedStdio::OwnConsole,
     };
     Ok(RunasOutcome::Launched { proc, pid, id, report })
+}
+
+/// The error for a runas child that launched but whose identity could not be resolved: it is
+/// terminated through the handle this process holds, and the outcome folded into the `Untracked`
+/// detail. `ERROR_ACCESS_DENIED` means its exit is already underway, so the handle is waited on. A
+/// child the termination cannot end gets its one ownership check (see
+/// [`unreaped`](crate::child::unreaped)): one still running is handed back in
+/// [`Error::Unreaped`], whose `error` is that `Untracked`, so the caller holds a handle to wait on.
+pub(crate) fn untracked(proc: std::os::windows::io::OwnedHandle, pid: u32) -> Error {
+    use crate::child::spawn::windows_raw::{can_terminate, terminate, RawChild, Terminated};
+    use crate::child::unreaped::{Checked, Held, Unreaped};
+    let untracked = |note: String| Error::Elevation {
+        kind: ElevationErrorKind::Untracked,
+        detail: format!("the elevated child (pid {pid}) launched but its identity could not be resolved; {note}"),
+    };
+    let child = RawChild::new_runas(proc, pid);
+    #[cfg(test)]
+    let forced_denial = fault::take_force_higher_integrity_denial();
+    #[cfg(not(test))]
+    let forced_denial = false;
+    #[cfg(test)]
+    let terminated = match crate::child::spawn::fault::take_force_kill_failure() {
+        Some((marker, kind)) => Terminated::Failed(std::io::Error::new(kind, marker)),
+        None if forced_denial => Terminated::ExitUnderway,
+        None => terminate(child.handle_for_teardown()),
+    };
+    #[cfg(not(test))]
+    let terminated = terminate(child.handle_for_teardown());
+    let kill = match terminated {
+        // Terminated, or already exiting — `ERROR_ACCESS_DENIED` on a handle with terminate
+        // rights — so the wait is bounded.
+        Terminated::Yes => None,
+        Terminated::ExitUnderway if !forced_denial && can_terminate(pid) => None,
+        // `ERROR_ACCESS_DENIED` without terminate rights: a higher-integrity child refusing us,
+        // as `RawChild::kill` reads it. Never waited on.
+        Terminated::ExitUnderway => Some(std::io::Error::from_raw_os_error(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32,
+        )),
+        Terminated::Failed(e) => Some(e),
+    };
+    let Some(kill) = kill else {
+        #[cfg(test)]
+        let waited = match crate::child::spawn::fault::take_force_reap_failure() {
+            Some(marker) => child.wait().and(Err(std::io::Error::other(marker))),
+            None => child.wait(),
+        };
+        #[cfg(not(test))]
+        let waited = child.wait();
+        if let Err(e) = waited {
+            log::warn!("failed to reap the terminated runas child {pid}: {e}");
+            debug_assert!(false, "failed to reap a terminated runas child: {e}");
+        }
+        return untracked("it was terminated".into());
+    };
+    match Held::Raw(child).check() {
+        Checked::Running(held) => Error::Unreaped {
+            error: Box::new(untracked("it could not be terminated and is handed back".into())),
+            kill,
+            child: Unreaped::new(held),
+        },
+        Checked::Reaped => untracked("it had already exited".into()),
+        Checked::Uncertain(e) => untracked(format!(
+            "it could not be terminated ({kill}), and its state could not be read ({e}); it was released"
+        )),
+    }
+}
+
+/// Test-only seams for [`untracked`].
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    thread_local! {
+        static FORCE_HIGHER_INTEGRITY_DENIAL: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Make the next `untracked` on this thread find its termination denied (`ERROR_ACCESS_DENIED`)
+    /// and the child one this process may not terminate, as a higher-integrity runas child is.
+    pub(crate) fn set_force_higher_integrity_denial() {
+        FORCE_HIGHER_INTEGRITY_DENIAL.with(|f| f.set(true));
+    }
+    pub(crate) fn take_force_higher_integrity_denial() -> bool {
+        FORCE_HIGHER_INTEGRITY_DENIAL.with(|f| f.replace(false))
+    }
 }
 
 pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error> {

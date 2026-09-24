@@ -9,9 +9,10 @@ mod process;
 #[path = "tokio/pump.rs"]
 mod pump;
 #[path = "tokio/spawn.rs"]
-mod spawn;
+pub(crate) mod spawn;
 #[path = "tokio/stdio.rs"]
 mod stdio;
+pub(crate) mod unreaped;
 #[path = "tokio/wait.rs"]
 pub(crate) mod wait;
 
@@ -19,6 +20,12 @@ pub use child::Child;
 pub use command::Command;
 pub use process::Process;
 pub use stdio::{ChildStderr, ChildStdin, ChildStdout};
+pub use unreaped::Unreaped;
+
+/// [`cosca::error::Error`](crate::error::Error) for the async API: a failed spawn's child it could
+/// not kill comes back in [`Error::Unreaped`](crate::error::Error::Unreaped) as an awaitable
+/// [`Unreaped`].
+pub type Error = crate::error::Error<Unreaped>;
 
 /// Start building an async command from an argument vector.
 pub fn run<I, S>(args: I) -> Command

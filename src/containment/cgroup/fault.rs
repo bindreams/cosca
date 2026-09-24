@@ -11,7 +11,7 @@ thread_local! {
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
-    static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static FORCE_GROUP_KILL_FAILURE: Cell<Option<&'static str>> = const { Cell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -264,12 +264,13 @@ pub(crate) fn take_force_child_kill_denied() -> bool {
     FORCE_CHILD_KILL_DENIED.with(|f| f.replace(false))
 }
 
-/// Have the NEXT background reap started on this thread report on `notify` once it has reaped.
-pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<()>) {
-    BACKGROUND_REAP_NOTIFY.with(|n| *n.borrow_mut() = Some(notify));
+/// Make the NEXT group kill of an abandoned child on this thread fail with `marker`, without
+/// signalling the group.
+pub(crate) fn set_force_group_kill_failure(marker: &'static str) {
+    FORCE_GROUP_KILL_FAILURE.with(|f| f.set(Some(marker)));
 }
-pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<()>> {
-    BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
+pub(crate) fn take_force_group_kill_failure() -> Option<&'static str> {
+    FORCE_GROUP_KILL_FAILURE.with(|f| f.take())
 }
 
 /// Have the NEXT verdict on this thread that cannot wait find its leaf busy (`EBUSY`), as one

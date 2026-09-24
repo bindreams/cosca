@@ -52,19 +52,19 @@ impl Command {
         self.inner.raw_executable(p);
         self
     }
-    pub fn stdin(&mut self, t: Stdio) -> Result<&mut Command, Error> {
+    pub fn stdin(&mut self, t: Stdio) -> Result<&mut Command, crate::tokio::Error> {
         self.inner.stdin(t)?;
         Ok(self)
     }
-    pub fn stdout(&mut self, t: Stdio) -> Result<&mut Command, Error> {
+    pub fn stdout(&mut self, t: Stdio) -> Result<&mut Command, crate::tokio::Error> {
         self.inner.stdout(t)?;
         Ok(self)
     }
-    pub fn stderr(&mut self, t: Stdio) -> Result<&mut Command, Error> {
+    pub fn stderr(&mut self, t: Stdio) -> Result<&mut Command, crate::tokio::Error> {
         self.inner.stderr(t)?;
         Ok(self)
     }
-    pub fn fd(&mut self, slot: impl Into<crate::stdio::Fd>, t: Stdio) -> Result<&mut Command, Error> {
+    pub fn fd(&mut self, slot: impl Into<crate::stdio::Fd>, t: Stdio) -> Result<&mut Command, crate::tokio::Error> {
         self.inner.fd(slot, t)?;
         Ok(self)
     }
@@ -215,13 +215,27 @@ impl Command {
     /// ends.
     ///
     /// [`Containment::CgroupV2`]: crate::Containment::CgroupV2
-    pub fn spawn(&mut self) -> Result<Child, Error> {
-        super::spawn::spawn(&mut self.inner)
+    ///
+    /// # A child the failed spawn could not kill
+    ///
+    /// A spawn that fails after creating its child kills and reaps it. One the kill cannot end — a
+    /// setuid child refuses it with `EPERM` — comes back in
+    /// [`Error::Unreaped`](crate::tokio::Error) as a
+    /// [`cosca::tokio::Unreaped`](crate::tokio::Unreaped), still running: `wait().await` it rather
+    /// than drop the error on a runtime thread, where its drop blocks until the child exits.
+    pub fn spawn(&mut self) -> Result<Child, crate::tokio::Error> {
+        super::spawn::spawn(&mut self.inner).map_err(Into::into)
     }
 
     /// Run to completion with inherited stdio, returning the exit status.
     /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
-    pub async fn status(&mut self) -> Result<std::process::ExitStatus, Error> {
+    ///
+    /// If the spawn fails with a child it could not kill, the error carries it as
+    /// [`Error::Unreaped`](crate::tokio::Error), returned at once, as [`spawn`](Command::spawn)
+    /// returns it — nothing is awaited while the error holds it. Dropping it blocks until the child
+    /// exits: match on `Error::Unreaped` to wait with your own timeout, move it, or
+    /// [`leak`](crate::tokio::Unreaped::leak) it.
+    pub async fn status(&mut self) -> Result<std::process::ExitStatus, crate::tokio::Error> {
         self.inner.stdin(Stdio::inherit())?;
         self.inner.stdout(Stdio::inherit())?;
         self.inner.stderr(Stdio::inherit())?;
@@ -231,7 +245,13 @@ impl Command {
 
     /// Run to completion, capturing stdout and stderr (stdin is `/dev/null`).
     /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
-    pub async fn output(&mut self) -> Result<crate::Output, Error> {
+    ///
+    /// If the spawn fails with a child it could not kill, the error carries it as
+    /// [`Error::Unreaped`](crate::tokio::Error), returned at once, as [`spawn`](Command::spawn)
+    /// returns it — nothing is awaited while the error holds it. Dropping it blocks until the child
+    /// exits: match on `Error::Unreaped` to wait with your own timeout, move it, or
+    /// [`leak`](crate::tokio::Unreaped::leak) it.
+    pub async fn output(&mut self) -> Result<crate::Output, crate::tokio::Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
         self.inner.stderr(Stdio::pipe())?;
@@ -241,7 +261,13 @@ impl Command {
 
     /// Run to completion, capturing stdout as a UTF-8 string (stdin is `/dev/null`).
     /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
-    pub async fn read(&mut self) -> Result<String, Error> {
+    ///
+    /// If the spawn fails with a child it could not kill, the error carries it as
+    /// [`Error::Unreaped`](crate::tokio::Error), returned at once, as [`spawn`](Command::spawn)
+    /// returns it — nothing is awaited while the error holds it. Dropping it blocks until the child
+    /// exits: match on `Error::Unreaped` to wait with your own timeout, move it, or
+    /// [`leak`](crate::tokio::Unreaped::leak) it.
+    pub async fn read(&mut self) -> Result<String, crate::tokio::Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
         let mut child = self.spawn()?;
@@ -258,7 +284,7 @@ impl Command {
         &mut self,
         started: ::tokio::sync::oneshot::Sender<()>,
         outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
-    ) -> Result<Child, Error> {
+    ) -> Result<Child, crate::tokio::Error> {
         let mut child = self.spawn()?;
         child.install_wait_observer(started, outcome);
         Ok(child)

@@ -81,6 +81,10 @@ impl RawAsyncChild {
         HANDLE(self.proc.as_raw_handle())
     }
 
+    pub(crate) fn id(&self) -> u32 {
+        self.pid
+    }
+
     /// Block until the child exits, returning its status. Runs the blocking handle wait on the
     /// blocking pool; a `CancelGuard` in this future signals a cancel event on drop so an aborted
     /// or timed-out wait releases the parked watcher at once.
@@ -174,7 +178,7 @@ impl RawAsyncChild {
             // (b) a runas child is genuinely higher-integrity than us. A static `can_terminate`
             // probe (shared with the sync `RawChild`) separates them WITHOUT racing a `try_wait`.
             // Only (b) is a real denial → surface the `Io` error so `Child::kill` maps it to the
-            // typed `Unkillable`; (a) is Ok (signal-only, so never block here).
+            // typed `ElevationErrorKind::Unkillable`; (a) is Ok (signal-only, so never block here).
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !sync_raw::can_terminate(self.pid) {
                     Err(Error::Io(std::io::Error::from_raw_os_error(
@@ -353,18 +357,26 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         graceful: crate::containment::windows::mechanism_from_flags(flags),
     };
     let raw_handle = proc.as_raw_handle();
+    // Read before `attach_or_fault` consumes `prepared`: a failed attach may leave it suspended.
+    let suspended = prepared.created_suspended();
     let attachment = match attach_or_fault(pid, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(e);
+            return Err(crate::child::spawn::unkillable(
+                e,
+                sync_raw::raw_spawn_teardown(proc, pid, suspended),
+            ));
         }
     };
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            // The attach succeeded, and with it the resume.
+            let handed_back = sync_raw::raw_spawn_teardown(proc, pid, false);
+            return Err(crate::child::spawn::unkillable(
+                crate::child::spawn::spawn_identity_error(other),
+                handed_back,
+            ));
         }
     };
 
