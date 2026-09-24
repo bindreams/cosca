@@ -25,8 +25,9 @@
 //! A leaf's watch is held for the leaf's life, and its parent watch queues an event for every
 //! sibling removed meanwhile, up to `fs.inotify.max_queued_events` (16384 by default) per
 //! instance, kernel memory the user is charged for. A full queue loses events after an
-//! `IN_Q_OVERFLOW`, which is harmless here: any event is only a reason to read `cgroup.events`
-//! again, a removed leaf reads as drained (`ENODEV`), and each wait empties the queue.
+//! `IN_Q_OVERFLOW`, which is harmless here: the pump empties the queue as events arrive, takes
+//! an overflow as a change (so every wait reads `cgroup.events` again), and a removed leaf reads
+//! as drained (`ENODEV`). A sibling's removal is taken in and ignored.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -47,6 +48,8 @@ pub(crate) struct DrainWatch {
     fd: OwnedFd,
     /// The parent's watch.
     parent: i32,
+    /// The watch on `cgroup.events`.
+    events_watch: i32,
     /// The leaf's name in its parent.
     name: OsString,
     /// Whether the leaf was seen removed.
@@ -76,13 +79,14 @@ impl DrainWatch {
             fd_path(dir.parent()),
             inotify::WatchFlags::DELETE | inotify::WatchFlags::ONLYDIR,
         )?;
-        inotify::add_watch(&fd, fd_path(events.as_fd()), inotify::WatchFlags::MODIFY)?;
+        let events_watch = inotify::add_watch(&fd, fd_path(events.as_fd()), inotify::WatchFlags::MODIFY)?;
         // A removal between the open and the parent's watch is still seen: reads through `events`
         // then fail with `ENODEV`.
         Ok(Some(DrainWatch {
             events,
             fd,
             parent,
+            events_watch,
             name: dir.name().to_os_string(),
             gone: false,
             buf: String::new(),
@@ -102,21 +106,33 @@ impl DrainWatch {
         read_populated(&mut self.events, &mut self.buf)
     }
 
-    /// Take in what made the watch readable, without blocking.
-    pub(crate) fn consume(&mut self) -> Result<(), Error> {
+    /// Take in what made the watch readable, without blocking. `true` if any of it bears on the
+    /// leaf: a write to `cgroup.events`, the leaf's own removal, a watch the kernel dropped, or an
+    /// overflowed queue, which may have lost any of these. A sibling's removal does not.
+    pub(crate) fn consume(&mut self) -> Result<bool, Error> {
+        use inotify::ReadFlags;
+
+        let mut changed = false;
         let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
         let mut reader = inotify::Reader::new(&self.fd, &mut buf);
         loop {
             match reader.next() {
                 Ok(event) => {
+                    let flags = event.events();
                     let named_us = event
                         .file_name()
                         .is_some_and(|n| n.to_bytes() == self.name.as_encoded_bytes());
-                    if event.wd() == self.parent && event.events().contains(inotify::ReadFlags::DELETE) && named_us {
+                    if event.wd() == self.parent && flags.contains(ReadFlags::DELETE) && named_us {
                         self.gone = true;
+                        changed = true;
+                    }
+                    if flags.intersects(ReadFlags::QUEUE_OVERFLOW | ReadFlags::IGNORED)
+                        || (event.wd() == self.events_watch && flags.contains(ReadFlags::MODIFY))
+                    {
+                        changed = true;
                     }
                 }
-                Err(rustix::io::Errno::AGAIN) => return Ok(()),
+                Err(rustix::io::Errno::AGAIN) => return Ok(changed),
                 Err(rustix::io::Errno::INTR) => {}
                 Err(e) => return Err(Error::Io(e.into())),
             }
@@ -145,7 +161,7 @@ impl DrainWatch {
             let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
             match poll(&mut fds, ts.as_ref()) {
                 Ok(0) => return Ok(TreeDrain::MembersRemain),
-                Ok(_) => self.consume()?,
+                Ok(_) => drop(self.consume()?),
                 Err(rustix::io::Errno::INTR) => {}
                 Err(e) => return Err(Error::Io(e.into())),
             }
@@ -164,3 +180,7 @@ impl AsFd for DrainWatch {
         self.fd.as_fd()
     }
 }
+
+#[cfg(test)]
+#[path = "drain_tests.rs"]
+mod drain_tests;
