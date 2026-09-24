@@ -1027,7 +1027,7 @@ fn signal_when_blocking(tx: std::sync::mpsc::Sender<()>) {
 }
 
 /// A wait polled once and then never again holds nothing another wait needs: a second wait on
-/// the same leaf still returns as soon as the leaf drains.
+/// the same leaf, already blocked when the leaf drains, still returns.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
 fn a_parked_async_wait_does_not_hold_up_another() {
@@ -1037,7 +1037,7 @@ fn a_parked_async_wait_does_not_hold_up_another() {
     use crate::containment::TreeDrain;
 
     let fake = FakeLeaf::new("cosca-parked-waiter", true);
-    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1047,11 +1047,20 @@ fn a_parked_async_wait_does_not_hold_up_another() {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(parked.as_mut().poll(&mut context).is_pending(), "the leaf is populated");
 
+        let (blocking, blocking_rx) = std::sync::mpsc::channel();
+        let other_leaf = leaf.clone();
+        let other = std::thread::spawn(move || {
+            signal_when_blocking(blocking);
+            let runtime = ::tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(crate::tokio::wait::cgroup_wait_tree_drained(&other_leaf, None))
+        });
+        blocking_rx.recv().expect("the second wait blocks");
         FakeLeaf::set_populated(&fake.events, false);
         assert_eq!(
-            crate::tokio::wait::cgroup_wait_tree_drained(&leaf, None)
-                .await
-                .expect("wait"),
+            other.join().expect("the second waiter").expect("wait"),
             TreeDrain::AllMembersExited
         );
         // Still parked, never polled again: it held nothing the second wait needed.
@@ -1161,33 +1170,158 @@ fn a_wait_past_its_deadline_answers_from_the_leafs_state() {
     );
 }
 
-/// The pump starts with the first wait, and dropping the leaf stops and joins it before `drop`
-/// returns.
+/// Block a wait on `leaf` on a thread of its own, returning once it blocks.
+#[cfg(target_os = "linux")]
+fn blocked_wait(
+    leaf: &std::sync::Arc<crate::containment::cgroup::CgroupLeaf>,
+) -> std::thread::JoinHandle<Result<crate::containment::TreeDrain, crate::error::Error>> {
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+    let leaf = leaf.clone();
+    let waiter = std::thread::spawn(move || {
+        crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking);
+        leaf.wait_drained(None)
+    });
+    blocking_rx.recv().expect("the wait blocks");
+    waiter
+}
+
+/// The pump starts with the first wait that blocks, and dropping the leaf stops and joins it
+/// before `drop` returns.
 #[cfg(target_os = "linux")]
 #[test]
 fn dropping_the_leaf_stops_and_joins_its_pump() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
 
     let fake = FakeLeaf::new("cosca-pumped-leaf", true);
-    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
-    assert_eq!(fault::pumps_of("cosca-pumped-leaf"), (0, 0), "no pump before any wait");
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
     let _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
     assert_eq!(
         fault::pumps_of("cosca-pumped-leaf"),
-        (1, 0),
-        "the first wait starts the pump"
+        (0, 0),
+        "a wait that cannot block starts none"
     );
-    let _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
+
+    let waiter = blocked_wait(&leaf);
+    assert_eq!(
+        fault::pumps_of("cosca-pumped-leaf"),
+        (1, 0),
+        "a blocking wait starts the pump"
+    );
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+
+    FakeLeaf::set_populated(&fake.events, true);
+    let waiter = blocked_wait(&leaf);
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
     assert_eq!(fault::pumps_of("cosca-pumped-leaf"), (1, 0), "one pump per leaf");
 
-    FakeLeaf::set_populated(&fake.events, false);
-    drop(leaf);
+    drop(std::sync::Arc::into_inner(leaf).expect("the waiters are joined"));
     assert_eq!(
         fault::pumps_of("cosca-pumped-leaf"),
         (1, 1),
         "the drop joins the pump it stopped"
     );
+}
+
+/// A drained leaf is answered from one read: no pump is started for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drained_leaf_is_answered_without_a_pump() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-drained-unpumped", false);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    assert_eq!(leaf.wait_drained(None).expect("wait"), TreeDrain::AllMembersExited);
+    assert_eq!(
+        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+    #[cfg(feature = "tokio")]
+    {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        assert_eq!(
+            runtime
+                .block_on(crate::tokio::wait::cgroup_wait_tree_drained(&leaf, None))
+                .expect("wait"),
+            TreeDrain::AllMembersExited
+        );
+    }
+    assert_eq!(fault::pumps_of("cosca-drained-unpumped"), (0, 0));
+}
+
+/// A pump that stops on its own wakes every wait, and each reports why.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_pump_wakes_every_wait_with_its_error() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-failed-pump", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let waiters = [blocked_wait(&leaf), blocked_wait(&leaf)];
+    fault::set_force_pump_failure("cosca-failed-pump");
+    // Readable once more: the pump wakes, and fails.
+    FakeLeaf::set_populated(&fake.events, true);
+
+    for waiter in waiters {
+        let e = waiter.join().expect("waiter").expect_err("the pump failed");
+        assert!(e.to_string().contains("can no longer be watched"), "{e}");
+    }
+    assert!(
+        !fault::take_force_pump_failure("cosca-failed-pump".as_ref()),
+        "the pump took it"
+    );
+}
+
+/// A sibling's removal reaches the pump, which wakes no wait for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_siblings_removal_wakes_no_wait() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-sibling-watcher", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (batches, batches_rx) = std::sync::mpsc::channel();
+    fault::set_pump_batch_notifier("cosca-sibling-watcher", batches);
+    let waiter = blocked_wait(&leaf);
+
+    let sibling = fake.leaf.with_file_name("cosca-sibling");
+    std::fs::create_dir(&sibling).expect("make a sibling");
+    std::fs::remove_dir(&sibling).expect("remove the sibling");
+    assert!(
+        !batches_rx.recv().expect("a batch"),
+        "a sibling's removal notifies no one"
+    );
+
+    FakeLeaf::set_populated(&fake.events, false);
+    assert!(batches_rx.recv().expect("a batch"), "a write to cgroup.events notifies");
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+}
+
+/// The pump's thread name fits Linux's 15 bytes, which would truncate it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_pump_thread_name_fits_the_kernels_limit() {
+    assert!(crate::containment::cgroup::PUMP_THREAD.len() <= 15);
 }
 
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some

@@ -38,8 +38,10 @@ pub enum Containment {
     /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
     /// `fs.inotify.max_user_instances` (128 per user by default). A spawn that cannot get one is
     /// not contained in a leaf, and degrades as for any other failed step. The first
-    /// [`wait_tree`](crate::Child::wait_tree) on a handle also starts one thread, owned by that
-    /// handle, which reads the watch for every wait on it; dropping the handle stops and joins it.
+    /// [`wait_tree`](crate::Child::wait_tree) on a handle that finds the tree still running, and
+    /// may block, also starts one thread, owned by that handle, which reads the watch for every
+    /// wait on it; dropping the handle stops and joins it. A wait that finds the tree drained, or
+    /// whose timeout has already passed, starts none.
     ///
     /// A handle that opted out — [`Child::detach`](crate::Child::detach) or
     /// [`kill_on_drop(false)`](crate::Command::kill_on_drop) — never kills, and removes the leaf

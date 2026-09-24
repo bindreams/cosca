@@ -606,8 +606,9 @@ impl Child {
     /// never collected by this call, only the root's own `wait`/`try_wait` does that. Requires
     /// a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2, a
     /// Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/
-    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). Reactor-native on
-    /// Linux and macOS (no polling interval); Windows hands the wait to `spawn_blocking` (job
+    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). No polling interval:
+    /// macOS waits on the reactor; Linux awaits a broadcast from a thread the leaf owns, started
+    /// by the first wait that blocks and joined when the child is dropped; Windows hands the wait to `spawn_blocking` (job
     /// objects have no pollable handle) with a cancel event so a dropped future releases the
     /// blocking watcher promptly instead of parking out the wait.
     pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {

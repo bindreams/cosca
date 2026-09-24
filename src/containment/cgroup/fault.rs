@@ -356,3 +356,44 @@ pub(crate) fn arms_of(name: &str) -> usize {
         .filter(|n| n.as_os_str() == name)
         .count()
 }
+
+/// Pump seams, per leaf name, process-wide: a leaf's pump is a thread of its own.
+static PUMP_SEAMS: std::sync::Mutex<Vec<(std::ffi::OsString, PumpSeam)>> = std::sync::Mutex::new(Vec::new());
+
+enum PumpSeam {
+    /// Fail the pump the next time its watch is readable.
+    Fail,
+    /// Report, after each batch the pump takes in, whether it notified.
+    Batches(std::sync::mpsc::Sender<bool>),
+}
+
+/// Make the pump of the leaf named `name` fail the next time its watch is readable, as a failed
+/// `read` of the inotify instance would. Take semantics.
+pub(crate) fn set_force_pump_failure(name: &str) {
+    PUMP_SEAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.into(), PumpSeam::Fail));
+}
+pub(crate) fn take_force_pump_failure(name: &std::ffi::OsStr) -> bool {
+    let mut seams = PUMP_SEAMS.lock().unwrap_or_else(|e| e.into_inner());
+    let at = seams
+        .iter()
+        .position(|(n, s)| n.as_os_str() == name && matches!(s, PumpSeam::Fail));
+    at.map(|at| seams.remove(at)).is_some()
+}
+
+/// Send, after each batch the pump of the leaf named `name` takes in, whether it notified.
+pub(crate) fn set_pump_batch_notifier(name: &str, notify: std::sync::mpsc::Sender<bool>) {
+    PUMP_SEAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.into(), PumpSeam::Batches(notify)));
+}
+pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
+    for (n, seam) in PUMP_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if let (true, PumpSeam::Batches(notify)) = (n.as_os_str() == name, seam) {
+            let _ = notify.send(notified);
+        }
+    }
+}

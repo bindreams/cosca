@@ -347,8 +347,9 @@ async fn wait_tree_drained_inner(
 }
 
 /// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), or until `deadline`.
-/// The async twin of `CgroupLeaf::wait_drained`: listen to the leaf's `Watcher`, read the leaf,
-/// and await the next broadcast only if it has not drained. It never touches the watch itself, so
+/// The async twin of `CgroupLeaf::wait_drained`: read the leaf, and only if it has not drained
+/// and the deadline allows, listen to the leaf's `Watcher` (starting its pump), read it again,
+/// and await the next broadcast. It never touches the watch itself, so
 /// a future dropped, or never polled again, holds nothing another wait needs. Each round awaits
 /// for exactly the caller's own remaining time; no interval anywhere.
 #[cfg(target_os = "linux")]
@@ -359,13 +360,17 @@ pub(crate) async fn cgroup_wait_tree_drained(
     use crate::containment::TreeDrain;
 
     loop {
-        let listener = leaf.watcher().listen().map_err(Error::Io)?;
         if let Some(drain) = leaf.drain_seen()? {
             return Ok(drain);
         }
         let remaining = crate::wait::remaining(deadline);
         if remaining == Some(std::time::Duration::ZERO) {
             return Ok(TreeDrain::MembersRemain);
+        }
+        // Listen, then read: a change after this read is always heard.
+        let listener = leaf.watcher().listen().map_err(Error::Io)?;
+        if let Some(drain) = leaf.drain_seen()? {
+            return Ok(drain);
         }
         #[cfg(test)]
         crate::containment::cgroup::fault::notify_drain_blocking();
@@ -378,8 +383,8 @@ pub(crate) async fn cgroup_wait_tree_drained(
 }
 
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
-/// Job objects expose no pollable handle, so — unlike the Linux/macOS arms in this file — this
-/// is NOT reactor-native: it hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
+/// Job objects expose no pollable handle, so — unlike the macOS arm, on the reactor, and the Linux
+/// arm, awaiting its leaf's pump — this hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
 /// releasing the blocking thread promptly on drop via the same cancel-event idiom
 /// `blocking_watch` uses for `grace_wait`.
 ///
@@ -494,8 +499,9 @@ async fn job_wait_tree_drained(
     }
 }
 
-/// Async equivalent of `Attached::wait_drained`, dispatched by mechanism. Linux and macOS are
-/// genuinely reactor-native (`AsyncFd`); Windows hands its sync loop to `spawn_blocking` with a
+/// Async equivalent of `Attached::wait_drained`, dispatched by mechanism. macOS is reactor-native
+/// (`AsyncFd`); Linux awaits a broadcast from the pump thread its leaf owns (an
+/// `event_listener` future, no reactor registration); Windows hands its sync loop to `spawn_blocking` with a
 /// cancel event (job objects have no pollable handle). Every other mechanism delegates to the
 /// sync `Attached::wait_drained`, whose non-drainable arm returns `Unsupported` immediately —
 /// never blocking — so calling it directly here (no `spawn_blocking`) is safe.

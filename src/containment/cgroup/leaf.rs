@@ -97,8 +97,8 @@ pub(crate) struct CgroupLeaf {
     pub(super) leaf_path: PathBuf,
     /// The leaf's directory and its parent, held from creation.
     dir: LeafDir,
-    /// The leaf's drain watch, held from creation so that no wait on it ever lacks one, and
-    /// shared by concurrent waits in turn.
+    /// The leaf's drain watch, held from creation so that no wait on it ever lacks one. Read by
+    /// the pump this watcher owns, which broadcasts each change to every wait.
     /// Boxed: its pump would make every `Attached` as large as a leaf.
     watch: Box<Watcher>,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
@@ -477,9 +477,10 @@ impl CgroupLeaf {
 
     /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
     /// `populated` reads 0, or the leaf is removed — or until `deadline` (see
-    /// [`crate::wait::remaining`]). Listens to the leaf's [`Watcher`], starting its pump, and
-    /// reads the leaf after listening and after every broadcast: no interval, and a wait holds
-    /// nothing another needs. The watch wakes on the leaf's removal as well as on `populated`,
+    /// [`crate::wait::remaining`]). Reads the leaf first, and answers from that read if it has
+    /// drained or the deadline has passed, starting nothing. Otherwise listens to the leaf's
+    /// [`Watcher`], starting its pump, reads the leaf again, and blocks until the next broadcast:
+    /// no interval, and a wait holds nothing another needs. The watch wakes on the leaf's removal as well as on `populated`,
     /// since the kernel can cancel the one notification a drain sends. A removed leaf holds
     /// nothing: `rmdir` succeeds only on a drained leaf ([`removed_after_drain`]).
     pub(crate) fn wait_drained(
@@ -491,13 +492,17 @@ impl CgroupLeaf {
         use crate::containment::TreeDrain;
 
         loop {
-            let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
             if let Some(drain) = self.drain_seen()? {
                 return Ok(drain);
             }
             let remaining = crate::wait::remaining(deadline);
             if remaining == Some(std::time::Duration::ZERO) {
                 return Ok(TreeDrain::MembersRemain);
+            }
+            // Listen, then read: a change after this read is always heard.
+            let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
+            if let Some(drain) = self.drain_seen()? {
+                return Ok(drain);
             }
             #[cfg(test)]
             fault::notify_drain_blocking();
@@ -532,8 +537,7 @@ impl CgroupLeaf {
         }
     }
 
-    /// Whether the leaf has drained, read now without the watch: for a wait whose deadline passed
-    /// while it queued for the watch.
+    /// Whether the leaf has drained, read now through the held leaf directory, without the watch.
     pub(crate) fn drain_now(&self) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         use crate::containment::TreeDrain;
 
