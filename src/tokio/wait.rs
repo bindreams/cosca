@@ -347,53 +347,21 @@ async fn wait_tree_drained_inner(
 }
 
 /// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), or until `deadline`.
-/// The async twin of `CgroupLeaf::wait_drained`: the same [`DrainWatch`], read before every await,
-/// with its fd registered with the reactor instead of `poll`ed. No interval anywhere; each round
-/// awaits readiness for exactly the caller's own remaining time, and dropping the future
-/// deregisters the fd.
-///
-/// [`DrainWatch`]: crate::containment::cgroup::DrainWatch
+/// The async twin of `CgroupLeaf::wait_drained`: listen to the leaf's `Watcher`, read the leaf,
+/// and await the next broadcast only if it has not drained. It never touches the watch itself, so
+/// a future dropped, or never polled again, holds nothing another wait needs. Each round awaits
+/// for exactly the caller's own remaining time; no interval anywhere.
 #[cfg(target_os = "linux")]
 pub(crate) async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
-    use std::os::fd::{AsRawFd, RawFd};
-
-    use ::tokio::io::unix::AsyncFd;
-    use ::tokio::io::Interest;
-
     use crate::containment::TreeDrain;
 
-    /// The watch's descriptor, registered for as long as this waiter holds its turn: the leaf,
-    /// which owns it, outlives this future, and the registration is dropped before the turn.
-    struct Registered(RawFd);
-    impl AsRawFd for Registered {
-        fn as_raw_fd(&self) -> RawFd {
-            self.0
-        }
-    }
-
-    let turns = leaf.watch_turns();
-    let turn = match crate::wait::remaining(deadline) {
-        None => turns.take().await,
-        Some(left) => match ::tokio::time::timeout(left, turns.take()).await {
-            Ok(turn) => turn,
-            Err(_queued_past_deadline) => return leaf.drain_now(),
-        },
-    };
-    let fd = match turn.watch().as_ref() {
-        Some(watch) => watch.as_raw_fd(),
-        None => return Ok(TreeDrain::AllMembersExited),
-    };
-    let afd = AsyncFd::with_interest(Registered(fd), Interest::READABLE).map_err(Error::Io)?;
     loop {
-        {
-            let mut watch = turn.watch();
-            let watch = watch.as_mut().expect("the watch was there when the turn began");
-            if !watch.populated()? {
-                return Ok(TreeDrain::AllMembersExited);
-            }
+        let listener = leaf.watcher().listen().map_err(Error::Io)?;
+        if let Some(drain) = leaf.drain_seen()? {
+            return Ok(drain);
         }
         let remaining = crate::wait::remaining(deadline);
         if remaining == Some(std::time::Duration::ZERO) {
@@ -401,21 +369,11 @@ pub(crate) async fn cgroup_wait_tree_drained(
         }
         #[cfg(test)]
         crate::containment::cgroup::fault::notify_drain_blocking();
-        let mut ready = match remaining {
-            None => afd.ready(Interest::READABLE).await.map_err(Error::Io)?,
-            Some(d) => match ::tokio::time::timeout(d, afd.ready(Interest::READABLE)).await {
-                Ok(r) => r.map_err(Error::Io)?,
-                Err(_elapsed) => return Ok(TreeDrain::MembersRemain),
-            },
-        };
-        {
-            let mut watch = turn.watch();
-            watch
-                .as_mut()
-                .expect("the watch was there when the turn began")
-                .consume()?;
+        match remaining {
+            None => listener.await,
+            // A timeout is looked at by the next round, which reads the leaf once more.
+            Some(left) => drop(::tokio::time::timeout(left, listener).await),
         }
-        ready.clear_ready();
     }
 }
 

@@ -97,10 +97,10 @@ mod drain;
 pub(crate) use drain::*;
 
 #[cfg(target_os = "linux")]
-#[path = "cgroup/turn.rs"]
-mod turn;
+#[path = "cgroup/watcher.rs"]
+mod watcher;
 #[cfg(target_os = "linux")]
-pub(crate) use turn::*;
+pub(crate) use watcher::*;
 
 #[cfg(target_os = "linux")]
 #[path = "cgroup/leaf.rs"]

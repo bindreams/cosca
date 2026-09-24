@@ -15,8 +15,8 @@
 //! `IN_DELETE` on the parent, for the leaf's own name. Both bind to the held inodes, through
 //! `/proc/self/fd`, never to a path a mount could redirect.
 //!
-//! Each leaf arms one watch, at creation, and every wait on the leaf uses it in turn (see
-//! `turn.rs`).
+//! Each leaf arms one watch, at creation, read by the leaf's pump for every wait on the leaf
+//! (see `watcher.rs`), and by the leaf's own teardown once the pump is stopped.
 //!
 //! An inotify instance counts against `fs.inotify.max_user_instances` (128 per user by default),
 //! and each watch against `fs.inotify.max_user_watches`. Arming one can therefore fail, and a
@@ -87,6 +87,11 @@ impl DrainWatch {
             gone: false,
             buf: String::new(),
         }))
+    }
+
+    /// Whether an event taken in so far said the leaf was removed.
+    pub(crate) fn saw_removal(&self) -> bool {
+        self.gone
     }
 
     /// Whether the leaf still has a member. A removed leaf has none.
