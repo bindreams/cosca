@@ -90,7 +90,7 @@ fn proc_state(pid: u32) -> Option<char> {
 /// needs them only until its `exec`.
 ///
 /// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill`, waits
-/// for the leaf to drain, and retries — but only if the child reported entering it and the leaf was not
+/// for the leaf to drain, removes its child cgroups and tries once more — but only if the child reported entering it and the leaf was not
 /// [`disarm`](Self::disarm)ed.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
@@ -506,27 +506,6 @@ impl CgroupLeaf {
         }
     }
 
-    /// Whether something is mounted on the leaf, in this thread's mount namespace: its name no
-    /// longer resolves to it from the held parent, or its mount table lists a mount on it through
-    /// any cgroup2 mount (a namespace entered since creation sees mounts the held descriptors do
-    /// not). `is_local_mountpoint` in `vfs_rmdir` asks the same of this namespace (kernel v6.12).
-    fn mounted_on(&self) -> io::Result<Mounted> {
-        match self.dir.name_resolves()? {
-            Resolves::Here => {}
-            Resolves::Elsewhere => return Ok(Mounted::Yes),
-            Resolves::Nothing => return Ok(Mounted::Gone),
-        }
-        let Some(cgroup_path) = &self.cgroup_path else {
-            return Ok(Mounted::No);
-        };
-        let mountinfo = fs::read_to_string("/proc/thread-self/mountinfo")?;
-        Ok(if mounted_on_cgroup(&mountinfo, cgroup_path) {
-            Mounted::Yes
-        } else {
-            Mounted::No
-        })
-    }
-
     /// SIGTERM every pid currently listed in `cgroup.procs`.
     ///
     /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
@@ -664,15 +643,6 @@ impl Drop for CgroupLeaf {
     }
 }
 
-/// Whether something is mounted on a leaf (see [`CgroupLeaf::mounted_on`]).
-#[cfg(target_os = "linux")]
-enum Mounted {
-    Yes,
-    No,
-    /// The leaf is gone.
-    Gone,
-}
-
 /// How an abandoned spawn's child ended up (see [`CgroupLeaf::abandon_before_verdict`]).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -746,7 +716,7 @@ impl CgroupLeaf {
     }
 
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
-    /// and killed again for as long as anything re-enters it before the removal lands. `killed`
+    /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
     /// says whether the caller's own kill through it succeeded; `context` says what removal this
     /// is, for the report of a leaf left behind.
     fn remove_killing_through(&mut self, killed: bool, context: &str) {
@@ -759,67 +729,40 @@ impl CgroupLeaf {
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Each round kills through the leaf, waits however long the drain takes (a [`DrainWatch`]),
-    /// removes the leaf's child cgroups, and retries the `rmdir`. cgroupfs refuses an `rmdir` with
-    /// `EBUSY` only while the leaf is populated or has a live child cgroup (`cgroup_destroy_locked`,
-    /// kernel v6.12), so an `EBUSY` after a round is something a third party did since — moved a
-    /// process in, or made a child cgroup — and the next round deals with it. Every other outcome
-    /// ends the loop: removed, or a failure reported as a leaf left behind.
-    fn drain_and_remove(&mut self, mut killed: bool, context: &str) {
-        loop {
-            if !killed {
-                if let Err(e) = self.hard_kill() {
-                    return warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
-                    );
-                }
-            }
-            killed = false;
-            if let Err(e) = self.block_until_drained() {
+    /// Kills through the leaf, waits however long the drain takes (a [`DrainWatch`]), removes the
+    /// leaf's child cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and
+    /// reported: after the drain and the sweep, an `EBUSY` means something another party did
+    /// since ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never
+    /// impossible.
+    fn drain_and_remove(&mut self, killed: bool, context: &str) {
+        if !killed {
+            if let Err(e) = self.hard_kill() {
                 return warn_leaf_left_behind(
                     &self.leaf_path,
-                    format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
+                    format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
                 );
             }
-            if let Err(e) = self.dir.remove_children() {
-                return warn_leaf_left_behind(
-                    &self.leaf_path,
-                    format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
-                );
-            }
-            let busy = match self.rmdir_leaf() {
-                Ok(()) => return,
-                Err(e) if removed_after_drain(&e) => return,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => e,
-                Err(e) => return warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
-            };
-            // cgroupfs's `EBUSY` means a member or a child cgroup. The VFS gives the same errno,
-            // before cgroupfs is asked, for a directory something is mounted on: no round can
-            // clear that, so it ends the loop. Every other `EBUSY` is cgroupfs's, and a new round
-            // kills, drains and sweeps the real leaf before the next `rmdir`.
-            match self.mounted_on() {
-                Ok(Mounted::No) => {}
-                // Removed by another party since the `rmdir`: nothing is left behind.
-                Ok(Mounted::Gone) => return,
-                Ok(Mounted::Yes) => {
-                    return warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!(
-                            "rmdir failed ({busy}) {context}; something is mounted on it, so it cannot be \
-                             removed; its tree was killed"
-                        ),
-                    )
-                }
-                Err(e) => {
-                    return warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!(
-                        "rmdir failed ({busy}) {context}; whether something is mounted on it could not be read ({e})"
-                    ),
-                    )
-                }
-            }
+        }
+        if let Err(e) = self.block_until_drained() {
+            return warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
+            );
+        }
+        if let Err(e) = self.dir.remove_children() {
+            return warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
+            );
+        }
+        match self.rmdir_leaf() {
+            Ok(()) => {}
+            Err(e) if removed_after_drain(&e) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed ({e}) {context}, after its kill, drain and sweep: {LEFT_BEHIND_CAUSES}"),
+            ),
+            Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
         }
     }
 
@@ -1017,6 +960,14 @@ fn reap_in_background(child: ChildId) {
         log::warn!("cgroup v2: could not start a thread to reap an abandoned spawn's child, which stays unreaped: {e}");
     }
 }
+
+/// What can make a leaf refuse its `rmdir` after its tree was killed and drained and its child
+/// cgroups removed. cgroupfs refuses with `EBUSY` only while the leaf holds a process or a child
+/// cgroup (`cgroup_destroy_locked`, kernel v6.12), and the VFS gives the same errno, before
+/// cgroupfs is asked, for a directory something is mounted on.
+#[cfg(target_os = "linux")]
+pub(crate) const LEFT_BEHIND_CAUSES: &str = "another party did something since: a process moved into it after the \
+     kill, a child cgroup created in it after the sweep, or a mount on it or on a child cgroup";
 
 /// Report a `cosca-*` leaf cosca failed to remove. Nothing revisits a leaf by name, so this
 /// record, made as it happens, is all a host accumulating them has to go on.

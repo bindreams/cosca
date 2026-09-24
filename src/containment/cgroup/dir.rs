@@ -122,34 +122,12 @@ impl LeafDir {
         Ok(rustix::fs::unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR)?)
     }
 
-    /// What the leaf's name in its parent resolves to now.
-    pub(crate) fn name_resolves(&self) -> io::Result<Resolves> {
-        let here = rustix::fs::fstat(&self.dir)?;
-        match rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(there) if (there.st_dev, there.st_ino) == (here.st_dev, here.st_ino) => Ok(Resolves::Here),
-            Ok(_) => Ok(Resolves::Elsewhere),
-            Err(rustix::io::Errno::NOENT) => Ok(Resolves::Nothing),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Remove every child cgroup of the leaf, deepest first, and count those removed. A child that
     /// `rmdir` refuses as busy — something re-entered it — is left for the caller's next kill. A
     /// directory already gone has nothing left to remove.
     pub(crate) fn remove_children(&self) -> io::Result<usize> {
         remove_children(self.dir.as_fd())
     }
-}
-
-/// What a leaf's name resolves to (see [`LeafDir::name_resolves`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Resolves {
-    /// The leaf itself.
-    Here,
-    /// Something else: a mount over the leaf, or a new directory reusing the name.
-    Elsewhere,
-    /// Nothing: the leaf was removed.
-    Nothing,
 }
 
 /// A path through which a watch or an open reaches `fd`'s own inode, whatever is mounted over its

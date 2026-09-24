@@ -789,25 +789,25 @@ fn an_armed_drop_whose_leaf_a_third_party_removes_reports_nothing() {
     );
 }
 
-/// An `rmdir` that fails `EBUSY` after the drain — a child cgroup a third party made and has
-/// since removed — is retried once the leaf is observed empty, not reported as left behind.
+/// An `rmdir` that fails `EBUSY` after the kill, drain and sweep is terminal: `Drop` tries once,
+/// then reports the leaf once, naming what can have held it. A retry would only make a third
+/// party's race rarer, never impossible.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_armed_drop_retries_an_rmdir_a_passing_child_cgroup_refused() {
+fn an_armed_drop_reports_an_rmdir_refused_after_its_drain_once_without_retrying() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
 
     crate::log_capture::install();
-    let fake = FakeLeaf::new("cosca-passing-child", true);
+    let fake = FakeLeaf::new("cosca-refused-after-drain", true);
     let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
-    let mut drained_rmdirs = 0;
+    let drained_rmdirs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = drained_rmdirs.clone();
     fault::set_rmdir_hook(move |_| {
-        if leaf.exists() && !FakeLeaf::is_populated(&events) {
-            drained_rmdirs += 1;
-            // The first rmdir after the drain meets the third party's child.
-            if drained_rmdirs == 1 {
-                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
-            }
+        if !FakeLeaf::is_populated(&events) {
+            counted.set(counted.get() + 1);
+            // Something a third party did since the sweep.
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
         }
         FakeLeaf::rmdir(&leaf, &events)
     });
@@ -819,12 +819,20 @@ fn an_armed_drop_retries_an_rmdir_a_passing_child_cgroup_refused() {
     drop(actor);
     fault::take_rmdir_hook();
 
-    let records = crate::log_capture::records_since(mark, "cosca-passing-child");
-    assert!(!fake.leaf.exists(), "the leaf must be removed, got {records:?}");
-    assert!(
-        !crate::log_capture::levels_since(mark, "cosca-passing-child").contains(&log::Level::Warn),
-        "nothing was left behind, got {records:?}"
+    let records = crate::log_capture::records_since(mark, "cosca-refused-after-drain");
+    assert_eq!(drained_rmdirs.get(), 1, "one rmdir after the drain, no retry");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-refused-after-drain"),
+        vec![log::Level::Warn],
+        "reported once, got {records:?}"
     );
+    for cause in ["moved into it after the kill", "child cgroup", "mount"] {
+        assert!(
+            records[0].contains(cause),
+            "the report must name {cause:?}: {}",
+            records[0]
+        );
+    }
 }
 
 /// A child-cgroup sweep of a leaf that is already gone removes nothing, and is no failure.
@@ -866,14 +874,14 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
 }
 
 /// Drop `leaf` on a thread of its own mount namespace, private to it, with a tmpfs mounted over
-/// `over`, and return the levels of the records its `Drop` made about `marker`. The mount is
+/// `over`, and return the levels and texts of the records its `Drop` made about `marker`. The mount is
 /// gone with the thread.
 #[cfg(target_os = "linux")]
 fn drop_under_a_mount(
     leaf: crate::containment::cgroup::CgroupLeaf,
     over: std::path::PathBuf,
     marker: String,
-) -> Vec<log::Level> {
+) -> (Vec<log::Level>, Vec<String>) {
     crate::log_capture::install();
     std::thread::spawn(move || {
         use std::ffi::CString;
@@ -916,7 +924,10 @@ fn drop_under_a_mount(
         }
         let mark = crate::log_capture::mark();
         drop(leaf);
-        crate::log_capture::levels_since(mark, &marker)
+        (
+            crate::log_capture::levels_since(mark, &marker),
+            crate::log_capture::records_since(mark, &marker),
+        )
     })
     .join()
     .expect("the dropping thread")
@@ -935,13 +946,18 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
     let leaf_path = leaf.leaf_path.clone();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
 
-    let levels = drop_under_a_mount(leaf, leaf_path.clone(), name);
+    let (levels, records) = drop_under_a_mount(leaf, leaf_path.clone(), name);
     let status = member.wait().expect("reap the member");
     // Outside the dropping thread's namespace nothing is mounted over the leaf.
     std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");
 
     assert_eq!(status.signal(), Some(libc::SIGKILL), "the real tree must be killed");
     assert_eq!(levels, vec![log::Level::Warn], "the leaf left behind is reported, once");
+    assert!(
+        records[0].contains("mount"),
+        "the report must name a mount as a cause: {}",
+        records[0]
+    );
 }
 
 /// A mount over the leaf's parent: the leaf's path finds nothing, which says nothing about the
@@ -955,7 +971,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
     let parent = leaf_path.parent().expect("a parent").to_path_buf();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
 
-    let levels = drop_under_a_mount(leaf, parent, name);
+    let (levels, _) = drop_under_a_mount(leaf, parent, name);
     let removed = !leaf_path.exists();
     if !removed {
         member.kill().expect("kill the member");

@@ -28,7 +28,9 @@ pub enum Containment {
     /// Linux cgroup v2 leaf + `cgroup.kill`. Fork-proof; a confined child can't leave.
     ///
     /// Dropping the handle kills the tree, waits while any process remains in the leaf, and
-    /// removes the leaf directory, reporting at `warn` a leaf it cannot remove. The wait is almost
+    /// removes the leaf directory, reporting at `warn` a leaf it cannot remove. It tries once:
+    /// after the kill and the drain, a leaf still refusing removal holds something another party
+    /// put there since — a process moved in, a child cgroup, or a mount. The wait is almost
     /// always instant; see [`kill_on_drop`](crate::Command::kill_on_drop) for what can prolong it.
     ///
     /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
