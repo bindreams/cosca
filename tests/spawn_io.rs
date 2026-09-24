@@ -1240,7 +1240,7 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
 /// without a disarm it fires `cgroup.kill` and both members below are already dead.
 ///
 /// Same proof as `windows_detach_leaves_the_tree_running` (see there for why a write alone
-/// isn't enough) — this test used to pass with the disarm reverted.
+/// isn't enough).
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]

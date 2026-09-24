@@ -112,7 +112,7 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     })
 }
 
-/// The part of an elevated spawn's failure detail that reports its tree kill, if it failed.
+/// `None`: no tree kill was tried, as the containment cannot tear one down.
 #[cfg(unix)]
 pub(crate) fn tree_note(tree: Option<Result<(), Error>>) -> String {
     match tree {

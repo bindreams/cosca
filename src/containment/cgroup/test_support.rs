@@ -103,7 +103,6 @@ pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containme
 #[cfg(target_os = "linux")]
 pub(crate) struct FakeLeaf {
     _dir: tempfile::TempDir,
-    /// The leaf directory.
     pub(crate) leaf: std::path::PathBuf,
     /// The file the leaf's `cgroup.events` resolves to.
     pub(crate) events: std::path::PathBuf,

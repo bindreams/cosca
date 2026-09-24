@@ -48,7 +48,6 @@ pub(crate) struct DrainWatch {
     fd: OwnedFd,
     /// The parent's watch.
     parent: i32,
-    /// The watch on `cgroup.events`.
     events_watch: i32,
     /// The leaf's name in its parent.
     name: OsString,

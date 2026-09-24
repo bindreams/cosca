@@ -433,7 +433,6 @@ impl CgroupLeaf {
         }
     }
 
-    /// `rmdir` the leaf.
     fn rmdir_leaf(&self) -> io::Result<()> {
         #[cfg(test)]
         fault::record_leaf_step(|| {
@@ -514,7 +513,6 @@ impl CgroupLeaf {
         }
     }
 
-    /// The leaf's watcher, for the async wait.
     #[cfg(feature = "tokio")]
     pub(crate) fn watcher(&self) -> &Watcher {
         &self.watch
