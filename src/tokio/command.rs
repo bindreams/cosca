@@ -205,6 +205,16 @@ impl Command {
     /// - `Backend::Pkexec` with `Auth::Gui` runs `pkexec --version` first, a few milliseconds;
     /// - Windows waits for the user to answer the UAC consent prompt;
     /// - `Auth::Stdin` delivers the password to `sudo -S`, waiting until sudo reads it.
+    ///
+    /// # Blocking on a failed contained spawn
+    ///
+    /// A [`contain`](Self::contain)ed spawn that fails after its child entered a cgroup v2 leaf
+    /// tears the leaf down on the calling thread. While a member remains, that is `cgroup.kill`,
+    /// then a wait for the leaf to drain, then its removal. The wait is brief unless a member
+    /// outlives the kill (see [`Containment::CgroupV2`]), and blocks the thread as above until it
+    /// ends.
+    ///
+    /// [`Containment::CgroupV2`]: crate::Containment::CgroupV2
     pub fn spawn(&mut self) -> Result<Child, Error> {
         super::spawn::spawn(&mut self.inner)
     }

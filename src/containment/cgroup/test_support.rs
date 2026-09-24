@@ -79,3 +79,100 @@ pub(crate) fn alone(name: &str) -> bool {
     );
     false
 }
+
+/// A test leaf at `leaf_path` whose verdict is taken, with the child reported `Placed`: an
+/// attached leaf whose `Drop` may kill.
+#[cfg(target_os = "linux")]
+pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containment::cgroup::CgroupLeaf {
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // SAFETY: the slot's channel lives as long as `leaf`.
+    unsafe { leaf.placement_slot().report_placed_for_test() };
+    // The verdict needs a live pid: this process's own stands in for the child.
+    leaf.take_placement(std::process::id())
+        .expect("decidable")
+        .expect("the child reported Placed");
+    leaf
+}
+
+/// A temp-directory stand-in for a cgroup leaf, `<tempdir>/<name>`.
+///
+/// Its `cgroup.events` is a symlink to a file outside the leaf, so removing the leaf leaves that
+/// file, and every fd and watch on it, untouched: as removing a real leaf neither modifies its
+/// `cgroup.events` nor delivers any event on it. [`rmdir`](FakeLeaf::rmdir) answers as cgroupfs
+/// does, through [`fault::set_rmdir_hook`](super::fault::set_rmdir_hook).
+#[cfg(target_os = "linux")]
+pub(crate) struct FakeLeaf {
+    _dir: tempfile::TempDir,
+    pub(crate) leaf: std::path::PathBuf,
+    /// The file the leaf's `cgroup.events` resolves to.
+    pub(crate) events: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl FakeLeaf {
+    pub(crate) fn new(name: &str, populated: bool) -> FakeLeaf {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf = dir.path().join(name);
+        std::fs::create_dir(&leaf).expect("create the leaf");
+        let events = dir.path().join(format!("{name}.events"));
+        std::fs::write(&events, format!("populated {}\nfrozen 0\n", u8::from(populated))).expect("write cgroup.events");
+        std::os::unix::fs::symlink(&events, leaf.join("cgroup.events")).expect("link cgroup.events");
+        std::fs::write(leaf.join("cgroup.kill"), b"").expect("create cgroup.kill");
+        FakeLeaf {
+            _dir: dir,
+            leaf,
+            events,
+        }
+    }
+
+    /// Flip `populated` by rewriting its one digit in place: a truncating rewrite could be read
+    /// half-done, as an empty file.
+    pub(crate) fn set_populated(events: &std::path::Path, populated: bool) {
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(events)
+            .expect("open cgroup.events");
+        file.write_all_at(if populated { b"1" } else { b"0" }, "populated ".len() as u64)
+            .expect("flip populated");
+    }
+
+    pub(crate) fn is_populated(events: &std::path::Path) -> bool {
+        let contents = std::fs::read_to_string(events).expect("read cgroup.events");
+        contents.lines().any(|l| l.trim() == "populated 1")
+    }
+
+    /// What a third party's `rmdir` of the leaf does: the leaf is gone, its `cgroup.events` file
+    /// is untouched.
+    pub(crate) fn remove(leaf: &std::path::Path) {
+        for entry in std::fs::read_dir(leaf).expect("list the leaf") {
+            std::fs::remove_file(entry.expect("leaf entry").path()).expect("remove a leaf file");
+        }
+        std::fs::remove_dir(leaf).expect("remove the leaf");
+    }
+
+    /// cgroupfs's `rmdir`: `ENOENT` once gone, `EBUSY` while populated, else the leaf goes.
+    pub(crate) fn rmdir(leaf: &std::path::Path, events: &std::path::Path) -> std::io::Result<()> {
+        if !leaf.exists() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        if FakeLeaf::is_populated(events) {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        FakeLeaf::remove(leaf);
+        Ok(())
+    }
+}
+
+/// Remove a real leaf once it drains, for a test's cleanup after a failure. Blocks on the leaf's
+/// own drain watch.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.to_path_buf());
+    leaf.wait_drained(None).expect("wait for the drain");
+    match std::fs::remove_dir(leaf_path) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(e) => panic!("remove the leaf: {e}"),
+    }
+}

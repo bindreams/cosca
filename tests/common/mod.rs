@@ -7,8 +7,11 @@
 // log-capture re-exports, which only `macos_fdmarker.rs` uses) are expected here.
 #![allow(dead_code, unused_imports)]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 
 pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
@@ -351,6 +354,45 @@ pub fn spawn_tree_async(
     )
 }
 
+/// A contained async `spawn-grandchild-echo` tree: both members round-trip a byte, so a test can
+/// prove each POSITIVELY alive (see [`assert_echoes`]).
+#[cfg(feature = "tokio")]
+pub struct AsyncEchoTree {
+    pub child: cosca::tokio::Child,
+    pub root: TcpStream,
+    pub grand: TcpStream,
+    /// The grandchild's own pid, for reading the tree's cgroup back out of `/proc`.
+    pub grand_pid: u32,
+}
+
+/// Spawn a contained [`AsyncEchoTree`] with the given `kill_on_drop`.
+#[cfg(feature = "tokio")]
+pub fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.args([testbin(), "spawn-grandchild-echo", addr.as_str()]);
+    cmd.contain();
+    cmd.kill_on_drop(kill_on_drop);
+    let child = cmd.spawn().expect("spawn async echo tree");
+    let (mut root, mut grand) = (None, None);
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept");
+        match read_tag_and_pid(&mut s) {
+            (b'R', _) => root = Some(s),
+            (b'G', pid) => grand = Some((s, pid)),
+            (tag, _) => panic!("unexpected tree tag {:?}", tag as char),
+        }
+    }
+    let (grand, grand_pid) = grand.expect("grandchild G connected");
+    AsyncEchoTree {
+        child,
+        root: root.expect("root R connected"),
+        grand,
+        grand_pid,
+    }
+}
+
 /// Async `control-block` blocker (uncontained): a child that connects, tags "R", and blocks on
 /// its socket. The accept/tag-read is sync std (the test side); the CHILD is async.
 #[cfg(feature = "tokio")]
@@ -375,4 +417,35 @@ pub fn spawn_grandchild_async_with(contain: bool, kill_on_drop: bool) -> (cosca:
         }
         cmd.kill_on_drop(kill_on_drop);
     })
+}
+
+/// Read one `<tag><pid>\n` line from a freshly accepted `control-echo-pid` connection.
+pub fn read_tag_and_pid(sock: &mut std::net::TcpStream) -> (u8, u32) {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        let n = sock.read(&mut b).expect("read the control line");
+        assert_ne!(n, 0, "the control connection closed before sending its tag line");
+        if b[0] == b'\n' {
+            break;
+        }
+        line.push(b[0]);
+    }
+    assert!(line.len() > 1, "a control line is a tag plus a pid, got {line:?}");
+    let pid = std::str::from_utf8(&line[1..])
+        .expect("the pid is ASCII")
+        .parse()
+        .expect("the pid is a number");
+    (line[0], pid)
+}
+
+/// Prove a `control-echo-pid` member is POSITIVELY alive: send a byte and read the echo back.
+/// A killed member gives EOF or `ConnectionReset` on the read instead, never the byte.
+pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
+    sock.write_all(b"p")
+        .unwrap_or_else(|e| panic!("{who} must accept a write while alive: {e}"));
+    let mut b = [0u8; 1];
+    sock.read_exact(&mut b)
+        .unwrap_or_else(|e| panic!("{who} must echo the byte back while alive: {e}"));
+    assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
 }

@@ -195,16 +195,41 @@ impl Attached {
         }
     }
 
+    /// Apply a handle's `kill_on_drop` decision to the containment resource, once its spawn is
+    /// committed.
+    ///
+    /// `Child::drop` returning early on `kill_on_drop == false` skips only ITS teardown. The
+    /// resource is a field of that handle and drops with it regardless — and a `CgroupLeaf`'s
+    /// `Drop` fires `cgroup.kill` over an occupied leaf, a Job Object's close fires
+    /// `KILL_ON_JOB_CLOSE`. So the opt-out has to reach the resource as well, which is what
+    /// [`disarm`](Self::disarm) is for; without this, `kill_on_drop(false)` killed exactly the
+    /// contained trees [`Child::detach`](crate::Child::detach) (which disarms) keeps alive,
+    /// while [`Command::kill_on_drop`](crate::Command::kill_on_drop) documents the two as the
+    /// same opt-out.
+    ///
+    /// Called by `spawn` as it hands the handle to the caller, not when the handle is built: a
+    /// spawn that fails after that (the POSIX password write) must still tear its tree down.
+    /// Not in `Drop` either: a supervisor that exits without running destructors still has its
+    /// Job Object handle closed by the OS, and with `KILL_ON_JOB_CLOSE` still set that close is
+    /// the kill. `detach()` disarms eagerly for the same reason.
+    pub(crate) fn honor_kill_on_drop(&self, kill_on_drop: bool) {
+        if !kill_on_drop {
+            self.disarm();
+        }
+    }
+
     /// Neutralize teardown so `detach()` leaves the tree running. For Job Objects,
-    /// clears `KILL_ON_JOB_CLOSE` so the handle close does not kill the tree.
-    /// No-op for mechanisms whose resource-drop does not kill (pgroup/cgroup/none).
+    /// clears `KILL_ON_JOB_CLOSE` so the handle close does not kill the tree; for a cgroup
+    /// leaf, stops `Drop` firing `cgroup.kill`. No-op only for mechanisms whose resource-drop
+    /// genuinely does not kill (pgroup/treewalk/fd marker/none), which `Child::drop`'s
+    /// `kill_on_drop` opt-out already covers.
     pub(crate) fn disarm(&self) {
         match self {
             Attached::None | Attached::Delegated => {}
             #[cfg(unix)]
             Attached::ProcessGroup(_) => {} // pgroup drop doesn't kill — no-op
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(_) => {} // cgroup.kill is explicit — drop doesn't kill
+            Attached::Cgroup(leaf) => leaf.disarm(), // CgroupLeaf::drop kills an occupied leaf
             #[cfg(windows)]
             Attached::JobObject(job) => job.disarm(), // clear KILL_ON_JOB_CLOSE before handle drops
             // dropping the read end does not kill; detach opts out via kill_on_drop

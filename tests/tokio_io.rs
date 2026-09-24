@@ -222,10 +222,33 @@ async fn async_run_line_round_trips() {
     assert_eq!(s, "hello\n");
 }
 
+/// The cgroup leaf a contained tree was placed in, if it got one. Read while the root is alive.
+#[cfg(target_os = "linux")]
+fn cgroup_leaf_of(child: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
+    (child.containment() == cosca::Containment::CgroupV2).then(|| common::cgroup::cgroup_of(child.id().pid()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_leaf_of(_: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Remove the leaf a test's tree left behind, once the tree drains. Call it only after every
+/// member has been released or killed.
+fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
+    #[cfg(target_os = "linux")]
+    if let Some(leaf) = leaf {
+        common::cgroup::drain_and_remove_leaf(&leaf);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = leaf;
+}
+
 #[tokio::test]
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
     let (child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let leaf = cgroup_leaf_of(&child);
     // The containment assert guards the EOFs below from passing for unrelated reasons.
     assert_ne!(
         child.containment(),
@@ -244,6 +267,9 @@ async fn async_drop_tears_down_a_contained_tree() {
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
+    // The reaper thread drops the leaf after the reap, possibly before the killed grandchild
+    // has left it.
+    remove_leftover_leaf(leaf);
 }
 
 #[tokio::test]
@@ -252,6 +278,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
     // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
     use std::io::{Read as _, Write as _};
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
@@ -263,12 +290,21 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
+    // This `Drop` ran on this thread, and waits for the leaf to drain before removing it.
+    if let Some(leaf) = leaf {
+        assert!(
+            !leaf.exists(),
+            "Drop must remove the leaf once it drains: {}",
+            leaf.display()
+        );
+    }
 }
 
 #[tokio::test]
 async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
-    let (mut child, mut root, _grand) = common::spawn_grandchild_async(true);
+    let (mut child, mut root, grand) = common::spawn_grandchild_async(true);
+    let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     child.detach();
     drop(child); // detached → Drop must NOT kill
@@ -286,18 +322,18 @@ async fn async_detach_leaves_the_tree_running() {
         matches!(root.read(&mut buf), Ok(0)),
         "released root exits cleanly (EOF)"
     );
-    // _grand drops here → its socket closes → the reparented grandchild exits.
+    drop(grand); // its socket closes → the reparented grandchild exits
+    remove_leftover_leaf(leaf);
 }
 
 #[tokio::test]
 async fn async_kill_on_drop_false_leaves_the_root_running() {
-    // `kill_on_drop(false)` hits the async Drop early-return with `attached` STILL ARMED (unlike
-    // detach(), which also disarms). Drop must NOT run the teardown (hard_kill + the root's kill), so the
-    // root stays alive. Proven by positive liveness on the never-signaled root (race-free, mirroring
-    // async_detach_leaves_the_tree_running). UNCONTAINED on purpose: a Windows JobObject's
-    // KILL_ON_JOB_CLOSE fires when the job handle field drops (only `disarm()` clears it, and
-    // kill_on_drop(false) does not disarm), so a *contained* tree would die on Windows regardless of
-    // the flag — `Attached::None` isolates the kill_on_drop(false) early-return on every platform.
+    // `kill_on_drop(false)` hits the async Drop early-return, so the teardown (hard_kill + the
+    // root's kill) must not run and the root stays alive. Proven by positive liveness on the
+    // never-signaled root (race-free, mirroring async_detach_leaves_the_tree_running).
+    // UNCONTAINED on purpose: `Attached::None` isolates the early-return itself from the
+    // containment resource's own drop, which
+    // `async_kill_on_drop_false_leaves_a_contained_tree_running` covers separately.
     use std::io::{Read as _, Write as _};
     let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false);
     let root_id = child.id();
@@ -315,6 +351,90 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
         matches!(root.read(&mut buf), Ok(0)),
         "released root exits cleanly (EOF)"
     );
+}
+
+#[tokio::test]
+async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
+    // The spawn disarms the resource (see `Attached::honor_kill_on_drop`). On Linux outside the
+    // cgroup lane this is a process group, whose disarm is a no-op;
+    // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
+    use std::io::{Read as _, Write as _};
+    let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false);
+    assert_ne!(
+        child.containment(),
+        cosca::Containment::None,
+        "contained spawn must engage a mechanism"
+    );
+    let leaf = cgroup_leaf_of(&child);
+    let root_id = child.id();
+    drop(child); // contained + kill_on_drop(false) → nothing may kill the tree
+    assert_eq!(
+        root_id.is_alive(),
+        cosca::identity::Liveness::Alive,
+        "kill_on_drop(false) must leave a CONTAINED tree running after the handle drops"
+    );
+    root.write_all(b"x").expect("release the live root");
+    let mut buf = [0u8; 1];
+    assert!(
+        matches!(root.read(&mut buf), Ok(0)),
+        "released root exits cleanly (EOF)"
+    );
+    drop(grand); // its socket closes → the reparented grandchild exits
+    remove_leftover_leaf(leaf);
+}
+
+/// `detach()` must leave a cgroup-contained tree running: `CgroupLeaf::drop` kills an occupied
+/// leaf unless the detach disarmed it. Proven by a byte round trip through both members.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
+    common::cgroup::require_lane();
+    assert_async_opted_out_tree_survives(true, |mut child| child.detach());
+}
+
+/// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does (see
+/// `Attached::honor_kill_on_drop`).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
+    common::cgroup::require_lane();
+    assert_async_opted_out_tree_survives(false, drop);
+}
+
+/// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
+/// the handle through `opt_out`, prove both members alive, then remove the leaf the tree keeps.
+#[cfg(target_os = "linux")]
+fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce(cosca::tokio::Child)) {
+    let common::AsyncEchoTree {
+        child,
+        mut root,
+        mut grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async(kill_on_drop);
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::CgroupV2,
+        "a process group's disarm is a no-op, so only CgroupV2 tests the leaf's"
+    );
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+    assert!(
+        leaf.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),
+        "the tree must be in a cosca leaf, got {}",
+        leaf.display()
+    );
+
+    opt_out(child);
+
+    common::assert_echoes(&mut root, "the opted-out root");
+    common::assert_echoes(&mut grand, "the opted-out grandchild");
+
+    // Release both: each read returns Ok(0) and the member exits on its own.
+    drop(root);
+    drop(grand);
+    common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
 // `async_drop_leaves_no_zombie` moved to `drop_reaps_on_a_worker_thread` in

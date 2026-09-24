@@ -23,6 +23,92 @@ thread_local! {
     static FORCE_MEMBERSHIP_UNREADABLE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
+    static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+    static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
+}
+
+/// Replaces a leaf's `rmdir`, given the leaf's path.
+type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+
+/// Make the NEXT leaf directory made on this thread fail to be held after its `mkdir`, with
+/// `EMFILE`, as at `RLIMIT_NOFILE`. Take semantics.
+pub(crate) fn set_force_leaf_open_failure(on: bool) {
+    FORCE_LEAF_OPEN_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_leaf_open_failure() -> bool {
+    FORCE_LEAF_OPEN_FAILURE.with(|f| f.replace(false))
+}
+
+/// Make the NEXT leaf creation's `cgroup.kill` lookup on this thread fail with `errno`: a lookup
+/// through the held leaf directory fails only on a real error, which a temp directory cannot
+/// produce. Take semantics.
+pub(crate) fn set_force_kill_check_errno(errno: i32) {
+    FORCE_KILL_CHECK_ERRNO.with(|f| f.set(Some(errno)));
+}
+pub(crate) fn take_force_kill_check_errno() -> Option<i32> {
+    FORCE_KILL_CHECK_ERRNO.with(|f| f.take())
+}
+
+/// Make the NEXT drain watch on this thread fail to create its inotify instance, as
+/// `fs.inotify.max_user_instances` would. Take semantics: assert [`take_force_inotify_failure`]
+/// returns `false` afterwards to prove it was consumed.
+pub(crate) fn set_force_inotify_failure(on: bool) {
+    FORCE_INOTIFY_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_inotify_failure() -> bool {
+    FORCE_INOTIFY_FAILURE.with(|f| f.replace(false))
+}
+
+/// Replace every leaf `rmdir` on this thread with `hook`, until [`take_rmdir_hook`]. A temp
+/// directory gives none of cgroupfs's `rmdir` answers, so a test supplies them.
+pub(crate) fn set_rmdir_hook(hook: impl FnMut(&std::path::Path) -> std::io::Result<()> + 'static) {
+    RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn take_rmdir_hook() {
+    RMDIR_HOOK.with(|h| h.borrow_mut().take());
+}
+/// Run the rmdir hook, if one is set.
+pub(crate) fn run_rmdir_hook(path: &std::path::Path) -> Option<std::io::Result<()>> {
+    let mut hook = RMDIR_HOOK.with(|h| h.borrow_mut().take())?;
+    let result = hook(path);
+    RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    Some(result)
+}
+
+/// Send on `notify` each time a leaf's drain wait on this thread is about to block: the watch is
+/// armed and `populated` last read 1. Kept until [`take_drain_blocking_notifier`].
+pub(crate) fn set_drain_blocking_notifier(notify: std::sync::mpsc::Sender<()>) {
+    DRAIN_BLOCKING.with(|d| *d.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_drain_blocking_notifier() {
+    DRAIN_BLOCKING.with(|d| d.borrow_mut().take());
+}
+pub(crate) fn notify_drain_blocking() {
+    DRAIN_BLOCKING.with(|d| {
+        if let Some(notify) = d.borrow().as_ref() {
+            let _ = notify.send(());
+        }
+    });
+}
+
+/// Record, on this thread, each `cgroup.kill` write (`"kill"`) and each `rmdir` of a leaf, the
+/// latter with its `cgroup.events` as read at that moment, until [`take_leaf_steps`].
+pub(crate) fn record_leaf_steps() {
+    LEAF_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+pub(crate) fn take_leaf_steps() -> Vec<String> {
+    LEAF_STEPS.with(|s| s.borrow_mut().take()).unwrap_or_default()
+}
+pub(crate) fn record_leaf_step(step: impl FnOnce() -> String) {
+    LEAF_STEPS.with(|s| {
+        if let Some(steps) = s.borrow_mut().as_mut() {
+            steps.push(step());
+        }
+    });
 }
 
 /// Treat the NEXT created leaf as exposing `cgroup.kill`. Supplies the single fact a temp
@@ -231,4 +317,83 @@ pub(crate) fn record_signalled_by_pid() {
 /// How many abandoned children this thread signalled by bare pid since the last call.
 pub(crate) fn take_signalled_by_pid() -> usize {
     SIGNALLED_BY_PID.with(|c| c.replace(0))
+}
+
+/// Pumps started and ended, per leaf name, process-wide.
+static PUMPS: std::sync::Mutex<Vec<(std::ffi::OsString, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a pump starting (`ended == false`) or ending on the leaf named `name`.
+pub(crate) fn record_pump(name: &std::ffi::OsStr, ended: bool) {
+    PUMPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.to_os_string(), ended));
+}
+/// How many pumps started and ended on the leaf named `name`.
+pub(crate) fn pumps_of(name: &str) -> (usize, usize) {
+    let pumps = PUMPS.lock().unwrap_or_else(|e| e.into_inner());
+    let of = |ended| {
+        pumps
+            .iter()
+            .filter(|(n, e)| n.as_os_str() == name && *e == ended)
+            .count()
+    };
+    (of(false), of(true))
+}
+
+/// How many drain watches were armed on each leaf name, process-wide.
+static ARMS: std::sync::Mutex<Vec<std::ffi::OsString>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_arm(name: &std::ffi::OsStr) {
+    ARMS.lock().unwrap_or_else(|e| e.into_inner()).push(name.to_os_string());
+}
+/// How many drain watches were armed on the leaf named `name`.
+#[cfg(feature = "tokio")]
+pub(crate) fn arms_of(name: &str) -> usize {
+    ARMS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|n| n.as_os_str() == name)
+        .count()
+}
+
+/// Pump seams, per leaf name, process-wide: a leaf's pump is a thread of its own.
+static PUMP_SEAMS: std::sync::Mutex<Vec<(std::ffi::OsString, PumpSeam)>> = std::sync::Mutex::new(Vec::new());
+
+enum PumpSeam {
+    /// Fail the pump the next time its watch is readable.
+    Fail,
+    /// Report, after each batch the pump takes in, whether it notified.
+    Batches(std::sync::mpsc::Sender<bool>),
+}
+
+/// Make the pump of the leaf named `name` fail the next time its watch is readable, as a failed
+/// `read` of the inotify instance would. Take semantics.
+pub(crate) fn set_force_pump_failure(name: &str) {
+    PUMP_SEAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.into(), PumpSeam::Fail));
+}
+pub(crate) fn take_force_pump_failure(name: &std::ffi::OsStr) -> bool {
+    let mut seams = PUMP_SEAMS.lock().unwrap_or_else(|e| e.into_inner());
+    let at = seams
+        .iter()
+        .position(|(n, s)| n.as_os_str() == name && matches!(s, PumpSeam::Fail));
+    at.map(|at| seams.remove(at)).is_some()
+}
+
+/// Send, after each batch the pump of the leaf named `name` takes in, whether it notified.
+pub(crate) fn set_pump_batch_notifier(name: &str, notify: std::sync::mpsc::Sender<bool>) {
+    PUMP_SEAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.into(), PumpSeam::Batches(notify)));
+}
+pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
+    for (n, seam) in PUMP_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if let (true, PumpSeam::Batches(notify)) = (n.as_os_str() == name, seam) {
+            let _ = notify.send(notified);
+        }
+    }
 }

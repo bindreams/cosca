@@ -26,6 +26,27 @@ use std::fmt;
 #[non_exhaustive]
 pub enum Containment {
     /// Linux cgroup v2 leaf + `cgroup.kill`. Fork-proof; a confined child can't leave.
+    ///
+    /// Dropping the handle kills the tree, waits for it to drain, then removes the leaf directory
+    /// once, reporting at `warn` a leaf that still refuses removal: something another party put
+    /// there since — a process moved in, a child cgroup, or a mount. See
+    /// [`kill_on_drop`](crate::Command::kill_on_drop) for how long the wait can run.
+    ///
+    /// The removal goes by the leaf's name, checked first against the leaf cosca holds. A party
+    /// with write access to the delegated parent, which already controls the subtree, can still
+    /// swap the name between the check and the removal.
+    ///
+    /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
+    /// `fs.inotify.max_user_instances` (128 per user by default). A spawn that cannot get one is
+    /// not contained in a leaf, and degrades as for any other failed step. The first
+    /// [`wait_tree`](crate::Child::wait_tree) on a handle that finds the tree still running, and
+    /// may block, also starts one thread, owned by that handle, which reads the watch for every
+    /// wait on it; dropping the handle stops and joins it. A wait that finds the tree drained, or
+    /// whose timeout has already passed, starts none.
+    ///
+    /// A handle that opted out — [`Child::detach`](crate::Child::detach) or
+    /// [`kill_on_drop(false)`](crate::Command::kill_on_drop) — never kills, and removes the leaf
+    /// only if the tree has already exited; see `kill_on_drop` for when it stays.
     CgroupV2,
     /// Windows Job Object + `KILL_ON_JOB_CLOSE`. Kernel-enforced for direct descendants.
     JobObject,

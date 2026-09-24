@@ -476,13 +476,28 @@ impl Command {
     /// uncontained child — see [`contain`](Command::contain)), then kill the ROOT. There is no
     /// cooperative signal first; use
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
-    /// child needs one. Descendants are killed, not waited for.
+    /// child needs one.
+    ///
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the drop waits for the tree to be gone**
+    /// before it removes the tree's leaf: it waits while any process remains in the leaf. That is
+    /// almost always instant, since every member was just sent `SIGKILL`. It lasts as long as a
+    /// member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
+    /// another party (the same uid, or root) moves into the leaf after the kill keeps running:
+    /// the kill reaches only the processes in the leaf when it is written. On kernels before
+    /// 6.14 (without commit b69bb476dee9, "cgroup: fix race between fork and cgroup.kill"), a
+    /// child a member forks at the moment of the kill can escape it too, and the drop waits for
+    /// that child's whole life. Neither case raises an event cosca could re-kill on: `populated`
+    /// does not change, and a fork writes no file. Under every other
+    /// mechanism descendants are killed, not waited for. To wait explicitly, call
+    /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
     /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
     /// until the root has exited, so after `drop` returns the child is gone. The async
     /// [`Child`](crate::tokio::Child) signals and returns — parking a runtime worker in a
     /// destructor is not something the caller can await or cancel — and hands the wait to reaper
-    /// threads of its own, so the reap happens later and off this thread.
+    /// threads of its own, so the reap happens later and off this thread. Its cgroup leaf's wait
+    /// happens there too, unless the drop releases the handle on the dropping thread: for a root
+    /// already reaped, one it could not signal, or when no reaper thread could be started.
     ///
     /// The async reap is **not** unconditional: a host too thread-starved to start the pool falls
     /// back to the runtime's orphan handling, and a process that forks without `exec` loses it
@@ -492,6 +507,15 @@ impl Command {
     ///
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
+    ///
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
+    /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
+    /// but never kills to empty it. A tree still running keeps it, and so does one torn down with
+    /// [`kill_tree`](crate::Child::kill_tree) or [`terminate_tree`](crate::Child::terminate_tree)
+    /// that has not finished exiting, which [`wait_tree`](crate::Child::wait_tree) before the drop
+    /// prevents. cosca does not come back
+    /// for a leaf it left: the empty `cosca-*` directory stays until something else removes it,
+    /// such as systemd removing a stopped unit's cgroup subtree.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self

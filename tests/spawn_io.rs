@@ -2,6 +2,9 @@ use std::io::{Read, Write};
 
 use cosca::{Command, Fd, Stdio};
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
@@ -259,15 +262,25 @@ fn env_variable_reaches_child() {
 
 #[test]
 fn current_dir_sets_working_directory() {
-    let tmpdir = std::env::temp_dir();
+    let dir = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new();
-    // Use exit 0 — simplest child that honors cwd without writing to stdout.
     cmd.executable(testbin())
-        .args(["cosca_testbin", "exit", "0"])
-        .current_dir(&tmpdir);
-    let child = cmd.spawn().expect("spawn with cwd");
-    let status = child.wait().expect("wait");
-    assert_eq!(status.code(), Some(0));
+        .args(["cosca_testbin", "cwd"])
+        .current_dir(dir.path())
+        .stdout(Stdio::pipe())
+        .expect("stdout pipe");
+    let mut child = cmd.spawn().expect("spawn with cwd");
+    let mut out = String::new();
+    child
+        .stdout()
+        .expect("stdout reader")
+        .read_to_string(&mut out)
+        .expect("read");
+    assert_eq!(child.wait().expect("wait").code(), Some(0));
+    assert_eq!(
+        std::fs::canonicalize(out.trim()).expect("the child's cwd exists"),
+        std::fs::canonicalize(dir.path()).expect("canonicalize"),
+    );
 }
 
 // Windows commandline path =====
@@ -487,23 +500,10 @@ fn unix_fd3_file_round_trips() {
     assert_eq!(buf, b"from file via fd3");
 }
 
-/// Regression: `.contain()` + `.fd(3, pipe_out())` on Linux must NOT let the
-/// cgroup self-placement clobber (or be clobbered by) the command-fds dup2.
-///
-/// The cgroup `pre_exec` writes "0" to a pre-opened `cgroup.procs` fd.
-/// command-fds installs its own `pre_exec` that dup2's the user's fd 3 onto
-/// child fd 3. If command-fds runs FIRST, its dup2 can land on the
-/// same fd number the cgroup `procs_fd` occupies — silently downgrading
-/// containment OR writing the cgroup's "0" into the user's fd 3 (corruption).
-/// We assert the parent reads EXACTLY the child-written token (no inserted "0",
-/// no broken pipe) AND that containment was actually established. Under a real
-/// delegated cgroup (COSCA_TEST_CGROUP set) we additionally assert the
-/// achieved mechanism is CgroupV2 — proof the cgroup write was not clobbered.
-/// Read to EOF; no timers.
+/// Spawn a contained child that writes a token to fd 3, and return the containment it achieved
+/// and what fd 3 carried. Read to EOF; no timers.
 #[cfg(target_os = "linux")]
-#[test]
-fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
-    stderr_log::install();
+fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
@@ -512,36 +512,51 @@ fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
         .expect("fd 3 pipe_out");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn contained child with fd 3");
-
-    // Containment must be a real mechanism (a clobbered procs_fd would silently
-    // downgrade CgroupV2 -> ProcessGroup; None would mean containment vanished).
-    assert_ne!(
-        child.containment(),
-        cosca::Containment::None,
-        "contain() + fd(3) must still establish containment"
-    );
-    // When a delegated cgroup is provisioned, the write must have landed in
-    // cgroup.procs (not been clobbered by command-fds' dup2): CgroupV2 achieved.
-    if std::env::var_os("COSCA_TEST_CGROUP").is_some() {
-        assert_eq!(
-            child.containment(),
-            cosca::Containment::CgroupV2,
-            "cgroup write must not be clobbered by command-fds dup2; got {:?}",
-            child.containment()
-        );
-    }
-
+    let containment = child.containment();
     let mut fd3_reader = child.fd_read_end(Fd::from(3)).expect("fd 3 reader");
     let mut buf = Vec::new();
     fd3_reader.read_to_end(&mut buf).expect("read fd 3");
     drop(fd3_reader);
     let _ = child.wait();
+    (containment, buf)
+}
 
-    // Exact payload: a clobber would prepend/insert the cgroup "0" or break the pipe.
-    assert_eq!(
-        buf, b"FD3PAYLOAD",
-        "fd 3 stream corrupted — cgroup procs_fd clobbered command-fds"
+/// `.contain()` + `.fd(3, pipe_out())` on Linux: whatever mechanism is achieved, the child's fd 3
+/// carries exactly its own token, and containment is established. The cgroup `pre_exec` writes
+/// "0" to a pre-opened `cgroup.procs` fd, and command-fds' `pre_exec` dup2's the user's fd onto
+/// child fd 3; if they collided, the "0" would land in the stream or the pipe would break.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_contain_with_fd3_delivers_the_exact_payload() {
+    stderr_log::install();
+    let (containment, buf) = contain_with_fd3();
+    assert_ne!(
+        containment,
+        cosca::Containment::None,
+        "contain() + fd(3) must still establish containment"
     );
+    assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
+}
+
+/// Regression: under a delegated cgroup, command-fds' dup2 onto fd 3 must not clobber the cgroup
+/// placement's `cgroup.procs` fd. A clobbered write degrades the spawn to a process group, so
+/// achieving `CgroupV2` is the proof.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let (containment, buf) = contain_with_fd3();
+    assert_eq!(
+        containment,
+        cosca::Containment::CgroupV2,
+        "the cgroup write must not be clobbered by command-fds' dup2"
+    );
+    assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
 #[test]
@@ -661,6 +676,61 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     (child, gc.expect("grandchild connected"))
 }
 
+/// A contained `spawn-grandchild-echo` tree, with BOTH members' live control sockets.
+///
+/// Unlike [`spawn_contained_tree`], each member round-trips a byte instead of merely holding
+/// its socket open, so a test can prove a member is POSITIVELY alive. `control-block`'s EOF is
+/// proof of death and no evidence at all of life: a peer that was killed and a peer that is
+/// still running both fail to produce a byte, and the write that precedes the read succeeds
+/// against a dead peer too (the first write into a socket whose peer is gone is buffered, not
+/// refused). See `spawn-grandchild-echo` in `testbin/main.rs`.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+struct EchoTree {
+    child: cosca::Child,
+    root: std::net::TcpStream,
+    grand: std::net::TcpStream,
+    /// The grandchild's own pid, for reading the tree's cgroup back out of `/proc`.
+    #[cfg(target_os = "linux")]
+    grand_pid: u32,
+}
+
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = Command::new();
+    cmd.executable(testbin())
+        .args(["cosca_testbin", "spawn-grandchild-echo", &addr]);
+    cmd.contain();
+    cmd.kill_on_drop(kill_on_drop);
+    // As in `spawn_contained_tree`: every caller asserts an achieved mechanism that can
+    // silently be a weaker one, so route the reason for that.
+    #[cfg(unix)]
+    stderr_log::install();
+    let child = cmd.spawn().expect("spawn");
+    // Accept order is not guaranteed, so demux by tag. Both connections being accepted is
+    // itself proof both members are alive — no is_alive() race.
+    let (mut root, mut grand) = (None, None);
+    for _ in 0..2 {
+        let (mut s, _) = listener.accept().expect("accept control conn");
+        match common::read_tag_and_pid(&mut s) {
+            (b'R', pid) => root = Some((s, pid)),
+            (b'G', pid) => grand = Some((s, pid)),
+            (tag, _) => panic!("unexpected tree tag {:?}", tag as char),
+        }
+    }
+    let (root, _root_pid) = root.expect("root R connected");
+    let (grand, _grand_pid) = grand.expect("grandchild G connected");
+    EchoTree {
+        child,
+        root,
+        grand,
+        #[cfg(target_os = "linux")]
+        grand_pid: _grand_pid,
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_kill_tree_reaps_the_grandchild() {
@@ -777,39 +847,48 @@ fn windows_child_is_inside_our_job_after_spawn() {
     let _ = child.wait();
 }
 
-/// `detach()` must NOT kill the grandchild's process tree.
-/// Proof: the grandchild's control socket must stay open after detach. We
-/// prove liveness by writing a byte (which causes the grandchild's blocking
-/// `sock.read` to return 1, letting it exit cleanly) and then observing EOF —
-/// a voluntary, natural exit rather than a job-kill EOF. The critical ordering
-/// is: detach FIRST, then write. If KILL_ON_JOB_CLOSE fired on detach, the
-/// grandchild would already be dead and the write would fail with BrokenPipe.
+/// `detach()` must NOT kill the tree: `KILL_ON_JOB_CLOSE` has to be cleared before the job
+/// handle is released. Proof is a real byte round trip through BOTH members (see `EchoTree`),
+/// taken AFTER the detach.
 #[cfg(windows)]
 #[test]
 fn windows_detach_leaves_the_tree_running() {
-    let (child, mut gc_stream) = spawn_contained_tree();
+    let EchoTree {
+        child,
+        mut root,
+        mut grand,
+    } = spawn_contained_echo_tree(true);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
-    // detach() must clear KILL_ON_JOB_CLOSE before closing the job handle.
     child.detach();
 
-    // Send a byte to the grandchild's control socket. If KILL_ON_JOB_CLOSE
-    // fired during detach, the grandchild is dead and this write fails with
-    // BrokenPipe — a hard assertion failure, not a silent pass.
-    gc_stream
-        .write_all(b"p")
-        .expect("grandchild control socket must accept write after detach (tree still alive)");
+    common::assert_echoes(&mut root, "the detached root");
+    common::assert_echoes(&mut grand, "the detached grandchild");
 
-    // Grandchild received the byte (its blocking read returned 1) and exited
-    // voluntarily — confirm by waiting for EOF on the control socket.
-    let mut buf = [0u8; 1];
-    let n = gc_stream
-        .read(&mut buf)
-        .expect("read grandchild control socket after detach");
-    assert_eq!(
-        n, 0,
-        "expected EOF after grandchild exited voluntarily; if n=1, it is still alive (not an error but unexpected)"
-    );
+    // Release both: each read returns Ok(0) and the member exits on its own.
+    drop(root);
+    drop(grand);
+}
+
+/// `kill_on_drop(false)` must leave a contained tree running, exactly as `detach()` does (see
+/// `Attached::honor_kill_on_drop`).
+#[cfg(windows)]
+#[test]
+fn windows_kill_on_drop_false_leaves_the_tree_running() {
+    let EchoTree {
+        child,
+        mut root,
+        mut grand,
+    } = spawn_contained_echo_tree(false);
+    assert_eq!(child.containment(), cosca::Containment::JobObject);
+
+    drop(child);
+
+    common::assert_echoes(&mut root, "the opted-out root");
+    common::assert_echoes(&mut grand, "the opted-out grandchild");
+
+    drop(root);
+    drop(grand);
 }
 
 // Unix session containment =====
@@ -1168,6 +1247,100 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     assert_eq!(n, 0, "cgroup terminate must SIGTERM the grandchild, not just the root");
 }
 
+/// `detach()` must NOT kill a cgroup-contained tree. `CgroupLeaf::drop` runs whatever
+/// `kill_on_drop` says, and its first `rmdir` fails `EBUSY` over a live detached tree — so
+/// without a disarm it fires `cgroup.kill` and both members below are already dead.
+///
+/// Same proof as `windows_detach_leaves_the_tree_running` (see there for why a write alone
+/// isn't enough).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_detach_leaves_the_tree_running() {
+    common::cgroup::require_lane();
+    stderr_log::install();
+    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(true), |child| child.detach());
+}
+
+/// `kill_on_drop(false)` must leave a cgroup-contained tree running, exactly as `detach()`
+/// does — `Command::kill_on_drop` documents the two as the same opt-out, and the leaf drops
+/// with the handle whatever the flag says.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
+    common::cgroup::require_lane();
+    stderr_log::install();
+    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(false), drop);
+}
+
+/// An opted-out handle still removes the leaf of a tree that has fully exited, as
+/// `Command::kill_on_drop` says: `kill_tree` then `wait_tree` before the drop leaves nothing.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
+    common::cgroup::require_lane();
+    stderr_log::install();
+    let EchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = spawn_contained_echo_tree(false);
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait();
+    child.wait_tree().expect("wait_tree");
+    drop(child);
+
+    assert!(
+        !leaf.exists(),
+        "an opted-out handle must still remove the leaf of a drained tree: {}",
+        leaf.display()
+    );
+    drop((root, grand));
+}
+
+/// Shared body of the two cgroup opt-out tests: spawn a contained echo tree, note the leaf it
+/// was placed in, release the handle through `opt_out`, and prove BOTH members are still alive
+/// by a byte round trip. Then release the tree and remove the leaf it kept.
+#[cfg(target_os = "linux")]
+fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: impl FnOnce(cosca::Child)) {
+    let EchoTree {
+        child,
+        mut root,
+        mut grand,
+        grand_pid,
+    } = spawn();
+    assert_eq!(
+        child.containment(),
+        cosca::Containment::CgroupV2,
+        "expected CgroupV2 containment but got {:?}; \
+         is a delegated cgroup v2 slice available?",
+        child.containment()
+    );
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+    assert!(
+        leaf.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),
+        "the tree must be in a cosca leaf, got {}",
+        leaf.display()
+    );
+
+    opt_out(child);
+
+    common::assert_echoes(&mut root, "the opted-out root");
+    common::assert_echoes(&mut grand, "the opted-out grandchild");
+
+    // Release both: each read returns Ok(0) and the member exits on its own.
+    drop(root);
+    drop(grand);
+    common::cgroup::drain_and_remove_leaf(&leaf);
+}
+
 /// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
 /// inside `f` inherits the pin, so parent and child share that CPU.
 #[cfg(target_os = "linux")]
@@ -1243,6 +1416,8 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     let mut hello = String::new();
     worker.read_line(&mut hello).expect("read the worker's hello");
     assert!(hello.starts_with('G'), "expected the worker's tag, got {hello:?}");
+    let worker_pid: u32 = hello[1..].trim().parse().expect("the worker's pid");
+    let leaf = common::cgroup::cgroup_of(worker_pid);
     // Proof of life, after the spawn returned: a round trip only a live worker completes.
     worker.get_mut().write_all(b"x").expect("write to the worker");
     let mut echo = [0u8; 1];
@@ -1257,6 +1432,14 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     let mut buf = [0u8; 1];
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
+
+    // The worker's socket closes before it leaves the leaf; `Drop` waits for it to.
+    drop(child);
+    assert!(
+        !leaf.exists(),
+        "Drop must remove the leaf once it drains: {}",
+        leaf.display()
+    );
 }
 
 /// The unified-hierarchy path in the contents of a `/proc/<pid>/cgroup` file.
@@ -1403,35 +1586,6 @@ fn parse_closed_slots(slots: &str) -> Vec<i32> {
         .collect()
 }
 
-/// Block until the cgroup at `leaf` has no live member, on the kernel's `populated` edge.
-#[cfg(target_os = "linux")]
-fn wait_unpopulated(leaf: &std::path::Path) {
-    use std::io::Seek;
-    use std::os::fd::AsRawFd;
-
-    let mut events = std::fs::File::open(leaf.join("cgroup.events")).expect("open cgroup.events");
-    loop {
-        let mut text = String::new();
-        events.rewind().expect("rewind cgroup.events");
-        events.read_to_string(&mut text).expect("read cgroup.events");
-        if text.lines().any(|line| line == "populated 0") {
-            return;
-        }
-        let mut fd = libc::pollfd {
-            fd: events.as_raw_fd(),
-            events: libc::POLLPRI,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd; -1 blocks until the kernel reports a transition.
-        let ret = unsafe { libc::poll(&mut fd, 1, -1) };
-        assert!(
-            ret >= 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
-            "poll cgroup.events: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
 /// Spawn `cmd` with `slots` closed in this process across the spawn, and restore them.
 #[cfg(target_os = "linux")]
 fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
@@ -1566,9 +1720,16 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
     let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
     let root_cgroup = unified_cgroup(&root_cgroup).to_string();
     let leaf_prefix = format!("{own}/cosca-{}-", std::process::id());
+    // A leaf is `cosca-<pid>-<seq>-<random>`.
     let in_leaf = root_cgroup
         .strip_prefix(&leaf_prefix)
-        .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(seq, random)| {
+            !seq.is_empty()
+                && seq.bytes().all(|b| b.is_ascii_digit())
+                && random.len() == 16
+                && random.bytes().all(|b| b.is_ascii_hexdigit())
+        });
     let expected = if deny_pidfd && slots.len() >= 2 {
         // `spawn` can return before the report, which cannot be waited for: either side of the
         // leaf is right, as long as it is reported.
@@ -1587,7 +1748,7 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
         (containment, in_leaf),
         expected,
         "slots {slots:?}, pidfd denied: {deny_pidfd}: cosca reports {containment:?}, and the \
-         child is in {root_cgroup} (its leaf would be {leaf_prefix}<seq>)"
+         child is in {root_cgroup} (its leaf would be {leaf_prefix}<seq>-<random>)"
     );
     let worker_cgroup = std::fs::read_to_string(format!("/proc/{worker_pid}/cgroup")).expect("worker cgroup");
     assert_eq!(
@@ -1620,7 +1781,7 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
     // The leaf is removed with the child: nothing is left behind once its members have exited.
     let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
     if in_leaf {
-        wait_unpopulated(&own_dir.join(root_cgroup.rsplit('/').next().expect("a leaf name")));
+        common::cgroup::wait_drained(&own_dir.join(root_cgroup.rsplit('/').next().expect("a leaf name")));
     }
     drop(child);
     let prefix = format!("cosca-{}-", std::process::id());

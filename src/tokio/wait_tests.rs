@@ -277,3 +277,28 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
+
+/// The async cgroup drain wait wakes when the leaf is removed, even with no event on
+/// `cgroup.events` — the removal can cancel the one notification a drain sends.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_populated_event() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-async-removed-while-waited", true);
+    let removed = fake.leaf.clone();
+    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel::<()>();
+    let remover = std::thread::spawn(move || {
+        if blocking_rx.recv().is_ok() {
+            FakeLeaf::remove(&removed);
+        }
+    });
+    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    let drained = super::cgroup_wait_tree_drained(&leaf, None).await;
+    crate::containment::cgroup::fault::take_drain_blocking_notifier();
+    remover.join().expect("remover");
+
+    assert_eq!(drained.expect("wait"), TreeDrain::AllMembersExited);
+}

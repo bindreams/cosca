@@ -346,65 +346,34 @@ async fn wait_tree_drained_inner(
     .await
 }
 
-/// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), observed via
-/// `cgroup.events`'s `populated` key over a reactor-registered `AsyncFd` (`EPOLLPRI`, tokio's
-/// `Interest::PRIORITY`) — genuinely reactor-native, no polling interval anywhere, and
-/// cancellable (dropping the future deregisters the fd, same as every other Unix watch in this
-/// file). Mirrors `CgroupLeaf::wait_drained`'s sync loop exactly, including read-before-arm: the
-/// file is read BEFORE every `ready()` await, not only after, so a transition that already
-/// happened is observed on the read rather than requiring a fresh edge that may never fire
-/// again. `deadline` follows the crate's watch convention; each round awaits readiness for
-/// exactly the caller's own remaining time (`tokio::time::timeout`), never an invented interval.
+/// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), or until `deadline`.
+/// The async twin of `CgroupLeaf::wait_drained`, taking the same `CgroupLeaf::drain_step`s and
+/// awaiting each broadcast where the sync wait blocks on it. It never touches the watch itself, so
+/// a future dropped, or never polled again, holds nothing another wait needs. Each round awaits
+/// for exactly the caller's own remaining time; no interval anywhere.
 #[cfg(target_os = "linux")]
-async fn cgroup_wait_tree_drained(
+pub(crate) async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
-    use ::tokio::io::unix::AsyncFd;
-    use ::tokio::io::Interest;
+    use crate::containment::cgroup::DrainStep;
 
-    use crate::containment::TreeDrain;
-
-    use crate::containment::cgroup::{read_populated, removed_after_drain};
-
-    let file = match std::fs::File::open(leaf.events_path()) {
-        Ok(f) => f,
-        Err(e) if removed_after_drain(&e) => return Ok(TreeDrain::AllMembersExited),
-        Err(e) => return Err(Error::Io(e)),
-    };
-    let mut afd = AsyncFd::with_interest(file, Interest::PRIORITY).map_err(Error::Io)?;
-    let mut buf = String::new();
     loop {
-        // Mirrors `CgroupLeaf::wait_drained`'s own leaf-removal race handling exactly (see its
-        // doc, and `read_populated`'s own): `rmdir` on this leaf — `Drop`'s own retry, or an
-        // external cgroup manager's cleanup of an already-empty leaf — can land between this
-        // loop's own `ready()` wakeup and its next read, and observing that removal is itself
-        // proof every member had already exited (rmdir cannot precede full drain), not a
-        // failure.
-        if !read_populated(afd.get_mut(), &mut buf)? {
-            return Ok(TreeDrain::AllMembersExited);
+        match leaf.drain_step(deadline)? {
+            DrainStep::Done(drain) => return Ok(drain),
+            DrainStep::Block { listener, left: None } => listener.await,
+            // A timeout is looked at by the next step, which reads the leaf once more.
+            DrainStep::Block {
+                listener,
+                left: Some(left),
+            } => drop(::tokio::time::timeout(left, listener).await),
         }
-        let remaining = crate::wait::remaining(deadline);
-        if remaining == Some(std::time::Duration::ZERO) {
-            return Ok(TreeDrain::MembersRemain);
-        }
-        let mut ready = match remaining {
-            None => afd.ready(Interest::PRIORITY).await.map_err(Error::Io)?,
-            Some(d) => match ::tokio::time::timeout(d, afd.ready(Interest::PRIORITY)).await {
-                Ok(r) => r.map_err(Error::Io)?,
-                Err(_elapsed) => return Ok(TreeDrain::MembersRemain),
-            },
-        };
-        // A regular file has no "would block" concept to drain — any readiness means a
-        // transition fired (possibly stale by the time we re-read, which the loop's own
-        // re-read handles); clear and re-await.
-        ready.clear_ready();
     }
 }
 
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
-/// Job objects expose no pollable handle, so — unlike the Linux/macOS arms in this file — this
-/// is NOT reactor-native: it hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
+/// Job objects expose no pollable handle, so — unlike the macOS arm, on the reactor, and the Linux
+/// arm, awaiting its leaf's pump — this hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
 /// releasing the blocking thread promptly on drop via the same cancel-event idiom
 /// `blocking_watch` uses for `grace_wait`.
 ///
@@ -519,8 +488,9 @@ async fn job_wait_tree_drained(
     }
 }
 
-/// Async equivalent of `Attached::wait_drained`, dispatched by mechanism. Linux and macOS are
-/// genuinely reactor-native (`AsyncFd`); Windows hands its sync loop to `spawn_blocking` with a
+/// Async equivalent of `Attached::wait_drained`, dispatched by mechanism. macOS is reactor-native
+/// (`AsyncFd`); Linux awaits a broadcast from the pump thread its leaf owns (an
+/// `event_listener` future, no reactor registration); Windows hands its sync loop to `spawn_blocking` with a
 /// cancel event (job objects have no pollable handle). Every other mechanism delegates to the
 /// sync `Attached::wait_drained`, whose non-drainable arm returns `Unsupported` immediately —
 /// never blocking — so calling it directly here (no `spawn_blocking`) is safe.

@@ -61,6 +61,15 @@ pub(crate) enum LeafError {
     /// unobservable, so the leaf is not created half-instrumented.
     #[error("could not open the placement-report channel shared with the forked child: {0}")]
     OpenReportChannel(#[source] io::Error),
+    /// The watch the leaf's removal waits on could not be armed: an inotify instance or watch
+    /// (`fs.inotify.max_user_instances`, `fs.inotify.max_user_watches`), or `cgroup.events`
+    /// itself. It is armed at creation so that no later teardown can find itself without one.
+    #[error("could not watch {} for its drain: {source}", path.display())]
+    WatchDrain {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// What the child's own `pre_exec` self-placement write reported back to the parent.
@@ -219,6 +228,7 @@ pub(crate) enum DegradeKind {
     CheckKill,
     OpenProcs,
     OpenReportChannel,
+    WatchDrain,
     PidfdUnavailable,
     PlacementNotReported,
     PlacementWriteFailed,
@@ -254,6 +264,7 @@ impl DegradeReason for LeafError {
             LeafError::CheckKill { source, .. } => (DegradeKind::CheckKill, Some(source)),
             LeafError::OpenProcs { source, .. } => (DegradeKind::OpenProcs, Some(source)),
             LeafError::OpenReportChannel(e) => (DegradeKind::OpenReportChannel, Some(e)),
+            LeafError::WatchDrain { source, .. } => (DegradeKind::WatchDrain, Some(source)),
         };
         DegradeCondition {
             kind,

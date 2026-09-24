@@ -226,6 +226,7 @@ fn main() {
                 writeln!(out, "{name}={val}").unwrap();
             }
         }
+        "cwd" => println!("{}", std::env::current_dir().unwrap().display()),
         "emit" => {
             let n_out: usize = args[2].parse().unwrap();
             let n_err: usize = args[3].parse().unwrap();

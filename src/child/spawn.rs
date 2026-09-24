@@ -20,6 +20,14 @@ pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
+    let child = spawn_uncommitted(cmd)?;
+    child.commit_kill_on_drop();
+    Ok(child)
+}
+
+/// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down
+/// on drop whatever `kill_on_drop` says.
+pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let kill_on_drop = cmd.kill_on_drop_flag();
     // Elevation runs BEFORE spawn_unelevated's std::mem::take(cmd.fds_mut()), so the
     // effect layers see/modify cmd.fds() while it is still populated (the honest Windows
@@ -57,30 +65,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             // kill() in the write-failure path must see the elevated state so an EPERM maps
             // to the typed Unkillable rather than leaking a raw Io.
             child.set_elevation(report);
-            if let Some(pw) = password_write {
-                if let Err(write_err) = pw.write_after_spawn() {
-                    // Do NOT orphan the running elevated child on a genuine write failure:
-                    // kill + reap it, folding the teardown outcome into the error detail. A
-                    // successful kill() (SIGKILL, uncatchable) is followed by a BLOCKING wait()
-                    // to actually reap; an Err kill() (e.g. Unkillable) can't be reaped, so fall
-                    // back to a non-blocking try_wait() and note it may still be running.
-                    let kill_note = match child.kill() {
-                        Ok(()) => {
-                            let _ = child.wait();
-                            "the elevated child was terminated".to_string()
-                        }
-                        Err(e) => {
-                            let _ = child.try_wait();
-                            format!("the elevated child could not be terminated ({e})")
-                        }
-                    };
-                    return Err(Error::Elevation {
-                        kind: crate::error::ElevationErrorKind::AuthFailed,
-                        detail: format!("{write_err}; {kill_note}"),
-                    });
-                }
-            }
-            return Ok(child);
+            let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
+            return finish_elevated(child, written);
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -92,6 +78,47 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
         }
     }
     spawn_unelevated(cmd, kill_on_drop)
+}
+
+/// Finish a POSIX elevated spawn whose deferred password write returned `written`.
+///
+/// On a failed write, do NOT orphan the running elevated child: kill its tree through its
+/// containment when it has one, so a descendant forked before the failure dies too, then kill
+/// and reap the root by its own handle, folding both outcomes into the error.
+///
+/// The reap follows the ROOT's kill alone. A tree kill can fail (a setuid member refusing the
+/// signal) while the root dies, and a killed root must be waited for, or it stays a zombie. A
+/// failed root kill (e.g. `Unkillable`) cannot be waited for, so it gets a non-blocking
+/// `try_wait` and the note that it may still be running.
+#[cfg(unix)]
+pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
+    let Err(write_err) = written else {
+        return Ok(child);
+    };
+    let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
+    let root_note = match child.kill() {
+        Ok(()) => {
+            let _ = child.wait();
+            "the elevated child was terminated".to_string()
+        }
+        Err(e) => {
+            let _ = child.try_wait();
+            format!("the elevated child could not be terminated ({e})")
+        }
+    };
+    Err(Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: format!("{write_err}; {root_note}{}", tree_note(tree)),
+    })
+}
+
+/// `None`: no tree kill was tried, as the containment cannot tear one down.
+#[cfg(unix)]
+pub(crate) fn tree_note(tree: Option<Result<(), Error>>) -> String {
+    match tree {
+        Some(Err(e)) => format!("; its contained tree could not be killed ({e})"),
+        _ => String::new(),
+    }
 }
 
 /// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`
@@ -825,6 +852,12 @@ pub(crate) fn attach_or_fault(
             detail: "forced attach failure (test seam)".into(),
         });
     }
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(attachment) = fault::take_attachment_override() {
+        let mut prepared = prepared;
+        prepared.settle_verdict(pid);
+        return Ok(attachment);
+    }
     crate::containment::attach(
         pid,
         #[cfg(windows)]
@@ -938,6 +971,9 @@ pub(crate) mod fault {
         static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
         static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
+        #[cfg(target_os = "linux")]
+        static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
+            const { std::cell::RefCell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -1012,6 +1048,18 @@ pub(crate) mod fault {
     pub(crate) fn set_force_attach_failure(on: bool) {
         FORCE_ATTACH_FAIL.with(|f| f.set(on));
     }
+    /// Hand the NEXT spawn on this thread `attachment` in place of the one `attach` would build,
+    /// so a test can give a real child a leaf it shapes itself. TAKE semantics.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_attachment_override(attachment: crate::containment::Attachment) {
+        ATTACHMENT_OVERRIDE.with(|f| *f.borrow_mut() = Some(attachment));
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_attachment_override() -> Option<crate::containment::Attachment> {
+        ATTACHMENT_OVERRIDE.with(|f| f.borrow_mut().take())
+    }
+
     pub(crate) fn force_attach_failure() -> bool {
         FORCE_ATTACH_FAIL.with(|f| f.get())
     }

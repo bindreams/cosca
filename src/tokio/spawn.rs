@@ -16,6 +16,14 @@ use crate::stdio::{Fd, ResolvedStdio};
 use super::child::{reap_now, Child, ProcSource};
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
+    let child = spawn_uncommitted(cmd)?;
+    child.commit_kill_on_drop();
+    Ok(child)
+}
+
+/// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down
+/// on drop whatever `kill_on_drop` says.
+pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // tokio's `process::Command::spawn` needs a running reactor; outside ANY runtime it panics on
     // Unix and defers the failure on Windows — reject that no-runtime case up front so it is a typed
     // Err on every platform.
@@ -65,7 +73,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 // Same shared honest remap as the sync path (parity-by-construction): remap a
                 // derived-backend exec failure to BackendUnavailable ONLY when the backend path is
                 // the culprit. An already-elevated derived (sanitized original) has no backend path.
-                let child = spawn(&mut derived);
+                let child = spawn_uncommitted(&mut derived);
                 let mut child = match backend_path.as_deref() {
                     Some(bp) => child.map_err(|e| crate::elevation::remap_derived_spawn_error(e, bp))?,
                     None => child?,
@@ -74,32 +82,8 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
                 // write-failure path must see the elevated state so an EPERM maps to the typed
                 // Unkillable rather than leaking a raw Io.
                 child.set_elevation(rw.report);
-                if let Some(pw) = rw.password_write {
-                    if let Err(write_err) = pw.write_after_spawn() {
-                        // Do NOT orphan the running elevated child on a genuine write failure:
-                        // kill + reap, folding the teardown outcome into the error detail. A
-                        // successful kill() (SIGKILL, uncatchable) is followed by a BLOCKING reap
-                        // (try_wait cannot reap a just-killed child, so it would leak a zombie),
-                        // which waits only — this kill is what bounds it; an Err kill() (e.g.
-                        // Unkillable) can't be reaped, so fall back to a non-blocking try_wait()
-                        // and note the child may still be running.
-                        let kill_note = match child.kill() {
-                            Ok(()) => {
-                                child.wait_and_reap_blocking();
-                                "the elevated child was terminated".to_string()
-                            }
-                            Err(e) => {
-                                let _ = child.try_wait();
-                                format!("the elevated child could not be terminated ({e})")
-                            }
-                        };
-                        return Err(Error::Elevation {
-                            kind: crate::error::ElevationErrorKind::AuthFailed,
-                            detail: format!("{write_err}; {kill_note}"),
-                        });
-                    }
-                }
-                return Ok(child);
+                let written = rw.password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
+                return finish_elevated(child, written);
             }
             // Defensive: the current POSIX `rewrite` always returns `Some(derived)` (it sanitizes
             // even the already-elevated case), so this no-derived fall-through is not reached today.
@@ -380,7 +364,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(all(test, target_os = "linux"))]
             let spawned = crate::child::spawn::fault::post_fork_failure(
                 spawned,
-                prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path_for_test()),
+                prepared.cgroup_leaf.as_ref().map(|leaf| leaf.path()),
             );
             match spawned {
                 Ok(c) => c,
@@ -450,6 +434,31 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let mut child = Child::from_parts(ProcSource::Tokio(child), id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
     Ok(child)
+}
+
+/// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking
+/// (`try_wait` cannot reap a just-killed child, so it would leak a zombie), and waits only on
+/// this kill.
+#[cfg(unix)]
+pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
+    let Err(write_err) = written else {
+        return Ok(child);
+    };
+    let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
+    let root_note = match child.kill() {
+        Ok(()) => {
+            child.wait_and_reap_blocking();
+            "the elevated child was terminated".to_string()
+        }
+        Err(e) => {
+            let _ = child.try_wait();
+            format!("the elevated child could not be terminated ({e})")
+        }
+    };
+    Err(Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: format!("{write_err}; {root_note}{}", crate::child::spawn::tree_note(tree)),
+    })
 }
 
 #[cfg(windows)]

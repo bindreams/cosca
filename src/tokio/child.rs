@@ -114,6 +114,20 @@ impl Child {
         self.os.proc.as_ref().expect(PROC_TAKEN)
     }
 
+    /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
+    /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
+    pub(super) fn commit_kill_on_drop(&self) {
+        self.os.attached.honor_kill_on_drop(self.kill_on_drop);
+    }
+
+    /// Kill the contained tree through its containment only, without the root's own kill that
+    /// [`kill_tree`](Self::kill_tree) adds. For a failed spawn, which kills and reaps the root
+    /// separately.
+    #[cfg(unix)]
+    pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
+        self.os.attached.hard_kill()
+    }
+
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
     /// a cleanup `kill` in the write-failure path already sees the elevated state.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
@@ -592,8 +606,9 @@ impl Child {
     /// never collected by this call, only the root's own `wait`/`try_wait` does that. Requires
     /// a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2, a
     /// Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/
-    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). Reactor-native on
-    /// Linux and macOS (no polling interval); Windows hands the wait to `spawn_blocking` (job
+    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). No polling interval:
+    /// macOS waits on the reactor; Linux awaits a broadcast from a thread the leaf owns, started
+    /// by the first wait that blocks and joined when the child is dropped; Windows hands the wait to `spawn_blocking` (job
     /// objects have no pollable handle) with a cancel event so a dropped future releases the
     /// blocking watcher promptly instead of parking out the wait.
     pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
@@ -615,7 +630,8 @@ impl Child {
 }
 
 impl Child {
-    /// Leave the child (and its contained tree) running after this handle drops.
+    /// Leave the child (and its contained tree) running after this handle drops. The drop then
+    /// neither kills the tree nor waits for it.
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
         self.os.attached.disarm();
@@ -676,7 +692,9 @@ impl Child {
 /// That divergence from the sync `Child`, which still blocks, is otherwise deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
-        // The opt-out/`detach()` contract: nothing is signalled and nothing is logged.
+        // The opt-out/`detach()` contract: nothing is signalled. The leaf's own `Drop` still
+        // reports a leaf the tree occupies: at `debug` for a running tree, at `warn` for one killed
+        // that has not drained.
         if !self.kill_on_drop {
             return;
         }

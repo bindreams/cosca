@@ -100,6 +100,12 @@ impl Child {
         }
     }
 
+    /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
+    /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
+    pub(crate) fn commit_kill_on_drop(&self) {
+        self.attached.honor_kill_on_drop(self.kill_on_drop);
+    }
+
     // Set by the elevation spawn arms.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.elevation = report;
@@ -397,9 +403,9 @@ impl Child {
     }
 
     /// Consume the handle without killing or waiting for the child (opt out of
-    /// kill-on-drop). For Job Object containment, `disarm()` clears the
-    /// `KILL_ON_JOB_CLOSE` flag before the job handle is released, ensuring the
-    /// tree keeps running after `detach`.
+    /// kill-on-drop). Also disarms the containment resource, so its own `Drop` neither kills the
+    /// tree nor waits for it; see [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what
+    /// that leaves behind.
     pub fn detach(mut self) {
         self.attached.disarm();
         self.kill_on_drop = false;

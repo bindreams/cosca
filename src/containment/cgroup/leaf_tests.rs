@@ -1,4 +1,4 @@
-use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
+use crate::containment::cgroup::test_support::{block_on, childs_copy, entered_leaf_at, fork_running, reap};
 use crate::containment::cgroup::{LeafError, NotEntered, NotPlaced, PlacementReport};
 
 // removed_after_drain tests -----
@@ -269,26 +269,15 @@ fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
 }
 
 /// A `cgroup.kill` the kernel cannot even look up is not a missing one: the errno is the
-/// diagnosis, and "the kernel is older than 5.14" would be a confident false cause.
-///
-/// The failing lookup is a path one component too long: the leaf itself fits in `PATH_MAX`,
-/// `<leaf>/cgroup.kill` does not, so the `stat` fails with `ENAMETOOLONG` for any uid.
+/// diagnosis, and "the kernel is older than 5.14" would be a confident false cause. The lookup is
+/// through the held leaf directory, where a temp directory yields only `ENOENT`, so the fault
+/// seam supplies the errno.
 #[cfg(target_os = "linux")]
 #[test]
 fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // The leaf is `<parent>/cosca-<pid>-<seq>`. Size `parent` so the leaf's length is 4084 plus
-    // the digits of `seq` — under PATH_MAX (4096, NUL included) for any seq below 10^11 — while
-    // the 12 bytes of "/cgroup.kill" push the lookup past it.
-    let pid_len = std::process::id().to_string().len();
-    let parent_len = 4084 - "/cosca-".len() - pid_len - "-".len();
-    let mut parent = dir.path().to_path_buf();
-    while parent.as_os_str().len() < parent_len {
-        let room = parent_len - parent.as_os_str().len() - 1;
-        parent.push("d".repeat(room.min(200)));
-    }
-    assert_eq!(parent.as_os_str().len(), parent_len, "the parent must be sized exactly");
-    std::fs::create_dir_all(&parent).expect("create the long parent");
+    let parent = dir.path().to_path_buf();
+    crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
 
     let err = match crate::containment::cgroup::create_leaf_under(&parent) {
         Err(e) => e,
@@ -298,7 +287,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
         matches!(err, LeafError::CheckKill { .. }),
         "expected CheckKill, got {err:?}"
     );
-    let reason = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG).to_string();
+    let reason = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
     assert!(err.to_string().contains(&reason), "the errno is the diagnosis: {err}");
     let strays: Vec<_> = std::fs::read_dir(&parent)
         .expect("read the parent")
@@ -353,15 +342,39 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
 
-    let leaf = crate::containment::cgroup::CgroupLeaf::placeholder_for_test();
+    // Its OWN leaf name, not the shared placeholder: `log_capture` is process-wide and
+    // libtest runs this file in parallel, so a marker a sibling test also emits makes the
+    // count below a count of whatever else happened to run alongside.
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
+        "/nonexistent/cosca-hard-kill-already-gone",
+    ));
     leaf.hard_kill()
         .expect("an already-removed leaf is a completed teardown, not a failure");
 
-    let levels = crate::log_capture::levels_since(mark, "cosca-cgroup-placeholder");
-    assert!(
-        !levels.contains(&log::Level::Warn),
-        "an already-gone leaf is routine and must not be reported at warn, got {levels:?}"
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-hard-kill-already-gone"),
+        vec![log::Level::Debug],
+        "an already-gone leaf is routine: exactly one record, and not at warn"
     );
+}
+
+/// `terminate` reads an already-removed leaf as a completed teardown, as `hard_kill` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
+    // Its own leaf name, for the reason `hard_kill`'s twin above gives.
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
+        "/nonexistent/cosca-terminate-already-gone",
+    ));
+    leaf.terminate()
+        .expect("an already-removed leaf has no member left to signal");
+
+    let attached = crate::containment::Attached::Cgroup(leaf);
+    assert!(
+        attached.terminate(0).is_ok(),
+        "terminate and hard_kill must agree about an already-gone leaf"
+    );
+    assert!(attached.hard_kill().is_ok());
 }
 
 // Drop's leaf-removal reporting -----
@@ -448,6 +461,932 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
             "the unremoved leaf is reported either way"
         );
     }
+}
+
+// detach's disarm -----
+// See `CgroupLeaf::disarm`.
+
+/// A disarmed leaf never writes `cgroup.kill`, and leaves the occupied directory alone. The
+/// occupant stands in for the detached tree; a real leaf refuses both `rmdir`s while one runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-detached-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the detached tree");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
+    let mark = crate::log_capture::mark();
+    attached.disarm();
+    drop(attached);
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "a detached tree must not be killed: cgroup.kill must never be written"
+    );
+    assert!(leaf_path.is_dir(), "the detached tree's leaf must survive with it");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-detached-leaf"),
+        vec![log::Level::Debug],
+        "a leaf left behind for a detached tree is what the caller asked for, not a leak"
+    );
+}
+
+/// The same leaf, left armed, DOES fire `cgroup.kill` — so the test above pins the disarm, not
+/// an inert path.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_leaf_still_kills_the_tree_on_drop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-armed-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    drop(entered_leaf_at(leaf_path.clone()));
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"1",
+        "an occupied leaf that was NOT detached must still be killed on Drop"
+    );
+}
+
+/// A disarmed leaf whose tree has already gone still removes the empty directory: detach gives
+/// up the KILL, not the tidying. cosca does not come back for a leaf it left.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-detached-empty-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+    let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
+    attached.disarm();
+    drop(attached);
+
+    assert!(
+        !leaf_path.exists(),
+        "an empty leaf is removable, and cosca does not come back for one it left"
+    );
+}
+
+/// A disarmed leaf whose tree the caller KILLED is not left behind for a live detached tree: it
+/// is a leaf `cgroup.kill` had not yet drained when the handle dropped (`kill_on_drop(false)`,
+/// `kill_tree()`, no `wait_tree()`). It is reported as the leak it is, at `warn`, like every
+/// other leaf cosca fails to remove.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_tree_was_killed_warns_that_it_was_not_removed() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-killed-opted-out-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the still-dying tree");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+    let leaf = entered_leaf_at(leaf_path);
+    leaf.disarm();
+    leaf.hard_kill().expect("kill the tree");
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+
+    let records = crate::log_capture::records_since(mark, "cosca-killed-opted-out-leaf");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-killed-opted-out-leaf"),
+        vec![log::Level::Warn],
+        "a killed tree's leaf that outlived its Drop is a leak, got {records:?}"
+    );
+    assert!(
+        records.iter().all(|r| !r.contains("detached")),
+        "the caller killed this tree; it was not left running, got {records:?}"
+    );
+}
+
+/// A SIGTERM is catchable, so `terminate_tree()` proves no teardown: a disarmed leaf whose tree
+/// ignored it is a live opted-out tree keeping its leaf, reported at `debug`, not a leak.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-terminate-survivor-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut ready = [0 as std::os::fd::RawFd; 2];
+    // SAFETY: `ready` is a valid two-element array for `pipe` to fill.
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "pipe");
+    let member = fork_running(move || {
+        // SAFETY (in the child): `signal`, `write` and `pause` are async-signal-safe.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::write(ready[1], b"r".as_ptr().cast(), 1);
+            libc::pause();
+        }
+    });
+    // SAFETY: the parent's copy of the write end, closed once.
+    unsafe { libc::close(ready[1]) };
+    block_on(ready[0]); // the member ignores SIGTERM from here on
+                        // SAFETY: the parent's copy of the read end, closed once.
+    unsafe { libc::close(ready[0]) };
+    std::fs::write(leaf_path.join("cgroup.procs"), format!("{member}\n")).expect("list the member");
+
+    let leaf = entered_leaf_at(leaf_path);
+    leaf.disarm();
+    leaf.terminate().expect("signal the tree");
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+    // SAFETY: `member` is this process's own unreaped child.
+    unsafe { libc::kill(member as i32, libc::SIGKILL) };
+    reap(member);
+
+    let records = crate::log_capture::records_since(mark, "cosca-terminate-survivor-leaf");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-terminate-survivor-leaf"),
+        vec![log::Level::Debug],
+        "a tree that survived SIGTERM is left running, not leaked, got {records:?}"
+    );
+}
+
+/// A disarmed leaf whose directory is already GONE leaves nothing behind, so `Drop` must not
+/// say it did. `rmdir` failing with `ENOENT` is proof of removal, not of survival — the armed
+/// path already reads it that way, and a detached leaf's one `rmdir` is the only reading it
+/// gets.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
+    crate::log_capture::install();
+    let leaf = entered_leaf_at(std::path::PathBuf::from("/nonexistent/cosca-detached-gone-leaf"));
+    leaf.disarm();
+
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-detached-gone-leaf"),
+        Vec::<log::Level>::new(),
+        "nothing is left behind for the detached tree, so there is nothing to report"
+    );
+}
+
+// Drop's two flags -----
+// See the truth table in `CgroupLeaf`'s `Drop`.
+
+/// All four combinations, each against an occupied leaf whose verdict is taken: only both-set
+/// writes `cgroup.kill`.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
+    for (entered, armed) in [(true, true), (true, false), (false, true), (false, false)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-two-flags-leaf");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+        std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+
+        let leaf = if entered {
+            entered_leaf_at(leaf_path.clone())
+        } else {
+            let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
+            // no-op. The slot's channel lives as long as `leaf`.
+            let _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+            assert!(
+                leaf.take_placement(std::process::id()).expect("decidable").is_err(),
+                "a failed write is not a placement"
+            );
+            leaf
+        };
+        if !armed {
+            leaf.disarm();
+        }
+        drop(leaf);
+
+        let expected: &[u8] = if entered && armed { b"1" } else { b"" };
+        assert_eq!(
+            std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+            expected,
+            "entered={entered}, armed={armed}"
+        );
+    }
+}
+
+// An armed Drop's drain -----
+// Each test gives a fake leaf cgroupfs's `rmdir` answers through the rmdir hook, and drives it from
+// another thread that acts only once the drop's drain wait is about to block.
+
+/// Run `act` on another thread each time a drain wait on THIS thread is about to block, until the
+/// returned guard drops. `act` gets the number of the block, from 0.
+#[cfg(target_os = "linux")]
+fn on_each_drain_block(mut act: impl FnMut(usize) + Send + 'static) -> impl Drop {
+    struct Stop(Option<std::thread::JoinHandle<()>>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            // Dropping the only sender ends the actor's loop.
+            crate::containment::cgroup::fault::take_drain_blocking_notifier();
+            self.0.take().expect("actor").join().expect("actor thread");
+        }
+    }
+    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel();
+    let actor = std::thread::spawn(move || {
+        let mut n = 0;
+        while blocking_rx.recv().is_ok() {
+            act(n);
+            n += 1;
+        }
+    });
+    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
+    Stop(Some(actor))
+}
+
+/// An armed `Drop` that kills through its leaf removes it only once the leaf has drained: no
+/// `rmdir` after the `cgroup.kill` write sees `populated 1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-draining-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    fault::record_leaf_steps();
+    drop(entered_leaf_at(fake.leaf.clone()));
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    assert!(
+        !fake.leaf.exists(),
+        "the drop must remove the drained leaf, got {steps:?}"
+    );
+    let killed_at = steps
+        .iter()
+        .position(|s| s == "kill")
+        .unwrap_or_else(|| panic!("an occupied armed leaf must be killed through, got {steps:?}"));
+    let after_kill = &steps[killed_at + 1..];
+    assert!(!after_kill.is_empty(), "the drop must retry the rmdir, got {steps:?}");
+    assert!(
+        after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
+        "every rmdir after the kill must wait for the drain, got {steps:?}"
+    );
+}
+
+/// A drain wait wakes when the leaf is removed, even with no event on `cgroup.events`: removing a
+/// cgroup cancels a `populated` notification the kernel had postponed (see `DrainWatch`), so a
+/// third party can remove a drained leaf while the wait still reads it populated.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-removed-while-waited", true);
+    let waited = fake.leaf.clone();
+    let removed = fake.leaf.clone();
+    let waiter = std::thread::spawn(move || {
+        let _actor = on_each_drain_block(move |_| FakeLeaf::remove(&removed));
+        crate::containment::cgroup::CgroupLeaf::for_test_at(waited).wait_drained(None)
+    });
+
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait_drained"),
+        TreeDrain::AllMembersExited,
+        "a removed leaf holds no member"
+    );
+}
+
+/// The same for a `Drop` killing through its leaf: it wakes, finds the leaf gone, and reports
+/// nothing, since nothing was left behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_drop_whose_leaf_a_third_party_removes_reports_nothing() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::log_capture::install();
+    let fake = FakeLeaf::new("cosca-removed-under-drop", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let removed = fake.leaf.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::remove(&removed));
+
+    let mark = crate::log_capture::mark();
+    drop(entered_leaf_at(fake.leaf.clone()));
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    let records = crate::log_capture::records_since(mark, "cosca-removed-under-drop");
+    assert!(
+        !crate::log_capture::levels_since(mark, "cosca-removed-under-drop").contains(&log::Level::Warn),
+        "a leaf a third party removed was not left behind, got {records:?}"
+    );
+}
+
+/// An `rmdir` that fails `EBUSY` after the kill, drain and sweep is terminal: `Drop` tries once,
+/// then reports the leaf once, naming what can have held it. A retry would only make a third
+/// party's race rarer, never impossible.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_drop_reports_an_rmdir_refused_after_its_drain_once_without_retrying() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::log_capture::install();
+    let fake = FakeLeaf::new("cosca-refused-after-drain", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    let drained_rmdirs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = drained_rmdirs.clone();
+    fault::set_rmdir_hook(move |_| {
+        if !FakeLeaf::is_populated(&events) {
+            counted.set(counted.get() + 1);
+            // Something a third party did since the sweep.
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        FakeLeaf::rmdir(&leaf, &events)
+    });
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let mark = crate::log_capture::mark();
+    drop(entered_leaf_at(fake.leaf.clone()));
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    let records = crate::log_capture::records_since(mark, "cosca-refused-after-drain");
+    assert_eq!(drained_rmdirs.get(), 1, "one rmdir after the drain, no retry");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-refused-after-drain"),
+        vec![log::Level::Warn],
+        "reported once, got {records:?}"
+    );
+    for cause in ["moved into it after the kill", "child cgroup", "mount"] {
+        assert!(
+            records[0].contains(cause),
+            "the report must name {cause:?}: {}",
+            records[0]
+        );
+    }
+}
+
+/// A child-cgroup sweep of a leaf that is already gone removes nothing, and is no failure.
+#[cfg(target_os = "linux")]
+#[test]
+fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        crate::containment::cgroup::LeafDir::open_for_test(&dir.path().join("cosca-gone"))
+            .remove_children()
+            .expect("sweep"),
+        0
+    );
+}
+
+/// A real leaf whose one member, a `sleep`, entered it. For the lane tests.
+#[cfg(target_os = "linux")]
+fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process::Child) {
+    use std::os::unix::process::CommandExt;
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
+    );
+    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("300");
+    // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
+    // closure runs between fork and exec, and `leaf` outlives the spawn.
+    unsafe {
+        cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+    }
+    let member = cmd.spawn().expect("spawn a member");
+    leaf.take_placement(member.id())
+        .expect("decidable")
+        .expect("the member entered the leaf");
+    (leaf, member)
+}
+
+/// Give the calling thread alone a mount namespace, private, so that every mount it makes stays in
+/// it and is gone with the thread.
+#[cfg(target_os = "linux")]
+fn enter_a_private_mount_namespace() {
+    // SAFETY: plain syscalls on valid NUL-terminated strings.
+    unsafe {
+        assert_eq!(
+            libc::unshare(libc::CLONE_NEWNS),
+            0,
+            "unshare: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null()
+            ),
+            0,
+            "make / private: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Mount a tmpfs over `over`, in the calling thread's mount namespace.
+#[cfg(target_os = "linux")]
+fn mount_a_tmpfs_over(over: &std::path::Path) {
+    let over = std::ffi::CString::new(over.as_os_str().as_encoded_bytes()).expect("no NUL");
+    // SAFETY: a plain syscall on valid NUL-terminated strings.
+    let mounted = unsafe { libc::mount(c"tmpfs".as_ptr(), over.as_ptr(), c"tmpfs".as_ptr(), 0, std::ptr::null()) };
+    assert_eq!(mounted, 0, "mount a tmpfs: {}", std::io::Error::last_os_error());
+}
+
+/// Drop `leaf` on a thread of its own mount namespace, private to it, with a tmpfs mounted over
+/// `over`, and return the levels and texts of the records its `Drop` made about `marker`. The mount is
+/// gone with the thread.
+#[cfg(target_os = "linux")]
+fn drop_under_a_mount(
+    leaf: crate::containment::cgroup::CgroupLeaf,
+    over: std::path::PathBuf,
+    marker: String,
+) -> (Vec<log::Level>, Vec<String>) {
+    crate::log_capture::install();
+    std::thread::spawn(move || {
+        enter_a_private_mount_namespace();
+        mount_a_tmpfs_over(&over);
+        let mark = crate::log_capture::mark();
+        drop(leaf);
+        (
+            crate::log_capture::levels_since(mark, &marker),
+            crate::log_capture::records_since(mark, &marker),
+        )
+    })
+    .join()
+    .expect("the dropping thread")
+}
+
+/// A mount over the leaf itself: `rmdir` of its name fails `EBUSY` in the VFS, before cgroupfs is
+/// asked. `Drop` kills the real tree through the held leaf, and reports the leaf it cannot remove
+/// rather than retrying forever.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (leaf, mut member) = entered_real_leaf();
+    let leaf_path = leaf.leaf_path.clone();
+    let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+
+    let (levels, records) = drop_under_a_mount(leaf, leaf_path.clone(), name);
+    let status = member.wait().expect("reap the member");
+    // Outside the dropping thread's namespace nothing is mounted over the leaf.
+    std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");
+
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the real tree must be killed");
+    assert_eq!(levels, vec![log::Level::Warn], "the leaf left behind is reported, once");
+    assert!(
+        records[0].contains("mount"),
+        "the report must name a mount as a cause: {}",
+        records[0]
+    );
+}
+
+/// A mount over the leaf's name in the namespace its held descriptors were opened in: the name
+/// no longer reaches the leaf, which says nothing about whether the leaf is gone. `Drop` kills the
+/// real tree through the held leaf, and reports the leaf it cannot remove.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    crate::log_capture::install();
+    let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
+        enter_a_private_mount_namespace();
+        let (leaf, member) = entered_real_leaf();
+        let leaf_path = leaf.leaf_path.clone();
+        let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+        mount_a_tmpfs_over(&leaf_path);
+        let mark = crate::log_capture::mark();
+        drop(leaf);
+        (
+            leaf_path,
+            member,
+            crate::log_capture::levels_since(mark, &name),
+            crate::log_capture::records_since(mark, &name),
+        )
+    })
+    .join()
+    .expect("the dropping thread");
+    let status = member.wait().expect("reap the member");
+    // Outside the dropping thread's namespace nothing is mounted over the leaf.
+    std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");
+
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the real tree must be killed");
+    assert_eq!(levels, vec![log::Level::Warn], "the leaf left behind is reported, once");
+    assert!(
+        records[0].contains("mount"),
+        "the report must name a mount as a cause: {}",
+        records[0]
+    );
+}
+
+/// A mount over the leaf's parent: the leaf's path finds nothing, which says nothing about the
+/// leaf. `Drop` kills, drains and removes the real leaf through the held directories.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
+    let (leaf, mut member) = entered_real_leaf();
+    let leaf_path = leaf.leaf_path.clone();
+    let parent = leaf_path.parent().expect("a parent").to_path_buf();
+    let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+
+    let (levels, _) = drop_under_a_mount(leaf, parent, name);
+    let removed = !leaf_path.exists();
+    if !removed {
+        member.kill().expect("kill the member");
+    }
+    member.wait().expect("reap the member");
+    if !removed {
+        crate::containment::cgroup::test_support::remove_drained_leaf(&leaf_path);
+    }
+
+    assert!(removed, "the real leaf must be killed through and removed");
+    assert!(
+        !levels.contains(&log::Level::Warn),
+        "nothing was left behind, got {levels:?}"
+    );
+}
+
+/// Without an inotify instance — `fs.inotify.max_user_instances` reached — no leaf is created:
+/// the spawn degrades as for any other failed step, rather than leaving a leaf whose teardown
+/// could not be watched. The half-made leaf is removed.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
+    );
+    crate::containment::cgroup::fault::set_force_inotify_failure(true);
+    let result = crate::containment::cgroup::try_create_leaf();
+    let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
+
+    assert!(consumed, "the creation must have tried, and failed, to watch");
+    // The error names the leaf it made, so the check needs no view of what else is in its parent.
+    let leaf = match result {
+        Err(LeafError::WatchDrain { source, path }) => {
+            assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
+            path.parent().expect("cgroup.events is in the leaf").to_path_buf()
+        }
+        Err(e) => panic!("expected WatchDrain, got {e:?}"),
+        Ok(_) => panic!("a leaf whose drain cannot be watched must not be created"),
+    };
+    assert!(!leaf.exists(), "the half-made leaf must be removed: {}", leaf.display());
+}
+
+// The leaf's shared watcher -----
+// A leaf holds one inotify instance. Its pump, a thread the leaf owns, blocks on it and broadcasts
+// every change; waits only listen and re-read the leaf.
+
+/// A thread's own notifier for "a wait is about to block", as a sender to share.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+fn signal_when_blocking(tx: std::sync::mpsc::Sender<()>) {
+    crate::containment::cgroup::fault::set_drain_blocking_notifier(tx);
+}
+
+/// A wait polled once and then never again holds nothing another wait needs: a second wait on
+/// the same leaf, already blocked when the leaf drains, still returns.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn a_parked_async_wait_does_not_hold_up_another() {
+    use std::future::Future as _;
+
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-parked-waiter", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let mut parked = std::pin::pin!(crate::tokio::wait::cgroup_wait_tree_drained(&leaf, None));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(parked.as_mut().poll(&mut context).is_pending(), "the leaf is populated");
+
+        let (blocking, blocking_rx) = std::sync::mpsc::channel();
+        let other_leaf = leaf.clone();
+        let other = std::thread::spawn(move || {
+            signal_when_blocking(blocking);
+            let runtime = ::tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(crate::tokio::wait::cgroup_wait_tree_drained(&other_leaf, None))
+        });
+        blocking_rx.recv().expect("the second wait blocks");
+        FakeLeaf::set_populated(&fake.events, false);
+        assert_eq!(
+            other.join().expect("the second waiter").expect("wait"),
+            TreeDrain::AllMembersExited
+        );
+        // Still parked, never polled again: it held nothing the second wait needed.
+        let _ = &parked;
+    });
+}
+
+/// A sync and an async wait on one leaf both return once it drains, on the leaf's one watch: no
+/// second inotify instance is armed.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn a_sync_and_an_async_wait_share_the_leafs_one_watch() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-two-waiters", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+
+    let (sync_leaf, sync_blocking) = (leaf.clone(), blocking.clone());
+    let sync_waiter = std::thread::spawn(move || {
+        signal_when_blocking(sync_blocking);
+        sync_leaf.wait_drained(None)
+    });
+    let (async_leaf, async_blocking) = (leaf.clone(), blocking.clone());
+    let async_waiter = std::thread::spawn(move || {
+        signal_when_blocking(async_blocking);
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(crate::tokio::wait::cgroup_wait_tree_drained(&async_leaf, None))
+    });
+
+    blocking_rx.recv().expect("a waiter blocks");
+    blocking_rx.recv().expect("the other waiter blocks");
+    FakeLeaf::set_populated(&fake.events, false);
+
+    assert_eq!(
+        sync_waiter.join().expect("sync waiter").expect("sync wait"),
+        TreeDrain::AllMembersExited
+    );
+    assert_eq!(
+        async_waiter.join().expect("async waiter").expect("async wait"),
+        TreeDrain::AllMembersExited
+    );
+    assert_eq!(
+        crate::containment::cgroup::fault::arms_of("cosca-two-waiters"),
+        1,
+        "only the leaf's own watch is armed, at creation"
+    );
+}
+
+/// A cancelled async wait leaves the others waiting as before.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn a_cancelled_async_wait_leaves_the_others_waiting() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-cancelled-waiter", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+    let (cancel, cancelled) = ::tokio::sync::oneshot::channel::<()>();
+
+    let async_leaf = leaf.clone();
+    let async_waiter = std::thread::spawn(move || {
+        signal_when_blocking(blocking);
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            ::tokio::select! {
+                drained = crate::tokio::wait::cgroup_wait_tree_drained(&async_leaf, None) => {
+                    panic!("the leaf was never drained, got {drained:?}")
+                }
+                _ = cancelled => {}
+            }
+        });
+    });
+    blocking_rx.recv().expect("the async wait blocks");
+    cancel.send(()).expect("cancel the async wait");
+    async_waiter.join().expect("the async waiter");
+
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(leaf.wait_drained(None).expect("wait"), TreeDrain::AllMembersExited);
+}
+
+/// A wait whose deadline has passed answers from the leaf's state at once.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_wait_past_its_deadline_answers_from_the_leafs_state() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-past-deadline", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    assert_eq!(
+        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        TreeDrain::MembersRemain
+    );
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(
+        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+}
+
+/// Block a wait on `leaf` on a thread of its own, returning once it blocks.
+#[cfg(target_os = "linux")]
+fn blocked_wait(
+    leaf: &std::sync::Arc<crate::containment::cgroup::CgroupLeaf>,
+) -> std::thread::JoinHandle<Result<crate::containment::TreeDrain, crate::error::Error>> {
+    let (blocking, blocking_rx) = std::sync::mpsc::channel();
+    let leaf = leaf.clone();
+    let waiter = std::thread::spawn(move || {
+        crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking);
+        leaf.wait_drained(None)
+    });
+    blocking_rx.recv().expect("the wait blocks");
+    waiter
+}
+
+/// The pump starts with the first wait that blocks, and dropping the leaf stops and joins it
+/// before `drop` returns.
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_the_leaf_stops_and_joins_its_pump() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-pumped-leaf", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
+    assert_eq!(
+        fault::pumps_of("cosca-pumped-leaf"),
+        (0, 0),
+        "a wait that cannot block starts none"
+    );
+
+    let waiter = blocked_wait(&leaf);
+    assert_eq!(
+        fault::pumps_of("cosca-pumped-leaf"),
+        (1, 0),
+        "a blocking wait starts the pump"
+    );
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+
+    FakeLeaf::set_populated(&fake.events, true);
+    let waiter = blocked_wait(&leaf);
+    FakeLeaf::set_populated(&fake.events, false);
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+    assert_eq!(fault::pumps_of("cosca-pumped-leaf"), (1, 0), "one pump per leaf");
+
+    drop(std::sync::Arc::into_inner(leaf).expect("the waiters are joined"));
+    assert_eq!(
+        fault::pumps_of("cosca-pumped-leaf"),
+        (1, 1),
+        "the drop joins the pump it stopped"
+    );
+}
+
+/// A drained leaf is answered from one read: no pump is started for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drained_leaf_is_answered_without_a_pump() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-drained-unpumped", false);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    assert_eq!(leaf.wait_drained(None).expect("wait"), TreeDrain::AllMembersExited);
+    assert_eq!(
+        leaf.wait_drained(Some(Some(std::time::Instant::now()))).expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+    #[cfg(feature = "tokio")]
+    {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        assert_eq!(
+            runtime
+                .block_on(crate::tokio::wait::cgroup_wait_tree_drained(&leaf, None))
+                .expect("wait"),
+            TreeDrain::AllMembersExited
+        );
+    }
+    assert_eq!(fault::pumps_of("cosca-drained-unpumped"), (0, 0));
+}
+
+/// A pump that stops on its own wakes every wait, and each reports why.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_pump_wakes_every_wait_with_its_error() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-failed-pump", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let waiters = [blocked_wait(&leaf), blocked_wait(&leaf)];
+    fault::set_force_pump_failure("cosca-failed-pump");
+    // Readable once more: the pump wakes, and fails.
+    FakeLeaf::set_populated(&fake.events, true);
+
+    for waiter in waiters {
+        let e = waiter.join().expect("waiter").expect_err("the pump failed");
+        assert!(e.to_string().contains("can no longer be watched"), "{e}");
+    }
+    assert!(
+        !fault::take_force_pump_failure("cosca-failed-pump".as_ref()),
+        "the pump took it"
+    );
+}
+
+/// A sibling's removal reaches the pump, which wakes no wait for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_siblings_removal_wakes_no_wait() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-sibling-watcher", true);
+    let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
+    let (batches, batches_rx) = std::sync::mpsc::channel();
+    fault::set_pump_batch_notifier("cosca-sibling-watcher", batches);
+    let waiter = blocked_wait(&leaf);
+
+    let sibling = fake.leaf.with_file_name("cosca-sibling");
+    std::fs::create_dir(&sibling).expect("make a sibling");
+    std::fs::remove_dir(&sibling).expect("remove the sibling");
+    assert!(
+        !batches_rx.recv().expect("a batch"),
+        "a sibling's removal notifies no one"
+    );
+
+    FakeLeaf::set_populated(&fake.events, false);
+    assert!(batches_rx.recv().expect("a batch"), "a write to cgroup.events notifies");
+    assert_eq!(
+        waiter.join().expect("waiter").expect("wait"),
+        TreeDrain::AllMembersExited
+    );
+}
+
+/// A pump started with no watch fails, waking its waits with the reason, rather than exiting
+/// silently. Debug builds also assert it: every leaf that can be waited on holds a watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pump_without_a_watch_fails_loudly() {
+    use event_listener::Listener as _;
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let watcher = crate::containment::cgroup::Watcher::new(None, "cosca-unwatched".into());
+    let listener = watcher.listen().expect("start the pump");
+    listener.wait();
+    assert!(
+        watcher.failure().is_some_and(|why| why.contains("never armed")),
+        "{:?}",
+        watcher.failure()
+    );
+    drop(watcher);
+    assert_eq!(
+        crate::log_capture::contains_since(mark, "cosca-unwatched"),
+        cfg!(debug_assertions),
+        "the joined pump panicked on its debug assertion in exactly the builds that keep it"
+    );
+}
+
+/// The pump's thread name fits Linux's 15 bytes, which would truncate it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_pump_thread_name_fits_the_kernels_limit() {
+    assert!(crate::containment::cgroup::PUMP_THREAD.len() <= 15);
 }
 
 /// A leaf that is already GONE is not a leak at all: `rmdir` failing with `ENOENT` means some
@@ -1860,4 +2799,24 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
         .to_string();
     assert!(err.contains("drain could not be watched"), "got {err}");
     child.wait().expect("reap the child");
+}
+
+/// A leaf's name carries 64 random bits past the pid and sequence number, which repeat across
+/// pid namespaces sharing a delegated parent, and across processes reusing a pid.
+#[cfg(target_os = "linux")]
+#[test]
+fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
+    let suffix = |name: String| {
+        let parts = name.split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4, "cosca-<pid>-<seq>-<random>: {name}");
+        assert_eq!((parts[0], parts[1]), ("cosca", std::process::id().to_string().as_str()));
+        assert!(
+            parts[3].len() == 16 && parts[3].bytes().all(|b| b.is_ascii_hexdigit()),
+            "{name}"
+        );
+        parts[3].to_owned()
+    };
+    let a = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
+    let b = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
+    assert_ne!(a, b);
 }
