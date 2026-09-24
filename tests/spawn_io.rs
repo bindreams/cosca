@@ -500,23 +500,10 @@ fn unix_fd3_file_round_trips() {
     assert_eq!(buf, b"from file via fd3");
 }
 
-/// Regression: `.contain()` + `.fd(3, pipe_out())` on Linux must NOT let the
-/// cgroup self-placement clobber (or be clobbered by) the command-fds dup2.
-///
-/// The cgroup `pre_exec` writes "0" to a pre-opened `cgroup.procs` fd.
-/// command-fds installs its own `pre_exec` that dup2's the user's fd 3 onto
-/// child fd 3. If command-fds runs FIRST, its dup2 can land on the
-/// same fd number the cgroup `procs_fd` occupies — silently downgrading
-/// containment OR writing the cgroup's "0" into the user's fd 3 (corruption).
-/// We assert the parent reads EXACTLY the child-written token (no inserted "0",
-/// no broken pipe) AND that containment was actually established. Under a real
-/// delegated cgroup (COSCA_TEST_CGROUP set) we additionally assert the
-/// achieved mechanism is CgroupV2 — proof the cgroup write was not clobbered.
-/// Read to EOF; no timers.
+/// Spawn a contained child that writes a token to fd 3, and return the containment it achieved
+/// and what fd 3 carried. Read to EOF; no timers.
 #[cfg(target_os = "linux")]
-#[test]
-fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
-    stderr_log::install();
+fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
@@ -525,36 +512,51 @@ fn linux_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
         .expect("fd 3 pipe_out");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn contained child with fd 3");
-
-    // Containment must be a real mechanism (a clobbered procs_fd would silently
-    // downgrade CgroupV2 -> ProcessGroup; None would mean containment vanished).
-    assert_ne!(
-        child.containment(),
-        cosca::Containment::None,
-        "contain() + fd(3) must still establish containment"
-    );
-    // When a delegated cgroup is provisioned, the write must have landed in
-    // cgroup.procs (not been clobbered by command-fds' dup2): CgroupV2 achieved.
-    if std::env::var_os("COSCA_TEST_CGROUP").is_some() {
-        assert_eq!(
-            child.containment(),
-            cosca::Containment::CgroupV2,
-            "cgroup write must not be clobbered by command-fds dup2; got {:?}",
-            child.containment()
-        );
-    }
-
+    let containment = child.containment();
     let mut fd3_reader = child.fd_read_end(Fd::from(3)).expect("fd 3 reader");
     let mut buf = Vec::new();
     fd3_reader.read_to_end(&mut buf).expect("read fd 3");
     drop(fd3_reader);
     let _ = child.wait();
+    (containment, buf)
+}
 
-    // Exact payload: a clobber would prepend/insert the cgroup "0" or break the pipe.
-    assert_eq!(
-        buf, b"FD3PAYLOAD",
-        "fd 3 stream corrupted — cgroup procs_fd clobbered command-fds"
+/// `.contain()` + `.fd(3, pipe_out())` on Linux: whatever mechanism is achieved, the child's fd 3
+/// carries exactly its own token, and containment is established. The cgroup `pre_exec` writes
+/// "0" to a pre-opened `cgroup.procs` fd, and command-fds' `pre_exec` dup2's the user's fd onto
+/// child fd 3; if they collided, the "0" would land in the stream or the pipe would break.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_contain_with_fd3_delivers_the_exact_payload() {
+    stderr_log::install();
+    let (containment, buf) = contain_with_fd3();
+    assert_ne!(
+        containment,
+        cosca::Containment::None,
+        "contain() + fd(3) must still establish containment"
     );
+    assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
+}
+
+/// Regression: under a delegated cgroup, command-fds' dup2 onto fd 3 must not clobber the cgroup
+/// placement's `cgroup.procs` fd. A clobbered write degrades the spawn to a process group, so
+/// achieving `CgroupV2` is the proof.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
+    stderr_log::install();
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let (containment, buf) = contain_with_fd3();
+    assert_eq!(
+        containment,
+        cosca::Containment::CgroupV2,
+        "the cgroup write must not be clobbered by command-fds' dup2"
+    );
+    assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
 #[test]
