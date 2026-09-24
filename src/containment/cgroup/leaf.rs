@@ -101,7 +101,8 @@ pub(crate) struct CgroupLeaf {
     dir: LeafDir,
     /// The leaf's drain watch, held from creation so that no wait on it ever lacks one, and
     /// shared by concurrent waits in turn.
-    watch: WatchTurns,
+    /// Boxed: the queue would make every `Attached` as large as a leaf.
+    watch: Box<WatchTurns>,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
     /// between `fork` and `exec`, and no program this process starts may inherit it. Numbered
     /// 3 or above, so it never shares a number with the child's stdio. `None` once the
@@ -585,7 +586,9 @@ impl CgroupLeaf {
     pub(crate) fn for_test_at(leaf_path: PathBuf) -> CgroupLeaf {
         let dir = LeafDir::open_for_test(&leaf_path);
         CgroupLeaf {
-            watch: WatchTurns::new(DrainWatch::arm(&dir).expect("arm a test leaf's drain watch")),
+            watch: Box::new(WatchTurns::new(
+                DrainWatch::arm(&dir).expect("arm a test leaf's drain watch"),
+            )),
             dir,
             leaf_path,
             procs_fd: None,
@@ -1164,7 +1167,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     Ok(CgroupLeaf {
         leaf_path,
         dir,
-        watch: WatchTurns::new(Some(watch)),
+        watch: Box::new(WatchTurns::new(Some(watch))),
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,

@@ -322,7 +322,6 @@ pub(crate) fn take_signalled_by_pid() -> usize {
 
 /// Send on `notify` each time a wait on this thread queues for a leaf's drain watch, for the
 /// rest of the thread's life.
-#[cfg(feature = "tokio")]
 pub(crate) fn set_turn_queued_notifier(notify: std::sync::mpsc::Sender<()>) {
     TURN_QUEUED.with(|t| *t.borrow_mut() = Some(notify));
 }
