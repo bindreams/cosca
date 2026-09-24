@@ -17,7 +17,8 @@ a stray child holding one open under `cargo test`'s shared-process model blocks 
 nextest run` avoids this by isolating each test in its own process.
 
 nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
-today.
+today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an
+agent can't run that step locally either — it only runs in CI.
 
 ## License
 

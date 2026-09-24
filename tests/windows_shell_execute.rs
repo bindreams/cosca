@@ -20,8 +20,11 @@
 //! creates any missing parent volatile, and that parent is left behind (seen on arm64, whose HKCU
 //! has no `App Paths` key); it goes at the next reboot, with the ephemeral runner.
 //!
-//! The tests share process-global state — the registry keys, `PATH`, one environment variable —
-//! so each holds [`serial`] for its whole body, whatever `--test-threads` says.
+//! The tests share machine-wide state — the registry keys, `PATH`, one environment variable — so
+//! each holds [`serial`] for its whole body. `serial`'s mutex only serializes within one process;
+//! nextest runs each test in its own process, so `.config/nextest.toml` also caps this binary's
+//! test group at one concurrent test, which is what actually keeps these from racing each other
+//! under nextest.
 #![cfg(windows)]
 
 use std::ffi::{OsStr, OsString};

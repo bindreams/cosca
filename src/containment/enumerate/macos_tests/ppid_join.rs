@@ -107,10 +107,10 @@ fn parents_contains_this_process_edge() {
 /// The precondition assertion is load-bearing, not decoration: the whole point of this test
 /// is that the FALLBACK resolves pid 1, but whether the fallback is even reached depends
 /// entirely on the runner's privilege - root's `proc_pidinfo(1, ..)` succeeds outright, so a
-/// privileged run (a root run — the Linux cgroup lane or a dev VM — or a root CI container) would
-/// satisfy `Found(0)` via the PRIMARY path alone and never exercise the fallback at all, leaving
-/// this test green while silently testing nothing. Asserting non-root up front makes that case
-/// fail loudly instead.
+/// privileged run (a root run on a dev VM, or a root CI container — this file only ever builds
+/// for macOS, so never the Linux cgroup lane) would satisfy `Found(0)` via the PRIMARY path alone
+/// and never exercise the fallback at all, leaving this test green while silently testing
+/// nothing. Asserting non-root up front makes that case fail loudly instead.
 #[test]
 fn ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback() {
     // SAFETY: geteuid takes no arguments and cannot fail.

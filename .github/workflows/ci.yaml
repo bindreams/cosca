@@ -251,9 +251,9 @@ jobs:
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
       # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo nextest run`
-      # anywhere, including the steps above, reports it as `ignored`, never a vacuous `ok`.
-      # This is the one step that opts in, via `--run-ignored only`, after provisioning a COPY of
-      # cosca_testbin that is genuinely setuid-root (owned by root, mode u+s) so the spawned
+      # anywhere, including the steps above, counts it as `skipped`, never runs it to a vacuous
+      # `ok`. This is the one step that opts in, via `--run-ignored only`, after provisioning a
+      # COPY of cosca_testbin that is genuinely setuid-root (owned by root, mode u+s) so the spawned
       # helper process can call setuid(0) itself and become truly unsignalable by this job's
       # ordinary unprivileged user — proving #61's fix against a REAL mixed process group
       # (one signalable member, one genuinely not), not a synthetic one. Only preparing the

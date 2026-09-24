@@ -26,12 +26,12 @@
 //!
 //! # Gating
 //! This test is `#[ignore]`d by default, so an ordinary `cargo nextest run` — locally, or in every
-//! CI step that doesn't explicitly ask for it — prints `... ignored`, never `... ok`. A vacuous
-//! pass that merely returned early (the shape this file used at first) is indistinguishable in the
-//! log from a real one, which is exactly the failure this rule exists to prevent: a test name
-//! reading "ok" must mean the scenario it describes was actually exercised. Only the one CI step
-//! that has provisioned the helper runs it, via `cargo nextest run --test group_teardown_setuid
-//! --run-ignored only` (see
+//! CI step that doesn't explicitly ask for it — counts it in the final `... skipped` tally, never
+//! runs it to `... ok`. A vacuous pass that merely returned early (the shape this file used at
+//! first) is indistinguishable in the log from a real one, which is exactly the failure this rule
+//! exists to prevent: a test name reading "ok" must mean the scenario it describes was actually
+//! exercised. Only the one CI step that has provisioned the helper runs it, via `cargo nextest run
+//! --test group_teardown_setuid --run-ignored only` (see
 //! `.github/workflows/ci.yaml`, the "Run setuid-root process-group teardown test" step, which
 //! follows "Set up setuid-root helper").
 //!
@@ -126,8 +126,8 @@ fn accept_one(listener: &TcpListener) -> Handshake {
 /// `Child::kill_tree` path (not a pure helper, not a fault-injection seam) against a REAL mixed
 /// process group.
 ///
-/// `#[ignore]`d by default so an ordinary `cargo nextest run` reports it honestly as `ignored`, not
-/// a vacuous `ok` — see the module docs' "Gating" section for why, and for the one CI step that
+/// `#[ignore]`d by default so an ordinary `cargo nextest run` counts it as `skipped`, not a
+/// vacuous `ok` — see the module docs' "Gating" section for why, and for the one CI step that
 /// runs it with `--run-ignored only` after provisioning `COSCA_TEST_SETUID_HELPER`.
 #[test]
 #[ignore = "requires COSCA_TEST_SETUID_HELPER (a real setuid-root helper); run with `cargo nextest \
