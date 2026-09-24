@@ -347,9 +347,8 @@ async fn wait_tree_drained_inner(
 }
 
 /// Resolve when every process in the cgroup v2 leaf has EXITED (not reaped), or until `deadline`.
-/// The async twin of `CgroupLeaf::wait_drained`: read the leaf, and only if it has not drained
-/// and the deadline allows, listen to the leaf's `Watcher` (starting its pump), read it again,
-/// and await the next broadcast. It never touches the watch itself, so
+/// The async twin of `CgroupLeaf::wait_drained`, taking the same `CgroupLeaf::drain_step`s and
+/// awaiting each broadcast where the sync wait blocks on it. It never touches the watch itself, so
 /// a future dropped, or never polled again, holds nothing another wait needs. Each round awaits
 /// for exactly the caller's own remaining time; no interval anywhere.
 #[cfg(target_os = "linux")]
@@ -357,27 +356,17 @@ pub(crate) async fn cgroup_wait_tree_drained(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
-    use crate::containment::TreeDrain;
+    use crate::containment::cgroup::DrainStep;
 
     loop {
-        if let Some(drain) = leaf.drain_seen()? {
-            return Ok(drain);
-        }
-        let remaining = crate::wait::remaining(deadline);
-        if remaining == Some(std::time::Duration::ZERO) {
-            return Ok(TreeDrain::MembersRemain);
-        }
-        // Listen, then read: a change after this read is always heard.
-        let listener = leaf.watcher().listen().map_err(Error::Io)?;
-        if let Some(drain) = leaf.drain_seen()? {
-            return Ok(drain);
-        }
-        #[cfg(test)]
-        crate::containment::cgroup::fault::notify_drain_blocking();
-        match remaining {
-            None => listener.await,
-            // A timeout is looked at by the next round, which reads the leaf once more.
-            Some(left) => drop(::tokio::time::timeout(left, listener).await),
+        match leaf.drain_step(deadline)? {
+            DrainStep::Done(drain) => return Ok(drain),
+            DrainStep::Block { listener, left: None } => listener.await,
+            // A timeout is looked at by the next step, which reads the leaf once more.
+            DrainStep::Block {
+                listener,
+                left: Some(left),
+            } => drop(::tokio::time::timeout(left, listener).await),
         }
     }
 }

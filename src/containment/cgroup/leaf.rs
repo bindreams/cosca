@@ -81,6 +81,18 @@ fn proc_state(pid: u32) -> Option<char> {
     parse_proc_stat_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
+/// What [`CgroupLeaf::drain_step`] found.
+#[cfg(target_os = "linux")]
+pub(crate) enum DrainStep {
+    /// The wait's answer.
+    Done(crate::containment::TreeDrain),
+    /// Block on `listener` for `left` (`None`: unbounded), then step again.
+    Block {
+        listener: event_listener::EventListener,
+        left: Option<std::time::Duration>,
+    },
+}
+
 /// A live leaf sub-cgroup created for a single spawned process tree. See
 /// [`place_self_in_cgroup_pre_exec`] for the placement write's contract.
 ///
@@ -488,39 +500,48 @@ impl CgroupLeaf {
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         use event_listener::Listener as _;
 
-        use crate::containment::TreeDrain;
-
         loop {
-            if let Some(drain) = self.drain_seen()? {
-                return Ok(drain);
-            }
-            let remaining = crate::wait::remaining(deadline);
-            if remaining == Some(std::time::Duration::ZERO) {
-                return Ok(TreeDrain::MembersRemain);
-            }
-            // Listen, then read: a change after this read is always heard.
-            let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
-            if let Some(drain) = self.drain_seen()? {
-                return Ok(drain);
-            }
-            #[cfg(test)]
-            fault::notify_drain_blocking();
-            match remaining {
-                None => listener.wait(),
-                // A timeout is looked at by the next round, which reads the leaf once more.
-                Some(left) => drop(listener.wait_timeout(left)),
+            match self.drain_step(deadline)? {
+                DrainStep::Done(drain) => return Ok(drain),
+                DrainStep::Block { listener, left: None } => listener.wait(),
+                // A timeout is looked at by the next step, which reads the leaf once more.
+                DrainStep::Block {
+                    listener,
+                    left: Some(left),
+                } => drop(listener.wait_timeout(left)),
             }
         }
     }
 
-    #[cfg(feature = "tokio")]
-    pub(crate) fn watcher(&self) -> &Watcher {
-        &self.watch
+    /// One step of a wait on the leaf's drain, shared by the sync and async waits: read the leaf,
+    /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump,
+    /// and read it again: a change after that read is always heard, so the caller may block on
+    /// the returned listener for the time left, then take another step.
+    pub(crate) fn drain_step(
+        &self,
+        deadline: Option<Option<std::time::Instant>>,
+    ) -> Result<DrainStep, crate::error::Error> {
+        use crate::containment::TreeDrain;
+
+        if let Some(drain) = self.drain_seen()? {
+            return Ok(DrainStep::Done(drain));
+        }
+        let left = crate::wait::remaining(deadline);
+        if left == Some(std::time::Duration::ZERO) {
+            return Ok(DrainStep::Done(TreeDrain::MembersRemain));
+        }
+        let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
+        if let Some(drain) = self.drain_seen()? {
+            return Ok(DrainStep::Done(drain));
+        }
+        #[cfg(test)]
+        fault::notify_drain_blocking();
+        Ok(DrainStep::Block { listener, left })
     }
 
     /// `Some(AllMembersExited)` if the leaf has drained or is gone; `None` if it still holds a
     /// member; an error if the pump that would report a change has stopped.
-    pub(crate) fn drain_seen(&self) -> Result<Option<crate::containment::TreeDrain>, crate::error::Error> {
+    fn drain_seen(&self) -> Result<Option<crate::containment::TreeDrain>, crate::error::Error> {
         use crate::containment::TreeDrain;
 
         if self.watch.saw_removal() || self.drain_now()? == TreeDrain::AllMembersExited {
@@ -1066,18 +1087,32 @@ pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
     Ok(leaf)
 }
 
+/// A new leaf's name: `cosca-<pid>-<seq>-<random>`. The pid and sequence number name the spawn for
+/// a reader; the 64 random bits keep the name from recurring, as the pid and sequence do across
+/// pid namespaces sharing a delegated parent and across processes reusing a pid. `rmdir` relies
+/// on it: see [`LeafDir::rmdir`].
+#[cfg(target_os = "linux")]
+pub(crate) fn leaf_name() -> io::Result<String> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        "cosca-{}-{seq}-{:016x}",
+        std::process::id(),
+        u64::from_ne_bytes(random)
+    ))
+}
+
 /// Create a containment leaf directly under `current` — the supervisor's own cgroup in
 /// production, and a temp directory in the tests that fail each precondition for real.
 ///
 /// Every early return names its step: the caller degrades either way, but never silently.
 #[cfg(target_os = "linux")]
 pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError> {
-    // Unique leaf name: pid + monotonic sequence counter avoids collisions when
-    // the same process spawns on multiple threads simultaneously (same pid, but
-    // different seq values mean different leaf names).
-    // Safety: getpid() is always valid.
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let leaf_name = format!("cosca-{}-{}", unsafe { libc::getpid() }, seq);
+    let leaf_name = leaf_name().map_err(|source| LeafError::CreateLeafDir {
+        path: current.join("cosca-*"),
+        source,
+    })?;
     let leaf_path = current.join(&leaf_name);
 
     let dir = LeafDir::create(current, &leaf_name).map_err(|source| LeafError::CreateLeafDir {

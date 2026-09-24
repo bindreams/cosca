@@ -154,3 +154,46 @@ fn cgroup_the_child_sweep_never_crosses_a_mount() {
         "the sweep crossed the mount and deleted the victim's directories"
     );
 }
+
+/// `rmdir` removes the leaf it holds.
+#[test]
+fn rmdir_removes_the_held_leaf() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let leaf = parent.path().join("cosca-held");
+    std::fs::create_dir(&leaf).expect("make the leaf");
+    LeafDir::open_for_test(&leaf).rmdir().expect("rmdir");
+    assert!(!leaf.exists());
+}
+
+/// A leaf whose name now names another directory is already gone: `rmdir` leaves that directory
+/// alone and answers as for a removed leaf.
+#[test]
+fn rmdir_spares_a_directory_that_took_the_leafs_name() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let leaf = parent.path().join("cosca-swapped");
+    std::fs::create_dir(&leaf).expect("make the leaf");
+    let dir = LeafDir::open_for_test(&leaf);
+    std::fs::rename(&leaf, parent.path().join("elsewhere")).expect("move the leaf away");
+    std::fs::create_dir(&leaf).expect("make a stranger under the leaf's name");
+
+    dir.rmdir().expect("the leaf is already gone");
+    assert!(leaf.exists(), "the stranger under the leaf's name must survive");
+}
+
+/// The same holds for a symlink that took the name: it is not followed.
+#[test]
+fn rmdir_spares_a_symlink_that_took_the_leafs_name() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let leaf = parent.path().join("cosca-linked");
+    std::fs::create_dir(&leaf).expect("make the leaf");
+    let dir = LeafDir::open_for_test(&leaf);
+    let moved = parent.path().join("moved");
+    std::fs::rename(&leaf, &moved).expect("move the leaf away");
+    std::os::unix::fs::symlink(&moved, &leaf).expect("link the leaf's name to it");
+
+    dir.rmdir().expect("the name no longer names the leaf");
+    assert!(
+        moved.exists(),
+        "the leaf behind the link must not be removed through it"
+    );
+}

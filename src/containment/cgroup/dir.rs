@@ -117,8 +117,16 @@ impl LeafDir {
         std::fs::File::from(fd).write_all(bytes)
     }
 
-    /// `rmdir` the leaf from its parent.
+    /// `rmdir` the leaf from its parent, if its name still names it. `unlinkat` goes by name, so
+    /// the name's inode is checked against the held leaf's first; if they differ, the leaf is
+    /// already gone and whatever holds its name is left alone. A random part in every leaf name
+    /// ([`leaf_name`](super::leaf_name)) keeps anyone else from taking the name in between.
     pub(crate) fn rmdir(&self) -> io::Result<()> {
+        let held = rustix::fs::fstat(&self.dir)?;
+        let named = rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino) {
+            return Ok(());
+        }
         Ok(rustix::fs::unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR)?)
     }
 

@@ -46,8 +46,7 @@ struct Shared {
     /// Why the pump stopped on its own, if it did: waits then report it rather than wait on a
     /// pump that will not broadcast again.
     failure: Mutex<Option<String>>,
-    /// The leaf's name, for the test seams.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The leaf's name, for reports.
     name: std::ffi::OsString,
 }
 
@@ -108,7 +107,10 @@ impl Watcher {
         // An eventfd write fails only on counter overflow, which one write cannot reach.
         let _ = rustix::io::write(&pump.stop, &1u64.to_ne_bytes());
         if pump.thread.join().is_err() {
-            log::warn!("a cgroup leaf's drain pump panicked");
+            log::warn!(
+                "the drain pump of cgroup leaf {} panicked",
+                self.shared.name.to_string_lossy()
+            );
         }
     }
 
@@ -184,6 +186,11 @@ fn run_pump(shared: &Shared, stop: &OwnedFd) {
             #[cfg(test)]
             super::fault::notify_pump_batch(&shared.name, changed);
         }
+    } else {
+        // Every leaf a wait can block on holds a watch: a waitable leaf without one reads as
+        // drained before any wait listens.
+        fail(shared, "its watch was never armed".into());
+        debug_assert!(false, "a cgroup leaf's pump started with no watch armed");
     }
     drop(watch);
     #[cfg(test)]

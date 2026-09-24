@@ -1720,9 +1720,16 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
     let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
     let root_cgroup = unified_cgroup(&root_cgroup).to_string();
     let leaf_prefix = format!("{own}/cosca-{}-", std::process::id());
+    // A leaf is `cosca-<pid>-<seq>-<random>`.
     let in_leaf = root_cgroup
         .strip_prefix(&leaf_prefix)
-        .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()));
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(seq, random)| {
+            !seq.is_empty()
+                && seq.bytes().all(|b| b.is_ascii_digit())
+                && random.len() == 16
+                && random.bytes().all(|b| b.is_ascii_hexdigit())
+        });
     let expected = if deny_pidfd && slots.len() >= 2 {
         // `spawn` can return before the report, which cannot be waited for: either side of the
         // leaf is right, as long as it is reported.
@@ -1741,7 +1748,7 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
         (containment, in_leaf),
         expected,
         "slots {slots:?}, pidfd denied: {deny_pidfd}: cosca reports {containment:?}, and the \
-         child is in {root_cgroup} (its leaf would be {leaf_prefix}<seq>)"
+         child is in {root_cgroup} (its leaf would be {leaf_prefix}<seq>-<random>)"
     );
     let worker_cgroup = std::fs::read_to_string(format!("/proc/{worker_pid}/cgroup")).expect("worker cgroup");
     assert_eq!(

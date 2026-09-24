@@ -97,8 +97,10 @@ nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"
 command-fds = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Queues waits on a cgroup leaf's one held drain watch, for sync and async waiters alike.
+# Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
 event-listener = "5"
+# The random part of a cgroup leaf's name.
+getrandom = "0.4"
 rustix = { version = "1", features = ["process", "event", "net", "fs"] }
 
 [[bin]]

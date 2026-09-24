@@ -1317,6 +1317,31 @@ fn a_siblings_removal_wakes_no_wait() {
     );
 }
 
+/// A pump started with no watch fails, waking its waits with the reason, rather than exiting
+/// silently. Debug builds also assert it: every leaf that can be waited on holds a watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pump_without_a_watch_fails_loudly() {
+    use event_listener::Listener as _;
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let watcher = crate::containment::cgroup::Watcher::new(None, "cosca-unwatched".into());
+    let listener = watcher.listen().expect("start the pump");
+    listener.wait();
+    assert!(
+        watcher.failure().is_some_and(|why| why.contains("never armed")),
+        "{:?}",
+        watcher.failure()
+    );
+    drop(watcher);
+    assert_eq!(
+        crate::log_capture::contains_since(mark, "cosca-unwatched"),
+        cfg!(debug_assertions),
+        "the joined pump panicked on its debug assertion in exactly the builds that keep it"
+    );
+}
+
 /// The pump's thread name fits Linux's 15 bytes, which would truncate it.
 #[cfg(target_os = "linux")]
 #[test]
@@ -2734,4 +2759,24 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
         .to_string();
     assert!(err.contains("drain could not be watched"), "got {err}");
     child.wait().expect("reap the child");
+}
+
+/// A leaf's name carries 64 random bits past the pid and sequence number, which repeat across
+/// pid namespaces sharing a delegated parent, and across processes reusing a pid.
+#[cfg(target_os = "linux")]
+#[test]
+fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
+    let suffix = |name: String| {
+        let parts = name.split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4, "cosca-<pid>-<seq>-<random>: {name}");
+        assert_eq!((parts[0], parts[1]), ("cosca", std::process::id().to_string().as_str()));
+        assert!(
+            parts[3].len() == 16 && parts[3].bytes().all(|b| b.is_ascii_hexdigit()),
+            "{name}"
+        );
+        parts[3].to_owned()
+    };
+    let a = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
+    let b = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
+    assert_ne!(a, b);
 }
