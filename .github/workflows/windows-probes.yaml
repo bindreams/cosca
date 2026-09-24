@@ -110,9 +110,10 @@ jobs:
       # They run on every schedule and pull-request run too, so a change to that code, or a new
       # Windows build, re-measures it. They measure an ELEVATED caller's launch, not the consent
       # route cosca takes from an unelevated one, so the elevated path's rules do not rest on them.
-      # These tests share machine-wide state and must not run concurrently with each other; unlike
-      # the old `cargo test ... --test-threads=1`, nothing here enforces that — it comes from the
-      # `windows-shell-execute` test group capped at one thread in `.config/nextest.toml`.
+      # These tests share machine-wide state (the App Paths keys) and must not run concurrently
+      # with each other. `--no-capture` already forces nextest to run every test in this
+      # invocation serially; the `windows-shell-execute` test group capped at one thread in
+      # `.config/nextest.toml` gives the same guarantee independent of that flag.
       - name: Run elevating probes
         if: github.event_name != 'workflow_dispatch' || inputs.elevating
         shell: bash

@@ -168,10 +168,9 @@ fn a_retained_supervisor_write_end_is_refused_not_waited_on() {
         "expected Error::Containment, got {err:?}"
     );
     drop(w);
-    // NOT `assert_eq!(..., Clear)`: under a plain `cargo test`, which runs every test in this
-    // crate in one shared process, this process's fd table is being churned by every other test
-    // running at the same moment. The property under test is that a CLEARED write end is never
-    // mistaken for a still-held one.
+    // NOT `assert_eq!(..., Clear)`: under a plain `cargo test` (see `marker_pipe`'s doc), this
+    // process's fd table is being churned by every other test running at the same moment. The
+    // property under test is that a CLEARED write end is never mistaken for a still-held one.
     assert_ne!(super::write_end_check(r.as_fd()), super::WriteEndCheck::HeldByUs);
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
@@ -507,8 +506,8 @@ fn a_quiet_live_holder_blocks_without_spending_cpu() {
     //
     // CPU is measured on THIS THREAD specifically (`CLOCK_THREAD_CPUTIME_ID`, not
     // `getrusage(RUSAGE_SELF)`, which is process-wide and would fold in whatever CPU work other
-    // tests do on other threads during the same window, under a plain `cargo test`, which runs
-    // every test in this crate in one shared process).
+    // tests do on other threads during the same window under a plain `cargo test` — see
+    // `marker_pipe`'s doc).
     let (child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
     let deadline = Duration::from_millis(300);
     let cpu_before = self_thread_cpu_time();
@@ -617,9 +616,9 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
 
 /// This CALLING THREAD's own CPU time, via `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` — NOT
 /// `getrusage(RUSAGE_SELF)`, which is process-wide and would be contaminated by whatever other
-/// tests are running concurrently during the same measurement window, under a plain `cargo test`,
-/// which runs every test in this crate in one shared process. Used only to distinguish "blocked"
-/// from "busy-polled" in the quiet-holder test above — no production code depends on it.
+/// tests are running concurrently during the same measurement window under a plain `cargo test`
+/// (see `marker_pipe`'s doc). Used only to distinguish "blocked" from "busy-polled" in the
+/// quiet-holder test above — no production code depends on it.
 fn self_thread_cpu_time() -> Duration {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: clock_gettime writes a fixed-size struct; pointer matches.

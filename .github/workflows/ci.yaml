@@ -29,7 +29,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # tools/skuld-migrate and tools/no-libtest (PR 2) run their own tests under nextest too.
+      # tools/skuld-migrate and tools/no-libtest also run their own tests under nextest.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -163,14 +163,14 @@ jobs:
           cargo package --list --locked --target "$TARGET" > "$LIST"
 
           set +e
-          grep -qE '^(testbin/|tests/|\.github/|\.claude/|prek\.toml$)' "$LIST"
+          grep -qE '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
           grep_status=$?
           set -e
 
           case "$grep_status" in
             0)
               echo "::error::Excluded paths leaked into the package:"
-              grep -E '^(testbin/|tests/|\.github/|\.claude/|prek\.toml$)' "$LIST"
+              grep -E '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
               exit 1
               ;;
             1) echo "no excluded paths in the package" ;;
@@ -228,7 +228,7 @@ jobs:
       # (as root, single-threaded) — across the `spawn_io` integration binary, the
       # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
       # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
-      # post-fork failure path), and `tokio_io` once #157 lands; its cgroup tests that
+      # post-fork failure path), and `tokio_io`; its cgroup tests that
       # cannot be a no-op are `#[ignore]`d, hence `--run-ignored all`. With the marker
       # set the tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable
       # — never a silent skip.

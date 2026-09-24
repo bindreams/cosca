@@ -20,10 +20,13 @@
 //! creates any missing parent volatile, and that parent is left behind (seen on arm64, whose HKCU
 //! has no `App Paths` key); it goes at the next reboot, with the ephemeral runner.
 //!
-//! The tests share machine-wide state — the registry keys, `PATH`, one environment variable — so
-//! each holds [`serial`] for its whole body. `serial`'s mutex only serializes within one process;
-//! nextest runs each test in its own process, so `.config/nextest.toml` also caps this binary's
-//! test group at one concurrent test, which is what actually keeps these from racing each other
+//! The tests share machine-wide state — the registry keys — so each holds [`serial`] for its
+//! whole body too, a holdover from when `cargo test` ran every test in one shared process and
+//! `PATH` and one environment variable were process-global state as well. Under nextest's
+//! one-process-per-test model, `PATH` and that env var are already isolated per test; only the
+//! registry keys are genuinely machine-wide, and `serial`'s mutex only serializes within one
+//! process, so it cannot reach across processes to guard them — `.config/nextest.toml`'s test
+//! group, capped at one concurrent test, is what actually keeps these from racing each other
 //! under nextest.
 #![cfg(windows)]
 

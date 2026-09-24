@@ -4,10 +4,12 @@ nextest-version = { required = "0.9.137" }
 fail-fast = false
 
 [test-groups]
-# `tests/windows_shell_execute.rs` serializes its tests with an in-process mutex because they
-# share machine-wide state (registry keys, PATH, one env var). That mutex only serializes threads
-# of one process, but nextest runs each test in its own process by default, so it does nothing
-# across processes. This group caps concurrency for that binary at one test at a time instead.
+# `tests/windows_shell_execute.rs` serializes its tests with an in-process mutex, a holdover from
+# when `cargo test` ran them all in one shared process — there PATH and one env var were also
+# process-global state the mutex had to guard. Under nextest's one-process-per-test model, PATH
+# and that env var are already isolated per test; only the registry keys (App Paths, in HKLM and
+# HKCU) are genuinely machine-wide, and the in-process mutex cannot reach across processes to
+# guard them. This group caps concurrency for that binary at one test at a time instead.
 windows-shell-execute = { max-threads = 1 }
 
 [[profile.default.overrides]]

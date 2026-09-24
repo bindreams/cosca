@@ -9,12 +9,9 @@ The API is not stable; expect breaking changes in any 0.x release.
 ## Running tests
 
 Use [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`), run as `cargo nextest
-run`. It's what CI runs, and it's the recommended way to run cosca's suite locally.
-
-Once cosca's suite moves onto Skuld, plain `cargo test` will be able to hang when a child process
-outlives its test: Skuld captures each test's stdout/stderr and waits for those pipes to close, and
-a stray child holding one open under `cargo test`'s shared-process model blocks the run. `cargo
-nextest run` avoids this by isolating each test in its own process.
+run`. It's what CI runs, and it's the recommended way to run cosca's suite locally: nextest
+isolates each test in its own process, rather than sharing one process across the whole run the
+way plain `cargo test` does.
 
 nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
 today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an

@@ -1105,8 +1105,8 @@ fn drop_kills_contained_tree() {
 
 // cgroup v2 integration tests =====
 // Linux only, and `#[ignore]`d: they need a delegated cgroup, which CI provisions and then runs
-// them with `--include-ignored` and COSCA_TEST_CGROUP=1. Run without the marker, each fails
-// loudly rather than pass having tested nothing.
+// them with `nextest run --run-ignored all` and COSCA_TEST_CGROUP=1. Run without the marker, each
+// fails loudly rather than pass having tested nothing.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
