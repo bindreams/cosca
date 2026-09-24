@@ -27,13 +27,14 @@ use std::fmt;
 pub enum Containment {
     /// Linux cgroup v2 leaf + `cgroup.kill`. Fork-proof; a confined child can't leave.
     ///
-    /// Dropping the handle kills the tree, waits while any process remains in the leaf, and
-    /// removes the leaf directory, reporting at `warn` a leaf it cannot remove. It tries once:
-    /// after the kill and the drain, a leaf still refusing removal holds something another party
-    /// put there since — a process moved in, a child cgroup, or a mount. The wait is almost
-    /// always instant. It lasts while a member stuck in D state stays stuck, while a process
-    /// moved in after the kill runs, and, on kernels before 6.14, while a child forked at the
-    /// moment of the kill runs; see [`kill_on_drop`](crate::Command::kill_on_drop).
+    /// Dropping the handle kills the tree, waits for it to drain, then removes the leaf directory
+    /// once, reporting at `warn` a leaf that still refuses removal: something another party put
+    /// there since — a process moved in, a child cgroup, or a mount. See
+    /// [`kill_on_drop`](crate::Command::kill_on_drop) for how long the wait can run.
+    ///
+    /// The removal goes by the leaf's name, checked first against the leaf cosca holds. A party
+    /// with write access to the delegated parent, which already controls the subtree, can still
+    /// swap the name between the check and the removal.
     ///
     /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
     /// `fs.inotify.max_user_instances` (128 per user by default). A spawn that cannot get one is
