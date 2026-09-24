@@ -42,9 +42,7 @@ pub(crate) fn removed_after_drain(e: &io::Error) -> bool {
 }
 
 /// Seek to the start of `file` (a `cgroup.events` handle) and read its current `populated`
-/// value. Shared verbatim by `CgroupLeaf::wait_drained`'s sync loop and its tokio twin,
-/// `cgroup_wait_tree_drained` — the only difference between the two callers is how each awaits
-/// the next readiness edge, not how either reads or classifies the file.
+/// value. The one read of a held `cgroup.events`, behind [`DrainWatch::populated`].
 ///
 /// A leaf removed after every member has exited (see [`removed_after_drain`]) is reported as
 /// `Ok(false)`: the leaf's own removal is itself proof of a full drain, indistinguishable in
@@ -627,12 +625,12 @@ impl Drop for CgroupLeaf {
         };
         // `Drop` kills only when both hold:
         //
-        // | entered | armed | Drop                                         |
-        // |---------|-------|----------------------------------------------|
-        // | true    | true  | rmdir; if it fails, cgroup.kill, drain, rmdir |
-        // | true    | false | one rmdir: the caller opted the tree out     |
-        // | false   | true  | one rmdir: the child never entered the leaf  |
-        // | false   | false | one rmdir: the child never entered the leaf  |
+        // | entered | armed | Drop                                                 |
+        // |---------|-------|------------------------------------------------------|
+        // | true    | true  | rmdir; if it fails, cgroup.kill, drain, sweep, rmdir |
+        // | true    | false | one rmdir: the caller opted the tree out             |
+        // | false   | true  | one rmdir: the child never entered the leaf          |
+        // | false   | false | one rmdir: the child never entered the leaf          |
         if !self.child_entered() {
             if !removed_after_drain(&first) {
                 warn_leaf_left_behind(
@@ -1144,6 +1142,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     // Armed now, so that no teardown of this leaf can later find itself without a watch.
     let watch = match DrainWatch::arm(&dir) {
         Ok(Some(watch)) => watch,
+        // The leaf has no `cgroup.events`: another party removed it since the `mkdir`.
         Ok(None) => {
             return Err(fail(
                 &leaf_path,

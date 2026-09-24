@@ -483,7 +483,11 @@ impl Command {
     /// almost always instant, since every member was just sent `SIGKILL`. It lasts as long as a
     /// member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
     /// another party (the same uid, or root) moves into the leaf after the kill keeps running:
-    /// the kill reaches only the processes in the leaf when it is written. Under every other
+    /// the kill reaches only the processes in the leaf when it is written. On kernels before
+    /// 6.14 (without commit b69bb476dee9, "cgroup: fix race between fork and cgroup.kill"), a
+    /// child a member forks at the moment of the kill can escape it too, and the drop waits for
+    /// that child's whole life. Neither case raises an event cosca could re-kill on: `populated`
+    /// does not change, and a fork writes no file. Under every other
     /// mechanism descendants are killed, not waited for. To wait explicitly, call
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///

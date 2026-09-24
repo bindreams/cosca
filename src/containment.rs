@@ -31,13 +31,17 @@ pub enum Containment {
     /// removes the leaf directory, reporting at `warn` a leaf it cannot remove. It tries once:
     /// after the kill and the drain, a leaf still refusing removal holds something another party
     /// put there since — a process moved in, a child cgroup, or a mount. The wait is almost
-    /// always instant; see [`kill_on_drop`](crate::Command::kill_on_drop) for what can prolong it.
+    /// always instant. It lasts while a member stuck in D state stays stuck, while a process
+    /// moved in after the kill runs, and, on kernels before 6.14, while a child forked at the
+    /// moment of the kill runs; see [`kill_on_drop`](crate::Command::kill_on_drop).
     ///
     /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
     /// `fs.inotify.max_user_instances` (128 per user by default). A spawn that cannot get one is
-    /// not contained in a leaf, and degrades as for any other failed step. A handle that opted out — [`Child::detach`](crate::Child::detach)
-    /// or [`kill_on_drop(false)`](crate::Command::kill_on_drop) — never kills, and removes the
-    /// leaf only if the tree has already exited; see `kill_on_drop` for when it stays.
+    /// not contained in a leaf, and degrades as for any other failed step.
+    ///
+    /// A handle that opted out — [`Child::detach`](crate::Child::detach) or
+    /// [`kill_on_drop(false)`](crate::Command::kill_on_drop) — never kills, and removes the leaf
+    /// only if the tree has already exited; see `kill_on_drop` for when it stays.
     CgroupV2,
     /// Windows Job Object + `KILL_ON_JOB_CLOSE`. Kernel-enforced for direct descendants.
     JobObject,
