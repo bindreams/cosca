@@ -1,0 +1,4 @@
+nextest-version = { required = "0.9.137" }
+
+[profile.ci]
+fail-fast = false
