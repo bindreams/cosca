@@ -22,10 +22,14 @@ use crate::child::unreaped::{Held, Retained};
 ///
 /// On Unix a `wait` can see the child exit before it is reapable: macOS reports the exit before
 /// the zombie exists, and a tracer holds a traced child until it releases it. The child then moves
-/// to a blocking-pool task that waits until it is reapable and reaps it. That wait is bounded by
-/// the exit, which has happened, and by the tracer's release. A `wait` cancelled meanwhile leaves
-/// the task holding the child: the next `wait` takes its result, `Drop` blocks until the task has
-/// finished, and `leak` lets it finish and disarms what the child retained.
+/// to a blocking-pool task that waits until it is reapable and reaps it. The exit has already
+/// happened, so only the tracer's release can still delay that wait — and a tracer that never
+/// releases it never lets the wait end: it ends once the child is reapable, not within any bound
+/// on how long that takes. A `wait` cancelled meanwhile leaves the task holding the child: the next
+/// `wait` takes its result, and `Drop` blocks until the task has finished. `leak` gives the task up
+/// instead of waiting on it: the task keeps running, unowned, and disarms what the child retained
+/// once it finally reaps it — for as long as a stalled tracer holds it, with nothing left
+/// afterward to reach the task, wait on it, or bound how long that takes.
 ///
 /// If the runtime shuts down before that task ever runs, it is dropped unrun, still `NotStarted`.
 /// `wait` and `Drop` tell that apart from a real report by reclaiming the child back from
@@ -278,6 +282,16 @@ impl RetainedDrain {
             "take_blocking on a task that has not claimed what it must drop would wait on pool scheduling"
         );
         while matches!(*state, DrainState::Committed) {
+            // Fires once per iteration actually reached, for a test: unlike `blocked` on
+            // `Unreaped` (which only proves this branch of `Drop` was taken, not that the wait
+            // loop itself ran), this witnesses the loop condition having genuinely found
+            // `Committed` and being about to park on the condvar — the one thing a `take_blocking`
+            // that skipped waiting entirely (round-7 review, mutant B) can never make true, on any
+            // schedule, since it never reaches this line at all.
+            #[cfg(test)]
+            if let Some(hook) = fault::take_before_take_blocking_wait() {
+                hook();
+            }
             state = self
                 .finished
                 .wait(state)
@@ -315,12 +329,15 @@ struct DrainTask {
     /// racing the task's own progress to `Finished`.
     #[cfg(test)]
     after_claim: Option<Box<dyn FnOnce() + Send + Sync>>,
-    /// Run once, right before `finish` drops what it retained — the real kill-through — for a
-    /// test. Cross-platform, unlike `crate::containment::cgroup::fault::set_next_kill_thread_hook`,
-    /// which reaches this same moment only on a Linux cgroup leaf, from inside its `cgroup.kill`
-    /// write; this reaches it for every `Attached` kind, on every platform.
+    /// Run once, right after `finish` drops what it retained — the real kill-through — and before
+    /// the state settles to `Finished` and notifies, for a test: gating here, rather than before
+    /// the drop, proves the drop already ran without also proving anything about when it ran
+    /// relative to the settle a mutant could move earlier (round-7 review, mutant A). Cross-platform,
+    /// unlike `crate::containment::cgroup::fault::set_next_kill_thread_hook`, which reaches this
+    /// same moment only on a Linux cgroup leaf, from inside its `cgroup.kill` write; this reaches
+    /// it for every `Attached` kind, on every platform.
     #[cfg(test)]
-    before_drop: Option<Box<dyn FnOnce() + Send + Sync>>,
+    after_drop: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl DrainTask {
@@ -358,27 +375,29 @@ impl DrainTask {
     /// (see `Retained`'s doc) — and only THEN settle the state to `Finished` and notify.
     ///
     /// Unlike `ReapTask::report`, which only ever hands its result back for a later consumer to
-    /// drop, this task performs the drop itself: notifying any earlier — before the drop, as an
-    /// initial version of this did — would tell a waiter (`wait`'s `await_draining`, or `Drop`'s
-    /// `take_blocking`) the teardown is done while it is, in fact, still running on this thread.
-    /// That earlier ordering is what let `wait` observe a cgroup leaf's `cgroup.kill` not yet
-    /// written right after a successful reap — caught by
-    /// `probe_tokio_wait_returns_only_after_the_retained_drop_ran` in `leaf_tests.rs`, and by this
-    /// module's own `wait_returns_only_after_the_retained_drop_ran` on every platform. A panic
-    /// mid-drop cannot hang either waiter regardless of this ordering: `catch_unwind` below always
-    /// reaches the settle-and-notify step that follows it.
+    /// drop, this task performs the drop itself: notifying before the drop has actually run would
+    /// tell a waiter (`wait`'s `await_draining`, or `Drop`'s `take_blocking`) the teardown is done
+    /// while it is not. An initial version of this let exactly that happen, and `wait` observed a
+    /// cgroup leaf's `cgroup.kill` not yet written right after a successful reap — caught by
+    /// `probe_tokio_wait_returns_only_after_the_retained_drop_ran` in `leaf_tests.rs`. This
+    /// module's own `wait_returns_only_after_the_retained_drop_ran` catches the same bug
+    /// cross-platform: `after_drop` gates right here, between the drop above and the settle below,
+    /// so any notify moved earlier than this point — however it is moved — has already run by the
+    /// time the gate is even reached, and `wait`'s biased `select!` catches it having won that race
+    /// instead of losing it. A panic mid-drop cannot hang either waiter regardless of this
+    /// ordering: `catch_unwind` below always reaches the settle-and-notify step that follows it.
     fn finish(&mut self) {
         let retained = self.retained.take().expect("claimed above, reported once");
-        #[cfg(test)]
-        if let Some(hook) = self.before_drop.take() {
-            hook();
-        }
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retained))).is_err() {
             // A consumer's `Log` impl is untrusted: keep its own panic from unwinding out of a
             // blocking-pool task, the same as `crate::tokio::child::reaper`'s teardown does.
             let _ = std::panic::catch_unwind(|| {
                 log::warn!("releasing what a reaped child retained panicked on the blocking pool");
             });
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_drop.take() {
+            hook();
         }
         let mut state = self.shared.state();
         *state = DrainState::Finished;
@@ -654,7 +673,7 @@ impl Unreaped {
             #[cfg(test)]
             after_claim: fault::take_after_drain_claim(),
             #[cfg(test)]
-            before_drop: fault::take_before_drain_drop(),
+            after_drop: fault::take_after_drain_drop(),
         };
         // The task reports through `shared`, run or not, so its handle is not needed.
         drop(::tokio::task::spawn_blocking(move || task.run()));
@@ -764,6 +783,13 @@ impl Unreaped {
     /// same claim, committed to kill-through (see `DrainState`'s doc), and is not recalled — `leak`
     /// disarms it only if it has not yet been claimed; otherwise it returns while the kill-through
     /// it can no longer stop keeps running.
+    ///
+    /// That still-running task is, in both cases, unbounded, and `leak` neither bounds it nor hands
+    /// back anything that could: the reap task blocks in `waitid` until the child is reapable — a
+    /// tracer that never releases it stalls the task exactly as long as it would have stalled `wait`
+    /// or `Drop` — and the drain task blocks the same way on whatever the kill-through itself
+    /// blocks on. `wait` can be cancelled again and `Drop` blocks on the same wait itself; `leak`
+    /// gives up both, so from its return the task runs on, unowned, for as long as that takes.
     pub fn leak(mut self) {
         if let Some((shared, _)) = self.draining.take() {
             match shared.reclaim_before_start() {
@@ -778,15 +804,26 @@ impl Unreaped {
                     );
                 }
                 // Already claimed: committed to kill-through by that same claim (see `DrainState`'s
-                // doc) — a drain already claimed is not recalled. `leak` returns while it runs,
-                // rather than wait for a blocking pool that may be saturated.
+                // doc) — a drain already claimed is not recalled, whether it is still running the
+                // real kill-through or has already finished it: only `reclaim_before_start`'s
+                // `NotStarted` check above tells the two apart from `Taken`, so peek again here,
+                // for the log alone, to tell `Committed` apart from `Finished` — the log is only as
+                // fresh as this peek, since the task may still be running concurrently.
                 None => {
-                    log::warn!(
-                        "leaking unkillable child {}: a drain already claimed what it retained and \
-                         is killing through it on the blocking pool; leak returns without waiting \
-                         for it",
-                        self.pid
-                    );
+                    if matches!(*shared.state(), DrainState::Committed) {
+                        log::warn!(
+                            "leaking unkillable child {}: a drain already claimed what it retained \
+                             and is killing through it on the blocking pool; leak returns without \
+                             waiting for it",
+                            self.pid
+                        );
+                    } else {
+                        log::warn!(
+                            "leaking unkillable child {}: a drain already claimed what it retained \
+                             and finished killing through it before leak ran",
+                            self.pid
+                        );
+                    }
                 }
             }
             return;
@@ -810,8 +847,8 @@ impl Unreaped {
                     *state = ReapState::Leaked;
                     log::warn!(
                         "leaking unkillable child {}: its blocking reap is still waiting for it to become \
-                         reapable, and will release what it retained (disarmed, not killed through) once \
-                         it finishes",
+                         reapable — unbounded if a tracer holds it — and will keep running, unowned, until \
+                         it does, then release what it retained (disarmed, not killed through)",
                         self.pid
                     );
                     return;
@@ -1106,7 +1143,8 @@ pub(crate) mod fault {
         #[cfg(unix)]
         static AFTER_CLAIM: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
         static AFTER_DRAIN_CLAIM: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
-        static BEFORE_DRAIN_DROP: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
+        static AFTER_DRAIN_DROP: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
+        static BEFORE_TAKE_BLOCKING_WAIT: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
     }
     /// Run `hook` once a `ReapTask` spawned next — by `spawn_blocking_reap`, sampled here on the
     /// submitting thread, before the task moves to the blocking pool — has claimed the child
@@ -1124,23 +1162,39 @@ pub(crate) mod fault {
     /// drop (state `Committed`), right on the task's own blocking-pool thread, having thereby
     /// committed to kill-through (see `DrainState`'s doc: claiming and committing are the same
     /// step).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // its callers are Linux cgroup tests
+    #[cfg_attr(windows, allow(dead_code))] // its callers are a Linux cgroup test and a cross-platform Unix test
     pub(crate) fn set_after_drain_claim(hook: Box<dyn FnOnce() + Send + Sync>) {
         AFTER_DRAIN_CLAIM.with(|f| *f.borrow_mut() = Some(hook));
     }
     pub(crate) fn take_after_drain_claim() -> Option<Box<dyn FnOnce() + Send + Sync>> {
         AFTER_DRAIN_CLAIM.with(|f| f.borrow_mut().take())
     }
-    /// Run `hook` once a `DrainTask` spawned next reaches `finish`, right before it drops what it
-    /// retained — the real kill-through — on the task's own blocking-pool thread. Cross-platform,
-    /// unlike `crate::containment::cgroup::fault::set_next_kill_thread_hook`, which reaches this
-    /// same moment only on a Linux cgroup leaf, from inside its `cgroup.kill` write: this reaches
-    /// it for every `Attached` kind, on every platform.
-    pub(crate) fn set_before_drain_drop(hook: Box<dyn FnOnce() + Send + Sync>) {
-        BEFORE_DRAIN_DROP.with(|f| *f.borrow_mut() = Some(hook));
+    /// Run `hook` once a `DrainTask` spawned next reaches `finish`, right after it drops what it
+    /// retained — the real kill-through — and before the state settles to `Finished` and notifies,
+    /// on the task's own blocking-pool thread. Cross-platform, unlike
+    /// `crate::containment::cgroup::fault::set_next_kill_thread_hook`, which reaches this same
+    /// moment only on a Linux cgroup leaf, from inside its `cgroup.kill` write: this reaches it for
+    /// every `Attached` kind, on every platform.
+    pub(crate) fn set_after_drain_drop(hook: Box<dyn FnOnce() + Send + Sync>) {
+        AFTER_DRAIN_DROP.with(|f| *f.borrow_mut() = Some(hook));
     }
-    pub(crate) fn take_before_drain_drop() -> Option<Box<dyn FnOnce() + Send + Sync>> {
-        BEFORE_DRAIN_DROP.with(|f| f.borrow_mut().take())
+    pub(crate) fn take_after_drain_drop() -> Option<Box<dyn FnOnce() + Send + Sync>> {
+        AFTER_DRAIN_DROP.with(|f| f.borrow_mut().take())
+    }
+    /// Run `hook` from inside `RetainedDrain::take_blocking`'s wait loop, right before it parks on
+    /// the condvar — reached only once the loop condition has itself observed `Committed`, so
+    /// reaching this at all already proves the wait loop runs (round-7 review, mutant B skips it
+    /// via `while false && ...`, which can never reach this line on any schedule). Unlike the other
+    /// hooks above, which are sampled on a submitting thread and carried to the blocking pool inside
+    /// a spawned task, `take_blocking` runs synchronously on whichever thread calls it (typically
+    /// `Drop for Unreaped`): set this hook on that same thread, immediately before triggering the
+    /// call that reaches `take_blocking`.
+    #[cfg_attr(windows, allow(dead_code))] // its one caller is a Unix test
+    pub(crate) fn set_before_take_blocking_wait(hook: Box<dyn FnOnce() + Send + Sync>) {
+        BEFORE_TAKE_BLOCKING_WAIT.with(|f| *f.borrow_mut() = Some(hook));
+    }
+    pub(crate) fn take_before_take_blocking_wait() -> Option<Box<dyn FnOnce() + Send + Sync>> {
+        BEFORE_TAKE_BLOCKING_WAIT.with(|f| f.borrow_mut().take())
     }
     /// Make the next wait on this thread find the child's ownership uncertain, as `ECHILD` does.
     #[cfg_attr(windows, allow(dead_code))] // its one caller is a Unix test
