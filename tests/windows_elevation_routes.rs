@@ -44,11 +44,13 @@
 //! cargo nextest run --test windows_elevation_routes --run-ignored only --no-capture
 //! ```
 //!
-//! Two probes additionally refuse to run — loudly, by panicking, never by skipping — unless an
+//! Three probes additionally refuse to run — loudly, by panicking, never by skipping — unless an
 //! environment variable says the host is disposable:
 //!
-//! - `COSCA_PROBE_ALLOW_ACCOUNTS=1` — creates and deletes a local user account.
-//! - `COSCA_PROBE_ALLOW_STATE=1` — registers and deletes a scheduled task.
+//! - `COSCA_PROBE_ALLOW_ACCOUNTS=1` — creates and deletes a local user account. Required by
+//!   [`does_create_process_with_logon_elevate`] and [`which_logon_types_return_a_filtered_token`].
+//! - `COSCA_PROBE_ALLOW_STATE=1` — registers and deletes a scheduled task. Required by
+//!   [`can_this_caller_register_a_runlevel_highest_task`].
 //!
 //! `does_create_process_with_logon_elevate` and `which_logon_types_return_a_filtered_token` both
 //! create their scratch accounts under the same two fixed names (`coscaprobeadm`,
@@ -85,16 +87,18 @@ use windows::Win32::System::SystemServices::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW, CreateProcessWithTokenW, GetCurrentProcess,
-    GetExitCodeProcess, OpenProcess, OpenProcessToken, ResumeThread, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    GetExitCodeProcess, OpenProcess, OpenProcessToken, ResumeThread, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+    LOGON_WITH_PROFILE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// A child is an external process that might never exit, so this is the honest failure bound
 /// surfaced to whoever reads the log — not a synchronisation device. If it trips, [`wait_for`]
-/// kills the child's whole job tree, waits (unboundedly) for that to land, and only then reports
-/// that the child did not finish; it never silently continues, and never touches a file or
-/// account the child might still hold open.
+/// kills the child's whole job tree, then waits (unboundedly) on the child's OWN process handle
+/// for that kill to land, and only then reports that the child did not finish; it never silently
+/// continues, and never touches a file or account the child might still hold open. That final
+/// wait covers only the immediate child: the job handle is already closed by the time the kill
+/// call returns, so there is nothing left to wait on for the rest of the tree.
 const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
@@ -338,41 +342,71 @@ fn self_report_cmdline() -> String {
 ///
 /// Panics rather than returning an error: an uncontained child defeats the reason every spawn in
 /// this file goes through a job at all, and `Job::assign`'s own contract forbids resuming a
-/// process that failed to join one, so there is no safe fallback measurement to report instead.
+/// process that failed to join one, so there is no safe fallback measurement to report instead. On
+/// an assign failure the child is still suspended and was never given to any job, so it is torn
+/// down here directly — `TerminateProcess`, waited out, both handles closed — before panicking,
+/// rather than leaking a suspended, uncontained process behind a panicking test.
 fn contain(pi: &PROCESS_INFORMATION, context: &str) -> Job {
     // SAFETY: `pi.hProcess` is a live, just-created suspended process handle; the borrow lasts
     // only for the duration of this call, and the process outlives it (owned by the caller).
-    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(pi.hProcess.0.cast()) })
-        .unwrap_or_else(|e| panic!("{context}: could not contain the child in a kill-on-close job: {e}"));
+    let job = match Job::assign(unsafe { BorrowedHandle::borrow_raw(pi.hProcess.0.cast()) }) {
+        Ok(job) => job,
+        Err(e) => {
+            // SAFETY: `pi.hProcess` is a live, still-suspended process handle that was never
+            // assigned to any job (assign just failed), so terminating and waiting it out
+            // directly is the only way to reap it; both handles are closed exactly once after.
+            unsafe {
+                let _ = TerminateProcess(pi.hProcess, 1);
+                let _ = WaitForSingleObject(pi.hProcess, INFINITE);
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+            }
+            panic!("{context}: could not contain the child in a kill-on-close job: {e}");
+        }
+    };
     // SAFETY: the job now has kill authority over this still-suspended thread, so resuming it now
     // — the last step of the mandated sequence — cannot let anything escape containment.
-    unsafe {
-        let _ = ResumeThread(pi.hThread);
-    }
+    let resumed = unsafe { ResumeThread(pi.hThread) };
+    assert_ne!(
+        resumed,
+        u32::MAX,
+        "{context}: ResumeThread failed (returned -1) on a child just assigned to its containing job"
+    );
     job
 }
 
 /// Wait for a child held in `job`, and return its exit code — or a description of why it could
 /// not be measured. `CHILD_EXIT_BOUND_MS` is given to this one, outermost wait only: on a timeout
-/// it kills the whole job and waits for that to actually land, which carries no bound of its own
-/// because it is waiting on a real kernel outcome (the kill taking effect), not racing a clock —
-/// so by the time this returns, the child is provably gone and it is safe for the caller to touch
-/// any file or account it might otherwise still hold open.
+/// it kills the whole job, then waits on the CHILD'S OWN process handle for that kill to actually
+/// land — not `job.wait_tree()`, which would return an error at once here: `Job::kill_tree`
+/// closes the underlying job handle as part of tearing the job down (see its doc), so by the time
+/// `wait_tree` could run there is nothing left for it to wait on. That final wait has no bound of
+/// its own because it is waiting on a real kernel outcome (the kill taking effect), not racing a
+/// clock — so by the time this returns, the immediate child is provably gone and it is safe for
+/// the caller to touch any file or account it might otherwise still hold open. It only covers the
+/// immediate child, not the rest of the tree: once the job handle is closed there is no longer a
+/// way to wait on the tree as a whole.
 fn wait_for(pi: &PROCESS_INFORMATION, job: &Job) -> Result<u32, String> {
     // SAFETY: `pi.hProcess` was just returned by CreateProcess* and is closed exactly once below.
     let waited = unsafe { WaitForSingleObject(pi.hProcess, CHILD_EXIT_BOUND_MS) };
     if waited != WAIT_OBJECT_0 {
         let killed = job.kill_tree();
-        let drained = job.wait_tree();
-        // SAFETY: the job's kill (if it succeeded) and the drain wait above mean nothing in the
-        // tree can still be touching these handles; each is closed exactly once.
+        // `kill_tree` already closed the job handle, so `job.wait_tree()` would fail immediately
+        // here instead of waiting for anything (see this function's doc comment). Wait on the
+        // child's own process handle instead — the one primitive still open that can actually
+        // observe the kill landing.
+        // SAFETY: `pi.hProcess` is still a valid, open handle to the child; waiting on it does
+        // not consume or invalidate it, so it is still safe to close below.
+        let waited_after_kill = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+        // SAFETY: the wait above means the immediate child is confirmed gone (or the wait itself
+        // failed, which `waited_after_kill` reports); both handles are closed exactly once.
         unsafe {
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
         }
         return Err(format!(
             "the child did not exit within {CHILD_EXIT_BOUND_MS}ms; kill_tree={killed:?} \
-             wait_tree={drained:?}"
+             wait_after_kill={waited_after_kill:?}"
         ));
     }
     // SAFETY: the process signalled within the bound above; both handles are closed exactly once.
@@ -477,16 +511,21 @@ fn measure(out: &mut String) {
     // medium-integrity child it is that claim under test rather than restated.
     if std::env::var_os("COSCA_PROBE_ALLOW_STATE").is_some_and(|v| v == "1") {
         let _ = writeln!(out, "=== can this caller register a RunLevel=HIGHEST task? ===");
-        for line in schtasks_registration_report() {
+        let (lines, _any_create_exited) = schtasks_registration_report();
+        for line in lines {
             let _ = writeln!(out, "  {line}");
         }
     }
 }
 
-/// Try to register a scheduled task at each run level and report what `schtasks` said. Always
-/// deletes what it created, on every path.
-fn schtasks_registration_report() -> Vec<String> {
+/// Try to register a scheduled task at each run level and report what `schtasks` said, plus
+/// whether at least one `/create` call actually exited with a status — a caller for whom `schtasks`
+/// itself could never even be launched measured nothing, no matter how many report lines come back.
+/// Always attempts to delete what it created, on every path, and reports whether each `/delete`
+/// succeeded rather than discarding that result.
+fn schtasks_registration_report() -> (Vec<String>, bool) {
     let mut lines = Vec::new();
+    let mut any_create_exited = false;
     let name = format!("cosca-probe-{}", std::process::id());
     for level in ["HIGHEST", "LIMITED"] {
         let tn = format!("{name}-{level}");
@@ -507,19 +546,26 @@ fn schtasks_registration_report() -> Vec<String> {
             ])
             .output()
         {
-            Ok(out) => lines.push(format!(
-                "/rl {level} -> {} {} {}",
-                out.status,
-                String::from_utf8_lossy(&out.stdout).trim(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            Ok(out) => {
+                any_create_exited = true;
+                lines.push(format!(
+                    "/rl {level} -> {} {} {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
             Err(e) => lines.push(format!("/rl {level} -> schtasks could not be run: {e}")),
         }
-        let _ = std::process::Command::new("schtasks")
+        match std::process::Command::new("schtasks")
             .args(["/delete", "/tn", &tn, "/f"])
-            .output();
+            .output()
+        {
+            Ok(out) => lines.push(format!("/rl {level} delete -> {}", out.status)),
+            Err(e) => lines.push(format!("/rl {level} delete -> schtasks could not be run: {e}")),
+        }
     }
-    lines
+    (lines, any_create_exited)
 }
 
 /// Try to actually START something with `token`, by both documented routes, and report the exact
@@ -528,11 +574,12 @@ fn schtasks_registration_report() -> Vec<String> {
 /// it. The child is this same test binary in report-only mode, so success is not taken on trust —
 /// its integrity level is read back out of the report it writes.
 fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
-    let dir = std::env::temp_dir().join(format!("cosca-elev-probe-{}-{which}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = tempfile::tempdir().expect("probe needs a temp dir");
 
     for (step, use_seclogon) in [("CreateProcessAsUserW", false), ("CreateProcessWithTokenW", true)] {
-        let report = dir.join(format!("{}.txt", if use_seclogon { "withtoken" } else { "asuser" }));
+        let report = dir
+            .path()
+            .join(format!("{}.txt", if use_seclogon { "withtoken" } else { "asuser" }));
         let _ = std::fs::remove_file(&report);
         let block = env_block(&[
             ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
@@ -588,14 +635,21 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    // `dir` is a `tempfile::TempDir`; it removes itself on drop.
 }
 
 // ── probes ═══════════════════════════════════════════════════════════════════════════
 
-/// The report, taken wherever this process happens to be running. Also the body a child runs when
-/// a spawning probe re-execs this binary: `COSCA_PROBE_REPORT_TO` names the file to answer
-/// through, and `COSCA_PROBE_CHILD` suppresses the nested spawn attempts so a child never recurses.
+/// The body a child runs when a spawning probe re-execs this binary: `COSCA_PROBE_REPORT_TO` names
+/// the file to answer through, and `COSCA_PROBE_CHILD` suppresses the nested spawn attempts so a
+/// child never recurses. [`logon_one_account`] deliberately spawns its child WITHOUT
+/// `COSCA_PROBE_CHILD` set — see that function's doc comment — so that child runs the full chain,
+/// the same as [`linked_token_chain_here`] does when run directly.
+///
+/// A direct, unspawned `--ignored` run (no `COSCA_PROBE_REPORT_TO`) has no report destination to
+/// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
+/// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
+/// token, nothing more.
 #[test]
 #[ignore = "platform probe; opt in with --ignored"]
 fn measure_this_token() {
@@ -606,9 +660,14 @@ fn measure_this_token() {
     if let Ok(v) = std::env::var("COSCA_PROBE_ENV_CANARY") {
         let _ = writeln!(out, "  env block: the caller's COSCA_PROBE_ENV_CANARY arrived as {v:?}");
     }
-    if std::env::var_os("COSCA_PROBE_CHILD").is_some() {
-        // A child answers the "what token did I get" question only. The spawn attempts belong to
-        // the outer probe, which controls the safety gates.
+    let report_to = std::env::var_os("COSCA_PROBE_REPORT_TO");
+    if report_to.is_some() && std::env::var_os("COSCA_PROBE_CHILD").is_none() {
+        // Spawned by `logon_one_account`: the child runs the whole chain.
+        measure(&mut out);
+    } else {
+        // Either a child of `spawn_attempts_with` (`COSCA_PROBE_CHILD` is set, so it does not
+        // recurse into more spawn attempts of its own), or a direct, unspawned `--ignored` run
+        // with nothing to answer through — both get the same minimal, own-purpose report.
         let _ = writeln!(out, "=== token report (pid {}) ===", std::process::id());
         match open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE) {
             Ok(t) => describe(&mut out, "current process token", t.0),
@@ -616,11 +675,9 @@ fn measure_this_token() {
                 let _ = writeln!(out, "  current process token: <{e}>");
             }
         }
-    } else {
-        measure(&mut out);
     }
     print!("{out}");
-    if let Some(dest) = std::env::var_os("COSCA_PROBE_REPORT_TO") {
+    if let Some(dest) = report_to {
         std::fs::write(&dest, &out)
             .unwrap_or_else(|e| panic!("could not write the report to {}: {e}", PathBuf::from(&dest).display()));
     }
@@ -732,17 +789,26 @@ fn measure_uac_policy() {
 }
 
 /// Question 2, measured at whatever integrity this process runs at. Read together with
-/// [`unelevated_caller_view`], which is the same measurement at medium integrity — the one that
-/// actually answers the question.
+/// [`unelevated_caller_view`], which takes the same measurement at medium integrity and is the one
+/// that can actually answer the question — but only when its own report confirms
+/// `TokenIsElevated=false`; see that function's doc for when it cannot.
 #[test]
 #[ignore = "platform probe; opt in with --ignored"]
 fn linked_token_chain_here() {
     let mut out = String::new();
     measure(&mut out);
     print!("{out}");
+    // `out.contains("step 1")` alone can never fail: `measure` always emits a "step 1 ..." line,
+    // whether it succeeded or not, so that check asserts nothing. Require the line to actually
+    // show a result — a successful open, or a failure carrying a real (non-empty) error — so a
+    // future report-format change that dropped the outcome would fail this loudly instead of
+    // sailing through a vacuous substring match.
     assert!(
-        out.contains("step 1"),
-        "the chain produced no steps, so nothing was measured"
+        out.contains("step 1 GetTokenInformation(TokenLinkedToken): OK")
+            || out.contains("step 1 OpenProcessToken: FAILED <")
+            || out.contains("step 1 GetTokenInformation(TokenLinkedToken): FAILED <"),
+        "the chain's step 1 produced neither a success nor a real error code, so nothing was \
+         measured:\n{out}"
     );
 }
 
@@ -757,7 +823,8 @@ fn unelevated_caller_view() {
     let own = open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT)
         .expect("the probe needs its own token to derive a medium one");
 
-    let etype = token_elevation_type(own.0).unwrap_or(0);
+    let etype = token_elevation_type(own.0)
+        .unwrap_or_else(|e| panic!("could not read this process's own TokenElevationType: {e}"));
     println!(
         "PROBE unelevated-view: this process is elevation_type={etype} {}",
         elevation_type_name(etype)
@@ -819,8 +886,7 @@ fn unelevated_caller_view() {
         println!("PROBE unelevated-view: medium token TokenIsElevated=false -- a genuine unelevated view.");
     }
 
-    let dir = std::env::temp_dir().join(format!("cosca-medium-probe-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("probe scratch dir");
+    let dir = tempfile::tempdir().expect("probe needs a temp dir");
 
     // Two routes, because `CreateProcessAsUserW` hands the child the caller's window station and
     // desktop unchanged, and a lowered-integrity token cannot always open them, which can make the
@@ -833,7 +899,8 @@ fn unelevated_caller_view() {
     // impossible".
     let mut spliced = String::new();
     for (route, use_seclogon) in [("CreateProcessAsUserW", false), ("CreateProcessWithTokenW", true)] {
-        let child_report = dir.join(format!("{route}.txt"));
+        let child_report = dir.path().join(format!("{route}.txt"));
+        let _ = std::fs::remove_file(&child_report);
         let block = env_block(&[("COSCA_PROBE_REPORT_TO", child_report.display().to_string())]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
@@ -887,7 +954,7 @@ fn unelevated_caller_view() {
         }
         spliced.clear();
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    // `dir` is a `tempfile::TempDir`; it removes itself on drop.
     assert!(
         spliced.contains("token report"),
         "no medium-integrity child produced a report, so the unelevated caller's view was NOT \
@@ -1151,21 +1218,35 @@ fn does_create_process_with_logon_elevate() {
         "COSCA_PROBE_ALLOW_ACCOUNTS",
         "creates and deletes a local administrator account",
     );
-    let mut measured = 0usize;
+    let mut measured_admin = false;
+    let mut measured_std = false;
     for (name, admin) in [("coscaprobeadm", true), ("coscaprobestd", false)] {
         match ScratchAccount::create(name, admin) {
             Ok(account) => {
                 if logon_one_account(&account) {
-                    measured += 1;
+                    if admin {
+                        measured_admin = true;
+                    } else {
+                        measured_std = true;
+                    }
                 }
             }
             Err(e) => println!("PROBE createprocesswithlogon: could not create {name}: {e}"),
         }
     }
+    // Both accounts must be measured, not just either one: the administrator account is the one
+    // the whole probe exists to answer (does a real logon reach an elevated token?), and the
+    // standard-user account is the contrast that result needs to mean anything at all.
     assert!(
-        measured > 0,
-        "no scratch account produced a token report, so CreateProcessWithLogonW's result was never \
-         actually measured — an account being created is not the same as a report coming back."
+        measured_admin,
+        "the Administrators-member scratch account produced no token report, so \
+         CreateProcessWithLogonW's elevation result was never actually measured — an account being \
+         created is not the same as a report coming back."
+    );
+    assert!(
+        measured_std,
+        "the standard-user scratch account produced no token report, so the contrast against the \
+         Administrators account — the whole point of running both — was never measured."
     );
 }
 
@@ -1188,22 +1269,27 @@ fn logon_one_account(account: &ScratchAccount) -> bool {
     } else {
         "STANDARD user"
     };
-    let dir = std::env::temp_dir().join(format!("cosca-logon-probe-{}-{}", std::process::id(), account.user));
-    std::fs::create_dir_all(&dir).expect("probe scratch dir");
+    let dir = tempfile::tempdir().expect("probe needs a temp dir");
     // The scratch user is not the user who owns this checkout, so it can reach neither the test
     // binary under `target/` nor this process's `%TEMP%`. Give it one directory that holds both
     // the image and its scratch space, and point the child's `%TEMP%` at it.
     let _ = std::process::Command::new("icacls")
-        .args([dir.to_str().unwrap(), "/grant", &format!("{}:(OI)(CI)F", account.user)])
+        .args([
+            dir.path().to_str().unwrap(),
+            "/grant",
+            &format!("{}:(OI)(CI)F", account.user),
+        ])
         .output();
-    let exe = dir.join("probe.exe");
+    let exe = dir.path().join("probe.exe");
     std::fs::copy(
         std::env::current_exe().expect("the test binary knows its own path"),
         &exe,
     )
     .expect("copy the probe where the scratch user can execute it");
-    let report = dir.join("logon.txt");
-    let stdout_file = dir.join("stdout.txt");
+    let report = dir.path().join("logon.txt");
+    let _ = std::fs::remove_file(&report);
+    let stdout_file = dir.path().join("stdout.txt");
+    let _ = std::fs::remove_file(&stdout_file);
 
     // An inheritable duplicate of a real file handle: the STARTF_USESTDHANDLES half of the
     // measurement. If seclogon drops it, the file stays empty and that IS the answer.
@@ -1230,8 +1316,8 @@ fn logon_one_account(account: &ScratchAccount) -> bool {
     let block = env_block(&[
         ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
         ("COSCA_PROBE_ENV_CANARY", "carried-through".into()),
-        ("TEMP", dir.display().to_string()),
-        ("TMP", dir.display().to_string()),
+        ("TEMP", dir.path().display().to_string()),
+        ("TMP", dir.path().display().to_string()),
     ]);
     let mut cmd = wide(&report_cmdline(&exe));
     let user = wide(&account.user);
@@ -1292,7 +1378,7 @@ fn logon_one_account(account: &ScratchAccount) -> bool {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    // `dir` is a `tempfile::TempDir`; it removes itself on drop.
     spliced.contains("token report")
 }
 
@@ -1376,18 +1462,26 @@ fn which_logon_types_return_a_filtered_token() {
 #[ignore = "registers and deletes a scheduled task; opt in with --ignored on a throwaway host"]
 fn can_this_caller_register_a_runlevel_highest_task() {
     require_gate("COSCA_PROBE_ALLOW_STATE", "registers and deletes a scheduled task");
-    let etype = open_own_token(TOKEN_QUERY)
+    let etype_str = open_own_token(TOKEN_QUERY)
         .and_then(|t| token_elevation_type(t.0))
-        .unwrap_or(0);
-    let rid = open_own_token(TOKEN_QUERY)
+        .map_or_else(
+            |e| format!("<error: {e}>"),
+            |v| format!("{v} {}", elevation_type_name(v)),
+        );
+    let rid_str = open_own_token(TOKEN_QUERY)
         .and_then(|t| token_integrity_rid(t.0))
-        .unwrap_or(0);
-    println!(
-        "PROBE schtasks-highest: measured at integrity 0x{rid:04x} {} (elevation_type {})",
-        integrity_name(rid),
-        elevation_type_name(etype)
-    );
-    for line in schtasks_registration_report() {
+        .map_or_else(
+            |e| format!("<error: {e}>"),
+            |v| format!("0x{v:04x} {}", integrity_name(v)),
+        );
+    println!("PROBE schtasks-highest: measured at integrity {rid_str} (elevation_type {etype_str})");
+    let (lines, any_create_exited) = schtasks_registration_report();
+    for line in lines {
         println!("PROBE schtasks-highest: {line}");
     }
+    assert!(
+        any_create_exited,
+        "not one schtasks /create call exited with a status, so nothing was measured — schtasks \
+         itself could not be launched"
+    );
 }

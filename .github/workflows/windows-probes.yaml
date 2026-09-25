@@ -116,11 +116,7 @@ jobs:
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          # A shared `filter` matching nothing here but something in the elevating step below must
-          # not fail this step: nextest fails a run whose filter matches zero tests, and a failed
-          # step stops the job before the next one runs. `--no-tests=pass` leaves that judgment to
-          # "Require that a canary ran" below, which checks markers instead.
-          args=(nextest run --no-tests=pass --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --run-ignored only --no-capture)
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --run-ignored only --no-capture)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -136,16 +132,14 @@ jobs:
       # invocation serially; the `windows-shell-execute` test group capped at one thread in
       # `.config/nextest.toml` gives the same guarantee independent of that flag.
       - name: Run elevating probes
-        if: github.event_name != 'workflow_dispatch' || inputs.elevating
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.elevating) }}
         shell: bash
         env:
           FILTER: ${{ inputs.filter }}
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          # Same reasoning as the path-resolution step above: leave the empty-match judgment to
-          # "Require that an elevating probe ran".
-          args=(nextest run --no-tests=pass --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --run-ignored only --no-capture)
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --run-ignored only --no-capture)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
