@@ -148,8 +148,13 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
     }
 
     // NOT `COSCA_PROBE_CHILD` — see this function's doc comment: the child runs the whole chain.
+    // `COSCA_PROBE_ANCESTOR_CONTAINED=1`: this function wraps the child in `contain` below before
+    // ever resuming it (`CREATE_SUSPENDED`), so by the time it runs, it is already a job member —
+    // see `measure_this_token`'s doc for why this must be its own explicit marker rather than
+    // inferred from `COSCA_PROBE_REPORT_TO`/`COSCA_PROBE_CHILD` alone.
     let block = env_block(&[
         ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
+        ("COSCA_PROBE_ANCESTOR_CONTAINED", "1".into()),
         ("COSCA_PROBE_ENV_CANARY", "carried-through".into()),
         ("TEMP", dir.path().display().to_string()),
         ("TMP", dir.path().display().to_string()),

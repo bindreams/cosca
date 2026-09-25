@@ -39,6 +39,17 @@ use crate::windows_probe::mark_test_passed;
 /// comment — so that child runs the full chain, the same as [`linked_token_chain_here`] does when
 /// run directly.
 ///
+/// `COSCA_PROBE_ANCESTOR_CONTAINED=1` is a THIRD, separate marker those same two spawn sites also
+/// set, and is read independently of the branch below: whether this process runs the whole chain is
+/// decided by `COSCA_PROBE_REPORT_TO`/`COSCA_PROBE_CHILD` alone, but whether it is actually nested
+/// inside a `contain()`-created job is a different question that condition cannot answer on its
+/// own — a human running `COSCA_PROBE_REPORT_TO=... cargo test measure_this_token -- --ignored`
+/// directly at the top level satisfies that same condition without ever being contained. Only
+/// `logon_one_account` and `unelevated_caller_view` actually wrap their child in `contain` (before
+/// ever resuming it, `CREATE_SUSPENDED`) before it can reach here, so only they set this marker;
+/// deriving `ancestor_contained` from anything else would mislabel a manual, uncontained run as
+/// contained.
+///
 /// A direct, unspawned `--ignored` run (no `COSCA_PROBE_REPORT_TO`) has no report destination to
 /// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
 /// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
@@ -55,10 +66,14 @@ fn measure_this_token() {
     }
     let report_to = std::env::var_os("COSCA_PROBE_REPORT_TO");
     if report_to.is_some() && std::env::var_os("COSCA_PROBE_CHILD").is_none() {
-        // Spawned by `logon_one_account` or `unelevated_caller_view`: the child runs the whole
-        // chain. Both of those wrap their own spawned child in `contain` before it ever reaches
-        // here, so this process is itself already a job member — `ancestor_contained=true`.
-        measure(&mut out, true);
+        // Spawned by `logon_one_account` or `unelevated_caller_view`, or a manual top-level run that
+        // set `COSCA_PROBE_REPORT_TO` by hand: either way, the child runs the whole chain. Only the
+        // former is actually nested inside a `contain()`-created job, so `ancestor_contained` is read
+        // from its own explicit marker below — set only by those two spawn sites — rather than
+        // inferred from this branch's own condition, which a manual run can satisfy without ever
+        // being contained. See this function's doc comment.
+        let ancestor_contained = std::env::var_os("COSCA_PROBE_ANCESTOR_CONTAINED").is_some_and(|v| v == "1");
+        measure(&mut out, ancestor_contained);
     } else {
         // Either a child of `spawn_attempts_with` (`COSCA_PROBE_CHILD` is set, so it does not
         // recurse into more spawn attempts of its own), or a direct, unspawned `--ignored` run
@@ -383,7 +398,13 @@ fn unelevated_caller_view() {
     for (route, use_seclogon) in [("CreateProcessAsUserW", false), ("CreateProcessWithTokenW", true)] {
         let child_report = dir.path().join(format!("{route}.txt"));
         let _ = std::fs::remove_file(&child_report);
-        let block = env_block(&[("COSCA_PROBE_REPORT_TO", child_report.display().to_string())]);
+        // `COSCA_PROBE_ANCESTOR_CONTAINED=1`: this loop wraps the child in `contain` below before
+        // ever resuming it (`CREATE_SUSPENDED`), so by the time it runs, it is already a job member
+        // — see `measure_this_token`'s doc for why this must be its own explicit marker.
+        let block = env_block(&[
+            ("COSCA_PROBE_REPORT_TO", child_report.display().to_string()),
+            ("COSCA_PROBE_ANCESTOR_CONTAINED", "1".into()),
+        ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
             cb: size_of::<STARTUPINFOW>() as u32,

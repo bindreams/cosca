@@ -45,10 +45,10 @@ use windows::Win32::System::Threading::{
 /// its own — nesting the two only if that inheritance already happened. Whether it does is NOT
 /// assumed here: `spawn_attempts_with` measures it with `IsProcessInJob`, once per spawn route that
 /// actually creates a process, before its own `contain` call runs (see that function). Only
-/// `CreateProcessAsUserW` has ever reached that measurement on the runners this suite has run on —
-/// `CreateProcessWithTokenW` has always failed there before creating a process at all (see
-/// `spawn_attempts_with`'s own `FAILED` log line for that route), so this route has never been
-/// measured directly, and nothing here claims otherwise. Whether a `CreateProcessWithTokenW` child
+/// `CreateProcessAsUserW` has ever reached that measurement — `CreateProcessWithTokenW` has always
+/// failed before creating a process at all (see `spawn_attempts_with`'s own `FAILED` log line for
+/// that route), so this route has never been measured directly, and nothing here claims otherwise.
+/// Whether a `CreateProcessWithTokenW` child
 /// WOULD nest into the same job is, at best, unverified reasoning, not a measurement: it is created
 /// through the Secondary Logon service, a process outside this job tree entirely, which is the kind
 /// of case ordinary parent-job inheritance would plausibly not reach — but that is as far as the
