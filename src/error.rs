@@ -189,15 +189,22 @@ where
     },
     /// A spawn failed after creating its child, and the child could not be killed — a setuid
     /// child refuses the kill with `EPERM`. `error` is why the spawn failed and `kill` why the kill
-    /// did. The one check made at that point found it still running, but nothing after that point
-    /// watches it, so by the time this error reaches the caller it may already have exited on its
-    /// own — reaping it, not just waiting for it, is the caller's, and dropping `child` blocks
-    /// until it does. See [`Unreaped`](crate::Unreaped).
+    /// did. The one check made at that point did not find the child exited or reaped elsewhere —
+    /// on Unix, that check failing with anything other than `ECHILD` is handed back too, not just
+    /// a confirmed-running child; on Windows every check failure is, since the held handle still
+    /// pins the process regardless of why the check itself failed. Nothing after that point
+    /// watches the child, so by the time this error reaches the caller it may already have exited
+    /// on its own — reaping it, not just waiting for it, is the caller's, and dropping `child`
+    /// blocks until it does. See [`Unreaped`](crate::Unreaped).
+    ///
+    /// `error` is the spawn's own error, unchanged — an [`Elevation`](Self::Elevation) with kind
+    /// `AuthFailed` or `Untracked` only on the elevated paths that produce those, and otherwise
+    /// whatever the failed spawn itself returned.
     ///
     /// That one check (Unix only) can also come back with the child's ownership uncertain instead
     /// — a genuine `ECHILD`: something else already reaped it. That outcome never reaches this
     /// variant: there is nothing left to hand back, so the child is released on the spot and the
-    /// caller gets a plain [`Elevation`](Self::Elevation) instead, with no `child` to reap.
+    /// caller gets `error` back directly, with no `child` to reap.
     #[error("a failed spawn's child could not be killed ({kill}) and is handed back unreaped")]
     Unreaped {
         #[source]

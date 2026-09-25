@@ -596,7 +596,8 @@ impl Command {
     ///
     /// A spawn that fails after creating its child kills and reaps it. One the kill cannot end — a
     /// setuid child refuses it with `EPERM` — comes back in [`Error::Unreaped`](crate::error::Error::Unreaped) as an
-    /// [`Unreaped`](crate::Unreaped), still running: dropping the error blocks until it exits.
+    /// [`Unreaped`](crate::Unreaped): the one check made did not find it exited or reaped
+    /// elsewhere, not necessarily still running, and dropping the error blocks until it exits.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         spawn::spawn(self)
     }

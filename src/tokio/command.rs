@@ -221,8 +221,9 @@ impl Command {
     /// A spawn that fails after creating its child kills and reaps it. One the kill cannot end — a
     /// setuid child refuses it with `EPERM` — comes back in
     /// [`Error::Unreaped`](crate::tokio::Error) as a
-    /// [`cosca::tokio::Unreaped`](crate::tokio::Unreaped), still running: `wait().await` it rather
-    /// than drop the error on a runtime thread, where its drop blocks until the child exits.
+    /// [`cosca::tokio::Unreaped`](crate::tokio::Unreaped): the one check made did not find it
+    /// exited or reaped elsewhere, not necessarily still running. `wait().await` it rather than
+    /// drop the error on a runtime thread, where its drop blocks until the child exits.
     pub fn spawn(&mut self) -> Result<Child, crate::tokio::Error> {
         super::spawn::spawn(&mut self.inner).map_err(Into::into)
     }

@@ -128,17 +128,34 @@ async fn wait_blocking_returns_the_forced_failure_instead_of_asserting() {
         .expect("a real wait after the forced failure still succeeds");
 }
 
-/// The same seam, but driven through `crate::Unreaped::wait` — the actual caller of
-/// `Held::wait`'s `RawAsync` arm in production — not `wait_blocking` called directly as above.
+/// The same seam, but driven through `cosca::tokio::Unreaped`'s `Drop` fallback wait — the actual
+/// production caller of `Held::wait`'s `RawAsync` arm. `Held::RawAsync` only ever reaches an
+/// `Unreaped` by way of `awaitable()` inside `crate::tokio::unreaped`: `crate::Unreaped` (the sync
+/// type) never holds one, so driving this through it, as an earlier version of this test did, is
+/// unreachable in production — dead code dressed as a regression test. `Drop`, not
+/// `crate::tokio::Unreaped::wait`, is what `awaitable`'s handle falls back to on a runtime that
+/// never gets to await it (a caller that just drops the error, the documented common case — see
+/// `Command::spawn`'s docs); that fallback wait is exactly `Held::wait`'s `RawAsync` arm, run
+/// synchronously because `Drop` cannot `.await`.
+///
 /// `wait_blocking_returns_the_forced_failure_instead_of_asserting` proves `wait_blocking` itself
 /// returns the forced error rather than asserting; this proves that error actually surfaces
-/// through the generic `Unreaped` path a real caller uses, rather than being swallowed or panicked
-/// on somewhere between `Held::wait` and `Unreaped::wait`.
+/// through `Drop`'s fallback wait a real caller relies on, and that a failed fallback wait disarms
+/// the containment `Unreaped` retained — the same as any other failed wait (see `Unreaped::drop`'s
+/// doc) — rather than leaving it armed to kill through a child that may already be gone.
 #[tokio::test]
-async fn unreaped_wait_returns_the_forced_wait_blocking_failure() {
-    use std::os::windows::io::OwnedHandle;
+async fn unreaped_drop_disarms_after_the_forced_wait_blocking_failure() {
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    };
 
     use super::RawAsyncChild;
+    use crate::child::unreaped::{Held, Retained};
+    use crate::containment::windows::{assign_to_kill_on_close_job, duplicate_job};
+    use crate::containment::Attached;
 
     let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args(["--exact", "__cosca_no_such_test__"])
@@ -147,13 +164,54 @@ async fn unreaped_wait_returns_the_forced_wait_blocking_failure() {
         .spawn()
         .expect("spawn a quickly-exiting child");
     let pid = child.id();
+    let job = assign_to_kill_on_close_job(child.as_raw_handle())
+        .expect("a real job object, assigned to the real child above");
+    // `Unreaped`'s drop below closes `job`'s own handle once it has disarmed it (see
+    // `JobHandle`'s `Drop`), so the query after that drop needs an INDEPENDENT reference to the
+    // same kernel job object — a `DuplicateHandle`, not the raw value `job` itself holds, which
+    // this test then owns and closes itself once done reading through it.
+    let dup_job = job
+        .with_handle(duplicate_job)
+        .expect("freshly assigned job handle must be live")
+        .expect("DuplicateHandle on a live job handle");
+
     let mut raw = RawAsyncChild::new(OwnedHandle::from(child), pid);
     raw.set_force_wait_blocking_failure("forced wait_blocking failure");
-    let unreaped = crate::Unreaped::new(crate::child::unreaped::Held::RawAsync(raw));
-    let err = unreaped
-        .wait()
-        .expect_err("the forced wait_blocking failure must surface through Unreaped::wait");
-    assert_eq!(err.to_string(), "forced wait_blocking failure");
+    let unreaped = crate::tokio::Unreaped::with_retained(
+        Held::RawAsync(raw),
+        Some(Retained {
+            attached: Attached::JobObject(job),
+        }),
+    );
+
+    // No `.wait()`: dropped directly, exercising `Drop`'s fallback wait, the actual production
+    // caller of this arm.
+    drop(unreaped);
+
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let mut returned = 0u32;
+    // SAFETY: `dup_job` is this test's own handle, independent of and unaffected by `job`'s
+    // closing inside the drop above, and not yet closed; `info` is sized for the class queried.
+    unsafe {
+        QueryInformationJobObject(
+            Some(dup_job),
+            JobObjectExtendedLimitInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            Some(&mut returned),
+        )
+    }
+    .expect("QueryInformationJobObject after the disarming drop");
+    assert_eq!(
+        info.BasicLimitInformation.LimitFlags.0, 0,
+        "a failed fallback wait must disarm what Unreaped retained, same as any other failed wait"
+    );
+
+    // SAFETY: `dup_job` is this test's own handle (from `DuplicateHandle` above), not shared with
+    // anything else, and not used again after this.
+    unsafe {
+        let _ = CloseHandle(dup_job);
+    }
 }
 
 /// The async twin of `a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance`.

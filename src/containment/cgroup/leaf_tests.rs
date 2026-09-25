@@ -3414,7 +3414,12 @@ fn drop_leaves_the_retained_leaf_armed_after_a_successful_synchronous_wait() {
     );
 }
 
-/// A `cosca::tokio::Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains armed too.
+/// A `cosca::tokio::Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains armed too —
+/// and (H1) the kill that arming leads to, once the retained leaf is dropped, must not run inline
+/// on the thread that awaited the reap: a still-occupied leaf's kill is followed by an unbounded
+/// drain wait, which must never run on a runtime worker. The runtime here has exactly one thread,
+/// so if the kill ran inline it would run on this test's own thread; the hook below proves it
+/// instead runs on the blocking pool.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
 fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
@@ -3425,6 +3430,18 @@ fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (leaf, kill) = occupied_entered_leaf(dir.path());
     let (child, stdin) = cat_child();
+    let leaf_name = kill
+        .parent()
+        .expect("cgroup.kill has a parent")
+        .file_name()
+        .expect("a leaf has a name")
+        .to_string_lossy()
+        .into_owned();
+    let runtime_thread = std::thread::current().id();
+    let (kill_thread_tx, kill_thread_rx) = std::sync::mpsc::channel();
+    crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_name, move |tid| {
+        let _ = kill_thread_tx.send(tid);
+    });
     runtime.block_on(async {
         let mut unreaped = crate::tokio::Unreaped::with_retained(
             crate::child::unreaped::Held::Std(child),
@@ -3439,5 +3456,13 @@ fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
         kill.exists(),
         "a successful tokio reap must leave the retained leaf armed, so its own Drop kills \
          through whatever else still occupies it"
+    );
+    let kill_thread = kill_thread_rx
+        .recv()
+        .expect("kill.exists() above already proves the write happened, so the hook must have fired");
+    assert_ne!(
+        kill_thread, runtime_thread,
+        "the kill on a still-occupied retained leaf must run on the blocking pool, not inline on \
+         the runtime thread that awaited the reap"
     );
 }

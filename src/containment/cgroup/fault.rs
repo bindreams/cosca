@@ -411,3 +411,31 @@ pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
         }
     }
 }
+
+type KillThreadHook = Box<dyn FnOnce(std::thread::ThreadId) + Send>;
+
+/// Kill-thread hooks, per leaf name, process-wide: unlike this module's other seams,
+/// `cgroup.kill` can now run on a thread other than the one that armed it (a retained,
+/// still-armed leaf's `Drop` moves to the blocking pool — see H1's fix in
+/// `crate::tokio::unreaped::Unreaped::reaped`), which a thread-local hook could never observe.
+static KILL_THREAD_HOOKS: std::sync::Mutex<Vec<(std::ffi::OsString, KillThreadHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `hook` with the id of the thread that performs the NEXT `cgroup.kill` write for the leaf
+/// named `name` (its directory's file name).
+pub(crate) fn set_next_kill_thread_hook(name: &str, hook: impl FnOnce(std::thread::ThreadId) + Send + 'static) {
+    KILL_THREAD_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.into(), Box::new(hook)));
+}
+pub(crate) fn run_kill_thread_hook(name: &std::ffi::OsStr) {
+    let hook = {
+        let mut hooks = KILL_THREAD_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let at = hooks.iter().position(|(n, _)| n.as_os_str() == name);
+        at.map(|at| hooks.remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook(std::thread::current().id());
+    }
+}

@@ -475,6 +475,10 @@ impl CgroupLeaf {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());
+                #[cfg(test)]
+                if let Some(name) = self.leaf_path.file_name() {
+                    fault::run_kill_thread_hook(name);
+                }
                 self.killed.store(true, Ordering::Relaxed);
                 Ok(())
             }
