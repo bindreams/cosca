@@ -4,13 +4,26 @@ nextest-version = { required = "0.9.137" }
 fail-fast = false
 
 [[profile.ci.overrides]]
-# Both binaries already bound their own external waits in-process: `windows_shell_resolution.rs`
-# wraps every `ShellExecuteExW` call likely to hang in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
-# (60s), and `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
+# `windows_shell_resolution.rs` already bounds its own external waits in-process: every
+# `ShellExecuteExW` call likely to hang is wrapped in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
+# (60s), at most one such call per test. This override is a second, redundant safety net on top of
+# that in-process bound, for whatever it cannot cover: a wait this test binary cannot cancel (Win32
+# gives no way to cancel a call already inside `ShellExecuteExW`), or a kill that itself does not
+# land.
+#
+# This binary's worst per-test case IS the single-wait bound, unlike `windows_elevation_routes`
+# below: no test here makes more than one `SHELL_EXECUTE_BOUND`-wrapped call. 180s (3 * 60s) leaves
+# headroom over that 60s floor for the overhead around it (planting a batch file, copying a payload
+# binary, reading a marker back) without leaving so much that a genuine hang sits unreported for
+# multiple minutes.
+filter = 'binary(windows_shell_resolution)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+# `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
 # `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s). This override is a second, redundant
-# safety net on top of those, for whatever an in-process bound cannot cover: a wait this test binary
-# cannot cancel (Win32 gives no way to cancel a call already inside `ShellExecuteExW`), or a kill
-# that itself does not land.
+# safety net on top of that in-process bound, for whatever it cannot cover — same reasoning as
+# `windows_shell_resolution` above.
 #
 # The per-test worst case, not the single-wait bound, is what this has to clear:
 # `does_create_process_with_logon_elevate` calls `logon_one_account` once per scratch account (an
@@ -21,7 +34,7 @@ fail-fast = false
 # 240s floor for overhead this code does not bound, so it is raised here to 600s (10 * 60s) — the
 # same roughly 2.5x margin the original 300s kept over a single 120s wait, applied to the 240s floor
 # instead of the 120s one. One hang here fails one test instead of the whole job.
-filter = 'binary(windows_shell_resolution) | binary(windows_elevation_routes)'
+filter = 'binary(windows_elevation_routes)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [test-groups]

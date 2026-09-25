@@ -114,19 +114,25 @@ use windows::Win32::System::Threading::{
 const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
 /// The bound for [`spawn_attempts_with`]'s own wait on the children it spawns. Kept well under
-/// [`CHILD_EXIT_BOUND_MS`] (an eighth of it) so that whenever `spawn_attempts_with` runs inside a
+/// [`CHILD_EXIT_BOUND_MS`] (a tenth of it) so that whenever `spawn_attempts_with` runs inside a
 /// process that is itself someone else's child — which happens whenever `COSCA_PROBE_CHILD` is
 /// left unset — there is enough headroom left in the outer bound for this inner one to trip,
 /// kill, and recover before the outer wait could plausibly trip too. See `CHILD_EXIT_BOUND_MS`'s
 /// doc.
 ///
-/// An eighth leaves a ×4 margin beyond the minimum ×2 that "trip, kill, and recover before the
-/// outer wait trips too" requires: the inner wait plus its own kill-and-recover could in principle
-/// take up to twice its own bound before the outer one needs to see it finished, and this constant
-/// is kept at half of that ×2 figure again. `const _` below asserts the ×4 relationship holds so a
-/// future change to either constant cannot silently erode this margin.
-const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 8;
-const _: () = assert!(4 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS);
+/// The real worst case this has to clear is TWO sequential grandchild waits, not one:
+/// `spawn_attempts_with` tries `CreateProcessAsUserW` and then `CreateProcessWithTokenW` in the same
+/// call, each with its own `wait_for(GRANDCHILD_EXIT_BOUND_MS)`, so both can trip in turn before the
+/// outer `wait_for` in `logon_one_account` / `unelevated_caller_view` needs to see the whole thing
+/// finished. Each trip-kill-recover can itself take up to twice its own bound (the minimum ×2 margin
+/// `CHILD_EXIT_BOUND_MS`'s doc relies on), so the real worst case is
+/// `2 * (2 * GRANDCHILD_EXIT_BOUND_MS)` = `4 * GRANDCHILD_EXIT_BOUND_MS` before the outer wait could
+/// plausibly see it done — and this constant is kept at half of THAT figure again, an overall ×8
+/// margin, not ×4. `const _` below asserts the real relationship
+/// (`4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS`) holds so a future change to either
+/// constant cannot silently erode it.
+const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 10;
+const _: () = assert!(4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS);
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
 
@@ -152,6 +158,23 @@ fn wide(s: &str) -> Vec<u16> {
 fn wide_path(p: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Record that this probe ran to a real conclusion, as a file named after the test in
+/// `$COSCA_PROBE_MARKERS` when that is set. The workflow's final "Require that an executing probe
+/// ran" step fails a run that leaves no marker, so a `probe_filter` that matches nothing cannot pass
+/// having run nothing — mirrors `tests/windows_path_resolution/harness.rs`'s `mark_canary_passed`
+/// and `windows_shell_execute.rs`'s `mark_passed`.
+fn mark_probe_passed() {
+    let Some(dir) = std::env::var_os("COSCA_PROBE_MARKERS") else {
+        return;
+    };
+    let name = std::thread::current()
+        .name()
+        .expect("libtest names each test's thread")
+        .replace("::", ".");
+    std::fs::write(std::path::Path::new(&dir).join(name), b"")
+        .unwrap_or_else(|e| panic!("could not write the probe marker: {e}"));
 }
 
 /// `GetTokenInformation`'s two-call protocol, into a `u64`-backed (8-byte-aligned) buffer —
@@ -758,6 +781,7 @@ fn measure_this_token() {
         std::fs::write(&dest, &out)
             .unwrap_or_else(|e| panic!("could not write the report to {}: {e}", PathBuf::from(&dest).display()));
     }
+    mark_probe_passed();
 }
 
 /// Read ANOTHER process's token, named by PID in `COSCA_PROBE_INSPECT_PID`.
@@ -821,6 +845,7 @@ fn measure_another_process_token() {
         out.contains("integrity="),
         "the target process's token could not be described, so nothing was measured"
     );
+    mark_probe_passed();
 }
 
 /// The UAC policy in force. Without these values a token-shape measurement is uninterpretable: on
@@ -863,6 +888,7 @@ fn measure_uac_policy() {
         any,
         "not one UAC policy value could be read, so no token result below is interpretable"
     );
+    mark_probe_passed();
 }
 
 /// Question 2, measured at whatever integrity this process runs at. Read together with
@@ -875,6 +901,15 @@ fn linked_token_chain_here() {
     let mut out = String::new();
     measure(&mut out);
     print!("{out}");
+    // A spawned grandchild that never exited is not an ordinary measurement outcome: `wait_for`
+    // kills and recovers it, but nothing downstream distinguishes that from a normal negative
+    // result. Fail loudly and specifically here instead of letting a hang masquerade as "step 1"
+    // simply lacking a recognised outcome line below.
+    assert!(
+        !out.contains("did not exit within"),
+        "a spawned child did not exit within its bound, so this probe's measurement is incomplete \
+         and must not be trusted:\n{out}"
+    );
     // `out.contains("step 1")` alone can never fail: `measure` always emits a "step 1 ..." line,
     // whether it succeeded or not, so that check asserts nothing. Require the line to actually
     // show a result — a successful open, or a failure carrying a real (non-empty) error — so a
@@ -887,6 +922,7 @@ fn linked_token_chain_here() {
         "the chain's step 1 produced neither a success nor a real error code, so nothing was \
          measured:\n{out}"
     );
+    mark_probe_passed();
 }
 
 /// **Question 2, properly.** Derive a medium-integrity token, start this binary under it, and read
@@ -1021,9 +1057,24 @@ fn unelevated_caller_view() {
             Ok(()) => {
                 let job = contain(&pi, &format!("PROBE unelevated-view[{route}]"));
                 let exit = wait_for(&pi, &job, CHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+                assert!(
+                    !exit.contains("did not exit within"),
+                    "PROBE unelevated-view: {route}'s medium child did not exit within its bound, \
+                     so this route's measurement is incomplete and must not be trusted: {exit}"
+                );
                 println!("PROBE unelevated-view: {route} started a medium child, {exit}. It reports:");
                 splice_child_report(&mut spliced, &child_report);
                 print!("{spliced}");
+                // A process the medium child itself spawned (there are none today, but
+                // `splice_child_report` pulls in whatever the child reported) could carry its own
+                // hang text through here; catch that the same way as the child's own direct hang,
+                // before the loop clears `spliced` for the next route and discards the evidence.
+                assert!(
+                    !spliced.contains("did not exit within"),
+                    "PROBE unelevated-view: {route}'s medium child's own report shows something it \
+                     spawned did not exit within its bound, so this route's measurement is \
+                     incomplete and must not be trusted:\n{spliced}"
+                );
             }
         }
         if spliced.contains("token report") {
@@ -1047,6 +1098,7 @@ fn unelevated_caller_view() {
     } else {
         println!("PROBE unelevated-view: measured, and correctly labelled as an unelevated caller's view.");
     }
+    mark_probe_passed();
 }
 
 /// A medium-integrity token for an account that has no UAC split to borrow one from: disable the
@@ -1214,6 +1266,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
              CreateProcess-based route would buy."
         );
     }
+    mark_probe_passed();
 }
 
 // ── credential-gated probes (throwaway hosts only) ═══════════════════════════════════
@@ -1336,6 +1389,7 @@ fn does_create_process_with_logon_elevate() {
         "the standard-user scratch account produced no token report, so the contrast against the \
          Administrators account — the whole point of running both — was never measured."
     );
+    mark_probe_passed();
 }
 
 /// The body of the probe above, for one account. Split out so the administrator and the standard
@@ -1448,9 +1502,23 @@ fn logon_one_account(account: &ScratchAccount) -> bool {
         Ok(()) => {
             let job = contain(&pi, &format!("PROBE createprocesswithlogon[{role}]"));
             let exit = wait_for(&pi, &job, CHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+            assert!(
+                !exit.contains("did not exit within"),
+                "PROBE createprocesswithlogon[{role}]: the logged-on child did not exit within its \
+                 bound, so this probe's measurement is incomplete and must not be trusted: {exit}"
+            );
             println!("PROBE createprocesswithlogon[{role}]: STARTED, {exit}. The child reports:");
             splice_child_report(&mut spliced, &report);
             print!("{spliced}");
+            // The logged-on child runs the FULL chain (see this function's doc), including its own
+            // `spawn_attempts_with` grandchild waits; catch a hang buried in its own report too,
+            // before the caller only sees `spliced.contains("token report")` fail with no reason.
+            assert!(
+                !spliced.contains("did not exit within"),
+                "PROBE createprocesswithlogon[{role}]: the logged-on child's own report shows \
+                 something it spawned did not exit within its bound, so this probe's measurement is \
+                 incomplete and must not be trusted:\n{spliced}"
+            );
             let captured = std::fs::read_to_string(&stdout_file).unwrap_or_default();
             println!(
                 "PROBE createprocesswithlogon-stdio[{role}]: STARTF_USESTDHANDLES captured {} bytes of child stdout",
@@ -1551,6 +1619,7 @@ fn which_logon_types_return_a_filtered_token() {
          contrast against the Administrators account — the whole point of running both — was never \
          measured"
     );
+    mark_probe_passed();
 }
 
 /// Question 3's Task Scheduler arm, reduced to its gating question: can a caller REGISTER a task
@@ -1586,4 +1655,5 @@ fn can_this_caller_register_a_runlevel_highest_task() {
         "not one schtasks /create call exited with a status, so nothing was measured — schtasks \
          itself could not be launched"
     );
+    mark_probe_passed();
 }

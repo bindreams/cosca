@@ -209,22 +209,27 @@ jobs:
       # for `windows_elevation_routes` ever ran.
       #
       # The three probes that hand `ShellExecuteExW` an EXISTING extensionless target are excluded
-      # here (`-E`) and run below instead, each in its own step, after every other probe and never
-      # back to back with each other: see the module doc in `tests/windows_shell_resolution.rs` for
-      # why — the leading hypothesis for the intermittent hang is a leftover `OpenWith.exe` from one
-      # such probe blocking the next `ShellExecuteExW` call, possibly one belonging to a DIFFERENT
-      # probe in a later process. `--no-tests=warn` covers the edge case that exclusion creates: a
-      # `probe_filter` that narrows this step to exactly one of those three would otherwise match
-      # zero tests and fail here; instead this step warns and exits 0, and the isolated step below
-      # for that probe still runs it (or skips it with its own message, if the filter excludes it
-      # too).
+      # here (`-E`) and run below instead, each in its own nextest invocation, consecutively, after
+      # all other probes: see the module doc in `tests/windows_shell_resolution.rs` for why — a
+      # leftover `OpenWith.exe` from one such probe blocking the next `ShellExecuteExW` call was a
+      # candidate explanation for the intermittent hang, but a dispatch run against this isolation
+      # found a leftover instance carried across both later probes on both architectures with
+      # neither probe hanging, which is evidence against it, not for it; the module doc has the
+      # detail. `--no-tests=warn` covers the edge case that exclusion creates: a `probe_filter` that
+      # narrows this step to exactly one of those three would otherwise match zero tests and fail
+      # here; instead this step warns and exits 0, and the isolated step below for that probe still
+      # runs it (or skips it with its own message, if the filter excludes it too).
+      # Each probe that passes leaves a marker named after itself (`mark_probe_passed`); the final
+      # "Require that an executing probe ran" step fails the job if none exists.
       - name: Run executing probes
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_ALLOW_ACCOUNTS: "1"
           COSCA_PROBE_ALLOW_STATE: "1"
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
           args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --run-ignored only --no-capture --no-tests=warn -E 'not test(does_a_trailing_dot_still_open_the_extensionless_file) and not test(does_pathext_outrank_an_existing_extensionless_file) and not test(does_an_existing_extensionless_file_ever_launch_directly)')
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
@@ -234,10 +239,15 @@ jobs:
       # them. Never kill one — a leftover from an earlier probe is exactly the state under
       # investigation (see the module doc in `tests/windows_shell_resolution.rs`), and the runner VM
       # is thrown away after the job regardless. Runs after an earlier probe failure too, but not
-      # after cancellation, so the log still shows what was there going in.
+      # after cancellation, so the log still shows what was there going in. `continue-on-error`: a
+      # WMI hiccup here must not fail probes that otherwise measured something real; bounded by its
+      # own short `timeout-minutes` so a stuck query cannot eat into the job's overall budget either.
       - name: OpenWith.exe before trailing-dot probe
         if: ${{ !cancelled() }}
-        run: Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+        continue-on-error: true
+        timeout-minutes: 2
+        run: &openwith_diagnostic >-
+          Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
       # Isolated so no other probe's `ShellExecuteExW` call runs in this process, immediately before
       # or after this one. `NAME` must match `probe_filter` (a blank filter matches everything, same
       # substring semantics as `${FILTER}` above) or this step skips with a message instead of
@@ -247,7 +257,9 @@ jobs:
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
           NAME='does_a_trailing_dot_still_open_the_extensionless_file'
           if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
@@ -256,16 +268,22 @@ jobs:
           cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
       - name: OpenWith.exe after trailing-dot probe
         if: ${{ !cancelled() }}
-        run: Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
       - name: OpenWith.exe before pathext-precedence probe
         if: ${{ !cancelled() }}
-        run: Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
       - name: Run pathext-precedence probe (isolated)
         if: ${{ !cancelled() }}
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
           NAME='does_pathext_outrank_an_existing_extensionless_file'
           if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
@@ -274,16 +292,22 @@ jobs:
           cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
       - name: OpenWith.exe after pathext-precedence probe
         if: ${{ !cancelled() }}
-        run: Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
       - name: OpenWith.exe before existing-extensionless-no-bat probe
         if: ${{ !cancelled() }}
-        run: Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
       - name: Run existing-extensionless-no-bat probe (isolated)
         if: ${{ !cancelled() }}
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
           NAME='does_an_existing_extensionless_file_ever_launch_directly'
           if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
@@ -292,9 +316,27 @@ jobs:
           cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
       - name: OpenWith.exe after existing-extensionless-no-bat probe
         if: ${{ !cancelled() }}
-        run: Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
       # The runner is itself an administrator, so its own token shape is the control every
       # elevation result is read against. Runs after a probe failure too, but not after cancellation.
       - name: Record the runner's own identity
         if: ${{ !cancelled() }}
         run: whoami /all
+      # A `probe_filter` matching no test, or only surveys, would otherwise pass having asserted
+      # nothing. Runs after a failure too, but not after cancellation, so the log shows which probes
+      # passed.
+      - name: Require that an executing probe ran
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          shopt -s nullglob
+          passed=("$COSCA_PROBE_MARKERS"/*)
+          if ((${#passed[@]} == 0)); then
+            echo "::error::no executing probe ran: the run asserted nothing"
+            exit 1
+          fi
+          printf 'executing probe passed: %s\n' "${passed[@]##*/}"

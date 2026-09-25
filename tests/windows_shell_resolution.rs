@@ -43,19 +43,25 @@
 //! file ever dropped it for any call, so setting it unconditionally again is not expected by itself
 //! to fix the hang), and — contrary to an earlier hypothesis — NOT explained by a missing COM
 //! apartment: initializing one before every `ShellExecuteExW` call (`shell_execute_with`, below) did
-//! not stop a later run from hanging on both architectures at once. The leading hypothesis now is
-//! that a leftover `OpenWith.exe` instance from one of the three probes below that hand
-//! `ShellExecuteExW` an EXISTING extensionless target blocks a later `ShellExecuteExW` call —
-//! possibly one belonging to a DIFFERENT probe in a later process, since `cargo nextest` gives each
-//! test its own OS process but every process on the same runner still shares the same shell state.
-//! Those three probes therefore each run in their own workflow step, after every other probe and
-//! never back to back with each other, with a read-only diagnostic printing which `OpenWith.exe`
-//! instances exist before and after — see `.github/workflows/windows-probes.yaml`'s `executing` job
-//! — rather than enumerating or killing anything from inside the test binary itself. Every such call
-//! site still bounds the whole call, via `shell_execute_bounded` and `SHELL_EXECUTE_BOUND` — see
-//! their docs — as a failure surface, not a synchronisation device: hitting that bound is always a
-//! FAILURE to measure, never a passing answer. Whether to keep these three probes at all, if the
-//! hang persists under this change too, is the repo owner's call.
+//! not stop a later run from hanging on both architectures at once. One candidate was that a
+//! leftover `OpenWith.exe` instance from one of the three probes below that hand `ShellExecuteExW`
+//! an EXISTING extensionless target blocks a LATER `ShellExecuteExW` call — possibly one belonging
+//! to a DIFFERENT probe in a later process, since `cargo nextest` gives each test its own OS process
+//! but every process on the same runner still shares the same shell state. Those three probes
+//! therefore each run in their own nextest invocation, consecutively, after all other probes, with a
+//! read-only diagnostic printing which `OpenWith.exe` instances exist before and after — see
+//! `.github/workflows/windows-probes.yaml`'s `executing` job — rather than enumerating or killing
+//! anything from inside the test binary itself. That isolation does NOT, on its own evidence,
+//! support the leftover-handler theory: a dispatch run against it (see the PR description's
+//! Verification section) found one `OpenWith.exe` instance carried across both LATER probes, on
+//! BOTH architectures, and neither probe hung — the leftover was present exactly when the theory
+//! says it should have blocked the next call, and it did not. Running each probe as its own OS
+//! process isolates the TEST PROCESS, not OS-level shell/handler state, so this was never going to
+//! rule the theory in or out on its own; this run is evidence against it. Every such call site still
+//! bounds the whole call, via `shell_execute_bounded` and `SHELL_EXECUTE_BOUND` — see their docs —
+//! as a failure surface, not a synchronisation device: hitting that bound is always a FAILURE to
+//! measure, never a passing answer. Whether to keep these three probes at all, if the hang persists
+//! under this change too, is the repo owner's call.
 //!
 //! # Why they are `#[ignore]`d
 //!
@@ -138,6 +144,23 @@ fn read_self_report_image(report: &Path) -> Option<PathBuf> {
         .lines()
         .find_map(|l| l.strip_prefix("image="))
         .map(PathBuf::from)
+}
+
+/// Record that this probe ran to a real conclusion, as a file named after the test in
+/// `$COSCA_PROBE_MARKERS` when that is set. The workflow's final "Require that an executing probe
+/// ran" step fails a run that leaves no marker, so a `probe_filter` that matches nothing cannot pass
+/// having run nothing — mirrors `tests/windows_path_resolution/harness.rs`'s `mark_canary_passed`
+/// and `windows_shell_execute.rs`'s `mark_passed`.
+fn mark_probe_passed() {
+    let Some(dir) = std::env::var_os("COSCA_PROBE_MARKERS") else {
+        return;
+    };
+    let name = std::thread::current()
+        .name()
+        .expect("libtest names each test's thread")
+        .replace("::", ".");
+    std::fs::write(std::path::Path::new(&dir).join(name), b"")
+        .unwrap_or_else(|e| panic!("could not write the probe marker: {e}"));
 }
 
 /// Whether `reported` names the same file as `want`, by file name only: a self-report's directory
@@ -321,7 +344,7 @@ fn shell_execute_in_apartment(
 /// exception to "don't synchronize via time", not a race against a clock this process controls.
 /// Hitting this bound is a FAILURE, not a passing answer: it means `ShellExecuteExW` did not return,
 /// so nothing about this probe's actual question was measured. Chosen well below
-/// `.config/nextest.toml`'s 300s `terminate-after` for this binary, so a genuine block is diagnosed
+/// `.config/nextest.toml`'s 180s `terminate-after` for this binary, so a genuine block is diagnosed
 /// here and reported with context, rather than only visible as a bare timeout kill with no
 /// diagnosis.
 const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
@@ -434,6 +457,7 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
             }
         }
     }
+    mark_probe_passed();
 }
 
 /// Control for the probe above: an absolute path to a real `.bat` must launch. If this does not
@@ -476,6 +500,7 @@ fn control_an_absolute_batch_path_does_launch() {
             }
         }
     }
+    mark_probe_passed();
 }
 
 /// The other half of the elevated hazard, re-measured rather than inherited: a PATH-LESS `lpFile`
@@ -530,6 +555,7 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
             }
         }
     }
+    mark_probe_passed();
 }
 
 // ── the trailing-dot convention ──────────────────────────────────────────────────────
@@ -591,6 +617,7 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
             }
         }
     }
+    mark_probe_passed();
 }
 
 /// Half two: does a trailing dot still OPEN the extensionless file it names? Uses a copy of
@@ -641,11 +668,24 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
         LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
             // Same fact as the LaunchedNoHandle arm below, just returned synchronously instead of as
             // a UI handoff: the dotted spelling DID resolve to the extensionless file — otherwise
-            // this would be ERROR_FILE_NOT_FOUND — but there is nothing to hand it to. Unlike that
-            // arm, ERROR_NO_ASSOCIATION means the shell found no handler to hand the file off to at
-            // all, so nothing could have launched it; reading the marker here would not measure
-            // anything, so this arm does not.
-            println!("PROBE trailing-dot-opens-extensionless: launched=false, no association ({e})");
+            // this would be ERROR_FILE_NOT_FOUND — but there is nothing to hand it to. Checked the
+            // same way as its siblings (`marker.exists()`), not by content: this probe's marker path
+            // is unique to this run, so existence alone already means the extensionless file ran.
+            let exe_ran = marker.exists();
+            println!(
+                "PROBE trailing-dot-opens-extensionless: launched=false, no association ({e}) \
+                 exe_ran={exe_ran}"
+            );
+            if exe_ran {
+                panic!(
+                    "PROBE trailing-dot-opens-extensionless: the marker exists despite this call's \
+                     synchronous ERROR_NO_ASSOCIATION. That this call itself returned no handle to \
+                     hand off to anything is authoritative — a synchronous fact from the API's return \
+                     value — but the marker existing anyway means the extensionless file ran through \
+                     some path this probe did not account for; failing rather than noting it and \
+                     moving on, matching does_an_existing_extensionless_file_ever_launch_directly."
+                );
+            }
             println!(
                 "  => NO, not as a directly-run process. The dotted spelling still resolves to the \
                  extensionless file rather than falling through to ERROR_FILE_NOT_FOUND, but an \
@@ -660,22 +700,20 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
              ERROR_NO_ASSOCIATION): {e}"
         ),
         LaunchOutcome::LaunchedNoHandle => {
-            let report = read_self_report_image(&marker);
-            let exe_ran = report.as_deref().is_some_and(|r| same_file(r, &extensionless));
+            let exe_ran = marker.exists();
             println!(
                 "PROBE trailing-dot-opens-extensionless: launched=true, no process handle \
-                 (LaunchedNoHandle) report={report:?} exe_ran={exe_ran} (an instantaneous, racy \
-                 snapshot taken right after the call returned — no process handle means nothing here \
-                 waits for a handed-off process before reading the marker)"
+                 (LaunchedNoHandle) exe_ran={exe_ran} (an instantaneous, racy snapshot taken right \
+                 after the call returned — no process handle means nothing here waits for a \
+                 handed-off process before reading the marker)"
             );
             if exe_ran {
                 panic!(
-                    "PROBE trailing-dot-opens-extensionless: the self-report names the extensionless \
-                     file despite this call returning no process handle to wait on. That this call \
-                     itself returned no handle is authoritative — a synchronous fact from the API's \
-                     return value, not a snapshot — but the marker naming the extensionless file \
-                     anyway means it ran through some path this probe did not account for; failing \
-                     rather than noting it and moving on, matching \
+                    "PROBE trailing-dot-opens-extensionless: the marker exists despite this call \
+                     returning no process handle to wait on. That this call itself returned no \
+                     handle is authoritative — a synchronous fact from the API's return value, not a \
+                     snapshot — but the marker existing anyway means it ran through some path this \
+                     probe did not account for; failing rather than noting it and moving on, matching \
                      does_an_existing_extensionless_file_ever_launch_directly."
                 );
             }
@@ -710,6 +748,7 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
             }
         }
     }
+    mark_probe_passed();
 }
 
 /// **Decides whether this is an `Exact`-only problem or a whole-resolver problem.**
@@ -846,6 +885,7 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
             }
         }
     }
+    mark_probe_passed();
 }
 
 /// Companion to the precedence probe above, with no `.bat` in the directory to compete: does an
@@ -984,4 +1024,5 @@ fn does_an_existing_extensionless_file_ever_launch_directly() {
             }
         }
     }
+    mark_probe_passed();
 }
