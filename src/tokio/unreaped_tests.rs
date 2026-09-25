@@ -107,7 +107,7 @@ async fn a_cancelled_wait_leaves_the_caller_holding_a_tokio_child() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_cancelled_wait_leaves_the_caller_holding_a_bare_child() {
-    let (child, stdin, id) = blocked_std_child();
+    let (child, stdin, id) = std_blocked_child();
     let pid = child.id();
     // Only the pidfd holds it now: nothing else may reap it.
     std::mem::forget(child);
@@ -127,34 +127,10 @@ async fn a_cancelled_wait_leaves_the_caller_holding_a_bare_child() {
 #[cfg(windows)]
 #[tokio::test]
 async fn a_cancelled_wait_leaves_the_caller_holding_a_raw_child() {
-    let (child, stdin, id) = blocked_std_child();
+    let (child, stdin, id) = std_blocked_child();
     let pid = child.id();
     let raw = crate::child::spawn::windows_raw::RawChild::new(std::os::windows::io::OwnedHandle::from(child), pid);
     a_cancelled_wait_leaves_the_caller_holding(Unreaped::new(Held::Raw(raw)), stdin, id).await;
-}
-
-/// A std child blocked reading stdin until the returned end drops, and its identity.
-#[cfg(any(target_os = "linux", windows))]
-fn blocked_std_child() -> (std::process::Child, std::process::ChildStdin, ProcessId) {
-    let mut child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        let mut cmd = if cfg!(windows) {
-            let mut cmd = std::process::Command::new("findstr");
-            cmd.arg("x");
-            cmd
-        } else {
-            std::process::Command::new("cat")
-        };
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn a child blocked on stdin")
-    };
-    let stdin = child.stdin.take().expect("piped stdin");
-    let Resolved::Found(id) = ProcessId::of(child.id()) else {
-        panic!("an unreaped child resolves");
-    };
-    (child, stdin, id)
 }
 
 /// `Drop` blocks until the child exits, then reaps it — here on the blocking pool, as the type's
@@ -178,7 +154,6 @@ async fn drop_blocks_until_the_child_exits_and_reaps_it() {
 async fn leak_drops_a_tokio_child_releasing_its_handles() {
     let (child, stdin, id) = blocked_child();
     drop(stdin);
-    // Its own exit, awaited without reaping.
     // Awaited without reaping, until it is reapable.
     crate::child::unreaped::block_until_reapable(id.pid()).expect("wait for the child's exit");
     Unreaped::new(Held::Tokio(Box::new(child))).leak();
@@ -190,13 +165,24 @@ async fn leak_drops_a_tokio_child_releasing_its_handles() {
 /// `Leaked` and returns, leaving the task's own `report` (once its reap completes) to release the
 /// held child and disarm what it retained.
 ///
-/// A gate hook runs inside the task's real `run`, right after its real `claim` succeeds and
-/// before it waits for the exit, and blocks there until this test releases it. That makes the
-/// state deterministically `Running` when `leak` is called below — `claim` updates it strictly
-/// before the hook that unblocks the `recv` runs — rather than racing the task's own progress
-/// toward `Finished`. Awaiting the task's own `JoinHandle` after releasing the gate, rather than
-/// polling, is what then proves its `report` — the disarm under test — has actually run before
-/// the assertion below reads it.
+/// Goes through the real `spawn_blocking_reap` (via the same cancelled-wait,
+/// `force_not_yet_reapable` path `a_cancelled_blocking_reap_is_resumed_by_the_next_wait` uses),
+/// not a hand-built `ReapTask`, so this exercises the same task construction production does —
+/// including `after_claim` now being read from the `fault` seam by `spawn_blocking_reap` itself,
+/// rather than set directly on a `ReapTask` this test built by hand.
+///
+/// The `after_claim` hook runs inside the task's real `run`, right after its real `claim`
+/// succeeds and before it waits for the exit, and blocks there until this test releases it. That
+/// makes the state deterministically `Running` when `leak` is called below — `claim` updates it
+/// strictly before the hook that unblocks the `recv` runs — rather than racing the task's own
+/// progress toward `Finished`.
+///
+/// `leak` consumes `self`, taking `self.blocking`'s `Arc<BlockingReap>` half but discarding its
+/// `oneshot::Receiver` half — so this test swaps a dummy receiver into that slot first and keeps
+/// the real one, to await after `leak` returns. `leak` only ever reads the `Arc` half, so the
+/// swap does not change what it does; awaiting the real receiver afterward is what then proves
+/// the gated task's own `report` — the disarm under test — has actually run before the assertion
+/// below reads it, the same as awaiting the task's own `JoinHandle` would.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
@@ -212,13 +198,7 @@ async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
         attached: crate::containment::Attached::Cgroup(leaf),
     };
     let mut unreaped = Unreaped::from_sync(crate::Unreaped::with_retained(Held::Std(child), Some(retained)));
-    let held = unreaped.held.take().expect("freshly built, still held");
-    let retained = unreaped.retained.take();
-    let shared = std::sync::Arc::new(super::BlockingReap {
-        state: std::sync::Mutex::new(super::ReapState::NotStarted(held, retained)),
-        finished: std::sync::Condvar::new(),
-    });
-    let (signal, finished) = ::tokio::sync::oneshot::channel();
+
     let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it (an
@@ -226,33 +206,40 @@ async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
     // nothing here, since the hook only ever touches them once, from the one thread that runs it.
     let claimed_tx = std::sync::Mutex::new(claimed_tx);
     let release_rx = std::sync::Mutex::new(release_rx);
-    let task = super::ReapTask {
-        shared: shared.clone(),
-        held: None,
-        retained: None,
-        signal: Some(signal),
-        after_claim: Some(Box::new(move || {
-            claimed_tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .send(())
-                .expect("the test thread is waiting for the claim");
-            release_rx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv()
-                .expect("the test thread releases the gate");
-        })),
-    };
-    let join = ::tokio::task::spawn_blocking(move || task.run());
-    unreaped.blocking = Some((shared, finished));
+    super::fault::set_after_claim(Box::new(move || {
+        claimed_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(())
+            .expect("the test thread is waiting for the claim");
+        release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("the test thread releases the gate");
+    }));
+    super::fault::set_force_not_yet_reapable();
+    cancel_after_one_pending_poll(&mut unreaped);
+    assert!(
+        unreaped.hands_child_to_blocking_task(),
+        "the real spawn_blocking_reap must have handed the child to a blocking-pool task"
+    );
+
+    // Swap the real `finished` receiver out for a dummy: `leak` below only reads the `Arc`
+    // half of the tuple, so this does not change what it does, and it lets this test keep the
+    // real one to await once `leak` has consumed `self`.
+    let (_dummy_tx, dummy_rx) = ::tokio::sync::oneshot::channel();
+    let real_finished = std::mem::replace(
+        &mut unreaped.blocking.as_mut().expect("just handed to a blocking task").1,
+        dummy_rx,
+    );
 
     claimed_rx
         .recv()
         .expect("the task reaches the gate once it has claimed the child");
     unreaped.leak();
     release_tx.send(()).expect("let the gated task proceed");
-    join.await.expect("the blocking task does not panic");
+    let _ = real_finished.await;
 
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
@@ -283,7 +270,7 @@ async fn a_tokio_child_of_uncertain_ownership_is_released_without_tokios_drop() 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_bare_child_is_waited_on_through_its_pidfd_without_an_identity_read() {
-    let (child, stdin, id) = blocked_std_child();
+    let (child, stdin, id) = std_blocked_child();
     let pid = child.id();
     std::mem::forget(child);
     let pidfd = rustix::process::pidfd_open(
@@ -428,8 +415,15 @@ async fn a_cancelled_blocking_reap_is_resumed_by_the_next_wait() {
 }
 
 /// Dropped while a cancelled wait's blocking reap holds the child, an `Unreaped` blocks until that
-/// reap finishes, as it blocks for a child it holds itself: nothing is left to finish detached. The
-/// hook runs as the drop starts to block, and lets the child exit.
+/// reap finishes, as it blocks for a child it holds itself: nothing is left to finish detached.
+///
+/// An `after_claim` gate holds the task in `Running` (claimed, not yet reported) until this test
+/// releases it, so `Drop` deterministically finds the task already claimed and must wait on
+/// `take_blocking` — not take `reclaim_before_start`'s fast path, which a `Drop` racing an
+/// unclaimed task could otherwise hit instead, proving nothing about the wait under test. The
+/// assertion right before `drop(unreaped)` checks the state is `Running` for exactly that reason.
+/// The `before_blocking_drop` hook then runs as `Drop` commits to blocking on the reap: it lets
+/// the child exit (so the gated task's own reap, once released, succeeds) and releases the gate.
 #[cfg(unix)]
 #[test]
 fn dropping_during_a_blocking_reap_waits_for_it() {
@@ -440,18 +434,53 @@ fn dropping_during_a_blocking_reap_waits_for_it() {
         .unwrap();
     let (child, stdin, id) = std_blocked_child();
     let blocked = std::sync::Arc::new(AtomicBool::new(false));
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it; the
+    // `Mutex` costs nothing here, since the hook only ever touches them once.
+    let claimed_tx = std::sync::Mutex::new(claimed_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
     runtime.block_on(async {
         let mut unreaped = Unreaped::from_sync(crate::Unreaped::new(Held::Std(child)));
+        super::fault::set_after_claim(Box::new(move || {
+            claimed_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(())
+                .expect("the test thread is waiting for the claim");
+            release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("the test thread releases the gate");
+        }));
         super::fault::set_force_not_yet_reapable();
         cancel_after_one_pending_poll(&mut unreaped);
         assert!(
             unreaped.hands_child_to_blocking_task(),
             "the blocking task owns the child now"
         );
+
+        claimed_rx
+            .recv()
+            .expect("the task reaches the gate once it has claimed the child");
+        // The branch this test exists to exercise: confirm the task has claimed the child
+        // (state `Running`) before `Drop` runs, so `Drop` must go through `take_blocking`.
+        {
+            let (shared, _) = unreaped.blocking.as_ref().expect("the blocking task owns the child");
+            assert!(
+                matches!(*shared.state(), super::ReapState::Running),
+                "the gate must hold the task in Running before Drop runs"
+            );
+        }
+
         let flag = blocked.clone();
         unreaped.before_blocking_drop(Box::new(move || {
             flag.store(true, Ordering::SeqCst);
             drop(stdin);
+            release_tx
+                .send(())
+                .expect("let the gated task proceed to its real reap");
         }));
         drop(unreaped);
     });
@@ -497,9 +526,10 @@ async fn a_blocking_reap_that_panicked_after_claiming_hands_the_child_back() {
 /// saying so: unlike the panicked-after-claiming case above, `ReapTask::drop` reports nothing here
 /// (it only does once `run` has claimed the child from `NotStarted`), so `finished`'s sender is
 /// simply dropped and `ReapState` stays `NotStarted` forever. Reading `take_blocking` past this
-/// point would deadlock on pool scheduling that will never come (its own `debug_assert`); reaching
-/// `take_reap` past it would hit its `unreachable!`. The regression this test guards against is
-/// exactly that: either of those, instead of the child handed back.
+/// point would panic instead of waiting on pool scheduling that will never come (its own
+/// `debug_assert`, in a debug build); reaching `take_reap` past it would hit its own
+/// `unreachable!` in release. The regression this test guards against is exactly that: either of
+/// those panics, instead of the child handed back.
 #[cfg(unix)]
 #[test]
 fn a_blocking_reap_that_never_ran_hands_the_child_back() {
@@ -534,8 +564,9 @@ fn a_blocking_reap_that_never_ran_hands_the_child_back() {
 /// must reclaim the child directly instead of waiting for the task, which then does nothing when
 /// it eventually runs.
 ///
-/// The 10s bound is a human-facing failure bound on a genuine hang, not a synchronization device:
-/// success is `rx.recv()` returning promptly, well under it.
+/// `rx.recv()` below has no timeout of its own: syncing on a wall clock is forbidden. The bound on
+/// a genuine deadlock is instead nextest's own `slow-timeout`/`terminate-after` for this test (see
+/// `.config/nextest.toml`), a human-facing failure bound, not a synchronization device.
 #[cfg(unix)]
 #[test]
 fn drop_on_a_saturated_blocking_pool_does_not_deadlock() {
@@ -555,7 +586,7 @@ fn drop_on_a_saturated_blocking_pool_does_not_deadlock() {
         drop(unreaped);
         let _ = tx.send(());
     });
-    let finished = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+    let finished = rx.recv().is_ok();
     // If this deadlocked, the runtime's own drop would hang on the same stuck thread too.
     std::mem::forget(runtime);
     assert!(
