@@ -3417,12 +3417,19 @@ fn drop_leaves_the_retained_leaf_armed_after_a_successful_synchronous_wait() {
 /// A `cosca::tokio::Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains armed too —
 /// and (H1) the kill that arming leads to, once the retained leaf is dropped, must not run inline
 /// on the thread that awaited the reap: a still-occupied leaf's kill is followed by an unbounded
-/// drain wait, which must never run on a runtime worker. The runtime here has exactly one thread,
-/// so if the kill ran inline it would run on this test's own thread; the hook below proves it
-/// instead runs on the blocking pool.
+/// drain wait, which must never run on a runtime worker.
+///
+/// Deterministic, not a race against the drain task: `set_next_kill_thread_hook` parks the task
+/// inside its real `cgroup.kill` write itself — mid-teardown, past `finish`'s `drop(retained)` call
+/// but before the write returns — until this test releases it. A biased `select!` against `wait`
+/// then proves `wait` cannot resolve before that write is reached: were the notify to fire before
+/// the real kill-through ran (the ordering bug this once caught only by luck, via `kill.exists()`
+/// checked after the fact — see `git blame`), `wait`'s arm would be ready first and this would
+/// panic instead of hanging. Also proves the write runs on the blocking pool, not inline on the
+/// runtime thread that awaited the reap: the runtime here has exactly one thread.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
-fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
+fn probe_tokio_wait_returns_only_after_the_retained_drop_ran() {
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3430,11 +3437,17 @@ fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (leaf, kill) = occupied_entered_leaf(dir.path());
     let (child, stdin) = cat_child();
+    drop(stdin);
     let leaf_path = kill.parent().expect("cgroup.kill has a parent").to_path_buf();
     let runtime_thread = std::thread::current().id();
-    let (kill_thread_tx, kill_thread_rx) = std::sync::mpsc::channel();
+    // The drain thread parks in its own `cgroup.kill` (inside `drop(retained)`) until released.
+    let (at_kill_tx, at_kill_rx) = ::tokio::sync::oneshot::channel::<std::thread::ThreadId>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
     crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |tid| {
-        let _ = kill_thread_tx.send(tid);
+        let _ = at_kill_tx.send(tid);
+        // Err once the test drops `release_tx` (on a failed assertion): never hangs.
+        let _ = release_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
     });
     runtime.block_on(async {
         let mut unreaped = crate::tokio::Unreaped::with_retained(
@@ -3443,22 +3456,103 @@ fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
                 attached: crate::containment::Attached::Cgroup(leaf),
             }),
         );
-        drop(stdin);
-        unreaped.wait().await.expect("the child exits cleanly");
+        let mut wait = std::pin::pin!(unreaped.wait());
+        let kill_thread = ::tokio::select! {
+            biased;
+            r = &mut wait => panic!("wait returned while the retained drop is parked mid-teardown: {r:?}"),
+            tid = at_kill_rx => tid.expect("the drain reached cgroup.kill"),
+        };
+        assert_ne!(
+            kill_thread, runtime_thread,
+            "the kill on a still-occupied retained leaf must run on the blocking pool, not inline \
+             on the runtime thread that awaited the reap"
+        );
+        release_tx.send(()).expect("the drain is parked on the gate");
+        wait.await.expect("the child exits cleanly");
     });
     assert!(
         kill.exists(),
         "a successful tokio reap must leave the retained leaf armed, so its own Drop kills \
          through whatever else still occupies it"
     );
-    let kill_thread = kill_thread_rx
-        .recv()
-        .expect("kill.exists() above already proves the write happened, so the hook must have fired");
-    assert_ne!(
-        kill_thread, runtime_thread,
-        "the kill on a still-occupied retained leaf must run on the blocking pool, not inline on \
-         the runtime thread that awaited the reap"
-    );
+}
+
+/// The drain's own commit to kill-through, once claimed, cannot be recalled: `leak` racing in
+/// after the drain has already claimed what it must drop (M2) finds it parked mid `cgroup.kill`
+/// (via the same gate as the probe above) and returns at once, without waiting for it — the kill
+/// still goes ahead once released.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_leak_of_a_committed_drain_still_kills_through() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    drop(stdin);
+    let leaf_path = kill.parent().unwrap().to_path_buf();
+    let (at_kill_tx, at_kill_rx) = ::tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |_| {
+        let _ = at_kill_tx.send(());
+        let _ = release_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
+        let _ = done_tx.send(());
+    });
+    let unreaped = runtime.block_on(async {
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained { attached: crate::containment::Attached::Cgroup(leaf) }),
+        );
+        ::tokio::select! { biased; r = u.wait() => panic!("wait completed while the drain is parked: {r:?}"), _ = at_kill_rx => {} }
+        u
+    });
+    // The drain is parked inside cgroup.kill; leak now returns without waiting.
+    unreaped.leak();
+    assert!(kill.exists(), "the kill write already ran (the hook fires just after it)");
+    release_tx.send(()).expect("the drain is parked on the gate");
+    done_rx.recv().expect("the drain finishes once released");
+    assert!(kill.exists(), "kill-through went ahead despite leak()");
+}
+
+/// M1 regression: a `wait` that returns `Ok` because the child's exit status was already cached
+/// (a previous, cancelled wait already reaped it) re-awaits what that reap retained — but if the
+/// runtime shuts down before the queued `DrainTask` ever claims it, that re-await reclaims the
+/// retained leaf back into the handle unsettled, not "fully settled" the way `wait`'s own doc used
+/// to claim. A later `leak()` must still disarm it rather than let `Unreaped::drop`'s fallback kill
+/// through it.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_leak_after_a_refused_drain_kills_through() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let handle = runtime.handle().clone();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    drop(stdin);
+    let mut u = runtime.block_on(async {
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained { attached: crate::containment::Attached::Cgroup(leaf) }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut w = std::pin::pin!(u.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(w.as_mut().poll(&mut cx).is_pending());
+        }
+        u
+    });
+    // The blocking reap runs the real reap before the runtime shuts down, so `wait` below finds a
+    // cached status rather than racing the reap itself.
+    u.block_until_blocking_reap_finished();
+    runtime.shutdown_background();
+    let r = handle.block_on(u.wait());
+    assert!(r.is_ok(), "the cached status must still be returned: {r:?}");
+    assert!(!kill.exists(), "nothing killed through yet: the drain task never ran");
+    u.leak();
+    assert!(!kill.exists(), "leak() must disarm what the refused drain left behind, not kill through it");
 }
 
 /// The same contract as `tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap`, but

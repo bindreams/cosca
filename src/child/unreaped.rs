@@ -184,7 +184,10 @@ impl Held {
     }
 
     /// Let go of a child whose ownership is uncertain: as [`release`](Held::release), except a
-    /// tokio child on Unix is forgotten (see the module's **Releasing**).
+    /// tokio child on Unix is forgotten (see the module's **Releasing**). Unix's own sync callers
+    /// (`check`, `settle_after_wait`) need it regardless of `tokio`; on Windows only
+    /// `cosca::tokio::Unreaped::release` calls it, so without that feature it is unused there.
+    #[cfg(any(unix, feature = "tokio"))]
     pub(crate) fn release_uncertain(self) {
         match self {
             #[cfg(all(unix, feature = "tokio"))]

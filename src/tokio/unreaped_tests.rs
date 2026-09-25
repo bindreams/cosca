@@ -639,7 +639,7 @@ fn drop_on_a_saturated_blocking_pool_does_not_deadlock() {
 /// synchronous) already set `status`, before spawning it.
 #[cfg(unix)]
 #[test]
-fn cancel_during_retained_drain_preserves_status_and_drop_waits() {
+fn cancel_during_retained_drain_preserves_status_and_a_later_wait_consumes_it() {
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
         .enable_all()
@@ -712,30 +712,60 @@ fn cancel_during_retained_drain_preserves_status_and_drop_waits() {
     });
 }
 
-/// The same cancellation point as `cancel_during_retained_drain_preserves_status_and_drop_waits`,
-/// but this time nothing re-awaits the drain before the handle drops: `Drop` itself must block
-/// until the still-running drain task actually finishes, per H1's recipe step 4.
+/// M4 (round-6 review): `Drop`'s own claim-slot wait (`take_blocking`) must genuinely block on a
+/// drain a cancelled `wait` left running, not merely appear to — the reviewer showed the previous
+/// version of this test passed even with `take_blocking`'s body replaced by `{}`, because on this
+/// test's own zero-length child the queued drain task typically finished well before `Drop` ran,
+/// so nothing about `Drop`'s own wait was ever exercised.
+///
+/// Deterministic instead, the same way `dropping_during_a_blocking_reap_waits_for_it` is: an
+/// `after_drain_claim` gate holds the task claimed (state `Committed`, not yet `Finished`) until
+/// this test releases it, so `Drop` deterministically finds the task already claimed and must go
+/// through `take_blocking`, not `reclaim_before_start`'s direct-drop fast path. The
+/// `before_blocking_drop` hook then fires as `Drop` commits to blocking on the drain and releases
+/// the gate — from inside `Drop`'s own call frame, so the release cannot be observed to race
+/// `Drop`'s own transition to blocking.
+///
+/// The proof itself does not lean on timing at all: only `take_blocking` ever transitions the
+/// state to `Taken` (see `RetainedDrain::take_blocking`) — the direct-reclaim fast path this test
+/// deliberately avoids never does, and neither does the drain task itself. So checking the shared
+/// state right after `drop(u)` returns is racy in neither direction: a `{}` stand-in for
+/// `take_blocking` would return long before the released task could reach `Finished`, but even if
+/// it happened to win that race, the state would read `Finished`, never `Taken`, and the
+/// assertion would still catch it.
 #[cfg(unix)]
 #[test]
 fn drop_after_a_cancelled_wait_waits_for_the_running_drain() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let runtime = ::tokio::runtime::Builder::new_current_thread()
-        .max_blocking_threads(1)
         .enable_all()
         .build()
-        .expect("build a runtime with a single blocking thread");
+        .expect("build a runtime");
     let (child, stdin, id) = std_blocked_child();
-    drop(stdin);
+    drop(stdin); // the child exits at once
     crate::child::unreaped::block_until_reapable(id.pid()).expect("zombie");
-    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-    let (tx, rx) = std::sync::mpsc::channel();
-    runtime.block_on(async {
-        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
-        let _blocker = ::tokio::task::spawn_blocking(move || {
-            let _ = occ_tx.send(());
-            let _ = gate_rx.recv();
-        });
-        occ_rx.await.expect("the blocker parked");
+    let blocked = std::sync::Arc::new(AtomicBool::new(false));
 
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it; the
+    // `Mutex` costs nothing here, since each hook only ever touches its own once.
+    let claimed_tx = std::sync::Mutex::new(claimed_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::fault::set_after_drain_claim(Box::new(move || {
+        claimed_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(())
+            .expect("the test thread is waiting for the claim");
+        release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("the test thread releases the gate");
+    }));
+
+    runtime.block_on(async {
         let mut u = Unreaped::with_retained(
             Held::Std(child),
             Some(crate::child::unreaped::Retained {
@@ -755,25 +785,95 @@ fn drop_after_a_cancelled_wait_waits_for_the_running_drain() {
         };
         ::tokio::select! {
             biased;
-            r = u.wait() => panic!("wait completed while the drain is queued behind the occupied pool: {r:?}"),
+            r = u.wait() => panic!("wait completed instead of being cancelled: {r:?}"),
             _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
         }
-        assert!(u.hands_retained_to_draining_task(), "the drain must still be tracked");
+        assert!(
+            u.hands_retained_to_draining_task(),
+            "the drain must still be tracked after the cancelled wait"
+        );
 
-        // Free the pool's one thread so the drain can run, then drop `u` on a fresh blocking
-        // thread of its own — `Drop` blocks the thread it runs on, so it must not run here on this
-        // async task.
-        gate_tx.send(()).expect("the blocker is still parked on this receiver");
-        ::tokio::task::spawn_blocking(move || {
-            drop(u);
-            let _ = tx.send(());
-        })
-        .await
-        .expect("the drop task did not panic");
+        // Deterministic: wait for the drain task's own claim signal before dropping, so `Drop`
+        // below exercises the "wait for a claimed drain" branch of `take_blocking`, not "drop an
+        // unclaimed one inline". The task is now parked in the gate, claimed but not yet finished.
+        claimed_rx
+            .recv()
+            .expect("the drain task reaches the gate once it has claimed what it must drop");
+        {
+            let (shared, _) = u.draining.as_ref().expect("the drain task owns what was retained");
+            assert!(
+                matches!(*shared.state(), super::DrainState::Committed),
+                "the gate must hold the task Committed before Drop runs"
+            );
+        }
+
+        // `before_blocking_drop` releases the gate from inside `Drop`'s own call frame, right as it
+        // commits to `take_blocking` — no separate thread, no race about when the release happens
+        // relative to `Drop`'s own transition to blocking.
+        let flag = blocked.clone();
+        u.before_blocking_drop(Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+            release_tx
+                .send(())
+                .expect("let the gated task proceed to the real drop");
+        }));
+        // Kept so this can check the state `Drop` leaves behind, immediately after `Drop` itself
+        // returns — not merely that `Drop` didn't hang, which `blocked` alone already proves.
+        let shared = u
+            .draining
+            .as_ref()
+            .expect("the drain task owns what was retained")
+            .0
+            .clone();
+        drop(u); // blocks until the task's own drop has actually run: proof `take_blocking` waited
+        assert!(
+            matches!(*shared.state(), super::DrainState::Taken),
+            "Drop must not return before take_blocking has settled the state to Taken"
+        );
     });
-    assert!(
-        rx.recv().is_ok(),
-        "Drop must return once the drain it waited for has actually finished"
+    assert!(blocked.load(Ordering::SeqCst), "the drop blocked on the drain");
+    crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
+}
+
+/// M3 (round-6 review): `wait` must not return before the drain task it queued has actually
+/// dropped what it retained — the real kill-through, or the real release on a merely disarmed
+/// leaf. Deterministic and cross-platform, unlike the flaky, Linux-cgroup-only test it replaces:
+/// `before_drop` gates `DrainTask::finish` right before `drop(retained)` (unlike
+/// `crate::containment::cgroup::fault::set_next_kill_thread_hook`, which reaches that same moment
+/// only on a Linux cgroup leaf's `cgroup.kill` write, `before_drop` reaches it for every
+/// `Attached` kind, on every platform), so a mutant that notifies `wait`'s waiter before dropping
+/// what was retained — instead of after — leaves the drain parked on the gate while `wait`
+/// wrongly resolves, and the `select!`'s `biased` losing arm catches that: `wait` racing ahead of
+/// the drop is exactly what a `select!` where `wait` wins first would hide.
+#[tokio::test]
+async fn wait_returns_only_after_the_retained_drop_ran() {
+    let (child, stdin, id) = blocked_child();
+    drop(stdin); // the child exits at once
+    let mut unreaped = Unreaped::with_retained(
+        Held::Tokio(Box::new(child)),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::None,
+        }),
     );
+    let (at_drop_tx, at_drop_rx) = ::tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::fault::set_before_drain_drop(Box::new(move || {
+        let _ = at_drop_tx.send(());
+        let _ = release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+    }));
+
+    let mut wait = std::pin::pin!(unreaped.wait());
+    ::tokio::select! {
+        biased;
+        r = &mut wait => panic!("wait returned while the retained drop is parked mid-teardown: {r:?}"),
+        r = at_drop_rx => r.expect("the drain reached the pre-drop hook"),
+    }
+    release_tx.send(()).expect("the drain is parked on the gate");
+    let status = wait.await.expect("wait for the child");
+    assert_eq!(status.code(), Some(0), "{status:?}");
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
