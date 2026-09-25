@@ -904,23 +904,56 @@ fn a_suspended_child_whose_retry_finds_its_exit_underway_is_waited_for_not_repor
     fault::assert_child_reaped(captured);
 }
 
-/// A `try_wait` error after a failed kill — ECHILD, when `SIGCHLD` is ignored and the kernel
+/// A `try_wait` error after a failed kill — a genuine `ECHILD`, meaning something else already
 /// reaped the child — means the pid may already name another process. The child is not handed
 /// back, which would have its holder wait on that pid: it is released, the error logged, and the
 /// spawn's own error returned.
 #[cfg(unix)]
 #[test]
-fn a_child_whose_one_check_fails_after_a_failed_kill_is_released_not_handed_back() {
+fn a_child_whose_one_check_fails_with_echild_after_a_failed_kill_is_released_not_handed_back() {
     use crate::stdio::Stdio;
     crate::log_capture::install();
-    let marker = "cosca-teardown-try-wait-fail-3c95";
     let mut cmd = Command::new();
     cmd.args(["cat"]);
     cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
     let mark = crate::log_capture::mark();
     fault::set_force_attach_failure(true);
     fault::set_force_kill_failure_leaving_child_alive_as(
-        "cosca-kill-eperm-try-wait-fail-80d4",
+        "cosca-kill-eperm-try-wait-echild-80d4",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+    let err = cmd.spawn().err();
+    fault::set_force_attach_failure(false);
+    assert!(
+        matches!(err, Some(Error::Containment { .. })),
+        "the spawn's own error, with no child handed back, got {err:?}"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "ownership is uncertain"),
+        "the release must be logged"
+    );
+    // Released, never waited on: this test's own child, reaped by hand.
+    let crate::identity::Resolved::Found(id) = fault::take_captured().expect("seam captured the child's identity")
+    else {
+        panic!("the seam must capture a resolved identity");
+    };
+    let pid = nix::unistd::Pid::from_raw(id.pid() as i32);
+    nix::sys::wait::waitpid(pid, None).expect("reap the child");
+}
+
+/// A `try_wait` error after a failed kill that is NOT `ECHILD` — a too-old kernel's `EINVAL` from
+/// `waitid(P_PIDFD)`, or any other transient failure — says nothing about the child's ownership:
+/// its pid is still pinned to this unreaped child, so it is handed back running, exactly as a
+/// check that had not failed at all would hand it back.
+#[cfg(unix)]
+#[test]
+fn a_child_whose_one_check_fails_with_a_non_echild_error_after_a_failed_kill_is_handed_back() {
+    let marker = "cosca-teardown-try-wait-fail-non-echild-3c95";
+    let mut cmd = blocker();
+    fault::set_force_attach_failure(true);
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-kill-eperm-try-wait-fail-non-echild-80d4",
         std::io::ErrorKind::PermissionDenied,
     );
     fault::set_force_teardown_try_wait_error(marker);
@@ -931,21 +964,21 @@ fn a_child_whose_one_check_fails_after_a_failed_kill_is_released_not_handed_back
         None,
         "the teardown must consume it"
     );
-    assert!(
-        matches!(err, Some(Error::Containment { .. })),
-        "the spawn's own error, with no child handed back, got {err:?}"
-    );
-    assert!(
-        crate::log_capture::contains_since(mark, marker),
-        "the release must be logged"
-    );
-    // Released, never waited on: this test's own child, reaped by hand.
-    let crate::identity::Resolved::Found(id) = fault::take_captured().expect("seam captured the child's identity")
-    else {
-        panic!("the seam must capture a resolved identity");
+    let Some(Error::Unreaped { child, .. }) = err else {
+        panic!("a non-ECHILD check failure keeps the child, handed back running, got {err:?}");
     };
-    let pid = nix::unistd::Pid::from_raw(id.pid() as i32);
-    nix::sys::wait::waitpid(pid, None).expect("reap the child");
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    assert_eq!(
+        child.pid(),
+        id.pid(),
+        "the handed-back child is the spawned one, still held"
+    );
+    crate::wait::kill(id).expect("end the child");
+    child.wait().expect("wait for the handed-back child");
+    fault::assert_child_reaped(captured);
 }
 
 /// A raw-backend child the teardown could not kill, and that is not suspended, is handed back in

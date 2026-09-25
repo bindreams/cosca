@@ -5,6 +5,44 @@ use super::Unreaped;
 use crate::child::unreaped::Held;
 use crate::identity::{ProcessId, Resolved};
 
+/// `reap_failed` and `classify_tokio_wait` are the async side of cosca's single Unix ownership
+/// classification (see `crate::child::unreaped::releases_ownership`): only `ECHILD` — something
+/// else already reaped the child — makes a failed reap release it (`Failed::Uncertain`); any other
+/// errno, including a too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, leaves it held
+/// (`Failed::Unawaitable`), for the caller to keep.
+#[cfg(unix)]
+#[test]
+fn reap_failed_releases_only_on_echild() {
+    assert!(
+        matches!(
+            super::reap_failed(std::io::Error::from_raw_os_error(libc::ECHILD)),
+            super::Failed::Uncertain(_)
+        ),
+        "ECHILD means something else already reaped the child"
+    );
+    assert!(
+        matches!(
+            super::reap_failed(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            super::Failed::Unawaitable(_)
+        ),
+        "EINVAL (a too-old kernel's waitid(P_PIDFD)) says nothing about ownership"
+    );
+    assert!(
+        matches!(
+            super::classify_tokio_wait(std::io::Error::from_raw_os_error(libc::ECHILD)),
+            super::Failed::Uncertain(_)
+        ),
+        "ECHILD means something else already reaped the child"
+    );
+    assert!(
+        matches!(
+            super::classify_tokio_wait(std::io::Error::other("transient failure")),
+            super::Failed::Unawaitable(_)
+        ),
+        "a non-ECHILD error says nothing about ownership"
+    );
+}
+
 /// A tokio child blocked reading stdin until the returned end drops, and its identity. Spawn it
 /// inside a runtime.
 fn blocked_child() -> (::tokio::process::Child, ::tokio::process::ChildStdin, ProcessId) {

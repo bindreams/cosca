@@ -96,7 +96,8 @@ impl ProcSource {
         }
     }
 
-    /// Block until the child has exited, then let the backend reap it. **Never kills** — the
+    /// Block until the child has exited, then let the backend reap it (see the free fn
+    /// `super::wait_and_reap` for the Unix ownership-uncertain case). **Never kills** — the
     /// caller's own successful kill is what bounds the wait.
     /// **Invariant:** no `wait()` future for this child is in flight when this runs.
     ///
@@ -104,11 +105,20 @@ impl ProcSource {
     /// [`is_reaped`](ProcSource::is_reaped) check or on a child that was never awaited, so an
     /// already-reaped one is a broken precondition, not a case to return quietly from — the shape
     /// this entry exists to remove.
-    pub(crate) fn wait_and_reap(&mut self, pid: u32) {
+    ///
+    /// Takes `self` by value (its caller owns it via `Option::take`) because the Unix
+    /// ownership-uncertain case must forget the tokio child rather than reap it: returns
+    /// `Some(self)` to put back for every other outcome (including every Windows case), or `None`
+    /// once that forgetting has already happened.
+    #[must_use]
+    pub(crate) fn wait_and_reap(self, pid: u32) -> Option<ProcSource> {
         match self {
-            ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false),
+            ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false).map(ProcSource::Tokio),
             #[cfg(windows)]
-            ProcSource::Raw(r) => r.wait_and_reap(),
+            ProcSource::Raw(mut r) => {
+                r.wait_and_reap();
+                Some(ProcSource::Raw(r))
+            }
         }
     }
 

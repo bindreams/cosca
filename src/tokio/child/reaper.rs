@@ -329,7 +329,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
         if force_panic {
             panic!("forced teardown panic (test seam)");
         }
-        os.proc_mut().wait_and_reap(pid);
+        os.wait_and_reap(pid);
     }));
 
     // The glue. Only a seeded fault reaches this, and only to give `work`'s recovery guard the

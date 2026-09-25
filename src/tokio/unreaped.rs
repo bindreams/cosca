@@ -152,14 +152,14 @@ enum Failed {
 }
 
 impl Unreaped {
-    /// Hold `held`, which its one check found running.
+    /// Hold `held`, which its one check did not find exited or reaped elsewhere.
     #[cfg(test)]
     pub(crate) fn new(held: Held) -> Unreaped {
         Unreaped::with_retained(held, None)
     }
 
-    /// Hold `held`, which its one check found running, and `retained` until its reap. A raw
-    /// Windows handle is held by the async backend, so `wait` can await it.
+    /// Hold `held`, which its one check did not find exited or reaped elsewhere, and `retained`
+    /// until its reap. A raw Windows handle is held by the async backend, so `wait` can await it.
     pub(crate) fn with_retained(held: Held, retained: Option<Retained>) -> Unreaped {
         let held = awaitable(held);
         Unreaped {
@@ -269,7 +269,7 @@ impl Unreaped {
             Some(Ok(None)) => Err(self.release(std::io::Error::other(
                 "the child was reapable, yet something else reaped it",
             ))),
-            Some(Err(e)) if e.raw_os_error() == Some(libc::ECHILD) => Err(self.release(e)),
+            Some(Err(e)) if crate::child::unreaped::releases_ownership(&e) => Err(self.release(e)),
             Some(Err(e)) => Err(e),
             // It panicked, or the runtime shut down before it ran: the child is held, unreaped.
             None => Err(std::io::Error::other("the blocking reap ended without reaping")),
@@ -332,9 +332,9 @@ impl Unreaped {
     /// only when a live runtime sees a later `SIGCHLD`, and otherwise the child stays a zombie (see
     /// `crate::child::unreaped`'s **Releasing**). Logged at `warn`.
     ///
-    /// Nothing the child leads is killed. A cgroup v2 leaf it still occupies is left in place, and cosca never removes it — not even once the
-    /// tree has exited: the empty `cosca-*` leaf stays until the owner of the delegated parent
-    /// cgroup removes it.
+    /// Nothing the child leads is killed. A cgroup v2 leaf it still occupies is left in place, and
+    /// cosca never removes it — not even once the tree has exited: the empty `cosca-*` leaf stays
+    /// until the owner of the delegated parent cgroup removes it.
     ///
     /// Leaking a child a cancelled `wait` left with its blocking-pool task does not stop that task:
     /// the child has exited, and the task still reaps it, then disarms what it retained instead of
@@ -374,7 +374,7 @@ impl Unreaped {
                                 self.pid
                             );
                         }
-                        Some(Err(e)) if e.raw_os_error() == Some(libc::ECHILD) => {
+                        Some(Err(e)) if crate::child::unreaped::releases_ownership(&e) => {
                             (*held).release_uncertain();
                             log::warn!(
                                 "leaking unkillable child {}, released: something else reaped it",
@@ -474,13 +474,21 @@ async fn wait_on(held: &mut Held) -> Result<ExitStatus, Failed> {
     })
 }
 
-/// A failed reap after an exit watch. On Unix its ownership is uncertain — something else reaped
-/// it. On Windows the held handle still names its process, so the caller keeps it.
+/// A failed reap after an exit watch, classified by `crate::child::unreaped::releases_ownership`.
+/// On Windows the held handle still names its process, so the caller keeps it either way.
 fn reap_failed(e: std::io::Error) -> Failed {
     #[cfg(unix)]
-    return Failed::Uncertain(e);
+    {
+        if crate::child::unreaped::releases_ownership(&e) {
+            Failed::Uncertain(e)
+        } else {
+            Failed::Unawaitable(e)
+        }
+    }
     #[cfg(windows)]
-    return Failed::Unawaitable(e);
+    {
+        Failed::Unawaitable(e)
+    }
 }
 
 /// A failed wait of tokio's own child. On Unix only `ECHILD` — something else reaped it — makes
@@ -488,7 +496,7 @@ fn reap_failed(e: std::io::Error) -> Failed {
 /// Windows the process handle names it whatever happens, so nothing does.
 fn classify_tokio_wait(e: std::io::Error) -> Failed {
     #[cfg(unix)]
-    if e.raw_os_error() == Some(libc::ECHILD) {
+    if crate::child::unreaped::releases_ownership(&e) {
         return Failed::Uncertain(e);
     }
     Failed::Unawaitable(e)
@@ -520,10 +528,12 @@ async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
 }
 
 impl Drop for Unreaped {
-    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`, and the
-    /// child released without another. A child a cancelled `wait` left with its blocking-pool task
-    /// is waited for there: this blocks until that task has reaped it, or handed it back unreaped
-    /// to be waited for here.
+    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`. On Unix the
+    /// child is released only if the failure makes its ownership uncertain (see
+    /// `crate::child::unreaped::releases_ownership`); any other error is released the same way. On
+    /// Windows the held handle always pins its process either way. A child a cancelled `wait` left
+    /// with its blocking-pool task is waited for there: this blocks until that task has reaped it,
+    /// or handed it back unreaped to be waited for here.
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some((shared, _)) = self.blocking.take() {
@@ -542,14 +552,19 @@ impl Drop for Unreaped {
                 Err(_) => {}
             }
         }
-        if let Some(mut held) = self.held.take() {
-            if let Err(e) = held.wait() {
-                (*held).release_uncertain();
+        if let Some(held) = self.held.take() {
+            let mut held = *held;
+            let waited = held.wait();
+            if let Err(e) = &waited {
                 log::warn!(
                     "waiting for unkillable child {} failed ({e}); it stays unreaped",
                     self.pid
                 );
             }
+            #[cfg(unix)]
+            crate::child::unreaped::settle_after_wait(held, &waited);
+            #[cfg(windows)]
+            drop(held);
         }
         drop(self.retained.take());
     }
