@@ -26,6 +26,12 @@ use crate::child::unreaped::{Held, Retained};
 /// the exit, which has happened, and by the tracer's release. A `wait` cancelled meanwhile leaves
 /// the task holding the child: the next `wait` takes its result, `Drop` blocks until the task has
 /// finished, and `leak` lets it finish and disarms what the child retained.
+///
+/// If the runtime shuts down before that task ever runs, it is dropped unrun, still `NotStarted`.
+/// `wait` and `Drop` tell that apart from a real report by reclaiming the child back from
+/// `NotStarted` directly: `wait` returns an error ("the blocking reap never ran") with the child
+/// still held and unreaped for a later `wait`, `leak`, or `Drop`; `Drop` reclaims it the same way
+/// and waits for it synchronously instead of hanging on a task that will never report.
 #[must_use = "an unkillable child must be waited for or explicitly leaked"]
 pub struct Unreaped {
     /// `None` once reaped or leaked, so `Drop` does nothing more. Boxed, so an
@@ -128,6 +134,12 @@ struct ReapTask {
     held: Option<Box<Held>>,
     retained: Option<Box<Retained>>,
     signal: Option<::tokio::sync::oneshot::Sender<()>>,
+    /// Run once, right after `claim` succeeds (state is now `Running`, on this task's own
+    /// blocking-pool thread), for a test. Lets a test gate the task there, so it can call `leak`
+    /// while state is deterministically `Running` — proving the `Running -> Leaked` arm without
+    /// racing the task's own progress to `Finished`.
+    #[cfg(test)]
+    after_claim: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -136,6 +148,10 @@ impl ReapTask {
         if !self.claim() {
             // Reclaimed directly before this task was scheduled: nothing to do.
             return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_claim.take() {
+            hook();
         }
         let held = self.held.as_mut().expect("claimed above");
         let reaped = crate::child::unreaped::block_until_reapable(held.pid()).and_then(|()| held.try_reap());
@@ -280,21 +296,22 @@ impl Unreaped {
             }
         }
         #[cfg(unix)]
-        if let Some((shared, _)) = self.blocking.as_ref() {
-            // Not yet claimed by the task: retry with a fresh one, rather than depend on the
-            // blocking pool having scheduled this one — a cancelled wait can otherwise leave it
-            // queued behind a saturated pool. The old task does nothing when it does run.
-            if let Some((held, retained)) = shared.reclaim_before_start() {
-                self.blocking = None;
-                self.spawn_blocking_reap(held, retained);
-            }
-        }
-        #[cfg(unix)]
         if let Some((_, finished)) = self.blocking.as_mut() {
             // Cancel-safe: a dropped wait leaves the receiver here, and the task keeps the child.
             // The task reports before it signals, or drops the sender; either ends this await.
             let _ = finished.await;
             let (shared, _) = self.blocking.take().expect("awaited above");
+            // The task may never have claimed the child at all: a runtime shutting down drops a
+            // still-queued task without running it, which drops `finished`'s sender too, so the
+            // `await` above resolves the same way a real report does. Only `reclaim_before_start`
+            // tells the two apart; `take_blocking` past this point would either deadlock (state
+            // still `NotStarted`, `debug_assert`ed against) or, past it, hit the `unreachable!` in
+            // `take_reap`.
+            if let Some((held, retained)) = shared.reclaim_before_start() {
+                self.held = Some(held);
+                self.retained = retained;
+                return Err(std::io::Error::other("the blocking reap never ran"));
+            }
             let taken = shared.take_blocking();
             return self.take_reap(taken);
         }
@@ -327,6 +344,8 @@ impl Unreaped {
             held: None,
             retained: None,
             signal: Some(signal),
+            #[cfg(test)]
+            after_claim: None,
         };
         // The task reports through `shared`, run or not, so its handle is not needed.
         drop(::tokio::task::spawn_blocking(move || task.run()));
@@ -358,12 +377,14 @@ impl Unreaped {
         }
     }
 
-    /// Record a reaped child's status, and release what it retained.
+    /// Record a reaped child's status. What it retained is left armed: its own teardown belongs
+    /// after the root's reap (see `Retained`'s doc), so it still kills through a failed spawn's
+    /// grandchildren left behind — only a released or leaked child disarms it. An armed
+    /// `CgroupLeaf` still occupied drops through `cgroup.kill` and a drain wait, but that wait is
+    /// bounded: `cgroup.kill` is uncatchable.
     fn reaped(&mut self, status: ExitStatus) -> ExitStatus {
         self.held = None;
-        if let Some(retained) = self.retained.take() {
-            retained.attached.disarm();
-        }
+        self.retained = None;
         self.status = Some(status);
         status
     }
@@ -631,12 +652,13 @@ async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
 }
 
 impl Drop for Unreaped {
-    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`. On Unix the
-    /// child is released only if the failure makes its ownership uncertain (see
-    /// `crate::child::unreaped::releases_ownership`); any other error is released the same way. On
-    /// Windows the held handle always pins its process either way. A child a cancelled `wait` left
+    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`, and always
+    /// releases the child: on Unix only the manner depends on
+    /// `crate::child::unreaped::releases_ownership`; on Windows the held handle always pins its
+    /// process, so it is released the same single way either way. A child a cancelled `wait` left
     /// with its blocking-pool task is waited for there: this blocks until that task has reaped it,
-    /// or handed it back unreaped to be waited for here.
+    /// or — if the task never ran at all (a runtime shut down before it was scheduled) — reclaims
+    /// the child directly and waits for it here instead, the same as a fresh `Unreaped` would.
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some((shared, _)) = self.blocking.take() {
@@ -668,10 +690,14 @@ impl Drop for Unreaped {
                 }
             }
         }
+        // Only the fallback synchronous wait just below, or just above, can still leave
+        // `retained` to settle here: `reaped`, `release` and `leak` all take it themselves.
+        let mut failed = false;
         if let Some(held) = self.held.take() {
             let mut held = *held;
             let waited = held.wait();
             if let Err(e) = &waited {
+                failed = true;
                 log::warn!(
                     "waiting for unkillable child {} failed ({e}); it stays unreaped",
                     self.pid
@@ -683,7 +709,10 @@ impl Drop for Unreaped {
             drop(held);
         }
         if let Some(retained) = self.retained.take() {
-            retained.attached.disarm();
+            // See `reaped`: a successful reap leaves what it retained armed.
+            if failed {
+                retained.attached.disarm();
+            }
         }
     }
 }

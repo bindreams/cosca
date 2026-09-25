@@ -33,7 +33,7 @@ fn blocked_child() -> (std::process::Child, std::process::ChildStdin, ProcessId)
 /// else already reaped the child — says the pid may now name another process. Every other errno,
 /// including a too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, and any non-OS `io::Error` —
 /// including `tokio_wait_blocking`'s own "reapable, yet nothing waiting" error (see
-/// `wait_keeps_a_tokio_child_whose_own_reap_finds_no_exit_waiting`), which tokio 1.53 never reports
+/// `wait_does_not_release_ownership_when_its_own_reap_finds_no_exit_waiting`), which tokio 1.53 never reports
 /// as a genuine foreign reap — says nothing about ownership and must not release the child.
 #[cfg(unix)]
 #[test]
@@ -159,7 +159,7 @@ fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
 /// leaks the zombie for good, since nothing else in fact reaped it.
 #[cfg(all(unix, feature = "tokio"))]
 #[tokio::test]
-async fn wait_keeps_a_tokio_child_whose_own_reap_finds_no_exit_waiting() {
+async fn wait_does_not_release_ownership_when_its_own_reap_finds_no_exit_waiting() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
     let Resolved::Found(id) = ProcessId::of(pid) else {
@@ -176,23 +176,16 @@ async fn wait_keeps_a_tokio_child_whose_own_reap_finds_no_exit_waiting() {
         "a reapable-yet-missed exit is not a foreign reap, and must not release ownership: {err}"
     );
     // Not forgotten: `settle_after_wait` released (not `release_uncertain`'d) the child, which for
-    // a tokio child means a normal `drop`, handed to tokio's own orphan queue, not `mem::forget`'d.
-    // That reap runs asynchronously, on tokio's signal driver, not synchronously with `wait()`
-    // returning — so proving no leak means waiting for tokio to actually reap it, not reaping it by
-    // hand: a manual `waitpid` right here races tokio's own reaper for an already-exited zombie and
-    // loses deterministically (measured: `ECHILD`, 10/10 runs). The 10s bound is a human-facing
-    // failure bound on a genuine leak — the bug this test guards against forgets the child, so
-    // nothing would ever reap it — not a synchronization device: success is tokio reaping it
-    // promptly, well under it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if !matches!(ProcessId::of(pid), Resolved::Found(found) if found == id) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "tokio never reaped the child: forgetting it (the bug this test guards against) leaks it exactly like this"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // a tokio child means a normal `drop` of the boxed `tokio::process::Child`. That drops tokio's
+    // own `Reaper`/`PidfdReaper` (src/process/unix/{reap,pidfd_reaper}.rs in tokio 1.53.1), whose
+    // `Drop` calls `try_wait` synchronously and only falls back to tokio's orphan queue if that
+    // comes back empty. The child was already confirmed reapable above, so that synchronous
+    // `try_wait` — which runs inside `wait()`, before it returns, not on tokio's signal driver
+    // afterward — reaps it right there. Proving no leak (the bug this test guards against forgets
+    // the child, leaving nothing to ever reap it) is therefore a direct assertion right after
+    // `wait()` returns, not a poll: the reap has already happened by then, or not at all.
+    assert!(
+        !matches!(ProcessId::of(pid), Resolved::Found(found) if found == id),
+        "tokio never reaped the child: forgetting it (the bug this test guards against) leaks it exactly like this"
+    );
 }

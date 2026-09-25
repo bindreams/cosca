@@ -459,6 +459,58 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// The async twin of
+/// `child::spawn::spawn_tests::a_failed_password_write_whose_check_is_uncertain_disarms_its_retained_leaf`:
+/// a failed password write whose child's one check comes back with ownership uncertain (a genuine
+/// `ECHILD`) disarms what it retained, rather than leaving it armed to kill through a tree that may
+/// no longer be its own.
+///
+/// `Containment::Delegated`, not `CgroupV2`: this function's own tree-kill note at its top fires
+/// whenever `can_teardown()` is true, which would write `cgroup.kill` before the Uncertain arm is
+/// even reached, hiding the one write under test.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_password_write_whose_check_is_uncertain_disarms_its_retained_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-uncertain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::Delegated,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let child = blocker().spawn().expect("spawn the stand-in for the elevated child");
+    let pid = child.id().pid();
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-elevated-kill-eperm-uncertain-7c4e",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-async-password-write-fail-uncertain-0a5d")),
+    );
+
+    assert!(err.to_string().contains("ownership is uncertain"), "got {err}");
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "an uncertain-ownership release must disarm its retained leaf, not kill through it"
+    );
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since cosca released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+}
+
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
 #[cfg(target_os = "linux")]
 fn reaped(pid: u32) -> bool {
@@ -634,6 +686,57 @@ fn a_child_the_async_teardown_cannot_kill_is_handed_back_in_the_error() {
             fault::assert_child_reaped(captured);
         });
     }
+}
+
+/// The async twin of
+/// `child::spawn::spawn_tests::a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf`:
+/// `reap_now`'s teardown whose one check comes back with ownership uncertain (a genuine `ECHILD`)
+/// disarms what it retained, rather than leaving it armed to kill through a tree that may no
+/// longer be its own.
+///
+/// Calls `reap_now` directly: it is private, reachable from this submodule, and driving this exact
+/// arm through a full spawn would need attach failure, a real placed leaf and the ECHILD seam all
+/// armed together for one code path, proving nothing the direct call does not.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-teardown-uncertain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
+    let child = ::tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(false)
+        .spawn()
+        .expect("spawn a real child");
+    let pid = child.id().expect("a freshly spawned child has a pid");
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-teardown-kill-eperm-uncertain-6b2f",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+
+    let handed_back =
+        crate::tokio::child::reap_now(child, pid, false, Some(crate::containment::Attached::Cgroup(leaf)));
+
+    assert!(
+        handed_back.is_none(),
+        "an uncertain check releases the child, handing nothing back"
+    );
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "an uncertain-ownership release must disarm its retained leaf, not kill through it"
+    );
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since the teardown released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
 }
 
 /// The async counterpart of the sync teardown's suspended-child test. A contained root is created

@@ -3365,3 +3365,79 @@ fn settle_verdict_retains_a_placed_leaf_as_attached_cgroup() {
         "the retained leaf must still be a normal, live one, killable through exactly as any other"
     );
 }
+
+/// `Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains ARMED, not disarm it: tree
+/// teardown belongs after the root's reap (see `Retained`'s own doc), so a failed spawn's
+/// grandchildren still in the leaf must still be killed through by the leaf's own `Drop`.
+/// Disarming on success too (the regression this test guards against) would let them run on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_successful_wait_leaves_the_retained_leaf_armed_to_kill_through_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    drop(stdin);
+    unreaped.wait().expect("the child exits cleanly");
+    assert!(
+        kill.exists(),
+        "a successful reap must leave the retained leaf armed, so its own Drop kills through \
+         whatever else still occupies it"
+    );
+}
+
+/// `Unreaped::drop`'s SUCCESSFUL synchronous wait must leave the leaf it retains armed too, the
+/// same as `wait` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_leaves_the_retained_leaf_armed_after_a_successful_synchronous_wait() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    drop(stdin);
+    drop(unreaped);
+    assert!(
+        kill.exists(),
+        "a successful synchronous wait in Drop must leave the retained leaf armed, so its own \
+         Drop kills through whatever else still occupies it"
+    );
+}
+
+/// A `cosca::tokio::Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains armed too.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        drop(stdin);
+        unreaped.wait().await.expect("the child exits cleanly");
+    });
+    assert!(
+        kill.exists(),
+        "a successful tokio reap must leave the retained leaf armed, so its own Drop kills \
+         through whatever else still occupies it"
+    );
+}

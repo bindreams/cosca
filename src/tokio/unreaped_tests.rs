@@ -185,6 +185,83 @@ async fn leak_drops_a_tokio_child_releasing_its_handles() {
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 
+/// `leak` on a child whose blocking-pool task has already claimed it (state `Running`) — not
+/// still `NotStarted`, not yet `Finished` — hits the `Running -> Leaked` arm: it marks the state
+/// `Leaked` and returns, leaving the task's own `report` (once its reap completes) to release the
+/// held child and disarm what it retained.
+///
+/// A gate hook runs inside the task's real `run`, right after its real `claim` succeeds and
+/// before it waits for the exit, and blocks there until this test releases it. That makes the
+/// state deterministically `Running` when `leak` is called below — `claim` updates it strictly
+/// before the hook that unblocks the `recv` runs — rather than racing the task's own progress
+/// toward `Finished`. Awaiting the task's own `JoinHandle` after releasing the gate, rather than
+/// polling, is what then proves its `report` — the disarm under test — has actually run before
+/// the assertion below reads it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
+    let (child, stdin, id) = std_blocked_child();
+    drop(stdin); // the child exits at once, so the task's own reap below does not hang
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-leaked-running-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
+    let retained = crate::child::unreaped::Retained {
+        attached: crate::containment::Attached::Cgroup(leaf),
+    };
+    let mut unreaped = Unreaped::from_sync(crate::Unreaped::with_retained(Held::Std(child), Some(retained)));
+    let held = unreaped.held.take().expect("freshly built, still held");
+    let retained = unreaped.retained.take();
+    let shared = std::sync::Arc::new(super::BlockingReap {
+        state: std::sync::Mutex::new(super::ReapState::NotStarted(held, retained)),
+        finished: std::sync::Condvar::new(),
+    });
+    let (signal, finished) = ::tokio::sync::oneshot::channel();
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it (an
+    // `Unreaped` carrying one must stay `Send + Sync` for `Error<Unreaped>`); the `Mutex` costs
+    // nothing here, since the hook only ever touches them once, from the one thread that runs it.
+    let claimed_tx = std::sync::Mutex::new(claimed_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let task = super::ReapTask {
+        shared: shared.clone(),
+        held: None,
+        retained: None,
+        signal: Some(signal),
+        after_claim: Some(Box::new(move || {
+            claimed_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(())
+                .expect("the test thread is waiting for the claim");
+            release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("the test thread releases the gate");
+        })),
+    };
+    let join = ::tokio::task::spawn_blocking(move || task.run());
+    unreaped.blocking = Some((shared, finished));
+
+    claimed_rx
+        .recv()
+        .expect("the task reaches the gate once it has claimed the child");
+    unreaped.leak();
+    release_tx.send(()).expect("let the gated task proceed");
+    join.await.expect("the blocking task does not panic");
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "a leak while the blocking reap is running must disarm what it retained, not kill through it"
+    );
+    crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
+}
+
 /// A tokio child of uncertain ownership is forgotten on Unix, never dropped: tokio's `Drop` would
 /// reap — or queue to reap — a pid that may be another process's. Here the child is this test's own
 /// zombie, still reapable by the test only if nothing reaped it.
@@ -382,12 +459,13 @@ fn dropping_during_a_blocking_reap_waits_for_it() {
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 
-/// A blocking reap that ends without running — the runtime shut down before it started, or it
-/// panicked — hands the child back unreaped: the wait says so, the holder keeps the child, and the
-/// next wait reaps it. The task is built and dropped here, as such a runtime drops it.
+/// A blocking reap that claimed the child, then ended without finishing — it panicked mid-reap —
+/// hands the child back unreaped: the wait says so, the holder keeps the child, and the next wait
+/// reaps it. The task is built with the child already claimed (state `Running`) and dropped here,
+/// as such a panic's unwind drops it.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_blocking_reap_that_never_ran_hands_the_child_back() {
+async fn a_blocking_reap_that_panicked_after_claiming_hands_the_child_back() {
     let (child, stdin, id) = std_blocked_child();
     let mut unreaped = Unreaped::from_sync(crate::Unreaped::new(Held::Std(child)));
     // Rebound, so a failing assertion drops it before `unreaped`, whose drop waits for the child.
@@ -402,14 +480,51 @@ async fn a_blocking_reap_that_never_ran_hands_the_child_back() {
         held: unreaped.held.take(),
         retained: unreaped.retained.take(),
         signal: Some(signal),
+        after_claim: None,
     };
     unreaped.blocking = Some((shared, finished));
     drop(task);
-    let err = unreaped.wait().await.expect_err("the reap never ran");
+    let err = unreaped.wait().await.expect_err("the reap never finished");
     assert!(err.to_string().contains("ended without reaping"), "{err}");
     assert!(unreaped.held.is_some(), "the holder keeps the child");
     drop(stdin);
     unreaped.wait().await.expect("the next wait reaps it");
+    crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
+}
+
+/// A blocking reap that never ran at all — the runtime shut down before its task was ever
+/// scheduled, so it was dropped still queued — hands the child back unreaped too, with an error
+/// saying so: unlike the panicked-after-claiming case above, `ReapTask::drop` reports nothing here
+/// (it only does once `run` has claimed the child from `NotStarted`), so `finished`'s sender is
+/// simply dropped and `ReapState` stays `NotStarted` forever. Reading `take_blocking` past this
+/// point would deadlock on pool scheduling that will never come (its own `debug_assert`); reaching
+/// `take_reap` past it would hit its `unreachable!`. The regression this test guards against is
+/// exactly that: either of those, instead of the child handed back.
+#[cfg(unix)]
+#[test]
+fn a_blocking_reap_that_never_ran_hands_the_child_back() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime");
+    let handle = runtime.handle().clone();
+    // Shut down before any work runs: `spawn_blocking`'s task is queued, then dropped unrun,
+    // rather than ever claiming the child.
+    runtime.shutdown_background();
+    let (child, stdin, id) = std_blocked_child();
+    drop(stdin); // the child exits at once, so Drop's own fallback wait below does not hang
+    let err = handle.block_on(async {
+        let mut unreaped = Unreaped::from_sync(crate::Unreaped::new(Held::Std(child)));
+        super::fault::set_force_not_yet_reapable();
+        let err = unreaped
+            .wait()
+            .await
+            .expect_err("a runtime shut down before scheduling the reap must not hand back a status");
+        // `unreaped` drops here, inside the still-live `block_on` call: its own fallback
+        // synchronous wait reaps the child it was just handed back.
+        err
+    });
+    assert!(err.to_string().contains("the blocking reap never ran"), "{err}");
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 

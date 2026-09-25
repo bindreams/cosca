@@ -434,11 +434,13 @@ impl Unreaped {
         (held, self.retained.take().map(|r| *r))
     }
 
-    /// Block until the child exits, and reap it. On Unix a failed wait releases the child only if
-    /// its ownership is now uncertain (see `releases_ownership`); any other error says nothing
-    /// about ownership, and the child is simply released, same as [`leak`](Unreaped::leak) leaves
-    /// a still-owned one. On Windows the held handle always pins its process, so a failed wait is
-    /// never about ownership either way.
+    /// Block until the child exits, and reap it. A failed wait always releases the child — this
+    /// `Unreaped` never returns still holding it. On Unix only the manner depends on
+    /// `releases_ownership`: [`release_uncertain`](Held::release_uncertain) if the failure makes
+    /// ownership uncertain, [`release`](Held::release) otherwise (see the module's **Releasing**
+    /// for what each does). On Windows the held handle always pins its process, so `release` is
+    /// the only manner either way — unlike [`leak`](Unreaped::leak), which always releases a
+    /// still-owned child.
     pub fn wait(mut self) -> std::io::Result<ExitStatus> {
         let mut held = *self
             .held
@@ -450,7 +452,13 @@ impl Unreaped {
         #[cfg(windows)]
         drop(held);
         if let Some(retained) = self.retained.take() {
-            retained.give_up();
+            // A successful reap leaves what it retained armed: its own teardown belongs after
+            // the root's reap (see `Retained`'s doc), so it still kills through a failed spawn's
+            // grandchildren left behind. Only a failed wait, which never confirmed the reap, gives
+            // it up disarmed.
+            if waited.is_err() {
+                retained.give_up();
+            }
         }
         waited
     }
@@ -473,15 +481,18 @@ impl Unreaped {
 }
 
 impl Drop for Unreaped {
-    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`. On Unix the
-    /// child is released only if the failure makes its ownership uncertain (see
-    /// `releases_ownership`); any other error is released the same way as
-    /// [`wait`](Unreaped::wait). On Windows the held handle always pins its process either way.
+    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`, and always
+    /// releases the child, the same way [`wait`](Unreaped::wait) does — see its doc for the two
+    /// manners a Unix failure can take, by `releases_ownership`.
     fn drop(&mut self) {
+        // Only the fallback synchronous wait below can still leave `retained` to settle here:
+        // `wait` and `leak` both take it themselves before this ever runs.
+        let mut failed = false;
         if let Some(held) = self.held.take() {
             let mut held = *held;
             let waited = held.wait();
             if let Err(e) = &waited {
+                failed = true;
                 log::warn!(
                     "waiting for unkillable child {} failed ({e}); it stays unreaped",
                     self.pid
@@ -493,7 +504,10 @@ impl Drop for Unreaped {
             drop(held);
         }
         if let Some(retained) = self.retained.take() {
-            retained.give_up();
+            // See `wait`: a successful reap leaves what it retained armed.
+            if failed {
+                retained.give_up();
+            }
         }
     }
 }

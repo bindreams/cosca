@@ -933,6 +933,11 @@ pub(crate) fn reap_now(
         // It had exited, which makes the kill's failure moot.
         Checked::Reaped => None,
         Checked::Uncertain(e) => {
+            // The pid may already name another process: what this spawn retained is given up
+            // disarmed, not left to kill through a tree that may no longer be its own.
+            if let Some(attached) = attached {
+                attached.disarm();
+            }
             log::warn!(
                 "async spawn teardown could not kill pid {pid} ({kill}), and its ownership is uncertain \
                  ({e}); released it without waiting"

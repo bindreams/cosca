@@ -193,6 +193,11 @@ where
     /// watches it, so by the time this error reaches the caller it may already have exited on its
     /// own — reaping it, not just waiting for it, is the caller's, and dropping `child` blocks
     /// until it does. See [`Unreaped`](crate::Unreaped).
+    ///
+    /// That one check (Unix only) can also come back with the child's ownership uncertain instead
+    /// — a genuine `ECHILD`: something else already reaped it. That outcome never reaches this
+    /// variant: there is nothing left to hand back, so the child is released on the spot and the
+    /// caller gets a plain [`Elevation`](Self::Elevation) instead, with no `child` to reap.
     #[error("a failed spawn's child could not be killed ({kill}) and is handed back unreaped")]
     Unreaped {
         #[source]

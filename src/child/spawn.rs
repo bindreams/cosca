@@ -144,10 +144,15 @@ pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
             child: Unreaped::with_retained(held, Some(retained)),
         },
         Checked::Reaped => auth_failed("the elevated child had already exited".into()),
-        Checked::Uncertain(e) => auth_failed(format!(
-            "the elevated child could not be terminated ({kill}), and its ownership is uncertain ({e}); \
-             it was released"
-        )),
+        Checked::Uncertain(e) => {
+            // The pid may already name another process: what this spawn retained is given up
+            // disarmed, not left to kill through a tree that may no longer be its own.
+            retained.attached.disarm();
+            auth_failed(format!(
+                "the elevated child could not be terminated ({kill}), and its ownership is uncertain ({e}); \
+                 it was released"
+            ))
+        }
     }
 }
 
@@ -467,6 +472,11 @@ fn teardown_unadopted(
             // It had exited, which makes the kill's failure moot.
             Checked::Reaped => None,
             Checked::Uncertain(e) => {
+                // The pid may already name another process: what this spawn retained is given up
+                // disarmed, not left to kill through a tree that may no longer be its own.
+                if let Some(attached) = attached {
+                    attached.disarm();
+                }
                 log::warn!(
                     "spawn teardown could not kill pid {pid} ({kill}), and its ownership is uncertain \
                      ({e}); released it without waiting"
