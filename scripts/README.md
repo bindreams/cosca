@@ -227,9 +227,9 @@ guest is the other option if a window on this Mac specifically isn't what's need
 **Measured timings on this host** (Apple Silicon Mac, so `windows-x64` runs under TCG
 cross-arch emulation; one-time data point on 2026-09-23, not a guarantee):
 
-| Guest                      | `up` (import → provisioned)                                        | trivial command | `destroy` |
-| -------------------------- | ------------------------------------------------------------------ | --------------- | --------- |
-| `linux-arm64` (native HVF) | ~75s                                                               | <1s             | ~5s       |
+| Guest                      | `up` (import → provisioned)                                                                                                                                                    | trivial command | `destroy` |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- | --------- |
+| `linux-arm64` (native HVF) | ~75s                                                                                                                                                                           | <1s             | ~5s       |
 | `windows-x64` (TCG)        | ~13.5 min (import + first boot + WinRM ready + full provisioning: file upload plus the 5 devvm.py-driven scripts — clean-stage, mirror-tree, lock-tree, account-and-uac, rust) | ~30s            | ~1 min    |
 
 `windows-x64`'s `boot_timeout`/`winrm.timeout` are set to 3600s to give real headroom for a
