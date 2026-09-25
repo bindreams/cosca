@@ -421,10 +421,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 /// child such as `sudo` refuses our SIGKILL with EPERM — and a blocking `wait()` would hang the
 /// spawn for as long as it runs. Its one ownership check decides what becomes of it (see
 /// [`unreaped`](crate::child::unreaped)): one that had exited is reaped by the check; one whose
-/// check fails is released without a wait, and logged; one still running is returned with the
-/// kill's error, for the caller to hand back in [`Error::Unreaped`] — cosca keeps no thread to
-/// reap it with. Its own stdio handles are closed first: one the caller holds would keep a child
-/// waiting on it.
+/// check fails with `ECHILD` — its ownership now uncertain — is released without a wait, and
+/// logged; one still running, or whose check fails any other way, is returned with the kill's
+/// error, for the caller to hand back in [`Error::Unreaped`] — cosca keeps no thread to reap it
+/// with. Its own stdio handles are closed first: one the caller holds would keep a child waiting
+/// on it.
 ///
 /// On Windows a `suspended` child — one created `CREATE_SUSPENDED` whose attach, the only thing
 /// that resumes it, failed — cannot exit on its own, so it is never handed back: a failed kill is
@@ -1103,6 +1104,10 @@ pub(crate) mod fault {
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
         static FORCE_TEARDOWN_TRY_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(unix)]
+        static FORCE_TEARDOWN_TRY_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
+        #[cfg(all(unix, feature = "tokio"))]
+        static FORCE_TOKIO_WAIT_BLOCKING_LOST: Cell<bool> = const { Cell::new(false) };
         #[cfg(windows)]
         static FORCE_SUSPENDED_TERMINATE_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
         #[cfg(windows)]
@@ -1165,13 +1170,41 @@ pub(crate) mod fault {
     }
 
     /// Make the next ownership check (`Held::check`) on this thread fail with `marker`, as a
-    /// `try_wait` failing would. On Unix that releases the child without a wait, so the test that
-    /// asks for it must reap it; on Windows the child stays held.
+    /// `try_wait` failing would. This is an `Other`-kind error, so on Unix it does NOT release the
+    /// child — only a genuine `ECHILD` does (see [`set_force_teardown_try_wait_echild`]) — the
+    /// child stays held, same as on Windows.
     pub(crate) fn set_force_teardown_try_wait_error(marker: &'static str) {
         FORCE_TEARDOWN_TRY_WAIT_ERROR.with(|f| f.set(Some(marker)));
     }
     pub(crate) fn take_force_teardown_try_wait_error() -> Option<&'static str> {
         FORCE_TEARDOWN_TRY_WAIT_ERROR.with(|f| f.take())
+    }
+
+    /// Make the next ownership check (`Held::check`) on this thread fail with a genuine `ECHILD`,
+    /// as a `try_wait` on a child something else already reaped would. Unlike
+    /// [`set_force_teardown_try_wait_error`], whose `Other`-kind error cannot carry a raw OS error
+    /// code, this constructs a real `ECHILD`, so `Held::check`'s ownership classification — and
+    /// only that classification — releases the child.
+    #[cfg(unix)]
+    pub(crate) fn set_force_teardown_try_wait_echild() {
+        FORCE_TEARDOWN_TRY_WAIT_ECHILD.with(|f| f.set(true));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_force_teardown_try_wait_echild() -> bool {
+        FORCE_TEARDOWN_TRY_WAIT_ECHILD.with(|f| f.take())
+    }
+
+    /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread lose tokio's own
+    /// reap race after confirming the child reapable: its own `try_wait` then finds no exit
+    /// waiting, as if something else had reaped it first — with no real errno to carry that, the
+    /// one case `set_force_teardown_try_wait_echild` cannot reach.
+    #[cfg(all(unix, feature = "tokio"))]
+    pub(crate) fn set_force_tokio_wait_blocking_lost() {
+        FORCE_TOKIO_WAIT_BLOCKING_LOST.with(|f| f.set(true));
+    }
+    #[cfg(all(unix, feature = "tokio"))]
+    pub(crate) fn take_force_tokio_wait_blocking_lost() -> bool {
+        FORCE_TOKIO_WAIT_BLOCKING_LOST.with(|f| f.take())
     }
 
     /// Make the teardown's next retried termination of a suspended child on this thread fail with

@@ -29,6 +29,7 @@ thread_local! {
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
+    static FORCE_END_CHILD_WAIT_EINVAL: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -309,6 +310,18 @@ pub(crate) fn run_between_check_and_kill() {
     if let Some(hook) = BETWEEN_CHECK_AND_KILL.with(|h| h.borrow_mut().take()) {
         hook();
     }
+}
+
+/// Make the FIRST `waitid` of `end_child`'s final reap on this thread — only while it is still
+/// trying its pidfd — fail with `EINVAL`, as `waitid(P_PIDFD, ...)` does on a kernel new enough for
+/// `pidfd_open` (Linux >= 5.3) but too old to wait through one (>= 5.4): proves the fallback to
+/// waiting by pid still reaps the child. Take semantics; a wait already reduced to waiting by pid
+/// (no pidfd in the intent) never consults this seam.
+pub(crate) fn set_force_end_child_wait_einval(on: bool) {
+    FORCE_END_CHILD_WAIT_EINVAL.with(|f| f.set(on));
+}
+pub(crate) fn take_force_end_child_wait_einval() -> bool {
+    FORCE_END_CHILD_WAIT_EINVAL.with(|f| f.replace(false))
 }
 
 /// Count an abandoned child signalled by its bare pid on this thread.

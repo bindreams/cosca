@@ -1041,9 +1041,29 @@ fn end_child(received: &Received) -> ChildFate {
             }
         };
     }
+    // `waitid(P_PIDFD, ...)` needs Linux >= 5.4; cosca's documented pidfd floor is `pidfd_open`
+    // alone (Linux >= 5.3, see `crate::wait::linux`). On such a kernel `pidfd_open` succeeds but
+    // this wait returns `EINVAL` — fall back to waiting by pid, which the kernel has supported
+    // unconditionally. The pid still names this same child: it was proven unreaped and signalled a
+    // moment ago, and only this process may reap it (mirrors `crate::child::unreaped::bare_wait`).
+    let mut by_pid = received.pidfd.is_none();
     let status = loop {
-        match waitid(id(), WaitIdOptions::EXITED) {
+        let this_id = if by_pid { WaitId::Pid(pid) } else { id() };
+        #[cfg(test)]
+        let forced_einval = !by_pid && fault::take_force_end_child_wait_einval();
+        #[cfg(not(test))]
+        let forced_einval = false;
+        let result = if forced_einval {
+            Err(rustix::io::Errno::INVAL)
+        } else {
+            waitid(this_id, WaitIdOptions::EXITED)
+        };
+        match result {
             Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::INVAL) if !by_pid => {
+                by_pid = true;
+                continue;
+            }
             other => break other,
         }
     };

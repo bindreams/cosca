@@ -2,11 +2,16 @@
 //! back: cosca keeps no thread, queue or state of its own to reap it with.
 //!
 //! **The ownership rule.** A child is waited on only once it is confirmed ours and unreaped: its
-//! one check, a `try_wait`, finds it still running. Anything else — a `try_wait` error, a status
-//! already taken — leaves its ownership uncertain: its pid may already name another process, and
-//! a wait would block on that process or steal its status. Such a child is released without any
-//! wait, and a tokio one without running its `Drop`, which would hand the pid to tokio's orphan
-//! queue to wait on. An [`Unreaped`] is only ever built for a child its check found running.
+//! one check, a `try_wait`, finds it still running. Two things leave its ownership uncertain: a
+//! `try_wait` failing with `ECHILD` (see [`releases_ownership`]), or one that succeeds but reports
+//! no exit despite an exit already confirmed some other way (an exit watch that already fired).
+//! Either way its pid may already name another process, and a wait would block on that process or
+//! steal its status. Such a child is released without any wait, and a tokio one without running
+//! its `Drop`, which would hand the pid to tokio's orphan queue to wait on. Any other `try_wait`
+//! failure (a too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, a transient failure) says nothing
+//! about ownership, and is kept the same way a running check is. An [`Unreaped`] is only ever
+//! built for a child its check did not find exited or reaped elsewhere: running, or a check that
+//! failed without saying anything about ownership.
 //!
 //! **Releasing.** A child still ours — one given up by [`Unreaped::leak`] — is released by dropping
 //! its handle: std's `Child` and a raw handle only close descriptors, a pidfd only closes, and a
@@ -47,7 +52,8 @@ pub(crate) enum Held {
 
 /// What a child's one check found.
 pub(crate) enum Checked {
-    /// Ours, unreaped and running: the only child an [`Unreaped`] may hold.
+    /// Ours and unreaped: running, or a check that failed without saying anything about
+    /// ownership — the only child an [`Unreaped`] may hold.
     Running(Held),
     /// It had exited, and the check reaped it.
     Reaped,
@@ -56,6 +62,52 @@ pub(crate) enum Checked {
     /// naming its process (see [`Held::check`]).
     #[cfg_attr(windows, allow(dead_code))]
     Uncertain(std::io::Error),
+}
+
+/// `tokio_wait_blocking`'s own marker for the one Unix case with no real errno to carry it: the
+/// child was confirmed reapable (`block_until_reapable`), then `try_wait` found no exit waiting
+/// for it — something else won the race and reaped it first, exactly as a genuine `ECHILD` would
+/// mean, but tokio's `try_wait` reports that as `Ok(None)`, not an OS error. `releases_ownership`
+/// downcasts for this so `tokio_wait_blocking` can still report it as an `io::Error`.
+#[cfg(all(unix, feature = "tokio"))]
+#[derive(Debug)]
+struct ReapedElsewhere(&'static str);
+
+#[cfg(all(unix, feature = "tokio"))]
+impl std::fmt::Display for ReapedElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+#[cfg(all(unix, feature = "tokio"))]
+impl std::error::Error for ReapedElsewhere {}
+
+#[cfg(all(unix, feature = "tokio"))]
+fn is_reaped_elsewhere(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<ReapedElsewhere>().is_some())
+}
+#[cfg(all(unix, not(feature = "tokio")))]
+fn is_reaped_elsewhere(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// Whether a failed wait/reap means "something else already reaped this child" — the single Unix
+/// condition under which this process must give up ownership of a pid: a genuine `ECHILD`, or
+/// `tokio_wait_blocking` losing the same race with no errno to carry it (see `ReapedElsewhere`).
+/// Either way the pid may since have been recycled onto an unrelated process. Every other errno (a
+/// too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, a transient failure) says nothing about
+/// ownership — the pid is still pinned to our own unreaped child for as long as we hold it, and is
+/// kept, not released.
+///
+/// The single classification every wait/reap error passes through on Unix — `Held::check`,
+/// `settle_after_wait` (the sync and async `Unreaped::wait`/`Drop`), the async `reap_failed`, and
+/// `crate::tokio::child::wait_and_reap` (the teardown path's own wait, past its own kill) all
+/// release on this alone.
+#[cfg(unix)]
+pub(crate) fn releases_ownership(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECHILD) || is_reaped_elsewhere(e)
 }
 
 impl Held {
@@ -74,16 +126,18 @@ impl Held {
         }
     }
 
-    /// The child's one ownership check: reaps it if it has exited, releases it if the check fails,
-    /// and hands it back only if it is running.
-    ///
-    /// On Windows a failed check keeps the child as running: the held handle pins its process, so
-    /// the failure says nothing about ownership, and the caller hands it back or retries its
-    /// termination. Only on Unix, where a pid is all that names it, is it released as uncertain.
+    /// The child's one ownership check: reaps it if it has exited, releases it if the check fails
+    /// in a way that gives up ownership (see `releases_ownership`), and hands it back running
+    /// otherwise — including every other check failure. On Windows a failed check always keeps
+    /// the child as running: the held handle pins its process regardless of the failure.
     pub(crate) fn check(mut self) -> Checked {
         #[cfg(test)]
         let checked = match crate::child::spawn::fault::take_force_teardown_try_wait_error() {
             Some(marker) => Err(std::io::Error::other(marker)),
+            #[cfg(unix)]
+            None if crate::child::spawn::fault::take_force_teardown_try_wait_echild() => {
+                Err(std::io::Error::from_raw_os_error(libc::ECHILD))
+            }
             None => self.try_reap(),
         };
         #[cfg(not(test))]
@@ -97,9 +151,14 @@ impl Held {
                 Checked::Running(self)
             }
             #[cfg(unix)]
-            Err(e) => {
+            Err(e) if releases_ownership(&e) => {
                 self.release_uncertain();
                 Checked::Uncertain(e)
+            }
+            #[cfg(unix)]
+            Err(e) => {
+                log::debug!("checking pid {} failed ({e}); its handle still holds it", self.pid());
+                Checked::Running(self)
             }
         }
     }
@@ -119,8 +178,8 @@ impl Held {
         }
     }
 
-    /// Block until the child exits, and reap it. Only for a child its check found running: ours,
-    /// and unreaped, so its pid cannot have been reused.
+    /// Block until the child exits, and reap it. Only for a child its check did not find exited
+    /// or reaped elsewhere: ours, and unreaped, so its pid cannot have been reused.
     pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
         match self {
             Held::Std(child) => child.wait(),
@@ -159,16 +218,44 @@ impl Held {
     }
 }
 
+/// Settle `held` after a `wait` that produced `waited`: released as [`Held::release_uncertain`]
+/// does if the failure makes its ownership uncertain (see `releases_ownership`), or as
+/// [`Held::release`] does otherwise — the single call site the sync and async `Unreaped::wait` and
+/// `Drop` share, so no one of them can special-case the classification on its own.
+#[cfg(unix)]
+pub(crate) fn settle_after_wait(held: Held, waited: &std::io::Result<ExitStatus>) {
+    match waited {
+        Err(e) if releases_ownership(e) => held.release_uncertain(),
+        _ => held.release(),
+    }
+}
+
 /// tokio has no blocking wait: wait for the exit without reaping — the child is this process's
 /// unreaped one, so its pid is not reused meanwhile — then let tokio reap it.
+///
+/// On Unix, `try_wait` after a confirmed-reapable exit can still report `Ok(None)`: something else
+/// won the race and reaped the child between the two checks. That is ownership-uncertain, exactly
+/// as a genuine `ECHILD` would be, but carries none — `try_wait` reports it as `Ok(None)`, not an
+/// OS error — so it is wrapped in `ReapedElsewhere`, which `releases_ownership` recognizes.
 #[cfg(feature = "tokio")]
 fn tokio_wait_blocking(child: &mut ::tokio::process::Child) -> std::io::Result<ExitStatus> {
     #[cfg(unix)]
-    block_until_reapable(
+    {
+        block_until_reapable(
+            child
+                .id()
+                .ok_or_else(|| std::io::Error::other("tokio already reaped the child"))?,
+        )?;
+        #[cfg(test)]
+        if crate::child::spawn::fault::take_force_tokio_wait_blocking_lost() {
+            return Err(std::io::Error::other(ReapedElsewhere(
+                "the child exited, yet tokio could not reap it",
+            )));
+        }
         child
-            .id()
-            .ok_or_else(|| std::io::Error::other("tokio already reaped the child"))?,
-    )?;
+            .try_wait()?
+            .ok_or_else(|| std::io::Error::other(ReapedElsewhere("the child exited, yet tokio could not reap it")))
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -180,10 +267,10 @@ fn tokio_wait_blocking(child: &mut ::tokio::process::Child) -> std::io::Result<E
         if unsafe { WaitForSingleObject(HANDLE(handle), INFINITE) } != WAIT_OBJECT_0 {
             return Err(std::io::Error::last_os_error());
         }
+        child
+            .try_wait()?
+            .ok_or_else(|| std::io::Error::other("the child exited, yet tokio could not reap it"))
     }
-    child
-        .try_wait()?
-        .ok_or_else(|| std::io::Error::other("the child exited, yet tokio could not reap it"))
 }
 
 /// A kill's crate error as the `io::Error` an `Error::Unreaped` carries: an elevated child's typed
@@ -250,6 +337,12 @@ pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
 /// `waitid` for a [`Held::Bare`] child, through its pidfd if it has one, else by its pid.
 /// `block`ing waits for its exit; otherwise it returns at once, `None` if it is still running.
 /// Either way an exited child is reaped.
+///
+/// `waitid(P_PIDFD, ...)` needs Linux >= 5.4; cosca's documented pidfd floor is `pidfd_open` alone
+/// (Linux >= 5.3, see `crate::wait::linux`). On such a kernel `pidfd_open` succeeds but the wait
+/// itself returns `EINVAL` — this falls back to waiting by pid, which the kernel has supported
+/// unconditionally. The pid is pinned to this unreaped child for as long as it is held, so the
+/// fallback still names the same process.
 #[cfg(target_os = "linux")]
 fn bare_wait(pid: u32, pidfd: Option<&std::os::fd::OwnedFd>, block: bool) -> std::io::Result<Option<ExitStatus>> {
     use std::os::fd::AsFd;
@@ -257,31 +350,48 @@ fn bare_wait(pid: u32, pidfd: Option<&std::os::fd::OwnedFd>, block: bool) -> std
 
     use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
     let pid = Pid::from_raw(pid as i32).ok_or_else(|| std::io::Error::other("pid 0"))?;
-    let id = || match pidfd {
-        Some(pidfd) => WaitId::PidFd(pidfd.as_fd()),
-        None => WaitId::Pid(pid),
-    };
     let options = if block {
         WaitIdOptions::EXITED
     } else {
         WaitIdOptions::EXITED | WaitIdOptions::NOHANG
     };
+    let mut by_pid = pidfd.is_none();
     let status = loop {
-        match waitid(id(), options) {
+        let id = if by_pid {
+            WaitId::Pid(pid)
+        } else {
+            WaitId::PidFd(pidfd.expect("by_pid is false only when pidfd is Some").as_fd())
+        };
+        match waitid(id, options) {
             Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::INVAL) if !by_pid => {
+                by_pid = true;
+                continue;
+            }
             other => break other?,
         }
     };
-    // A wait status as `waitpid` would report it: an exit code in the second byte, else the
-    // terminating signal in the first.
     Ok(status.map(|status| {
-        let raw = match (status.exit_status(), status.terminating_signal()) {
-            (Some(code), _) => (code & 0xff) << 8,
-            (None, Some(signal)) => signal & 0x7f,
-            (None, None) => 0,
-        };
-        ExitStatus::from_raw(raw)
+        ExitStatus::from_raw(wait_status_raw(
+            status.exit_status(),
+            status.terminating_signal(),
+            status.dumped(),
+        ))
     }))
+}
+
+/// A wait status as `waitpid` would report it, from `waitid`'s decoded fields: an exit code in the
+/// second byte, else the terminating signal in the first, with the core-dump bit (`0x80`) set
+/// alongside the signal when the child dumped core. `waitid`'s own `terminating_signal()` is
+/// already `Some` for a core-dumped exit (rustix's `killed() || dumped()`), so `dumped` only ever
+/// applies alongside a signal.
+#[cfg(target_os = "linux")]
+fn wait_status_raw(exit_status: Option<i32>, terminating_signal: Option<i32>, dumped: bool) -> i32 {
+    match (exit_status, terminating_signal) {
+        (Some(code), _) => (code & 0xff) << 8,
+        (None, Some(signal)) => (signal & 0x7f) | if dumped { 0x80 } else { 0 },
+        (None, None) => 0,
+    }
 }
 
 /// A child a failed spawn created but could not kill — a setuid child refuses the kill with
@@ -304,12 +414,13 @@ pub struct Unreaped {
 }
 
 impl Unreaped {
-    /// Hold `held`, which its one check found running.
+    /// Hold `held`, which its one check did not find exited or reaped elsewhere.
     pub(crate) fn new(held: Held) -> Unreaped {
         Unreaped::with_retained(held, None)
     }
 
-    /// Hold `held`, which its one check found running, and `retained` until its reap.
+    /// Hold `held`, which its one check did not find exited or reaped elsewhere, and `retained`
+    /// until its reap.
     pub(crate) fn with_retained(held: Held, retained: Option<Retained>) -> Unreaped {
         Unreaped {
             pid: held.pid(),
@@ -340,17 +451,21 @@ impl Unreaped {
         (held, self.retained.take().map(|r| *r))
     }
 
-    /// Block until the child exits, and reap it. A failed wait leaves the child's ownership
-    /// uncertain: it is released without another.
+    /// Block until the child exits, and reap it. On Unix a failed wait releases the child only if
+    /// its ownership is now uncertain (see `releases_ownership`); any other error says nothing
+    /// about ownership, and the child is simply released, same as [`leak`](Unreaped::leak) leaves
+    /// a still-owned one. On Windows the held handle always pins its process, so a failed wait is
+    /// never about ownership either way.
     pub fn wait(mut self) -> std::io::Result<ExitStatus> {
         let mut held = *self
             .held
             .take()
             .expect("an Unreaped holds its child until it is consumed");
         let waited = held.wait();
-        if waited.is_err() {
-            held.release_uncertain();
-        }
+        #[cfg(unix)]
+        settle_after_wait(held, &waited);
+        #[cfg(windows)]
+        drop(held);
         drop(self.retained.take());
         waited
     }
@@ -358,9 +473,9 @@ impl Unreaped {
     /// Give the child up without waiting for it: it runs on, and nothing of cosca's reaps it (see
     /// the module's **Releasing** for what closes, per kind of child). Logged at `warn`.
     ///
-    /// Nothing the child leads is killed. A cgroup v2 leaf it still occupies is left in place, and cosca never removes it — not even once the
-    /// tree has exited: the empty `cosca-*` leaf stays until the owner of the delegated parent
-    /// cgroup removes it.
+    /// Nothing the child leads is killed. A cgroup v2 leaf it still occupies is left in place, and
+    /// cosca never removes it — not even once the tree has exited: the empty `cosca-*` leaf stays
+    /// until the owner of the delegated parent cgroup removes it.
     pub fn leak(mut self) {
         if let Some(held) = self.held.take() {
             (*held).release();
@@ -373,17 +488,24 @@ impl Unreaped {
 }
 
 impl Drop for Unreaped {
-    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`, and the
-    /// child released without another.
+    /// Blocks until the child exits, then reaps it. A failed wait is logged at `warn`. On Unix the
+    /// child is released only if the failure makes its ownership uncertain (see
+    /// `releases_ownership`); any other error is released the same way as
+    /// [`wait`](Unreaped::wait). On Windows the held handle always pins its process either way.
     fn drop(&mut self) {
-        if let Some(mut held) = self.held.take() {
-            if let Err(e) = held.wait() {
-                (*held).release_uncertain();
+        if let Some(held) = self.held.take() {
+            let mut held = *held;
+            let waited = held.wait();
+            if let Err(e) = &waited {
                 log::warn!(
                     "waiting for unkillable child {} failed ({e}); it stays unreaped",
                     self.pid
                 );
             }
+            #[cfg(unix)]
+            settle_after_wait(held, &waited);
+            #[cfg(windows)]
+            drop(held);
         }
         drop(self.retained.take());
     }

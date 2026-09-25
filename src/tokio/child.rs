@@ -30,9 +30,11 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 #[cfg(windows)]
 pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 
-/// The `expect` behind the two backend accessors: only `Drop` takes `proc`, and nothing runs on
-/// the handle after that, so both are infallible.
-const PROC_TAKEN: &str = "the async child's process backend is taken only by Drop";
+/// The `expect` behind the backend accessors: `Drop`/`into_unreaped_parts` take `proc` to move it
+/// on, and `OsResources::wait_and_reap` takes it to put back or forget — nothing runs on the
+/// handle after any of those, so every accessor stays infallible.
+const PROC_TAKEN: &str =
+    "the async child's process backend is taken only by Drop, into_unreaped_parts, or wait_and_reap";
 
 /// Every field of a [`Child`] that owns an OS resource, **declared in the order they must be
 /// released**: the backend first, so the pid stays pinned for the whole wait and each other
@@ -44,7 +46,8 @@ const PROC_TAKEN: &str = "the async child's process backend is taken only by Dro
 /// `Child` instead would silently keep its release on the dropping thread.
 #[derive(Debug, Default)]
 pub(crate) struct OsResources {
-    /// `Option` so `Drop` can move the backend into the reaper job; nothing else takes it.
+    /// `Option` so `Drop` can move the backend into the reaper job, and so `wait_and_reap` can
+    /// take it to forget a tokio child of uncertain ownership (Unix only — see that method).
     /// Read it through [`proc_mut`](OsResources::proc_mut), never directly.
     pub(crate) proc: Option<ProcSource>,
     pub(crate) attached: Attached,
@@ -59,10 +62,19 @@ pub(crate) struct OsResources {
 }
 
 impl OsResources {
-    /// The process backend. The single `expect` site: `Drop` is the only thing that empties this,
-    /// and it is the last reader.
+    /// The process backend. See `PROC_TAKEN` for who may empty `self.proc` before this runs.
     pub(crate) fn proc_mut(&mut self) -> &mut ProcSource {
         self.proc.as_mut().expect(PROC_TAKEN)
+    }
+
+    /// Wait for the backend's process to exit, then let it be reaped: the one caller-facing entry
+    /// for [`ProcSource::wait_and_reap`], which must own the backend to forget it on
+    /// ownership-uncertain (Unix's tokio path only — see that method and the free fn
+    /// `wait_and_reap`). `self.proc` is left `None` only when that happened; every other outcome
+    /// puts the backend straight back.
+    pub(crate) fn wait_and_reap(&mut self, pid: u32) {
+        let proc = self.proc.take().expect(PROC_TAKEN);
+        self.proc = proc.wait_and_reap(pid);
     }
 }
 
@@ -137,7 +149,11 @@ impl Child {
         self.kill_on_drop = false;
         let os = std::mem::take(&mut self.os);
         drop(self);
-        let ProcSource::Tokio(child) = os.proc.expect(PROC_TAKEN);
+        let ProcSource::Tokio(mut child) = os.proc.expect(PROC_TAKEN);
+        // Drop tokio's OWN piped stdin/stdout/stderr too, as `reap_now` (below) does: an
+        // `Unreaped::wait` on this child must not wait on an exit that a held-open pipe end
+        // prevents.
+        drop_own_piped_stdio(&mut child);
         drop((os.pipes, os.owned_std));
         (
             crate::child::unreaped::Held::Tokio(Box::new(child)),
@@ -176,7 +192,7 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn wait_and_reap_blocking(&mut self) {
         let pid = self.id.pid();
-        self.proc_mut().wait_and_reap(pid);
+        self.os.wait_and_reap(pid);
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -666,6 +682,8 @@ pub(crate) mod fault {
 
     thread_local! {
         static FORCE_WAIT_FAILURE: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(unix)]
+        static FORCE_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Make the NEXT [`wait_and_reap`](super::wait_and_reap) on THIS thread fail its wait with
@@ -675,6 +693,19 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_force_wait_failure() -> Option<&'static str> {
         FORCE_WAIT_FAILURE.with(|f| f.take())
+    }
+
+    /// Make the NEXT [`wait_and_reap`](super::wait_and_reap) on THIS thread fail its wait with a
+    /// real `ECHILD` — the errno a foreign reaper stealing the child behind our back would leave —
+    /// so the ownership-uncertain path (`crate::child::unreaped::releases_ownership`) can be
+    /// exercised without one, which `set_force_wait_failure`'s generic marker cannot reach.
+    #[cfg(unix)]
+    pub(crate) fn set_force_wait_echild() {
+        FORCE_WAIT_ECHILD.with(|f| f.set(true));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_force_wait_echild() -> bool {
+        FORCE_WAIT_ECHILD.with(|f| f.take())
     }
 }
 
@@ -768,8 +799,10 @@ impl Drop for Child {
         // without touching this function. On every early return below it drops in group order,
         // on this thread — exactly where it dropped before the reap moved off it.
         let mut os = std::mem::take(&mut self.os);
-        // Already reaped: no signal to issue and no exit to wait for.
-        if os.proc_mut().is_reaped() {
+        // Already reaped, or (Unix only) its ownership already given up and the backend forgotten
+        // by an earlier `wait_and_reap` — `proc` is `None` only then, since `Drop` is what empties
+        // it otherwise: no signal to issue and no exit to wait for either way.
+        if os.proc.as_ref().is_none_or(ProcSource::is_reaped) {
             return;
         }
         // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
@@ -810,6 +843,14 @@ impl Drop for Child {
     }
 }
 
+/// Drop tokio's OWN piped stdin/stdout/stderr (not cosca's `os.pipes`/`os.owned_std`, which are a
+/// separate concern each caller handles itself). One the caller never took keeps a writer child
+/// blocked in `write(2)` on a full pipe nobody drains, or a reader blocked on one nobody feeds — so
+/// a subsequent wait on the child's exit would then wait on one that never comes.
+fn drop_own_piped_stdio(child: &mut ::tokio::process::Child) {
+    drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+}
+
 /// The async spawn's error teardown: kill the child, then block until it has exited. The kill
 /// here is what bounds the wait, so a caller that has ALREADY killed must use [`wait_and_reap`]
 /// instead — re-killing would make its reap conditional on a second kill that can be refused.
@@ -846,10 +887,12 @@ pub(crate) fn reap_now(
         None => child.start_kill(),
     };
     let Err(kill) = killed else {
-        wait_and_reap(&mut child, pid, done_ok);
+        // `Some` ⇒ still needs an ordinary drop to trigger tokio's own reap; `None` ⇒ ownership
+        // came back uncertain and the child was already forgotten (see `wait_and_reap`'s doc).
+        drop(wait_and_reap(child, pid, done_ok));
         return None;
     };
-    drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+    drop_own_piped_stdio(&mut child);
     match Held::Tokio(Box::new(child)).check() {
         Checked::Running(mut held) => {
             #[cfg(windows)]
@@ -861,8 +904,10 @@ pub(crate) fn reap_now(
                     _ => false,
                 };
                 if terminated {
-                    if let Held::Tokio(child) = &mut held {
-                        wait_and_reap(child, pid, done_ok);
+                    if let Held::Tokio(boxed) = held {
+                        // Windows never finds ownership uncertain (see `wait_and_reap`'s doc): the
+                        // returned child is always `Some`, and dropping it lets tokio reap it.
+                        drop(wait_and_reap(*boxed, pid, done_ok));
                     }
                     log::warn!(
                         "async spawn teardown failed to kill pid {pid}: {kill}; terminated it through its handle"
@@ -898,8 +943,20 @@ pub(crate) fn reap_now(
 /// reaped it), the pid may be recycled and we must not wait on it. `done_ok` says whether an
 /// already-`Done` child is legal here: `true` for `Drop` (the user may have `wait()`ed), `false`
 /// for a caller whose child was never awaited.
+///
+/// Returns `Some(child)` if the caller may drop it normally — every Windows outcome, and the
+/// ordinary Unix success path, which relies on exactly that drop to trigger tokio's own reap.
+/// Returns `None` only on Unix, when the wait finds ownership uncertain (classified by
+/// `crate::child::unreaped::releases_ownership`, the same predicate `Held`'s own wait uses):
+/// `child` is forgotten before returning, since a normal drop would hand its pid to tokio's orphan
+/// queue, which may since name a different process.
 /// **Invariant:** no `wait()` future for this child is in flight when this runs.
-pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
+#[must_use]
+pub(crate) fn wait_and_reap(
+    child: ::tokio::process::Child,
+    pid: u32,
+    done_ok: bool,
+) -> Option<::tokio::process::Child> {
     // tokio `Done` ⇒ already reaped, pid possibly recycled ⇒ nothing to do (the recycled-pid wait
     // hazard the sync side avoids by holding a handle).
     if child.id().is_none() {
@@ -907,7 +964,7 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
             done_ok,
             "wait_and_reap found an already-reaped child where one was impossible"
         );
-        return;
+        return Some(child);
     }
     #[cfg(unix)]
     {
@@ -920,7 +977,11 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
         let mut forced = fault::take_force_wait_failure();
         loop {
             #[cfg(test)]
-            let forced_err = forced.take().map(std::io::Error::other);
+            let forced_err = if fault::take_force_wait_echild() {
+                Some(std::io::Error::from_raw_os_error(libc::ECHILD))
+            } else {
+                forced.take().map(std::io::Error::other)
+            };
             #[cfg(not(test))]
             let forced_err: Option<std::io::Error> = None;
             let err = match forced_err {
@@ -933,7 +994,7 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
                         libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
                     };
                     if rc == 0 {
-                        break;
+                        return Some(child);
                     }
                     std::io::Error::last_os_error()
                 }
@@ -941,12 +1002,22 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            // id() was Some above (tokio un-reaped ⇒ pid pinned), so no ECHILD / other errno should
-            // occur — a debug tripwire, with a safe release `break`. warn first: the assert is
-            // compiled out in release.
+            if crate::child::unreaped::releases_ownership(&err) {
+                // Something else already reaped this pid: it may since name another process, so
+                // forget the tokio child rather than let its drop `waitpid` on that pid.
+                log::warn!(
+                    "waiting for pid {pid} to exit in teardown found its ownership uncertain ({err}); \
+                     released it without reaping"
+                );
+                std::mem::forget(child);
+                return None;
+            }
+            // id() was Some above (tokio un-reaped ⇒ pid pinned), so any other errno is a genuine
+            // tripwire, not an ownership question — a safe release `return` keeps the child.
+            // warn first: the assert is compiled out in release.
             log::warn!("waiting for pid {pid} to exit in teardown failed: {err}; leaving its reap to tokio");
             debug_assert!(false, "waitid in wait_and_reap failed unexpectedly: {err}");
-            break;
+            return Some(child);
         }
     }
     #[cfg(windows)]
@@ -973,5 +1044,6 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
             log::warn!("waiting for pid {pid} to exit in teardown failed: {e}");
             debug_assert!(false, "wait_and_reap did not observe the child's exit: {e}");
         }
+        Some(child)
     }
 }

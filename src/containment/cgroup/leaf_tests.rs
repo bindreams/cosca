@@ -2195,6 +2195,40 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
     assert!(reaped(&pidfd), "and reaped");
 }
 
+/// `end_child`'s final reap falls back to waiting by pid when its `waitid(P_PIDFD, ...)` fails with
+/// `EINVAL` — a too-old kernel's answer for a pidfd it could still open (see `bare_wait`'s doc, the
+/// analogous fallback on the `Unreaped` side). Without the fallback this leaves the child unreaped:
+/// this pins that it does not.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_reaped_by_pidfd_falls_back_to_its_pid_on_einval() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-einval-fallback");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], false, std::process::Stdio::null());
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
+    drop(child);
+
+    crate::containment::cgroup::fault::set_force_end_child_wait_einval(true);
+    drop(leaf);
+    assert!(
+        !crate::containment::cgroup::fault::take_force_end_child_wait_einval(),
+        "the forced EINVAL must be consumed by the wait it targets"
+    );
+
+    assert!(
+        crate::containment::cgroup::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
+        "the fallback wait by pid must still record the reap"
+    );
+    assert!(
+        reaped(&pidfd),
+        "and the child must actually be reaped, not left a zombie"
+    );
+}
+
 /// A pidfd for `pid`, this process's own unreaped child, taken while its pid is pinned.
 #[cfg(target_os = "linux")]
 fn pidfd_of(pid: u32) -> std::os::fd::OwnedFd {

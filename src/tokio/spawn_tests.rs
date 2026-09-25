@@ -202,17 +202,18 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
-/// On the identity-failure path, a child tokio could not kill (`EPERM`) goes to tokio's orphan
-/// queue, which reaps it once it exits. The leaf, having taken its verdict first, answers only for
-/// the tree — its kill through the leaf — and never reaps that child as an abandoned spawn's,
-/// which would race tokio's reap for the same pid.
+/// On the identity-failure path, a child tokio could not kill (`EPERM`) is handed back running in
+/// [`Error::Unreaped`] — cosca keeps no background thread to reap it, so the caller must, not
+/// tokio's orphan queue. The leaf, having taken its verdict first, answers only for the tree — its
+/// kill through the leaf — and never reaps that child as an abandoned spawn's, which would race
+/// the caller's own reap of the same pid.
 ///
 /// The leaf may be left behind: its `Drop` removes it right after `cgroup.kill`, without waiting
 /// for the kill to land — a known exit-lag gap, not this.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio() {
+async fn cgroup_an_identity_failure_whose_kill_is_refused_hands_the_child_back_unreaped() {
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
@@ -227,19 +228,37 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
     cmd.contain();
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
-    err.expect("forced identity-vanish must make spawn return Err");
     assert_eq!(
         fault::take_force_kill_failure(),
         None,
         "the kill failure must be consumed"
     );
-    let _ = fault::take_captured();
+
+    let Some(Error::Unreaped { kill, mut child, .. }) = err else {
+        panic!("the unkillable child must be handed back, got {err:?}");
+    };
+    assert_eq!(
+        kill.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the kill's own error"
+    );
 
     assert_eq!(
         crate::containment::cgroup::fault::take_reaped_orphans(),
         Vec::new(),
         "the leaf must not reap a child tokio owns"
     );
+
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    assert_eq!(child.pid(), id.pid(), "the handed-back child is the spawned one");
+    // Handled explicitly rather than dropped: `Unreaped`'s `Drop` would block this async test's
+    // runtime thread waiting for the child.
+    crate::wait::kill(id).expect("end the child");
+    child.wait().await.expect("wait for the handed-back child");
+    fault::assert_child_reaped(captured);
 }
 
 /// An abandoned spawn's child writes nothing into its own stdio. With fds 1 and 2 closed, `std`'s

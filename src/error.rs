@@ -118,8 +118,18 @@ pub enum RecordErrorKind {
 /// **Building one in an expression needs a type.** A default type parameter is not applied during
 /// inference, so `let e = Error::Io(err);` fails to compile (`E0283`, type annotations needed) when
 /// nothing else fixes `C`. Annotate it: `let e: cosca::error::Error = Error::Io(err);`, or build it
-/// where the expected type is already known, such as a function's `Err` return. Naming the type,
-/// matching on it and `?` are unaffected.
+/// where the expected type is already known, such as a function's `Err` return. Naming the type and
+/// matching on it are unaffected either way.
+///
+/// **`?` does NOT cross between [`cosca::error::Error`](crate::error::Error) and
+/// [`cosca::tokio::Error`](crate::tokio::Error).** Only one direction converts: a sync
+/// `cosca::error::Error` becomes a `cosca::tokio::Error`, never the reverse. `child.kill()?` inside
+/// a function returning `Result<_, cosca::error::Error>`, where `child.kill()` returns
+/// `Result<_, cosca::tokio::Error>`, fails to compile (`E0277`, the trait bound `?` needs is
+/// missing); `cmd.status().await?` from such a function fails the same way, and with the same code.
+/// Async code that calls tokio-flavored cosca APIs must itself return
+/// `cosca::tokio::Error`, not `cosca::error::Error` — the sync default only widens into the tokio
+/// type, not out of it.
 ///
 /// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
 /// wildcard arm rather than have each new variant break them.
