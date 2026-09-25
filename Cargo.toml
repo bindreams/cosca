@@ -50,13 +50,15 @@ regex = "1"
 [target.'cfg(windows)'.dev-dependencies]
 # Integration tests cannot reach the crate's own dependencies, and the `windows_*` probes call
 # GetFullPathNameW, GetFileInformationByHandleEx, ShellExecuteExW, the token APIs, the
-# CreateProcess* family, SetHandleInformation, RtlGetVersion and RegGetValueW directly (the last two
-# stamp each measurement with its OS build) to MEASURE the platform rather than to use cosca;
-# `windows_shell_execute` calls ShellExecuteExW from an STA and writes one volatile App Paths key in
-# HKLM and one in HKCU (see its module doc).
+# CreateProcess* family, SetHandleInformation, RtlGetVersion, RegGetValueW and CompareStringOrdinal
+# directly (the middle two stamp each measurement with its OS build; the last orders an environment
+# block's keys the same case-insensitive way CreateProcess* itself does) to MEASURE the platform
+# rather than to use cosca; `windows_shell_execute` calls ShellExecuteExW from an STA and writes one
+# volatile App Paths key in HKLM and one in HKCU (see its module doc).
 windows = { version = "0.62", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",

@@ -212,14 +212,12 @@ jobs:
       # here (`-E`) and run below instead, each in its own nextest invocation, consecutively, after
       # all other probes: see the module doc in `tests/windows_shell_resolution.rs` for why — a
       # leftover `OpenWith.exe` from one such probe blocking the next `ShellExecuteExW` call was a
-      # candidate explanation for the intermittent hang, but a dispatch run against this isolation
-      # found a leftover instance carried across both later probes on both architectures with
-      # neither probe hanging, which is evidence against it, not for it; the module doc has the
-      # detail. `--no-tests=warn` covers the edge case that exclusion creates: a `probe_filter` that
+      # candidate explanation for the intermittent hang; the module doc has what was measured about
+      # it. `--no-tests=warn` covers the edge case that exclusion creates: a `probe_filter` that
       # narrows this step to exactly one of those three would otherwise match zero tests and fail
       # here; instead this step warns and exits 0, and the isolated step below for that probe still
       # runs it (or skips it with its own message, if the filter excludes it too).
-      # Each probe that passes leaves a marker named after itself (`mark_probe_passed`); the final
+      # Each probe that passes leaves a marker named after itself (`mark_test_passed`); the final
       # "Require that an executing probe ran" step fails the job if none exists.
       - name: Run executing probes
         shell: bash
