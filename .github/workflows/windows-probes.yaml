@@ -11,6 +11,11 @@
 #
 #     gh workflow run windows-probes.yaml [-f filter=<test-name substring>] [-f run_canary=false] \
 #         [-f elevating=true]
+#
+# `-f run_executing_probes=true` adds the `executing` job, which never runs any other way; its tests
+# take their own `-f probe_filter=`. To run only those, add `-f run_canary=false` (and leave
+# `elevating` at its default of `false`): the path-resolution job is then skipped too, rather than
+# run with nothing to assert.
 name: windows-probes
 
 on:
@@ -29,11 +34,14 @@ on:
       - "tests/windows_path_resolution.rs"
       - "tests/windows_path_resolution/**"
       - "tests/windows_shell_execute.rs"
+      - "tests/common/windows_probe.rs"
       # The canary's payload is built from here.
       - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
       - "Cargo.toml"
       - "Cargo.lock"
+      # `terminate-after` and other nextest profile settings the probes' own bounds are chosen against.
+      - ".config/nextest.toml"
       - ".github/actions/setup-rust/**"
       - ".github/workflows/windows-probes.yaml"
   # `windows-latest` floats: a new Windows build can change the answer with no commit here.
@@ -42,7 +50,7 @@ on:
   workflow_dispatch:
     inputs:
       filter:
-        description: "Test-name filter (blank runs every probe)"
+        description: "Test-name filter for path-resolution and elevating probes (blank runs every probe)"
         required: false
         default: ""
       run_canary:
@@ -55,6 +63,15 @@ on:
         type: boolean
         required: false
         default: false
+      run_executing_probes:
+        description: "Also run the probes that execute a batch file through ShellExecuteEx"
+        type: boolean
+        required: false
+        default: false
+      probe_filter:
+        description: "Executing-probe test-name filter (blank runs every executing probe)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -69,6 +86,9 @@ concurrency:
 jobs:
   path-resolution:
     name: Path canary (${{ matrix.runner }})
+    # Only a dispatch can opt out, and only by refusing both steps this job can run; pull requests
+    # and the schedule always run it.
+    if: github.event_name != 'workflow_dispatch' || inputs.run_canary || inputs.elevating
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +135,7 @@ jobs:
       # invocation serially; the `windows-shell-execute` test group capped at one thread in
       # `.config/nextest.toml` gives the same guarantee independent of that flag.
       - name: Run elevating probes
-        if: github.event_name != 'workflow_dispatch' || inputs.elevating
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.elevating) }}
         shell: bash
         env:
           FILTER: ${{ inputs.filter }}
@@ -130,7 +150,7 @@ jobs:
       # A filter matching no test, or only surveys, would otherwise pass having asserted nothing.
       # Runs after a failure too, so the log shows which canaries passed.
       - name: Require that a canary ran
-        if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_canary)
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.run_canary) }}
         shell: bash
         env:
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
@@ -143,7 +163,7 @@ jobs:
           fi
           printf 'canary passed: %s\n' "${passed[@]##*/}"
       - name: Require that an elevating probe ran
-        if: always() && (github.event_name != 'workflow_dispatch' || inputs.elevating)
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.elevating) }}
         shell: bash
         env:
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
@@ -155,3 +175,168 @@ jobs:
             exit 1
           fi
           printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
+
+  # These plant a `.bat` and hand it to `ShellExecuteEx`, so unlike the canary they EXECUTE code
+  # chosen by the path rules they measure, and the elevation probes create a throwaway local
+  # administrator and register a scheduled task. That is done deliberately, never as a side effect
+  # of a pull request or a schedule: dispatch with `run_executing_probes`. A GitHub-hosted runner is
+  # an ephemeral VM destroyed after the job — the only kind of host they may run on.
+  executing:
+    name: Executing probes (${{ matrix.runner }})
+    if: github.event_name == 'workflow_dispatch' && inputs.run_executing_probes
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      # Survey probes print what they measured; probes with a specific expectation assert on it and
+      # fail if it doesn't hold. `--no-capture` is the point, and also forces nextest to run every
+      # test in this invocation serially, independent of the `windows-elevation-routes` test group
+      # in `.config/nextest.toml`. Both binaries run in one invocation: nextest fails a run whose
+      # filter matches nothing, so a `probe_filter` naming only an elevation-route test would match
+      # zero tests in `windows_shell_resolution` and, split into its own step, fail before the step
+      # for `windows_elevation_routes` ever ran.
+      #
+      # The three probes that hand `ShellExecuteExW` an EXISTING extensionless target are excluded
+      # here (`-E`) and run below instead, each in its own nextest invocation, consecutively, after
+      # all other probes: see the module doc in `tests/windows_shell_resolution.rs` for why — a
+      # leftover `OpenWith.exe` from one such probe blocking the next `ShellExecuteExW` call was a
+      # candidate explanation for the intermittent hang; the module doc has what was measured about
+      # it. `--no-tests=warn` covers the edge case that exclusion creates: a `probe_filter` that
+      # narrows this step to exactly one of those three would otherwise match zero tests and fail
+      # here; instead this step warns and exits 0, and the isolated step below for that probe still
+      # runs it (or skips it with its own message, if the filter excludes it too).
+      # Each probe that passes leaves a marker named after itself (`mark_test_passed`); the final
+      # "Require that an executing probe ran" step fails the job if none exists.
+      - name: Run executing probes
+        shell: bash
+        env:
+          FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_ALLOW_ACCOUNTS: "1"
+          COSCA_PROBE_ALLOW_STATE: "1"
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --run-ignored only --no-capture --no-tests=warn -E 'not test(does_a_trailing_dot_still_open_the_extensionless_file) and not test(does_pathext_outrank_an_existing_extensionless_file) and not test(does_an_existing_extensionless_file_ever_launch_directly)')
+          if [[ -n "${FILTER}" ]]; then
+            args+=("${FILTER}")
+          fi
+          cargo "${args[@]}"
+      # Read-only: lists whatever OpenWith.exe instances already exist, without touching any of
+      # them. Never kill one — a leftover from an earlier probe is exactly the state under
+      # investigation (see the module doc in `tests/windows_shell_resolution.rs`), and the runner VM
+      # is thrown away after the job regardless. Runs after an earlier probe failure too, but not
+      # after cancellation, so the log still shows what was there going in. `continue-on-error`: a
+      # WMI hiccup here must not fail probes that otherwise measured something real; bounded by its
+      # own short `timeout-minutes` so a stuck query cannot eat into the job's overall budget either.
+      - name: OpenWith.exe before trailing-dot probe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: &openwith_diagnostic >-
+          Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
+      # Isolated so no other probe's `ShellExecuteExW` call runs in this process, immediately before
+      # or after this one. `NAME` must match `probe_filter` (a blank filter matches everything, same
+      # substring semantics as `${FILTER}` above) or this step skips with a message instead of
+      # letting nextest fail on zero matches.
+      - name: Run trailing-dot probe (isolated)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
+          NAME='trailing_dot::does_a_trailing_dot_still_open_the_extensionless_file'
+          if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
+            echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
+            exit 0
+          fi
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
+      - name: OpenWith.exe after trailing-dot probe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
+      - name: OpenWith.exe before pathext-precedence probe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
+      - name: Run pathext-precedence probe (isolated)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
+          NAME='precedence::does_pathext_outrank_an_existing_extensionless_file'
+          if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
+            echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
+            exit 0
+          fi
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
+      - name: OpenWith.exe after pathext-precedence probe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
+      - name: OpenWith.exe before existing-extensionless-no-bat probe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
+      - name: Run existing-extensionless-no-bat probe (isolated)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          FILTER: ${{ inputs.probe_filter }}
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          mkdir -p "$COSCA_PROBE_MARKERS"
+          NAME='precedence::does_an_existing_extensionless_file_ever_launch_directly'
+          if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
+            echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
+            exit 0
+          fi
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
+      - name: OpenWith.exe after existing-extensionless-no-bat probe
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: *openwith_diagnostic
+      # The runner is itself an administrator, so its own token shape is the control every
+      # elevation result is read against. Runs after a probe failure too, but not after cancellation.
+      - name: Record the runner's own identity
+        if: ${{ !cancelled() }}
+        run: whoami /all
+      # A `probe_filter` matching no test would otherwise pass having asserted nothing. Runs after a
+      # failure too, but not after cancellation, so the log shows which probes passed.
+      - name: Require that an executing probe ran
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+        run: |
+          shopt -s nullglob
+          passed=("$COSCA_PROBE_MARKERS"/*)
+          if ((${#passed[@]} == 0)); then
+            echo "::error::no executing probe ran: the run asserted nothing"
+            exit 1
+          fi
+          printf 'executing probe passed: %s\n' "${passed[@]##*/}"
