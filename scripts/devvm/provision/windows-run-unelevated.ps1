@@ -34,9 +34,12 @@
 # read blocks for as long as that process does.
 #
 # -TimeoutSeconds bounds every blocking Task Scheduler RPC call this script itself makes
-# (Register-ScheduledTask, Start-ScheduledTask, Unregister-ScheduledTask — none has a timeout
-# of its own) and the pipe connect wait: a genuine external-event bound (Task Scheduler
-# actually dispatching the task and its wrapper reaching Connect()), not a poll.
+# during the probe (Register-ScheduledTask, Start-ScheduledTask — neither has a timeout of its
+# own) and the pipe connect wait: a genuine external-event bound (Task Scheduler actually
+# dispatching the task and its wrapper reaching Connect()), not a poll. Unregister-ScheduledTask
+# (cleanup, in the `finally` block below) is NOT bounded by -TimeoutSeconds — it runs after the
+# probe either way, on its own fixed 120s budget, so a small -TimeoutSeconds can't cut cleanup
+# short.
 # Invoke-Bounded (below) implements that bound by running each call on an in-process runspace
 # via [PowerShell]::BeginInvoke()/AsyncWaitHandle.WaitOne() — the same real-completion-event
 # pattern the named-pipe waits use, and no new process spawned (this guest is already
@@ -76,11 +79,25 @@
 # unattended job, so the residual case above (a suspended wrapper, or a WER dialog silently
 # holding it — both leave the pipe open with nothing wrong for the OS to report) is handled by
 # the human, not by guessing a second timeout. Ctrl-C the `devvm.py run` invocation, then clean
-# up the guest by hand:
-#   vagrant winrm -c "Get-ScheduledTask 'DevvmUnelevatedRun-*' | Stop-ScheduledTask -PassThru | Unregister-ScheduledTask -Confirm:$false"
-# removes the task and, since Stop-ScheduledTask kills its action process, the stuck wrapper
-# with it; if a WER dialog is what's actually holding it, clear that first:
-#   vagrant winrm -c "Get-Process WerFault -ErrorAction SilentlyContinue | Stop-Process -Force"
+# up the guest by hand. Go through devvm.py, not a bare `vagrant winrm`: a bare invocation runs
+# outside devvm.py's own environment (DEVVM_STAGE_DIR, VAGRANT_DOTFILE_PATH, its working
+# directory) and would fail or target the wrong guest. Single-quote the PowerShell command on
+# the HOST side, so the host shell (bash/zsh) never touches `$false` or other
+# PowerShell-special characters inside it — a double-quoted `$false` here gets expanded by the
+# host shell before PowerShell ever sees it. `-PassThru` is also not a documented parameter of
+# Stop-ScheduledTask, so the pipeline below routes each task through ForEach-Object instead of
+# relying on it:
+#   uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | ForEach-Object { $_ | Stop-ScheduledTask; $_ | Unregister-ScheduledTask -Confirm:$false }'
+# removes the task(s) and, since Stop-ScheduledTask kills its action process, the stuck wrapper
+# with it; if a WER dialog is what's actually holding it, clear that first. `Get-Process
+# WerFault -ErrorAction SilentlyContinue` is deliberately NOT used here: -ErrorAction only
+# suppresses the error's message, not its effect on `$?` — with nothing named WerFault running
+# (the common case), `$?` is still left False, and devvm.py's remote-command wrapper falls back
+# to `$?` for its exit code whenever a command sets no `$LASTEXITCODE` of its own (true for a
+# pure PowerShell pipeline like this one), turning that "nothing to clean up" outcome into a
+# reported failure. Filtering client-side instead of via Get-Process's own -Name matching avoids
+# the error (and the `$?` it leaves behind) in the first place:
+#   uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-Process | Where-Object Name -eq WerFault | Stop-Process -Force'
 Param(
     [Parameter(Mandatory = $true)]
     [string]$EncodedCommand,
@@ -234,12 +251,12 @@ function Invoke-Bounded {
       documented case this guards against). The abandoned $ps is left for BeginStop's own
       completion and eventual GC, off this thread.
 
-      $TimeoutMessage may contain the literal token `{ELAPSED}`, replaced on the timeout path
-      with the actual measured seconds this call spent waiting (via a Stopwatch spanning
-      BeginInvoke through the failed WaitOne) — mechanically close to $TimeoutSeconds itself
-      (WaitOne blocks for up to exactly that long), but callers ask for it anyway rather than
-      just repeating the budget they already know, and it is a real, separately-measured
-      number, not the same value twice.
+      $TimeoutMessage is thrown as-is on timeout, with no substitution: WaitOne blocks for up
+      to exactly $TimeoutSeconds, so a separately-measured "actual elapsed" value would be
+      mechanically forced to be ≈ $TimeoutSeconds itself (confirmed live: a couple of seconds
+      over, from `[Math]::Ceiling` rounding plus BeginStop overhead) — a second number that
+      looks precise but adds no real information beyond the one budget the caller already
+      knows and states in $TimeoutMessage.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -252,9 +269,8 @@ function Invoke-Bounded {
         [string]$TimeoutMessage
     )
     if ($TimeoutSeconds -le 0) {
-        throw ($TimeoutMessage -replace '\{ELAPSED\}', '0')
+        throw $TimeoutMessage
     }
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $ps = [PowerShell]::Create()
     try {
         [void]$ps.AddScript($ScriptBlock)
@@ -271,8 +287,7 @@ function Invoke-Bounded {
     $signaled = $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
     if (-not $signaled) {
         $ps.BeginStop($null, $null) | Out-Null
-        $elapsedSeconds = [Math]::Ceiling($stopwatch.Elapsed.TotalSeconds)
-        throw ($TimeoutMessage -replace '\{ELAPSED\}', $elapsedSeconds)
+        throw $TimeoutMessage
     }
     try {
         $ps.EndInvoke($asyncResult) | Out-Null
@@ -401,7 +416,11 @@ try {
                 $killPsi.UseShellExecute = $false
                 $killPsi.CreateNoWindow = $true
                 $killProcess = [System.Diagnostics.Process]::Start($killPsi)
-                $killProcess.WaitForExit(30000) | Out-Null
+                if ($killProcess.WaitForExit(30000)) {
+                    Write-Log "devvm wrapper: taskkill exited with code $($killProcess.ExitCode)"
+                } else {
+                    Write-Log "devvm wrapper: taskkill did not finish within 30s (PID $($killProcess.Id)) - the caller's command's process tree may still be running"
+                }
             } catch {
                 Write-Log "devvm wrapper: taskkill of the caller's command failed: $($_.Exception.Message)"
             }
@@ -466,41 +485,51 @@ Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 # constructor itself threw in between.
 $pipeServer = $null
 try {
-    try {
-        # Bounded by whatever's left of the caller's own -TimeoutSeconds, not a budget of its
-        # own — so a timeout here means -TimeoutSeconds itself ran out during this step, not
-        # that Task Scheduler is stuck (see Invoke-Bounded's finally-block sibling call below
-        # for the one case where that distinction doesn't apply).
-        $registerBudget = Get-RemainingSeconds
-        Invoke-Bounded -TimeoutSeconds $registerBudget `
-            -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Register-ScheduledTask - it had ${registerBudget}s left when this step started and took {ELAPSED}s without finishing. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
-            -Parameters @{ TaskName = $taskName; ScriptPath = $scriptPath; UserId = $currentUser } `
-            -ScriptBlock {
-                param($TaskName, $ScriptPath, $UserId)
-                # -ExecutionPolicy Bypass: the LIMITED-run-level principal's own effective execution
-                # policy is untested/unknown territory (a different, filtered token than the
-                # High-integrity WinRM session that registers this task) - forcing Bypass for this
-                # one task action removes that as a variable entirely rather than relying on
-                # whatever CurrentUser/LocalMachine policy happens to be configured on the guest.
-                # -WindowStyle Hidden: an Interactive-logon task otherwise opens a real, visible
-                # console on vagrant's desktop - QuickEdit-mode text selection in that window (or
-                # any other way of pausing it) blocks a console write indefinitely, which would
-                # block the wrapper before it ever reaches taskkill or its own pipe write. See "If
-                # a run hangs anyway" in the header above for the residual case even this doesn't
-                # cover, and why this script deliberately does not add a second timer for it.
-                $action = New-ScheduledTaskAction -Execute "powershell" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $ScriptPath"
-                $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
-                # Without this, Task Scheduler applies its own default ExecutionTimeLimit (commonly
-                # 72 hours) on top of -TimeoutSeconds - normally moot, but a caller passing a long
-                # --timeout close to or past that would hit a second, uncoordinated limit instead of
-                # the one this script actually reports and explains. Zero means unlimited: this
-                # script's own deadline is the only bound that should apply.
-                $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)
+    # No try/catch wraps this Invoke-Bounded call itself: that would catch its own
+    # already-complete timeout throw and re-wrap it below with an "is there an active
+    # interactive session" question that has nothing to do with a timeout. Instead, only the
+    # actual Register-ScheduledTask cmdlet call, inside the ScriptBlock below, is wrapped - a
+    # genuine cmdlet failure (e.g. no interactive session to borrow) gets the friendly
+    # RDP-recovery wrapping there and surfaces through Invoke-Bounded's own
+    # $ps.Streams.Error[0].Exception path already fully formatted, needing no further wrapping
+    # here. $rdpRecoveryNote is passed in via -Parameters since the ScriptBlock runs on its own
+    # runspace and cannot close over this script's variables.
+    #
+    # Bounded by whatever's left of the caller's own -TimeoutSeconds, not a budget of its own —
+    # so a timeout here means -TimeoutSeconds itself ran out during this step, not that Task
+    # Scheduler is stuck (see Invoke-Bounded's finally-block sibling call below for the one case
+    # where that distinction doesn't apply).
+    $registerBudget = Get-RemainingSeconds
+    Invoke-Bounded -TimeoutSeconds $registerBudget `
+        -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Register-ScheduledTask - it had ${registerBudget}s left when this step started. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
+        -Parameters @{ TaskName = $taskName; ScriptPath = $scriptPath; UserId = $currentUser; RdpRecoveryNote = $rdpRecoveryNote } `
+        -ScriptBlock {
+            param($TaskName, $ScriptPath, $UserId, $RdpRecoveryNote)
+            # -ExecutionPolicy Bypass: the LIMITED-run-level principal's own effective execution
+            # policy is untested/unknown territory (a different, filtered token than the
+            # High-integrity WinRM session that registers this task) - forcing Bypass for this
+            # one task action removes that as a variable entirely rather than relying on
+            # whatever CurrentUser/LocalMachine policy happens to be configured on the guest.
+            # -WindowStyle Hidden: an Interactive-logon task otherwise opens a real, visible
+            # console on vagrant's desktop - QuickEdit-mode text selection in that window (or
+            # any other way of pausing it) blocks a console write indefinitely, which would
+            # block the wrapper before it ever reaches taskkill or its own pipe write. See "If
+            # a run hangs anyway" in the header above for the residual case even this doesn't
+            # cover, and why this script deliberately does not add a second timer for it.
+            $action = New-ScheduledTaskAction -Execute "powershell" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $ScriptPath"
+            $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
+            # Without this, Task Scheduler applies its own default ExecutionTimeLimit (commonly
+            # 72 hours) on top of -TimeoutSeconds - normally moot, but a caller passing a long
+            # --timeout close to or past that would hit a second, uncoordinated limit instead of
+            # the one this script actually reports and explains. Zero means unlimited: this
+            # script's own deadline is the only bound that should apply.
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)
+            try {
                 Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+            } catch {
+                throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup.$RdpRecoveryNote"
             }
-    } catch {
-        throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup.$rdpRecoveryNote"
-    }
+        }
 
     # The 2-arg NamedPipeServerStream(name, direction) constructor defaults to
     # PipeOptions.None (synchronous); BeginWaitForConnection() below is the async API and throws
@@ -554,7 +583,7 @@ try {
     # -TimeoutSeconds ran out, not that Task Scheduler is stuck.
     $startBudget = Get-RemainingSeconds
     Invoke-Bounded -TimeoutSeconds $startBudget `
-        -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Start-ScheduledTask - it had ${startBudget}s left when this step started and took {ELAPSED}s without finishing. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
+        -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Start-ScheduledTask - it had ${startBudget}s left when this step started. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
         -Parameters @{ TaskName = $taskName } `
         -ScriptBlock {
             param($TaskName)
@@ -640,7 +669,7 @@ try {
         # this guest, well above Register-/Start-ScheduledTask's own. A failure bound surfaced
         # to the human via the warning below, not a synchronization interval.
         Invoke-Bounded -TimeoutSeconds 120 `
-            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand: Get-ScheduledTask 'DevvmUnelevatedRun-*' | Unregister-ScheduledTask." `
+            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment): uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | Unregister-ScheduledTask -Confirm:`$false'." `
             -Parameters @{ TaskName = $taskName } `
             -ScriptBlock {
                 param($TaskName)

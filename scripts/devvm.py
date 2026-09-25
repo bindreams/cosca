@@ -581,7 +581,15 @@ def set_windows_reboot_marker(guest: Guest) -> None:
     across an ordinary reboot (NTP resync), which would make a wall-clock timestamp comparison
     unreliable in either direction.
     """
+    # $ErrorActionPreference='Stop' plus an explicit trap: PowerShell's default
+    # ErrorActionPreference is 'Continue', so a failing CreateSubKey (or a failing $k.Close())
+    # would not by itself stop the script or make it exit nonzero — `vagrant winrm -c` would
+    # then report success even though no marker was ever created, and
+    # reboot_windows_guest_and_wait's wait loop would wait out its full deadline for a marker
+    # that never existed to begin with, misreporting that as "the guest never rebooted" instead
+    # of "the marker was never set."
     cmd = (
+        "$ErrorActionPreference = 'Stop'; trap { exit 1 }; "
         "$k = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey("
         "'SOFTWARE\\DevvmRebootMarker', $true, [Microsoft.Win32.RegistryOptions]::Volatile); "
         "$k.Close()"
@@ -962,7 +970,12 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     no later step that's actually safer to run first - checking immediately, before spending
     any time on the rest, is strictly better than finding out partway through.
     """
+    # Whether THIS invocation is the one that actually started the guest (as opposed to `up`
+    # finding it already running and doing nothing) — see the session-wait gating at the
+    # bottom of this function for why that distinction, not merely `create`, is what matters.
+    started_guest = False
     if create:
+        started_guest = get_vagrant_machine_state(guest) != "running"
         # --no-provision: a fresh `up` would otherwise auto-run the one remaining
         # Vagrantfile-declared provisioner (the "file" upload) as part of creation, and then
         # the explicit `vagrant provision` call two lines down would run it a second,
@@ -986,6 +999,7 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     )
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-rust.ps1", elevated=False, display=display)
 
+    rebooted = False
     if REBOOT_MARKER_TRUE in account_output:
         print(
             "note: an EnableLUA or autologon change needs a reboot to take effect — "
@@ -994,6 +1008,7 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
             file=sys.stderr,
         )
         reboot_windows_guest_and_wait(guest)
+        rebooted = True
     elif REBOOT_MARKER_FALSE not in account_output:
         print(
             "error: windows-account-and-uac.ps1 did not print a DEVVM_REBOOT_REQUIRED "
@@ -1003,33 +1018,48 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
         )
         sys.exit(1)
 
-    # Whether or not the block above rebooted: a real interactive (autologon) session may not
-    # exist yet the moment this returns, and windows-run-unelevated.ps1's scheduled task needs
-    # one to borrow a filtered token from. Checked here, conditionally — only when autologon is
-    # actually configured — rather than folded into the reboot decision above, because a
-    # session can be missing without a reboot having just run — e.g. this `up`'s license rearm
-    # found nothing needing a reboot, or rebooted on a guest an earlier `up` already configured
-    # autologon on. Skipped entirely when autologon genuinely isn't configured at all (a guest
-    # windows-account-and-uac.ps1 has never provisioned successfully), where there's no session
-    # to wait for.
-    #
-    # A None (WinRM not answering this particular check yet, even though every script above
-    # just succeeded over it) is retried, not guessed at or treated as fatal on the first
-    # occurrence — the same "ask again immediately, fail only once the guest is gone or the
-    # deadline passes" contract wait_for_windows_session and reboot_windows_guest_and_wait's
-    # own loops use, via the same _require_guest_running and one shared deadline (also reused
-    # below for wait_for_windows_session itself, if it turns out to be needed).
-    deadline = time.monotonic() + WINDOWS_REBOOT_DEADLINE_SECONDS
-    last_output = ""
-    while True:
-        _require_guest_running(
-            guest, deadline, what="a readable autologon-configured state", last_output=last_output
-        )
-        autologon_configured, last_output = get_windows_autologon_configured(guest)
-        if autologon_configured is not None:
-            break
-    if autologon_configured:
-        wait_for_windows_session(guest, deadline)
+    # A real interactive (autologon) session may not exist yet the moment this returns, and
+    # windows-run-unelevated.ps1's scheduled task needs one to borrow a filtered token from —
+    # but AutoAdminLogon (without ForceAutoLogon, which this tool does not set) only fires a
+    # fresh logon at BOOT. So waiting for one is only ever correct when THIS invocation is what
+    # just produced a boot: either it started the guest itself (`started_guest`) or it rebooted
+    # the guest just above (`rebooted`). Neither `create` alone (an `up` against an already-
+    # running, already-provisioned guest that needed no reboot — e.g. immediately re-running
+    # `up`) nor merely "autologon is configured" (true on every subsequent `up`/`sync` once
+    # windows-account-and-uac.ps1 has ever succeeded, regardless of whether a human RDP'd in and
+    # signed out since) is such an event — waiting in either of those cases would block for up
+    # to WINDOWS_REBOOT_DEADLINE_SECONDS for a session that will not spontaneously reappear.
+    # `sync` (create=False) never waits, matching that: it never starts or reboots the guest
+    # itself. `run --unelevated` needs no proactive wait either — windows-run-unelevated.ps1's
+    # own $currentUser check already fails immediately with RDP-recovery guidance when there is
+    # no session to borrow.
+    if create and (started_guest or rebooted):
+        # A None (WinRM not answering this particular check yet, even though every script above
+        # just succeeded over it) is retried, not guessed at or treated as fatal on the first
+        # occurrence — the same "ask again immediately, fail only once the guest is gone or the
+        # deadline passes" contract wait_for_windows_session and reboot_windows_guest_and_wait's
+        # own loops use, via the same _require_guest_running and one shared deadline (also
+        # reused below for wait_for_windows_session itself, if it turns out to be needed).
+        deadline = time.monotonic() + WINDOWS_REBOOT_DEADLINE_SECONDS
+        last_output = ""
+        while True:
+            _require_guest_running(
+                guest, deadline, what="a readable autologon-configured state", last_output=last_output
+            )
+            autologon_configured, last_output = get_windows_autologon_configured(guest)
+            if autologon_configured is not None:
+                break
+        if autologon_configured:
+            print(
+                "+ this run just started or rebooted the guest — waiting for vagrant's "
+                "autologon session to come up (needed by `run --unelevated`), up to "
+                f"{WINDOWS_REBOOT_DEADLINE_SECONDS}s. If this hangs: RDP into the guest and "
+                "confirm 'vagrant' is signed in and NOT merely disconnected (`query session`; "
+                "`tscon <id> /dest:console` reattaches a disconnected session to the console), "
+                "or reboot the guest to force a fresh autologon.",
+                file=sys.stderr,
+            )
+            wait_for_windows_session(guest, deadline)
 
 
 def cmd_up(args: argparse.Namespace) -> None:

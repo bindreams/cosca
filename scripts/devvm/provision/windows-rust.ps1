@@ -11,18 +11,22 @@
 
 $ErrorActionPreference = "Stop"
 
-# rustup-init.exe and cargo-nextest are run via `Start-Process ... -Wait -PassThru` rather
-# than an inline `&` invocation, so their stdio never interacts with this script's own
-# PowerShell stream/error machinery. Historically (when this script ran through Vagrant's
-# shell provisioner) that mattered for correctness: the provisioner's WinRM PSRP shell
-# appended a trailer that turned rustup-init's benign stderr progress lines into a false
-# failure. That's no longer how this script runs - devvm.py drives it directly via
-# `vagrant winrm -c` (see run_windows_script's docstring), whose communicator
-# (plugins/communicators/winrm/shell.rb) appends no such trailer and never inspects `$?` -
-# only `$LASTEXITCODE`, which the explicit exit-code checks below already set correctly
-# either way. The `Start-Process` pattern is kept regardless: it's simple, still correct, and
-# every native call below has its own explicit exit-code/output check immediately after it,
-# which `throw`s on failure.
+# rustup-init.exe and the VC++ redistributable installer (below) are run via
+# `Start-Process ... -Wait -PassThru` rather than an inline `&` invocation, so their stdio
+# never interacts with this script's own PowerShell stream/error machinery. Historically
+# (when this script ran through Vagrant's shell provisioner) that mattered for correctness:
+# the provisioner's WinRM PSRP shell appended a trailer that turned rustup-init's benign
+# stderr progress lines into a false failure. That's no longer how this script runs -
+# devvm.py drives it directly via `vagrant winrm -c` (see run_windows_script's docstring),
+# whose communicator (plugins/communicators/winrm/shell.rb) appends no such trailer and
+# never inspects `$?` - only `$LASTEXITCODE`, which the explicit exit-code checks below
+# already set correctly either way. The `Start-Process` pattern is kept regardless: it's
+# simple, still correct, and every native call below has its own explicit exit-code/output
+# check immediately after it, which `throw`s on failure. cargo-nextest itself is never run
+# via `Start-Process` at all - it's fetched as a prebuilt release zip (Invoke-WebRequest plus
+# Expand-Archive, below) and its `--version` output is read via a plain `&`/subexpression
+# invocation, since that call only needs its stdout captured, not isolation from this
+# script's streams.
 
 # rustup-init doesn't update the CURRENT process's PATH after installing - re-derive cargo's
 # bin dir directly (matches rustup's own default: %USERPROFILE%\.cargo\bin) so the
