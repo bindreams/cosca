@@ -157,12 +157,18 @@ async fn unreaped_drop_disarms_after_the_forced_wait_blocking_failure() {
     use crate::containment::windows::{assign_to_kill_on_close_job, duplicate_job};
     use crate::containment::Attached;
 
-    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", "__cosca_no_such_test__"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn a quickly-exiting child");
+    let child = {
+        // A raw `std::process::Command` bypasses cosca's own spawn path and its internal
+        // `spawn_lock()`, so it is taken here by hand — see `unreaped_tests.rs`'s
+        // `std_blocked_child` for the same pattern.
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a quickly-exiting child")
+    };
     let pid = child.id();
     let job = assign_to_kill_on_close_job(child.as_raw_handle())
         .expect("a real job object, assigned to the real child above");
@@ -174,6 +180,33 @@ async fn unreaped_drop_disarms_after_the_forced_wait_blocking_failure() {
         .with_handle(duplicate_job)
         .expect("freshly assigned job handle must be live")
         .expect("DuplicateHandle on a live job handle");
+
+    let query = |what: &str| {
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut returned = 0u32;
+        // SAFETY: `dup_job` is this test's own handle, independent of and unaffected by `job`'s
+        // own lifecycle; `info` is sized for the class queried.
+        unsafe {
+            QueryInformationJobObject(
+                Some(dup_job),
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of_mut!(info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                Some(&mut returned),
+            )
+        }
+        .unwrap_or_else(|e| panic!("QueryInformationJobObject {what}: {e}"));
+        info.BasicLimitInformation.LimitFlags.0
+    };
+
+    // Positive control: prove the job really starts armed (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    // set by `assign_to_kill_on_close_job`), so the post-drop `== 0` assertion below actually
+    // means something rather than the flag having never been set at all.
+    assert_ne!(
+        query("before the drop"),
+        0,
+        "assign_to_kill_on_close_job must arm the job before Unreaped ever sees it"
+    );
 
     let mut raw = RawAsyncChild::new(OwnedHandle::from(child), pid);
     raw.set_force_wait_blocking_failure("forced wait_blocking failure");
@@ -188,22 +221,9 @@ async fn unreaped_drop_disarms_after_the_forced_wait_blocking_failure() {
     // caller of this arm.
     drop(unreaped);
 
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    let mut returned = 0u32;
-    // SAFETY: `dup_job` is this test's own handle, independent of and unaffected by `job`'s
-    // closing inside the drop above, and not yet closed; `info` is sized for the class queried.
-    unsafe {
-        QueryInformationJobObject(
-            Some(dup_job),
-            JobObjectExtendedLimitInformation,
-            std::ptr::addr_of_mut!(info).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            Some(&mut returned),
-        )
-    }
-    .expect("QueryInformationJobObject after the disarming drop");
     assert_eq!(
-        info.BasicLimitInformation.LimitFlags.0, 0,
+        query("after the disarming drop"),
+        0,
         "a failed fallback wait must disarm what Unreaped retained, same as any other failed wait"
     );
 

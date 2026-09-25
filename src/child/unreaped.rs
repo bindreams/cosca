@@ -2,10 +2,10 @@
 //! back: cosca keeps no thread, queue or state of its own to reap it with.
 //!
 //! **The ownership rule.** A child is waited on only once it is confirmed ours and unreaped: its
-//! one check, a `try_wait`, finds it still running. The one thing that leaves its ownership
-//! uncertain is a `try_wait` failing with `ECHILD` (see [`releases_ownership`]): its pid may
-//! already name another process, and a wait would block on that process or steal its status. Such
-//! a child is released without any wait, and a tokio one without running
+//! one check, a `try_wait`, finds it not exited or reaped elsewhere. The one thing that leaves its
+//! ownership uncertain is a `try_wait` failing with `ECHILD` (see [`releases_ownership`]): its pid
+//! may already name another process, and a wait would block on that process or steal its status.
+//! Such a child is released without any wait, and a tokio one without running
 //! its `Drop`, which would hand the pid to tokio's orphan queue to wait on. Any other `try_wait`
 //! failure (a too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, a transient failure) says nothing
 //! about ownership, and is kept the same way a running check is. An [`Unreaped`] is only ever
@@ -394,8 +394,7 @@ impl Unreaped {
     /// retained. Its remaining production callers are Linux's cgroup teardown
     /// (`containment::cgroup::leaf`) and Windows' elevation/raw-spawn teardown — both of which
     /// never have containment to retain at their call site — so it is dead code on a macOS build,
-    /// where every production path now goes through `with_retained` instead (see L4: the
-    /// identity-failure teardown arms retain what they attached, rather than dropping it).
+    /// where every production path now goes through `with_retained` instead.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn new(held: Held) -> Unreaped {
         Unreaped::with_retained(held, None)
