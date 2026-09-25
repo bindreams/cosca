@@ -101,7 +101,25 @@ use windows::Win32::System::Threading::{
 /// continues, and never touches a file or account the child might still hold open. That final
 /// wait covers only the immediate child: the job handle is already closed by the time the kill
 /// call returns, so there is nothing left to wait on for the rest of the tree.
+///
+/// This is the bound for a process this test binary spawns and waits on directly. Some of those
+/// children — [`logon_one_account`]'s and [`unelevated_caller_view`]'s, both spawned without
+/// `COSCA_PROBE_CHILD` set — themselves run the full chain, so they spawn and wait on a
+/// grandchild through [`spawn_attempts_with`]. That inner wait is given
+/// [`GRANDCHILD_EXIT_BOUND_MS`], a strictly smaller bound, on purpose: if the grandchild hangs,
+/// the child's own `wait_for` call trips, kills, and recovers well within this constant's 120s,
+/// so this outer wait still finishes on schedule. If this outer wait ever trips instead, that
+/// names the immediate child itself as stuck — not a grandchild the child was already recovering
+/// from.
 const CHILD_EXIT_BOUND_MS: u32 = 120_000;
+
+/// The bound for [`spawn_attempts_with`]'s own wait on the children it spawns. Kept well under
+/// [`CHILD_EXIT_BOUND_MS`] (a quarter of it) so that whenever `spawn_attempts_with` runs inside a
+/// process that is itself someone else's child — which happens whenever `COSCA_PROBE_CHILD` is
+/// left unset — there is enough headroom left in the outer bound for this inner one to trip,
+/// kill, and recover before the outer wait could plausibly trip too. See `CHILD_EXIT_BOUND_MS`'s
+/// doc.
+const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 4;
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
 
@@ -393,19 +411,23 @@ fn contain(pi: &PROCESS_INFORMATION, context: &str) -> Job {
 }
 
 /// Wait for a child held in `job`, and return its exit code — or a description of why it could
-/// not be measured. `CHILD_EXIT_BOUND_MS` is given to this one, outermost wait only: on a timeout
-/// it kills the whole job, then waits on the CHILD'S OWN process handle for that kill to actually
-/// land — not `job.wait_tree()`, which would return an error at once here: `Job::kill_tree`
-/// closes the underlying job handle as part of tearing the job down (see its doc), so by the time
+/// not be measured. `bound_ms` is given to this one, outermost wait only: on a timeout it kills
+/// the whole job, then waits on the CHILD'S OWN process handle for that kill to actually land —
+/// not `job.wait_tree()`, which would return an error at once here: `Job::kill_tree` closes the
+/// underlying job handle as part of tearing the job down (see its doc), so by the time
 /// `wait_tree` could run there is nothing left for it to wait on. That final wait has no bound of
 /// its own because it is waiting on a real kernel outcome (the kill taking effect), not racing a
 /// clock — so by the time this returns, the immediate child is provably gone and it is safe for
 /// the caller to touch any file or account it might otherwise still hold open. It only covers the
 /// immediate child, not the rest of the tree: once the job handle is closed there is no longer a
 /// way to wait on the tree as a whole.
-fn wait_for(pi: &PROCESS_INFORMATION, job: &Job) -> Result<u32, String> {
+///
+/// Callers pass [`CHILD_EXIT_BOUND_MS`] for a process they spawned and wait on directly, or
+/// [`GRANDCHILD_EXIT_BOUND_MS`] inside [`spawn_attempts_with`] — see that constant's doc for why
+/// the two must stay different.
+fn wait_for(pi: &PROCESS_INFORMATION, job: &Job, bound_ms: u32) -> Result<u32, String> {
     // SAFETY: `pi.hProcess` was just returned by CreateProcess* and is closed exactly once below.
-    let waited = unsafe { WaitForSingleObject(pi.hProcess, CHILD_EXIT_BOUND_MS) };
+    let waited = unsafe { WaitForSingleObject(pi.hProcess, bound_ms) };
     if waited != WAIT_OBJECT_0 {
         let killed = job.kill_tree();
         if let Err(kill_err) = &killed {
@@ -421,7 +443,7 @@ fn wait_for(pi: &PROCESS_INFORMATION, job: &Job) -> Result<u32, String> {
                     let _ = CloseHandle(pi.hProcess);
                 }
                 return Err(format!(
-                    "the child did not exit within {CHILD_EXIT_BOUND_MS}ms; kill_tree failed \
+                    "the child did not exit within {bound_ms}ms; kill_tree failed \
                      ({kill_err}) and the direct child could not be terminated either \
                      ({term_err}) — it has been abandoned rather than waited on unboundedly for an \
                      exit nothing here could obtain"
@@ -443,7 +465,7 @@ fn wait_for(pi: &PROCESS_INFORMATION, job: &Job) -> Result<u32, String> {
             let _ = CloseHandle(pi.hProcess);
         }
         return Err(format!(
-            "the child did not exit within {CHILD_EXIT_BOUND_MS}ms; kill_tree={killed:?} \
+            "the child did not exit within {bound_ms}ms; kill_tree={killed:?} \
              wait_after_kill={waited_after_kill:?}"
         ));
     }
@@ -667,7 +689,8 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
             }
             Ok(()) => {
                 let job = contain(&pi, &format!("PROBE spawn-attempts[{which}/{step}]"));
-                let exit = wait_for(&pi, &job).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+                let exit =
+                    wait_for(&pi, &job, GRANDCHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
                 let _ = writeln!(out, "  {step} [{which} token]: STARTED, {exit}. The child reports:");
                 splice_child_report(out, &report);
             }
@@ -990,7 +1013,7 @@ fn unelevated_caller_view() {
             Err(e) => println!("PROBE unelevated-view: {route} with the medium token FAILED {e:?}"),
             Ok(()) => {
                 let job = contain(&pi, &format!("PROBE unelevated-view[{route}]"));
-                let exit = wait_for(&pi, &job).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+                let exit = wait_for(&pi, &job, CHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
                 println!("PROBE unelevated-view: {route} started a medium child, {exit}. It reports:");
                 splice_child_report(&mut spliced, &child_report);
                 print!("{spliced}");
@@ -1151,7 +1174,8 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
     let started = res.is_ok();
     if started {
         let job = contain(&pi, "PROBE createprocessw-pathext");
-        wait_for(&pi, &job).unwrap_or_else(|e| panic!("PROBE createprocessw-pathext: child did not exit cleanly: {e}"));
+        wait_for(&pi, &job, CHILD_EXIT_BOUND_MS)
+            .unwrap_or_else(|e| panic!("PROBE createprocessw-pathext: child did not exit cleanly: {e}"));
     }
     let bat_ran = marker.exists();
     println!(
@@ -1416,7 +1440,7 @@ fn logon_one_account(account: &ScratchAccount) -> bool {
         Err(e) => println!("PROBE createprocesswithlogon[{role}]: FAILED {e:?} — nothing to measure"),
         Ok(()) => {
             let job = contain(&pi, &format!("PROBE createprocesswithlogon[{role}]"));
-            let exit = wait_for(&pi, &job).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+            let exit = wait_for(&pi, &job, CHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
             println!("PROBE createprocesswithlogon[{role}]: STARTED, {exit}. The child reports:");
             splice_child_report(&mut spliced, &report);
             print!("{spliced}");
