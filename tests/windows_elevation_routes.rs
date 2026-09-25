@@ -114,12 +114,12 @@ use windows::Win32::System::Threading::{
 const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
 /// The bound for [`spawn_attempts_with`]'s own wait on the children it spawns. Kept well under
-/// [`CHILD_EXIT_BOUND_MS`] (a quarter of it) so that whenever `spawn_attempts_with` runs inside a
+/// [`CHILD_EXIT_BOUND_MS`] (an eighth of it) so that whenever `spawn_attempts_with` runs inside a
 /// process that is itself someone else's child — which happens whenever `COSCA_PROBE_CHILD` is
 /// left unset — there is enough headroom left in the outer bound for this inner one to trip,
 /// kill, and recover before the outer wait could plausibly trip too. See `CHILD_EXIT_BOUND_MS`'s
 /// doc.
-const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 4;
+const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 8;
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
 

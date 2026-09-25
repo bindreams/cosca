@@ -12,9 +12,9 @@
 //! a helper could not be written, or a launch this probe waited on left no self-report behind. An
 //! earlier version of this rule let a probe that only surveys the platform print `INCONCLUSIVE` and
 //! PASS when the shell launched something without handing back a process handle to wait on —
-//! `does_a_trailing_dot_still_open_the_extensionless_file` did exactly that, on both architectures,
-//! in run 36117246246 — so an inconclusive run is now a hard failure everywhere it is genuinely
-//! inconclusive. That handoff (`LaunchOutcome::LaunchedNoHandle`) is NOT always inconclusive,
+//! `does_a_trailing_dot_still_open_the_extensionless_file` did exactly that, on both architectures
+//! (see the PR description for which run caught it) — so an inconclusive run is now a hard failure
+//! everywhere it is genuinely inconclusive. That handoff (`LaunchOutcome::LaunchedNoHandle`) is NOT always inconclusive,
 //! though: for an EXTENSIONLESS `lpFile` it is itself the measured answer — `ShellExecuteEx` never
 //! runs an extensionless file as a program, existing or not, so getting no process handle back is
 //! exactly what should happen, and every probe that plants an extensionless target says so
@@ -30,20 +30,21 @@
 //! is a genuine measured negative for a probe whose target is itself extensionless, not a harness
 //! failure; each such probe's `NotLaunched` arm says so explicitly.
 //!
-//! `ShellExecuteExW` can also fail to return at all rather than ever completing. Measured once, in
-//! run 36125783666: `does_an_existing_extensionless_file_ever_launch_directly` produced no output
-//! and ran to nextest's 300s per-test bound on `windows-latest` (x64), while `windows-11-arm` in the
-//! same run got a clean `LaunchedNoHandle`. No UI was observed in that run — a call blocked inside
-//! the API leaves nothing to see — and a later run (36128030190, after the fix below) passed 16/16
-//! on both architectures with no repeat, so this is not established to be UI-related and not
-//! established to be architecture-specific: it was an unexplained intermittent hang. The most likely
-//! cause found on review: the call ran on a thread with no COM apartment initialized, which
-//! Microsoft documents as required before calling `ShellExecuteExW`, and which production
-//! (`src/elevation/windows.rs`) and `windows_shell_execute.rs`'s `launch` both already do —
-//! `shell_execute_with` now does the same; see its doc. Every call site that hands `ShellExecuteExW`
-//! an EXISTING extensionless target still bounds the whole call too, via `shell_execute_bounded` and
-//! `SHELL_EXECUTE_BOUND` — see their docs — as a diagnostic safety net in case that fix is
-//! incomplete: hitting that bound is always a FAILURE to measure, never a passing answer.
+//! `ShellExecuteExW` can also fail to return at all rather than ever completing, for an EXISTING
+//! extensionless target — measured across several dispatch runs, intermittently, on both `x64` and
+//! `arm64` (see the PR description for the run/commit history; not repeated here to keep it in one
+//! place). `OpenWith.exe` has been observed present during a hang. Beyond that, the cause is
+//! UNMEASURED: not established to be UI-related, not established to be architecture-specific, and —
+//! contrary to an earlier hypothesis — NOT explained by a missing COM apartment: initializing one
+//! before every `ShellExecuteExW` call (`shell_execute_with`, below) did not stop a later run from
+//! hanging on both architectures at once. This commit tests a different, still-unconfirmed
+//! hypothesis instead: dropping `SEE_MASK_NOASYNC` for the three calls that hand `ShellExecuteExW`
+//! an EXISTING extensionless target — see `shell_execute_in_apartment`'s doc for what that flag does
+//! and why it might be implicated. Every such call site still bounds the whole call, via
+//! `shell_execute_bounded` and `SHELL_EXECUTE_BOUND` — see their docs — as a failure surface, not a
+//! synchronisation device: hitting that bound is always a FAILURE to measure, never a passing
+//! answer. Whether to keep these three probes at all, if the hang persists under this change too, is
+//! the repo owner's call.
 //!
 //! # Why they are `#[ignore]`d
 //!
@@ -67,7 +68,6 @@
 //! elevated process behind.
 #![cfg(windows)]
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -75,12 +75,7 @@ use std::time::Duration;
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_ASSOCIATION, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE, PROCESS_TERMINATE,
-};
+use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
@@ -187,47 +182,66 @@ enum LaunchOutcome {
 }
 
 /// Launch `lp_file` through `ShellExecuteExW` with the default verb, wait for whatever it started,
-/// and report what could be measured.
+/// and report what could be measured. Keeps `SEE_MASK_NOASYNC` set — see
+/// `shell_execute_in_apartment`'s doc for what that controls and why the three probes with an
+/// existing extensionless target call `shell_execute_with` directly instead, with it dropped.
 fn shell_execute(lp_file: &Path, lp_directory: Option<&Path>) -> Result<LaunchOutcome, String> {
-    shell_execute_with(lp_file, lp_directory, None)
+    shell_execute_with(lp_file, lp_directory, None, true)
 }
 
 /// Initialise a single-threaded COM apartment on this thread, as production
 /// (`src/elevation/windows.rs`) and `windows_shell_execute.rs`'s `launch` both already do, before
-/// calling `ShellExecuteExW` — Microsoft documents COM initialization as required before that call,
-/// and its absence is the most likely cause found on review for the intermittent hang described in
-/// the module doc. The init and the call and the uninit must all run on the SAME thread: a COM
-/// apartment is thread-local, so `shell_execute_bounded`'s worker thread calls this function
-/// directly rather than initializing COM on the test's own thread and calling
-/// `shell_execute_in_apartment` from the worker.
+/// calling `ShellExecuteExW` — Microsoft documents COM initialization as required before that call.
+/// Kept for that reason, even though it did NOT by itself stop the intermittent hang described in
+/// the module doc: a later dispatch run with this already in place still hung, on both architectures
+/// at once. The init and the call and the uninit must all run on the SAME thread: a COM apartment is
+/// thread-local, so `shell_execute_bounded`'s worker thread calls this function directly rather than
+/// initializing COM on the test's own thread and calling `shell_execute_in_apartment` from the
+/// worker.
+///
+/// `include_noasync` is passed straight through to `shell_execute_in_apartment` — see its doc.
 fn shell_execute_with(
     lp_file: &Path,
     lp_directory: Option<&Path>,
     lp_parameters: Option<&str>,
+    include_noasync: bool,
 ) -> Result<LaunchOutcome, String> {
     // SAFETY: paired with the `CoUninitialize` below, on this same thread.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
     if com.is_err() {
         return Err(format!("CoInitializeEx failed before ShellExecuteExW: {com:?}"));
     }
-    let result = shell_execute_in_apartment(lp_file, lp_directory, lp_parameters);
+    let result = shell_execute_in_apartment(lp_file, lp_directory, lp_parameters, include_noasync);
     // SAFETY: balances the successful `CoInitializeEx` above, still on this thread.
     unsafe { CoUninitialize() };
     result
 }
 
+/// `include_noasync` controls whether `SEE_MASK_NOASYNC` is set. Microsoft documents that flag as
+/// making `ShellExecuteExW` wait for the shell operation to actually finish before returning;
+/// without it, the call may return before that operation completes, having handed it off to a
+/// separate internal thread. Every call here has set it since these probes were first written. This
+/// commit drops it (`include_noasync = false`) for the three calls that hand `ShellExecuteExW` an
+/// EXISTING extensionless target, to test a reviewer's hypothesis that it is implicated in the hang
+/// described in the module doc — not tried before now, and not yet confirmed either way. Every other
+/// call site keeps it set, unchanged.
 fn shell_execute_in_apartment(
     lp_file: &Path,
     lp_directory: Option<&Path>,
     lp_parameters: Option<&str>,
+    include_noasync: bool,
 ) -> Result<LaunchOutcome, String> {
     let file_w = wide_nul(lp_file.as_os_str());
     let dir_w = lp_directory.map(|d| wide_nul(d.as_os_str()));
     let params_w = lp_parameters.map(|p| wide_nul(std::ffi::OsStr::new(p)));
 
+    let mut mask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    if include_noasync {
+        mask |= SEE_MASK_NOASYNC;
+    }
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        fMask: mask,
         lpFile: PCWSTR(file_w.as_ptr()),
         lpDirectory: dir_w.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
         lpParameters: params_w.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
@@ -289,15 +303,16 @@ fn shell_execute_in_apartment(
 }
 
 /// The failure bound for `ShellExecuteExW` itself never returning at all — see the module doc for
-/// what was actually measured (an unexplained intermittent hang, observed once) and the COM-init fix
-/// in `shell_execute_with`'s doc. Win32 gives this process no way to cancel a call already inside
-/// `ShellExecuteExW`, so the call's return is a genuinely external event this code cannot synchronize
-/// on — bounding it is the sanctioned exception to "don't synchronize via time", not a race against a
-/// clock this process controls. Hitting this bound is a FAILURE, not a passing answer: it means
-/// `ShellExecuteExW` did not return, so nothing about this probe's actual question was measured.
-/// Chosen well below `.config/nextest.toml`'s 300s `terminate-after` for this binary, so a genuine
-/// block is diagnosed here and reported with context, rather than only visible as a bare timeout kill
-/// with no diagnosis.
+/// what was actually measured (an unexplained intermittent hang) and what is not (it is not
+/// established to be fixed by the COM-apartment init in `shell_execute_with`). Win32 gives this
+/// process no way to cancel a call already inside `ShellExecuteExW`, so the call's return is a
+/// genuinely external event this code cannot synchronize on — bounding it is the sanctioned
+/// exception to "don't synchronize via time", not a race against a clock this process controls.
+/// Hitting this bound is a FAILURE, not a passing answer: it means `ShellExecuteExW` did not return,
+/// so nothing about this probe's actual question was measured. Chosen well below
+/// `.config/nextest.toml`'s 300s `terminate-after` for this binary, so a genuine block is diagnosed
+/// here and reported with context, rather than only visible as a bare timeout kill with no
+/// diagnosis.
 const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
 
 /// Runs `f` (a `shell_execute_with` call) on its own thread and waits for it, bounded by
@@ -307,6 +322,13 @@ const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
 /// Returns `None` if `f` has not returned within the bound. Every call site below treats `None` as a
 /// hard failure — it panics rather than drawing any conclusion about `lpFile` resolution, since
 /// nothing about that question was actually measured when the call itself never returned.
+///
+/// If `f` itself panics, the channel disconnects immediately rather than timing out — that is
+/// reported here as what it is (a panic inside `f`, which DID return, by unwinding) rather than
+/// folded into the `None`/bound-exceeded case, which would misreport a real panic as an unexplained
+/// hang. The worker is joined (it has already finished panicking, so this cannot itself hang) and
+/// its panic payload is propagated on this thread via `std::panic::resume_unwind`, so the original
+/// panic message and location are what the test actually reports.
 ///
 /// The spawned thread, if still blocked when the bound trips, is deliberately never joined or
 /// killed: Rust has no API to force a thread out of a blocking syscall. Leaking it is safe because
@@ -318,84 +340,22 @@ where
     F: FnOnce() -> Result<LaunchOutcome, String> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         // If the receiver already gave up (the bound elapsed), this send fails silently — there is
         // no one left to report the eventual result to.
         let _ = tx.send(f());
     });
-    rx.recv_timeout(SHELL_EXECUTE_BOUND).ok()
-}
-
-// ── process cleanup ══════════════════════════════════════════════════════════════════
-//
-// An existing extensionless target that gets `LaunchOutcome::LaunchedNoHandle` or
-// `ERROR_NO_ASSOCIATION` may have started a handler process (e.g. `OpenWith.exe`) this probe has no
-// handle to — nothing here assigned it to a Job Object, since no process handle was ever returned.
-// Left running, it leaks into whatever probe nextest runs next on the same CI runner. These two
-// helpers turn "did anything else start" into an actual measurement (a snapshot diff) instead of an
-// assumption, and clean up anything found.
-
-/// Snapshot every running process as `pid -> image file name`.
-fn snapshot_processes() -> HashMap<u32, String> {
-    let mut out = HashMap::new();
-    // SAFETY: no preconditions beyond a valid flags/pid pair, both satisfied here.
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return out;
-    };
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: `snapshot` is a valid handle just returned above, and `entry.dwSize` is set as
-    // required before the first call.
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
-    while ok {
-        let name_len = entry
-            .szExeFile
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(entry.szExeFile.len());
-        let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
-        out.insert(entry.th32ProcessID, name);
-        // SAFETY: `snapshot` and `entry` are both still valid from the call above.
-        ok = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
-    }
-    // SAFETY: `snapshot` is a valid handle owned by this function, closed exactly once.
-    unsafe {
-        let _ = CloseHandle(snapshot);
-    }
-    out
-}
-
-/// Terminate every process present in `after` but not in `before`, and return a diagnostic string
-/// naming what was found and whether each termination succeeded — logged so a failing probe's
-/// message shows exactly what leaked, not just that something did.
-fn kill_new_processes(before: &HashMap<u32, String>, after: &HashMap<u32, String>) -> String {
-    let mut diag = String::new();
-    for (&pid, name) in after {
-        if before.contains_key(&pid) {
-            continue;
-        }
-        // SAFETY: `pid` names a process observed to exist moments ago by the snapshot above;
-        // `OpenProcess` itself fails cleanly if it has since exited.
-        let killed = match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
-            Ok(handle) => {
-                // SAFETY: `handle` was just opened above, with PROCESS_TERMINATE rights.
-                let result = unsafe { TerminateProcess(handle, 1) };
-                // SAFETY: `handle` is this function's own, closed exactly once.
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                result
-            }
-            Err(e) => Err(e),
-        };
-        diag.push_str(&format!("\n    pid={pid} name={name:?} terminate={killed:?}"));
-    }
-    if diag.is_empty() {
-        "no new processes appeared".to_owned()
-    } else {
-        format!("new processes appeared and were terminated:{diag}")
+    match rx.recv_timeout(SHELL_EXECUTE_BOUND) {
+        Ok(result) => Some(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!(
+                "PROBE shell-execute: the worker thread ended without panicking and without \
+                 sending a result — this should be impossible, since it sends immediately after \
+                 the call returns"
+            ),
+        },
     }
 }
 
@@ -632,9 +592,9 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 /// for the same underlying fact.
 ///
 /// `ShellExecuteExW` itself can fail to return at all rather than ever completing: measured once,
-/// in run 36120443833 on `cd764ef`, this probe produced no output and the whole job hit its
-/// 30-minute timeout. `CHILD_EXIT_BOUND_MS` cannot cover this — it only bounds the wait AFTER a
-/// handle is obtained — so this call is wrapped in `shell_execute_bounded` instead, bounded by
+/// this probe produced no output and the whole job hit its 30-minute timeout (see the PR description
+/// for the run). `CHILD_EXIT_BOUND_MS` cannot cover this — it only bounds the wait AFTER a handle is
+/// obtained — so this call is wrapped in `shell_execute_bounded` instead, bounded by
 /// `SHELL_EXECUTE_BOUND`. Hitting that bound is a hard failure here, never a conclusion about
 /// whether the dotted spelling opens the file: see `SHELL_EXECUTE_BOUND`'s doc.
 #[test]
@@ -647,17 +607,15 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
 
     let dotted = dir.path().join("tool.");
     let params = format!("--report-to \"{}\"", marker.display());
-    let before = snapshot_processes();
     let outcome = {
         let dotted = dotted.clone();
         let params = params.clone();
-        shell_execute_bounded(move || shell_execute_with(&dotted, None, Some(&params)))
+        shell_execute_bounded(move || shell_execute_with(&dotted, None, Some(&params), false))
     };
     let Some(outcome) = outcome else {
-        let diag = kill_new_processes(&before, &snapshot_processes());
         panic!(
             "PROBE trailing-dot-opens-extensionless: ShellExecuteExW did not return within \
-             {SHELL_EXECUTE_BOUND:?}; this probe could not be measured. {diag}"
+             {SHELL_EXECUTE_BOUND:?}; this probe could not be measured"
         );
     };
     let outcome = outcome.expect("probe must be measurable");
@@ -673,16 +631,20 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
             // Same fact as the LaunchedNoHandle arm below, just returned synchronously instead of as
             // a UI handoff: the dotted spelling DID resolve to the extensionless file — otherwise
             // this would be ERROR_FILE_NOT_FOUND — but there is nothing to hand it to.
-            let diag = kill_new_processes(&before, &snapshot_processes());
-            println!("PROBE trailing-dot-opens-extensionless: launched=false, no association ({e})");
+            let report = read_self_report_image(&marker);
+            println!(
+                "PROBE trailing-dot-opens-extensionless: launched=false, no association ({e}) \
+                 report={report:?} (an instantaneous, racy snapshot taken right after the call \
+                 returned — no process handle means nothing here waits for a handed-off process \
+                 before reading the marker)"
+            );
             println!(
                 "  => NO, not as a directly-run process. The dotted spelling still resolves to the \
                  extensionless file rather than falling through to ERROR_FILE_NOT_FOUND, but an \
                  extensionless target is never executed directly regardless of spelling — the shell \
                  reported ERROR_NO_ASSOCIATION rather than handing it to a picker. This is the \
                  expected, measured negative for an extensionless target — see \
-                 LaunchOutcome::LaunchedNoHandle's doc for the handoff variant of this same fact. \
-                 {diag}"
+                 LaunchOutcome::LaunchedNoHandle's doc for the handoff variant of this same fact."
             );
         }
         LaunchOutcome::NotLaunched(e) => panic!(
@@ -690,10 +652,12 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
              ERROR_NO_ASSOCIATION): {e}"
         ),
         LaunchOutcome::LaunchedNoHandle => {
-            let diag = kill_new_processes(&before, &snapshot_processes());
+            let report = read_self_report_image(&marker);
             println!(
                 "PROBE trailing-dot-opens-extensionless: launched=true, no process handle \
-                 (LaunchedNoHandle)"
+                 (LaunchedNoHandle) report={report:?} (an instantaneous, racy snapshot taken right \
+                 after the call returned — no process handle means nothing here waits for a \
+                 handed-off process before reading the marker)"
             );
             println!(
                 "  => NO, not as a directly-run process. The dotted spelling still resolves to the \
@@ -701,7 +665,7 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
                  extensionless target is never executed directly regardless of spelling — it is \
                  handed to an association handler with no process handle, so it cannot be waited on, \
                  terminated, or contained. This is the expected, measured negative for an \
-                 extensionless target — see LaunchOutcome::LaunchedNoHandle's doc. {diag}"
+                 extensionless target — see LaunchOutcome::LaunchedNoHandle's doc."
             );
         }
         LaunchOutcome::Waited => {
@@ -747,6 +711,16 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
 /// observed to hang; see the module doc for what actually was. If `ShellExecuteExW` does fail to
 /// return here, that is a hard failure (see `SHELL_EXECUTE_BOUND`'s doc): this probe never infers
 /// precedence from a call that never returned.
+///
+/// This call also drops `SEE_MASK_NOASYNC` (see `shell_execute_in_apartment`'s doc), which costs it
+/// a conclusion it could otherwise draw: without that flag, `ShellExecuteExW` may return before the
+/// underlying shell operation has actually finished, so a `LaunchedNoHandle` or
+/// `ERROR_NO_ASSOCIATION` return here no longer reliably means "the extensionless file won, and a
+/// `.bat` launch would instead have returned a live process handle" — it could equally mean the
+/// `.bat` route is still in flight, on a thread this probe has no handle to and cannot wait for.
+/// Chosen deliberately: those arms below report NOT MEASURED rather than assert a precedence
+/// conclusion this call can no longer support (the alternative, keeping the old inference, was
+/// rejected — see the PR description).
 #[test]
 #[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_pathext_outrank_an_existing_extensionless_file() {
@@ -763,65 +737,52 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 
     // Inert if the shell instead routes to tool.bat: the planted batch ignores its arguments.
     let params = format!("--report-to \"{}\"", exe_marker.display());
-    let before = snapshot_processes();
     let outcome = {
         let extensionless = extensionless.clone();
         let params = params.clone();
-        shell_execute_bounded(move || shell_execute_with(&extensionless, None, Some(&params)))
+        shell_execute_bounded(move || shell_execute_with(&extensionless, None, Some(&params), false))
     };
     let Some(outcome) = outcome else {
-        let diag = kill_new_processes(&before, &snapshot_processes());
         panic!(
             "PROBE pathext-vs-existing-extensionless: ShellExecuteExW did not return within \
              {SHELL_EXECUTE_BOUND:?}; this probe could not be measured — precedence is never inferred \
-             from a call that never returned. {diag}"
+             from a call that never returned"
         );
     };
     let outcome = outcome.expect("probe must be measurable");
     // Shared by the LaunchedNoHandle and ERROR_NO_ASSOCIATION arms below: both mean this call
-    // returned without ever handing this probe a process handle to wait on. There is therefore no
-    // handle to wait on before checking the markers below, so that check is an instantaneous, racy
-    // snapshot taken the moment the call returned — not a durable measurement. A process handed off
-    // asynchronously (this probe has no handle to and cannot wait for) could still be running, and
-    // could write either marker moments later. Only the immediate state at that instant is
-    // reportable; "neither ever ran" or "X wins outright" are NOT — see the module doc and
-    // `LaunchOutcome::LaunchedNoHandle`'s doc for why no handle means no such wait is possible.
-    let report_no_handle = |before: &HashMap<u32, String>, via: &str| {
-        let diag = kill_new_processes(before, &snapshot_processes());
+    // returned without ever handing this probe a process handle to wait on. This call drops
+    // SEE_MASK_NOASYNC (see this function's doc), so getting no handle here no longer reliably
+    // distinguishes "the extensionless file won" from "the operation just had not finished yet" —
+    // report NOT MEASURED rather than a precedence conclusion, except when both markers are set,
+    // which is unambiguous contamination regardless of any of that.
+    let report_no_handle = |via: &str| {
         let exe_ran = exe_marker.exists();
         let bat_ran = read_self_report(&bat_marker).is_some_and(|r| same_file(&r, &bat));
         println!(
             "PROBE pathext-vs-existing-extensionless: outcome={via} exe_ran={exe_ran} \
-             bat_ran={bat_ran} (an instantaneous snapshot right after the call returned — see this \
-             probe's doc). {diag}"
+             bat_ran={bat_ran} (an instantaneous, racy snapshot taken right after the call \
+             returned)."
         );
-        match (exe_ran, bat_ran) {
-            (false, false) => println!(
-                "  => at this instant neither marker exists. This does NOT establish that neither \
-                 image ever ran: {via} means the call returned no process handle to wait on, so a \
-                 handed-off process this probe cannot wait for could still write either marker later. \
-                 Only the immediate absence is measured here."
-            ),
-            (true, false) => println!(
-                "  => at this instant the exe marker exists but the bat marker does not, despite {via} \
-                 reporting no process handle for this call. Not asserted as impossible — this is only \
-                 an instantaneous snapshot — but worth a closer look."
-            ),
-            (false, true) => println!(
-                "  => at this instant the bat marker exists but the exe marker does not, despite {via} \
-                 reporting no process handle for this call. Not asserted as impossible — this is only \
-                 an instantaneous snapshot — but worth a closer look, since a real cmd.exe launch of a \
-                 .bat ordinarily does yield a process handle."
-            ),
-            (true, true) => println!(
-                "  => at this instant BOTH markers exist — this run is contaminated and its result \
-                 cannot be trusted."
-            ),
+        if exe_ran && bat_ran {
+            panic!(
+                "PROBE pathext-vs-existing-extensionless: BOTH markers exist — this run is \
+                 contaminated and its result cannot be trusted"
+            );
         }
+        panic!(
+            "PROBE pathext-vs-existing-extensionless: NOT MEASURED. {via} means this call returned \
+             no process handle, but this call drops SEE_MASK_NOASYNC to test the reviewer's hang \
+             hypothesis (see this function's doc) — without that flag, ShellExecuteExW may return \
+             before the shell operation has actually finished, so no handle no longer reliably tells \
+             this probe whether the extensionless file was chosen over tool.bat. Chosen \
+             deliberately: fail rather than report a precedence conclusion this call can no longer \
+             support."
+        );
     };
     match outcome {
         LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
-            report_no_handle(&before, &format!("no association ({e})"));
+            report_no_handle(&format!("no association ({e})"));
         }
         LaunchOutcome::NotLaunched(e) => panic!(
             "PROBE pathext-vs-existing-extensionless: the shell declined to launch anything with an \
@@ -829,11 +790,7 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
              here, so precedence could not be measured"
         ),
         LaunchOutcome::LaunchedNoHandle => {
-            // Not automatically a harness failure here: `does_an_existing_extensionless_file_...`
-            // establishes that an existing extensionless target can be handed to an association
-            // handler outright, independent of whether PATHEXT could have matched something beside
-            // it.
-            report_no_handle(&before, "no process handle (LaunchedNoHandle)");
+            report_no_handle("no process handle (LaunchedNoHandle)");
         }
         LaunchOutcome::Waited => {
             let exe_ran = exe_marker.exists();
@@ -871,21 +828,28 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 
 /// Companion to the precedence probe above, with no `.bat` in the directory to compete: does an
 /// EXISTING extensionless file ever get run directly by `ShellExecuteEx`, when nothing else present
-/// could satisfy `PATHEXT`? Measured: no, on this call. Depending on the runner, the shell hands it
-/// to an association/Open-With handler (`LaunchOutcome::LaunchedNoHandle`), or fails synchronously
-/// with `ERROR_NO_ASSOCIATION` where `SEE_MASK_FLAG_NO_UI` actually suppresses the picker — measured
-/// in run 36125783666: `windows-11-arm` got `LaunchedNoHandle` in that run. `ShellExecuteExW` can
-/// also fail to return at all: the same run's `windows-latest` (x64) leg produced no output and ran
-/// to nextest's 300s per-test bound. No UI was observed there — a call blocked inside the API leaves
-/// nothing to see — and this is not established to be architecture-specific; see the module doc for
-/// what that hang does and does not establish, and `shell_execute_with`'s doc for the fix. Hitting
-/// `SHELL_EXECUTE_BOUND` below is a hard failure, never a conclusion. This probe deliberately plants
+/// could satisfy `PATHEXT`? Measured: no, on this call — the shell hands it to an association/
+/// Open-With handler (`LaunchOutcome::LaunchedNoHandle`), or fails synchronously with
+/// `ERROR_NO_ASSOCIATION` where `SEE_MASK_FLAG_NO_UI` actually suppresses the picker. `ShellExecuteExW`
+/// can also fail to return at all (see the module doc for what is and is not established about that,
+/// and the PR description for the run history). Hitting `SHELL_EXECUTE_BOUND` below is a hard
+/// failure, never a conclusion. This probe deliberately plants
 /// no competing `.bat`, so it says nothing about what happens when something else COULD satisfy
 /// `PATHEXT` beside an existing extensionless file — that is what
 /// `does_pathext_outrank_an_existing_extensionless_file` measures instead. This was originally
 /// written as a control expected to always launch; it does not, and that failure to launch — a
-/// genuine negative, not a harness bug — IS the answer, and is what makes
-/// `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` outcome unreachable.
+/// genuine negative, not a harness bug — IS the answer. Both probes hand `ShellExecuteExW` the same
+/// existing extensionless target and drop `SEE_MASK_NOASYNC` (see `shell_execute_in_apartment`'s
+/// doc), so neither gets a process handle for it either way — that sibling probe cannot draw a
+/// precedence conclusion from a no-handle outcome and now reports NOT MEASURED there instead; see
+/// its doc for why.
+///
+/// A no-handle outcome here does not, by itself, prove the file never ran: the marker check right
+/// after such an outcome is an instantaneous, racy snapshot — nothing waits for a handed-off process
+/// before reading it. If that marker is ever found set anyway, this probe treats it as a failure,
+/// not a note: this crate's contract needs a definite answer for whether an existing extensionless
+/// target can run without ever handing back a process handle, and "unexplained, not asserted as
+/// impossible" is not a definite answer.
 #[test]
 #[ignore = "launches a copied payload binary; opt in with --ignored, on a throwaway runner only"]
 fn does_an_existing_extensionless_file_ever_launch_directly() {
@@ -898,35 +862,35 @@ fn does_an_existing_extensionless_file_ever_launch_directly() {
     // Deliberately no tool.bat: nothing else in this directory could satisfy PATHEXT.
 
     let params = format!("--report-to \"{}\"", exe_marker.display());
-    let before = snapshot_processes();
     let outcome = {
         let extensionless = extensionless.clone();
         let params = params.clone();
-        shell_execute_bounded(move || shell_execute_with(&extensionless, None, Some(&params)))
+        shell_execute_bounded(move || shell_execute_with(&extensionless, None, Some(&params), false))
     };
     let Some(outcome) = outcome else {
-        let diag = kill_new_processes(&before, &snapshot_processes());
         panic!(
             "PROBE existing-extensionless-no-bat: ShellExecuteExW did not return within \
-             {SHELL_EXECUTE_BOUND:?}; this probe could not be measured. {diag}"
+             {SHELL_EXECUTE_BOUND:?}; this probe could not be measured"
         );
     };
     let outcome = outcome.expect("probe must be measurable");
     match outcome {
         LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
-            let diag = kill_new_processes(&before, &snapshot_processes());
             let exe_ran = exe_marker.exists();
             println!(
                 "PROBE existing-extensionless-no-bat: launched=false, no association ({e}) \
-                 exe_ran={exe_ran} (instantaneous snapshot right after the call returned). {diag}"
+                 exe_ran={exe_ran} (an instantaneous, racy snapshot taken right after the call \
+                 returned — no process handle means nothing here waits for a handed-off process \
+                 before reading the marker)."
             );
             if exe_ran {
-                println!(
-                    "  => NOTE: the exe marker exists despite this call's synchronous \
-                     ERROR_NO_ASSOCIATION. That this call itself returned no process handle is \
-                     authoritative — a synchronous fact from the API's return value, not a snapshot \
-                     — but the marker's existence is unexplained and worth a closer look; not \
-                     asserted as impossible."
+                panic!(
+                    "PROBE existing-extensionless-no-bat: the exe marker exists despite this call's \
+                     synchronous ERROR_NO_ASSOCIATION. That this call itself returned no process \
+                     handle is authoritative — a synchronous fact from the API's return value, not a \
+                     snapshot — but the marker existing anyway means the extensionless file ran \
+                     through some path this probe did not account for; failing rather than noting it \
+                     and moving on."
                 );
             }
             println!(
@@ -934,11 +898,9 @@ fn does_an_existing_extensionless_file_ever_launch_directly() {
                  extensionless file directly through this call, even when nothing else in the \
                  directory could satisfy PATHEXT: it reported ERROR_NO_ASSOCIATION synchronously \
                  rather than handing off to a picker — the same fact as the LaunchedNoHandle arm \
-                 below, just surfaced differently (see the module doc). This is the measured floor \
-                 for `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` branch: \
-                 that branch is unreachable, because this call never returned a process handle for \
-                 the extensionless target. It also means anything the shell refuses this way can \
-                 never be contained by cosca — there is no process handle to assign to a Job Object."
+                 below, just surfaced differently (see the module doc). It also means anything the \
+                 shell refuses this way can never be contained by cosca — there is no process handle \
+                 to assign to a Job Object."
             );
         }
         LaunchOutcome::NotLaunched(e) => panic!(
@@ -948,30 +910,30 @@ fn does_an_existing_extensionless_file_ever_launch_directly() {
              broken"
         ),
         LaunchOutcome::LaunchedNoHandle => {
-            let diag = kill_new_processes(&before, &snapshot_processes());
             let exe_ran = exe_marker.exists();
             println!(
                 "PROBE existing-extensionless-no-bat: launched=true, no process handle \
-                 (LaunchedNoHandle) exe_ran={exe_ran} (instantaneous snapshot right after the call \
-                 returned). {diag}"
+                 (LaunchedNoHandle) exe_ran={exe_ran} (an instantaneous, racy snapshot taken right \
+                 after the call returned — no process handle means nothing here waits for a \
+                 handed-off process before reading the marker)."
             );
             if exe_ran {
-                println!(
-                    "  => NOTE: the exe marker exists despite this call returning no process handle \
-                     to wait on. That this call itself returned no handle is authoritative — a \
-                     synchronous fact from the API's return value, not a snapshot — but the marker's \
-                     existence is unexplained and worth a closer look; not asserted as impossible."
+                panic!(
+                    "PROBE existing-extensionless-no-bat: the exe marker exists despite this call \
+                     returning no process handle to wait on. That this call itself returned no \
+                     handle is authoritative — a synchronous fact from the API's return value, not a \
+                     snapshot — but the marker existing anyway means the extensionless file ran \
+                     through some path this probe did not account for; failing rather than noting it \
+                     and moving on."
                 );
             }
             println!(
                 "  => NO, as far as THIS call is concerned. ShellExecuteEx did not run the existing \
                  extensionless file directly through this call, even when nothing else in the \
                  directory could satisfy PATHEXT. It hands the file to an association/Open-With \
-                 handler instead, which returns no process handle. This is the measured floor for \
-                 `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` branch: that \
-                 branch is unreachable, because this call never returned a process handle for the \
-                 extensionless target. It also means anything the shell hands off to this way can \
-                 never be contained by cosca — there is no process handle to assign to a Job Object."
+                 handler instead, which returns no process handle. It also means anything the shell \
+                 hands off to this way can never be contained by cosca — there is no process handle \
+                 to assign to a Job Object."
             );
         }
         LaunchOutcome::Waited => {
