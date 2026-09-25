@@ -449,3 +449,49 @@ pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
         .unwrap_or_else(|e| panic!("{who} must echo the byte back while alive: {e}"));
     assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
 }
+
+/// Duplicate each of `fds` aside and close it, restoring all of them (on drop, even if the test
+/// panics) so the CURRENT process's own low-numbered descriptors are free for a test to reuse —
+/// then land back where they started. Some fd_map regression tests need this THIS process's own
+/// fd 1 and/or fd 2 closed to reproduce a bug that only manifests when a mapping's parent-side
+/// source, or a `Stdio::from_file` target, gets allocated one of those exact numbers.
+///
+/// Safe only because this workspace's test runner (`cargo nextest`) puts every test function in
+/// its own OS process — a plain `cargo test` run shares one process across parallel test
+/// threads, so this would race with (and could disable output from) unrelated tests.
+#[cfg(unix)]
+pub struct RestoreStdio {
+    saved: Vec<(libc::c_int, std::os::fd::OwnedFd)>,
+}
+
+#[cfg(unix)]
+impl RestoreStdio {
+    pub fn close(fds: &[libc::c_int]) -> RestoreStdio {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut saved = Vec::with_capacity(fds.len());
+        for &fd in fds {
+            // SAFETY: F_DUPFD_CLOEXEC(fd, 3) duplicates fd to a fresh number >= 3, checked below.
+            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(dup >= 0, "dup fd {fd} aside before closing it");
+            // SAFETY: `dup` was just returned by a successful F_DUPFD_CLOEXEC.
+            let dup = unsafe { OwnedFd::from_raw_fd(dup) };
+            assert_eq!(unsafe { libc::close(fd) }, 0, "close the test process' fd {fd}");
+            saved.push((fd, dup));
+        }
+        RestoreStdio { saved }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreStdio {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        for (fd, dup) in &self.saved {
+            // SAFETY: dup2 back onto `fd`; `dup` stays valid (closed normally by its own Drop,
+            // right after) regardless of this call's outcome.
+            unsafe {
+                libc::dup2(dup.as_raw_fd(), *fd);
+            }
+        }
+    }
+}

@@ -2,9 +2,8 @@
 //! numbers, replacing the `command-fds` dependency.
 //!
 //! # Why cosca owns this now (I14)
-//! `command-fds` 0.3.3 has two bugs that together made an out-of-range or negative
-//! [`Fd`](crate::stdio::Fd) either abort the child or silently vanish rather than fail the
-//! spawn cleanly:
+//! `command-fds` 0.3.3 has two bugs that together made an out-of-range [`Fd`](crate::stdio::Fd)
+//! either abort the child or silently vanish rather than fail the spawn cleanly:
 //!  - its `map_fds` computes `max(every parent/child fd) + 1` as a temporary-fd floor with
 //!    unchecked `i32` arithmetic, which overflows for `child_fd == i32::MAX` — and even when it
 //!    does not overflow, that single global floor can sit above the process' `RLIMIT_NOFILE`
@@ -15,10 +14,11 @@
 //!    own file-descriptor validity checks later see it. Reported upstream as
 //!    nix-rust/nix#2797 (unfixed as of nix 0.31.3); not cosca's to fix.
 //!
-//! A negative `Fd` never reaches this module at all — [`Command::fd`](crate::Command::fd)
-//! rejects it before a [`FdMapping`] is ever built, via cosca's own `raw() >= 3` filter. It is
-//! not something `command-fds` ever handled correctly; there is no equivalent path here for it
-//! to "vanish" through.
+//! A negative `Fd` never reaches this module at all: [`Command::fd`](crate::Command::fd) rejects
+//! it directly, via its own `slot.raw() < 0` check. Before that check existed, a negative `Fd`
+//! would have silently vanished via the `fd.raw() >= 3` filter that `child::spawn::spawn_unelevated`
+//! uses to collect which configured slots become mappings in the first place — that filter, not
+//! anything in this module, is what used to make a negative `Fd` disappear.
 //!
 //! This module ports `command-fds`' actual algorithm (the collision-avoiding temporary-fd
 //! shuffle, and the `FD_CLOEXEC`-clearing `preserved_fds` the macOS fd marker uses, here
@@ -76,7 +76,8 @@ pub(crate) struct FdMapping {
 /// `parent_fd` sits below fd 3, via `F_DUPFD_CLOEXEC(fd, 3)` — see the module docs for why a
 /// low-numbered source would otherwise be clobbered by std's own stdio setup. That relocation is
 /// the only parent-side failure mode left: an ordinary `Err` (e.g. `EMFILE`) if the duplicate
-/// itself cannot be made.
+/// itself cannot be made. The vacated original number is deliberately NOT freed at this point —
+/// it stays open, owned by the returned `Plan`, until `std_cmd` itself drops (see `Plan::_retired`).
 pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdMapping>) -> io::Result<()> {
     if mappings.is_empty() {
         return Ok(());
@@ -100,20 +101,30 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdM
          (callers build this from a BTreeMap<Fd, _>, whose keys already are)"
     );
 
-    // M2: a mapping's `parent_fd` sitting at fd 0/1/2 would be clobbered by std's own stdio
-    // dup2, which runs in the child before any `pre_exec` hook (including this module's own).
-    // Move it out of the way here, in the parent, before the fork ever happens.
+    // A mapping's `parent_fd` sitting at fd 0/1/2 would be clobbered by std's own stdio dup2,
+    // which runs in the child before any `pre_exec` hook (including this module's own). Move it
+    // out of the way here, in the parent, before the fork ever happens.
+    //
+    // The ORIGINAL low-numbered descriptor is kept open in `retired`, not closed here: closing
+    // it would free that exact number back to the OS right before `std_cmd.spawn()` does its own
+    // internal fd allocation (its child-to-parent error-reporting pipe, or any piped stdio),
+    // which can then claim that same number and collide with a dup2 std performs in the child
+    // before any `pre_exec` hook runs. `retired` is carried inside `Plan`, which the `pre_exec`
+    // closure below owns, so it only actually closes once `std_cmd` itself drops — well after
+    // `spawn()` (and everything it internally allocates) has completed.
+    let mut retired: Vec<OwnedFd> = Vec::new();
     for m in mappings.iter_mut() {
         let parent_raw = m.parent_fd.as_raw_fd();
         if parent_raw < 3 {
             let tmp = dup_fd_cloexec_at_or_above(parent_raw, 3)?;
             // SAFETY: `tmp` was just returned by a successful F_DUPFD_CLOEXEC — a fresh,
             // uniquely-owned descriptor nothing else references yet.
-            m.parent_fd = unsafe { OwnedFd::from_raw_fd(tmp) };
+            let relocated = unsafe { OwnedFd::from_raw_fd(tmp) };
+            retired.push(std::mem::replace(&mut m.parent_fd, relocated));
         }
     }
 
-    let mut plan = Plan::build(mappings);
+    let mut plan = Plan::build(mappings, retired);
     // SAFETY: `Plan::apply` makes only raw `dup2`/`fcntl` syscalls, checks every return value,
     // and reads the failure errno without allocating — the async-signal-safety `pre_exec`
     // requires.
@@ -149,15 +160,24 @@ struct Plan {
     /// parent fd that collides with ANOTHER mapping's child fd (needs a temporary first) and,
     /// via [`dup_avoiding`], to pick a temporary that avoids every one of them.
     child_fds: Vec<RawFd>,
+    /// Original low-numbered (`< 3`) `parent_fd`s that `install` relocated before this `Plan` was
+    /// built, kept open here purely so their numbers stay busy in the parent — not read by
+    /// `apply`, dropped (closing them) only when this `Plan`, and so this whole `pre_exec`
+    /// closure, drops. See `install`'s own comment for why closing them any earlier is unsafe.
+    _retired: Vec<OwnedFd>,
 }
 
 impl Plan {
-    fn build(mappings: Vec<FdMapping>) -> Plan {
+    fn build(mappings: Vec<FdMapping>, retired: Vec<OwnedFd>) -> Plan {
         let mut child_fds: Vec<RawFd> = mappings.iter().map(|m| m.child_fd).collect();
         child_fds.sort_unstable();
         child_fds.dedup();
 
-        Plan { mappings, child_fds }
+        Plan {
+            mappings,
+            child_fds,
+            _retired: retired,
+        }
     }
 
     /// Async-signal-safe: no allocation, every syscall's return value is checked, `EINTR` is
@@ -220,9 +240,10 @@ fn dup_fd_cloexec_at_or_above(fd: RawFd, min: RawFd) -> io::Result<RawFd> {
 /// nothing in this loop ever frees a lower number back up, so the same forbidden number can
 /// never be returned twice — each retry permanently rules out one more element of `forbidden`.
 ///
-/// Async-signal-safe: no allocation; the only failure path is `min`'s `checked_add` overflowing
-/// (only reachable when `forbidden` contains `i32::MAX`), which is reported as a plain
-/// `io::Error` without formatting.
+/// Async-signal-safe: no allocation. `dup_fd_cloexec_at_or_above`'s `?` can propagate an ordinary
+/// OS failure (e.g. `EMFILE` — too many open files) as-is. Separately, `min`'s `checked_add` can
+/// overflow, but only if `forbidden` contains `i32::MAX` AND the process has enough open-file
+/// headroom for `F_DUPFD_CLOEXEC` to actually hand back `i32::MAX` — not reachable in practice.
 fn dup_avoiding(fd: RawFd, forbidden: &[RawFd]) -> io::Result<RawFd> {
     let mut min: RawFd = 3;
     loop {

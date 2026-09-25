@@ -95,6 +95,12 @@ windows = { version = "0.62", features = [
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Integration tests cannot reach the crate's own dependencies (see the Windows dev-dependencies
+# comment above) — `tests/common`'s `RestoreStdio` needs raw `fcntl`/`close`/`dup2` to reproduce
+# the fd_map low-fd regressions (N1, M2) through the public `Command` API.
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
 event-listener = "5"

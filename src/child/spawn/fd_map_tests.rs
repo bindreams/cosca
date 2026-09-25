@@ -165,13 +165,12 @@ fn without_install_preserved_the_fd_is_closed_at_exec() {
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "CLOSED");
 }
 
-// Very large child fds fail at spawn, not at install (I14 / M1) =====
+// Very large child fds fail at spawn, not at install (I14) =====
 
-/// `child_fd == i32::MAX` must be ACCEPTED by `install` in the parent — the old parent-side
-/// checked-arithmetic floor that used to refuse it there is gone (M1 replaced the single global
-/// floor with a per-mapping `F_DUPFD_CLOEXEC` search that starts at 3 and never computes
-/// `i32::MAX + 1` at all) — and fails only later, in the child, at `dup2`: an ordinary `EBADF`,
-/// not a parent-side refusal and not an abort.
+/// `child_fd == i32::MAX` must be ACCEPTED by `install` in the parent — its per-mapping
+/// `F_DUPFD_CLOEXEC` search starts at 3 and never computes `i32::MAX + 1` at all — and fails only
+/// later, in the child, at `dup2`: an ordinary `EBADF`, not a parent-side refusal and not an
+/// abort.
 #[test]
 fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
     let f = file_with("x");
@@ -184,7 +183,7 @@ fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
             child_fd: i32::MAX,
         }],
     )
-    .expect("i32::MAX must be accepted by install — M1 removed the parent-side refusal");
+    .expect("i32::MAX must be accepted by install");
     let err = cmd
         .spawn()
         .and_then(|c| c.wait_with_output())
@@ -221,17 +220,14 @@ fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
     assert!(err.raw_os_error().is_some(), "expected an OS error, got {err:?}");
 }
 
-// M1: one distant child_fd must not inflate every temporary past a tight RLIMIT_NOFILE =====
+// One distant child_fd must not inflate every temporary past a tight RLIMIT_NOFILE =====
 
-/// The OLD algorithm computed ONE global temporary-fd floor from the numerically highest fd
-/// anywhere in the mapping set, so a single distant `child_fd` (here 255) pushed EVERY OTHER
-/// mapping's temporary-fd search above it too — even when the collision that actually needs a
-/// temporary (the A/B swap below) has plenty of free numbers well below that ceiling. Under a
-/// tight `RLIMIT_NOFILE` (256, so fd 255 is the highest valid number) that global floor of 256
-/// is itself out of range, and the swap fails with `EINVAL` even though it could have been
-/// resolved at some ordinary low number. M1's per-mapping `F_DUPFD_CLOEXEC(fd, 3)` search must
-/// not have this problem: it must resolve the swap using a low temporary, independent of the
-/// numerically distant 255 target.
+/// A single distant `child_fd` (here 255) must not push every OTHER mapping's temporary-fd
+/// search above it too — even when the collision that actually needs a temporary (the A/B swap
+/// below) has plenty of free numbers well below that ceiling. Under a tight `RLIMIT_NOFILE` (256,
+/// so fd 255 is the highest valid number), this module's per-mapping `F_DUPFD_CLOEXEC(fd, 3)`
+/// search must resolve the swap using a low temporary, independent of the numerically distant
+/// 255 target.
 #[test]
 fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rlimit() {
     let a = file_with("AAA");
@@ -276,9 +272,8 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
                 parent_fd: b_owned,
                 child_fd: a_raw,
             },
-            // Numerically distant but still a valid fd under the 256 rlimit (0..255): under the
-            // OLD algorithm this alone was enough to push the swap's temporary search past the
-            // rlimit ceiling.
+            // Numerically distant but still a valid fd under the 256 rlimit (0..255) — must not push
+            // the swap's temporary search past the rlimit ceiling.
             FdMapping {
                 parent_fd: c_owned,
                 child_fd: 255,
@@ -296,7 +291,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
     );
 }
 
-// M2: a parent_fd below fd 3 must not be clobbered by std's own stdio dup2 =====
+// A parent_fd below fd 3 must not be clobbered by std's own stdio dup2 =====
 
 /// Dup fd 2 aside and close the original, so the CURRENT test process's fd 2 is free for the
 /// test to reuse — restoring it on drop even if the test panics. Safe because this workspace's
@@ -332,10 +327,10 @@ impl Drop for RestoreFd2 {
 /// just closed its own fd 2 and the source is the next thing opened — must not be silently
 /// repointed to whatever std's OWN `.stderr()` setup later `dup2`s onto fd 2 in the child. Std
 /// runs that dup2 in the child BEFORE any `pre_exec` hook (including `install`'s own), so
-/// without M2's parent-side relocation, `fd_map`'s later `dup2(2, 3)` would duplicate the
-/// stderr pipe (now sitting at fd 2) instead of the mapping's actual source. Reproduces the bug
-/// measured on tokio: `close(2)`, `stderr(pipe())` + `fd(3, null)` delivered the stderr pipe's
-/// bytes through fd 3 instead of the mapping's real source.
+/// without a parent-side relocation, `fd_map`'s later `dup2(2, 3)` would duplicate the stderr
+/// pipe (now sitting at fd 2) instead of the mapping's actual source. Reproduces the bug measured
+/// on tokio: `close(2)`, `stderr(pipe())` + `fd(3, null)` delivered the stderr pipe's bytes
+/// through fd 3 instead of the mapping's real source.
 #[test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
     let _restore = RestoreFd2::take();
@@ -374,4 +369,46 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
         "unrelated-stderr",
         "the stderr pipe must carry only the child's own stderr writes, not fd 3's bytes"
     );
+}
+
+/// A relocated low `parent_fd`'s ORIGINAL number must stay open (busy) in the parent for as long
+/// as `std_cmd` holds the `pre_exec` closure — not just until `install` returns. Freeing it any
+/// earlier hands that exact number back to the OS right before `std_cmd.spawn()` does its own
+/// internal fd allocation (e.g. its child-to-parent error-reporting pipe, or any piped stdio),
+/// which can then claim that same number in the parent and collide with a dup2 std performs in
+/// the child before any `pre_exec` hook runs — so the freed number ends up serving two different
+/// purposes across the fork, corrupting whichever one loses.
+#[test]
+fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
+    let _restore = RestoreFd2::take();
+    // The next fd opened lands at 2 (just closed above by `RestoreFd2::take`).
+    let owned: OwnedFd = file_with("kept-open").into();
+    assert_eq!(
+        owned.as_raw_fd(),
+        2,
+        "test setup invariant: the source must land exactly at fd 2 to reproduce the bug"
+    );
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg("true");
+    install(
+        &mut cmd,
+        vec![FdMapping {
+            parent_fd: owned,
+            child_fd: 5,
+        }],
+    )
+    .expect("install");
+
+    // fd 2, in THIS process, must still be a live descriptor right after `install` returns —
+    // freeing it earlier is exactly the bug: it must stay open until `cmd` itself (and the
+    // closure/Plan it owns) drops.
+    let still_open = unsafe { libc::fcntl(2, libc::F_GETFD) } != -1;
+    assert!(
+        still_open,
+        "the original low fd (2) must remain open across install() — it must not be freed \
+         back to the OS before std_cmd's own spawn() internals have run"
+    );
+
+    drop(cmd); // only now may the retired original actually close
 }

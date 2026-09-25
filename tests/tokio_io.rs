@@ -525,16 +525,20 @@ async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     let err = cmd
         .spawn()
         .expect_err("dup2 onto an unachievable fd number must fail the spawn with Err, not abort");
-    assert!(
-        matches!(err, cosca::error::Error::Io(_)),
-        "expected a plain Io error (propagated via the child's error pipe), got {err:?}"
+    let cosca::error::Error::Io(io_err) = err else {
+        panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
+    };
+    assert_eq!(
+        io_err.raw_os_error(),
+        Some(libc::EBADF),
+        "dup2 onto an out-of-range target must fail with EBADF specifically, got {io_err:?}"
     );
 }
 
 /// Async twin of sync `unix_fd_i32_max_fails_spawn_cleanly_not_abort`: `fd(i32::MAX, ...)` must
 /// fail — never abort the child — with an ordinary `Err` from `spawn()`. `Command::fd()` itself
-/// accepts `i32::MAX` (M1 removed the parent-side checked-arithmetic refusal); the failure now
-/// happens post-fork, at `dup2`, exactly like any other out-of-range child fd (`EBADF`).
+/// accepts `i32::MAX`; the failure happens post-fork, at `dup2`, exactly like any other
+/// out-of-range child fd (`EBADF`).
 #[cfg(unix)]
 #[tokio::test]
 async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
@@ -542,13 +546,45 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(i32::MAX, cosca::Stdio::null())
-        .expect("fd() itself accepts i32::MAX — install() does too, since M1");
+        .expect("fd() itself accepts i32::MAX — install() does too");
     let err = cmd
         .spawn()
         .expect_err("dup2 onto i32::MAX must fail the spawn with Err, not abort");
+    let cosca::error::Error::Io(io_err) = err else {
+        panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
+    };
+    assert_eq!(
+        io_err.raw_os_error(),
+        Some(libc::EBADF),
+        "dup2 onto i32::MAX must fail with EBADF specifically, got {io_err:?}"
+    );
+}
+
+/// Async twin of sync `unix_m2_fd3_does_not_leak_into_stderr_pipe`: with this process' own fd 2
+/// closed and freed, a plain `fd(3, null)` mapping must not end up readable as the child's
+/// stderr just because `install()`'s own bookkeeping happens to source or park something at
+/// that exact number. `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the parent's stderr
+/// pipe must receive nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_m2_fd3_does_not_leak_into_stderr_pipe() {
+    use tokio::io::AsyncReadExt;
+
+    let _restore = common::RestoreStdio::close(&[2]);
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
+    cmd.stderr(cosca::Stdio::pipe()).expect("stderr pipe");
+    cmd.fd(3, cosca::Stdio::null()).expect("fd 3 null");
+    let mut child = cmd.spawn().expect("spawn");
+    let mut stderr = child.stderr().expect("stderr reader");
+    let mut buf = Vec::new();
+    stderr.read_to_end(&mut buf).await.expect("read stderr");
+    let _ = child.wait().await;
+
     assert!(
-        matches!(err, cosca::error::Error::Io(_)),
-        "expected a plain Io error (propagated via the child's error pipe), got {err:?}"
+        buf.is_empty(),
+        "the stderr pipe must not receive fd 3's bytes ('LEAK'), got {buf:?}"
     );
 }
 
