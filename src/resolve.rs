@@ -32,9 +32,17 @@
 //! Windows, so a `Path`-based rule could not be exercised from a POSIX host at all.
 //!
 //! A bare name is resolved from [`ResolveInput::system_dirs`] (Windows only) and then `PATH` —
-//! **never** the current directory. `system_dirs` is likewise taken as a parameter rather than
-//! queried from the OS here, for the same host-independence reason; see its doc for what it
-//! contains and why it precedes `PATH`.
+//! **never** the current directory, in either sense of that phrase: bare-name resolution never
+//! reads [`ResolveInput::cwd`] (the CHILD's working directory) at all, a structural guarantee of
+//! this module, and never reaches THIS PROCESS's own cwd either, because [`accepted`] rejects any
+//! joined candidate that is not fully qualified, so a relative `PATH` element (which would resolve
+//! against this process's cwd if followed) never produces a match. And, in practice, never the app
+//! directory (the directory this process's own image loaded from) either: `system_dirs` is an
+//! arbitrary caller-supplied slice, so this module CAN be handed the app directory (the test suite
+//! does exactly that as a positive control), but the one production caller,
+//! `windows_raw::resolve::windows_system_dirs`, never includes it. `system_dirs` is likewise taken
+//! as a parameter rather than queried from the OS here, for the
+//! same host-independence reason; see its doc for what it contains and why it precedes `PATH`.
 //!
 //! # Which error kind
 //!
@@ -79,32 +87,55 @@ pub(crate) struct ResolveInput<'a> {
     /// Directories searched for a bare name BEFORE `PATH`, in order. Ignored entirely when
     /// `windows` is `false` — POSIX has no analogous search order to preserve.
     ///
-    /// On Windows this reproduces `CreateProcessW`'s documented NULL-`lpApplicationName` search
-    /// order — app directory, then the System32 directory, then the Windows directory — MINUS the
-    /// parent's current directory, which this crate refuses to search at all (see `cwd`'s own
-    /// doc and the module doc above). That framing is what makes prepending these directories
-    /// provably monotonic rather than just "probably fine": the old, unpatched order was app dir
-    /// -> cwd -> System32 -> Windows dir -> `PATH`; removing the cwd step is a strict narrowing,
-    /// but if this crate ALSO silently dropped the system-directory precedence over `PATH` — which
-    /// is exactly what happens if `system_dirs` is left empty for a route that has no
-    /// `executable()` set — that would be a strict WIDENING on that route: a user-writable
-    /// directory placed early on `PATH` (a dev toolchain install, an `%LOCALAPPDATA%\...\WindowsApps`
-    /// shim) would then shadow e.g. `System32\find.exe`, a new way to load the wrong binary that
-    /// the pre-patch code never had. The caller passes these in (rather than this module calling
-    /// `GetSystemDirectoryW`/`GetWindowsDirectoryW`/`current_exe` itself) so the rule stays
-    /// testable from a POSIX host, exactly like `windows` below.
+    /// On Windows, the production caller (`windows_raw::resolve::windows_system_dirs`) passes the
+    /// System32 directory, then the Windows directory — this field itself enforces no particular
+    /// order or content, only that whatever it holds is searched before `PATH`.
+    /// `CreateProcessW`'s own documented NULL-`lpApplicationName` search order has six steps: app
+    /// directory, current directory, System32, the 16-bit system directory, the Windows directory,
+    /// then `PATH`. This policy keeps `System32`, the Windows directory, and `PATH` itself
+    /// (searched after both, never dropped), and excludes the other three:
     ///
-    /// **The monotonicity argument above is stated against the NULL-`lpApplicationName`
-    /// baseline**, i.e. the route where `executable()` is unset and `CreateProcessW` did its own
-    /// search. It does not transfer wholesale to the `executable()` route, whose pre-patch order
-    /// was `base_cwd` -> `PATH` and which never consulted the app directory, `System32` or the
-    /// Windows directory at all. On that route the app directory is a NEW search source: a
-    /// consumer installed at `...\Programs\MyApp\myapp.exe` calling `executable("tool")` now
-    /// prefers `...\Programs\MyApp\tool.exe` over a `tool.exe` on `PATH`. Net-net that route
-    /// still narrows, because the cwd step it DID have is gone and the directory holding the
-    /// running image is not attacker-writable in any install worth defending — but it is a
-    /// behaviour change in both directions, not a pure narrowing, and saying otherwise would
-    /// overstate it.
+    /// - The 16-bit system directory is left out because Win32 exposes no function to obtain its
+    ///   path directly. This crate could in principle reconstruct it from the Windows directory
+    ///   plus the name `System` Microsoft gives it, but does not (see
+    ///   `windows_raw::resolve::get_windows_directory`'s doc for Microsoft's own wording and why
+    ///   not).
+    /// - The current directory and the app directory (the directory this process's own image
+    ///   loaded from) ARE queryable, and excluding both is a deliberate choice: each is a
+    ///   binary-planting vector, since where a process's current directory points, or where its own
+    ///   image sits (a per-user install, a portable zip-extracted copy, a build/test output
+    ///   directory), is not a fixed, vetted location the way `System32`/the Windows directory are —
+    ///   `CreateProcessW` searches both regardless; `std::process::Command` searches the app
+    ///   directory too, but — like this crate — not the current directory (a Rust-side hardening,
+    ///   not a Win32 default).
+    ///
+    /// Both exclusions narrow the search along a TRUST ordering this crate treats as a default,
+    /// not a proof that holds for every possible install: `System32` and the Windows directory are
+    /// treated as at least as trustworthy as an arbitrary current directory or app directory,
+    /// because on an ordinary install planting a file into either system directory takes
+    /// privileges an attacker confined to a process's own app directory or its current
+    /// directory does not have. `PATH` gets no such blanket trust — an early `PATH` entry can
+    /// itself be user-writable, exactly the risk the WIDENING paragraph below spells out — but this
+    /// policy still searches it, at the position `CreateProcessW` gives it, rather than dropping it
+    /// too. That default can be wrong in a specific, unusually locked-down install: a name present
+    /// in BOTH the current directory (or the app directory) and an early `PATH` entry, but absent
+    /// from `System32` and the Windows directory, resolves through the current/app directory under
+    /// `CreateProcessW`'s own order; under this policy it resolves via whatever `PATH` supplies
+    /// instead, which could in principle be a LESS trustworthy file than the current/app-directory
+    /// copy would have been in that specific install. What holds in every install, given the
+    /// production caller's `system_dirs` (this field itself enforces no particular content — a
+    /// caller that passes the app directory here, as the test suite does, gets exactly that
+    /// searched), is that this policy never lets an unvetted current or app directory pre-empt
+    /// `PATH`.
+    ///
+    /// `System32` and the Windows directory keep their precedence over `PATH` regardless: a caller
+    /// leaving `system_dirs` empty — dropping them too — would be a straightforward WIDENING, not a
+    /// narrowing, letting a user-writable directory placed early on `PATH` (a dev toolchain
+    /// install, an `%LOCALAPPDATA%\...\WindowsApps` shim) shadow e.g. `System32\find.exe`, a way to
+    /// load the wrong binary that `CreateProcessW`'s own order (`System32` ahead of `PATH`)
+    /// prevents. The caller passes these in (rather than this module calling
+    /// `GetSystemDirectoryW`/`GetWindowsDirectoryW` itself) so the rule stays testable from a POSIX
+    /// host, exactly like `windows` below.
     pub system_dirs: &'a [PathBuf],
     /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
     pub path_var: Option<&'a OsStr>,
@@ -943,12 +974,14 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             // read that caller cannot see.
             None => unreachable!("{:?} needs a base, and none was given", input.program),
         }],
-        // System directories precede `PATH` — never the cwd, which is deliberately absent from
-        // this list; see `ResolveInput::system_dirs`'s doc for why that ordering is what keeps
-        // this change a strict narrowing of the pre-patch `CreateProcessW` search rather than
-        // trading one hazard for another. Ignored outright off Windows: `system_dirs` is always
-        // empty there in practice, but the `input.windows` guard makes that a hard rule rather
-        // than a convention a future POSIX caller could violate by accident.
+        // `system_dirs` precedes `PATH`. The cwd is never read on this arm at all — a structural
+        // guarantee, not a property of `system_dirs`. The app directory is absent only because the
+        // production caller (`windows_system_dirs`) omits it from what it passes as `system_dirs`;
+        // this arm searches whatever the slice holds, as the app-directory positive-control test
+        // demonstrates. See `ResolveInput::system_dirs`'s doc for the full trust-ordering argument.
+        // Ignored outright off Windows: `system_dirs` is always empty there in practice, but the
+        // `input.windows` guard makes that a hard rule rather than a convention a future POSIX
+        // caller could violate by accident.
         Shape::BareName => {
             let mut dirs = if input.windows {
                 input.system_dirs.to_vec()

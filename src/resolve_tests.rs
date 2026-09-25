@@ -717,23 +717,13 @@ fn fixture_drive_relative_name_fails_closed() {
 
 // ── Windows system directories precede PATH for a bare name ─────────────────────────────
 //
-// No route may end up WORSE than it was on `main`, even where a different vulnerability on that
-// same route is being narrowed. Before this crate resolved anything, a `Command` routed to the
-// raw backend purely by `fd >= 3` (no `executable()` set) passed a NULL `lpApplicationName`, so
-// `CreateProcessW` ran its OWN documented search order: app dir -> parent cwd -> System32 ->
-// Windows dir -> PATH. This crate's fix to stop searching the parent cwd (a binary-planting
-// hazard: a fd-mapped decoy planted in a tempdir cwd must not be picked up — see
-// `bare_name_is_not_resolved_from_the_current_directory` above) is a strict narrowing of that
-// order. But the NAIVE way to implement "stop searching the cwd" is "search PATH only" — which
-// ALSO drops system-directory precedence, a change nobody asked for and a strict WIDENING on this
-// route: a user-writable directory placed early on PATH (a dev toolchain install, an
-// `%LOCALAPPDATA%\...\WindowsApps` shim) would then shadow e.g. `System32\find.exe`, a new way to
-// get the wrong binary that did not exist even in the pre-patch code. These four tests exercise
-// `ResolveInput::system_dirs` directly with `windows` forced explicitly true/false — never
-// `HOST_WINDOWS` — because the policy under test is Windows-only by definition and this module is
-// deliberately built to be exercised from any host; forcing the flag (rather than relying on the
-// host actually being Windows) is what makes these tests run in ordinary CI, not just the Windows
-// runner.
+// These four tests exercise `ResolveInput::system_dirs` directly: `System32`/the Windows
+// directory precede `PATH` for a bare name, on Windows only. They force `windows` explicitly
+// true/false — never `HOST_WINDOWS` — because the policy under test is Windows-only by definition
+// and this module is deliberately built to be exercised from any host; forcing the flag (rather
+// than relying on the host actually being Windows) is what makes these tests run in ordinary CI,
+// not just the Windows runner. `system_dirs` here is always a fabricated slice the caller
+// controls, so these tests do not depend on real system directories existing.
 
 #[test]
 fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {

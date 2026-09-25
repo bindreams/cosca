@@ -196,21 +196,53 @@ impl Command {
     /// `executable` is resolved with a deliberate rule (not full `CreateProcessW`
     /// search parity): a name containing a path separator resolves against the
     /// working directory with no search, while a true bare name is looked up in the
-    /// system directories (the directory this process's own image loaded from,
-    /// `System32`, then the Windows directory) and then `PATH` — **never the current
-    /// directory**. That order, system directories before `PATH`, is deliberate: it is
-    /// `CreateProcessW`'s own documented search order with the current directory cut
-    /// out, not a fresh rule, so a directory placed early on `PATH` (a dev toolchain
-    /// install, a per-user app shim) still cannot shadow e.g. `System32\find.exe`.
-    /// Searching the current directory first is a binary-planting hazard: `executable("helper")`
-    /// would load a `helper.exe` dropped in whatever directory the process happened to sit in.
-    /// Write `./helper` to reach it explicitly.
+    /// system directories (`System32`, then the Windows directory) and then `PATH` —
+    /// **never the app directory (the directory this process's own image loaded
+    /// from), and never the current directory**. That order, system directories
+    /// before `PATH`, is deliberate: it is `CreateProcessW`'s own documented search
+    /// order minus the app directory and the current directory (and the 16-bit
+    /// system directory — Microsoft's own reference says "There is no function
+    /// that obtains the path of this directory", so this crate cannot query it
+    /// either), not a fresh rule, so a directory placed early on `PATH` (a dev toolchain install, a
+    /// per-user app shim) still cannot shadow e.g. `System32\find.exe`. Searching the
+    /// app directory or the current directory is a binary-planting hazard:
+    /// `executable("helper")` would load a `helper.exe` dropped next to the running
+    /// program's own `.exe`, or in whatever directory the process is running in, or
+    /// the child is about to run in ([`current_dir`](Self::current_dir) when set) —
+    /// either way, a directory this crate's caller does not necessarily
+    /// control. This is a deliberate difference from `CreateProcessW`'s own
+    /// NULL-`lpApplicationName` search and from `std::process::Command`, both of
+    /// which search the app directory. This is a trust-ordering default, not a proof
+    /// it's strictly safer in every install: an install where the app/current
+    /// directory is locked down but an early `PATH` entry is not could in principle
+    /// see the opposite. Write `./helper` to reach the working directory
+    /// explicitly (the child's, via [`current_dir`](Self::current_dir) when set — see below), or
+    /// `std::env::current_exe()?.with_file_name("helper.exe")` to reach the app directory
+    /// explicitly.
     ///
-    /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a
-    /// descriptor >= 3 also routes an unelevated Windows spawn through the raw backend, so
-    /// `Command::new().arg("sub/helper").fd(3, ..)` is resolved by everything described here —
+    /// **The rule follows the BACKEND, not this setter.** A [`fd`](Self::fd) mapping a descriptor >= 3, or
+    /// [`raw_executable`](Self::raw_executable), also routes an unelevated Windows spawn through the raw
+    /// backend, so `Command::new().arg("sub/helper").fd(3, ..)` is resolved by everything described here —
     /// against the CHILD's working directory ([`current_dir`](Self::current_dir) when set) — even with no
-    /// `executable` set at all.
+    /// `executable` set at all. (`raw_executable` itself does not add a second bare-name search: its image is
+    /// completed rather than searched — see its own doc — so this rule has nothing to resolve for it; it
+    /// matters here only as a second way to land on the raw backend.) This is specific
+    /// to the raw backend: on Windows, [`elevate`](Self::elevate) ordinarily takes a different route
+    /// (`ShellExecuteEx`, not `CreateProcessW`) — except when the calling process is already elevated, where it
+    /// falls back to the same unelevated backends this doc otherwise describes: the raw `CreateProcessW`
+    /// backend when `executable` or `raw_executable` is set (an elevated spawn cannot map fd >= 3, so that
+    /// trigger is unavailable here), `std::process::Command` otherwise. Either way — `ShellExecuteEx`, or either
+    /// already-elevated fallback — `elevate()` refuses anything but a fully qualified `.exe`/`.com` before that
+    /// matters, so a bare or relative `executable` never reaches a search on the `elevate()` path at all. (On
+    /// POSIX, `elevate` goes through one of the POSIX elevation backends — `sudo`, `doas`, `run0`, `pkexec`,
+    /// `osascript` — none of which is `CreateProcessW`, so this rule, specific to Windows's raw backend, has
+    /// nothing to resolve there either.)
+    ///
+    /// **An UNELEVATED spawn that reaches neither trigger — no `executable`/`raw_executable`, no `fd` mapping a
+    /// descriptor >= 3 — stays on the DEFAULT Windows backend, `std::process::Command`, and none
+    /// of this applies.** `Command::new().arg("helper").spawn()` alone does not route through the
+    /// raw backend, so it is resolved by `std::process::Command` itself, which — unlike the rule
+    /// above — DOES search the app directory.
     ///
     /// The directory resolved against is the one the child runs in. `current_dir`, or this
     /// process's cwd when none is set, is read once and handed to `CreateProcessW` completed, so a

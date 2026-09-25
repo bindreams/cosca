@@ -365,59 +365,174 @@ fn clear_only_yields_empty_double_nul_block() {
 //
 // The core ordering policy is pinned host-independently in `crate::resolve_tests` (it takes
 // `system_dirs` as fabricated `PathBuf`s, by design, so it can run without Windows at all). These
-// two tests instead exercise the REAL `GetSystemDirectoryW`/`GetWindowsDirectoryW`/`current_exe`
-// wiring in `windows_system_dirs` — the one part of this fix a cross-compile cannot validate,
-// because `cargo xwin check`/`clippy` only prove the code TYPE-CHECKS for Windows, never that it
-// runs correctly there. What a real runner catches here is a wrong Win32 return-value convention
-// and `System32` not being where this crate assumes it is.
+// tests instead exercise the REAL `GetSystemDirectoryW`/`GetWindowsDirectoryW` wiring in
+// `windows_system_dirs` — the one part of this policy a cross-compile cannot validate, because
+// `cargo xwin check`/`clippy` only prove the code TYPE-CHECKS for Windows, never that it runs
+// correctly there. What a real runner catches here is a wrong Win32 return-value convention and
+// `System32` not being where this crate assumes it is — plus, below, that the app directory
+// really is excluded end to end, not merely absent from a doc comment.
 //
-// NOT `wide_dir_buffer`'s grow loop: `System32` and the Windows directory fit the initial
+// NOT `grow_wide_buffer`'s grow loop: `System32` and the Windows directory fit the initial
 // 260-element buffer on every install, so the loop never runs and no test on any host reaches it.
 // Its own `debug_assert!` and the `.max(buf.len() + 1)` that keeps it from spinning are what
 // stand in for coverage there.
 #[test]
 fn windows_system_dirs_are_real_existing_directories() {
-    let dirs = windows_system_dirs();
+    let dirs = windows_system_dirs().unwrap();
     for dir in &dirs {
         assert!(dir.is_dir(), "{dir:?} is not a real, existing directory");
     }
 
-    // Exercise all THREE individual sources by calling each private accessor directly, not just
-    // the aggregate: a bound like `dirs.len() >= 2` survives deleting EITHER the `app_dir()` or
-    // the `get_windows_directory()` line from `windows_system_dirs`, even though this test's own
-    // preamble claims to cover all three. All three should resolve
-    // under the test runner on a real Windows runner, so each is asserted present outright rather
-    // than loosely.
-    let app = app_dir();
+    // Call each private accessor directly, not just the aggregate: the exact-list assertion below
+    // needs their individual return values to compare `dirs` against, and asserting each is
+    // `Ok` here — rather than folding that into the comparison — gives a query failure its own
+    // specific message instead of surfacing as a generic list mismatch.
     let sys32 = get_system_directory();
     let win = get_windows_directory();
     assert!(
-        app.is_some(),
-        "current_exe()'s parent should resolve under the test runner"
+        sys32.is_ok(),
+        "GetSystemDirectoryW should succeed under the test runner, got {sys32:?}"
     );
     assert!(
-        sys32.is_some(),
-        "GetSystemDirectoryW should succeed under the test runner"
+        win.is_ok(),
+        "GetWindowsDirectoryW should succeed under the test runner, got {win:?}"
     );
-    assert!(
-        win.is_some(),
-        "GetWindowsDirectoryW should succeed under the test runner"
-    );
-    let (app, sys32, win) = (app.unwrap(), sys32.unwrap(), win.unwrap());
-    assert!(dirs.contains(&app), "app dir {app:?} missing from {dirs:?}");
-    assert!(dirs.contains(&sys32), "System32 {sys32:?} missing from {dirs:?}");
-    assert!(dirs.contains(&win), "Windows dir {win:?} missing from {dirs:?}");
+    let (sys32, win) = (sys32.unwrap(), win.unwrap());
 
-    // Pin the ORDER too: app dir -> System32 -> Windows dir is the policy both
-    // `crate::resolve::ResolveInput::system_dirs` and the public `executable()` doc state — all
-    // three being merely PRESENT, in any order, would still let a widening regression (system-dir
-    // precedence over PATH silently reshuffled) through undetected.
-    let pos = |d: &PathBuf| dirs.iter().position(|x| x == d).unwrap();
-    let (app_pos, sys32_pos, win_pos) = (pos(&app), pos(&sys32), pos(&win));
-    assert!(
-        app_pos < sys32_pos && sys32_pos < win_pos,
-        "expected app dir < System32 < Windows dir, got positions {app_pos}, {sys32_pos}, {win_pos} in {dirs:?}"
+    // The list is EXACTLY [System32, Windows dir], in that order, and nothing else. A
+    // merely-`contains` assertion would pass even with a stray extra entry present; pinning
+    // the full, exact list is what catches that.
+    assert_eq!(
+        dirs,
+        vec![sys32, win],
+        "expected exactly [System32, Windows dir], got {dirs:?}"
     );
+
+    // The exact-list pin above only compares against `get_system_directory`/`get_windows_directory`
+    // themselves, so it cannot catch either of THOSE accessors wrongly returning the app directory.
+    // Check independently, against `current_exe()` directly: never the app directory (this crate
+    // treats it as a planting vector and must not search it) — see also
+    // `the_app_directory_is_not_searched` below, which proves this end to end through
+    // `resolve_executable`.
+    let app_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    assert!(
+        !dirs.contains(&app_dir),
+        "windows_system_dirs must never include the app directory {app_dir:?}, got {dirs:?}"
+    );
+}
+
+/// A `GetSystemDirectoryW`/`GetWindowsDirectoryW`-shaped call reporting failure (`0`, its only
+/// "give up" signal — see `grow_wide_buffer`'s doc) is not silently dropped: `query_wide_dir`
+/// propagates it as an `Err` naming which API failed. `windows_system_dirs` then fails the whole
+/// resolution on that `Err` rather than dropping the directory and letting `PATH` shadow it — see
+/// `windows_system_dirs`'s doc for why a silent drop would be a WIDENING this module treats as no
+/// more acceptable than a deliberate one. No real Win32 failure is needed to exercise this:
+/// `query_wide_dir` takes the Win32 call as a closure, so a fake one that always reports failure
+/// exercises the exact propagation path `get_system_directory`/`get_windows_directory` rely on, on
+/// any host that compiles this module.
+#[test]
+fn a_system_directory_query_failure_is_not_silently_dropped() {
+    let err = query_wide_dir("GetSystemDirectoryW", |_buf| 0).unwrap_err();
+    let msg = match err {
+        Error::Io(e) => e.to_string(),
+        other => panic!("expected Io, got {other:?}"),
+    };
+    assert!(
+        msg.contains("GetSystemDirectoryW"),
+        "the error should name which query failed: {msg:?}"
+    );
+}
+
+/// A copy of this test binary planted directly in the app directory
+/// (`std::env::current_exe()`'s parent), under a name unique per call. Built on
+/// [`tempfile::NamedTempFile`] rather than a hand-picked name: `tempfile_in` creates the file
+/// atomically (`O_EXCL`-equivalent) with a random name, so two of these racing in the same
+/// directory — two `cargo nextest run` test-binary processes sharing one `target/.../deps`
+/// build-output directory (default-feature and `--features tokio` builds, or overlapping CI jobs)
+/// — can never collide on a name or on each other's copy/delete, and a copy that fails partway or
+/// a test that panics mid-body still gets cleaned up by the same `Drop`.
+struct PlantedInAppDir(tempfile::NamedTempFile);
+
+impl PlantedInAppDir {
+    fn new(prefix: &str) -> Self {
+        let app_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let mut file = tempfile::Builder::new()
+            .prefix(prefix)
+            .suffix(".exe")
+            .tempfile_in(&app_dir)
+            .unwrap();
+        let mut src = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        std::io::copy(&mut src, file.as_file_mut()).unwrap();
+        PlantedInAppDir(file)
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.0.path().parent().unwrap().to_path_buf()
+    }
+
+    fn file_stem(&self) -> String {
+        self.0.path().file_stem().unwrap().to_str().unwrap().to_owned()
+    }
+}
+
+/// The app directory — the directory THIS test binary's own image loaded from — is not searched
+/// for a bare name (see `crate::resolve::ResolveInput::system_dirs`'s doc for why), even though
+/// `CreateProcessW`'s own NULL-`lpApplicationName` search visits it first. A copy of this very
+/// test binary is planted directly in `current_exe()`'s parent under a name that exists nowhere
+/// else — not on the `PATH` passed below, not in System32 or the Windows directory — so any
+/// resolution of it could only have come from the app directory.
+///
+/// Control A and the final miss pass an explicit empty-tempdir `PATH` rather than `None`, so the
+/// `PATH` step still runs (an empty `PATH` step and a skipped one are the same outcome here, but
+/// exercising the real step is the more faithful test). It must be an EMPTY tempdir, not the real
+/// ambient `PATH` this process was launched with: cargo and nextest put the `target/.../deps`
+/// directory itself, where the planted file lives, on the ambient `PATH` on Windows (it is the
+/// dylib search path), which would let an accidentally-real `PATH` satisfy the search on its own
+/// and mask a regression in the app-directory step. (`resolve_executable`/`resolve_executable_in`
+/// never read the ambient `PATH` themselves — this is about not accidentally FEEDING it to them.)
+/// Control B deliberately puts the app directory ON that `PATH` instead, the one place in this
+/// test it is supposed to be found.
+#[test]
+fn the_app_directory_is_not_searched() {
+    let planted = PlantedInAppDir::new("sp_appdir_decoy");
+    let name = planted.file_stem();
+    let base = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    // Positive control A, via `resolve_executable_in` directly: the decoy DOES resolve when its
+    // own directory is listed in `system_dirs` — proving a miss below is really about the app
+    // directory being excluded, not an unrelated naming, extension or plumbing mistake that would
+    // make the decoy unresolvable everywhere.
+    let with_app_dir_searched = resolve_executable_in(
+        Path::new(&name),
+        Some(base.path()),
+        std::slice::from_ref(&planted.dir()),
+        Some(empty_path.path().as_os_str()),
+        false,
+    );
+    assert_eq!(
+        with_app_dir_searched.unwrap().canonicalize().unwrap(),
+        planted.0.path().canonicalize().unwrap()
+    );
+
+    // Positive control B, via the REAL entry point `resolve_executable`: the decoy DOES resolve
+    // when its directory is on `PATH` instead. Control A alone would still pass if
+    // `resolve_executable` itself were broken and returned `NotFound` unconditionally — this rules
+    // that out by proving `resolve_executable`'s own plumbing can find the decoy when nothing
+    // excludes it, before the miss below claims that a specific exclusion is why it fails.
+    let app_dir_as_path = planted.dir().into_os_string();
+    let with_app_dir_on_path =
+        resolve_executable(Path::new(&name), Some(base.path()), Some(app_dir_as_path.as_os_str()));
+    assert_eq!(
+        with_app_dir_on_path.unwrap().canonicalize().unwrap(),
+        planted.0.path().canonicalize().unwrap()
+    );
+
+    // The real entry point again, this time with the app directory excluded as it is in
+    // production: `resolve_executable` calls `windows_system_dirs`, which — this test's whole
+    // point — never includes the app directory, and the app directory is not on `PATH` either.
+    let got = resolve_executable(Path::new(&name), Some(base.path()), Some(empty_path.path().as_os_str()));
+    assert_not_found(got);
 }
 
 #[test]
@@ -426,7 +541,7 @@ fn resolve_finds_a_real_system32_binary_through_system_dirs() {
     // a dev machine's `PATH`, so successfully resolving the BARE name "notepad" with an empty
     // `PATH` can only have come from `system_dirs` — proving the real wiring end to end, not just
     // that `windows_system_dirs()` returns plausible-looking paths.
-    let dirs = windows_system_dirs();
+    let dirs = windows_system_dirs().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let got = resolve_executable_in(std::path::Path::new("notepad"), Some(cwd.path()), &dirs, None, false).unwrap();
     assert!(got.to_string_lossy().to_lowercase().contains("system32"), "{got:?}");
