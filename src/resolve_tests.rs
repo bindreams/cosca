@@ -59,7 +59,7 @@ fn go(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::Path
     resolve(ResolveInput {
         program: Path::new(program),
         cwd: Some(cwd),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: path,
         windows: HOST_WINDOWS,
         loadable_only: false,
@@ -388,7 +388,7 @@ fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::p
     resolve(ResolveInput {
         program: Path::new(program),
         cwd: Some(cwd),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: path,
         windows: true,
         loadable_only: false,
@@ -722,8 +722,8 @@ fn fixture_drive_relative_name_fails_closed() {
 // true/false — never `HOST_WINDOWS` — because the policy under test is Windows-only by definition
 // and this module is deliberately built to be exercised from any host; forcing the flag (rather
 // than relying on the host actually being Windows) is what makes these tests run in ordinary CI,
-// not just the Windows runner. `system_dirs` here is always a fabricated slice the caller
-// controls, so these tests do not depend on real system directories existing.
+// not just the Windows runner. `system_dirs` here always calls back into a fabricated closure the
+// test controls, so these tests do not depend on real system directories existing.
 
 #[test]
 fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
@@ -743,11 +743,12 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
     let want = touch(sysdir.path(), "tool.exe");
     touch(pathdir.path(), "tool.exe"); // PATH decoy: same name, must lose to the system dir.
     let system_dirs = [sysdir.path().to_path_buf()];
+    let system_dirs_fn = || -> Result<Vec<PathBuf>, Error> { Ok(system_dirs.to_vec()) };
     let path = path_var_for(&[pathdir.path()], true);
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: Some(cwd.path()),
-        system_dirs: &system_dirs,
+        system_dirs: &system_dirs_fn,
         path_var: Some(&path),
         windows: true,
         loadable_only: false,
@@ -768,11 +769,12 @@ fn bare_name_only_on_path_still_resolves_from_path() {
     let pathdir = tempfile::tempdir().unwrap();
     let want = touch(pathdir.path(), "tool.exe"); // forced windows: true below -> only "tool.exe" is tried
     let system_dirs = [sysdir.path().to_path_buf()];
+    let system_dirs_fn = || -> Result<Vec<PathBuf>, Error> { Ok(system_dirs.to_vec()) };
     let path = path_var_for(&[pathdir.path()], true);
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: Some(cwd.path()),
-        system_dirs: &system_dirs,
+        system_dirs: &system_dirs_fn,
         path_var: Some(&path),
         windows: true,
         loadable_only: false,
@@ -784,13 +786,14 @@ fn bare_name_only_on_path_still_resolves_from_path() {
 
 #[test]
 fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
-    // Every test in this file predating this fix calls `go()`, which passes `system_dirs: &[]`
-    // (see `go`'s definition above). That is only a safe default if an empty slice is truly a
-    // no-op — otherwise those tests would have silently stopped meaning what their own doc
-    // comments say the day this field was added, without a single one of them failing to notice.
-    // This test pins the no-op directly: positive control resolves via PATH exactly as
-    // `bare_name_resolves_from_path` above expects, and the negative control (nothing anywhere)
-    // still fails closed exactly as `bare_name_is_not_resolved_from_the_current_directory` expects.
+    // Every test in this file predating this fix calls `go()`, which passes
+    // `system_dirs: &no_system_dirs` (see `go`'s definition above). That is only a safe default if
+    // returning no directories is truly a no-op — otherwise those tests would have silently
+    // stopped meaning what their own doc comments say the day this field was added, without a
+    // single one of them failing to notice. This test pins the no-op directly: positive control
+    // resolves via PATH exactly as `bare_name_resolves_from_path` above expects, and the negative
+    // control (nothing anywhere) still fails closed exactly as
+    // `bare_name_is_not_resolved_from_the_current_directory` expects.
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     let want = touch(bin.path(), "tool.exe"); // forced windows: true below -> only "tool.exe" is tried
@@ -798,7 +801,7 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: Some(cwd.path()),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: Some(&path),
         windows: true,
         loadable_only: false,
@@ -808,11 +811,11 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 
     // Negative control: nothing on PATH and an empty system_dirs must still fail closed, not
-    // silently succeed by, say, treating an empty slice as "search the cwd instead".
+    // silently succeed by, say, treating "no system directories" as "search the cwd instead".
     let miss = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: Some(cwd.path()),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: true,
         loadable_only: false,
@@ -828,25 +831,90 @@ fn posix_ignores_system_dirs_entirely() {
     // system-directory step at all, so consulting `system_dirs` off Windows would fabricate a
     // search step POSIX resolution never had, which is a widening with no upstream justification
     // (and directly contradicts this module's own POSIX-coverage doc). Gating on `input.windows`
-    // itself — rather than trusting every POSIX caller to always pass an empty slice — is what
-    // makes that impossible even if a future POSIX caller passes a non-empty `system_dirs` by
-    // mistake. The system dir here genuinely contains a matching, executable file: if the guard
-    // were ever weakened to "non-empty implies consult it", this test starts passing where it
-    // should keep failing, and that flip is exactly what it exists to catch.
+    // itself — rather than trusting every POSIX caller to always return no directories — is what
+    // makes that impossible even if a future POSIX caller's `system_dirs` closure would return a
+    // non-empty answer. The system dir here genuinely contains a matching, executable file: if the
+    // guard were ever weakened to call the closure regardless of `windows`, this test starts
+    // panicking from inside the closure instead of passing, and that flip is exactly what it
+    // exists to catch.
     let cwd = tempfile::tempdir().unwrap();
     let sysdir = tempfile::tempdir().unwrap();
     touch(sysdir.path(), "tool");
     let system_dirs = [sysdir.path().to_path_buf()];
+    // Panics, rather than merely returning the (non-empty, matching) directory, if the `windows`
+    // guard is ever weakened to call this off Windows: a call that returned the real answer would
+    // pass silently and defeat the point of this test.
+    let system_dirs_fn = || -> Result<Vec<PathBuf>, Error> {
+        panic!("system_dirs must not be queried when windows is false: {system_dirs:?}")
+    };
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: Some(cwd.path()),
-        system_dirs: &system_dirs,
+        system_dirs: &system_dirs_fn,
         path_var: None,
         windows: false,
         loadable_only: false,
         normalise: &as_written,
     });
     assert_not_found("tool", got);
+}
+
+#[test]
+fn a_located_name_still_resolves_when_the_system_dirs_query_fails() {
+    // `system_dirs` is called only from the `BareName` arm (see `ResolveInput::system_dirs`'s own
+    // doc), after every shape refusal above it has already passed — a `Located` name (one
+    // containing a separator) never reaches that arm at all. So a query that CAN fail (the
+    // production caller reaches the OS; see `windows_raw::resolve::windows_system_dirs`) must not
+    // be able to break resolving one. Panics, rather than returning `Err`, if `system_dirs` is ever
+    // called here: a call that happened to return `Err` and got silently absorbed would pass this
+    // test and defeat the point of it.
+    let cwd = tempfile::tempdir().unwrap();
+    let want = touch(cwd.path(), "myapp");
+    let system_dirs_fn =
+        || -> Result<Vec<PathBuf>, Error> { panic!("system_dirs must not be queried for a Located name") };
+    let got = resolve(ResolveInput {
+        program: Path::new("./myapp"),
+        cwd: Some(cwd.path()),
+        system_dirs: &system_dirs_fn,
+        path_var: None,
+        windows: true,
+        loadable_only: false,
+        normalise: &as_written,
+    })
+    .unwrap();
+    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+}
+
+#[test]
+fn a_bare_name_fails_closed_when_the_system_dirs_query_fails() {
+    // The mirror image of the test above: a TRUE bare name (no separator) does reach the
+    // `BareName` arm, so a failing `system_dirs` query must fail the whole resolution — the
+    // specific error the query returns, not a silent fall-through to `PATH` (which would be the
+    // same accidental widening `ResolveInput::system_dirs`'s doc describes for a `system_dirs` that
+    // returns no directories on purpose) and not a generic `NotFound` that discards which query
+    // failed and why. A matching file sits on `PATH` so a pass here could only come from swallowing
+    // the error and searching `PATH` anyway, not from an honest miss.
+    let cwd = tempfile::tempdir().unwrap();
+    let pathdir = tempfile::tempdir().unwrap();
+    touch(pathdir.path(), "tool.exe");
+    let path = path_var_for(&[pathdir.path()], true);
+    let system_dirs_fn =
+        || -> Result<Vec<PathBuf>, Error> { Err(Error::Io(std::io::Error::other("system_dirs query failed"))) };
+    let got = resolve(ResolveInput {
+        program: Path::new("tool"),
+        cwd: Some(cwd.path()),
+        system_dirs: &system_dirs_fn,
+        path_var: Some(&path),
+        windows: true,
+        loadable_only: false,
+        normalise: &as_written,
+    });
+    match got {
+        Err(Error::Io(e)) => {
+            assert_eq!(e.to_string(), "system_dirs query failed", "{e}");
+        }
+        other => panic!("expected the system_dirs error to propagate verbatim, got {other:?}"),
+    }
 }
 
 // ── the located axis does not search, and a miss is NotFound ─────────────────────────

@@ -18,7 +18,7 @@ fn go(program: &str, cwd: &Path, path_var: Option<&OsStr>, loadable_only: bool) 
     resolve(ResolveInput {
         program: Path::new(program),
         cwd: Some(cwd),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var,
         windows: true,
         loadable_only,

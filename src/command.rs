@@ -212,10 +212,7 @@ impl Command {
     /// either way, a directory this crate's caller does not necessarily
     /// control. This is a deliberate difference from `CreateProcessW`'s own
     /// NULL-`lpApplicationName` search and from `std::process::Command`, both of
-    /// which search the app directory. This is a trust-ordering default, not a proof
-    /// it's strictly safer in every install: an install where the app/current
-    /// directory is locked down but an early `PATH` entry is not could in principle
-    /// see the opposite. Write `./helper` to reach the working directory
+    /// which search the app directory. Write `./helper` to reach the working directory
     /// explicitly (the child's, via [`current_dir`](Self::current_dir) when set — see below), or
     /// `std::env::current_exe()?.with_file_name("helper.exe")` to reach the app directory
     /// explicitly.

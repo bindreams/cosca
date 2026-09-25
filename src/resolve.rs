@@ -38,8 +38,8 @@
 //! joined candidate that is not fully qualified, so a relative `PATH` element (which would resolve
 //! against this process's cwd if followed) never produces a match. And, in practice, never the app
 //! directory (the directory this process's own image loaded from) either: `system_dirs` is an
-//! arbitrary caller-supplied slice, so this module CAN be handed the app directory (the test suite
-//! does exactly that as a positive control), but the one production caller,
+//! arbitrary caller-supplied closure, so this module CAN be handed the app directory (the test
+//! suite does exactly that as a positive control), but the one production caller,
 //! `windows_raw::resolve::windows_system_dirs`, never includes it. `system_dirs` is likewise taken
 //! as a parameter rather than queried from the OS here, for the
 //! same host-independence reason; see its doc for what it contains and why it precedes `PATH`.
@@ -84,8 +84,13 @@ pub(crate) struct ResolveInput<'a> {
     /// `None` is allowed only for a name [`needs_base`] says needs none, which then reads nothing;
     /// for any other name it is a contract violation and panics.
     pub cwd: Option<&'a Path>,
-    /// Directories searched for a bare name BEFORE `PATH`, in order. Ignored entirely when
-    /// `windows` is `false` — POSIX has no analogous search order to preserve.
+    /// Directories searched for a bare name BEFORE `PATH`, in order, queried lazily: called at
+    /// most once, and only from the `Shape::BareName` arm of [`resolve`] — after every shape
+    /// refusal above it has already passed. A `Located` or absolute name never calls it at all, so
+    /// a query that can fail (the production caller reaches the OS; see
+    /// `windows_raw::resolve::windows_system_dirs`) cannot break resolution of a name that was
+    /// never going to consult it. Ignored entirely when `windows` is `false` — POSIX has no
+    /// analogous search order to preserve.
     ///
     /// On Windows, the production caller (`windows_raw::resolve::windows_system_dirs`) passes the
     /// System32 directory, then the Windows directory — this field itself enforces no particular
@@ -123,20 +128,18 @@ pub(crate) struct ResolveInput<'a> {
     /// `CreateProcessW`'s own order; under this policy it resolves via whatever `PATH` supplies
     /// instead, which could in principle be a LESS trustworthy file than the current/app-directory
     /// copy would have been in that specific install. What holds in every install, given the
-    /// production caller's `system_dirs` (this field itself enforces no particular content — a
-    /// caller that passes the app directory here, as the test suite does, gets exactly that
-    /// searched), is that this policy never lets an unvetted current or app directory pre-empt
-    /// `PATH`.
+    /// production caller's `system_dirs`, is that this policy never lets an unvetted current or
+    /// app directory pre-empt `PATH`.
     ///
     /// `System32` and the Windows directory keep their precedence over `PATH` regardless: a caller
     /// leaving `system_dirs` empty — dropping them too — would be a straightforward WIDENING, not a
     /// narrowing, letting a user-writable directory placed early on `PATH` (a dev toolchain
     /// install, an `%LOCALAPPDATA%\...\WindowsApps` shim) shadow e.g. `System32\find.exe`, a way to
     /// load the wrong binary that `CreateProcessW`'s own order (`System32` ahead of `PATH`)
-    /// prevents. The caller passes these in (rather than this module calling
+    /// prevents. The caller supplies this closure (rather than this module calling
     /// `GetSystemDirectoryW`/`GetWindowsDirectoryW` itself) so the rule stays testable from a POSIX
     /// host, exactly like `windows` below.
-    pub system_dirs: &'a [PathBuf],
+    pub system_dirs: &'a dyn Fn() -> Result<Vec<PathBuf>, Error>,
     /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
     pub path_var: Option<&'a OsStr>,
     /// Apply Windows rules: `;` separated `PATH`, `\` a separator, drive prefixes, the `.exe` rule.
@@ -167,6 +170,12 @@ pub(crate) struct ResolveInput<'a> {
 #[cfg(test)]
 pub(crate) fn as_written(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.to_path_buf())
+}
+
+/// [`ResolveInput::system_dirs`] for a test with no system directories to search — `PATH` only.
+#[cfg(test)]
+pub(crate) fn no_system_dirs() -> Result<Vec<PathBuf>, Error> {
+    Ok(Vec::new())
 }
 
 /// How the program names its file, which decides whether `PATH` (and, on Windows,
@@ -974,17 +983,20 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             // read that caller cannot see.
             None => unreachable!("{:?} needs a base, and none was given", input.program),
         }],
-        // `system_dirs` precedes `PATH`. The cwd is never read on this arm at all — a structural
-        // guarantee, not a property of `system_dirs`. The app directory is absent only because the
-        // production caller (`windows_system_dirs`) omits it from what it passes as `system_dirs`;
-        // this arm searches whatever the slice holds, as the app-directory positive-control test
-        // demonstrates. See `ResolveInput::system_dirs`'s doc for the full trust-ordering argument.
-        // Ignored outright off Windows: `system_dirs` is always empty there in practice, but the
-        // `input.windows` guard makes that a hard rule rather than a convention a future POSIX
-        // caller could violate by accident.
+        // `system_dirs` precedes `PATH`, and is called HERE — the one place in `resolve` that
+        // invokes it — so a query that can fail is only ever reached once every shape refusal above
+        // has already passed and the name is confirmed bare; a `Located` or absolute name returns
+        // through one of the arms above without calling it at all. The cwd is never read on this
+        // arm at all — a structural guarantee, not a property of `system_dirs`. The app directory is
+        // absent only because the production caller (`windows_system_dirs`) omits it from what it
+        // returns; this arm searches whatever the closure returns, as the app-directory
+        // positive-control test demonstrates. See `ResolveInput::system_dirs`'s doc for the full
+        // trust-ordering argument. Ignored outright off Windows: `system_dirs` is never called there
+        // in practice, but the `input.windows` guard makes that a hard rule rather than a convention
+        // a future POSIX caller could violate by accident.
         Shape::BareName => {
             let mut dirs = if input.windows {
-                input.system_dirs.to_vec()
+                (input.system_dirs)()?
             } else {
                 Vec::new()
             };

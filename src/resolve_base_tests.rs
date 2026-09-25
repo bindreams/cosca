@@ -60,7 +60,7 @@ fn an_absolute_name_needs_no_base() {
     let got = resolve(ResolveInput {
         program: &tool,
         cwd: None,
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: cfg!(windows),
         loadable_only: false,
@@ -84,7 +84,7 @@ fn a_bare_name_needs_no_base() {
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: None,
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: Some(dir.path().as_os_str()),
         windows: cfg!(windows),
         loadable_only: false,
@@ -108,7 +108,7 @@ fn a_unc_shaped_name_with_no_share_is_refused() {
         let got = resolve(ResolveInput {
             program: Path::new(name),
             cwd: None,
-            system_dirs: &[],
+            system_dirs: &no_system_dirs,
             path_var: None,
             windows: true,
             loadable_only: false,
@@ -200,7 +200,7 @@ fn a_digit_drive_is_drive_relative_everywhere() {
     let got = resolve(ResolveInput {
         program: Path::new(name),
         cwd: None,
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: true,
         loadable_only: false,
@@ -228,7 +228,7 @@ fn a_located_name_without_a_base_is_a_contract_violation() {
     let _ = resolve(ResolveInput {
         program: Path::new("sub/tool"),
         cwd: None,
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: false,
         loadable_only: false,
@@ -322,7 +322,7 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
     resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: None,
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: Some(path_var),
         windows: true,
         loadable_only,
@@ -406,7 +406,7 @@ fn a_relative_windows_base_is_a_contract_violation() {
     let _ = resolve(ResolveInput {
         program: Path::new(r"sub\tool.exe"),
         cwd: Some(Path::new("rel")),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: true,
         loadable_only: false,
@@ -422,7 +422,7 @@ fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
     let _ = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: None,
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: false,
         loadable_only: true,
@@ -445,7 +445,7 @@ fn a_candidate_made_verbatim_by_its_base_is_normalised() {
     let got = resolve(ResolveInput {
         program: Path::new(r"sub.\tool.exe"),
         cwd: Some(Path::new(r"\\?\C:\d")),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: true,
         loadable_only: false,
@@ -467,7 +467,7 @@ fn a_candidate_made_verbatim_by_its_base_is_joined_as_written() {
     let _ = resolve(ResolveInput {
         program: Path::new(r"..\..\..\t.exe"),
         cwd: Some(Path::new(r"\\?\UNC\srv\shr\d")),
-        system_dirs: &[],
+        system_dirs: &no_system_dirs,
         path_var: None,
         windows: true,
         loadable_only: false,
@@ -484,7 +484,7 @@ fn a_rooted_name_on_a_verbatim_base_is_refused() {
         let got = resolve(ResolveInput {
             program: Path::new(r"\t.exe"),
             cwd: Some(Path::new(cwd)),
-            system_dirs: &[],
+            system_dirs: &no_system_dirs,
             path_var: None,
             windows: true,
             loadable_only: false,
@@ -508,7 +508,7 @@ fn only_a_verbatim_base_makes_a_candidate_normalised() {
         let got = resolve(ResolveInput {
             program: Path::new(program),
             cwd,
-            system_dirs: &[],
+            system_dirs: &no_system_dirs,
             path_var: None,
             windows: true,
             loadable_only: false,
@@ -527,10 +527,11 @@ fn only_a_verbatim_base_makes_a_candidate_normalised() {
 fn a_verbatim_search_directory_is_taken_as_written() {
     let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be normalised") };
     let system = [PathBuf::from(r"\\?\C:\a\..\b")];
+    let system_fn = || -> Result<Vec<PathBuf>, Error> { Ok(system.to_vec()) };
     let got = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: None,
-        system_dirs: &system,
+        system_dirs: &system_fn,
         path_var: Some(OsStr::new(r"\\?\C:\x\bin.")),
         windows: true,
         loadable_only: false,
@@ -565,7 +566,7 @@ fn a_normalised_candidate_that_names_no_file_is_refused() {
         let got = resolve(ResolveInput {
             program: Path::new(r"..\..\t.exe"),
             cwd: Some(Path::new(r"\\?\UNC\srv\shr\d")),
-            system_dirs: &[],
+            system_dirs: &no_system_dirs,
             path_var: None,
             windows: true,
             loadable_only: false,

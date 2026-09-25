@@ -11,7 +11,6 @@
 //! directory, the current directory, and the 16-bit system directory (Win32 provides no function to query it,
 //! and this crate does not reconstruct it — see [`get_windows_directory`]'s doc). The app directory and the
 //! current directory ARE queryable; see [`resolve_executable_in`]'s doc for why they are excluded anyway.
-//! `CreateProcessW` and `std::process::Command` both search the app directory.
 //! [`ChildEnv`] is the child's environment, captured once per spawn from an [`EnvSnapshot`] and a
 //! recorded [`EnvOp`] sequence; resolution reads its `PATH` and [`ChildEnv::into_block`] gives
 //! `CreateProcessW` its block.
@@ -44,7 +43,7 @@ use crate::error::Error;
 /// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
 /// promises — and no second read of this process's environment can disagree with the block.
 pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    resolve_executable_in(exe, base, &windows_system_dirs()?, path, false)
+    resolve_executable_in(exe, base, &windows_system_dirs, path, false)
 }
 
 /// A raw spawn's effective working directory: filled once per spawn, and the one value every later
@@ -117,14 +116,21 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// access, rather than inside `crate::resolve` itself, which is deliberately parameterised so its
 /// rules stay exercisable from a POSIX host.
 ///
-/// A step this process cannot determine fails the whole resolution, rather than being dropped and
-/// falling through to whatever is left: a failed `GetSystemDirectoryW` or `GetWindowsDirectoryW`
-/// call is returned to [`resolve_executable`]'s caller as a spawn error instead of letting
-/// resolution continue on the other directory, then `PATH`. This fails CLOSED, on purpose: it
-/// produces the same accidental widening [`crate::resolve::ResolveInput::system_dirs`]'s doc
-/// describes for a `system_dirs` left empty on purpose, so `windows_system_dirs` and its two
-/// accessors below all return the Win32 failure rather than discard it — an ordinary spawn error
-/// instead of a silent search-order change.
+/// This function is [`crate::resolve::ResolveInput::system_dirs`] itself — `resolve_executable`
+/// passes it, unevaluated, as that field's closure, so `crate::resolve::resolve` only calls it from
+/// its `BareName` arm, after every shape refusal has already passed. A `Located` or absolute name
+/// never reaches this call at all, so a failed Win32 query cannot break resolving one; see
+/// `a_located_name_still_resolves_when_the_system_dirs_query_fails` in `resolve_tests` for that
+/// proven end to end.
+///
+/// For a bare name, a step this process cannot determine fails that resolution, rather than being
+/// dropped and falling through to whatever is left: a failed `GetSystemDirectoryW` or
+/// `GetWindowsDirectoryW` call is returned to [`resolve_executable`]'s caller as a spawn error
+/// instead of letting resolution continue on the other directory, then `PATH`. This fails CLOSED,
+/// on purpose: it produces the same accidental widening [`crate::resolve::ResolveInput::system_dirs`]'s
+/// doc describes for a `system_dirs` returning no directories on purpose, so `windows_system_dirs`
+/// and its two accessors below all return the Win32 failure rather than discard it — an ordinary
+/// spawn error instead of a silent search-order change.
 fn windows_system_dirs() -> Result<Vec<PathBuf>, Error> {
     Ok(vec![get_system_directory()?, get_windows_directory()?])
 }
@@ -136,7 +142,15 @@ fn windows_system_dirs() -> Result<Vec<PathBuf>, Error> {
 fn get_system_directory() -> Result<PathBuf, Error> {
     // SAFETY: `GetSystemDirectoryW` writes into the given buffer, or reports the required length
     // via its return value when the buffer is too small; both are honoured by `grow_wide_buffer`.
-    query_wide_dir("GetSystemDirectoryW", |buf| unsafe { GetSystemDirectoryW(buf) })
+    get_system_directory_via(|buf| unsafe { GetSystemDirectoryW(buf) })
+}
+
+/// [`get_system_directory`] with the Win32 call injectable, so a test can force a failure through
+/// this exact function — the one `windows_system_dirs` actually calls — rather than through a
+/// re-typed copy of `"GetSystemDirectoryW"` that could drift from the literal above without either
+/// ever being run against the other.
+fn get_system_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
+    query_wide_dir("GetSystemDirectoryW", f)
 }
 
 /// The Windows directory — step 5 of `CreateProcessW`'s search order. Step 4, the 16-bit Windows
@@ -149,16 +163,26 @@ fn get_system_directory() -> Result<PathBuf, Error> {
 /// no accessor for.
 fn get_windows_directory() -> Result<PathBuf, Error> {
     // SAFETY: see `get_system_directory` — `GetWindowsDirectoryW` has the identical contract.
-    query_wide_dir("GetWindowsDirectoryW", |buf| unsafe { GetWindowsDirectoryW(buf) })
+    get_windows_directory_via(|buf| unsafe { GetWindowsDirectoryW(buf) })
+}
+
+/// [`get_windows_directory`] with the Win32 call injectable — see [`get_system_directory_via`].
+fn get_windows_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
+    query_wide_dir("GetWindowsDirectoryW", f)
 }
 
 /// Call a `GetXDirectoryW`-shaped Win32 function, growing the buffer until the directory fits, and
 /// naming `api` (e.g. `"GetSystemDirectoryW"`) in the error on failure — [`grow_wide_buffer`]'s own
 /// `std::io::Error` carries the OS's reason but not which of the two identically-shaped calls made
-/// it, and [`windows_system_dirs`] fails the whole resolution on either, so the error a caller sees
-/// needs to say which query failed.
+/// it, and a bare name's resolution fails on either (see [`windows_system_dirs`]'s doc), so the
+/// error a caller sees needs to say which query failed.
+///
+/// Wrapped through [`crate::error::io_context`] rather than a hand-rolled `std::io::Error::new` with
+/// a formatted message: that would fold the OS reason into a `String` and lose it, so a caller
+/// branching on `raw_os_error()` would see `None` instead of the real code. `io_context` keeps the
+/// original `std::io::Error` reachable via `.source()` instead.
 fn query_wide_dir(api: &str, f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
-    grow_wide_buffer(f).map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{api} failed: {e}"))))
+    grow_wide_buffer(f).map_err(|e| Error::Io(crate::error::io_context(format!("{api} failed"), e)))
 }
 
 /// The shared buffer-growth loop, preserving the Win32 failure reason.
@@ -543,16 +567,17 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 /// [`std::io::ErrorKind::NotFound`]; a name refused on its shape is
 /// [`std::io::ErrorKind::InvalidInput`], per [`crate::resolve`]'s error-kind rule.
 ///
-/// `system_dirs` is searched BEFORE `PATH`, in the order given; [`resolve_executable`] passes
-/// `System32`, then the Windows directory, i.e. `CreateProcessW`'s own NULL-`lpApplicationName`
-/// search order minus the app directory, the calling process's current directory (step 2), and the
-/// 16-bit system directory. `base_cwd` is not step 2, though it can be the same directory: it is
-/// the CHILD's working directory (the calling process's cwd only when no
+/// `system_dirs` is called, lazily and at most once, only once resolution reaches a true bare
+/// name — see [`crate::resolve::ResolveInput::system_dirs`] for exactly when — and searched
+/// BEFORE `PATH`, in the order it returns; [`resolve_executable`] passes `windows_system_dirs`,
+/// which queries `System32`, then the Windows directory: `CreateProcessW`'s own
+/// NULL-`lpApplicationName` search order minus the app directory, the calling process's current
+/// directory (step 2), and the 16-bit system directory. `base_cwd` is not step 2, though it can be
+/// the same directory: it is the CHILD's working directory (the calling process's cwd only when no
 /// [`current_dir`](crate::Command::current_dir) is set), and it is not searched for a bare name
-/// either, for the same reason. The app directory and the current directory are deliberately
-/// excluded as a trust-ordering default rather than a proven narrowing in every install: see
-/// [`crate::resolve::ResolveInput::system_dirs`] for the full argument. Pass an empty slice to
-/// search `PATH` only.
+/// either. The app directory and the current directory are deliberately excluded — see
+/// [`crate::resolve::ResolveInput::system_dirs`] for the full argument. Pass a closure returning an
+/// empty `Vec` to search `PATH` only.
 ///
 /// `loadable_only` is [`crate::resolve::ResolveInput::loadable_only`].
 ///
@@ -578,7 +603,7 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 pub(crate) fn resolve_executable_in(
     exe: &Path,
     base_cwd: Option<&Path>,
-    system_dirs: &[PathBuf],
+    system_dirs: &dyn Fn() -> Result<Vec<PathBuf>, Error>,
     path: Option<&OsStr>,
     loadable_only: bool,
 ) -> Result<PathBuf, Error> {

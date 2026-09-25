@@ -40,6 +40,12 @@ fn assert_not_found(got: Result<PathBuf, Error>) {
     }
 }
 
+/// [`resolve_executable_in`]'s `system_dirs` for a test with no system directories to search —
+/// `PATH` only.
+fn no_system_dirs() -> Result<Vec<PathBuf>, Error> {
+    Ok(Vec::new())
+}
+
 /// There is no "absolute and exists -> return unchanged" shortcut: an absolute path goes through
 /// the ordinary located path — one directory, the exact name tried first — and lands on the same
 /// answer by a different route.
@@ -66,7 +72,7 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
     assert_not_found(resolve_executable_in(
         std::path::Path::new("sp_shadow"),
         Some(dir.path()),
-        &[],
+        &no_system_dirs,
         None,
         false,
     ));
@@ -308,7 +314,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
     let got = resolve_executable_in(
         std::path::Path::new("sp_dirtool"),
         Some(base.path()),
-        &[],
+        &no_system_dirs,
         Some(joined.as_os_str()),
         false,
     )
@@ -329,7 +335,13 @@ fn resolve_absolute_directory_is_not_returned() {
     let sub = dir.path().join("sp_dir_shadow.exe");
     std::fs::create_dir(&sub).unwrap();
     // The base must be fully qualified; an absolute program never reads it.
-    assert_not_found(resolve_executable_in(&sub, Some(dir.path()), &[], None, false));
+    assert_not_found(resolve_executable_in(
+        &sub,
+        Some(dir.path()),
+        &no_system_dirs,
+        None,
+        false,
+    ));
 }
 #[test]
 fn path_wins_over_base_cwd_when_both_have_exe() {
@@ -345,7 +357,7 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
     let got = resolve_executable_in(
         std::path::Path::new("sp_pref"),
         Some(base.path()),
-        &[],
+        &no_system_dirs,
         Some(other.path().as_os_str()),
         false,
     )
@@ -443,6 +455,92 @@ fn a_system_directory_query_failure_is_not_silently_dropped() {
     );
 }
 
+/// [`get_system_directory_via`] is the exact function [`get_system_directory`] calls with the real
+/// Win32 closure — `windows_system_dirs`, `resolve_executable`'s real chain, reaches it through no
+/// other path. Forcing failure HERE, rather than through a re-typed `query_wide_dir("...", ...)`
+/// call, is what would catch `get_system_directory`/`get_windows_directory` accidentally swapping
+/// which literal API name they hand to `query_wide_dir`: asserting the OTHER api string is absent,
+/// not just that the right one is present, is what makes a swap fail this test instead of silently
+/// passing it (both queries fail identically, so a wrong name would still "contain an API name").
+#[test]
+fn get_system_directory_via_names_its_own_api_on_failure() {
+    let err = get_system_directory_via(|_buf| 0).unwrap_err();
+    let msg = match err {
+        Error::Io(e) => e.to_string(),
+        other => panic!("expected Io, got {other:?}"),
+    };
+    assert!(msg.contains("GetSystemDirectoryW"), "{msg:?}");
+    assert!(!msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+}
+
+/// The [`get_windows_directory_via`] mirror of
+/// [`get_system_directory_via_names_its_own_api_on_failure`] — see its doc.
+#[test]
+fn get_windows_directory_via_names_its_own_api_on_failure() {
+    let err = get_windows_directory_via(|_buf| 0).unwrap_err();
+    let msg = match err {
+        Error::Io(e) => e.to_string(),
+        other => panic!("expected Io, got {other:?}"),
+    };
+    assert!(msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+    assert!(!msg.contains("GetSystemDirectoryW"), "{msg:?}");
+}
+
+/// The real chain end to end, with only the Win32 call itself swapped for one that always fails:
+/// `get_system_directory_via`/`get_windows_directory_via` — the exact functions
+/// `get_system_directory`/`get_windows_directory` call, with only their real Win32 closure argument
+/// replaced — feed `resolve_executable_in`'s `system_dirs` closure directly, the same shape
+/// `windows_system_dirs` itself has. A bare name's resolution must surface the OS query's own
+/// error, naming which API failed, instead of silently falling through to `PATH` (which does have
+/// a matching file planted, so a pass here could only come from swallowing the failure).
+#[test]
+fn a_bare_name_fails_closed_naming_the_failed_api_through_the_real_chain() {
+    let pathdir = tempfile::tempdir().unwrap();
+    std::fs::write(pathdir.path().join("sp_realchain.exe"), b"x").unwrap();
+    let system_dirs_fn = || -> Result<Vec<PathBuf>, Error> { Ok(vec![get_system_directory_via(|_buf| 0)?]) };
+    let cwd = tempfile::tempdir().unwrap();
+    let err = resolve_executable_in(
+        std::path::Path::new("sp_realchain"),
+        Some(cwd.path()),
+        &system_dirs_fn,
+        Some(pathdir.path().as_os_str()),
+        false,
+    )
+    .unwrap_err();
+    let msg = match err {
+        Error::Io(e) => e.to_string(),
+        other => panic!("expected Io, got {other:?}"),
+    };
+    assert!(
+        msg.contains("GetSystemDirectoryW"),
+        "the error should name which query failed, and not have been swallowed in favor of \
+         searching PATH: {msg:?}"
+    );
+}
+
+/// [`query_wide_dir`] wraps the Win32 failure through [`crate::error::io_context`] rather than a
+/// hand-rolled message, specifically so the original `std::io::Error` — and its `raw_os_error()` —
+/// stays reachable one hop down via `.source()`, exactly as
+/// `crate::error_tests::io_context_keeps_the_os_error_as_its_source` pins for `io_context` itself.
+/// This test pins that the SAME guarantee survives all the way through `get_system_directory_via`,
+/// not just through `io_context` in isolation: a caller catching a specific OS error code (e.g. to
+/// distinguish "access denied" from "not found") must still be able to, after this wrap.
+#[test]
+fn get_system_directory_via_keeps_the_os_error_reachable() {
+    let code: u32 = 87; // ERROR_INVALID_PARAMETER
+                        // SAFETY: `SetLastError` only writes the calling thread's last-error slot.
+    unsafe { windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(code)) };
+    let err = get_system_directory_via(|_buf| 0).unwrap_err();
+    let io_err = match err {
+        Error::Io(e) => e,
+        other => panic!("expected Io, got {other:?}"),
+    };
+    let source = std::error::Error::source(io_err.get_ref().expect("a custom error"))
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the OS error is the source");
+    assert_eq!(source.raw_os_error(), Some(code as i32), "{source:?}");
+}
+
 /// A copy of this test binary planted directly in the app directory
 /// (`std::env::current_exe()`'s parent), under a name unique per call. Built on
 /// [`tempfile::NamedTempFile`] rather than a hand-picked name: `tempfile_in` creates the file
@@ -503,10 +601,11 @@ fn the_app_directory_is_not_searched() {
     // own directory is listed in `system_dirs` — proving a miss below is really about the app
     // directory being excluded, not an unrelated naming, extension or plumbing mistake that would
     // make the decoy unresolvable everywhere.
+    let app_dir_fn = || -> Result<Vec<PathBuf>, Error> { Ok(vec![planted.dir()]) };
     let with_app_dir_searched = resolve_executable_in(
         Path::new(&name),
         Some(base.path()),
-        std::slice::from_ref(&planted.dir()),
+        &app_dir_fn,
         Some(empty_path.path().as_os_str()),
         false,
     );
@@ -541,9 +640,15 @@ fn resolve_finds_a_real_system32_binary_through_system_dirs() {
     // a dev machine's `PATH`, so successfully resolving the BARE name "notepad" with an empty
     // `PATH` can only have come from `system_dirs` — proving the real wiring end to end, not just
     // that `windows_system_dirs()` returns plausible-looking paths.
-    let dirs = windows_system_dirs().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let got = resolve_executable_in(std::path::Path::new("notepad"), Some(cwd.path()), &dirs, None, false).unwrap();
+    let got = resolve_executable_in(
+        std::path::Path::new("notepad"),
+        Some(cwd.path()),
+        &windows_system_dirs,
+        None,
+        false,
+    )
+    .unwrap();
     assert!(got.to_string_lossy().to_lowercase().contains("system32"), "{got:?}");
 }
 
