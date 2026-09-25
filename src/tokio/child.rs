@@ -860,8 +860,10 @@ fn drop_own_piped_stdio(child: &mut ::tokio::process::Child) {
 /// for as long as it runs. Its one ownership check decides what becomes of it (see
 /// `crate::child::unreaped`): one that had exited is reaped; one whose check fails is released
 /// without a wait or tokio's `Drop`, and logged; one still running is returned with the kill's
-/// error, for the caller to hand back in [`Error::Unreaped`](crate::error::Error). Its own
-/// stdio handles are closed first: one the caller holds would keep a child waiting on it.
+/// error, for the caller to hand back in [`Error::Unreaped`](crate::error::Error) — retaining
+/// `attached`, if given, so the caller's own wait/leak/Drop decides the containment's fate
+/// instead of it tearing down here before the error even arrives (matching the elevated path).
+/// Its own stdio handles are closed first: one the caller holds would keep a child waiting on it.
 ///
 /// On Windows a `suspended` child — created `CREATE_SUSPENDED`, and not yet resumed by a
 /// successful attach — cannot exit on its own, so it is never handed back: a failed kill is
@@ -873,8 +875,9 @@ pub(crate) fn reap_now(
     pid: u32,
     done_ok: bool,
     #[cfg(windows)] suspended: bool,
+    attached: Option<crate::containment::Attached>,
 ) -> Option<(std::io::Error, crate::Unreaped)> {
-    use crate::child::unreaped::{Checked, Held};
+    use crate::child::unreaped::{Checked, Held, Retained};
     // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
     // whose argument is stripped in release). A no-op on an already-exited child.
     #[cfg(test)]
@@ -919,7 +922,13 @@ pub(crate) fn reap_now(
             }
             #[cfg(unix)]
             let _ = &mut held;
-            Some((kill, crate::Unreaped::new(held)))
+            // Retained, not dropped: matching `teardown_unadopted`'s sync twin, the caller that
+            // gets this child back decides the containment's fate (via `Unreaped`'s own
+            // wait/leak/Drop) rather than having it torn down before the error even arrives.
+            Some((
+                kill,
+                crate::Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
+            ))
         }
         // It had exited, which makes the kill's failure moot.
         Checked::Reaped => None,

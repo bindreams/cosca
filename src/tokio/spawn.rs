@@ -392,8 +392,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // never leaks a live (Windows: still CREATE_SUSPENDED) process.
         other => {
             // The verdict first: tokio owns this child, so the leaf must not answer for it as an
-            // abandoned spawn's, reaping a pid tokio's own reap is about to.
-            prepared.settle_verdict(pid);
+            // abandoned spawn's, reaping a pid tokio's own reap is about to. Retained (not
+            // dropped) when the verdict says the child was actually placed: otherwise `prepared`
+            // dropping here would cgroup.kill and drain-wait the tree before this error even
+            // returns — the caller's own `Unreaped` decides that instead (mirrors the
+            // attach-failure arm below, and the elevated path).
+            let attached = prepared.settle_verdict(pid);
             // Never awaited — an already-Done child is impossible.
             let handed_back = reap_now(
                 child,
@@ -401,6 +405,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 false,
                 #[cfg(windows)]
                 suspended,
+                attached,
             );
             return Err(unkillable(
                 crate::child::spawn::spawn_identity_error(other),
@@ -431,6 +436,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 false,
                 #[cfg(windows)]
                 suspended,
+                // The attach itself failed: nothing was ever attached to retain.
+                None,
             );
             return Err(unkillable(e, handed_back));
         }

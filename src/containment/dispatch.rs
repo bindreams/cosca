@@ -40,16 +40,42 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed while the caller still holds its child
     /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
-    /// never for the child the caller will reap. A no-op without a leaf, or once taken.
+    /// never for the child the caller will reap.
+    ///
+    /// Returns the leaf as `Attached::Cgroup`, for the caller to retain (exactly as `attach_tree`
+    /// itself would construct it on a successful placement), if — and only if — the verdict says
+    /// the child was actually placed in it. A `None`-placed or undecidable verdict is discarded:
+    /// `take_placement` has already dealt with the child in every branch that is not
+    /// `Ok(Ok(()))` (an undecidable verdict has already killed it; a negative one never put
+    /// anything of the child's in the leaf), so there is nothing left worth retaining. Also
+    /// `None` without a leaf, once its verdict is already taken, or on any other platform.
     #[cfg_attr(not(any(test, feature = "tokio")), allow(dead_code))]
-    pub(crate) fn settle_verdict(&mut self, pid: u32) {
+    #[must_use]
+    pub(crate) fn settle_verdict(&mut self, pid: u32) -> Option<Attached> {
         #[cfg(target_os = "linux")]
-        if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            // The spawn fails either way; an undecidable verdict has already killed the child.
-            let _ = leaf.take_placement(pid);
+        {
+            match self.cgroup_leaf.take() {
+                Some(mut leaf) if leaf.holds_verdict_to_take() => {
+                    // The spawn fails either way; an undecidable verdict has already killed the
+                    // child.
+                    match leaf.take_placement(pid) {
+                        Ok(Ok(())) => Some(Attached::Cgroup(leaf)),
+                        _ => None,
+                    }
+                }
+                // No verdict to take (already resolved, or never had one): put it back untouched.
+                Some(leaf) => {
+                    self.cgroup_leaf = Some(leaf);
+                    None
+                }
+                None => None,
+            }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = pid;
+        {
+            let _ = pid;
+            None
+        }
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
