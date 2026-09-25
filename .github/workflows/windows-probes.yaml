@@ -195,15 +195,23 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-      # These print what they measured rather than asserting; `--nocapture` is the point.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      # These print what they measured rather than asserting; `--no-capture` is the point. It also
+      # forces nextest to run every test in this invocation serially, independent of the
+      # `windows-elevation-routes` test group in `.config/nextest.toml`.
       - name: Run shell-resolution probes
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
-        run: >
-          cargo test --locked --target ${{ matrix.target }}
-          --test windows_shell_resolution
-          -- "${FILTER}" --ignored --nocapture --test-threads=1
+        run: |
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture)
+          if [[ -n "${FILTER}" ]]; then
+            args+=("${FILTER}")
+          fi
+          cargo "${args[@]}"
       # The elevation probes refuse to run without these two gates. `continue-on-error` keeps one
       # unmeasurable probe from hiding the others' output, which is the whole product of this job.
       - name: Run elevation-route probes
@@ -213,10 +221,12 @@ jobs:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_ALLOW_ACCOUNTS: "1"
           COSCA_PROBE_ALLOW_STATE: "1"
-        run: >
-          cargo test --locked --target ${{ matrix.target }}
-          --test windows_elevation_routes
-          -- "${FILTER}" --ignored --nocapture --test-threads=1
+        run: |
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_elevation_routes --run-ignored only --no-capture)
+          if [[ -n "${FILTER}" ]]; then
+            args+=("${FILTER}")
+          fi
+          cargo "${args[@]}"
       # The runner is itself an administrator, so its own token shape is the control every
       # elevation result is read against.
       - name: Record the runner's own identity

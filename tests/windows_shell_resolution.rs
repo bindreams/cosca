@@ -13,10 +13,10 @@
 //! # Why they are `#[ignore]`d
 //!
 //! They execute a batch file. That is the exact vector `reject_batch_path` exists to refuse, so it
-//! must never happen incidentally during `cargo test`. Opt in explicitly:
+//! must never happen incidentally during `cargo nextest run`. Opt in explicitly:
 //!
 //! ```text
-//! cargo test --test windows_shell_resolution -- --ignored --nocapture
+//! cargo nextest run --test windows_shell_resolution --run-ignored only --no-capture
 //! ```
 //!
 //! Or, from any host OS and without a local Windows VM, dispatch the `windows-probes` workflow with

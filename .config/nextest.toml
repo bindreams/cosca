@@ -12,6 +12,17 @@ fail-fast = false
 # guard them. This group caps concurrency for that binary at one test at a time instead.
 windows-shell-execute = { max-threads = 1 }
 
+# `does_create_process_with_logon_elevate` and `which_logon_types_return_a_filtered_token` in
+# `tests/windows_elevation_routes.rs` both create their scratch accounts under the same two fixed
+# names (`coscaprobeadm`, `coscaprobestd`), so nextest's default one-process-per-test parallelism
+# would race the two `net user ... /add` calls against each other. This group caps concurrency for
+# that binary at one test at a time instead.
+windows-elevation-routes = { max-threads = 1 }
+
 [[profile.default.overrides]]
 filter = 'binary(windows_shell_execute)'
 test-group = 'windows-shell-execute'
+
+[[profile.default.overrides]]
+filter = 'binary(windows_elevation_routes)'
+test-group = 'windows-elevation-routes'

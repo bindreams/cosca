@@ -36,7 +36,7 @@
 //! They create processes with derived tokens, and two of them change machine state. Opt in:
 //!
 //! ```text
-//! cargo test --test windows_elevation_routes -- --ignored --nocapture --test-threads=1
+//! cargo nextest run --test windows_elevation_routes --run-ignored only --no-capture
 //! ```
 //!
 //! Two probes additionally refuse to run — loudly, by panicking, never by skipping — unless an
@@ -44,6 +44,13 @@
 //!
 //! - `COSCA_PROBE_ALLOW_ACCOUNTS=1` — creates and deletes a local user account.
 //! - `COSCA_PROBE_ALLOW_STATE=1` — registers and deletes a scheduled task.
+//!
+//! `does_create_process_with_logon_elevate` and `which_logon_types_return_a_filtered_token` both
+//! create their scratch accounts under the same two fixed names (`coscaprobeadm`,
+//! `coscaprobestd`), so they must never run concurrently with each other; `--no-capture` already
+//! forces nextest to run every test in this invocation serially, and the `windows-elevation-routes`
+//! test group capped at one thread in `.config/nextest.toml` gives the same guarantee independent
+//! of that flag.
 //!
 //! Both are set by the `executing` job of `.github/workflows/windows-probes.yaml`, which runs only
 //! when dispatched with `run_executing_probes`, on a GitHub-hosted runner: an ephemeral VM
