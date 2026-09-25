@@ -161,9 +161,6 @@ enum ChildHandle {
     /// The shell handed back no process handle at all (`LaunchedNoHandle`/`NotLaunched`) — nothing
     /// here was ever going to need reaping.
     NoHandle,
-    /// A process handle existed, but `DuplicateHandle` itself failed; only the worker's own
-    /// `info.hProcess`, on the worker's own thread, can still act on it.
-    DuplicateFailed,
     /// A live duplicate, independent of the worker's own `info.hProcess`, that a reaper can
     /// terminate and close directly.
     Duplicate(HANDLE),
@@ -176,10 +173,22 @@ enum ChildHandle {
 /// progresses. See `BoundedCallState`'s doc for why this is one `Mutex`-guarded value rather than a
 /// separate phase flag and handle slot.
 enum CallState {
-    /// Still inside `ShellExecuteExW` itself. Nothing has launched yet — there is no handle
-    /// anywhere, on this thread or any other, for a bound-trip reaper to act on. If the outer bound
-    /// trips here, nothing launched so far can be reaped; only the moment `ShellExecuteExW` itself
-    /// eventually returns (if it ever does — see `SHELL_EXECUTE_BOUND`'s doc) does that change.
+    /// Before anything has been published here. This does NOT mean nothing has launched — that
+    /// would only be true if `ShellExecuteExW` itself had not yet returned, but this state also
+    /// covers the moment right after it does, before the code below has finished acting on what it
+    /// got back:
+    ///   - `ShellExecuteExW` may already have returned a live `info.hProcess`, with this thread
+    ///     still inside `DuplicateHandle` — a process exists, but nothing has published it here yet;
+    ///   - the shell may have created, or handed off to, a process entirely inside its own
+    ///     synchronous call (`SEE_MASK_NOASYNC` is always set — see that mask's doc), so a process
+    ///     can have been created and finished running before `ShellExecuteExW` ever returns.
+    ///
+    /// If the outer bound trips while this is `Calling`, a bound-trip reaper has nothing published
+    /// to act on — not because nothing launched, but because nothing here has been published for it
+    /// to find yet. And a process the shell handed off to with NO process handle at all
+    /// (`LaunchOutcome::LaunchedNoHandle`) is never reaped in ANY state this enum can reach, whether
+    /// or not the outer bound ever trips: there is no PID, only `SHELLEXECUTEINFOW`'s missing
+    /// `hProcess`, so nothing here can ever terminate or wait on it, and it can outlive this test.
     Calling,
     /// `ShellExecuteExW` returned; the `ChildHandle` says what (if anything) a bound-trip reaper can
     /// act on.
@@ -195,28 +204,33 @@ enum CallState {
     /// has genuinely, fully finished (either way: a natural exit, or a completed terminate-and-reap
     /// after [`CallState::Reaping`]). There is nothing left here for a reaper to act on.
     Done,
+    /// A `TerminateProcess` this thread needed for its own reap — of `info.hProcess`, either after
+    /// `CallState::Reaping` or in the `DuplicateHandle`-failure path that never publishes `Reaping`
+    /// at all — itself failed. The process was never confirmed dead: it has been abandoned, not
+    /// reaped. This must never be conflated with [`CallState::Done`]; a reader must be told the
+    /// child may still be alive.
+    ReapFailed,
     /// A bound-trip reaper already gave up and took responsibility for whatever was here: either it
-    /// reaped a `ChildHandle::Duplicate` itself, or it found `Calling`, `NoHandle` or
-    /// `DuplicateFailed` and is telling the worker "reap your own handle yourself, the moment you
-    /// get one — this call has already returned to its caller and will not come back for it." The
-    /// worker checks for this the instant it publishes `Returned`, before starting its own bounded
-    /// wait.
+    /// reaped a `ChildHandle::Duplicate` itself, or it found `Calling` or `NoHandle` and is telling
+    /// the worker "reap your own handle yourself, the moment you get one — this call has already
+    /// returned to its caller and will not come back for it." The worker checks for this the instant
+    /// it publishes `Returned(ChildHandle::Duplicate(_))`, before starting its own bounded wait. The
+    /// `DuplicateHandle`-failure path never depends on this at all: that path terminates and reaps
+    /// `info.hProcess` itself, synchronously, before publishing anything, regardless of whether a
+    /// reaper has already given up — see `shell_execute_in_apartment`'s `DuplicateHandle` branch.
     Abandoned,
 }
 
 fn call_state_description(state: &CallState) -> String {
     match state {
-        CallState::Calling => "still inside ShellExecuteExW itself — nothing has launched here yet, so nothing \
-             launched so far can be reaped"
+        CallState::Calling => "nothing has been published here yet — this does NOT mean nothing has launched: \
+             ShellExecuteExW may already have returned a live process handle while this thread is \
+             still inside DuplicateHandle, or the shell may already have created or handed off to a \
+             process inside its own synchronous call. A no-handle hand-off is never reaped in any \
+             state and can outlive this test"
             .to_string(),
         CallState::Returned(ChildHandle::NoHandle) => {
             "ShellExecuteExW had already returned with no process handle to reap".to_string()
-        }
-        CallState::Returned(ChildHandle::DuplicateFailed) => {
-            "a process handle existed but could not be duplicated for this reaper; the worker \
-             terminates and reaps it directly, on its own thread, the moment duplication fails, \
-             rather than waiting on it naturally first"
-                .to_string()
         }
         CallState::Returned(ChildHandle::Duplicate(_)) => {
             "waiting for, or reaping, the process ShellExecuteExW launched".to_string()
@@ -226,6 +240,9 @@ fn call_state_description(state: &CallState) -> String {
             .to_string(),
         CallState::Done => "the worker had already finished its own wait, and any terminate-and-reap that \
              followed, by the time this bound tripped; nothing here needed reaping"
+            .to_string(),
+        CallState::ReapFailed => "a terminate-and-reap of info.hProcess was under way and TerminateProcess \
+             itself failed; the process was never confirmed dead and has been abandoned, not reaped"
             .to_string(),
         CallState::Abandoned => "already claimed by an earlier bound-trip reaper".to_string(),
     }
@@ -361,28 +378,27 @@ fn shell_execute_in_apartment(
     if duplicated.is_err() {
         // No independent duplicate exists here, so — unlike the `Duplicate` case below — nothing
         // but THIS worker thread, on ITS OWN schedule, can ever recover this process; a bound-trip
-        // reaper reading `DuplicateFailed` has no handle of its own to act on. Publishing this state
-        // and then running the normal (up to `CHILD_EXIT_BOUND_MS`) natural-exit wait before
-        // terminating would leave exactly that window open: if `shell_execute_bounded`'s outer bound
-        // trips while this worker is still inside that wait, and the caller panics on the resulting
-        // `Err`, `cargo nextest` tearing down this test's OS process can kill this thread before it
-        // ever reaches its own terminate-and-reap, leaving the child running. Terminating and
-        // reaping immediately, synchronously, right here — before returning at all — closes that
-        // window: there is no natural exit worth waiting for that a later `Err` would need to
-        // preserve, since nothing else can ever help reap this handle.
+        // reaper has no handle of its own to act on for this call, whatever it currently reads.
+        // Publishing ANY state here before terminating — even one meant to tell a reaper "not my
+        // problem" — would leave a window open: if `shell_execute_bounded`'s outer bound trips right
+        // after that publish, and the caller panics on the resulting `Err`, `cargo nextest` tearing
+        // down this test's OS process can kill this thread before it ever reaches its own
+        // terminate-and-reap, leaving the child running. Terminating and reaping immediately,
+        // synchronously, right here — BEFORE publishing anything at all — closes that window: by the
+        // time anything here becomes visible to a reader, the outcome is already decided and
+        // irreversible, so there is nothing left for a reaper to act on.
         eprintln!(
             "PROBE shell-execute: could not duplicate the launched process's handle for the \
              bound-trip reaper; terminating and reaping it directly on this thread instead of \
              waiting on it naturally"
         );
-        // Whether or not a bound-trip reaper already gave up on this call (`Abandoned`) makes no
-        // difference to what happens next — reaped immediately either way — only to whether the
-        // `Err` returned below is ever observed by anyone.
-        let _ = state.publish_returned(ChildHandle::DuplicateFailed);
         // SAFETY: `info.hProcess` is still owned by this function, closed exactly once below.
         return unsafe {
             if let Err(term_err) = TerminateProcess(info.hProcess, 1) {
                 let _ = CloseHandle(info.hProcess);
+                // The process could not be confirmed dead: publish that plainly. `Done` would claim
+                // a completed reap that never actually happened.
+                *state.lock() = CallState::ReapFailed;
                 Err(format!(
                     "the launched process's handle could not be duplicated for a bound-trip \
                      reaper, and this worker's own attempt to terminate it directly also failed \
@@ -415,10 +431,15 @@ fn shell_execute_in_apartment(
         unsafe {
             let _ = CloseHandle(dup);
         }
+        // This state is never actually read back — the bound-trip reaper already returned its own
+        // `Err` to `shell_execute_bounded`'s caller, and nothing is listening on `tx` any more — but
+        // it is published accurately anyway, the same as every other path here: `Done` must not be
+        // claimed for a `TerminateProcess` that itself failed.
         // SAFETY: `info.hProcess` is still owned by this function, closed exactly once below.
         unsafe {
             if let Err(term_err) = TerminateProcess(info.hProcess, 1) {
                 let _ = CloseHandle(info.hProcess);
+                *state.lock() = CallState::ReapFailed;
                 eprintln!(
                     "PROBE shell-execute: the outer bound had already given up on this call before \
                      this worker could publish a handle for it to reap; this worker's own attempt to \
@@ -429,11 +450,9 @@ fn shell_execute_in_apartment(
             } else {
                 let _ = WaitForSingleObject(info.hProcess, INFINITE);
                 let _ = CloseHandle(info.hProcess);
+                *state.lock() = CallState::Done;
             }
         }
-        *state.lock() = CallState::Done;
-        // The bound-trip reaper already returned its own `Err` to `shell_execute_bounded`'s caller;
-        // nothing is listening on `tx` any more, so this result is never observed.
         return Err("this call was abandoned by the outer bound before it could publish a \
              process handle to reap"
             .to_string());
@@ -446,13 +465,20 @@ fn shell_execute_in_apartment(
     // close it now, so a run that never hits the outer bound does not leak it. If
     // `shell_execute_bounded`'s reaper already claimed it (the outer bound tripped while the wait
     // above was still running), this finds `Abandoned` instead and there is nothing left to close
-    // here — the reaper already did. This transitions to `Reaping`, NOT `Done`: whether the wait
-    // above already succeeded or still needs a terminate-and-reap below is not yet decided at this
-    // point, and `Done` must not be observable until that decision has actually been carried out —
-    // see `CallState::Reaping`'s doc for the race this closes.
+    // here — the reaper already did. `waited` is already known by this point, so the state this
+    // reclaim publishes reflects it directly: `Reaping` only when a terminate-and-reap of
+    // `info.hProcess` genuinely still lies ahead (`waited != WAIT_OBJECT_0` — see `CallState::Reaping`'s
+    // doc for the race that distinction closes); otherwise straight to `Done`, since all that is left
+    // on the natural-exit path below is a single `CloseHandle`, which cannot block or fail to
+    // complete.
+    let post_reclaim = if waited == WAIT_OBJECT_0 {
+        CallState::Done
+    } else {
+        CallState::Reaping
+    };
     {
         let mut guard = state.lock();
-        match std::mem::replace(&mut *guard, CallState::Reaping) {
+        match std::mem::replace(&mut *guard, post_reclaim) {
             CallState::Returned(ChildHandle::Duplicate(dup)) => {
                 // SAFETY: this function's own duplicate, not yet closed by anyone else — the reaper
                 // only ever takes it by replacing this same `Mutex`-guarded state with `Abandoned`,
@@ -461,18 +487,18 @@ fn shell_execute_in_apartment(
                     let _ = CloseHandle(dup);
                 }
             }
-            CallState::Returned(ChildHandle::NoHandle | ChildHandle::DuplicateFailed) => {}
+            CallState::Returned(ChildHandle::NoHandle) => {}
             // The bound-trip reaper already claimed and dealt with whatever was here itself.
             CallState::Abandoned => {}
             CallState::Calling => {
                 unreachable!("this function already published Returned before this point")
             }
-            CallState::Reaping | CallState::Done => {
+            CallState::Reaping | CallState::Done | CallState::ReapFailed => {
                 unreachable!("this reclaim runs exactly once per call")
             }
         }
     }
-    let result = if waited != WAIT_OBJECT_0 {
+    if waited != WAIT_OBJECT_0 {
         let reason = if waited == WAIT_TIMEOUT {
             format!("did not exit within {CHILD_EXIT_BOUND_MS}ms")
         } else {
@@ -488,9 +514,12 @@ fn shell_execute_in_apartment(
         // waiting INFINITE on a process this probe cannot make exit would be exactly the unbounded
         // hang this bound exists to prevent.
         // SAFETY: `info.hProcess` is still owned by this function; closed exactly once below.
-        unsafe {
+        return unsafe {
             if let Err(term_err) = TerminateProcess(info.hProcess, 1) {
                 let _ = CloseHandle(info.hProcess);
+                // The process could not be confirmed dead: publish that plainly, never `Done` —
+                // see `CallState::ReapFailed`'s doc.
+                *state.lock() = CallState::ReapFailed;
                 Err(format!(
                     "the launched process {reason}, and could not even be terminated ({term_err}); \
                      it has been abandoned rather than waited on unboundedly for an exit that \
@@ -499,25 +528,25 @@ fn shell_execute_in_apartment(
             } else {
                 let _ = WaitForSingleObject(info.hProcess, INFINITE);
                 let _ = CloseHandle(info.hProcess);
+                // Only NOW — after this terminate-and-reap has actually, fully completed, not merely
+                // been decided upon — is `Done` an accurate description of this call: see
+                // `CallState::Reaping`'s doc for why setting this any earlier would let a bound-trip
+                // reaper observe "nothing here needed reaping" while it was still in flight.
+                *state.lock() = CallState::Done;
                 Err(format!(
                     "the launched process {reason}, so this probe could not be measured (it has \
                      now been terminated and reaped)"
                 ))
             }
-        }
-    } else {
-        // SAFETY: `info.hProcess` is still owned by this function; closed exactly once.
-        unsafe {
-            let _ = CloseHandle(info.hProcess);
-        }
-        Ok(LaunchOutcome::Waited)
-    };
-    // Only NOW — after the reap above (if any) has actually, fully completed, not merely been
-    // decided upon — is `Done` an accurate description of this call: see `CallState::Reaping`'s doc
-    // for why setting this any earlier would let a bound-trip reaper observe "nothing here needed
-    // reaping" while a terminate-and-reap was still in flight or about to start.
-    *state.lock() = CallState::Done;
-    result
+        };
+    }
+    // The reclaim above already published `Done`: the natural-exit path has nothing left that can
+    // block or fail.
+    // SAFETY: `info.hProcess` is still owned by this function; closed exactly once.
+    unsafe {
+        let _ = CloseHandle(info.hProcess);
+    }
+    Ok(LaunchOutcome::Waited)
 }
 
 /// The outer failure bound for the WHOLE `shell_execute_with` call, not `ShellExecuteExW` alone:
@@ -553,17 +582,20 @@ pub(crate) const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
 /// `shell_execute_in_apartment`'s `DuplicateHandle` branch — closing the window where an earlier
 /// version of this code would leave that reap to a later, unbounded wait.
 ///
-/// What is NOT closed: if the outer bound trips while `f` is still inside `ShellExecuteExW` itself
-/// (`CallState::Calling`), there is no handle anywhere yet — on this thread or any other — for
-/// either side to act on, and Win32 gives this process no way to cancel a call already in progress.
-/// This function's own thread returns an `Err` here regardless, but the launched process (if
-/// `ShellExecuteExW` eventually does return one) is reaped only by the worker thread, on its own
-/// schedule, after this function has already returned. If a caller then panics on that `Err` and
-/// `cargo nextest` tears down this test's OS process before the worker reaches that point, the
-/// child is left running — a genuine, undocumented-until-now residual risk, not a solved case; there
-/// is no Win32 primitive available here to close it. The `Err` message says which of these happened,
-/// rather than always blaming `ShellExecuteExW` — see `BoundedCallState`'s doc for how the two sides
-/// avoid ever touching the same handle twice.
+/// What is NOT closed: if the outer bound trips while `f`'s state is still `CallState::Calling`,
+/// nothing has been published here yet for either side to act on — see that variant's doc for the
+/// two ways a live process can already exist at that point even though nothing has been published —
+/// and Win32 gives this process no way to cancel a call already in progress. This function's own
+/// thread returns an `Err` here regardless, but the launched process (if one exists) is reaped only
+/// by the worker thread, on its own schedule, after this function has already returned. Separately,
+/// and regardless of whether the outer bound ever trips: a process the shell handed off to with NO
+/// process handle at all (`LaunchOutcome::LaunchedNoHandle`) is never reaped in ANY state this module
+/// can reach, and can outlive this test. If a caller panics on this function's `Err` and `cargo
+/// nextest` tears down this test's OS process before the worker reaches its own reap, the child is
+/// left running — a genuine residual risk, not a solved case; there is no Win32 primitive available
+/// here to close it. The `Err` message says which of these happened, rather than always blaming
+/// `ShellExecuteExW` — see `BoundedCallState`'s doc for how the two sides avoid ever touching the
+/// same handle twice.
 ///
 /// If `f` itself panics, the channel disconnects immediately rather than timing out — that is
 /// reported here as what it is (a panic inside `f`, which DID return, by unwinding) rather than

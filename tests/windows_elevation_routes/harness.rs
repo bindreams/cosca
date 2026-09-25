@@ -43,11 +43,16 @@ use windows::Win32::System::Threading::{
 /// inheritance already carried it into whatever job its own creator belongs to, before
 /// `spawn_attempts_with`'s own `contain` call explicitly assigns it to a second, independent job of
 /// its own — nesting the two only if that inheritance already happened. Whether it does is NOT
-/// assumed here: `spawn_attempts_with` measures it directly with `IsProcessInJob`, once per spawn
-/// route, before its own `contain` call runs (see that function). The two routes are not assumed to
-/// agree — `CreateProcessWithTokenW` creates the process through the Secondary Logon service, a
-/// process outside this job tree entirely, which is exactly the kind of case ordinary parent-job
-/// inheritance would not reach.
+/// assumed here: `spawn_attempts_with` measures it with `IsProcessInJob`, once per spawn route that
+/// actually creates a process, before its own `contain` call runs (see that function). Only
+/// `CreateProcessAsUserW` has ever reached that measurement on the runners this suite has run on —
+/// `CreateProcessWithTokenW` has always failed there before creating a process at all (see
+/// `spawn_attempts_with`'s own `FAILED` log line for that route), so this route has never been
+/// measured directly, and nothing here claims otherwise. Whether a `CreateProcessWithTokenW` child
+/// WOULD nest into the same job is, at best, unverified reasoning, not a measurement: it is created
+/// through the Secondary Logon service, a process outside this job tree entirely, which is the kind
+/// of case ordinary parent-job inheritance would plausibly not reach — but that is as far as the
+/// reasoning goes, since the route has never actually produced a process here to check.
 ///
 /// This is the bound for a process this test binary spawns and waits on directly. Some of those
 /// children — `logon_routes::logon_one_account`'s and `token_filtering::unelevated_caller_view`'s,
@@ -378,8 +383,11 @@ pub(crate) fn self_report_cmdline() -> String {
 /// initial thread — the mandatory sequence [`cosca::Job::assign`]'s own docs require, closing the
 /// race where a resumed-too-early child (or a grandchild it forks) escapes containment before
 /// assignment lands. Every `CreateProcess*` call in this folder that hands back a
-/// `PROCESS_INFORMATION` uses `CREATE_SUSPENDED` and routes through this function, so `wait_for`
-/// can always terminate the whole tree — not just the immediate child — on a timeout.
+/// `PROCESS_INFORMATION` uses `CREATE_SUSPENDED` and routes through this function, so `wait_for` can
+/// terminate every process that actually joined this job on a timeout — not just the immediate
+/// child. That covers only whatever became a member of the job; whether a given grandchild always
+/// does is a separate, only-partly-measured question — see [`CHILD_EXIT_BOUND_MS`]'s doc for what
+/// `spawn_attempts_with`'s own `IsProcessInJob` measurement does and doesn't establish.
 ///
 /// Panics rather than returning an error: an uncontained child defeats the reason every spawn in
 /// this folder goes through a job at all, and `Job::assign`'s own contract forbids resuming a
@@ -451,18 +459,21 @@ impl std::fmt::Display for WaitFailure {
     }
 }
 
-/// Wait for the WHOLE tree held in `job` to exit, and return the immediate child's exit code — or
-/// a [`WaitFailure`] describing why the measurement is incomplete. `bound_ms` is given to
-/// `Job::wait_tree_timeout`, which drains the tree (the child and every grandchild it spawned)
-/// through a real kernel primitive (Job Object membership accounting), not just the immediate
-/// child's own process handle.
+/// Wait for the WHOLE tree held in `job` to exit — i.e. every process that is a MEMBER of `job`, not
+/// necessarily every process the child goes on to spawn — and return the immediate child's exit
+/// code, or a [`WaitFailure`] describing why the measurement is incomplete. `bound_ms` is given to
+/// `Job::wait_tree_timeout`, which drains the job's actual membership (the child, and any grandchild
+/// that in fact joined this same job) through a real kernel primitive (Job Object membership
+/// accounting), not just the immediate child's own process handle. Whether a given grandchild joins
+/// this job at all is not something this function guarantees — see [`CHILD_EXIT_BOUND_MS`]'s doc for
+/// what has and hasn't actually been measured about that.
 ///
-/// On [`TreeDrain::AllMembersExited`], every member of the tree is confirmed gone, so reading the
-/// immediate child's exit code and touching any file or account any member of the tree might
-/// otherwise still hold open is safe. `TreeDrain::AllMarkersClosed` is the macOS fd-marker
-/// channel; `wait_tree_timeout` on a Windows `Job` only ever drives the Job Object channel, so
-/// that variant is asserted unreachable rather than silently matched away — see [`TreeDrain`]'s
-/// own doc.
+/// On [`TreeDrain::AllMembersExited`], every member of `job` is confirmed gone, so reading the
+/// immediate child's exit code and touching any file or account any member of `job` might otherwise
+/// still hold open is safe — that safety covers only whatever actually joined `job`, per above.
+/// `TreeDrain::AllMarkersClosed` is the macOS fd-marker channel; `wait_tree_timeout` on a Windows
+/// `Job` only ever drives the Job Object channel, so that variant is asserted unreachable rather than
+/// silently matched away — see [`TreeDrain`]'s own doc.
 ///
 /// On [`TreeDrain::MembersRemain`] or an `Err` from `wait_tree_timeout` itself (the job handle was
 /// already consumed by a concurrent `kill_tree`/`Drop`, or the duplicate/wait syscalls failed),
@@ -585,7 +596,15 @@ pub(crate) fn splice_child_report(out: &mut String, path: &Path) {
 
 /// Everything this process can find out about its own token, and about what its token lets it do.
 /// Written into a string so a child can hand it back through a file.
-pub(crate) fn measure(out: &mut String) {
+///
+/// `ancestor_contained` says whether THIS process is itself already a member of a job an ancestor
+/// created via [`contain`] — i.e. whether it was reached through the spawned-child path
+/// ([`crate::logon_routes::logon_one_account`], [`crate::token_filtering::unelevated_caller_view`])
+/// rather than called directly at the top level
+/// ([`crate::token_filtering::linked_token_chain_here`]). It is passed straight through to
+/// [`spawn_attempts_with`], which needs it to label its own `IsProcessInJob` readings — see that
+/// function's doc for why an uncontained caller's reading does not bear on question C at all.
+pub(crate) fn measure(out: &mut String, ancestor_contained: bool) {
     let _ = writeln!(out, "=== token report (pid {}) ===", std::process::id());
     match open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE) {
         Ok(t) => describe(out, "current process token", t.0),
@@ -628,7 +647,7 @@ pub(crate) fn measure(out: &mut String) {
                         let primary = Token(primary);
                         let _ = writeln!(out, "  step 2 DuplicateTokenEx(->primary): OK");
                         describe(out, "duplicated primary token", primary.0);
-                        spawn_attempts_with(out, "linked", primary.0);
+                        spawn_attempts_with(out, "linked", primary.0, ancestor_contained);
                     }
                 }
             }
@@ -649,7 +668,7 @@ pub(crate) fn measure(out: &mut String) {
         Err(e) => {
             let _ = writeln!(out, "  could not reopen own token: <{e}>");
         }
-        Ok(own) => spawn_attempts_with(out, "own", own.0),
+        Ok(own) => spawn_attempts_with(out, "own", own.0, ancestor_contained),
     }
 
     // Task Scheduler's gating question, asked from wherever this process is running. The docs say
@@ -719,7 +738,16 @@ pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
 /// is bypassable and these succeed; if it is not, the error code names the privilege that stopped
 /// it. The child is this same test binary in report-only mode, so success is not taken on trust —
 /// its integrity level is read back out of the report it writes.
-fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
+///
+/// `ancestor_contained` (see [`measure`]'s doc) gates whether the `IsProcessInJob` reading logged
+/// below is informative for question C at all. That question is about ordinary Windows job
+/// inheritance nesting a grandchild into an ancestor's job — which presupposes THIS process is
+/// itself a member of one. When it isn't (`linked_token_chain_here` calling in at the top level,
+/// with no `contain`-created job anywhere above it in this process's own ancestry), a `true` reading
+/// reflects at most some ambient job this process happens to be in for unrelated reasons (e.g. a CI
+/// runner's own wrapping job) — not inheritance from anything this suite created — so it is labelled
+/// as such in the log rather than left to be read alongside the informative ones.
+fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE, ancestor_contained: bool) {
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
 
     for (step, use_seclogon) in [("CreateProcessAsUserW", false), ("CreateProcessWithTokenW", true)] {
@@ -792,9 +820,19 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
                 let job = contain(&pi, &format!("PROBE spawn-attempts[{which}/{step}]"));
                 let exit = wait_for(&pi, &job, GRANDCHILD_EXIT_BOUND_MS)
                     .map_or_else(|e| e.to_string(), |c| format!("exit=0x{c:08x}"));
+                // `ancestor_contained=false`: this reading does not bear on question C — see this
+                // function's own doc for why — and is labelled as such rather than left to be
+                // confused with the informative readings below it.
+                let job_note = if ancestor_contained {
+                    String::new()
+                } else {
+                    " [NOT informative for C: this process was never itself contained, so this can \
+                      only reflect an ambient job, not inheritance from a `contain()` job]"
+                        .to_string()
+                };
                 let _ = writeln!(
                     out,
-                    "  {step} [{which} token]: STARTED (pre-contain IsProcessInJob(_, None)={in_any_job}), \
+                    "  {step} [{which} token]: STARTED (pre-contain IsProcessInJob(_, None)={in_any_job}{job_note}), \
                      {exit}. The child reports:"
                 );
                 splice_child_report(out, &report);

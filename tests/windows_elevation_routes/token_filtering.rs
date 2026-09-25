@@ -55,8 +55,10 @@ fn measure_this_token() {
     }
     let report_to = std::env::var_os("COSCA_PROBE_REPORT_TO");
     if report_to.is_some() && std::env::var_os("COSCA_PROBE_CHILD").is_none() {
-        // Spawned by `logon_one_account` or `unelevated_caller_view`: the child runs the whole chain.
-        measure(&mut out);
+        // Spawned by `logon_one_account` or `unelevated_caller_view`: the child runs the whole
+        // chain. Both of those wrap their own spawned child in `contain` before it ever reaches
+        // here, so this process is itself already a job member — `ancestor_contained=true`.
+        measure(&mut out, true);
     } else {
         // Either a child of `spawn_attempts_with` (`COSCA_PROBE_CHILD` is set, so it does not
         // recurse into more spawn attempts of its own), or a direct, unspawned `--ignored` run
@@ -263,7 +265,11 @@ fn measure_uac_policy() {
 #[ignore = "platform probe; opt in with --ignored"]
 fn linked_token_chain_here() {
     let mut out = String::new();
-    measure(&mut out);
+    // This test runs at the top level, uncontained — nothing above it in this process's own
+    // ancestry ever called `contain`. `ancestor_contained=false`: see `measure`'s and
+    // `spawn_attempts_with`'s docs for why that makes their `IsProcessInJob` readings uninformative
+    // for question C.
+    measure(&mut out, false);
     print!("{out}");
     // A spawned grandchild that never exited is not an ordinary measurement outcome: `wait_for`
     // kills and recovers it, but nothing downstream distinguishes that from a normal negative
