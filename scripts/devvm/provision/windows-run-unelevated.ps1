@@ -233,6 +233,13 @@ function Invoke-Bounded {
       ScheduledTask have no timeout of their own; a wedged Task Scheduler service is the
       documented case this guards against). The abandoned $ps is left for BeginStop's own
       completion and eventual GC, off this thread.
+
+      $TimeoutMessage may contain the literal token `{ELAPSED}`, replaced on the timeout path
+      with the actual measured seconds this call spent waiting (via a Stopwatch spanning
+      BeginInvoke through the failed WaitOne) — mechanically close to $TimeoutSeconds itself
+      (WaitOne blocks for up to exactly that long), but callers ask for it anyway rather than
+      just repeating the budget they already know, and it is a real, separately-measured
+      number, not the same value twice.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -245,8 +252,9 @@ function Invoke-Bounded {
         [string]$TimeoutMessage
     )
     if ($TimeoutSeconds -le 0) {
-        throw $TimeoutMessage
+        throw ($TimeoutMessage -replace '\{ELAPSED\}', '0')
     }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $ps = [PowerShell]::Create()
     try {
         [void]$ps.AddScript($ScriptBlock)
@@ -263,7 +271,8 @@ function Invoke-Bounded {
     $signaled = $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
     if (-not $signaled) {
         $ps.BeginStop($null, $null) | Out-Null
-        throw $TimeoutMessage
+        $elapsedSeconds = [Math]::Ceiling($stopwatch.Elapsed.TotalSeconds)
+        throw ($TimeoutMessage -replace '\{ELAPSED\}', $elapsedSeconds)
     }
     try {
         $ps.EndInvoke($asyncResult) | Out-Null
@@ -458,8 +467,13 @@ Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 $pipeServer = $null
 try {
     try {
-        Invoke-Bounded -TimeoutSeconds (Get-RemainingSeconds) `
-            -TimeoutMessage "devvm: Register-ScheduledTask did not complete within ${TimeoutSeconds}s - Task Scheduler may be stuck." `
+        # Bounded by whatever's left of the caller's own -TimeoutSeconds, not a budget of its
+        # own — so a timeout here means -TimeoutSeconds itself ran out during this step, not
+        # that Task Scheduler is stuck (see Invoke-Bounded's finally-block sibling call below
+        # for the one case where that distinction doesn't apply).
+        $registerBudget = Get-RemainingSeconds
+        Invoke-Bounded -TimeoutSeconds $registerBudget `
+            -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Register-ScheduledTask - it had ${registerBudget}s left when this step started and took {ELAPSED}s without finishing. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
             -Parameters @{ TaskName = $taskName; ScriptPath = $scriptPath; UserId = $currentUser } `
             -ScriptBlock {
                 param($TaskName, $ScriptPath, $UserId)
@@ -535,8 +549,12 @@ try {
     # yet.
     $connectResult = $pipeServer.BeginWaitForConnection($null, $null)
 
-    Invoke-Bounded -TimeoutSeconds (Get-RemainingSeconds) `
-        -TimeoutMessage "devvm: Start-ScheduledTask did not complete within ${TimeoutSeconds}s - Task Scheduler may be stuck." `
+    # Same reasoning as the Register-ScheduledTask call above: this budget is whatever's left
+    # of the caller's own -TimeoutSeconds, not an independent one, so a timeout here means
+    # -TimeoutSeconds ran out, not that Task Scheduler is stuck.
+    $startBudget = Get-RemainingSeconds
+    Invoke-Bounded -TimeoutSeconds $startBudget `
+        -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Start-ScheduledTask - it had ${startBudget}s left when this step started and took {ELAPSED}s without finishing. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
         -Parameters @{ TaskName = $taskName } `
         -ScriptBlock {
             param($TaskName)
