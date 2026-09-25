@@ -427,6 +427,7 @@ static KILL_THREAD_HOOKS: std::sync::Mutex<Vec<(std::path::PathBuf, KillThreadHo
 
 /// Run `hook` with the id of the thread that performs the NEXT `cgroup.kill` write for the leaf
 /// at `path`.
+#[cfg(feature = "tokio")]
 pub(crate) fn set_next_kill_thread_hook(
     path: &std::path::Path,
     hook: impl FnOnce(std::thread::ThreadId) + Send + 'static,
