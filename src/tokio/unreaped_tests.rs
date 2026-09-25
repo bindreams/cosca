@@ -412,3 +412,40 @@ async fn a_blocking_reap_that_never_ran_hands_the_child_back() {
     unreaped.wait().await.expect("the next wait reaps it");
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
+
+/// Dropping on a saturated blocking pool, as the type's own doc recommends, must not deadlock:
+/// a cancelled wait leaves the child with a `ReapTask` queued but not yet claimed, and if the
+/// pool's only thread is the one `Drop` itself runs on, that task can never be scheduled. `Drop`
+/// must reclaim the child directly instead of waiting for the task, which then does nothing when
+/// it eventually runs.
+///
+/// The 10s bound is a human-facing failure bound on a genuine hang, not a synchronization device:
+/// success is `rx.recv()` returning promptly, well under it.
+#[cfg(unix)]
+#[test]
+fn drop_on_a_saturated_blocking_pool_does_not_deadlock() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build a runtime with a single blocking thread");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (child, stdin, id) = std_blocked_child();
+    drop(stdin); // the child exits at once
+    runtime.spawn_blocking(move || {
+        let mut unreaped = Unreaped::from_sync(crate::Unreaped::new(Held::Std(child)));
+        super::fault::set_force_not_yet_reapable();
+        cancel_after_one_pending_poll(&mut unreaped);
+        // Drops on the only blocking thread: the queued ReapTask must not be waited for.
+        drop(unreaped);
+        let _ = tx.send(());
+    });
+    let finished = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+    // If this deadlocked, the runtime's own drop would hang on the same stuck thread too.
+    std::mem::forget(runtime);
+    assert!(
+        finished,
+        "DEADLOCK: Unreaped::drop on the only blocking thread never returned"
+    );
+    crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
+}

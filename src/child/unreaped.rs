@@ -64,42 +64,13 @@ pub(crate) enum Checked {
     Uncertain(std::io::Error),
 }
 
-/// `tokio_wait_blocking`'s own marker for the one Unix case with no real errno to carry it: the
-/// child was confirmed reapable (`block_until_reapable`), then `try_wait` found no exit waiting
-/// for it — something else won the race and reaped it first, exactly as a genuine `ECHILD` would
-/// mean, but tokio's `try_wait` reports that as `Ok(None)`, not an OS error. `releases_ownership`
-/// downcasts for this so `tokio_wait_blocking` can still report it as an `io::Error`.
-#[cfg(all(unix, feature = "tokio"))]
-#[derive(Debug)]
-struct ReapedElsewhere(&'static str);
-
-#[cfg(all(unix, feature = "tokio"))]
-impl std::fmt::Display for ReapedElsewhere {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
-
-#[cfg(all(unix, feature = "tokio"))]
-impl std::error::Error for ReapedElsewhere {}
-
-#[cfg(all(unix, feature = "tokio"))]
-fn is_reaped_elsewhere(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(|inner| inner.downcast_ref::<ReapedElsewhere>().is_some())
-}
-#[cfg(all(unix, not(feature = "tokio")))]
-fn is_reaped_elsewhere(_e: &std::io::Error) -> bool {
-    false
-}
-
 /// Whether a failed wait/reap means "something else already reaped this child" — the single Unix
-/// condition under which this process must give up ownership of a pid: a genuine `ECHILD`, or
-/// `tokio_wait_blocking` losing the same race with no errno to carry it (see `ReapedElsewhere`).
-/// Either way the pid may since have been recycled onto an unrelated process. Every other errno (a
-/// too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, a transient failure) says nothing about
-/// ownership — the pid is still pinned to our own unreaped child for as long as we hold it, and is
-/// kept, not released.
+/// condition under which this process must give up ownership of a pid: a genuine `ECHILD`. tokio
+/// 1.53's `try_wait` reports a foreign reap the same way std's does — as `ECHILD`, not `Ok(None)`
+/// — so `Ok(None)` after a confirmed-reapable exit is never treated as a foreign reap (see
+/// `tokio_wait_blocking`). Every other errno (a too-old kernel's `EINVAL` from
+/// `waitid(P_PIDFD)`, a transient failure) says nothing about ownership either — the pid is still
+/// pinned to our own unreaped child for as long as we hold it, and is kept, not released.
 ///
 /// The single classification every wait/reap error passes through on Unix — `Held::check`,
 /// `settle_after_wait` (the sync and async `Unreaped::wait`/`Drop`), the async `reap_failed`, and
@@ -107,7 +78,7 @@ fn is_reaped_elsewhere(_e: &std::io::Error) -> bool {
 /// release on this alone.
 #[cfg(unix)]
 pub(crate) fn releases_ownership(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ECHILD) || is_reaped_elsewhere(e)
+    e.raw_os_error() == Some(libc::ECHILD)
 }
 
 impl Held {
@@ -181,6 +152,10 @@ impl Held {
     /// Block until the child exits, and reap it. Only for a child its check did not find exited
     /// or reaped elsewhere: ours, and unreaped, so its pid cannot have been reused.
     pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        #[cfg(test)]
+        if let Some(marker) = crate::child::spawn::fault::take_force_teardown_wait_error() {
+            return Err(std::io::Error::other(marker));
+        }
         match self {
             Held::Std(child) => child.wait(),
             #[cfg(feature = "tokio")]
@@ -189,7 +164,9 @@ impl Held {
             Held::Raw(child) => child.wait(),
             #[cfg(all(windows, feature = "tokio"))]
             Held::RawAsync(child) => {
-                child.wait_and_reap();
+                // `wait_blocking`, not `wait_and_reap`: this generic wait carries no precondition
+                // that a kill preceded it — an `Unreaped` child may never have been killed at all.
+                child.wait_blocking()?;
                 child
                     .try_wait()
                     .map_err(error_to_io)?
@@ -233,10 +210,10 @@ pub(crate) fn settle_after_wait(held: Held, waited: &std::io::Result<ExitStatus>
 /// tokio has no blocking wait: wait for the exit without reaping — the child is this process's
 /// unreaped one, so its pid is not reused meanwhile — then let tokio reap it.
 ///
-/// On Unix, `try_wait` after a confirmed-reapable exit can still report `Ok(None)`: something else
-/// won the race and reaped the child between the two checks. That is ownership-uncertain, exactly
-/// as a genuine `ECHILD` would be, but carries none — `try_wait` reports it as `Ok(None)`, not an
-/// OS error — so it is wrapped in `ReapedElsewhere`, which `releases_ownership` recognizes.
+/// On Unix, `try_wait` after a confirmed-reapable exit can still report `Ok(None)`. This is not a
+/// foreign reap: tokio's `try_wait`, like std's, reports a foreign reap as `ECHILD` (measured
+/// against tokio 1.53), so the pid is still ours, and is kept, not released — releasing it here
+/// would zombie-leak it.
 #[cfg(feature = "tokio")]
 fn tokio_wait_blocking(child: &mut ::tokio::process::Child) -> std::io::Result<ExitStatus> {
     #[cfg(unix)]
@@ -247,14 +224,14 @@ fn tokio_wait_blocking(child: &mut ::tokio::process::Child) -> std::io::Result<E
                 .ok_or_else(|| std::io::Error::other("tokio already reaped the child"))?,
         )?;
         #[cfg(test)]
-        if crate::child::spawn::fault::take_force_tokio_wait_blocking_lost() {
-            return Err(std::io::Error::other(ReapedElsewhere(
-                "the child exited, yet tokio could not reap it",
-            )));
+        if crate::child::spawn::fault::take_force_tokio_wait_blocking_miss() {
+            return Err(std::io::Error::other(
+                "the child was reapable, yet its reap found no exit waiting for it (test seam)",
+            ));
         }
         child
             .try_wait()?
-            .ok_or_else(|| std::io::Error::other(ReapedElsewhere("the child exited, yet tokio could not reap it")))
+            .ok_or_else(|| std::io::Error::other("the child was reapable, yet its reap found no exit waiting for it"))
     }
     #[cfg(windows)]
     {
@@ -414,7 +391,13 @@ pub struct Unreaped {
 }
 
 impl Unreaped {
-    /// Hold `held`, which its one check did not find exited or reaped elsewhere.
+    /// Hold `held`, which its one check did not find exited or reaped elsewhere, with nothing
+    /// retained. Its remaining production callers are Linux's cgroup teardown
+    /// (`containment::cgroup::leaf`) and Windows' elevation/raw-spawn teardown — both of which
+    /// never have containment to retain at their call site — so it is dead code on a macOS build,
+    /// where every production path now goes through `with_retained` instead (see L4: the
+    /// identity-failure teardown arms retain what they attached, rather than dropping it).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn new(held: Held) -> Unreaped {
         Unreaped::with_retained(held, None)
     }
@@ -466,7 +449,9 @@ impl Unreaped {
         settle_after_wait(held, &waited);
         #[cfg(windows)]
         drop(held);
-        drop(self.retained.take());
+        if let Some(retained) = self.retained.take() {
+            retained.give_up();
+        }
         waited
     }
 
@@ -507,7 +492,9 @@ impl Drop for Unreaped {
             #[cfg(windows)]
             drop(held);
         }
-        drop(self.retained.take());
+        if let Some(retained) = self.retained.take() {
+            retained.give_up();
+        }
     }
 }
 

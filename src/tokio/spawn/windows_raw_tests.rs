@@ -96,6 +96,38 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     child.wait().await.expect("reap");
 }
 
+/// `Held::wait`'s `RawAsync` arm calls `RawAsyncChild::wait_blocking`, not `wait_and_reap`: the
+/// generic `Unreaped` wait/`Drop` carries no precondition that a kill preceded it (an `Unreaped`
+/// exists exactly because a kill failed or was never attempted), so a `WaitForSingleObject`
+/// failure there must come back as an `io::Error`, not a `debug_assert` panic. A real failure
+/// needs a handle genuinely missing `SYNCHRONIZE` (an unkillable runas child), which a unit test
+/// cannot arrange — the forced-failure seam exercises the same code path deterministically.
+#[tokio::test]
+async fn wait_blocking_returns_the_forced_failure_instead_of_asserting() {
+    use std::os::windows::io::OwnedHandle;
+
+    use super::RawAsyncChild;
+
+    // A quickly-exiting child: the forced-failure seam short-circuits before any real OS wait, so
+    // this need not stay running.
+    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "__cosca_no_such_test__"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a quickly-exiting child");
+    let pid = child.id();
+    let mut raw = RawAsyncChild::new(OwnedHandle::from(child), pid);
+    raw.set_force_wait_blocking_failure("forced wait_blocking failure");
+    let err = raw
+        .wait_blocking()
+        .expect_err("a forced OS wait failure must be returned, not asserted away");
+    assert_eq!(err.to_string(), "forced wait_blocking failure");
+    // Real: the forced failure did not memoize an exit, so a real wait afterward still succeeds.
+    raw.wait_blocking()
+        .expect("a real wait after the forced failure still succeeds");
+}
+
 /// The async twin of `a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance`.
 #[cfg(windows)]
 #[tokio::test]
