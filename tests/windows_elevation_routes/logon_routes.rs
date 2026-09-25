@@ -14,7 +14,7 @@ use windows::Win32::System::Threading::{
 
 use crate::harness::{
     contain, env_block, report_cmdline, require_gate, splice_child_report, wait_for, wide, ScratchAccount,
-    CHILD_EXIT_BOUND_MS,
+    CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
 };
 use crate::windows_probe::mark_test_passed;
 
@@ -194,22 +194,26 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
         Err(e) => println!("PROBE createprocesswithlogon[{role}]: FAILED {e:?} — nothing to measure"),
         Ok(()) => {
             let job = contain(&pi, &format!("PROBE createprocesswithlogon[{role}]"));
-            let exit = wait_for(&pi, &job, CHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
-            assert!(
-                !exit.contains("did not exit within"),
-                "PROBE createprocesswithlogon[{role}]: the logged-on child did not exit within its \
-                 bound, so this probe's measurement is incomplete and must not be trusted: {exit}"
-            );
+            // Any `Err` here means this probe's measurement is incomplete; treat the `Result`
+            // itself as the check, rather than converting to a string first and pattern-matching
+            // English text.
+            let exit = match wait_for(&pi, &job, CHILD_EXIT_BOUND_MS) {
+                Ok(code) => format!("exit=0x{code:08x}"),
+                Err(e) => panic!(
+                    "PROBE createprocesswithlogon[{role}]: the logged-on child's exit could not be \
+                     confirmed, so this probe's measurement is incomplete and must not be trusted: {e}"
+                ),
+            };
             println!("PROBE createprocesswithlogon[{role}]: STARTED, {exit}. The child reports:");
             splice_child_report(&mut spliced, &report);
             print!("{spliced}");
             // The logged-on child runs the FULL chain (see this function's doc), including its own
-            // `spawn_attempts_with` grandchild waits; catch a hang buried in its own report too,
-            // before the caller only sees `spliced.contains("token report")` fail with no reason.
+            // `spawn_attempts_with` grandchild waits; catch a `WaitFailure` buried in its own report
+            // too, before the caller only sees `spliced.contains("token report")` fail with no reason.
             assert!(
-                !spliced.contains("did not exit within"),
-                "PROBE createprocesswithlogon[{role}]: the logged-on child's own report shows \
-                 something it spawned did not exit within its bound, so this probe's measurement is \
+                !spliced.contains(WAIT_INCOMPLETE_TOKEN),
+                "PROBE createprocesswithlogon[{role}]: the logged-on child's own report shows a \
+                 grandchild wait that could not be confirmed, so this probe's measurement is \
                  incomplete and must not be trusted:\n{spliced}"
             );
             let captured = std::fs::read_to_string(&stdout_file).unwrap_or_default();

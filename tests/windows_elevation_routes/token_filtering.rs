@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use windows::core::{HRESULT, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE};
 use windows::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, DuplicateTokenEx, FreeSid, LogonUserW, SecurityImpersonation,
     SetTokenInformation, TokenIntegrityLevel, TokenPrimary, DISABLE_MAX_PRIVILEGE, LOGON32_LOGON_BATCH,
@@ -19,15 +19,16 @@ use windows::Win32::System::SystemServices::{
     DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CreateProcessW, CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NO_WINDOW,
-    CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, CreateProcessW, CreateProcessWithTokenW, GetProcessTimes, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTUPINFOW,
 };
 
 use crate::harness::{
     contain, describe, elevation_type_name, env_block, linked_token, measure, open_own_token, require_gate,
     self_report_cmdline, splice_child_report, token_elevation_type, token_is_elevated, wait_for, wide, wide_path,
-    ScratchAccount, Token, CHILD_EXIT_BOUND_MS,
+    ScratchAccount, Token, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
 };
 use crate::windows_probe::mark_test_passed;
 
@@ -103,8 +104,14 @@ fn measure_this_token() {
 #[test]
 #[ignore = "platform probe; opt in with --ignored and COSCA_PROBE_INSPECT_PID=<pid>"]
 fn measure_another_process_token() {
-    let pid: u32 = match std::env::var("COSCA_PROBE_INSPECT_PID") {
-        Ok(v) => v.trim().parse().expect("COSCA_PROBE_INSPECT_PID must be a decimal PID"),
+    // Whether this run resolved `pid` itself (looking specifically for `explorer.exe`) or took it
+    // on trust from the caller — see the image-identity check below for why that distinction
+    // matters.
+    let (pid, expect_explorer): (u32, bool) = match std::env::var("COSCA_PROBE_INSPECT_PID") {
+        Ok(v) => (
+            v.trim().parse().expect("COSCA_PROBE_INSPECT_PID must be a decimal PID"),
+            false,
+        ),
         // With no target named, go looking for the interesting one: the shell of a signed-in
         // user. `tasklist` is read-only.
         Err(_) => {
@@ -112,7 +119,7 @@ fn measure_another_process_token() {
                 .args(["/fi", "IMAGENAME eq explorer.exe", "/fo", "csv", "/nh"])
                 .output()
                 .expect("tasklist must be runnable to find a target process");
-            String::from_utf8_lossy(&out.stdout)
+            let pid = String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .find_map(|l| l.split(',').nth(1)?.trim_matches('"').parse().ok())
                 .expect(
@@ -120,13 +127,36 @@ fn measure_another_process_token() {
                      filtered token could be read. Point the probe at a specific process with \
                      COSCA_PROBE_INSPECT_PID=<pid>, or run it on a machine with an interactive \
                      session — a headless CI runner cannot take this measurement.",
-                )
+                );
+            (pid, true)
         }
     };
 
-    // SAFETY: a query-only open of a live PID; both handles are closed below.
+    // SAFETY: a query-only open of a live PID; the handle is closed exactly once below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .unwrap_or_else(|e| panic!("could not open pid {pid} for query: {e}"));
+
+    // Verify what this handle actually IS, on the handle itself, before trusting its token: a PID
+    // is a number the OS can reuse for an unrelated process the moment the original one exits —
+    // between the `tasklist` snapshot above (or whatever supplied `COSCA_PROBE_INSPECT_PID`) and
+    // this `OpenProcess` call, `pid` could already name a different process. `GetProcessTimes`'s
+    // creation time is reported alongside the image for the same reason: it is evidence a reader
+    // can use to judge how likely that reuse race was, even though this probe has no earlier
+    // creation time of its own to compare it against.
+    let mut image_w = [0u16; 1024];
+    let mut image_len = image_w.len() as u32;
+    // SAFETY: `handle` is live; `image_w` outlives the call and `image_len` names its capacity.
+    let image_result =
+        unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(image_w.as_mut_ptr()), &mut image_len) };
+    let image_path = image_result.map(|()| String::from_utf16_lossy(&image_w[..image_len as usize]));
+
+    let mut creation = FILETIME::default();
+    let (mut exit_time, mut kernel_time, mut user_time) =
+        (FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: `handle` is live; every out-param below is a plain stack value borrowed for the call.
+    let times_result =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit_time, &mut kernel_time, &mut user_time) };
+
     let mut token = HANDLE::default();
     // SAFETY: `handle` is live; the token is wrapped in a guard immediately.
     let opened = unsafe { OpenProcessToken(handle, TOKEN_QUERY, &mut token) };
@@ -134,11 +164,36 @@ fn measure_another_process_token() {
     unsafe {
         let _ = CloseHandle(handle);
     }
+
+    let image_path = image_path.unwrap_or_else(|e| {
+        panic!("could not confirm pid {pid}'s image via QueryFullProcessImageNameW before trusting its token: {e}")
+    });
     opened.unwrap_or_else(|e| panic!("could not open pid {pid}'s token: {e}"));
     let token = Token(token);
 
     let mut out = String::new();
-    let _ = writeln!(out, "=== token of pid {pid} ===");
+    let _ = writeln!(out, "=== token of pid {pid} (image={image_path}) ===");
+    match times_result {
+        Ok(()) => {
+            let _ = writeln!(
+                out,
+                "  process creation time (FILETIME): high={} low={}",
+                creation.dwHighDateTime, creation.dwLowDateTime
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(out, "  GetProcessTimes: <{e}>");
+        }
+    }
+    if expect_explorer {
+        assert!(
+            image_path.to_lowercase().ends_with("explorer.exe"),
+            "pid {pid} was found via tasklist as explorer.exe, but the handle this probe opened \
+             reports its image as {image_path} instead — the PID was almost certainly reused by \
+             an unrelated process between the tasklist snapshot and OpenProcess, so the token \
+             below is NOT explorer.exe's and this measurement must not be trusted"
+        );
+    }
     describe(&mut out, "that process's token", token.0);
     match linked_token(token.0) {
         Ok(linked) => describe(&mut out, "its TokenLinkedToken", linked.0),
@@ -212,8 +267,8 @@ fn linked_token_chain_here() {
     // result. Fail loudly and specifically here instead of letting a hang masquerade as "step 1"
     // simply lacking a recognised outcome line below.
     assert!(
-        !out.contains("did not exit within"),
-        "a spawned child did not exit within its bound, so this probe's measurement is incomplete \
+        !out.contains(WAIT_INCOMPLETE_TOKEN),
+        "a spawned child's exit could not be confirmed, so this probe's measurement is incomplete \
          and must not be trusted:\n{out}"
     );
     // `out.contains("step 1")` alone can never fail: `measure` always emits a "step 1 ..." line,
@@ -361,24 +416,31 @@ fn unelevated_caller_view() {
             Err(e) => println!("PROBE unelevated-view: {route} with the medium token FAILED {e:?}"),
             Ok(()) => {
                 let job = contain(&pi, &format!("PROBE unelevated-view[{route}]"));
-                let exit = wait_for(&pi, &job, CHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
-                assert!(
-                    !exit.contains("did not exit within"),
-                    "PROBE unelevated-view: {route}'s medium child did not exit within its bound, \
-                     so this route's measurement is incomplete and must not be trusted: {exit}"
-                );
+                // Any `Err` here — not just one whose message happens to say "did not exit within"
+                // — means this route's measurement is incomplete; treat the `Result` itself as the
+                // check, rather than converting to a string first and pattern-matching English text.
+                let exit = match wait_for(&pi, &job, CHILD_EXIT_BOUND_MS) {
+                    Ok(code) => format!("exit=0x{code:08x}"),
+                    Err(e) => panic!(
+                        "PROBE unelevated-view: {route}'s medium child's exit could not be \
+                         confirmed, so this route's measurement is incomplete and must not be \
+                         trusted: {e}"
+                    ),
+                };
                 println!("PROBE unelevated-view: {route} started a medium child, {exit}. It reports:");
                 splice_child_report(&mut spliced, &child_report);
                 print!("{spliced}");
-                // A process the medium child itself spawned (there are none today, but
-                // `splice_child_report` pulls in whatever the child reported) could carry its own
-                // hang text through here; catch that the same way as the child's own direct hang,
-                // before the loop clears `spliced` for the next route and discards the evidence.
+                // The medium child runs the FULL chain (`measure`, the same as
+                // `linked_token_chain_here` runs directly), which itself spawns grandchildren
+                // through `spawn_attempts_with` — so a `WaitFailure` any of THOSE hit lands in the
+                // child's own report text, spliced in above. Catch that the same way as the medium
+                // child's own direct wait failure, before the loop clears `spliced` for the next
+                // route and discards the evidence.
                 assert!(
-                    !spliced.contains("did not exit within"),
-                    "PROBE unelevated-view: {route}'s medium child's own report shows something it \
-                     spawned did not exit within its bound, so this route's measurement is \
-                     incomplete and must not be trusted:\n{spliced}"
+                    !spliced.contains(WAIT_INCOMPLETE_TOKEN),
+                    "PROBE unelevated-view: {route}'s medium child's own report shows a grandchild \
+                     wait that could not be confirmed, so this route's measurement is incomplete \
+                     and must not be trusted:\n{spliced}"
                 );
             }
         }

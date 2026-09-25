@@ -2,12 +2,15 @@
 //! `lpDirectory` for a bare name? See `tests/windows_shell_resolution.rs`'s module doc for why these
 //! are the two questions this whole probe suite exists to answer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::core::HRESULT;
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
-use crate::harness::{plant_batch, probe_dir, read_self_report, shell_execute, LaunchOutcome};
+use crate::harness::{
+    plant_batch, probe_dir, read_self_report, read_self_report_image, shell_execute, shell_execute_with,
+    BoundedCallState, LaunchOutcome,
+};
 use crate::windows_probe::{mark_test_passed, same_file};
 
 /// **THE question.** `raw_executable("tool")` under `.elevate()` produces an `lpFile` that is
@@ -175,67 +178,98 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
 
 /// Same question as the probe above, but with `SEE_MASK_CLASSNAME`/`lpClass = "exefile"` set,
 /// matching production's actual elevated call (`launch_runas_with_host`,
-/// `src/elevation/windows.rs`) exactly. Forcing the class tells the shell the file's type is
-/// already known and dispatches straight to `HKCR\exefile\shell\<verb>\command`, skipping its own
-/// class-detection step — a materially different resolution path than letting the shell infer the
-/// class itself, which is what every OTHER probe in this suite does. See the module doc's "The
-/// lpClass divergence" section for why this probe exists and what it settles.
+/// `src/elevation/windows.rs`). Forcing the class tells the shell the file's type is already known
+/// and dispatches straight to `HKCR\exefile\shell\<verb>\command`, skipping its own class-detection
+/// step — a materially different resolution path than letting the shell infer the class itself,
+/// which is what every OTHER probe in this suite does. See the module doc's "The lpClass
+/// divergence" section for why this probe exists and what it settles.
+///
+/// Both a `tool.exe` (a copy of `cosca_testbin_image`, self-reporting via `--report-to`) and a
+/// `tool.bat` are planted side by side: PATHEXT's default order resolves a bare `tool` to whichever
+/// of these extensions it lists first, and which one that is is itself part of what this probe
+/// measures rather than something to assume — see each `Waited` arm below for how the conclusion is
+/// scoped to whichever file actually self-reports having run.
 #[test]
 #[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile() {
-    let (dir, marker) = probe_dir("lpdir-exefile");
+    let (dir, bat_marker) = probe_dir("lpdir-exefile-bat");
     let bat = dir.path().join("tool.bat");
-    plant_batch(&bat, &marker);
+    plant_batch(&bat, &bat_marker);
 
-    let outcome =
-        shell_execute(Path::new("tool"), Some(dir.path()), Some("exefile")).expect("probe must be measurable");
+    let image_bin = PathBuf::from(env!("CARGO_BIN_EXE_cosca_testbin_image"));
+    let exe = dir.path().join("tool.exe");
+    std::fs::copy(&image_bin, &exe).expect("copy cosca_testbin_image to tool.exe");
+    let exe_report = dir.path().join("lpdir-exefile-exe-report.txt");
+    let params = format!("--report-to \"{}\"", exe_report.display());
+
+    let outcome = shell_execute_with(
+        Path::new("tool"),
+        Some(dir.path()),
+        Some(&params),
+        Some("exefile"),
+        &BoundedCallState::default(),
+    )
+    .expect("probe must be measurable");
     match outcome {
         LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
             println!("PROBE pathless-lpFile-with-lpDirectory-as-exefile: launched=false ({e})");
             println!(
                 "  => under SEE_MASK_CLASSNAME/lpClass=\"exefile\", a path-less lpFile is NOT found \
-                 via lpDirectory search. This matches src/elevation/windows.rs:452's note of 'no \
-                 App Paths, no bare-name search' for an elevated caller under this same class, and \
-                 means the no-class probe above does NOT transfer to production's actual call: \
-                 completing the name closes a hazard the forced class was never exposed to in the \
-                 first place."
+                 via lpDirectory search — neither the planted tool.exe nor tool.bat ran. This \
+                 matches plan_runas's (src/elevation/windows.rs) note of 'no App Paths, no \
+                 bare-name search' for an elevated caller under this same class, and means the \
+                 no-class probe above does NOT transfer to production's actual call: completing the \
+                 name closes a hazard the forced class was never exposed to in the first place."
             );
         }
         LaunchOutcome::NotLaunched(e) => panic!(
             "PROBE pathless-lpFile-with-lpDirectory-as-exefile: `tool` cannot exist as a bare name in \
-             this directory (only `tool.bat` was planted), so ERROR_NO_ASSOCIATION (or anything but \
-             ERROR_FILE_NOT_FOUND) is not the negative this probe measures: {e}"
+             this directory (both `tool.exe` and `tool.bat` were planted), so ERROR_NO_ASSOCIATION \
+             (or anything but ERROR_FILE_NOT_FOUND) is not the negative this probe measures: {e}"
         ),
         LaunchOutcome::LaunchedNoHandle => panic!(
             "PROBE pathless-lpFile-with-lpDirectory-as-exefile: INCONCLUSIVE — launched without a \
-             process handle, so this probe could not wait for the batch to finish before reading its \
-             marker"
+             process handle, so this probe could not wait for the child to finish before reading its \
+             report"
         ),
         LaunchOutcome::Waited => {
-            let report = read_self_report(&marker);
+            let exe_ran = read_self_report_image(&exe_report).filter(|r| same_file(r, &exe));
+            let bat_ran = read_self_report(&bat_marker).filter(|r| same_file(r, &bat));
             println!(
-                "PROBE pathless-lpFile-with-lpDirectory-as-exefile: launched=true \
-                 self_report={report:?}"
+                "PROBE pathless-lpFile-with-lpDirectory-as-exefile: launched=true exe_ran={} \
+                 bat_ran={}",
+                exe_ran.is_some(),
+                bat_ran.is_some()
             );
-            match report {
-                Some(reported) if same_file(&reported, &bat) => println!(
+            match (exe_ran, bat_ran) {
+                (Some(_), None) => println!(
                     "  => under SEE_MASK_CLASSNAME/lpClass=\"exefile\", a path-less lpFile IS still \
-                     searched, PATHEXT applied and lpDirectory consulted — the forced class does NOT \
-                     close this hazard, contrary to src/elevation/windows.rs:452's note (which was \
-                     measured only for an elevated caller). The no-class probe above's conclusion \
-                     DOES transfer to production's actual call."
+                     searched, PATHEXT applied and lpDirectory consulted, and here it resolved to \
+                     the planted tool.exe (tool.bat was also planted, but did not run). The forced \
+                     class does NOT close this hazard for an .exe placeholder, contrary to \
+                     plan_runas's (src/elevation/windows.rs) note (measured only for an elevated \
+                     caller). This conclusion is scoped to tool.exe: it is NOT established that \
+                     tool.bat is also reachable this way — see the `tool.bat`-only probe above."
                 ),
-                Some(reported) => panic!(
-                    "PROBE pathless-lpFile-with-lpDirectory-as-exefile: INCONCLUSIVE — a marker was \
-                     written, but it self-reports {} instead of the planted batch {} — something \
-                     other than the planted batch ran",
-                    reported.display(),
-                    bat.display()
+                (None, Some(_)) => println!(
+                    "  => under SEE_MASK_CLASSNAME/lpClass=\"exefile\", a path-less lpFile IS still \
+                     searched, PATHEXT applied and lpDirectory consulted, and here it resolved to \
+                     the planted tool.bat (tool.exe was also planted, but did not run). The forced \
+                     class does NOT close this hazard for a .bat placeholder, contrary to \
+                     plan_runas's (src/elevation/windows.rs) note (measured only for an elevated \
+                     caller). This conclusion is scoped to tool.bat: it is NOT established that \
+                     tool.exe is also reachable this way."
                 ),
-                None => panic!(
+                (Some(_), Some(_)) => panic!(
+                    "PROBE pathless-lpFile-with-lpDirectory-as-exefile: INCONCLUSIVE — both the \
+                     planted tool.exe and tool.bat self-reported having run from a single \
+                     ShellExecuteExW call, which should be impossible — something is wrong with the \
+                     harness, not the measurement"
+                ),
+                (None, None) => panic!(
                     "PROBE pathless-lpFile-with-lpDirectory-as-exefile: INCONCLUSIVE — the shell \
-                     waited on a real process, but no marker was ever written, so what actually ran \
-                     cannot be confirmed"
+                     waited on a real process, but neither planted file self-reported having run, so \
+                     what actually ran cannot be confirmed"
                 ),
             }
         }

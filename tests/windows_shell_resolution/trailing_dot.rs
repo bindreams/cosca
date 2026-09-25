@@ -18,13 +18,66 @@ use crate::harness::{
 };
 use crate::windows_probe::{mark_test_passed, same_file};
 
-/// Half one: does a trailing dot SUPPRESS the PATHEXT extension that the probe above measured?
+/// Half one: does a trailing dot SUPPRESS the PATHEXT extension that `pathext.rs`'s
+/// `does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile` measured? That undotted
+/// baseline is re-measured here too, in the SAME test and against the SAME planted `tool.bat`,
+/// rather than trusted from a separate test file's separate run: `pathext.rs` plants its own
+/// `tool.bat` in its own temp directory, so nothing ties its result to this probe's — a change to
+/// either file's setup could silently make the two probes' conclusions stop actually comparing the
+/// same thing.
 #[test]
 #[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
     let (dir, marker) = probe_dir("dot-suppress");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
+    let undotted = dir.path().join("tool"); // the baseline: absolute, extensionless, no dot
+
+    let undotted_outcome = shell_execute(&undotted, None, None).expect("probe must be measurable");
+    let undotted_ran_bat = match undotted_outcome {
+        LaunchOutcome::Waited => {
+            let report = read_self_report(&marker);
+            println!("PROBE trailing-dot-suppresses-pathext[baseline]: launched=true self_report={report:?}");
+            match report {
+                Some(reported) if same_file(&reported, &bat) => true,
+                Some(reported) => panic!(
+                    "PROBE trailing-dot-suppresses-pathext[baseline]: INCONCLUSIVE — a marker was \
+                     written, but it self-reports {} instead of the planted batch {} — something \
+                     other than the planted batch ran",
+                    reported.display(),
+                    bat.display()
+                ),
+                None => panic!(
+                    "PROBE trailing-dot-suppresses-pathext[baseline]: INCONCLUSIVE — the shell \
+                     waited on a real process, but no marker was ever written, so what actually ran \
+                     cannot be confirmed"
+                ),
+            }
+        }
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
+            println!("PROBE trailing-dot-suppresses-pathext[baseline]: launched=false ({e})");
+            false
+        }
+        LaunchOutcome::NotLaunched(e) => panic!(
+            "PROBE trailing-dot-suppresses-pathext[baseline]: unexpected error (not \
+             ERROR_FILE_NOT_FOUND): {e}"
+        ),
+        LaunchOutcome::LaunchedNoHandle => panic!(
+            "PROBE trailing-dot-suppresses-pathext[baseline]: INCONCLUSIVE — launched without a \
+             process handle, so this probe could not wait for the batch to finish before reading its \
+             marker"
+        ),
+    };
+    assert!(
+        undotted_ran_bat,
+        "PROBE trailing-dot-suppresses-pathext[baseline]: the undotted `tool` did not reach the \
+         planted `tool.bat` in this environment, so the dotted measurement below has no baseline to \
+         be compared against"
+    );
+    // The marker `tool.bat` writes is truncated by `plant_batch`'s own `>` redirect, so re-running
+    // it below for the dotted spelling cannot be confused with this baseline run's own marker.
+    let _ = std::fs::remove_file(&marker);
+
     let lp_file = dir.path().join("tool."); // the "complete name" spelling
 
     let outcome = shell_execute(&lp_file, None, None).expect("probe must be measurable");

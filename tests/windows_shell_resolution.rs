@@ -71,10 +71,10 @@
 //! probes here set that, except `pathext::does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile`,
 //! added specifically to measure it: forcing the class is itself a variable in `lpFile` resolution,
 //! not incidental to it, so the "same `PathResolve` step for every verb" premise below does not by
-//! itself cover a divergence in `lpClass`. An existing comment beside production's own call
-//! (`src/elevation/windows.rs:452`) records, for an ELEVATED caller under that forced class: "no App
-//! Paths, no bare-name search, % literal" — see that probe's doc for how its measurement reconciles
-//! with this file's no-class conclusion.
+//! itself cover a divergence in `lpClass`. An existing comment inside `plan_runas`
+//! (`src/elevation/windows.rs`), beside production's own call, records, for an ELEVATED caller under
+//! that forced class: "no App Paths, no bare-name search, % literal" — see that probe's doc for how
+//! its measurement reconciles with this file's no-class conclusion.
 //!
 //! # Why they are `#[ignore]`d
 //!

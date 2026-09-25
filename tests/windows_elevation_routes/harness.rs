@@ -7,10 +7,12 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::os::windows::io::BorrowedHandle;
 use std::path::Path;
+use std::time::Duration;
 
+use cosca::containment::TreeDrain;
 use cosca::Job;
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN};
 use windows::Win32::Security::{
     DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LookupPrivilegeNameW,
@@ -25,12 +27,16 @@ use windows::Win32::System::Threading::{
 };
 
 /// A child is an external process that might never exit, so this is the honest failure bound
-/// surfaced to whoever reads the log — not a synchronisation device. If it trips, [`wait_for`]
-/// kills the child's whole job tree, then waits (unboundedly) on the child's OWN process handle
-/// for that kill to land, and only then reports that the child did not finish; it never silently
-/// continues, and never touches a file or account the child might still hold open. That final
-/// wait covers only the immediate child: the job handle is already closed by the time the kill
-/// call returns, so there is nothing left to wait on for the rest of the tree.
+/// surfaced to whoever reads the log — not a synchronisation device. [`wait_for`] gives this to
+/// `Job::wait_tree_timeout`, which drains the WHOLE job tree (the child and every grandchild it
+/// spawned) through a real kernel primitive, not just the immediate child. If it trips, `wait_for`
+/// kills the whole tree, then waits (unboundedly) on the child's OWN process handle for that kill
+/// to land, and only then reports that the tree did not finish; it never silently continues. On
+/// that kill/timeout fallback path, only the immediate child can still be confirmed gone — the job
+/// handle is consumed by `kill_tree` by the time the fallback wait runs, so there is no way to
+/// re-confirm the rest of the tree — but on the (common) success path, the whole tree, not just the
+/// immediate child, is confirmed exited before `wait_for` returns, so it is safe for the caller to
+/// touch any file or account any member of the tree might otherwise still hold open.
 ///
 /// This is the bound for a process this test binary spawns and waits on directly. Some of those
 /// children — `logon_routes::logon_one_account`'s and `token_filtering::unelevated_caller_view`'s,
@@ -48,22 +54,13 @@ pub(crate) const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 /// left unset — there is enough headroom left in the outer bound for this inner one to trip, kill,
 /// and recover before the outer wait could plausibly trip too. See `CHILD_EXIT_BOUND_MS`'s doc.
 ///
-/// The real worst case this has to clear is FOUR sequential grandchild waits, not two: [`measure`]
-/// calls `spawn_attempts_with` twice — once for the linked token, once for the caller's own — and
-/// each of those calls itself loops over `CreateProcessAsUserW` then `CreateProcessWithTokenW`,
-/// each with its own `wait_for(GRANDCHILD_EXIT_BOUND_MS)`. That is 2 calls × 2 waits, all of which
-/// can trip in turn before the outer `wait_for` in `logon_routes::logon_one_account` /
-/// `token_filtering::unelevated_caller_view` needs to see the whole thing finished. Each
-/// trip-kill-recover can itself take up to twice its own bound (the minimum ×2 margin
-/// `CHILD_EXIT_BOUND_MS`'s doc relies on), so the real worst case is
-/// `4 * (2 * GRANDCHILD_EXIT_BOUND_MS)` = `8 * GRANDCHILD_EXIT_BOUND_MS` before the outer wait
-/// could plausibly see it done. At a tenth of `CHILD_EXIT_BOUND_MS`, that leaves only about ×1.25
-/// of headroom over the bare minimum — tight, not the wide margin a "kept well under" framing might
-/// suggest, but `const _` below still asserts the real relationship
-/// (`4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS`) holds, so a future change to either
-/// constant cannot silently erode it below break-even.
+/// No finite worst-case multiple of this constant is claimed to bound the outer wait: `wait_for`
+/// does not distinguish, by measurement, which of several nested `wait_tree_timeout`/kill-and-reap
+/// phases a slow run spent its time in, so attributing blame to a specific phase count (e.g. "four
+/// grandchild waits") would not be something this harness actually observes — only something a
+/// reader would have to trust blind. Kept at a tenth of `CHILD_EXIT_BOUND_MS` as a practical
+/// margin instead.
 const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 10;
-const _: () = assert!(4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS);
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
 
@@ -422,87 +419,128 @@ pub(crate) fn contain(pi: &PROCESS_INFORMATION, context: &str) -> Job {
     job
 }
 
-/// Wait for a child held in `job`, and return its exit code — or a description of why it could
-/// not be measured. `bound_ms` is given to this one, outermost wait only: on a timeout it kills
-/// the whole job, then waits (unboundedly) on the CHILD'S OWN process handle for that kill to
-/// actually land — not `job.wait_tree()`, which would return an error at once here: `Job::kill_tree`
-/// closes the underlying job handle as part of tearing the job down (see its doc), so by the time
-/// `wait_tree` could run there is nothing left for it to wait on. That final wait has no bound of
-/// its own because it is waiting on a real kernel outcome (the kill taking effect), not racing a
-/// clock — so by the time this returns, the immediate child is provably gone and it is safe for
-/// the caller to touch any file or account it might otherwise still hold open. It only covers the
-/// immediate child, not the rest of the tree: once the job handle is closed there is no longer a
-/// way to wait on the tree as a whole.
+/// Why [`wait_for`] could not confirm a child's exit code. Every caller must treat ANY `Err` here
+/// as "this probe's measurement is incomplete" — never gate that on whether the message happens to
+/// contain some particular English phrase, since that silently misses whichever failure text does
+/// not happen to contain it. `Display` always leads with [`WAIT_INCOMPLETE_TOKEN`], so a report a
+/// descendant wrote to a FILE (plain text, not this Rust value) still carries a stable, grep-able
+/// marker for whichever ancestor eventually splices that file in via [`splice_child_report`].
+#[derive(Debug)]
+pub(crate) struct WaitFailure(String);
+
+/// The stable marker every [`WaitFailure`] carries in its `Display`. A caller that only sees a
+/// spliced-in text report — not the `Result` itself — greps for this token instead of any
+/// particular English phrase.
+pub(crate) const WAIT_INCOMPLETE_TOKEN: &str = "WAIT-INCOMPLETE";
+
+impl std::fmt::Display for WaitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{WAIT_INCOMPLETE_TOKEN}: {}", self.0)
+    }
+}
+
+/// Wait for the WHOLE tree held in `job` to exit, and return the immediate child's exit code — or
+/// a [`WaitFailure`] describing why the measurement is incomplete. `bound_ms` is given to
+/// `Job::wait_tree_timeout`, which drains the tree (the child and every grandchild it spawned)
+/// through a real kernel primitive (Job Object membership accounting), not just the immediate
+/// child's own process handle.
 ///
-/// The first wait's result is matched explicitly rather than treated as a bare timeout: only
-/// `WAIT_TIMEOUT` means the child is still running after `bound_ms`. Any other non-`WAIT_OBJECT_0`
-/// result — `WAIT_FAILED`, or an unrecognised code — means the wait itself could not be taken, and
-/// is reported with `GetLastError` rather than mislabelled as a timeout that never happened.
-/// Teardown is identical either way: a child this call cannot confirm has exited is not left
-/// running just because the reason it could not be confirmed differs.
+/// On [`TreeDrain::AllMembersExited`], every member of the tree is confirmed gone, so reading the
+/// immediate child's exit code and touching any file or account any member of the tree might
+/// otherwise still hold open is safe. `TreeDrain::AllMarkersClosed` is the macOS fd-marker
+/// channel; `wait_tree_timeout` on a Windows `Job` only ever drives the Job Object channel, so
+/// that variant is asserted unreachable rather than silently matched away — see [`TreeDrain`]'s
+/// own doc.
+///
+/// On [`TreeDrain::MembersRemain`] or an `Err` from `wait_tree_timeout` itself (the job handle was
+/// already consumed by a concurrent `kill_tree`/`Drop`, or the duplicate/wait syscalls failed),
+/// this falls back to killing the whole tree and then waiting (unboundedly) on the CHILD'S OWN
+/// process handle for that kill to land — not `job.wait_tree()` again, which would fail at once:
+/// `Job::kill_tree` closes the underlying job handle as part of tearing the job down (see its
+/// doc), so there is nothing left afterward for a tree-wide wait to act on. That fallback wait has
+/// no bound of its own because it is waiting on a real kernel outcome (the kill taking effect),
+/// not racing a clock — so once it returns, the immediate child is provably gone. It only covers
+/// the immediate child, not the rest of the tree: once the job handle is closed there is no longer
+/// a way to wait on the tree as a whole, which is why the success path above — confirming the
+/// WHOLE tree before ever touching `kill_tree` — is what this function reaches for first.
 ///
 /// Callers pass [`CHILD_EXIT_BOUND_MS`] for a process they spawned and wait on directly, or
 /// [`GRANDCHILD_EXIT_BOUND_MS`] inside [`spawn_attempts_with`] — see that constant's doc for why
 /// the two must stay different.
-pub(crate) fn wait_for(pi: &PROCESS_INFORMATION, job: &Job, bound_ms: u32) -> Result<u32, String> {
-    // SAFETY: `pi.hProcess` was just returned by CreateProcess* and is closed exactly once below.
-    let waited = unsafe { WaitForSingleObject(pi.hProcess, bound_ms) };
-    if waited != WAIT_OBJECT_0 {
-        let reason = if waited == WAIT_TIMEOUT {
-            format!("the child did not exit within {bound_ms}ms")
-        } else {
-            format!(
-                "WaitForSingleObject on the child failed ({waited:?}): {}",
-                std::io::Error::last_os_error()
-            )
-        };
-        let killed = job.kill_tree();
-        if let Err(kill_err) = &killed {
-            // `kill_tree` itself failed, so nothing has confirmed the job's members were ever
-            // actually asked to terminate. Fall back to terminating the immediate child directly,
-            // and check THAT result too, rather than waiting INFINITE below on a process nothing
-            // here has managed to ask to exit.
-            // SAFETY: `pi.hProcess` is still a valid, open handle to the child.
-            let terminated = unsafe { TerminateProcess(pi.hProcess, 1) };
-            if let Err(term_err) = terminated {
-                unsafe {
-                    let _ = CloseHandle(pi.hThread);
-                    let _ = CloseHandle(pi.hProcess);
-                }
-                return Err(format!(
-                    "{reason}; kill_tree failed ({kill_err}) and the direct child could not be \
-                     terminated either ({term_err}) — it has been abandoned rather than waited on \
-                     unboundedly for an exit nothing here could obtain"
-                ));
+pub(crate) fn wait_for(pi: &PROCESS_INFORMATION, job: &Job, bound_ms: u32) -> Result<u32, WaitFailure> {
+    match job.wait_tree_timeout(Duration::from_millis(u64::from(bound_ms))) {
+        Ok(TreeDrain::AllMembersExited) => {
+            // SAFETY: every member of the job — including `pi.hProcess` — is confirmed exited;
+            // both handles are closed exactly once.
+            unsafe {
+                let mut code = 0u32;
+                let got = GetExitCodeProcess(pi.hProcess, &mut code);
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+                got.map_err(|e| WaitFailure(format!("GetExitCodeProcess failed: {e}")))?;
+                Ok(code)
             }
         }
-        // `kill_tree` already closed the job handle on success, so `job.wait_tree()` would fail
-        // immediately here instead of waiting for anything (see this function's doc comment).
-        // Either `kill_tree` succeeded, or the fallback `TerminateProcess` above did — either way
-        // the child has genuinely been asked to exit, so waiting on its own process handle now
-        // observes a real kernel outcome, not a clock race.
-        // SAFETY: `pi.hProcess` is still a valid, open handle to the child; waiting on it does
-        // not consume or invalidate it, so it is still safe to close below.
-        let waited_after_kill = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
-        // SAFETY: the wait above means the immediate child is confirmed gone (or the wait itself
-        // failed, which `waited_after_kill` reports); both handles are closed exactly once.
-        unsafe {
-            let _ = CloseHandle(pi.hThread);
-            let _ = CloseHandle(pi.hProcess);
+        Ok(TreeDrain::AllMarkersClosed) => unreachable!(
+            "wait_tree_timeout on a Windows Job drives only the Job Object completion channel; it \
+             never reports the macOS fd-marker variant"
+        ),
+        Ok(TreeDrain::MembersRemain) => {
+            kill_and_reap(pi, job, format!("the job tree did not fully drain within {bound_ms}ms"))
         }
-        return Err(format!(
-            "{reason}; kill_tree={killed:?} wait_after_kill={waited_after_kill:?}"
-        ));
+        Err(e) => kill_and_reap(
+            pi,
+            job,
+            format!("wait_tree_timeout on the job failed ({e}), so this could not confirm the tree had exited"),
+        ),
     }
-    // SAFETY: the process signalled within the bound above; both handles are closed exactly once.
+}
+
+/// The kill-then-reap fallback [`wait_for`] uses once a tree-wide `wait_tree_timeout` could not
+/// itself confirm the tree had drained. `reason` names what `wait_tree_timeout` reported before
+/// this ran. Kills the whole job, then waits (unboundedly, on a real kernel outcome — not a clock
+/// race) on the CHILD'S OWN process handle for that kill to land; only the immediate child can
+/// still be confirmed gone this way, since `kill_tree` consumes the job handle a tree-wide wait
+/// would otherwise need. The returned message says what happened to the child at every step,
+/// including a `TerminateProcess` failure, rather than only ever blaming the original wait.
+fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<u32, WaitFailure> {
+    let killed = job.kill_tree();
+    if let Err(kill_err) = &killed {
+        // `kill_tree` itself failed, so nothing has confirmed the job's members were ever
+        // actually asked to terminate. Fall back to terminating the immediate child directly,
+        // and check THAT result too, rather than waiting INFINITE below on a process nothing
+        // here has managed to ask to exit.
+        // SAFETY: `pi.hProcess` is still a valid, open handle to the child.
+        let terminated = unsafe { TerminateProcess(pi.hProcess, 1) };
+        if let Err(term_err) = terminated {
+            unsafe {
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+            }
+            return Err(WaitFailure(format!(
+                "{reason}; kill_tree failed ({kill_err}) and the direct child could not be \
+                 terminated either ({term_err}) — it has been abandoned rather than waited on \
+                 unboundedly for an exit nothing here could obtain"
+            )));
+        }
+    }
+    // `kill_tree` already closed the job handle on success, so `job.wait_tree()` would fail
+    // immediately here instead of waiting for anything (see this function's doc comment).
+    // Either `kill_tree` succeeded, or the fallback `TerminateProcess` above did — either way
+    // the child has genuinely been asked to exit, so waiting on its own process handle now
+    // observes a real kernel outcome, not a clock race.
+    // SAFETY: `pi.hProcess` is still a valid, open handle to the child; waiting on it does
+    // not consume or invalidate it, so it is still safe to close below.
+    let waited_after_kill = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+    // SAFETY: the wait above means the immediate child is confirmed gone (or the wait itself
+    // failed, which `waited_after_kill` reports); both handles are closed exactly once.
     unsafe {
-        let mut code = 0u32;
-        let got = GetExitCodeProcess(pi.hProcess, &mut code);
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
-        got.map_err(|e| format!("GetExitCodeProcess failed: {e}"))?;
-        Ok(code)
     }
+    Err(WaitFailure(format!(
+        "{reason}; kill_tree={killed:?} wait_after_kill={waited_after_kill:?}"
+    )))
 }
 
 /// Read back a report a child wrote, indented so nesting is visible in the log.
@@ -714,8 +752,8 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
             }
             Ok(()) => {
                 let job = contain(&pi, &format!("PROBE spawn-attempts[{which}/{step}]"));
-                let exit =
-                    wait_for(&pi, &job, GRANDCHILD_EXIT_BOUND_MS).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+                let exit = wait_for(&pi, &job, GRANDCHILD_EXIT_BOUND_MS)
+                    .map_or_else(|e| e.to_string(), |c| format!("exit=0x{c:08x}"));
                 let _ = writeln!(out, "  {step} [{which} token]: STARTED, {exit}. The child reports:");
                 splice_child_report(out, &report);
             }
@@ -790,30 +828,24 @@ impl ScratchAccount {
                 String::from_utf8_lossy(&out.stderr)
             ));
         }
+        // The account already exists on the host from this point on. Construct `Self` immediately
+        // — not after the `if admin` block below — so `Drop` runs uniformly for every subsequent
+        // `?`/return in this function: `net localgroup ... /add` below can itself fail after the
+        // account has already been created, and returning `Err` before `Self` existed used to
+        // `?`-propagate straight past a manual rollback block, leaking the account on that one
+        // path. Constructing `Self` here makes `Drop` the single, uniform cleanup for every path
+        // through the rest of this function, so no separate manual rollback is needed at all.
+        let account = Self {
+            user: user.to_string(),
+            password,
+            admin,
+        };
         if admin {
             let out = std::process::Command::new("net")
                 .args(["localgroup", "Administrators", user, "/add"])
                 .output()
                 .map_err(|e| format!("could not run `net localgroup`: {e}"))?;
             if !out.status.success() {
-                match std::process::Command::new("net")
-                    .args(["user", user, "/delete"])
-                    .output()
-                {
-                    Ok(o) if o.status.success() => {
-                        println!("PROBE scratch-account: rolled back {user} after a failed Administrators add")
-                    }
-                    Ok(o) => println!(
-                        "PROBE scratch-account: rollback `net user {user} /delete` FAILED: status={} \
-                         stdout={} stderr={}",
-                        o.status,
-                        String::from_utf8_lossy(&o.stdout),
-                        String::from_utf8_lossy(&o.stderr)
-                    ),
-                    Err(e) => {
-                        println!("PROBE scratch-account: rollback `net user {user} /delete` could not be run: {e}");
-                    }
-                }
                 return Err(format!(
                     "adding {user} to Administrators failed: status={:?} stdout={} stderr={}",
                     out.status,
@@ -822,11 +854,7 @@ impl ScratchAccount {
                 ));
             }
         }
-        Ok(Self {
-            user: user.to_string(),
-            password,
-            admin,
-        })
+        Ok(account)
     }
 }
 

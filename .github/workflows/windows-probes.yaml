@@ -34,11 +34,14 @@ on:
       - "tests/windows_path_resolution.rs"
       - "tests/windows_path_resolution/**"
       - "tests/windows_shell_execute.rs"
+      - "tests/common/windows_probe.rs"
       # The canary's payload is built from here.
       - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
       - "Cargo.toml"
       - "Cargo.lock"
+      # `terminate-after` and other nextest profile settings the probes' own bounds are chosen against.
+      - ".config/nextest.toml"
       - ".github/actions/setup-rust/**"
       - ".github/workflows/windows-probes.yaml"
   # `windows-latest` floats: a new Windows build can change the answer with no commit here.
@@ -258,7 +261,7 @@ jobs:
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          NAME='does_a_trailing_dot_still_open_the_extensionless_file'
+          NAME='trailing_dot::does_a_trailing_dot_still_open_the_extensionless_file'
           if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
@@ -282,7 +285,7 @@ jobs:
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          NAME='does_pathext_outrank_an_existing_extensionless_file'
+          NAME='precedence::does_pathext_outrank_an_existing_extensionless_file'
           if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
@@ -306,7 +309,7 @@ jobs:
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          NAME='does_an_existing_extensionless_file_ever_launch_directly'
+          NAME='precedence::does_an_existing_extensionless_file_ever_launch_directly'
           if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
