@@ -3188,3 +3188,180 @@ fn leaking_after_a_blocking_reap_finished_disarms_the_retained_leaf() {
     assert!(!kill.exists(), "a leaked child's leaf must not be killed through");
     assert!(reaped(&pidfd), "its blocking reap reaped it");
 }
+
+/// `Unreaped::wait` disarms the leaf it retains even when the wait itself fails: a bare `drop`
+/// (the regression this test guards against) leaves the leaf armed, so its own `Drop` still fires
+/// `cgroup.kill` the next time something makes the leaf directory unremovable.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_disarms_the_retained_leaf_even_when_the_wait_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    let err = unreaped.wait().expect_err("the forced failure must fail the wait");
+    assert!(err.to_string().contains("forced wait failure"), "{err}");
+    assert!(!kill.exists(), "a failed wait must still disarm the leaf it retains");
+    drop(stdin);
+    reap(pid);
+}
+
+/// `Unreaped::drop` disarms the leaf it retains even when its synchronous wait fails, the same as
+/// `wait` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_disarms_the_retained_leaf_even_when_the_wait_fails() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    let mark = crate::log_capture::mark();
+    drop(unreaped);
+    assert!(
+        crate::log_capture::contains_since(mark, "it stays unreaped"),
+        "a failed wait in Drop must be logged"
+    );
+    assert!(
+        !kill.exists(),
+        "a failed wait in Drop must still disarm the leaf it retains"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// A `cosca::tokio::Unreaped::wait` that releases the child for uncertain ownership still disarms
+/// the leaf it retains, the same as a leaked or successfully reaped one does.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn wait_disarms_the_retained_leaf_when_ownership_becomes_uncertain() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_uncertain();
+        let err = unreaped
+            .wait()
+            .await
+            .expect_err("forced uncertain ownership must fail the wait");
+        assert!(err.to_string().contains("forced uncertain ownership"), "{err}");
+    });
+    assert!(
+        !kill.exists(),
+        "a wait that releases for uncertain ownership must still disarm the leaf it retains"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// A `cosca::tokio::Unreaped` dropped without ever being awaited falls to `Drop`'s own
+/// synchronous wait, which must disarm the leaf it retains even when that wait fails, the same as
+/// the sync `Unreaped`'s `Drop` does.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn drop_disarms_the_retained_leaf_even_when_the_synchronous_wait_fails() {
+    crate::log_capture::install();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let mark = crate::log_capture::mark();
+    runtime.block_on(async {
+        let unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        // Dropped without ever being awaited: `Drop` falls straight to its own synchronous wait.
+        drop(unreaped);
+    });
+    assert!(
+        crate::log_capture::contains_since(mark, "it stays unreaped"),
+        "a failed synchronous wait in Drop must be logged"
+    );
+    assert!(
+        !kill.exists(),
+        "Drop's synchronous wait failure must still disarm the leaf it retains"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// `Prepared::settle_verdict` — the tokio identity-failure teardown arm's own verdict-taking,
+/// which runs BEFORE the caller gets an `Unreaped` back — retains a successfully placed leaf as
+/// `Attached::Cgroup`, rather than leaving `Prepared` to drop it: a bare drop there would
+/// `cgroup.kill` and drain-wait the tree before the caller's error even returns, exactly the
+/// premature teardown `teardown_unadopted`'s own `attached` parameter (sync's twin) exists to
+/// avoid.
+#[cfg(target_os = "linux")]
+#[test]
+fn settle_verdict_retains_a_placed_leaf_as_attached_cgroup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-settle-verdict-retains");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    // SAFETY: the slot's channel lives as long as `leaf`.
+    unsafe { leaf.placement_slot().report_placed_for_test() };
+
+    let mut prepared = crate::containment::Prepared {
+        mode: Some(crate::containment::ContainMode::Strongest),
+        is_root: true,
+        cgroup_leaf: Some(leaf),
+        #[cfg(target_os = "macos")]
+        marker: None,
+        #[cfg(windows)]
+        graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
+    };
+    // This process's own pid stands in for a child's, exactly as `entered_leaf_at` does: the
+    // synthetic report already decided `Placed` before `take_placement` ever reads a pid.
+    let attached = prepared.settle_verdict(std::process::id());
+    let Some(crate::containment::Attached::Cgroup(leaf)) = attached else {
+        panic!("a placed verdict must retain the leaf as Attached::Cgroup, got {attached:?}");
+    };
+
+    // Occupy the leaf so its `Drop` cannot silently `rmdir` it away: this makes the retained
+    // leaf's continued liveness (armed, real, killable-through) observable.
+    std::fs::write(leaf_path.join("occupant"), b"").expect("occupy the leaf");
+    let kill = leaf_path.join("cgroup.kill");
+    assert!(
+        !kill.exists(),
+        "settle_verdict itself must not tear the leaf down: retaining it, not dropping it, is the point"
+    );
+    drop(leaf);
+    assert_eq!(
+        std::fs::read(&kill).expect("cgroup.kill written"),
+        b"1",
+        "the retained leaf must still be a normal, live one, killable through exactly as any other"
+    );
+}

@@ -57,9 +57,15 @@ struct BlockingReap {
 
 #[cfg(unix)]
 enum ReapState {
+    /// The task has not yet claimed the child: still queued for a blocking-pool thread, or
+    /// dropped (a runtime shutdown) before it ever ran. Reclaimable directly, without waiting for
+    /// a thread that a saturated pool may never free: see `reclaim_before_start`.
+    NotStarted(Box<Held>, Option<Box<Retained>>),
+    /// The task has claimed the child and is running (or, having panicked mid-run, is about to
+    /// report `None` from its own `Drop`).
     Running,
     /// The child and what it retained, handed back, and how the reap went: `None` if the task
-    /// ended without running it — it panicked, or the runtime shut down before it started.
+    /// claimed the child, then ended without finishing — it panicked after claiming it.
     Finished(
         Box<Held>,
         Option<Box<Retained>>,
@@ -67,7 +73,7 @@ enum ReapState {
     ),
     /// `leak` gave the child up while the task held it: the task disarms what it retained.
     Leaked,
-    /// The holder took what the task handed back.
+    /// The holder took what the task handed back, or reclaimed it directly.
     Taken,
 }
 
@@ -77,9 +83,16 @@ impl BlockingReap {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Block until the task has finished, and take what it handed back.
+    /// Block until the task has finished, and take what it handed back. Only correct to call once
+    /// the task has claimed the child (state is no longer `NotStarted`): a task still queued may
+    /// be behind the very thread that would call this, which would deadlock it — check
+    /// `reclaim_before_start` first.
     fn take_blocking(&self) -> ReapState {
         let mut state = self.state();
+        debug_assert!(
+            !matches!(*state, ReapState::NotStarted(..)),
+            "take_blocking on a task that has not claimed the child would wait on pool scheduling"
+        );
         while matches!(*state, ReapState::Running) {
             state = self
                 .finished
@@ -88,13 +101,30 @@ impl BlockingReap {
         }
         std::mem::replace(&mut *state, ReapState::Taken)
     }
+
+    /// Take the child back directly, without waiting for the task, if it has not yet claimed it —
+    /// still queued, or dropped unrun. The task, if it later runs anyway, finds the child already
+    /// gone and does nothing (see `ReapTask::run`).
+    #[cfg(unix)]
+    fn reclaim_before_start(&self) -> Option<(Box<Held>, Option<Box<Retained>>)> {
+        let mut state = self.state();
+        if !matches!(*state, ReapState::NotStarted(..)) {
+            return None;
+        }
+        let ReapState::NotStarted(held, retained) = std::mem::replace(&mut *state, ReapState::Taken) else {
+            unreachable!("checked above")
+        };
+        Some((held, retained))
+    }
 }
 
 /// The blocking-pool task's hold on the child. Whether it runs or is dropped unrun, it reports to
-/// the holder exactly once.
+/// the holder exactly once — but only once it has claimed the child from `NotStarted`; a task
+/// beaten to the claim by a direct reclaim does nothing at all.
 #[cfg(unix)]
 struct ReapTask {
     shared: std::sync::Arc<BlockingReap>,
+    /// `Some` only once `run` has claimed the child from `NotStarted`, until it reports.
     held: Option<Box<Held>>,
     retained: Option<Box<Retained>>,
     signal: Option<::tokio::sync::oneshot::Sender<()>>,
@@ -103,13 +133,34 @@ struct ReapTask {
 #[cfg(unix)]
 impl ReapTask {
     fn run(mut self) {
-        let held = self.held.as_mut().expect("held until reported");
+        if !self.claim() {
+            // Reclaimed directly before this task was scheduled: nothing to do.
+            return;
+        }
+        let held = self.held.as_mut().expect("claimed above");
         let reaped = crate::child::unreaped::block_until_reapable(held.pid()).and_then(|()| held.try_reap());
         self.report(Some(reaped));
     }
 
+    /// Atomically take the child from `NotStarted`, transitioning to `Running`. `false` if a
+    /// direct reclaim already took it.
+    fn claim(&mut self) -> bool {
+        let mut state = self.shared.state();
+        match std::mem::replace(&mut *state, ReapState::Running) {
+            ReapState::NotStarted(held, retained) => {
+                self.held = Some(held);
+                self.retained = retained;
+                true
+            }
+            other => {
+                *state = other;
+                false
+            }
+        }
+    }
+
     fn report(&mut self, reaped: Option<std::io::Result<Option<ExitStatus>>>) {
-        let held = self.held.take().expect("reported once");
+        let held = self.held.take().expect("reported once, after claiming");
         let retained = self.retained.take();
         let mut state = self.shared.state();
         match *state {
@@ -121,7 +172,9 @@ impl ReapTask {
                     retained.attached.disarm();
                 }
             }
-            ReapState::Finished(..) | ReapState::Taken => unreachable!("a blocking reap reports once"),
+            ReapState::NotStarted(..) | ReapState::Finished(..) | ReapState::Taken => {
+                unreachable!("a blocking reap reports once, after claiming")
+            }
         }
         drop(state);
         self.shared.finished.notify_all();
@@ -135,6 +188,8 @@ impl ReapTask {
 #[cfg(unix)]
 impl Drop for ReapTask {
     fn drop(&mut self) {
+        // `held` is `Some` only once `claim` succeeded and before `report` runs: a task never
+        // scheduled, or beaten to the claim by a direct reclaim, has nothing to report.
         if self.held.is_some() {
             self.report(None);
         }
@@ -144,6 +199,10 @@ impl Drop for ReapTask {
 /// Why an async wait did not reap: the child's ownership became uncertain, so it must be released;
 /// or its exit cannot be awaited without blocking, and the caller keeps it.
 enum Failed {
+    /// On Unix, a genuine `ECHILD` (see `crate::child::unreaped::releases_ownership`). On Windows
+    /// a held handle always pins its process, so nothing in production code constructs this here
+    /// — only the `set_force_uncertain` test seam does, cross-platform, for a shared test.
+    #[cfg_attr(windows, allow(dead_code))]
     Uncertain(std::io::Error),
     Unawaitable(std::io::Error),
     /// Its exit is certain, but it is not reapable yet: see `Unreaped::wait`'s blocking reap.
@@ -214,21 +273,20 @@ impl Unreaped {
                 // on a runtime worker. The task owns the child, so no wait there is keyed on a pid
                 // the holder could reap and free.
                 Err(Failed::NotYetReapable) => {
-                    let shared = std::sync::Arc::new(BlockingReap {
-                        state: std::sync::Mutex::new(ReapState::Running),
-                        finished: std::sync::Condvar::new(),
-                    });
-                    let (signal, finished) = ::tokio::sync::oneshot::channel();
-                    let task = ReapTask {
-                        shared: shared.clone(),
-                        held: self.held.take(),
-                        retained: self.retained.take(),
-                        signal: Some(signal),
-                    };
-                    // The task reports through `shared`, run or not, so its handle is not needed.
-                    drop(::tokio::task::spawn_blocking(move || task.run()));
-                    self.blocking = Some((shared, finished));
+                    let held = self.held.take().expect("checked above");
+                    let retained = self.retained.take();
+                    self.spawn_blocking_reap(held, retained);
                 }
+            }
+        }
+        #[cfg(unix)]
+        if let Some((shared, _)) = self.blocking.as_ref() {
+            // Not yet claimed by the task: retry with a fresh one, rather than depend on the
+            // blocking pool having scheduled this one — a cancelled wait can otherwise leave it
+            // queued behind a saturated pool. The old task does nothing when it does run.
+            if let Some((held, retained)) = shared.reclaim_before_start() {
+                self.blocking = None;
+                self.spawn_blocking_reap(held, retained);
             }
         }
         #[cfg(unix)]
@@ -255,6 +313,26 @@ impl Unreaped {
         unreachable!("a wait either finishes, or hands its child to a blocking reap it then awaits")
     }
 
+    /// Hand `held` (and `retained`) to a fresh blocking-pool task that waits for it to become
+    /// reapable and reaps it, recording the new task in `self.blocking`.
+    #[cfg(unix)]
+    fn spawn_blocking_reap(&mut self, held: Box<Held>, retained: Option<Box<Retained>>) {
+        let shared = std::sync::Arc::new(BlockingReap {
+            state: std::sync::Mutex::new(ReapState::NotStarted(held, retained)),
+            finished: std::sync::Condvar::new(),
+        });
+        let (signal, finished) = ::tokio::sync::oneshot::channel();
+        let task = ReapTask {
+            shared: shared.clone(),
+            held: None,
+            retained: None,
+            signal: Some(signal),
+        };
+        // The task reports through `shared`, run or not, so its handle is not needed.
+        drop(::tokio::task::spawn_blocking(move || task.run()));
+        self.blocking = Some((shared, finished));
+    }
+
     /// Take back what a finished blocking reap handed back, and settle the child as its reap went.
     #[cfg(unix)]
     fn take_reap(&mut self, taken: ReapState) -> std::io::Result<ExitStatus> {
@@ -265,13 +343,17 @@ impl Unreaped {
         self.retained = retained;
         match reaped {
             Some(Ok(Some(status))) => Ok(self.reaped(status)),
-            // Reapable, yet not reaped, or `ECHILD`: something else reaped it.
-            Some(Ok(None)) => Err(self.release(std::io::Error::other(
-                "the child was reapable, yet something else reaped it",
-            ))),
+            // Reapable, yet `try_wait` found no exit waiting for it: not something else reaping
+            // it first (tokio's own `try_wait` reports a foreign reap as `ECHILD`, not `Ok(None)`
+            // — see `crate::child::unreaped`'s module doc), so the child is kept, unreaped, not
+            // released: releasing here would zombie-leak it.
+            Some(Ok(None)) => Err(std::io::Error::other(
+                "the child was reapable, yet its reap found no exit waiting for it",
+            )),
             Some(Err(e)) if crate::child::unreaped::releases_ownership(&e) => Err(self.release(e)),
             Some(Err(e)) => Err(e),
-            // It panicked, or the runtime shut down before it ran: the child is held, unreaped.
+            // It claimed the child, then ended without finishing — it panicked mid-reap: the
+            // child is held, unreaped.
             None => Err(std::io::Error::other("the blocking reap ended without reaping")),
         }
     }
@@ -279,7 +361,9 @@ impl Unreaped {
     /// Record a reaped child's status, and release what it retained.
     fn reaped(&mut self, status: ExitStatus) -> ExitStatus {
         self.held = None;
-        drop(self.retained.take());
+        if let Some(retained) = self.retained.take() {
+            retained.attached.disarm();
+        }
         self.status = Some(status);
         status
     }
@@ -290,7 +374,9 @@ impl Unreaped {
             (*held).release_uncertain();
         }
         self.released = Some(e.to_string());
-        drop(self.retained.take());
+        if let Some(retained) = self.retained.take() {
+            retained.attached.disarm();
+        }
         e
     }
 
@@ -303,11 +389,18 @@ impl Unreaped {
     }
 
     /// Block until the blocking reap has finished, without taking its result, for a test.
+    ///
+    /// Waits through `NotStarted` too: unlike `take_blocking` (production code, which must not
+    /// block on a task that may still be queued behind a saturated pool — see its doc), this is a
+    /// test helper for a pool with nothing else queued, so the wait is bounded by the task actually
+    /// running. `report` is the only notifier, firing once as the task moves straight to
+    /// `Finished`; waiting through `NotStarted` (rather than only `Running`, which the task may
+    /// never be observed in between one `lock()` and the next) still wakes exactly there.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn block_until_blocking_reap_finished(&self) {
         let (shared, _) = self.blocking.as_ref().expect("a blocking reap holds the child");
         let mut state = shared.state();
-        while matches!(*state, ReapState::Running) {
+        while matches!(*state, ReapState::Running | ReapState::NotStarted(..)) {
             state = shared
                 .finished
                 .wait(state)
@@ -344,6 +437,17 @@ impl Unreaped {
         if let Some((shared, _)) = self.blocking.take() {
             let mut state = shared.state();
             match std::mem::replace(&mut *state, ReapState::Taken) {
+                // Never claimed by the task: reclaim directly, rather than leave it queued
+                // behind a blocking pool that may never schedule it.
+                ReapState::NotStarted(held, retained) => {
+                    drop(state);
+                    (*held).release();
+                    if let Some(retained) = retained {
+                        retained.attached.disarm();
+                    }
+                    log::warn!("leaking unkillable child {}, unreaped", self.pid);
+                    return;
+                }
                 ReapState::Running => {
                     *state = ReapState::Leaked;
                     log::warn!(
@@ -367,13 +471,6 @@ impl Unreaped {
                                 self.pid
                             );
                         }
-                        Some(Ok(None)) => {
-                            (*held).release_uncertain();
-                            log::warn!(
-                                "leaking unkillable child {}, released: something else reaped it",
-                                self.pid
-                            );
-                        }
                         Some(Err(e)) if crate::child::unreaped::releases_ownership(&e) => {
                             (*held).release_uncertain();
                             log::warn!(
@@ -381,7 +478,10 @@ impl Unreaped {
                                 self.pid
                             );
                         }
-                        Some(Err(_)) | None => {
+                        // `Ok(None)` here is reapable yet unreaped, not a foreign reap (only
+                        // `ECHILD` reports that — see `crate::child::unreaped`'s module doc):
+                        // releasing it would zombie-leak the child, so it is kept, unreaped.
+                        Some(Ok(None)) | Some(Err(_)) | None => {
                             (*held).release();
                             log::warn!("leaking unkillable child {}, unreaped", self.pid);
                         }
@@ -466,9 +566,12 @@ async fn wait_on(held: &mut Held) -> Result<ExitStatus, Failed> {
     if reaped.is_none() {
         return Err(Failed::NotYetReapable);
     }
-    // Reapable, yet not reaped: something else did.
+    // Reapable, yet not reaped. On Unix this is unreachable: the `NotYetReapable` branch above
+    // already returns before here. On Windows this is the same condition `tokio_wait_blocking`
+    // guards against on the sync side (see `crate::child::unreaped`'s module doc): not a
+    // confirmed foreign reap, so the child is kept, not released.
     reaped.ok_or_else(|| {
-        Failed::Uncertain(std::io::Error::other(
+        Failed::Unawaitable(std::io::Error::other(
             "the child's exit watch reported an exit it had not made",
         ))
     })
@@ -537,19 +640,32 @@ impl Drop for Unreaped {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some((shared, _)) = self.blocking.take() {
+            // Fires once Drop commits to blocking on this reap, before either arm below actually
+            // blocks: a direct reclaim still blocks right after, on `held.wait()` further down.
+            // Firing it only in the `take_blocking` arm would leave that direct wait blocked
+            // forever on whatever the hook was meant to release.
             #[cfg(test)]
             if let Some(hook) = self.before_blocking_drop.take() {
                 hook();
             }
-            let taken = shared.take_blocking();
-            match self.take_reap(taken) {
-                Ok(_) => return,
-                Err(e) if self.held.is_none() => {
-                    log::warn!("unkillable child {} was released unreaped: {e}", self.pid);
-                    return;
+            // Not yet claimed by the task: reclaim it directly, instead of blocking on pool
+            // scheduling that a saturated pool — even one whose only thread is this very
+            // drop's own — may never grant. `Drop` is documented as safe to block on the
+            // child's own exit, so the synchronous wait below picks it up from here.
+            if let Some((held, retained)) = shared.reclaim_before_start() {
+                self.held = Some(held);
+                self.retained = retained;
+            } else {
+                let taken = shared.take_blocking();
+                match self.take_reap(taken) {
+                    Ok(_) => return,
+                    Err(e) if self.held.is_none() => {
+                        log::warn!("unkillable child {} was released unreaped: {e}", self.pid);
+                        return;
+                    }
+                    // Still held, unreaped: waited for below.
+                    Err(_) => {}
                 }
-                // Still held, unreaped: waited for below.
-                Err(_) => {}
             }
         }
         if let Some(held) = self.held.take() {
@@ -566,7 +682,9 @@ impl Drop for Unreaped {
             #[cfg(windows)]
             drop(held);
         }
-        drop(self.retained.take());
+        if let Some(retained) = self.retained.take() {
+            retained.attached.disarm();
+        }
     }
 }
 

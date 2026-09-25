@@ -31,9 +31,10 @@ fn blocked_child() -> (std::process::Child, std::process::ChildStdin, ProcessId)
 
 /// `releases_ownership` is cosca's single Unix ownership classification: only `ECHILD` — something
 /// else already reaped the child — says the pid may now name another process. Every other errno,
-/// including a too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, and any non-OS `io::Error` other
-/// than `tokio_wait_blocking`'s own `ReapedElsewhere` marker (see the next test), says nothing
-/// about ownership and must not release the child.
+/// including a too-old kernel's `EINVAL` from `waitid(P_PIDFD)`, and any non-OS `io::Error` —
+/// including `tokio_wait_blocking`'s own "reapable, yet nothing waiting" error (see
+/// `wait_keeps_a_tokio_child_whose_own_reap_finds_no_exit_waiting`), which tokio 1.53 never reports
+/// as a genuine foreign reap — says nothing about ownership and must not release the child.
 #[cfg(unix)]
 #[test]
 fn releases_ownership_is_true_only_for_echild() {
@@ -53,19 +54,6 @@ fn releases_ownership_is_true_only_for_echild() {
         !super::releases_ownership(&std::io::Error::other("transient failure")),
         "a non-OS error says nothing about ownership"
     );
-}
-
-/// `tokio_wait_blocking`'s own marker for the one case with no real errno to carry it: the child
-/// was confirmed reapable, then `try_wait` found no exit waiting for it. `releases_ownership` must
-/// recognize it exactly as it recognizes a genuine `ECHILD` — see
-/// `wait_forgets_a_tokio_child_that_loses_tokios_own_reap_race` for the end-to-end proof through
-/// `Unreaped::wait`.
-#[cfg(all(unix, feature = "tokio"))]
-#[test]
-fn releases_ownership_is_true_for_the_reaped_elsewhere_marker() {
-    assert!(super::releases_ownership(&std::io::Error::other(
-        super::ReapedElsewhere("the child exited, yet tokio could not reap it")
-    )));
 }
 
 /// `wait_status_raw` is `bare_wait`'s pure encoding of a `waitid` result as `waitpid` would report
@@ -163,28 +151,48 @@ fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
         .expect("spawn")
 }
 
-/// `Unreaped::wait`'s sync blocking path (`tokio_wait_blocking`) loses tokio's own reap race: the
-/// child is confirmed reapable (`block_until_reapable`), then `try_wait` finds no exit waiting for
-/// it, exactly as something else winning the race and reaping it first would. `wait` must classify
-/// that as ownership-uncertain — the same `releases_ownership` predicate a genuine `ECHILD` trips —
-/// and release the held tokio child by forgetting it (see the module's **Releasing**), not by
-/// dropping it into tokio's orphan queue, which would `waitpid` a pid that may already name another
-/// process. This is the regression `tokio_wait_blocking` (f2ec8532) fixes.
+/// `Unreaped::wait`'s sync blocking path (`tokio_wait_blocking`) can find the child confirmed
+/// reapable (`block_until_reapable`), then its own `try_wait` reports no exit waiting for it. That
+/// is NOT a foreign reap: tokio 1.53's `try_wait`, like std's, reports a genuine foreign reap as
+/// `ECHILD`, not `Ok(None)` — so this condition must not classify as ownership-uncertain. Doing so
+/// (the bug this regression test guards against) would release the child by forgetting it, which
+/// leaks the zombie for good, since nothing else in fact reaped it.
 #[cfg(all(unix, feature = "tokio"))]
 #[tokio::test]
-async fn wait_forgets_a_tokio_child_that_loses_tokios_own_reap_race() {
+async fn wait_keeps_a_tokio_child_whose_own_reap_finds_no_exit_waiting() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
+    let Resolved::Found(id) = ProcessId::of(pid) else {
+        panic!("an unreaped child resolves");
+    };
     // Real: the child must already be a genuine zombie before the seam below makes
-    // `tokio_wait_blocking`'s OWN `try_wait` miss it, or this would not be the race it reproduces.
+    // `tokio_wait_blocking`'s OWN `try_wait` miss it, or this would not reproduce the condition.
     super::block_until_reapable(pid).expect("the child exits promptly");
-    crate::child::spawn::fault::set_force_tokio_wait_blocking_lost();
+    crate::child::spawn::fault::set_force_tokio_wait_blocking_miss();
     let unreaped = Unreaped::new(Held::Tokio(Box::new(child)));
-    let err = unreaped.wait().expect_err("the forced race must fail the wait");
+    let err = unreaped.wait().expect_err("the forced miss must fail the wait");
     assert!(
-        super::releases_ownership(&err),
-        "losing tokio's own reap race must classify exactly as ECHILD does: {err}"
+        !super::releases_ownership(&err),
+        "a reapable-yet-missed exit is not a foreign reap, and must not release ownership: {err}"
     );
-    // Forgotten, not handed to tokio's orphan queue: this test's own child, reaped by hand.
-    nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None).expect("reap the child");
+    // Not forgotten: `settle_after_wait` released (not `release_uncertain`'d) the child, which for
+    // a tokio child means a normal `drop`, handed to tokio's own orphan queue, not `mem::forget`'d.
+    // That reap runs asynchronously, on tokio's signal driver, not synchronously with `wait()`
+    // returning — so proving no leak means waiting for tokio to actually reap it, not reaping it by
+    // hand: a manual `waitpid` right here races tokio's own reaper for an already-exited zombie and
+    // loses deterministically (measured: `ECHILD`, 10/10 runs). The 10s bound is a human-facing
+    // failure bound on a genuine leak — the bug this test guards against forgets the child, so
+    // nothing would ever reap it — not a synchronization device: success is tokio reaping it
+    // promptly, well under it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if !matches!(ProcessId::of(pid), Resolved::Found(found) if found == id) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tokio never reaped the child: forgetting it (the bug this test guards against) leaks it exactly like this"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }

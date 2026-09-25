@@ -373,6 +373,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     child,
                     #[cfg(windows)]
                     suspended,
+                    // The attach itself failed: nothing was ever attached to retain.
+                    None,
                 ),
             ));
         }
@@ -395,6 +397,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 child,
                 #[cfg(windows)]
                 false,
+                Some(attachment.attached),
             );
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
@@ -436,8 +439,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 fn teardown_unadopted(
     mut child: std::process::Child,
     #[cfg(windows)] suspended: bool,
+    attached: Option<crate::containment::Attached>,
 ) -> Option<(std::io::Error, crate::child::unreaped::Unreaped)> {
-    use crate::child::unreaped::{Checked, Held, Unreaped};
+    use crate::child::unreaped::{Checked, Held, Retained, Unreaped};
     if let Err(kill) = kill_unadopted(&mut child) {
         let pid = child.id();
         drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
@@ -451,7 +455,14 @@ fn teardown_unadopted(
                     log::warn!("spawn teardown failed to kill suspended pid {pid}: {kill}");
                     return None;
                 }
-                Some((kill, Unreaped::new(held)))
+                // Retained, not dropped: matching `elevated_write_failed`'s handoff, the caller
+                // that gets this child back decides the containment's fate (via `Unreaped`'s own
+                // wait/leak/Drop) rather than having it torn down — cgroup.kill plus a drain wait
+                // — before the error even arrives.
+                Some((
+                    kill,
+                    Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
+                ))
             }
             // It had exited, which makes the kill's failure moot.
             Checked::Reaped => None,
@@ -1057,7 +1068,10 @@ pub(crate) fn attach_or_fault(
             }
         }
         let mut prepared = prepared;
-        prepared.settle_verdict(pid);
+        // Discarded: this seam simulates a real attach FAILURE, which retains nothing (mirrors
+        // the attach-error teardown arm's own `None`), not the identity-failure arm this method
+        // also serves.
+        let _ = prepared.settle_verdict(pid);
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
         return Err(Error::Containment {
@@ -1067,7 +1081,9 @@ pub(crate) fn attach_or_fault(
     #[cfg(all(test, target_os = "linux"))]
     if let Some(attachment) = fault::take_attachment_override() {
         let mut prepared = prepared;
-        prepared.settle_verdict(pid);
+        // Discarded: `attachment` (the injected override) is what the test wants retained, not
+        // whatever this real leaf's verdict happens to say.
+        let _ = prepared.settle_verdict(pid);
         return Ok(attachment);
     }
     crate::containment::attach(
@@ -1104,10 +1120,11 @@ pub(crate) mod fault {
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
         static FORCE_TEARDOWN_TRY_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static FORCE_TEARDOWN_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
         #[cfg(unix)]
         static FORCE_TEARDOWN_TRY_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(unix, feature = "tokio"))]
-        static FORCE_TOKIO_WAIT_BLOCKING_LOST: Cell<bool> = const { Cell::new(false) };
+        static FORCE_TOKIO_WAIT_BLOCKING_MISS: Cell<bool> = const { Cell::new(false) };
         #[cfg(windows)]
         static FORCE_SUSPENDED_TERMINATE_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
         #[cfg(windows)]
@@ -1194,17 +1211,37 @@ pub(crate) mod fault {
         FORCE_TEARDOWN_TRY_WAIT_ECHILD.with(|f| f.take())
     }
 
-    /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread lose tokio's own
-    /// reap race after confirming the child reapable: its own `try_wait` then finds no exit
-    /// waiting, as if something else had reaped it first — with no real errno to carry that, the
-    /// one case `set_force_teardown_try_wait_echild` cannot reach.
+    /// Make the next blocking reap (`Held::wait`, the sync and async `Unreaped::wait`/`Drop`'s
+    /// shared call) on this thread fail with `marker`, without actually waiting on the child: it
+    /// stays running, unreaped, for the test to clean up. An `Other`-kind error, so on Unix it
+    /// does NOT release the child — only a genuine `ECHILD` does.
+    ///
+    /// Only called from Linux-gated cgroup-leaf regression tests (the retained-containment
+    /// disarm-on-failed-wait proof needs a real, observable armed/disarmed resource, which only a
+    /// cgroup leaf's occupancy check gives without a live Windows job object to query): unused, so
+    /// dead on a non-Linux test build. The seam it drives — `Held::wait`'s top-of-function check —
+    /// is itself platform-agnostic code with no `cfg`, so what it proves (a failed wait is
+    /// returned, not special-cased, and disarms `Retained` before it does) holds identically on
+    /// every platform the call site compiles for.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn set_force_teardown_wait_error(marker: &'static str) {
+        FORCE_TEARDOWN_WAIT_ERROR.with(|f| f.set(Some(marker)));
+    }
+    pub(crate) fn take_force_teardown_wait_error() -> Option<&'static str> {
+        FORCE_TEARDOWN_WAIT_ERROR.with(|f| f.take())
+    }
+
+    /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread find the child
+    /// confirmed reapable, then find its own `try_wait` reporting no exit waiting for it — as
+    /// tokio 1.53 can, though this is never a genuine foreign reap (see
+    /// `releases_ownership`'s doc): a real one reports `ECHILD`, not `Ok(None)`.
     #[cfg(all(unix, feature = "tokio"))]
-    pub(crate) fn set_force_tokio_wait_blocking_lost() {
-        FORCE_TOKIO_WAIT_BLOCKING_LOST.with(|f| f.set(true));
+    pub(crate) fn set_force_tokio_wait_blocking_miss() {
+        FORCE_TOKIO_WAIT_BLOCKING_MISS.with(|f| f.set(true));
     }
     #[cfg(all(unix, feature = "tokio"))]
-    pub(crate) fn take_force_tokio_wait_blocking_lost() -> bool {
-        FORCE_TOKIO_WAIT_BLOCKING_LOST.with(|f| f.take())
+    pub(crate) fn take_force_tokio_wait_blocking_miss() -> bool {
+        FORCE_TOKIO_WAIT_BLOCKING_MISS.with(|f| f.take())
     }
 
     /// Make the teardown's next retried termination of a suspended child on this thread fail with
