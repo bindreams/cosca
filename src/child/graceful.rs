@@ -109,7 +109,7 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.proc.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        self.proc().kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
         let status = self.wait()?;
         watch?;
         Ok(status)
