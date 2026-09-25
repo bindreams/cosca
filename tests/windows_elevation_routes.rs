@@ -19,17 +19,22 @@
 //! at high integrity does not answer the question, so every report line carries the integrity RID
 //! it was taken at.
 //!
-//! Two probes reach the unelevated case, and only one of them works:
+//! Two probes reach the unelevated case, and only one of them is trustworthy on every host:
 //!
 //! - [`does_create_process_with_logon_elevate`] logs a throwaway administrator on and runs the
 //!   whole report inside the resulting child. That child is a REAL process from a REAL logon, and
 //!   it is where the unelevated answers come from. It needs a disposable host.
 //! - [`unelevated_caller_view`] derives a medium token from this process's own and starts a child
-//!   under it, needing no account. Measured on both a GitHub runner and a desktop over SSH, this
-//!   FAILS: the lowered-integrity child cannot open the caller's window station and dies in loader
-//!   init (0xC0000142), and the seclogon fallback is refused. It is kept because it needs no
-//!   credentials and would be the better instrument on an interactive desktop — but when it fails
-//!   it says so rather than reporting a misleading negative.
+//!   under it, needing no account. On a desktop over SSH the lowered-integrity child can fail to
+//!   open the caller's window station and die in loader init (0xC0000142); on a GitHub runner (run
+//!   35850159223) it instead SUCCEEDS and produces a full report, so 0xC0000142 is a possible
+//!   failure of this route, not its guaranteed outcome, and the probe fails loudly rather than
+//!   reporting a misleading negative if it happens. Succeeding is not the same as measuring an
+//!   unelevated caller, though: `TokenIsElevated` is fixed at token creation from the source
+//!   logon's elevation type, so on a Default (non-split) admin token — what run 35850159223's
+//!   GitHub runner has — synthesis cannot clear it, and the resulting child is a lowered-integrity
+//!   ELEVATED caller, not an unelevated one. The probe prints and labels which case it measured;
+//!   read its output before trusting its report as the unelevated answer.
 //!
 //! # Why they are `#[ignore]`d, and the two safety gates
 //!
@@ -59,8 +64,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::os::windows::io::BorrowedHandle;
 use std::path::{Path, PathBuf};
 
+use cosca::Job;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
@@ -78,14 +85,16 @@ use windows::Win32::System::SystemServices::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW, CreateProcessWithTokenW, GetCurrentProcess,
-    GetExitCodeProcess, OpenProcess, OpenProcessToken, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+    GetExitCodeProcess, OpenProcess, OpenProcessToken, ResumeThread, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// A child is an external process that might never exit, so this is the honest failure bound
-/// surfaced to whoever reads the log — not a synchronisation device. If it trips, the probe says
-/// the child did not finish; it never silently continues.
+/// surfaced to whoever reads the log — not a synchronisation device. If it trips, [`wait_for`]
+/// kills the child's whole job tree, waits (unboundedly) for that to land, and only then reports
+/// that the child did not finish; it never silently continues, and never touches a file or
+/// account the child might still hold open.
 const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
@@ -275,16 +284,24 @@ fn describe(out: &mut String, label: &str, token: HANDLE) {
 /// Builds an environment block for a child. Doubles as a measurement in its own right: if a
 /// token-based spawn API accepts this and the child sees the variables, then cosca's `.env()` —
 /// which `ShellExecuteEx` cannot honour at all — is supportable on that route.
+///
+/// Built from an allowlist, not a copy of this process's whole environment: several routes here
+/// hand the block to a DIFFERENT account (a scratch logon, a medium token derived from this
+/// process's own), and carrying this process's full environment across would leak whatever this
+/// caller happens to have set — including any secrets a CI runner exports — into a child running
+/// as, or purporting to measure, someone else. Only what a freshly logged-on account needs to run
+/// anything at all (`SystemRoot`, `PATH`, `TEMP`/`TMP`, `COMSPEC`, `PATHEXT`), plus any
+/// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus whatever the
+/// caller passes in `extra`.
 fn env_block(extra: &[(&str, String)]) -> Vec<u16> {
+    const ALLOWLIST: [&str; 6] = ["SYSTEMROOT", "PATH", "TEMP", "TMP", "COMSPEC", "PATHEXT"];
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
-        // Windows' per-drive working-directory variables ("=C:") are not settable and confuse a
-        // hand-built block.
-        if k.starts_with('=') {
-            continue;
+        let upper = k.to_ascii_uppercase();
+        if ALLOWLIST.contains(&upper.as_str()) || upper.starts_with("COSCA_PROBE_") {
+            map.insert(k, v.to_string_lossy().into_owned());
         }
-        map.insert(k, v.to_string_lossy().into_owned());
     }
     for (k, v) in extra {
         map.insert((*k).to_string(), v.clone());
@@ -312,18 +329,58 @@ fn self_report_cmdline() -> String {
     report_cmdline(&std::env::current_exe().expect("the test binary knows its own path"))
 }
 
-/// Wait for a child and return its exit code, or a description of why it could not be measured.
-fn wait_for(pi: &PROCESS_INFORMATION) -> Result<u32, String> {
-    // SAFETY: handles CreateProcess* just returned; each is waited on then closed exactly once.
+/// Assign a just-created SUSPENDED child to a fresh `KILL_ON_JOB_CLOSE` job, then resume its
+/// initial thread — the mandatory sequence [`cosca::Job::assign`]'s own docs require, closing the
+/// race where a resumed-too-early child (or a grandchild it forks) escapes containment before
+/// assignment lands. Every `CreateProcess*` call in this file that hands back a
+/// `PROCESS_INFORMATION` uses `CREATE_SUSPENDED` and routes through this function, so `wait_for`
+/// can always terminate the whole tree — not just the immediate child — on a timeout.
+///
+/// Panics rather than returning an error: an uncontained child defeats the reason every spawn in
+/// this file goes through a job at all, and `Job::assign`'s own contract forbids resuming a
+/// process that failed to join one, so there is no safe fallback measurement to report instead.
+fn contain(pi: &PROCESS_INFORMATION, context: &str) -> Job {
+    // SAFETY: `pi.hProcess` is a live, just-created suspended process handle; the borrow lasts
+    // only for the duration of this call, and the process outlives it (owned by the caller).
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(pi.hProcess.0.cast()) })
+        .unwrap_or_else(|e| panic!("{context}: could not contain the child in a kill-on-close job: {e}"));
+    // SAFETY: the job now has kill authority over this still-suspended thread, so resuming it now
+    // — the last step of the mandated sequence — cannot let anything escape containment.
     unsafe {
-        let waited = WaitForSingleObject(pi.hProcess, CHILD_EXIT_BOUND_MS);
+        let _ = ResumeThread(pi.hThread);
+    }
+    job
+}
+
+/// Wait for a child held in `job`, and return its exit code — or a description of why it could
+/// not be measured. `CHILD_EXIT_BOUND_MS` is given to this one, outermost wait only: on a timeout
+/// it kills the whole job and waits for that to actually land, which carries no bound of its own
+/// because it is waiting on a real kernel outcome (the kill taking effect), not racing a clock —
+/// so by the time this returns, the child is provably gone and it is safe for the caller to touch
+/// any file or account it might otherwise still hold open.
+fn wait_for(pi: &PROCESS_INFORMATION, job: &Job) -> Result<u32, String> {
+    // SAFETY: `pi.hProcess` was just returned by CreateProcess* and is closed exactly once below.
+    let waited = unsafe { WaitForSingleObject(pi.hProcess, CHILD_EXIT_BOUND_MS) };
+    if waited != WAIT_OBJECT_0 {
+        let killed = job.kill_tree();
+        let drained = job.wait_tree();
+        // SAFETY: the job's kill (if it succeeded) and the drain wait above mean nothing in the
+        // tree can still be touching these handles; each is closed exactly once.
+        unsafe {
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        return Err(format!(
+            "the child did not exit within {CHILD_EXIT_BOUND_MS}ms; kill_tree={killed:?} \
+             wait_tree={drained:?}"
+        ));
+    }
+    // SAFETY: the process signalled within the bound above; both handles are closed exactly once.
+    unsafe {
         let mut code = 0u32;
         let got = GetExitCodeProcess(pi.hProcess, &mut code);
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
-        if waited != WAIT_OBJECT_0 {
-            return Err(format!("the child did not exit within {CHILD_EXIT_BOUND_MS}ms"));
-        }
         got.map_err(|e| format!("GetExitCodeProcess failed: {e}"))?;
         Ok(code)
     }
@@ -488,7 +545,8 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
         };
         let mut pi = PROCESS_INFORMATION::default();
         // SAFETY: `cmd` is a NUL-terminated writable UTF-16 buffer and `block` a NUL-NUL-terminated
-        // environment block; both outlive the call.
+        // environment block; both outlive the call. `CREATE_SUSPENDED`: the child must not run
+        // before `contain` has assigned it to a kill-on-close job.
         let res = unsafe {
             if use_seclogon {
                 CreateProcessWithTokenW(
@@ -496,7 +554,7 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
                     CREATE_PROCESS_LOGON_FLAGS(0),
                     None,
                     Some(PWSTR(cmd.as_mut_ptr())),
-                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                     Some(block.as_ptr().cast()),
                     None,
                     &si,
@@ -510,7 +568,7 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
                     None,
                     None,
                     false,
-                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                     Some(block.as_ptr().cast()),
                     None,
                     &si,
@@ -523,7 +581,8 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
                 let _ = writeln!(out, "  {step} [{which} token]: FAILED {e:?}");
             }
             Ok(()) => {
-                let exit = wait_for(&pi).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+                let job = contain(&pi, &format!("PROBE spawn-attempts[{which}/{step}]"));
+                let exit = wait_for(&pi, &job).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
                 let _ = writeln!(out, "  {step} [{which} token]: STARTED, {exit}. The child reports:");
                 splice_child_report(out, &report);
             }
@@ -736,15 +795,42 @@ fn unelevated_caller_view() {
     describe(&mut report, "medium token about to be used", medium.0);
     print!("{report}");
 
+    // `describe` above already prints this token's `elevated=` flag buried among privileges;
+    // surface it again on its own, because it is the one bit that decides whether what follows is
+    // actually a measurement of an unelevated caller. Measured in run 35850159223: on a GitHub
+    // runner (a Default, non-split admin token, `elevation_type=1`), synthesis disables the
+    // Administrators SID and lowers integrity to Medium, but `TokenIsElevated` is fixed at token
+    // creation from the source logon's elevation type and neither of those adjustments touches it
+    // — so the synthesised token still reads `elevated=true`. Only the genuine
+    // `TokenLinkedToken` route (`etype == 2`, a real UAC split) clears it. Print this prominently
+    // instead of asserting it false: on a non-split admin account it is EXPECTED to stay true, so
+    // asserting false would fail this probe on exactly the hosts it is meant to run on.
+    let medium_is_elevated = token_is_elevated(medium.0)
+        .unwrap_or_else(|e| panic!("could not read the medium token's own TokenIsElevated flag: {e}"));
+    if medium_is_elevated {
+        println!(
+            "PROBE unelevated-view: medium token TokenIsElevated=true -- NOT a genuine unelevated \
+             view. Integrity was lowered and the Administrators SID disabled, but this token was \
+             derived from a non-split admin token, and TokenIsElevated cannot be cleared that way. \
+             Read everything below as \"lowered integrity, still an elevated token\", not as an \
+             unelevated caller's report."
+        );
+    } else {
+        println!("PROBE unelevated-view: medium token TokenIsElevated=false -- a genuine unelevated view.");
+    }
+
     let dir = std::env::temp_dir().join(format!("cosca-medium-probe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("probe scratch dir");
 
     // Two routes, because `CreateProcessAsUserW` hands the child the caller's window station and
-    // desktop unchanged, and a lowered-integrity token cannot always open them — the child then
-    // dies in loader init (STATUS_DLL_INIT_FAILED, 0xC0000142) before it can report anything.
-    // `CreateProcessWithTokenW` goes through the Secondary Logon service, which sets the station
-    // and desktop up itself. Either one that yields a report answers the question; both are tried
-    // so a station ACL cannot be mistaken for "elevation is impossible".
+    // desktop unchanged, and a lowered-integrity token cannot always open them, which can make the
+    // child die in loader init (STATUS_DLL_INIT_FAILED, 0xC0000142) before it can report anything
+    // — measured on a desktop over SSH. On a GitHub runner (run 35850159223) this route instead
+    // SUCCEEDED and produced a full report, so 0xC0000142 is a possible failure mode of this route,
+    // not its guaranteed outcome. `CreateProcessWithTokenW` goes through the Secondary Logon
+    // service, which sets the station and desktop up itself. Either one that yields a report
+    // answers the question; both are tried so a station ACL cannot be mistaken for "elevation is
+    // impossible".
     let mut spliced = String::new();
     for (route, use_seclogon) in [("CreateProcessAsUserW", false), ("CreateProcessWithTokenW", true)] {
         let child_report = dir.join(format!("{route}.txt"));
@@ -755,7 +841,8 @@ fn unelevated_caller_view() {
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
-        // SAFETY: `cmd` and `block` are correctly terminated and outlive the call.
+        // SAFETY: `cmd` and `block` are correctly terminated and outlive the call. `CREATE_SUSPENDED`:
+        // the child must not run before `contain` assigns it to a kill-on-close job.
         let started = unsafe {
             if use_seclogon {
                 CreateProcessWithTokenW(
@@ -763,7 +850,7 @@ fn unelevated_caller_view() {
                     CREATE_PROCESS_LOGON_FLAGS(0),
                     None,
                     Some(PWSTR(cmd.as_mut_ptr())),
-                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                     Some(block.as_ptr().cast()),
                     None,
                     &si,
@@ -777,7 +864,7 @@ fn unelevated_caller_view() {
                     None,
                     None,
                     false,
-                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                     Some(block.as_ptr().cast()),
                     None,
                     &si,
@@ -788,7 +875,8 @@ fn unelevated_caller_view() {
         match started {
             Err(e) => println!("PROBE unelevated-view: {route} with the medium token FAILED {e:?}"),
             Ok(()) => {
-                let exit = wait_for(&pi).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+                let job = contain(&pi, &format!("PROBE unelevated-view[{route}]"));
+                let exit = wait_for(&pi, &job).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
                 println!("PROBE unelevated-view: {route} started a medium child, {exit}. It reports:");
                 splice_child_report(&mut spliced, &child_report);
                 print!("{spliced}");
@@ -806,6 +894,15 @@ fn unelevated_caller_view() {
          measured. Every other result in this file was taken at this process's own integrity level \
          and must not be read as an unelevated result."
     );
+    if medium_is_elevated {
+        println!(
+            "PROBE unelevated-view: measured, but LABEL AS ELEVATED: the medium token's \
+             TokenIsElevated stayed true (see above), so this is a lowered-integrity elevated \
+             caller's view, not an unelevated one."
+        );
+    } else {
+        println!("PROBE unelevated-view: measured, and correctly labelled as an unelevated caller's view.");
+    }
 }
 
 /// A medium-integrity token for an account that has no UAC split to borrow one from: disable the
@@ -921,7 +1018,8 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
     };
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: `app` is NUL-terminated and outlives the call; no command line is supplied, which is
-    // legal when lpApplicationName is present.
+    // legal when lpApplicationName is present. `CREATE_SUSPENDED`: the child must not run before
+    // `contain` assigns it to a kill-on-close job.
     let res = unsafe {
         CreateProcessW(
             PCWSTR(app.as_ptr()),
@@ -929,7 +1027,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
             None,
             None,
             false,
-            CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED,
             None,
             None,
             &si,
@@ -938,7 +1036,8 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
     };
     let started = res.is_ok();
     if started {
-        let _ = wait_for(&pi);
+        let job = contain(&pi, "PROBE createprocessw-pathext");
+        wait_for(&pi, &job).unwrap_or_else(|e| panic!("PROBE createprocessw-pathext: child did not exit cleanly: {e}"));
     }
     let bat_ran = marker.exists();
     println!(
@@ -952,7 +1051,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
              same planting hazard as ShellExecuteEx."
         );
     } else if started {
-        println!("  => INCONCLUSIVE: something started but was not the planted batch.");
+        panic!("PROBE createprocessw-pathext: INCONCLUSIVE: something started but was not the planted batch.");
     } else {
         println!(
             "  => CreateProcessW refused a nonexistent extensionless lpApplicationName rather than \
@@ -999,8 +1098,10 @@ impl ScratchAccount {
             .map_err(|e| format!("could not run `net user`: {e}"))?;
         if !out.status.success() {
             return Err(format!(
-                "`net user {user} /add` failed: {}",
-                String::from_utf8_lossy(&out.stdout)
+                "`net user {user} /add` failed: status={:?} stdout={} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
             ));
         }
         if admin {
@@ -1013,8 +1114,10 @@ impl ScratchAccount {
                     .args(["user", user, "/delete"])
                     .output();
                 return Err(format!(
-                    "adding {user} to Administrators failed: {}",
-                    String::from_utf8_lossy(&out.stdout)
+                    "adding {user} to Administrators failed: status={:?} stdout={} stderr={}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
                 ));
             }
         }
@@ -1052,15 +1155,17 @@ fn does_create_process_with_logon_elevate() {
     for (name, admin) in [("coscaprobeadm", true), ("coscaprobestd", false)] {
         match ScratchAccount::create(name, admin) {
             Ok(account) => {
-                logon_one_account(&account);
-                measured += 1;
+                if logon_one_account(&account) {
+                    measured += 1;
+                }
             }
             Err(e) => println!("PROBE createprocesswithlogon: could not create {name}: {e}"),
         }
     }
     assert!(
         measured > 0,
-        "no scratch account could be created, so CreateProcessWithLogonW was never exercised"
+        "no scratch account produced a token report, so CreateProcessWithLogonW's result was never \
+         actually measured — an account being created is not the same as a report coming back."
     );
 }
 
@@ -1072,7 +1177,12 @@ fn does_create_process_with_logon_elevate() {
 /// this file: a real process, from a real logon, owned by a real account of known group
 /// membership — the caller cosca's question is actually about. If a freshly logged-on
 /// administrator could reach its own elevated token and spawn with it, it would show up here.
-fn logon_one_account(account: &ScratchAccount) {
+///
+/// Returns whether the child actually produced a token report — the account being created and
+/// `CreateProcessWithLogonW` returning `Ok` are both necessary but not sufficient: the child can
+/// still start and exit without ever writing its report. The caller must count only this, not
+/// account creation, as "measured".
+fn logon_one_account(account: &ScratchAccount) -> bool {
     let role = if account.admin {
         "local ADMINISTRATOR"
     } else {
@@ -1136,7 +1246,8 @@ fn logon_one_account(account: &ScratchAccount) {
     };
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: every wide buffer is NUL-terminated and outlives the call; `block` is NUL-NUL
-    // terminated, matching CREATE_UNICODE_ENVIRONMENT.
+    // terminated, matching CREATE_UNICODE_ENVIRONMENT. `CREATE_SUSPENDED`: the child must not run
+    // before `contain` assigns it to a kill-on-close job.
     let res = unsafe {
         CreateProcessWithLogonW(
             PCWSTR(user.as_ptr()),
@@ -1145,7 +1256,7 @@ fn logon_one_account(account: &ScratchAccount) {
             LOGON_WITH_PROFILE,
             None,
             Some(PWSTR(cmd.as_mut_ptr())),
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             Some(block.as_ptr().cast()),
             None,
             &si,
@@ -1157,12 +1268,13 @@ fn logon_one_account(account: &ScratchAccount) {
         let _ = CloseHandle(inheritable);
     }
 
+    let mut spliced = String::new();
     match res {
         Err(e) => println!("PROBE createprocesswithlogon[{role}]: FAILED {e:?} — nothing to measure"),
         Ok(()) => {
-            let exit = wait_for(&pi).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
+            let job = contain(&pi, &format!("PROBE createprocesswithlogon[{role}]"));
+            let exit = wait_for(&pi, &job).map_or_else(|e| e, |c| format!("exit=0x{c:08x}"));
             println!("PROBE createprocesswithlogon[{role}]: STARTED, {exit}. The child reports:");
-            let mut spliced = String::new();
             splice_child_report(&mut spliced, &report);
             print!("{spliced}");
             let captured = std::fs::read_to_string(&stdout_file).unwrap_or_default();
@@ -1181,6 +1293,7 @@ fn logon_one_account(account: &ScratchAccount) {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+    spliced.contains("token report")
 }
 
 /// **Question 2's first step.** Which logon types return a FILTERED token for an account in

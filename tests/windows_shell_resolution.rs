@@ -8,7 +8,11 @@
 //! These are **probes, not assertions about cosca**. They measure the platform and print what they
 //! found, so a maintainer can write a policy against evidence. Each still FAILS if the measurement
 //! itself could not be taken (the shell refused to launch anything at all, a helper could not be
-//! written), so an inconclusive run is never a silent pass.
+//! written), so an inconclusive run is never a silent pass. A probe that only surveys the platform
+//! also prints `INCONCLUSIVE` and passes if the shell launched something without handing back a
+//! process handle to wait on — it never claimed a specific outcome. A probe that asserts one
+//! (`control_an_absolute_batch_path_does_launch`, `does_pathext_outrank_an_existing_extensionless_file`)
+//! FAILS on that same case instead, since it cannot wait for what it needs to check.
 //!
 //! # Why they are `#[ignore]`d
 //!
@@ -59,9 +63,24 @@ fn plant_batch(path: &Path, marker: &Path) {
         .unwrap_or_else(|e| panic!("could not plant the probe batch at {}: {e}", path.display()));
 }
 
+/// What `shell_execute_with` was actually able to measure, distinct from what it launched.
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchOutcome {
+    /// The shell launched something, handed back a process handle, and this function waited for
+    /// it to exit — a marker written by the child can now be read.
+    Waited,
+    /// The shell launched something but `SEE_MASK_NOCLOSEPROCESS` did not yield a process handle
+    /// to wait on (this happens when the verb hands off to another process, e.g. a DDE server).
+    /// Nothing tells this probe whether the child has finished, so reading its marker now would
+    /// be a race, not a measurement.
+    LaunchedNoHandle,
+    /// The shell declined outright; nothing was launched.
+    NotLaunched,
+}
+
 /// Launch `lp_file` through `ShellExecuteExW` with the default verb, wait for whatever it started,
-/// and report whether the shell launched anything at all.
-fn shell_execute(lp_file: &Path, lp_directory: Option<&Path>) -> Result<bool, String> {
+/// and report what could be measured.
+fn shell_execute(lp_file: &Path, lp_directory: Option<&Path>) -> Result<LaunchOutcome, String> {
     shell_execute_with(lp_file, lp_directory, None)
 }
 
@@ -69,7 +88,7 @@ fn shell_execute_with(
     lp_file: &Path,
     lp_directory: Option<&Path>,
     lp_parameters: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<LaunchOutcome, String> {
     let file_w = wide_nul(lp_file.as_os_str());
     let dir_w = lp_directory.map(|d| wide_nul(d.as_os_str()));
     let params_w = lp_parameters.map(|p| wide_nul(std::ffi::OsStr::new(p)));
@@ -89,22 +108,23 @@ fn shell_execute_with(
     if !launched {
         // The shell declined — the measurement is "nothing was launched", which is a result, not
         // an error.
-        return Ok(false);
+        return Ok(LaunchOutcome::NotLaunched);
     }
-    if !info.hProcess.is_invalid() {
-        // SAFETY: a process handle the shell just handed us, waited on then closed exactly once.
-        unsafe {
-            let waited = WaitForSingleObject(info.hProcess, CHILD_EXIT_BOUND_MS);
-            let _ = CloseHandle(info.hProcess);
-            if waited != WAIT_OBJECT_0 {
-                return Err(format!(
-                    "the launched process did not exit within {CHILD_EXIT_BOUND_MS}ms, so this probe \
-                     could not be measured"
-                ));
-            }
+    if info.hProcess.is_invalid() {
+        return Ok(LaunchOutcome::LaunchedNoHandle);
+    }
+    // SAFETY: a process handle the shell just handed us, waited on then closed exactly once.
+    unsafe {
+        let waited = WaitForSingleObject(info.hProcess, CHILD_EXIT_BOUND_MS);
+        let _ = CloseHandle(info.hProcess);
+        if waited != WAIT_OBJECT_0 {
+            return Err(format!(
+                "the launched process did not exit within {CHILD_EXIT_BOUND_MS}ms, so this probe \
+                 could not be measured"
+            ));
         }
     }
-    Ok(true)
+    Ok(LaunchOutcome::Waited)
 }
 
 fn probe_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
@@ -126,21 +146,33 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
     plant_batch(&dir.path().join("tool.bat"), &marker);
     let lp_file = dir.path().join("tool"); // absolute, extensionless, does not exist
 
-    let launched = shell_execute(&lp_file, None).expect("probe must be measurable");
-    let ran = marker.exists();
-
-    println!("PROBE absolute-extensionless-lpFile: launched={launched} batch_ran={ran}");
-    if ran {
-        println!(
-            "  => ShellExecuteEx DOES apply PATHEXT to an absolute lpFile. `raw_executable(\"tool\")` \
-             under .elevate() can reach a planted tool.bat; absolutising alone does NOT close the \
-             batch vector, and the gate must also run on the completed path."
-        );
-    } else {
-        println!(
-            "  => ShellExecuteEx does NOT extend an absolute lpFile. Completing the name is \
-             sufficient to close the search half, as cosca currently assumes."
-        );
+    let outcome = shell_execute(&lp_file, None).expect("probe must be measurable");
+    match outcome {
+        LaunchOutcome::NotLaunched => {
+            panic!(
+                "PROBE absolute-extensionless-lpFile: the shell declined to launch anything, so nothing was measured"
+            )
+        }
+        LaunchOutcome::LaunchedNoHandle => println!(
+            "PROBE absolute-extensionless-lpFile: INCONCLUSIVE — launched without a process handle, \
+             so this probe could not wait for the batch to finish before reading its marker"
+        ),
+        LaunchOutcome::Waited => {
+            let ran = marker.exists();
+            println!("PROBE absolute-extensionless-lpFile: launched=true batch_ran={ran}");
+            if ran {
+                println!(
+                    "  => ShellExecuteEx DOES apply PATHEXT to an absolute lpFile. `raw_executable(\"tool\")` \
+                     under .elevate() can reach a planted tool.bat; absolutising alone does NOT close the \
+                     batch vector, and the gate must also run on the completed path."
+                );
+            } else {
+                println!(
+                    "  => ShellExecuteEx does NOT extend an absolute lpFile. Completing the name is \
+                     sufficient to close the search half, as cosca currently assumes."
+                );
+            }
+        }
     }
 }
 
@@ -154,16 +186,29 @@ fn control_an_absolute_batch_path_does_launch() {
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
 
-    let launched = shell_execute(&bat, None).expect("probe must be measurable");
-    println!(
-        "PROBE control-absolute-bat: launched={launched} batch_ran={}",
-        marker.exists()
-    );
-    assert!(
-        marker.exists(),
-        "the harness cannot launch a batch file at all, so the PATHEXT probe's result is not \
-         interpretable — fix the harness before reading it"
-    );
+    let outcome = shell_execute(&bat, None).expect("probe must be measurable");
+    match outcome {
+        LaunchOutcome::NotLaunched => panic!(
+            "PROBE control-absolute-bat: the shell declined to launch anything, so the harness cannot \
+             launch a batch file at all — fix the harness before reading the PATHEXT probe's result"
+        ),
+        LaunchOutcome::LaunchedNoHandle => panic!(
+            "PROBE control-absolute-bat: INCONCLUSIVE — launched without a process handle, so this \
+             control could not wait for the batch to finish before checking its marker; fix the \
+             harness before reading the PATHEXT probe's result"
+        ),
+        LaunchOutcome::Waited => {
+            println!(
+                "PROBE control-absolute-bat: launched=true batch_ran={}",
+                marker.exists()
+            );
+            assert!(
+                marker.exists(),
+                "the harness cannot launch a batch file at all, so the PATHEXT probe's result is not \
+                 interpretable — fix the harness before reading it"
+            );
+        }
+    }
 }
 
 /// The other half of the elevated hazard, re-measured rather than inherited: a PATH-LESS `lpFile`
@@ -176,20 +221,30 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
     plant_batch(&dir.path().join("tool.bat"), &marker);
 
     // Path-less, extensionless: only a search can find anything.
-    let launched = shell_execute(Path::new("tool"), Some(dir.path())).expect("probe must be measurable");
-    let ran = marker.exists();
-
-    println!("PROBE pathless-lpFile-with-lpDirectory: launched={launched} batch_ran={ran}");
-    if ran {
-        println!(
-            "  => confirmed: a path-less lpFile is searched, PATHEXT applied and lpDirectory \
-             consulted. This is the hazard the elevated path closes by completing the name."
-        );
-    } else {
-        println!(
-            "  => NOT reproduced here. The premise behind resolving before ShellExecuteEx is not \
-             holding in this environment; re-examine it before relying on it."
-        );
+    let outcome = shell_execute(Path::new("tool"), Some(dir.path())).expect("probe must be measurable");
+    match outcome {
+        LaunchOutcome::NotLaunched => {
+            panic!("PROBE pathless-lpFile-with-lpDirectory: the shell declined to launch anything, so nothing was measured")
+        }
+        LaunchOutcome::LaunchedNoHandle => println!(
+            "PROBE pathless-lpFile-with-lpDirectory: INCONCLUSIVE — launched without a process \
+             handle, so this probe could not wait for the batch to finish before reading its marker"
+        ),
+        LaunchOutcome::Waited => {
+            let ran = marker.exists();
+            println!("PROBE pathless-lpFile-with-lpDirectory: launched=true batch_ran={ran}");
+            if ran {
+                println!(
+                    "  => confirmed: a path-less lpFile is searched, PATHEXT applied and lpDirectory \
+                     consulted. This is the hazard the elevated path closes by completing the name."
+                );
+            } else {
+                println!(
+                    "  => NOT reproduced here. The premise behind resolving before ShellExecuteEx is not \
+                     holding in this environment; re-examine it before relying on it."
+                );
+            }
+        }
     }
 }
 
@@ -212,14 +267,26 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
     plant_batch(&dir.path().join("tool.bat"), &marker);
     let lp_file = dir.path().join("tool."); // the "complete name" spelling
 
-    let launched = shell_execute(&lp_file, None).expect("probe must be measurable");
-    let ran = marker.exists();
-
-    println!("PROBE trailing-dot-suppresses-pathext: launched={launched} batch_ran={ran}");
-    if ran {
-        println!("  => NO. The dot does not suppress PATHEXT; the planted .bat still ran.");
-    } else {
-        println!("  => YES. The dot suppressed the PATHEXT search — the .bat did NOT run.");
+    let outcome = shell_execute(&lp_file, None).expect("probe must be measurable");
+    match outcome {
+        LaunchOutcome::NotLaunched => {
+            panic!(
+                "PROBE trailing-dot-suppresses-pathext: the shell declined to launch anything, so nothing was measured"
+            )
+        }
+        LaunchOutcome::LaunchedNoHandle => println!(
+            "PROBE trailing-dot-suppresses-pathext: INCONCLUSIVE — launched without a process \
+             handle, so this probe could not wait for the batch to finish before reading its marker"
+        ),
+        LaunchOutcome::Waited => {
+            let ran = marker.exists();
+            println!("PROBE trailing-dot-suppresses-pathext: launched=true batch_ran={ran}");
+            if ran {
+                println!("  => NO. The dot does not suppress PATHEXT; the planted .bat still ran.");
+            } else {
+                println!("  => YES. The dot suppressed the PATHEXT search — the .bat did NOT run.");
+            }
+        }
     }
 }
 
@@ -236,17 +303,27 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
 
     let dotted = dir.path().join("tool.");
     let params = format!("/c echo ran > \"{}\"", marker.display());
-    let launched = shell_execute_with(&dotted, None, Some(&params)).expect("probe must be measurable");
-    let ran = marker.exists();
-
-    println!("PROBE trailing-dot-opens-extensionless: launched={launched} image_ran={ran}");
-    if ran {
-        println!("  => YES. `<dir>\\tool.` loads the extensionless `<dir>\\tool`.");
-    } else {
-        println!(
-            "  => NO. The dotted spelling did not load the file, so it cannot be used as a \
-             complete-path marker even if it suppresses PATHEXT."
-        );
+    let outcome = shell_execute_with(&dotted, None, Some(&params)).expect("probe must be measurable");
+    match outcome {
+        LaunchOutcome::NotLaunched => {
+            panic!("PROBE trailing-dot-opens-extensionless: the shell declined to launch anything, so nothing was measured")
+        }
+        LaunchOutcome::LaunchedNoHandle => println!(
+            "PROBE trailing-dot-opens-extensionless: INCONCLUSIVE — launched without a process \
+             handle, so this probe could not wait for the image to finish before reading its marker"
+        ),
+        LaunchOutcome::Waited => {
+            let ran = marker.exists();
+            println!("PROBE trailing-dot-opens-extensionless: launched=true image_ran={ran}");
+            if ran {
+                println!("  => YES. `<dir>\\tool.` loads the extensionless `<dir>\\tool`.");
+            } else {
+                println!(
+                    "  => NO. The dotted spelling did not load the file, so it cannot be used as a \
+                     complete-path marker even if it suppresses PATHEXT."
+                );
+            }
+        }
     }
 }
 
@@ -280,11 +357,22 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 
     // No `>` anywhere: if the shell routes through tool.bat instead, these are inert arguments.
     let params = format!("/c copy /y \"{}\" \"{}\"", bat.display(), exe_marker.display());
-    let launched = shell_execute_with(&extensionless, None, Some(&params)).expect("probe must be measurable");
+    let outcome = shell_execute_with(&extensionless, None, Some(&params)).expect("probe must be measurable");
+    match outcome {
+        LaunchOutcome::NotLaunched => panic!(
+            "PROBE pathext-vs-existing-extensionless: the shell declined to launch anything, so \
+             precedence could not be measured"
+        ),
+        LaunchOutcome::LaunchedNoHandle => panic!(
+            "PROBE pathext-vs-existing-extensionless: INCONCLUSIVE — launched without a process \
+             handle, so this probe could not wait for the copy to finish before reading its markers"
+        ),
+        LaunchOutcome::Waited => {}
+    }
 
     let exe_ran = exe_marker.exists();
     let bat_ran = bat_marker.exists();
-    println!("PROBE pathext-vs-existing-extensionless: launched={launched} exe_ran={exe_ran} bat_ran={bat_ran}");
+    println!("PROBE pathext-vs-existing-extensionless: launched=true exe_ran={exe_ran} bat_ran={bat_ran}");
     match (exe_ran, bat_ran) {
         (true, false) => println!(
             "  => the EXISTING extensionless file wins. PATHEXT is only consulted when the named \
@@ -298,11 +386,13 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
              arms — `Search` included. Any absolute lpFile without a loadable extension is \
              plantable."
         ),
-        (true, true) => println!("  => INCONCLUSIVE: both markers set; the probe is still contaminated."),
-        (false, false) => println!("  => INCONCLUSIVE: neither ran; nothing was launched to measure."),
+        (true, true) => panic!(
+            "PROBE pathext-vs-existing-extensionless: INCONCLUSIVE — both markers set; the probe is \
+             still contaminated and its result cannot be trusted"
+        ),
+        (false, false) => panic!(
+            "PROBE pathext-vs-existing-extensionless: nothing ran, so precedence could not be \
+             measured — the probe is not interpretable"
+        ),
     }
-    assert!(
-        exe_ran || bat_ran,
-        "nothing ran, so precedence could not be measured — the probe is not interpretable"
-    );
 }
