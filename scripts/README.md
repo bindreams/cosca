@@ -83,12 +83,8 @@ numbers on this host.
 ### `windows-arm64`
 
 No publicly available Vagrant box for Windows on arm64 targets the `qemu` or `libvirt`
-provider this tool uses. Checked 2026-09-23 on Vagrant Cloud: `hbsmith/win11-arm`,
-`pipegz/Windows11ARM`, `nullx/windows-arm64`, `aihua/windows-11-arm64`,
-`apter-tech/windows-11-arm64`, `chicken-wire/windows-11-arm64-flutter-dev`,
-`santiago-bassett/windows-11-pro-arm64-vmware`, and `Sy3Omda/Win-SRV-2025` — every one of
-them publishes only `parallels`, `vmware_desktop`, or `utm` providers, none of which
-vagrant-qemu (or plain libvirt) can consume. `devvm.py` refuses this guest with that
+provider this tool uses (checked 2026-09-23 on Vagrant Cloud — every arm64 Windows box found
+there ships only `parallels`/`vmware_desktop`/`utm`). `devvm.py` refuses this guest with that
 explanation rather than silently doing nothing useful.
 
 If you need this lane: build a qcow2 image yourself from a Windows-on-ARM evaluation VHDX
@@ -137,8 +133,8 @@ provisioner invocation, before it even uploads the script. That capability's act
 reboot pending?" test (`reboot_detect.ps1`, vendored inside the `vagrant` gem) doesn't just
 check — it _schedules a real forced restart_ (`shutdown -f -r -t 60`) and then, if nothing was
 already pending, immediately cancels it (`shutdown -a`). That's a genuine, if normally
-self-cancelled, 60-second restart fuse on every ordinary `up`/`sync`, once per shell
-provisioner that used to be declared here. Every
+self-cancelled, 60-second restart fuse on every ordinary `up`/`sync`, once per shell provisioner.
+Every
 `vagrant provision` against this guest produced a matching guest System-log event 1074
 ("wininit.exe has initiated restart") followed by event 1075 ("aborted") — the owner watching
 the guest's console twice saw the real "you're about to be signed out" sign-off splash flash
@@ -198,8 +194,7 @@ with no display or UI automation needed: `scripts/devvm/provision/windows-accoun
 configures the `vagrant` account to autolog in at boot, giving the guest a genuine active
 interactive (session 1, console) logon; `windows-run-unelevated.ps1` then runs the command via
 a scheduled task (`Register-ScheduledTask` with a `New-ScheduledTaskPrincipal -LogonType
-Interactive -RunLevel Limited` principal — the PowerShell cmdlets replaced an earlier
-`schtasks.exe`-based version of this script), which borrows that logon's actual filtered token
+Interactive -RunLevel Limited` principal), which borrows that logon's actual filtered token
 at the LIMITED (non-elevated) run level even though the account is itself an Administrators
 member.
 Combined with `--allow-elevation` (`ConsentPromptBehaviorAdmin=0`), a `runas` child launched
@@ -261,6 +256,28 @@ scheduled task still fails to run — the account is logged on but its session i
 redirected, e.g. an RDP client that was closed without logging off — the error names this and
 gives the recovery: from inside the guest, `query session` lists session IDs and `tscon <id>
 /dest:console` reattaches a disconnected session to the console; otherwise reboot the guest.
+
+**If a `run --unelevated` (or any `devvm.py run`) hangs.** This is a developer tool with a human
+watching it run, not an unattended job: a suspended wrapper or a WER "... has stopped working"
+dialog leaves the completion pipe genuinely open, with nothing wrong for the OS to report, so no
+timeout can tell "still working" apart from "wedged forever" — that residual case is handled by
+the human, not by guessing a second timeout. Ctrl-C the `devvm.py run` invocation, then clean up
+the guest by hand, going through `devvm.py` (a bare `vagrant winrm` runs outside its own
+environment — `DEVVM_STAGE_DIR`, `VAGRANT_DOTFILE_PATH`, its working directory — and would fail or
+target the wrong guest). Only run this when no other `run --unelevated` is in flight — the
+wildcard below matches every `DevvmUnelevatedRun-*` task, not just the hung one, so it would
+stop/unregister a concurrent healthy run's task too:
+
+```sh
+uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | ForEach-Object { $_ | Stop-ScheduledTask; $_ | Unregister-ScheduledTask -Confirm:$false }'
+```
+
+This removes the task(s) and, since `Stop-ScheduledTask` kills its action process, the stuck
+wrapper with it. If a WER dialog is what's actually holding it, clear that first:
+
+```sh
+uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-Process | Where-Object Name -eq WerFault | Stop-Process -Force'
+```
 
 **Measured timings on this host** (Apple Silicon Mac, so `windows-x64` runs under TCG
 cross-arch emulation; one-time data point on 2026-09-23, not a guarantee):

@@ -2,11 +2,12 @@
 
 Deliberately small, by design, not by omission — covers stage_tree's two fixed bugs (stale
 files not removed on re-stage; a tracked-but-since-deleted file crashing the stage instead of
-being skipped), the run-argv-splitting function, powershell_quote, and the diagnostic-route
-split (_diag_write/build_run_inner) that picks Write-Host vs [Console]::Error.WriteLine
-depending on whether WinRM has a host attached. Everything else in devvm.py either shells out
-to vagrant/WinRM (only meaningfully testable inside a real guest, see scripts/README.md) or is
-a thin argparse/subprocess wrapper not worth a host-side test.
+being skipped), the run-argv-splitting function, powershell_quote, the diagnostic-route split
+(_diag_write/build_run_inner) that picks Write-Host vs [Console]::Error.WriteLine depending on
+whether WinRM has a host attached, and cmd_run's/cmd_up's own pure validation branches (flag
+combinations that exit before any vagrant/WinRM call is made). Everything else in devvm.py
+shells out to vagrant/WinRM and is only meaningfully testable inside a real guest (see
+scripts/README.md).
 
 Run with: uv run python -m unittest scripts.devvm_test -v
 
@@ -17,12 +18,14 @@ state (no sudo, no cgroups, no elevation), so it runs directly on this machine, 
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from scripts import devvm
+from scripts import devvm, devvm_common
 
 TEST_GUEST = devvm.Guest(name="devvm-test-guest", communicator="ssh", box="unused/for-tests")
 TEST_WINDOWS_GUEST = devvm.Guest(
@@ -174,6 +177,59 @@ class BuildRunInnerTests(unittest.TestCase):
         self.assertIn("$__devvmExit = [int](-not $?)", inner)
         self.assertIn("$global:LASTEXITCODE = $null", inner)
         self.assertTrue(inner.endswith("exit $__devvmExit"))
+
+
+class CmdRunValidationTests(unittest.TestCase):
+    # cmd_run does GUESTS[args.guest] internally, so these use real guest keys (not
+    # TEST_GUEST/TEST_WINDOWS_GUEST) — and none of these reach a vagrant/WinRM call, since
+    # every branch here exits before build_run_inner is ever built.
+
+    def test_unelevated_on_non_winrm_guest_exits(self) -> None:
+        args = argparse.Namespace(guest="linux-x64", unelevated=True, timeout=None, cmd=["whoami"])
+        with self.assertRaises(SystemExit):
+            devvm.cmd_run(args)
+
+    def test_timeout_without_unelevated_exits(self) -> None:
+        args = argparse.Namespace(guest="windows-x64", unelevated=False, timeout=60, cmd=["whoami"])
+        with self.assertRaises(SystemExit):
+            devvm.cmd_run(args)
+
+    def test_non_positive_timeout_exits(self) -> None:
+        args = argparse.Namespace(guest="windows-x64", unelevated=True, timeout=0, cmd=["whoami"])
+        with self.assertRaises(SystemExit):
+            devvm.cmd_run(args)
+
+    def test_timeout_over_max_exits(self) -> None:
+        args = argparse.Namespace(
+            guest="windows-x64",
+            unelevated=True,
+            timeout=devvm.WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS + 1,
+            cmd=["whoami"],
+        )
+        with self.assertRaises(SystemExit):
+            devvm.cmd_run(args)
+
+
+class CmdUpValidationTests(unittest.TestCase):
+    # cmd_up's second statement is dotfile_dir(guest).mkdir(...). dotfile_dir lives in
+    # devvm_common.py and resolves STATE_DIR against that module's own globals, not devvm's —
+    # so devvm_common.STATE_DIR (not devvm.STATE_DIR) is patched to a throwaway temp directory,
+    # so that mkdir call never touches this repo's real .tmp/devvm, before either validation
+    # check below runs.
+
+    def test_allow_elevation_on_non_winrm_guest_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(devvm_common, "STATE_DIR", Path(tmp)):
+                args = argparse.Namespace(guest="linux-x64", allow_elevation=True, display=False)
+                with self.assertRaises(SystemExit):
+                    devvm.cmd_up(args)
+
+    def test_display_on_non_winrm_guest_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(devvm_common, "STATE_DIR", Path(tmp)):
+                args = argparse.Namespace(guest="linux-x64", allow_elevation=None, display=True)
+                with self.assertRaises(SystemExit):
+                    devvm.cmd_up(args)
 
 
 if __name__ == "__main__":

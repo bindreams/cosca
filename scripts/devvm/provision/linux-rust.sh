@@ -80,5 +80,15 @@ else
     mkdir -p "$HOME/.cargo/bin"
     tar -xzf "$NEXTEST_TARBALL" -C "$HOME/.cargo/bin" cargo-nextest
     rm -f "$NEXTEST_TARBALL"
-    echo "devvm: installed cargo-nextest $("$CARGO" nextest --version | head -n1 | awk '{print $2}')"
+    # A broken extraction (corrupt tarball past the checksum check, wrong binary for this
+    # host's libc, ...) can leave a cargo-nextest that exists but doesn't actually run - the
+    # checksum above only confirms the download matches what was published, not that the
+    # extracted binary works on THIS guest. Verify the installed version, mirroring
+    # windows-rust.ps1's own post-extraction check.
+    INSTALLED_VERSION_AFTER="$("$CARGO" nextest --version 2>/dev/null | head -n1 | awk '{print $2}' || true)"
+    if [ "$INSTALLED_VERSION_AFTER" != "$NEXTEST_VERSION" ]; then
+        echo "devvm: cargo-nextest install verification failed - expected version $NEXTEST_VERSION, got '$INSTALLED_VERSION_AFTER'" >&2
+        exit 1
+    fi
+    echo "devvm: installed cargo-nextest $INSTALLED_VERSION_AFTER"
 fi

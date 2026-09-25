@@ -30,16 +30,18 @@
 # reported as "exited without reporting a result", rather than this script waiting out the rest
 # of -TimeoutSeconds for a result that will never arrive. That is a narrower claim than "the
 # wrapper always reaches its pipe write or dies": a wrapper that is merely stuck while still
-# alive (see "If a run hangs anyway" below) leaves the pipe genuinely open, and this script's
+# alive (see "If a run hangs" below) leaves the pipe genuinely open, and this script's
 # read blocks for as long as that process does.
 #
 # -TimeoutSeconds bounds every blocking Task Scheduler RPC call this script itself makes
 # during the probe (Register-ScheduledTask, Start-ScheduledTask — neither has a timeout of its
 # own) and the pipe connect wait: a genuine external-event bound (Task Scheduler actually
-# dispatching the task and its wrapper reaching Connect()), not a poll. Unregister-ScheduledTask
-# (cleanup, in the `finally` block below) is NOT bounded by -TimeoutSeconds — it runs after the
-# probe either way, on its own fixed 120s budget, so a small -TimeoutSeconds can't cut cleanup
-# short.
+# dispatching the task and its wrapper reaching Connect()), not a poll. Stop-/Unregister-
+# ScheduledTask (cleanup, in the `finally` block below) is NOT bounded by -TimeoutSeconds — it
+# runs after the probe either way, on its own fixed 120s budget, so a small -TimeoutSeconds
+# can't cut cleanup short. That cleanup is skipped entirely, not merely bounded differently, when
+# Register-/Start-ScheduledTask's own -TimeoutSeconds bound is what actually expired — see
+# $setupTimedOut below for why.
 # Invoke-Bounded (below) implements that bound by running each call on an in-process runspace
 # via [PowerShell]::BeginInvoke()/AsyncWaitHandle.WaitOne() — the same real-completion-event
 # pattern the named-pipe waits use, and no new process spawned (this guest is already
@@ -64,7 +66,7 @@
 # running slowly, or its command running long — it does NOT cover the wrapper being stuck while
 # still alive (suspended, or held by a Windows Error Reporting "... has stopped working"
 # dialog): the pipe stays genuinely open in that case, and nothing here can tell "still
-# legitimately working" apart from "wedged forever". See "If a run hangs anyway" below for that
+# legitimately working" apart from "wedged forever". See "If a run hangs" below for that
 # residual case, and -WindowStyle Hidden plus the wrapper's use of Add-Content instead of
 # Write-Host (in the template below) for why an ordinary console can no longer be the cause of
 # it.
@@ -75,37 +77,17 @@
 # wrapper's Connect() would block forever against a server pipe this script has by then
 # disposed, leaking a process on the guest indefinitely.
 #
-# If a run hangs anyway: this is a developer tool with a human watching it run, not an
-# unattended job, so the residual case above (a suspended wrapper, or a WER dialog silently
-# holding it — both leave the pipe open with nothing wrong for the OS to report) is handled by
-# the human, not by guessing a second timeout. Ctrl-C the `devvm.py run` invocation, then clean
-# up the guest by hand. Go through devvm.py, not a bare `vagrant winrm`: a bare invocation runs
-# outside devvm.py's own environment (DEVVM_STAGE_DIR, VAGRANT_DOTFILE_PATH, its working
-# directory) and would fail or target the wrong guest. Single-quote the PowerShell command on
-# the HOST side, so the host shell (bash/zsh) never touches `$false` or other
-# PowerShell-special characters inside it — a double-quoted `$false` here gets expanded by the
-# host shell before PowerShell ever sees it. `-PassThru` is also not a documented parameter of
-# Stop-ScheduledTask, so the pipeline below routes each task through ForEach-Object instead of
-# relying on it. Only run this when no other `run --unelevated` is in flight - the wildcard
-# matches every DevvmUnelevatedRun-* task, not just the hung one, so it would stop/unregister a
-# concurrent healthy run's task too:
-#   uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | ForEach-Object { $_ | Stop-ScheduledTask; $_ | Unregister-ScheduledTask -Confirm:$false }'
-# removes the task(s) and, since Stop-ScheduledTask kills its action process, the stuck wrapper
-# with it; if a WER dialog is what's actually holding it, clear that first. `Get-Process
-# WerFault -ErrorAction SilentlyContinue` is deliberately NOT used here: -ErrorAction only
-# suppresses the error's message, not its effect on `$?` — with nothing named WerFault running
-# (the common case), `$?` is still left False at the end of the command. devvm.py's `run`
-# wrapper runs this `-Command` string inside a nested `powershell.exe -NoProfile -Command '...'`
-# child process, and that child's own process exit code mirrors ITS internal `$?` at exit
-# (measured directly, 2026-09-25: `Get-Process` on a nonexistent name with
-# `-ErrorAction SilentlyContinue` alone yields child `$LASTEXITCODE=1`) - the outer wrapper
-# then reads that as `$LASTEXITCODE` and reports it as a command failure, turning a "nothing to
-# clean up" outcome into a reported failure. Filtering client-side instead of via Get-Process's
-# own -Name matching avoids the error (and the `$?` it leaves behind) in the first place:
-#   uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-Process | Where-Object Name -eq WerFault | Stop-Process -Force'
+# If a run hangs, Ctrl-C and clean up the guest by hand via devvm.py — see
+# scripts/README.md#windows-guests for the recovery commands.
 Param(
     [Parameter(Mandatory = $true)]
     [string]$EncodedCommand,
+
+    # The domain-qualified account name (e.g. "DESKTOP-RPVSB2I\vagrant") a scheduled task
+    # borrows its Interactive-logon token from. Resolved by the caller, not here - see the
+    # $currentUser assignment below for why.
+    [Parameter(Mandatory = $true)]
+    [string]$InteractiveUser,
 
     [int]$TimeoutSeconds = 3600
 )
@@ -152,7 +134,7 @@ $innerScriptPath = "$env:TEMP\$taskName.inner.ps1"
 # own deliberate diagnostics (below) don't rely on that passive capture: they Add-Content
 # directly to $logPath, a second file, instead of ever calling Write-Host - so nothing here
 # depends on rendering to a console that, even before -WindowStyle Hidden, could block
-# indefinitely on a paused or QuickEdit-selected window (see "If a run hangs anyway" in the
+# indefinitely on a paused or QuickEdit-selected window (see "If a run hangs" in the
 # header above).
 $transcriptPath = "$env:TEMP\$taskName.transcript.txt"
 $logPath = "$env:TEMP\$taskName.log.txt"
@@ -161,49 +143,22 @@ $logPath = "$env:TEMP\$taskName.log.txt"
 # default to "whoever is currently logged on", so without this Register-ScheduledTask throws
 # "missing mandatory parameter: UserId".
 #
-# Not Win32_ComputerSystem.UserName (an earlier version of this check): that property reports
-# only the CONSOLE (session 1) session's owner, and goes blank the moment an RDP logon takes
-# over that session - which this tool's own README recommends for interactive debugging. RDP
-# taking over a client-SKU console session doesn't log the account out, it keeps driving the
-# same interactive session remotely - so 'vagrant' was genuinely still logged in, but this
-# check reported no logon to borrow at all.
-#
-# Not Win32_LoggedOnUser/Win32_LogonSession either (a later version of this check, replacing
-# the one above): live-verified 2026-09-25 that after fully signing 'vagrant' out (`logoff
-# <session id>`, confirmed via `query session` no longer listing any session for the account),
-# Win32_LoggedOnUser piped through Win32_LogonSession kept reporting the SAME LogonId,
-# LogonType 2 (Interactive), for 'vagrant' as before the sign-out - a stale WMI/LSA
-# association, not a live session. A task registered against that borrows a token from a logon
-# that's already gone.
-#
-# The owner of a running explorer.exe (the desktop shell itself) does not have that staleness
-# problem: in the same measurement it correctly went from 'vagrant' to nothing the moment the
-# sign-out completed, and it needs no logon-type enumeration to be session-type-agnostic across
-# console, RDP, and cached logons - a live desktop shell is proof enough on its own. This is
-# therefore the sole check now, not a fallback for an incomplete WMI association, filtered to
-# the owning account so an explorer.exe belonging to a different user already logged onto the
-# same box can't be mistaken for 'vagrant's own session. $owner.Domain is the machine name for
-# a local account (e.g. "DESKTOP-RPVSB2I"), giving -UserId exactly the machine-qualified form
-# it needs.
-#
-# Fail loudly, not silently substitute a guess, if nobody is logged on
-# interactively - a task registered against no session-1 logon to borrow would just fail later
-# with a less legible error inside Start-ScheduledTask instead.
-$owner = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" |
-    ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName GetOwner } |
-    Where-Object { $_.ReturnValue -eq 0 -and $_.User -eq 'vagrant' } | Select-Object -First 1
-$currentUser = if ($owner) { "$($owner.Domain)\$($owner.User)" } else { $null }
-# RDP recovery guidance is threaded through to all three sites below that can surface a
-# missing or unusable interactive logon: the immediate throw right here (no interactive logon
-# found at all), Register-ScheduledTask (found a logon here but it's gone by then), and "no
-# wrapper ever connected" (found a logon and registered the task, but nothing about running it
-# further confirms the session was actually usable) - an interactive-but-RDP-redirected
-# session can still leave the scheduled task unable to actually run, e.g. the session was
-# disconnected (not just redirected) between one check and the next.
+# Resolved by the caller (devvm.py's cmd_run, via get_windows_interactive_username), not here:
+# that Python-side helper and this script used to run the identical explorer.exe-owner-via-WMI
+# query independently - see get_windows_interactive_username's own docstring in devvm.py for
+# the full "why explorer.exe, not Win32_ComputerSystem.UserName or
+# Win32_LoggedOnUser/Win32_LogonSession" reasoning, which applies equally to both call sites.
+# devvm.py already fails loudly there if nobody is logged on interactively, before this script
+# ever runs.
+$currentUser = $InteractiveUser
+# RDP recovery guidance is threaded through to the two sites below that can surface a logon
+# that was usable when devvm.py resolved it but isn't by the time this script actually needs
+# it: Register-ScheduledTask (found a logon there but it's gone by now), and "no wrapper ever
+# connected" (found a logon and registered the task, but nothing about running it further
+# confirms the session was actually usable) - an interactive-but-RDP-redirected session can
+# still leave the scheduled task unable to actually run, e.g. the session was disconnected
+# (not just redirected) between one check and the next.
 $rdpRecoveryNote = " If this guest was reached over RDP: the scheduled task needs vagrant's session to still be an active, connected desktop, not merely logged on - a disconnected RDP session (closed the client without logging off) can leave a LogonType 10/11 session that this check finds but the scheduled task still can't run in. From inside the guest, 'query session' lists session IDs and 'tscon <id> /dest:console' reattaches a disconnected session to the console; otherwise reboot the guest."
-if (-not $currentUser) {
-    throw "devvm: no interactive (session 1, console or RDP-redirected) logon for 'vagrant' was found, so there is no logon for a scheduled task to borrow. See windows-account-and-uac.ps1's autologon setup.$rdpRecoveryNote"
-}
 
 # Shared monotonic deadline for every blocking wait THIS script itself makes (Register-,
 # Start-, the pipe connect wait) and, via __DEADLINE_TICKS__ below, for the wrapper's own waits
@@ -306,7 +261,11 @@ function Invoke-Bounded {
             # exception so callers see the friendly message it actually threw.
             throw $_.Exception.InnerException
         }
-        if ($ps.HadErrors) {
+        # Not $ps.HadErrors: PowerShell/PowerShell#4613 - HadErrors can be $true even when
+        # -ErrorAction SilentlyContinue suppressed the error and nothing was actually added to
+        # Streams.Error, making Streams.Error[0] below throw an index-out-of-range instead of
+        # the intended exception. Streams.Error.Count is what HadErrors is documented to mean.
+        if ($ps.Streams.Error.Count -gt 0) {
             throw $ps.Streams.Error[0].Exception
         }
     } finally {
@@ -351,7 +310,7 @@ function Invoke-Bounded {
 # wait and disposed the server pipe. Diagnostics throughout use Add-Content to __LOG_PATH__,
 # never Write-Host: with the task's action now running -WindowStyle Hidden (below), there is no
 # console for Write-Host to reach anyway, but writing to a file directly also means nothing
-# here depends on a host/console object succeeding at all - see "If a run hangs anyway" in the
+# here depends on a host/console object succeeding at all - see "If a run hangs" in the
 # header above for the one thing that still isn't bounded by any of this.
 $wrapperTemplate = @'
 Start-Transcript -Path '__TRANSCRIPT_PATH__' | Out-Null
@@ -498,30 +457,41 @@ Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 # Remove-Item): starting the try/finally any later would leak a registered task and/or
 # $scriptPath on the guest if, say, the pipe's SDDL construction or the NamedPipeServerStream
 # constructor itself threw in between.
+#
+# $setupTimedOut tracks whether Register-/Start-ScheduledTask's own Invoke-Bounded call timed
+# out specifically (as opposed to the ScriptBlock inside it throwing a normal, already-complete
+# error) - Invoke-Bounded's own contract on timeout is BeginStop (async) with no Dispose(), so
+# the abandoned runspace may still be actually running Register-/Start-ScheduledTask when this
+# script reaches its cleanup below. Unregistering the task or deleting its files in that window
+# would race that still-in-flight call: it could re-create the task (Register) or leave it
+# freshly started (Start) right after cleanup just removed it. The `finally` block below skips
+# cleanup entirely when this is set, and warns instead - see there.
+$setupTimedOut = $false
 $pipeServer = $null
 try {
-    # No try/catch wraps this Invoke-Bounded call itself: that would catch its own
-    # already-complete timeout throw and re-wrap it below with an "is there an active
-    # interactive session" question that has nothing to do with a timeout. Instead, only the
-    # actual Register-ScheduledTask cmdlet call, inside the ScriptBlock below, is wrapped - a
-    # genuine cmdlet failure (e.g. no interactive session to borrow) gets the friendly
-    # RDP-recovery wrapping there (an explicit `throw`, a terminating error inside the
-    # ScriptBlock's own runspace) and surfaces through Invoke-Bounded's unwrapped-EndInvoke
-    # path already fully formatted, needing no further wrapping here - not through
-    # $ps.Streams.Error[0].Exception, which only catches a ScriptBlock that leaves a
-    # non-terminating error unthrown (see Invoke-Bounded's own comment). $rdpRecoveryNote is
-    # passed in via -Parameters since the ScriptBlock runs on its own runspace and cannot close
-    # over this script's variables.
+    # The try/catch immediately below Get-RemainingSeconds exists only to notice a TIMEOUT
+    # specifically (via an exact match against $registerTimeoutMessage, which Invoke-Bounded
+    # throws as-is - see its own docstring) and set $setupTimedOut before rethrowing unchanged -
+    # it does not re-wrap or alter the error itself. A genuine cmdlet failure (e.g. no
+    # interactive session to borrow) still gets its friendly RDP-recovery wrapping purely inside
+    # the ScriptBlock below (an explicit `throw`, a terminating error inside the ScriptBlock's
+    # own runspace), surfacing through Invoke-Bounded's unwrapped-EndInvoke path already fully
+    # formatted - not through $ps.Streams.Error[0].Exception, which only catches a ScriptBlock
+    # that leaves a non-terminating error unthrown (see Invoke-Bounded's own comment).
+    # $rdpRecoveryNote is passed in via -Parameters since the ScriptBlock runs on its own
+    # runspace and cannot close over this script's variables.
     #
     # Bounded by whatever's left of the caller's own -TimeoutSeconds, not a budget of its own —
     # so a timeout here means -TimeoutSeconds itself ran out during this step, not that Task
     # Scheduler is stuck (see Invoke-Bounded's finally-block sibling call below for the one case
     # where that distinction doesn't apply).
     $registerBudget = Get-RemainingSeconds
-    Invoke-Bounded -TimeoutSeconds $registerBudget `
-        -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Register-ScheduledTask - it had ${registerBudget}s left when this step started. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
-        -Parameters @{ TaskName = $taskName; ScriptPath = $scriptPath; UserId = $currentUser; RdpRecoveryNote = $rdpRecoveryNote } `
-        -ScriptBlock {
+    $registerTimeoutMessage = "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Register-ScheduledTask - it had ${registerBudget}s left when this step started. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this."
+    try {
+        Invoke-Bounded -TimeoutSeconds $registerBudget `
+            -TimeoutMessage $registerTimeoutMessage `
+            -Parameters @{ TaskName = $taskName; ScriptPath = $scriptPath; UserId = $currentUser; RdpRecoveryNote = $rdpRecoveryNote } `
+            -ScriptBlock {
             param($TaskName, $ScriptPath, $UserId, $RdpRecoveryNote)
             # -ExecutionPolicy Bypass: the LIMITED-run-level principal's own effective execution
             # policy is untested/unknown territory (a different, filtered token than the
@@ -546,7 +516,7 @@ try {
                 # -ErrorAction Stop: Register-ScheduledTask is CDXML-backed (a CIM cmdlet
                 # generated from a Task Scheduler CDXML definition, not native .NET), and a
                 # CDXML cmdlet's own failure is a NON-terminating error regardless of this
-                # runspace's default $ErrorActionPreference - measured directly (2026-09-25):
+                # runspace's default $ErrorActionPreference:
                 # without -ErrorAction Stop here, a forced registration failure (e.g. no
                 # interactive session to borrow) writes to the error stream and returns
                 # normally, so this catch never runs and the friendly RDP-recovery message
@@ -559,6 +529,12 @@ try {
                 throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup.$RdpRecoveryNote"
             }
         }
+    } catch {
+        if ($_.Exception.Message -eq $registerTimeoutMessage) {
+            $setupTimedOut = $true
+        }
+        throw
+    }
 
     # The 2-arg NamedPipeServerStream(name, direction) constructor defaults to
     # PipeOptions.None (synchronous); BeginWaitForConnection() below is the async API and throws
@@ -609,15 +585,25 @@ try {
 
     # Same reasoning as the Register-ScheduledTask call above: this budget is whatever's left
     # of the caller's own -TimeoutSeconds, not an independent one, so a timeout here means
-    # -TimeoutSeconds ran out, not that Task Scheduler is stuck.
+    # -TimeoutSeconds ran out, not that Task Scheduler is stuck. Same $setupTimedOut tracking
+    # too, and for the identical reason: an abandoned, still-running Start-ScheduledTask call
+    # could leave the task freshly started right after cleanup below removes it.
     $startBudget = Get-RemainingSeconds
-    Invoke-Bounded -TimeoutSeconds $startBudget `
-        -TimeoutMessage "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Start-ScheduledTask - it had ${startBudget}s left when this step started. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this." `
-        -Parameters @{ TaskName = $taskName } `
-        -ScriptBlock {
-            param($TaskName)
-            Start-ScheduledTask -TaskName $TaskName
+    $startTimeoutMessage = "devvm: -TimeoutSeconds ${TimeoutSeconds}s expired during Start-ScheduledTask - it had ${startBudget}s left when this step started. If the guest is just slow, a larger -TimeoutSeconds (devvm.py's --timeout) usually fixes this."
+    try {
+        Invoke-Bounded -TimeoutSeconds $startBudget `
+            -TimeoutMessage $startTimeoutMessage `
+            -Parameters @{ TaskName = $taskName } `
+            -ScriptBlock {
+                param($TaskName)
+                Start-ScheduledTask -TaskName $TaskName
+            }
+    } catch {
+        if ($_.Exception.Message -eq $startTimeoutMessage) {
+            $setupTimedOut = $true
         }
+        throw
+    }
 
     # A genuine external-event failure bound, not a poll: the task might never run at all (no
     # interactive session to borrow) or Task Scheduler might hang before the wrapper ever gets
@@ -625,16 +611,18 @@ try {
     # running" other than waiting up to some bound.
     $signaled = $connectResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds((Get-RemainingSeconds)))
     if (-not $signaled) {
-        # No client ever connected here, so there is no wrapper process to signal at all.
-        # Dispose the server pipe FIRST: that's what makes the wrapper's own bounded Connect()
-        # (against this now-closed pipe) fail promptly if a late-dispatched task tries to
-        # connect after this point, rather than blocking against a pipe still nominally open. A
-        # late dispatch that hasn't even started its process yet instead finds $scriptPath
-        # already gone (Remove-Item, in the shared `finally` below) and fails to start at all -
-        # one that's already running is bounded by its own Connect()/child-WaitForExit deadline
-        # regardless (see the wrapper template's comment above).
+        # No connection was seen before WaitOne's own deadline, so there is no wrapper process
+        # known to this script to signal at all - not the stronger claim "no wrapper ever
+        # connected": a wrapper could still connect in the gap between this check and the
+        # Dispose() right below. Dispose the server pipe FIRST: that's what makes the wrapper's
+        # own bounded Connect() (against this now-closed pipe) fail promptly if a late-dispatched
+        # task tries to connect after this point, rather than blocking against a pipe still
+        # nominally open. A late dispatch that hasn't even started its process yet instead finds
+        # $scriptPath already gone (Remove-Item, in the shared `finally` below) and fails to
+        # start at all - one that's already running is bounded by its own Connect()/child-
+        # WaitForExit deadline regardless (see the wrapper template's comment above).
         $pipeServer.Dispose()
-        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - no wrapper ever connected. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$rdpRecoveryNote$(Get-TranscriptNote)"
+        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - no wrapper connection was seen before the deadline. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$rdpRecoveryNote$(Get-TranscriptNote)"
     }
 
     $pipeServer.EndWaitForConnection($connectResult)
@@ -693,23 +681,54 @@ try {
     if ($pipeServer) {
         $pipeServer.Dispose()
     }
-    try {
-        # 120s, not 30s: real headroom above Unregister-ScheduledTask's measured duration on
-        # this guest, well above Register-/Start-ScheduledTask's own. A failure bound surfaced
-        # to the human via the warning below, not a synchronization interval.
-        Invoke-Bounded -TimeoutSeconds 120 `
-            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment):`n`nuv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask $taskName | Unregister-ScheduledTask -Confirm:`$false'" `
-            -Parameters @{ TaskName = $taskName } `
-            -ScriptBlock {
-                param($TaskName)
-                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-            }
-    } catch {
-        # Best-effort cleanup only: never let a stuck/failed Unregister-ScheduledTask replace
-        # the real outcome of the probe above (success, or the timeout already thrown).
-        Write-Warning $_.Exception.Message
+    if ($setupTimedOut) {
+        # Register-/Start-ScheduledTask's own Invoke-Bounded call timed out, which per its own
+        # contract (BeginStop, no Dispose - see its docstring) may still be genuinely running on
+        # an abandoned runspace right now. Unregistering the task or deleting its files here
+        # would race that: a still-in-flight Register-ScheduledTask could re-create the task
+        # right after Unregister-ScheduledTask just removed it, or a still-in-flight
+        # Start-ScheduledTask could leave it freshly started right after cleanup. Skipping
+        # cleanup entirely is the safe side of that race - the cost is a possibly-leaked task
+        # and files, surfaced to the human below, not a resurrected task nobody is watching.
+        Write-Warning "devvm: setup (Register-/Start-ScheduledTask) timed out with its call possibly still running in the background - skipping cleanup to avoid racing it. The task '$taskName' (and its per-run files under `$env:TEMP`) may be left behind; its name is GUID-suffixed and unique to THIS run, so it will not collide with a later run, but it will accumulate until removed by hand. Once you're sure the timed-out call has actually finished (give it a few minutes), remove it via devvm.py (a bare 'vagrant winrm' lacks its environment):`n`nuv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:`$false'"
+    } else {
+        try {
+            # 120s, not 30s: real headroom above Stop-/Unregister-ScheduledTask's measured
+            # duration on this guest, well above Register-/Start-ScheduledTask's own. A failure
+            # bound surfaced to the human via the warning below, not a synchronization interval.
+            Invoke-Bounded -TimeoutSeconds 120 `
+                -TimeoutMessage "devvm: cleanup (Stop-/Unregister-ScheduledTask) did not complete within 120s - the task '$taskName' may be left behind, possibly still running. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment):`n`nuv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:`$false'" `
+                -Parameters @{ TaskName = $taskName } `
+                -ScriptBlock {
+                    param($TaskName)
+                    # Existence-checked first, not -ErrorAction SilentlyContinue on
+                    # Unregister-ScheduledTask itself: that used to silently swallow a GENUINE
+                    # Unregister failure (as opposed to "there was nothing to unregister")
+                    # together with Invoke-Bounded's own (now-fixed) HadErrors bug, so a real
+                    # failure never reached the Write-Warning below. Checking existence first,
+                    # then using -ErrorAction Stop only once the task is confirmed present, lets
+                    # a genuine failure surface through Invoke-Bounded's already-fixed
+                    # EndInvoke-unwrap path instead of being swallowed twice over.
+                    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                    if ($task) {
+                        # Best-effort: Stop-ScheduledTask kills the wrapper's action process if
+                        # it's still somehow running (e.g. a late-dispatched task that connected
+                        # in the WaitOne-to-Dispose gap above, or one that connected and then
+                        # hung) before its transcript/log/output files get deleted below, closing
+                        # the window where a still-running wrapper could be caught mid-write to a
+                        # file this script is about to remove out from under it.
+                        $task | Stop-ScheduledTask -ErrorAction SilentlyContinue
+                        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+                    }
+                }
+        } catch {
+            # Best-effort cleanup only: never let a stuck/failed Stop-/Unregister-ScheduledTask
+            # replace the real outcome of the probe above (success, or the timeout already
+            # thrown).
+            Write-Warning $_.Exception.Message
+        }
+        Remove-Item -Path $outputPath, $errorPath, $scriptPath, $transcriptPath, $logPath, $innerScriptPath -ErrorAction SilentlyContinue
     }
-    Remove-Item -Path $outputPath, $errorPath, $scriptPath, $transcriptPath, $logPath, $innerScriptPath -ErrorAction SilentlyContinue
 }
 
 if ($output) {
@@ -719,24 +738,10 @@ if ($output) {
 # `vagrant winrm -c` on the host. But `vagrant winrm -c` itself does not forward the value:
 # for a remote command exiting {0, 1, 2, 42, 255}, vagrant's own process exit code is 0 for
 # the zero case and exactly 1 for every nonzero case. So only the zero-vs-nonzero distinction
-# survives to devvm.py's sys.exit, not the probe's actual exit code. The inner script that
-# runs the caller's actual command (built by devvm.py's build_run_inner with direct=False,
-# decoded to __INNER_SCRIPT_PATH__ above) prints the real value itself, via its
-# "devvm: command exited N" diagnostic, whenever that command runs to completion and exits
-# nonzero - so it's still visible in the developer's shell, just not as this process's own
-# exit status.
-#
-# That diagnostic requires the inner script to reach its own `exit $__devvmExit` - two
-# separate things can prevent that, and only one of them is what leaves $exitCode here at its
-# -1 sentinel:
-#   - The wrapper's own child-process wait (`$childProcess.WaitForExit(...)`, inside
-#     $wrapperTemplate above) expiring: the inner script's process tree gets taskkilled mid-run,
-#     never reaching its own exit line, so $exitCode stays -1 and is what reaches `exit
-#     $exitCode` here. The "did not finish within its deadline" message in the wrapper's own
-#     log is what explains that case.
-#   - THIS script's own connect-wait timeout (the "no wrapper ever connected" `throw` above)
-#     firing instead: that's an unhandled exception that terminates this script before it ever
-#     reaches this line at all - `exit $exitCode` never runs, and the -1 sentinel is irrelevant
-#     to that path. The result read that follows a successful connect has no timeout of its own
-#     (see the header comment above), so it cannot independently reach this comment's territory.
+# survives to devvm.py's sys.exit, not the probe's actual exit code (see run_vagrant's own
+# comment in devvm_common.py). The inner script that runs the caller's actual command (built
+# by devvm.py's build_run_inner with direct=False, decoded to __INNER_SCRIPT_PATH__ above)
+# prints the real value itself, via its "devvm: command exited N" diagnostic, whenever that
+# command runs to completion and exits nonzero - so it's still visible in the developer's
+# shell, just not as this process's own exit status.
 exit $exitCode

@@ -33,7 +33,7 @@
 #      Deliberately NOT checked at load time (this file is require_relative'd unconditionally
 #      from every guest Vagrantfile, so a load-time check runs on EVERY `vagrant` invocation
 #      that touches this Vagrantfile, including `destroy`/`halt` against an already-running
-#      QEMU process): measured directly (2026-09-25), reading driver.rb end to end - `stop`
+#      QEMU process): reading driver.rb end to end - `stop`
 #      (halt) sends QMP commands over the control port or SIGKILLs the process directly, and
 #      `delete` (destroy) only removes files - neither ever calls `execute`. A load-time
 #      check would mean that after a plugin upgrade to an unpinned vagrant-qemu version, THIS

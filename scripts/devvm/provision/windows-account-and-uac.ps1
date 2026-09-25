@@ -60,7 +60,17 @@ if ($null -eq $account) {
 if ($account.SID.Value.EndsWith("-500")) {
     throw "devvm: the account this tool connects as ('$($env:USERNAME)') is the built-in Administrator (RID 500), which Windows elevates without a UAC prompt. This box no longer matches the 'ordinary admin, UAC on' guest this tool promises - update scripts/devvm/guests/windows-x64/Vagrantfile to connect as a non-built-in admin account."
 }
-$members = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue
+# -ErrorAction Stop, not SilentlyContinue: Get-LocalGroupMember is CDXML-backed like
+# Register-ScheduledTask (see windows-run-unelevated.ps1's own comment on that), so its failure
+# is a NON-terminating error regardless of $ErrorActionPreference unless the cmdlet call itself
+# is told to stop. Without this, a cmdlet failure (e.g. a transient WMI/LSA glitch) would leave
+# $members empty exactly like "the account genuinely isn't a member" does, and the throw below
+# would misreport a query failure as a real non-membership finding.
+try {
+    $members = Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop
+} catch {
+    throw "devvm: could not enumerate Administrators group membership: $($_.Exception.Message)"
+}
 $isAdmin = @($members | Where-Object { $_.Name -like "*\$($env:USERNAME)" -or $_.Name -eq $env:USERNAME }).Count -gt 0
 if (-not $isAdmin) {
     throw "devvm: account '$($env:USERNAME)' is not a member of Administrators"
