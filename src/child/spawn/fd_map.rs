@@ -99,6 +99,11 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, mappings: Vec<FdMappi
 /// child only. The cosca-owned equivalent of `command-fds`' `preserved_fds`, used by
 /// `containment::fdmarker` to keep the marker write end open at the fd number it was placed
 /// at.
+///
+/// `cfg`-gated to macOS, the only platform with a caller (`containment::fdmarker`): an
+/// unconditional definition is dead code (and so a `-D warnings` clippy failure) on every other
+/// Unix this module also compiles for.
+#[cfg(target_os = "macos")]
 pub(crate) fn install_preserved(std_cmd: &mut std::process::Command, fds: Vec<OwnedFd>) {
     if fds.is_empty() {
         return;
@@ -194,6 +199,7 @@ impl Plan {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn preserve(fds: &[OwnedFd]) -> io::Result<()> {
     for fd in fds {
         clear_cloexec(fd.as_raw_fd())?;

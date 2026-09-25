@@ -3,7 +3,9 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 
-use super::{install, install_preserved, FdMapping};
+#[cfg(target_os = "macos")]
+use super::install_preserved;
+use super::{install, FdMapping};
 
 /// A throwaway file holding `content`, rewound to its start so a child reading it from the
 /// beginning sees exactly `content`.
@@ -129,6 +131,7 @@ fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
 
 // preserved_fds equivalent =====
 
+#[cfg(target_os = "macos")]
 #[test]
 fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
     let f = file_with("preserved");
@@ -146,6 +149,7 @@ fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
 /// survive exec (`std`'s `File`/`OwnedFd` is `FD_CLOEXEC` by default) — proves the previous
 /// test is actually exercising the CLOEXEC-clearing code path, not passing by accident (e.g.
 /// because `/bin/sh` itself happened to inherit the fd some other way).
+#[cfg(target_os = "macos")]
 #[test]
 fn without_install_preserved_the_fd_is_closed_at_exec() {
     let f = file_with("not-preserved");
