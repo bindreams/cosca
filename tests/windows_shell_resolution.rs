@@ -21,6 +21,19 @@
 //! explicitly at that arm. Whatever the shell hands off to this way can never be contained by
 //! cosca either, since no process handle is ever returned to assign to a Job Object.
 //!
+//! Every call sets `SEE_MASK_FLAG_NO_UI` for exactly this reason: these probes measure `lpFile`
+//! RESOLUTION, not a human's answer to a picker dialog, and must run unattended on a CI runner
+//! where no one is there to click one. The flag does not guarantee no UI ever appears — measured in
+//! run 36125783666: `does_an_existing_extensionless_file_ever_launch_directly` got
+//! `LaunchedNoHandle` on `windows-11-arm` (no UI, a clean handoff) but hung for the full 300s
+//! per-test bound on `windows-latest` (x64), where the same extensionless target's "how do you want
+//! to open this?" picker still appeared despite the flag. Where the flag *does* suppress the picker,
+//! the shell instead returns `ERROR_NO_ASSOCIATION` synchronously — so that code, exactly like
+//! `ERROR_FILE_NOT_FOUND`, is a genuine measured negative for a probe whose target is itself
+//! extensionless, not a harness failure; each such probe's `NotLaunched` arm says so explicitly. A
+//! hang the flag fails to prevent is still bounded, just not by this flag: `.config/nextest.toml`'s
+//! per-test `slow-timeout` kills that one test's process and lets the rest of the suite run.
+//!
 //! # Why they are `#[ignore]`d
 //!
 //! Most of them execute a batch file. That is the exact vector `reject_batch_path` exists to
@@ -46,7 +59,7 @@
 use std::path::{Path, PathBuf};
 
 use windows::core::{HRESULT, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_ASSOCIATION, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -141,10 +154,15 @@ enum LaunchOutcome {
     /// say so explicitly at each such arm. Either way, whatever the shell hands off to this way can
     /// never be contained by cosca: there is no process handle here to assign to a Job Object.
     LaunchedNoHandle,
-    /// The shell reported `ERROR_FILE_NOT_FOUND`: it looked for `lpFile` and found nothing to
-    /// launch. This is a genuine negative measurement, carried here so a caller can report it. Any
-    /// OTHER error means the harness itself could not even ask the question — `shell_execute_with`
-    /// panics on those instead of returning them mislabelled as this.
+    /// The shell reported `ERROR_FILE_NOT_FOUND` (it looked for `lpFile` and found nothing to
+    /// launch) or `ERROR_NO_ASSOCIATION` (it found `lpFile`, but — with `SEE_MASK_FLAG_NO_UI`
+    /// suppressing the picker that would otherwise ask a human — has no program to hand it to).
+    /// Both are genuine negative measurements, carried here so a caller can report them; which one
+    /// (or both) is the expected answer differs per probe, since `ERROR_NO_ASSOCIATION` only makes
+    /// sense where `lpFile` can actually exist. Any OTHER error means the harness itself could not
+    /// even ask the question — `shell_execute_with` panics on those instead of returning them
+    /// mislabelled as this, and callers must still check which of the two codes they actually got
+    /// rather than assume.
     NotLaunched(windows::core::Error),
 }
 
@@ -175,16 +193,21 @@ fn shell_execute_with(
 
     // SAFETY: every pointer field borrows a buffer that outlives the call, and `cbSize` matches.
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
-        // `ERROR_FILE_NOT_FOUND` is the shell reporting a genuine negative measurement: it looked
-        // for `lpFile` and found nothing to launch, which is a result, not a probe-harness
-        // failure. Any other error means the harness could not even ask the question — panic
-        // rather than mislabel it as a measured "nothing was launched".
-        if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) {
+        // `ERROR_FILE_NOT_FOUND` and `ERROR_NO_ASSOCIATION` are the shell reporting genuine
+        // negative measurements — "nothing there" and "something there, but nothing to hand it
+        // to" respectively — which are results, not probe-harness failures. Both are handed back
+        // as `NotLaunched` for the CALLER to classify: which code (or codes) counts as the
+        // expected answer is specific to each probe's target, not to this shared helper. Any other
+        // error means the harness could not even ask the question — panic rather than mislabel it
+        // as a measured "nothing was launched".
+        if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+            || e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0)
+        {
             return Ok(LaunchOutcome::NotLaunched(e));
         }
         panic!(
             "PROBE shell-execute: ShellExecuteExW failed with an unexpected error (not \
-             ERROR_FILE_NOT_FOUND): {e}"
+             ERROR_FILE_NOT_FOUND or ERROR_NO_ASSOCIATION): {e}"
         );
     }
     if info.hProcess.is_invalid() {
@@ -243,7 +266,7 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
 
     let outcome = shell_execute(&lp_file, None).expect("probe must be measurable");
     match outcome {
-        LaunchOutcome::NotLaunched(e) => {
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
             // A genuine negative: the shell looked for `tool` and found nothing to launch, which
             // is exactly what "PATHEXT is not applied" would look like.
             println!("PROBE absolute-extensionless-lpFile: launched=false ({e})");
@@ -252,6 +275,10 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
                  sufficient to close the search half, as cosca currently assumes."
             );
         }
+        LaunchOutcome::NotLaunched(e) => panic!(
+            "PROBE absolute-extensionless-lpFile: `tool` does not exist here, so ERROR_NO_ASSOCIATION \
+             (or anything but ERROR_FILE_NOT_FOUND) is not the negative this probe measures: {e}"
+        ),
         LaunchOutcome::LaunchedNoHandle => panic!(
             "PROBE absolute-extensionless-lpFile: INCONCLUSIVE — launched without a process handle, \
              so this probe could not wait for the batch to finish before reading its marker"
@@ -338,13 +365,18 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
     // Path-less, extensionless: only a search can find anything.
     let outcome = shell_execute(Path::new("tool"), Some(dir.path())).expect("probe must be measurable");
     match outcome {
-        LaunchOutcome::NotLaunched(e) => {
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
             println!("PROBE pathless-lpFile-with-lpDirectory: launched=false ({e})");
             println!(
                 "  => NOT reproduced here. The premise behind resolving before ShellExecuteEx is not \
                  holding in this environment; re-examine it before relying on it."
             );
         }
+        LaunchOutcome::NotLaunched(e) => panic!(
+            "PROBE pathless-lpFile-with-lpDirectory: `tool` cannot exist as a bare name in this \
+             directory (only `tool.bat` was planted), so ERROR_NO_ASSOCIATION (or anything but \
+             ERROR_FILE_NOT_FOUND) is not the negative this probe measures: {e}"
+        ),
         LaunchOutcome::LaunchedNoHandle => panic!(
             "PROBE pathless-lpFile-with-lpDirectory: INCONCLUSIVE — launched without a process \
              handle, so this probe could not wait for the batch to finish before reading its marker"
@@ -396,12 +428,17 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 
     let outcome = shell_execute(&lp_file, None).expect("probe must be measurable");
     match outcome {
-        LaunchOutcome::NotLaunched(e) => {
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
             // A genuine negative: the shell found nothing at all for `tool.`, meaning it did not
             // fall through to a PATHEXT-extended `tool.bat`.
             println!("PROBE trailing-dot-suppresses-pathext: launched=false ({e})");
             println!("  => YES. The dot suppressed the PATHEXT search — the .bat did NOT run.");
         }
+        LaunchOutcome::NotLaunched(e) => panic!(
+            "PROBE trailing-dot-suppresses-pathext: `tool.` does not exist here (only `tool.bat` was \
+             planted), so ERROR_NO_ASSOCIATION (or anything but ERROR_FILE_NOT_FOUND) is not the \
+             negative this probe measures: {e}"
+        ),
         LaunchOutcome::LaunchedNoHandle => panic!(
             "PROBE trailing-dot-suppresses-pathext: INCONCLUSIVE — launched without a process \
              handle, so this probe could not wait for the batch to finish before reading its marker"
@@ -434,8 +471,10 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 /// `cosca_testbin_image`, renamed to the extensionless `tool`, invoked with `--report-to` — a
 /// report means the real image was loaded through the dotted spelling; the image self-reports which
 /// file it is, since a post-exit OS query cannot (see `shell_execute_with`'s doc). An extensionless
-/// target may also get no process handle at all (`LaunchOutcome::LaunchedNoHandle`) — that is the
-/// expected, measured negative for this half (see that arm below), not a harness failure.
+/// target may also get no process handle at all (`LaunchOutcome::LaunchedNoHandle`) or fail
+/// synchronously with `ERROR_NO_ASSOCIATION` — both are the expected, measured negative for this
+/// half (see those arms below), not a harness failure; see the module doc for why both can happen
+/// for the same underlying fact.
 ///
 /// `ShellExecuteExW` itself can block on this exact input rather than ever returning — measured on
 /// `windows-latest`, where it hung with no output past a 30-minute job timeout (run 36120443833).
@@ -453,13 +492,31 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
     let params = format!("--report-to \"{}\"", marker.display());
     let outcome = shell_execute_with(&dotted, None, Some(&params)).expect("probe must be measurable");
     match outcome {
-        LaunchOutcome::NotLaunched(e) => {
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
             println!("PROBE trailing-dot-opens-extensionless: launched=false ({e})");
             println!(
                 "  => NO. The dotted spelling did not resolve to anything at all, so it cannot be \
                  used as a complete-path marker even if it suppresses PATHEXT."
             );
         }
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
+            // Same fact as the LaunchedNoHandle arm below, just returned synchronously instead of as
+            // a UI handoff: the dotted spelling DID resolve to the extensionless file — otherwise
+            // this would be ERROR_FILE_NOT_FOUND — but there is nothing to hand it to.
+            println!("PROBE trailing-dot-opens-extensionless: launched=false, no association ({e})");
+            println!(
+                "  => NO, not as a directly-run process. The dotted spelling still resolves to the \
+                 extensionless file rather than falling through to ERROR_FILE_NOT_FOUND, but an \
+                 extensionless target is never executed directly regardless of spelling — the shell \
+                 reported ERROR_NO_ASSOCIATION rather than handing it to a picker. This is the \
+                 expected, measured negative for an extensionless target — see \
+                 LaunchOutcome::LaunchedNoHandle's doc for the handoff variant of this same fact."
+            );
+        }
+        LaunchOutcome::NotLaunched(e) => panic!(
+            "PROBE trailing-dot-opens-extensionless: unexpected error (not ERROR_FILE_NOT_FOUND or \
+             ERROR_NO_ASSOCIATION): {e}"
+        ),
         LaunchOutcome::LaunchedNoHandle => {
             println!(
                 "PROBE trailing-dot-opens-extensionless: launched=true, no process handle \
@@ -528,43 +585,49 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
     // Inert if the shell instead routes to tool.bat: the planted batch ignores its arguments.
     let params = format!("--report-to \"{}\"", exe_marker.display());
     let outcome = shell_execute_with(&extensionless, None, Some(&params)).expect("probe must be measurable");
+    // Shared by the LaunchedNoHandle and ERROR_NO_ASSOCIATION arms below: both mean "the shell
+    // resolved `tool`'s own handoff and never even searched PATHEXT for `tool.bat` beside it" — the
+    // same fact, reported through two different mechanisms (see the module doc).
+    let report_neither_ran = |via: &str| {
+        let exe_ran = exe_marker.exists();
+        let bat_ran = read_self_report(&bat_marker).is_some_and(|r| same_file(&r, &bat));
+        println!("PROBE pathext-vs-existing-extensionless: launched=true, {via} exe_ran={exe_ran} bat_ran={bat_ran}");
+        assert!(
+            !exe_ran,
+            "PROBE pathext-vs-existing-extensionless: UNREACHABLE — the shell reported {via} for an \
+             extensionless target, yet the exe marker exists. An extensionless target is never run \
+             directly (see LaunchOutcome::LaunchedNoHandle's doc), so nothing should have been able \
+             to write this marker."
+        );
+        assert!(
+            !bat_ran,
+            "PROBE pathext-vs-existing-extensionless: INCONCLUSIVE — the shell reported {via}, yet \
+             the .bat's marker also exists — a real cmd.exe launch of the .bat always yields a \
+             process handle, which cannot coexist with that."
+        );
+        println!(
+            "  => the extensionless target's own handoff resolution wins outright: ShellExecuteEx \
+             resolved `tool` without ever searching PATHEXT for `tool.bat` beside it. Neither image \
+             ran as a process here, so this exact vector is not plantable through a direct launch — \
+             but nothing here was contained either, since neither a handoff nor a bare error yields a \
+             process handle (see LaunchOutcome::LaunchedNoHandle's doc)."
+        );
+    };
     match outcome {
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
+            report_neither_ran(&format!("no association ({e})"));
+        }
         LaunchOutcome::NotLaunched(e) => panic!(
-            "PROBE pathext-vs-existing-extensionless: the shell declined to launch anything ({e}), so \
-             precedence could not be measured"
+            "PROBE pathext-vs-existing-extensionless: the shell declined to launch anything with an \
+             unexpected error (not ERROR_NO_ASSOCIATION): {e} — both `tool` and `tool.bat` exist \
+             here, so precedence could not be measured"
         ),
         LaunchOutcome::LaunchedNoHandle => {
             // Not automatically a harness failure here: `does_an_existing_extensionless_file_...`
             // establishes that an existing extensionless target can be handed to an association
             // handler outright, independent of whether PATHEXT could have matched something beside
             // it. If neither marker was written, that is what happened here too.
-            let exe_ran = exe_marker.exists();
-            let bat_ran = read_self_report(&bat_marker).is_some_and(|r| same_file(&r, &bat));
-            println!(
-                "PROBE pathext-vs-existing-extensionless: launched=true, no process handle \
-                 (LaunchedNoHandle) exe_ran={exe_ran} bat_ran={bat_ran}"
-            );
-            assert!(
-                !exe_ran,
-                "PROBE pathext-vs-existing-extensionless: UNREACHABLE — the shell reported no \
-                 process handle for an extensionless target, yet the exe marker exists. An \
-                 extensionless target is never run directly (see LaunchOutcome::LaunchedNoHandle's \
-                 doc), so nothing should have been able to write this marker."
-            );
-            assert!(
-                !bat_ran,
-                "PROBE pathext-vs-existing-extensionless: INCONCLUSIVE — the shell reported no \
-                 process handle, yet the .bat's marker also exists — a real cmd.exe launch of the \
-                 .bat always yields a process handle, so this contradicts LaunchedNoHandle."
-            );
-            println!(
-                "  => the extensionless target's own handoff resolution wins outright: \
-                 ShellExecuteEx handed `tool` to an association handler without ever searching \
-                 PATHEXT for `tool.bat` beside it. Neither image ran as a process here, so this \
-                 exact vector is not plantable through a direct launch — but nothing here was \
-                 contained either, since a handoff never yields a process handle (see \
-                 LaunchOutcome::LaunchedNoHandle's doc)."
-            );
+            report_neither_ran("no process handle (LaunchedNoHandle)");
         }
         LaunchOutcome::Waited => {
             let exe_ran = exe_marker.exists();
@@ -601,13 +664,18 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 }
 
 /// Companion to the precedence probe above, with no `.bat` in the directory to compete: does an
-/// EXISTING extensionless file ever get run directly by `ShellExecuteEx`? Measured: no. The shell
-/// hands it to an association/Open-With handler instead (`LaunchOutcome::LaunchedNoHandle`) —
-/// regardless of whether the file exists, and regardless of whether anything else in the directory
-/// could satisfy `PATHEXT`. This was originally written as a control expected to always launch; it
-/// does not, and that failure to launch — a genuine `LaunchedNoHandle`, not a harness bug — IS the
-/// answer, and is what makes `does_pathext_outrank_an_existing_extensionless_file`'s `(true,
-/// false)` outcome unreachable.
+/// EXISTING extensionless file ever get run directly by `ShellExecuteEx`? Measured: no. Depending on
+/// the runner, the shell either hands it to an association/Open-With handler
+/// (`LaunchOutcome::LaunchedNoHandle`) or, where `SEE_MASK_FLAG_NO_UI` actually suppresses that
+/// picker, fails synchronously with `ERROR_NO_ASSOCIATION` — measured in run 36125783666:
+/// `windows-11-arm` got `LaunchedNoHandle`, `windows-latest` (x64) instead blocked inside
+/// `ShellExecuteExW` on the picker itself until the per-test bound killed it, which is why this
+/// probe now also accepts the synchronous error as the same answer rather than depending on always
+/// getting a clean handoff. Either way, this holds regardless of whether the file exists and
+/// regardless of whether anything else in the directory could satisfy `PATHEXT`. This was originally
+/// written as a control expected to always launch; it does not, and that failure to launch — a
+/// genuine negative, not a harness bug — IS the answer, and is what makes
+/// `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` outcome unreachable.
 #[test]
 #[ignore = "launches a copied payload binary; opt in with --ignored, on a throwaway runner only"]
 fn does_an_existing_extensionless_file_ever_launch_directly() {
@@ -622,10 +690,31 @@ fn does_an_existing_extensionless_file_ever_launch_directly() {
     let params = format!("--report-to \"{}\"", exe_marker.display());
     let outcome = shell_execute_with(&extensionless, None, Some(&params)).expect("probe must be measurable");
     match outcome {
+        LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
+            assert!(
+                !exe_marker.exists(),
+                "PROBE existing-extensionless-no-bat: UNREACHABLE — the shell reported no \
+                 association, yet the exe marker exists; something ran despite a synchronous \
+                 failure, which should be impossible"
+            );
+            println!("PROBE existing-extensionless-no-bat: launched=false, no association ({e})");
+            println!(
+                "  => NO. ShellExecuteEx does NOT run an existing extensionless file directly, even \
+                 when nothing else in the directory could satisfy PATHEXT. Here it reported \
+                 ERROR_NO_ASSOCIATION synchronously rather than handing off to a picker — the same \
+                 fact as the LaunchedNoHandle arm below, just surfaced differently (see the module \
+                 doc). This is the measured floor for \
+                 `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` branch: that \
+                 branch is unreachable, because an extensionless target is never executed directly. \
+                 It also means anything the shell refuses this way can never be contained by cosca — \
+                 there is no process handle to assign to a Job Object."
+            );
+        }
         LaunchOutcome::NotLaunched(e) => panic!(
-            "PROBE existing-extensionless-no-bat: the shell declined to launch anything at all ({e}) \
-             — not even the association-handler handoff this probe expects — so the harness itself \
-             appears to be broken"
+            "PROBE existing-extensionless-no-bat: the shell declined to launch anything with an \
+             unexpected error (not ERROR_NO_ASSOCIATION): {e} — the file exists here, so \
+             ERROR_FILE_NOT_FOUND would also be unexpected — so the harness itself appears to be \
+             broken"
         ),
         LaunchOutcome::LaunchedNoHandle => {
             assert!(
