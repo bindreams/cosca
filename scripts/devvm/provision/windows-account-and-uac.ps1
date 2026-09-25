@@ -3,8 +3,9 @@
 # built-in RID-500 Administrator, which Windows elevates silently, without a UAC prompt,
 # regardless of EnableLUA — and that the account autologs in at boot so a real interactive
 # (session 1) logon exists for windows-run-unelevated.ps1's Register-ScheduledTask
-# (-LogonType Interactive) probe runner to borrow. Idempotent: safe to re-run on every
-# `vagrant up --provision`.
+# (-LogonType Interactive) probe runner to borrow. Idempotent: safe to re-run any time this
+# script runs, which is every `up`/`sync` — it's driven directly over `vagrant winrm` by
+# run_windows_script (scripts/devvm.py), not Vagrant's shell provisioner.
 #
 # ConsentPromptBehaviorAdmin is only flipped away from the interactive default (5) when
 # DEVVM_WINDOWS_AUTO_CONSENT=1 is set — see scripts/devvm.py's --allow-elevation flag and
@@ -18,9 +19,11 @@
 # provision_windows_guest (scripts/devvm.py) scans for that marker and, if set, calls
 # reboot_windows_guest_and_wait to actually reboot (issued directly, not via Vagrant's
 # reboot-if-needed/wait_for_reboot capability — see the Vagrantfile's provisioning comment for
-# why) and wait for the guest to come back with a real interactive session on top of it. It
-# does NOT re-run this script afterward to re-verify the settings — the write above already
-# happened and reboot_windows_guest_and_wait's own wait is the only post-reboot check.
+# why). It does NOT re-run this script afterward to re-verify the settings — the write above
+# already happened. Confirming a real interactive session exists on top of the reboot is a
+# separate concern: provision_windows_guest calls wait_for_windows_session for that,
+# unconditionally, once, at the end of its own flow — not something reboot_windows_guest_and_wait
+# itself does.
 
 $ErrorActionPreference = "Stop"
 $policyKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"

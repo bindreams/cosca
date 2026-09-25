@@ -155,23 +155,12 @@ just right after a reboot that configured it, but also on a guest an earlier `up
 configured, where this `up`'s own reboot decision (if any) has nothing to do with whether a
 session shows up. Both waits: no `sleep`, no arbitrarily-chosen poll interval, just an
 immediate retry, bounded by `vagrant status` failing fast the moment the guest stops running
-and by one wall-clock deadline reusing the Vagrantfile's own 3600s
+and by one monotonic deadline reusing the Vagrantfile's own 3600s
 `boot_timeout`/`winrm.timeout`. Neither goes through Vagrant's own
 `reboot-if-needed`/`Reboot.reboot` capability, which carries the exact same fuse plus its own
 `sleep 10` wait loop. `vagrant winrm -c` itself has no readiness wait of its own (same source
 read as above), which is why these wait loops need their own deadline rather than relying on
 one baked into `vagrant winrm`.
-
-Whether this fuse explains any _specific_ historical "QEMU just disappeared" failure during
-`devvm.py run windows-x64 --unelevated` is **inferred, not measured**: `run`'s own code path
-(`vagrant winrm -c`) never touched `wait_for_reboot` either, before or after this fix, so a
-death during `run` itself isn't directly this mechanism. But every `up`/`sync` immediately
-before such a `run` — which is the normal workflow — did carry this fuse (one scheduled+
-aborted restart per shell provisioner, five per pass), so a leftover or mistimed abort from
-that immediately-preceding provisioning pass is a plausible contributing cause for a guest
-that goes away with no crash report shortly after. No specific historical failure was
-correlated against a specific event-1074 timestamp to confirm this; it's a plausible
-mechanism, not a demonstrated one.
 
 **Account and UAC.** The box's default `vagrant` account is an ordinary `Administrators`
 member — not the built-in Administrator (SID ending `-500`), which Windows elevates
@@ -251,6 +240,16 @@ This opens a real, local QEMU window on this Mac (`-display cocoa -vga std`) —
 other network-exposed display, so it doesn't touch the loopback-only port-forwarding guarantee
 above. Off by default; pass it again on every `up` that needs it (not persisted). RDP into the
 guest is the other option if a window on this Mac specifically isn't what's needed.
+
+RDP-ing into `vagrant` takes over its console (session 1) logon rather than opening a second,
+independent one — the account stays genuinely logged in, but `sync` and `run --unelevated`
+detect that logon by its `Win32_LogonSession`/`explorer.exe` ownership, not
+`Win32_ComputerSystem.UserName` (which goes blank the moment RDP takes the console over), so
+both keep working through an active RDP session. If `run --unelevated`'s scheduled task still
+fails to run — the account is logged on but its session is _disconnected_, not merely
+redirected, e.g. an RDP client that was closed without logging off — the error names this and
+gives the recovery: from inside the guest, `query session` lists session IDs and `tscon <id>
+/dest:console` reattaches a disconnected session to the console; otherwise reboot the guest.
 
 **Measured timings on this host** (Apple Silicon Mac, so `windows-x64` runs under TCG
 cross-arch emulation; one-time data point on 2026-09-23, not a guarantee):

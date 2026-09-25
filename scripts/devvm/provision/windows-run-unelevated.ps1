@@ -34,36 +34,43 @@
 # unblocks immediately with EOF, reported as "exited without reporting a result", rather than
 # this script waiting out the rest of -TimeoutSeconds for a result that will never arrive.
 #
-# -TimeoutSeconds bounds every blocking wait in this script from one shared deadline, not just
-# the pipe connect: Register-ScheduledTask, Start-ScheduledTask, the pipe connect wait, the
-# result read that follows it, AND the wrapper's own child process (the caller's actual
-# command). The deadline is monotonic (QueryPerformanceCounter-backed, via
+# -TimeoutSeconds bounds every blocking wait in this script and the wrapper it launches, not
+# just the pipe connect: Register-ScheduledTask, Start-ScheduledTask, the pipe connect wait,
+# the result read that follows it, AND the wrapper's own child process (the caller's actual
+# command). This script's own deadline is monotonic (QueryPerformanceCounter-backed, via
 # [System.Diagnostics.Stopwatch]::GetTimestamp()/::Frequency), not wall-clock (Get-Date): this
 # guest's own clock has been observed to jump by hours across an ordinary reboot (NTP resync),
 # which would corrupt a Get-Date-based deadline mid-wait. GetTimestamp()/Frequency are static
 # OS-level values, consistent across processes on the same machine with no intervening reboot —
 # unlike a Stopwatch *instance*'s Elapsed state, which cannot cross the process boundary to the
 # wrapper template below, a raw absolute tick count can: it's baked into that template
-# (__DEADLINE_TICKS__) for the wrapper to compute its own remaining time against.
+# (__DEADLINE_TICKS__) as a fixed grace margin EARLIER than this script's own deadline, not the
+# identical tick count - see $WrapperGraceSeconds's own comment below for why.
 #
-# The read used to be the one unbounded wait here — a command that deadlocks inside the wrapper
-# (as opposed to the wrapper itself dying, which the pipe-EOF liveness signal above already
-# covers) would hang this script, and devvm.py behind it, forever. It's bounded the same way as
-# the connect wait: a real completion event (ReadLineAsync()'s Task, via its AsyncWaitHandle)
-# raced against the remaining deadline, not a poll. On expiry it kills the wrapper's whole
-# process tree via the PID this script captured right after EndWaitForConnection — which
-# reliably reflects the actual connected wrapper process by construction, not a file this
-# script has to hope was already written (see Stop-WrapperProcessTree). The wrapper's own pipe
-# Connect() call (in the here-string below) is bounded too, for a case neither of the above
-# covers: a scheduled task that starts running only AFTER this script has already given up on
-# the connect wait and moved on — without a bound there, that late wrapper's Connect() would
-# block forever against a server pipe this script has by then disposed, leaking a process on
-# the guest indefinitely. And the wrapper's own child — the caller's actual command, run via
-# cmd.exe — is bounded the same way, against the same deadline: without that bound, that child
-# could outlive both a late-connecting wrapper this script has already given up on (nothing left
-# to taskkill it from this side) and this whole script being interrupted (Ctrl-C) — nothing else
-# on the guest would ever stop it. On expiry the wrapper kills its own child's process tree via
-# taskkill /F /T, the same mechanism this script uses on the wrapper itself.
+# The result read is bounded the same way as the connect wait: a real completion event
+# (ReadLineAsync()'s Task, via its AsyncWaitHandle) raced against the remaining deadline, not a
+# poll — a command that deadlocks inside the wrapper (as opposed to the wrapper itself dying,
+# which the pipe-EOF liveness signal above already covers) would otherwise hang this script,
+# and devvm.py behind it, forever. On expiry it kills the wrapper's whole process tree via the
+# PID this script captured right after EndWaitForConnection — which reliably reflects the
+# actual connected wrapper process by construction, not a file this script has to hope was
+# already written (see Stop-WrapperProcessTree). Because the wrapper's own deadline is earlier
+# than this script's, reaching this timeout at all means the wrapper already hit its own bound
+# and still didn't finish its own graceful shutdown within the grace margin — the expected case
+# is the wrapper's own bound firing first, unblocking this read with a result or a clean EOF
+# well before this script's later deadline is ever reached.
+#
+# The wrapper's own pipe Connect() call (in the here-string below) is bounded too, for a case
+# neither of the above covers: a scheduled task that starts running only AFTER this script has
+# already given up on the connect wait and moved on — without a bound there, that late
+# wrapper's Connect() would block forever against a server pipe this script has by then
+# disposed, leaking a process on the guest indefinitely. And the wrapper's own child — the
+# caller's actual command, run via cmd.exe — is bounded the same way, against that same wrapper
+# deadline: without that bound, that child could outlive both a late-connecting wrapper this
+# script has already given up on (nothing left to taskkill it from this side) and this whole
+# script being interrupted (Ctrl-C) — nothing else on the guest would ever stop it. On expiry
+# the wrapper kills its own child's process tree via taskkill /F /T, the same mechanism this
+# script uses on the wrapper itself.
 #
 # That bound has to cover every blocking Task Scheduler RPC call, not just the pipe waits:
 # Register-ScheduledTask, Start-ScheduledTask, and Unregister-ScheduledTask have no timeout
@@ -142,22 +149,79 @@ $transcriptPath = "$env:TEMP\$taskName.transcript.txt"
 
 # New-ScheduledTaskPrincipal -LogonType Interactive requires an explicit -UserId: it does not
 # default to "whoever is currently logged on", so without this Register-ScheduledTask throws
-# "missing mandatory parameter: UserId". Win32_ComputerSystem.UserName already comes back
-# machine-qualified (e.g. "DESKTOP-RPVSB2I\vagrant"), which is exactly what -UserId needs.
+# "missing mandatory parameter: UserId".
+#
+# Not Win32_ComputerSystem.UserName (the previous check here): that property reports only the
+# CONSOLE (session 1) session's owner, and goes blank the moment an RDP logon takes over that
+# session - which this tool's own README recommends for interactive debugging. RDP taking over
+# a client-SKU console session doesn't log the account out, it keeps driving the same
+# interactive session remotely - so 'vagrant' was genuinely still logged in, but this check
+# reported no logon to borrow at all (live-verified: an active RDP logon leaves
+# Win32_ComputerSystem.UserName empty while Win32_LoggedOnUser/Win32_LogonSession still show
+# 'vagrant', LogonType 2). devvm.py's get_windows_interactive_username runs the identical
+# check, for the same reason - see its docstring.
+#
+# Checks two things instead, session-type-agnostic: a Win32_LogonSession linked (via
+# Win32_LoggedOnUser) to the 'vagrant' account whose LogonType is Interactive (2),
+# RemoteInteractive (10, i.e. RDP), or CachedInteractive (11) - the logon types an actual
+# desktop session can present as - falling back to the owner of a running explorer.exe (the
+# desktop shell itself) in case that association is ever incomplete for a session type this box
+# hasn't been observed in. The result comes back machine-qualified (e.g.
+# "DESKTOP-RPVSB2I\vagrant"), which is exactly what -UserId needs.
+#
 # Fail loudly, not silently substitute a guess, if nobody is logged on
 # interactively - a task registered against no session-1 logon to borrow would just fail later
 # with a less legible error inside Start-ScheduledTask instead.
-$currentUser = (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
-if ([string]::IsNullOrWhiteSpace($currentUser)) {
-    throw "devvm: no interactive (session 1, console) user is currently logged on - Win32_ComputerSystem.UserName is empty, so there is no logon for a scheduled task to borrow. See windows-account-and-uac.ps1's autologon setup."
+$logonTypes = 2, 10, 11
+$currentUser = Get-CimInstance -ClassName Win32_LoggedOnUser | Where-Object { $_.Antecedent.Name -eq 'vagrant' } | ForEach-Object {
+    $session = Get-CimInstance -ClassName Win32_LogonSession -Filter "LogonId='$($_.Dependent.LogonId)'"
+    if ($session -and $logonTypes -contains $session.LogonType) {
+        "$($_.Antecedent.Domain)\$($_.Antecedent.Name)"
+    }
+} | Select-Object -First 1
+if (-not $currentUser) {
+    $owner = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" |
+        ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName GetOwner } |
+        Where-Object { $_.ReturnValue -eq 0 } | Select-Object -First 1
+    if ($owner) {
+        $currentUser = "$($owner.Domain)\$($owner.User)"
+    }
+}
+# RDP recovery guidance is threaded through to the two failure sites below (Register-
+# ScheduledTask, and "no wrapper ever connected") where an interactive-but-RDP-redirected
+# session can still leave the scheduled task unable to actually run - e.g. the session was
+# disconnected (not just redirected) between this check and Start-ScheduledTask firing.
+$rdpRecoveryNote = " If this guest was reached over RDP: the scheduled task needs vagrant's session to still be an active, connected desktop, not merely logged on - a disconnected RDP session (closed the client without logging off) can leave a LogonType 10/11 session that this check finds but the scheduled task still can't run in. From inside the guest, 'query session' lists session IDs and 'tscon <id> /dest:console' reattaches a disconnected session to the console; otherwise reboot the guest."
+if (-not $currentUser) {
+    throw "devvm: no interactive (session 1, console or RDP-redirected) logon for 'vagrant' was found, so there is no logon for a scheduled task to borrow. See windows-account-and-uac.ps1's autologon setup.$rdpRecoveryNote"
 }
 
-# Shared monotonic deadline for every blocking wait below (Register-, Start-, the pipe wait,
-# and the wrapper's own child — see Invoke-Bounded and the header comment above for why this is
-# Stopwatch/QPC-based rather than Get-Date). One shared deadline instead of a fresh
-# $TimeoutSeconds per phase bounds total worst-case runtime to ~$TimeoutSeconds, not some
-# multiple of it.
+# Shared monotonic deadline for every blocking wait THIS script itself makes (Register-,
+# Start-, the pipe connect wait, the result read — see Invoke-Bounded and the header comment
+# above for why this is Stopwatch/QPC-based rather than Get-Date). One shared deadline instead
+# of a fresh $TimeoutSeconds per phase bounds total worst-case runtime to ~$TimeoutSeconds, not
+# some multiple of it.
 $deadlineTicks = [System.Diagnostics.Stopwatch]::GetTimestamp() + [long]($TimeoutSeconds * [System.Diagnostics.Stopwatch]::Frequency)
+
+# The wrapper (a separate process — see __DEADLINE_TICKS__ below) gets its OWN deadline, a
+# fixed grace margin earlier than $deadlineTicks above, not the identical tick count. With one
+# shared deadline, the outer script's own read-wait and the wrapper's internal bound (Connect,
+# then its child's WaitForExit) expire at the same instant — which one actually fires first is
+# a race, so an ordinary timeout could have this script taskkill the wrapper's whole process
+# tree (see the read-wait timeout below) while the wrapper was already mid-way through its own
+# graceful shutdown (killing its own child, flushing its transcript, writing its pipe result),
+# duplicating that work and discarding whatever the wrapper's own -1-sentinel result/transcript
+# would otherwise have reported. Giving the wrapper a deadline this much earlier instead makes
+# its own graceful shutdown the expected outcome: by the time this script's later read-wait
+# deadline could fire, the wrapper's pipe write/close (or the OS tearing the pipe down if it
+# dies outright) has already unblocked that read with a result or a clean EOF. This script's
+# own read-wait timeout is then reachable only if the wrapper hasn't even finished its own
+# graceful shutdown within the margin below - a genuine hang, not the expected case. The margin
+# has to cover the wrapper's own worst-case cleanup after its deadline hits: taskkill of its
+# child (bounded 30s, see the wrapper template) plus Stop-Transcript and the pipe write/close
+# (both fast) - 45s leaves real headroom above that 30s bound, not another too-tight guess.
+$WrapperGraceSeconds = 45
+$wrapperDeadlineTicks = $deadlineTicks - [long]($WrapperGraceSeconds * [System.Diagnostics.Stopwatch]::Frequency)
 
 function Get-RemainingSeconds {
     $remaining = ($deadlineTicks - [System.Diagnostics.Stopwatch]::GetTimestamp()) / [double][System.Diagnostics.Stopwatch]::Frequency
@@ -176,9 +240,8 @@ function Read-WrapperTranscript {
 }
 
 function Get-TranscriptNote {
-    # Centralizes what used to be four near-identical inline blocks below: whatever the
-    # wrapper itself printed or threw, formatted for appending to a thrown error message, or ""
-    # if there's nothing to add.
+    # Whatever the wrapper itself printed or threw, formatted for appending to a thrown error
+    # message, or "" if there's nothing to add.
     $transcript = Read-WrapperTranscript
     if (-not $transcript) { return "" }
     return "`n--- wrapper transcript (captures anything the wrapper itself printed or threw) ---`n$transcript"
@@ -235,6 +298,14 @@ function Invoke-Bounded {
       event pattern the named-pipe wait below uses, not a poll. $ScriptBlock must be
       self-contained (only $Parameters in scope, no closures over this script's variables):
       AddScript(scriptblock) re-parses it from its string form in the new runspace.
+
+      On timeout, stops the pipeline via BeginStop (async) and does NOT Dispose() it: "not
+      signaled" means a command is still actually executing on that runspace, and Dispose()
+      on a still-running pipeline blocks the calling thread until it actually stops — exactly
+      the unbounded wait this function exists to avoid (Register-/Start-/Unregister-
+      ScheduledTask have no timeout of their own; a wedged Task Scheduler service is the
+      documented case this guards against). The abandoned $ps is left for BeginStop's own
+      completion and eventual GC, off this thread.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -256,11 +327,18 @@ function Invoke-Bounded {
             [void]$ps.AddParameter($key, $Parameters[$key])
         }
         $asyncResult = $ps.BeginInvoke()
-        $signaled = $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
-        if (-not $signaled) {
-            $ps.Stop() | Out-Null
-            throw $TimeoutMessage
-        }
+    } catch {
+        # Setup itself failed before there was ever a pipeline actually running - safe (and
+        # necessary) to dispose here, unlike the timeout path below.
+        $ps.Dispose()
+        throw
+    }
+    $signaled = $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+    if (-not $signaled) {
+        $ps.BeginStop($null, $null) | Out-Null
+        throw $TimeoutMessage
+    }
+    try {
         $ps.EndInvoke($asyncResult) | Out-Null
         if ($ps.HadErrors) {
             throw $ps.Streams.Error[0].Exception
@@ -300,7 +378,8 @@ function Invoke-Bounded {
 # text for the wrapper's own process to evaluate when it runs.
 # $exitCode starts at -1 (not 0) so that if the wrapper crashes before the caller's command
 # ever runs, the caller sees a nonzero/sentinel status rather than a false "succeeded". Connect()
-# is the wrapper's very first action, bounded by the same deadline this script itself uses -
+# is the wrapper's very first action, bounded by this script's own deadline minus
+# $WrapperGraceSeconds (see that constant's own comment for why it's earlier, not identical) -
 # baked into this template as raw QPC ticks (__DEADLINE_TICKS__, see the header comment for why
 # Stopwatch/QPC rather than wall-clock), not a millisecond duration computed once at
 # Register-ScheduledTask time. A duration frozen at registration time is wrong by however long
@@ -383,12 +462,11 @@ try {
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $childProcess = [System.Diagnostics.Process]::Start($psi)
-        # Bounded against the same deadline as everything else in this script/its outer caller:
-        # an unbounded WaitForExit() (the previous behavior) could leave this child running
-        # forever on the guest, either because the outer script already gave up on a late
-        # connect (nothing left there to kill it from) or because the outer script/devvm.py
-        # itself was interrupted (Ctrl-C, the whole `vagrant winrm` call dying) - nothing else
-        # on the guest would ever stop it. On expiry this kills only the immediate cmd.exe
+        # Bounded against this wrapper's own deadline: an unbounded WaitForExit() could leave
+        # this child running forever on the guest, either because the outer script already gave
+        # up on a late connect (nothing left there to kill it from) or because the outer
+        # script/devvm.py itself was interrupted (Ctrl-C, the whole `vagrant winrm` call dying) -
+        # nothing else on the guest would ever stop it. On expiry this kills only the immediate cmd.exe
         # child's own process tree (via taskkill /F /T, same as the outer script's
         # Stop-WrapperProcessTree), not any further descendant it may have already detached.
         if ($childProcess.WaitForExit((Get-RemainingMs))) {
@@ -457,15 +535,12 @@ $taskCommand = $wrapperTemplate.
     Replace('__INNER_SCRIPT_PATH__', $innerScriptPath).
     Replace('__TASK_NAME__', $taskName).
     Replace('__TRANSCRIPT_PATH__', $transcriptPath).
-    Replace('__DEADLINE_TICKS__', $deadlineTicks.ToString())
+    Replace('__DEADLINE_TICKS__', $wrapperDeadlineTicks.ToString())
 Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 
 # Register-ScheduledTask with NO -Trigger at all: this task is only ever fired on demand via
-# Start-ScheduledTask below, so there is no time-of-day value anywhere in this path. The
-# schtasks.exe-based predecessor of this script needed a `/SC ONCE /ST HH:mm` value purely to
-# satisfy schtasks' own required-field validation, and a fixed "00:00" wrapped/failed for any
-# invocation after midnight - Register-ScheduledTask has no such requirement, so that failure
-# mode is structurally impossible here, not just less likely.
+# Start-ScheduledTask below, so there is no time-of-day value anywhere in this path, and no
+# midnight-wraparound failure mode to guard against.
 try {
     Invoke-Bounded -TimeoutSeconds (Get-RemainingSeconds) `
         -TimeoutMessage "devvm: Register-ScheduledTask did not complete within ${TimeoutSeconds}s - Task Scheduler may be stuck." `
@@ -488,7 +563,7 @@ try {
             Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
         }
 } catch {
-    throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup."
+    throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup.$rdpRecoveryNote"
 }
 
 # The 2-arg NamedPipeServerStream(name, direction) constructor defaults to
@@ -571,7 +646,7 @@ try {
         # by name before deleting any files, closing that race outright rather than relying on
         # this bound alone.
         $pipeServer.Dispose()
-        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - no wrapper ever connected. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$(Get-TranscriptNote)"
+        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - no wrapper ever connected. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$rdpRecoveryNote$(Get-TranscriptNote)"
     }
 
     $pipeServer.EndWaitForConnection($connectResult)
@@ -730,8 +805,8 @@ if ($output) {
 # That diagnostic requires the inner script to reach its own `exit $__devvmExit` - two
 # separate things can prevent that, and only one of them is what leaves $exitCode here at its
 # -1 sentinel:
-#   - The wrapper's own child-process wait above (`$childProcess.WaitForExit(...)`,
-#     around line 394) expiring: the inner script's process tree gets taskkilled mid-run,
+#   - The wrapper's own child-process wait (`$childProcess.WaitForExit(...)`, inside
+#     $wrapperTemplate above) expiring: the inner script's process tree gets taskkilled mid-run,
 #     never reaching its own exit line, so $exitCode stays -1 and is what reaches `exit
 #     $exitCode` here. The "did not finish within its deadline" message on the wrapper's own
 #     transcript is what explains that case.

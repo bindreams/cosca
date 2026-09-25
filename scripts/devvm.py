@@ -548,8 +548,9 @@ def get_vagrant_machine_state(guest: Guest) -> str:
     no longer running, instead of retrying `vagrant winrm` in a tight loop against a guest that
     is never coming back on its own.
 
-    `vagrant status` reads local state via the qemu provider's own read_state action (a QMP
-    query against the guest's own QEMU process) — no WinRM round-trip, so this stays fast and
+    `vagrant status` reads local state via the qemu provider's own read_state action: a
+    liveness check (`Process.kill(0, pid)`, see vagrant-qemu's driver.rb) against the PID in
+    the guest's own pidfile, not a QMP query — no WinRM round-trip, so this stays fast and
     answers even when WinRM itself is unresponsive.
     """
     require_tool("vagrant")
@@ -655,15 +656,52 @@ def get_windows_autologon_configured(guest: Guest) -> bool | None:
 
 
 def get_windows_interactive_username(guest: Guest) -> str | None:
-    """The name logged into the guest's interactive (session 1, console) desktop right now,
-    via `Win32_ComputerSystem.UserName`, or None if nobody is logged in yet
-    (blank result) or WinRM isn't answering. Used by wait_for_windows_session to confirm
-    autologon has actually produced a real interactive session — the thing
-    windows-run-unelevated.ps1's scheduled task borrows a filtered token from — not just that
-    the kernel has finished booting.
+    """The domain-qualified name of the guest's autologon account ("vagrant") if it currently
+    has a live interactive logon anywhere, or None if it doesn't yet or WinRM isn't answering.
+    Used by wait_for_windows_session to confirm autologon has actually produced a real
+    interactive session — the thing windows-run-unelevated.ps1's scheduled task borrows a
+    filtered token from — not just that the kernel has finished booting.
+
+    Not `Win32_ComputerSystem.UserName` (the previous check here): that property reports only
+    the CONSOLE (session 1) session's owner, and goes blank the moment an RDP logon takes over
+    that session — which this tool's own README recommends for interactive debugging. RDP
+    taking over a client-SKU console session doesn't log the account out, it keeps driving the
+    same interactive session remotely — so `vagrant` was genuinely still logged in, but
+    reported as absent: `wait_for_windows_session` would loop for the full
+    WINDOWS_REBOOT_DEADLINE_SECONDS and windows-run-unelevated.ps1's scheduled task would fail
+    to register at all (live-verified: an active RDP logon leaves
+    `Win32_ComputerSystem.UserName` empty while `Win32_LoggedOnUser`/`Win32_LogonSession` still
+    show 'vagrant', LogonType 2).
+
+    Checks two things instead, session-type-agnostic:
+    - a `Win32_LogonSession` linked (via `Win32_LoggedOnUser`) to the `vagrant` account whose
+      LogonType is Interactive (2), RemoteInteractive (10, i.e. RDP), or CachedInteractive
+      (11) — the logon types an actual desktop session can present as;
+    - failing that, the owner of a running `explorer.exe` (the desktop shell itself), in case
+      the association above is ever incomplete for a session type this box hasn't been
+      observed in.
+    windows-run-unelevated.ps1 runs the identical check, for the same reason, to find the
+    `-UserId` its own scheduled task borrows a token from — see its header comment.
     """
+    cmd = (
+        "$logonTypes = 2, 10, 11; "
+        "$m = Get-CimInstance -ClassName Win32_LoggedOnUser | "
+        "Where-Object { $_.Antecedent.Name -eq 'vagrant' } | ForEach-Object { "
+        "$s = Get-CimInstance -ClassName Win32_LogonSession "
+        "-Filter \"LogonId='$($_.Dependent.LogonId)'\"; "
+        "if ($s -and $logonTypes -contains $s.LogonType) { "
+        "[PSCustomObject]@{ Domain = $_.Antecedent.Domain; Name = $_.Antecedent.Name } } "
+        "} | Select-Object -First 1; "
+        "if (-not $m) { "
+        "$o = Get-CimInstance -ClassName Win32_Process -Filter \"Name='explorer.exe'\" | "
+        "ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName GetOwner } | "
+        "Where-Object { $_.ReturnValue -eq 0 } | Select-Object -First 1; "
+        "if ($o) { $m = [PSCustomObject]@{ Domain = $o.Domain; Name = $o.User } } "
+        "}; "
+        'if ($m) { "$($m.Domain)\\$($m.Name)" }'
+    )
     result = subprocess.run(
-        ["vagrant", "winrm", "-c", "(Get-CimInstance Win32_ComputerSystem).UserName"],
+        ["vagrant", "winrm", "-c", cmd],
         cwd=guest_dir(guest),
         env=vagrant_env(guest),
         capture_output=True,
@@ -679,7 +717,7 @@ def _require_guest_running(guest: Guest, deadline: float, *, what: str) -> None:
     """Raise if the guest is no longer 'running' per vagrant, or if `deadline` (a
     time.monotonic() value) has passed. Shared by reboot_windows_guest_and_wait's wait loop and
     wait_for_windows_session's wait loop so a powered-off/crashed guest fails immediately
-    instead of retrying WinRM forever, and so both loops fail on the same kind of wall-clock
+    instead of retrying WinRM forever, and so both loops fail on the same kind of monotonic
     bound (each call site passes its own `deadline`, not necessarily tied to a reboot).
     """
     state = get_vagrant_machine_state(guest)
@@ -728,12 +766,10 @@ def reboot_windows_guest_and_wait(guest: Guest) -> None:
     wait_for_windows_session themselves afterward, under their own deadline.
     provision_windows_guest does this unconditionally, once, at the end of its own
     provisioning flow, whenever get_windows_autologon_configured says autologon is set —
-    regardless of whether THIS run's `up` actually rebooted the guest to get there. An earlier
-    version of this function took a `require_session` flag instead and waited internally, which
-    only covered the reboot-just-configured-autologon case; it missed the more common case of
-    an already-provisioned guest where autologon was configured by an earlier `up` and this
-    `up` reboots for a license rearm, or doesn't reboot at all — both leave a session that
-    nothing was waiting for.
+    regardless of whether THIS run's `up` actually rebooted the guest to get there: an
+    already-provisioned guest where autologon was configured by an earlier `up` and this `up`
+    only reboots for a license rearm (or doesn't reboot at all) still needs that wait, since
+    nothing else is waiting for its session to come up.
 
     Deliberately does NOT go through Vagrant's named `reboot-if-needed` shell provisioner /
     `Reboot.reboot` capability: that path is itself a shell provisioner, so it still runs
@@ -752,7 +788,7 @@ def reboot_windows_guest_and_wait(guest: Guest) -> None:
 
     No `time.sleep()`, and no chosen retry interval of devvm.py's own: each iteration IS the
     wait — a real WinRM round-trip or a real `vagrant status` query — and failure just means
-    "ask again immediately," not "nap, then ask again." The loop is bounded by one wall-clock
+    "ask again immediately," not "nap, then ask again." The loop is bounded by one monotonic
     deadline (WINDOWS_REBOOT_DEADLINE_SECONDS, reusing the Windows Vagrantfile's own 3600s
     boot_timeout/winrm.timeout — a real, already-configured, human-facing failure bound for a
     guest reboot genuinely never completing) and by `_require_guest_running` failing fast the
@@ -959,20 +995,22 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     # having just run — e.g. this `up`'s license rearm found nothing needing a reboot, or
     # rebooted on a guest an earlier `up` already configured autologon on. Only skipped when
     # autologon genuinely isn't configured at all (a guest windows-account-and-uac.ps1 has
-    # never provisioned successfully), where there's no session to wait for. A None (WinRM
-    # unreachable right after every script above just succeeded over it) is not guessed at
-    # either way — that's a bug worth surfacing, not silently treating as "not configured".
-    autologon_configured = get_windows_autologon_configured(guest)
-    if autologon_configured is None:
-        print(
-            f"error: could not determine whether autologon is configured on guest "
-            f"'{guest.name}' right after provisioning it — WinRM answered every script above "
-            "but not this check. This is a bug, not something to guess past.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # never provisioned successfully), where there's no session to wait for.
+    #
+    # A None (WinRM not answering this particular check yet, even though every script above
+    # just succeeded over it) is retried, not guessed at or treated as fatal on the first
+    # occurrence — the same "ask again immediately, fail only once the guest is gone or the
+    # deadline passes" contract wait_for_windows_session and reboot_windows_guest_and_wait's
+    # own loops use, via the same _require_guest_running and one shared deadline (also reused
+    # below for wait_for_windows_session itself, if it turns out to be needed).
+    deadline = time.monotonic() + WINDOWS_REBOOT_DEADLINE_SECONDS
+    while True:
+        _require_guest_running(guest, deadline, what="a readable autologon-configured state")
+        autologon_configured = get_windows_autologon_configured(guest)
+        if autologon_configured is not None:
+            break
     if autologon_configured:
-        wait_for_windows_session(guest, time.monotonic() + WINDOWS_REBOOT_DEADLINE_SECONDS)
+        wait_for_windows_session(guest, deadline)
 
 
 def cmd_up(args: argparse.Namespace) -> None:
