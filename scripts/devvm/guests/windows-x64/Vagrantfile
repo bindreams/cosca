@@ -1,0 +1,156 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# devvm guest: windows-x64 — the production consent route (ShellExecuteExW("runas") from an
+# unelevated process). Cross-arch-emulated (TCG) on an Apple Silicon host, so first boot of
+# a fresh install can be very slow; see scripts/README.md#windows-guests for measured timings.
+#
+# Not meant to be run directly with `vagrant up` in this directory — use
+# `scripts/devvm.py up windows-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_STAGE_DIR so
+# all state lands under .tmp/devvm/ in the worktree, never in the box's own directory. The
+# `--allow-elevation` UAC opt-in toggle is unrelated to this file — it's threaded straight
+# into windows-account-and-uac.ps1's own remote WinRM invocation (see
+# provision_windows_guest's run_windows_script call), never through Vagrantfile ENV at all.
+#
+# Box: stromweld/windows-10, provider qemu, version pinned below. A "vanilla Windows 10"
+# box built with Bento (chef-io/bento) from Microsoft's free evaluation media — evaluation
+# Windows installs activate on a timer and expire (commonly 90 days for Windows 10
+# Enterprise eval); when this box's Windows install expires, `vagrant box update` /
+# repointing the version pin to a newer build is the fix, not disabling activation checks.
+#
+# UAC / account model: the box's default "vagrant" account is an ordinary Administrators
+# member, distinct from the built-in RID-500 Administrator (which Windows elevates without
+# a prompt) — see provision/windows-account-and-uac.ps1, which also verifies this on every
+# provision run rather than assuming it silently.
+#
+# This guest is headless by default (`-display none`, the vagrant-qemu default) - it can run
+# scripted probes and inspect their results (return codes, event logs, spawned process
+# trees), but a WinRM/PowerShell-remoting session is not the interactive console session, so
+# it cannot itself render or click through the secure-desktop UAC prompt. For a probe that
+# needs a human (or UI automation) to see the prompt, pass `devvm.py up windows-x64
+# --display`, which sets DEVVM_WINDOWS_DISPLAY below and opens a local QEMU window
+# (`-display cocoa -vga std`) on this Mac instead — a real local window, not VNC or any other
+# network-exposed display, so it doesn't touch the loopback-only guarantee
+# fix_qemu_loopback_only.rb enforces for forwarded ports. Off by default; RDP into the guest
+# is the other option if a window on this Mac specifically isn't what's needed.
+#
+# Provisioning: this Vagrantfile deliberately declares only ONE provisioner below (the "file"
+# upload). Every other Windows provisioning step (clean-stage, mirror-tree, lock-tree,
+# account-and-uac, rust) is driven directly by scripts/devvm_windows.py over `vagrant winrm`
+# (provision_windows_guest / run_windows_script there), not through Vagrant's `config.vm.
+# provision "shell", ...`. Reason: vagrant 2.4.9's own shell-provisioner WinRM path
+# (provision_winrm) calls the `wait_for_reboot` guest capability UNCONDITIONALLY at the start
+# of every single shell-provisioner run — including this box's former reboot-if-needed
+# provisioner — and that capability's actual "is a reboot pending?" test
+# (reboot_detect.ps1) is a real `shutdown -f -r -t 60` followed by `shutdown -a`: a genuine,
+# if usually self-cancelled, 60-second forced-restart fuse on every ordinary provisioning
+# step. Measured directly (2026-09-24): every `vagrant provision`/`vagrant up --provision`
+# against this guest produced a matching System-log event 1074 ("wininit.exe has initiated
+# restart") followed by 1075 ("aborted") pair — once per shell provisioner in the block below,
+# as it stood before this comment — and the owner twice saw the guest's real "you're about to
+# be signed out" sign-off splash live during an otherwise-ordinary `devvm.py sync`. Driving
+# each script over `vagrant winrm -c` instead sidesteps `provision_winrm`/`wait_for_reboot`
+# entirely — confirmed by reading vagrant's plugins/commands/winrm/command.rb and
+# communicators/winrm/{communicator,shell}.rb end to end, none of which reference
+# `wait_for_reboot` or `reboot_detect`. The one legitimate reboot this guest ever needs
+# (EnableLUA/autologon changes only take effect at the next boot) is issued and waited on
+# directly by devvm_windows.py's reboot_windows_guest_and_wait, not Vagrant's `reboot: true` shell-
+# provisioner capability, which carries the exact same fuse plus its own `sleep 10` poll loop.
+
+require_relative "../_shared/fix_macos_port_check"
+require_relative "../_shared/fix_qemu_loopback_only"
+
+STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "stromweld/windows-10"
+  config.vm.box_version = "202503.09.0"
+  # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
+  # host silently excludes it from "usable providers" and `up` fails with a misleading "box
+  # doesn't support requested provider" error, even though the box does publish a qemu
+  # provider — it's just for the wrong (host) architecture unless told otherwise.
+  config.vm.box_architecture = "amd64"
+  config.vm.guest = :windows
+  config.vm.communicator = "winrm"
+  config.winrm.username = "vagrant"
+  config.winrm.password = "vagrant"
+
+  # The box's own embedded Vagrantfile declares forwarded ports "winrm" (guest+host 5985) and
+  # "rdp" (guest+host 3389) with no host_ip — measured directly (2026-09-23): redeclaring the
+  # same id with ONLY host_ip set, expecting Vagrant core to merge it against the box's
+  # existing host/guest values, does NOT work — `vagrant up` fails config validation
+  # ("Forwarded port definitions require a 'host' and 'guest' value", "Ports to forward must
+  # be 1 to 65535") for all three ids, including "winrm"/"rdp" which the box DOES declare.
+  # Whatever merge Vagrant core performs on same-id forwarded_port config, host_ip-only is not
+  # a valid partial update. Declaring host/guest explicitly here — matching the box's own
+  # values for winrm/rdp, and choosing 5986 for winrm-ssl (which the box doesn't declare at
+  # all) — sidesteps the merge question entirely. `auto_correct: true` matches the box's own
+  # declarations and lets Vagrant pick a different host port if this one's taken on a host
+  # already running another guest, rather than failing `up`. fix_qemu_loopback_only.rb above
+  # is defense-in-depth for all three regardless of how the host/guest/host_ip values here
+  # were arrived at.
+  config.vm.network "forwarded_port", id: "winrm", guest: 5985, host: 5985, host_ip: "127.0.0.1", auto_correct: true
+  config.vm.network "forwarded_port", id: "winrm-ssl", guest: 5986, host: 5986, host_ip: "127.0.0.1", auto_correct: true
+  config.vm.network "forwarded_port", id: "rdp", guest: 3389, host: 3389, host_ip: "127.0.0.1", auto_correct: true
+
+  # A fresh install booting under TCG (cross-arch emulation) can be extremely slow — give it
+  # a lot of room rather than fail a merely-slow-not-stuck boot.
+  config.vm.boot_timeout = 3600
+  config.winrm.timeout = 3600
+  config.vm.graceful_halt_timeout = 600
+
+  config.vm.provider "qemu" do |qe|
+    qe.arch = "x86_64"
+    qe.machine = "q35"
+    qe.cpu = "max"
+    qe.net_device = "virtio-net-pci"
+    qe.memory = "4096"
+    qe.smp = "2"
+    # This host may already have unrelated VMs (this tool's or not) holding the default
+    # forwarded port; let Vagrant pick a free one instead of failing `up`.
+    qe.ssh_auto_correct = true
+    # Opt-in only, via `devvm.py up windows-x64 --display` -> DEVVM_WINDOWS_DISPLAY: overrides
+    # vagrant-qemu's own headless default (`-display none -vga none`, see config.rb's
+    # `other_default`) with a local macOS window. `-vga std` is needed alongside `-display
+    # cocoa` because `-display` alone doesn't attach a framebuffer device for QEMU to render
+    # into. This is a LOCAL window only (no `-display vnc=...` or other network-exposed
+    # display) - it doesn't touch fix_qemu_loopback_only.rb's hostfwd-only loopback guarantee,
+    # and doesn't disturb the monitor/serial chardev setup vagrant-qemu's driver.rb adds
+    # independently of (and before) this array is appended.
+    #
+    # no_daemonize is NOT optional alongside -display cocoa - measured directly (2026-09-24):
+    # without it, driver.rb's default path appends `-daemonize`, which makes QEMU call fork()
+    # itself *after* Cocoa/AppKit has already begun initializing on its main thread; the
+    # Objective-C runtime detects a Cocoa call following that internal fork() and deliberately
+    # crashes the process ("may have been in progress in another thread when fork() was
+    # called... Crashing instead"), 100% reproducible. `no_daemonize: true` instead has
+    # driver.rb spawn qemu-system-x86_64 as a normal detached child via Ruby's ChildProcess
+    # (ChildProcess#leader/#detach) - a fork()+exec() pair where the fork happens in the Ruby
+    # process, before qemu-system-x86_64 (and its Cocoa state) exists at all, so there is no
+    # already-initialized Cocoa runtime for the fork to strand. QEMU still writes its own
+    # `-pidfile` either way, so vagrant-qemu's own running?/stop lifecycle tracking (which
+    # reads that pidfile and the monitor socket, not any Ruby parent/child relationship) is
+    # unaffected by which path started the process.
+    if ENV.fetch("DEVVM_WINDOWS_DISPLAY", "0") == "1"
+      qe.other_default = %w(-parallel none -monitor none -display cocoa -vga std)
+      qe.no_daemonize = true
+    end
+  end
+
+  # No live synced folder for Windows (no rsync binary on the box, and SMB needs a macOS
+  # File Sharing toggle + password prompt). Instead, `devvm.py sync` stages a git-tracked-only
+  # copy of the tree on the host (see stage_tree() in scripts/devvm.py), the "file"
+  # provisioner below uploads it over WinRM into a scratch staging directory, and
+  # windows-mirror-tree.ps1 (devvm.py-driven, see the comment above) mirrors it into C:\cosca
+  # with robocopy /MIR — the WinRM upload alone is additive-only (never deletes), so without
+  # the mirror step a `devvm.py sync` after deleting a host file would leave it behind in the
+  # guest.
+  #
+  # This is the ONLY provisioner declared here — confirmed clean of any wait_for_reboot call
+  # by reading plugins/provisioners/file/provisioner.rb, so there's no reason to reimplement
+  # WinRM file upload by hand the way the former shell provisioners were replaced. `run:
+  # "always"` overrides Vagrant's normal already-ran-on-this-machine skip so a plain `vagrant
+  # provision` re-uploads every time devvm.py calls it (on every `up`/`sync`), not just once.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.provision "file", source: STAGE_DIR, destination: "C:/cosca-stage", run: "always"
+end
