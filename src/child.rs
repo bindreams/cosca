@@ -70,10 +70,17 @@ pub(crate) fn root_pid_was_recycled(
     }
 }
 
+/// The `expect` behind [`Child::proc`]: taken only by [`Child::into_unreaped_parts`], which
+/// leaves nothing running on the handle afterward, so the accessor stays infallible everywhere
+/// else.
+const PROC_TAKEN: &str = "the child's process backend is taken only by into_unreaped_parts";
+
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
-    proc: ProcHandle,
+    /// `Option` so [`into_unreaped_parts`](Child::into_unreaped_parts) can take it out safely,
+    /// without `ManuallyDrop`/`ptr::read`. Read it through [`proc`](Child::proc), never directly.
+    proc: Option<ProcHandle>,
     /// Stable identity resolved immediately after spawn.
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
@@ -93,7 +100,7 @@ impl Child {
         attachment: crate::containment::Attachment,
     ) -> Child {
         Child {
-            proc,
+            proc: Some(proc),
             id,
             pipes,
             kill_on_drop,
@@ -102,6 +109,11 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
         }
+    }
+
+    /// The process backend. See [`PROC_TAKEN`] for who may empty `self.proc` before this runs.
+    fn proc(&self) -> &ProcHandle {
+        self.proc.as_ref().expect(PROC_TAKEN)
     }
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
@@ -114,19 +126,13 @@ impl Child {
     /// the std child to hold, and the containment to release after its reap. Its pipes' parent
     /// ends close here: one held on would keep the child waiting on it.
     #[cfg(unix)]
-    pub(crate) fn into_unreaped_parts(self) -> (crate::child::unreaped::Held, crate::child::unreaped::Retained) {
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: each field that owns anything is read out exactly once, and `this` is never used
-        // or dropped again; the rest (`id`, `kill_on_drop`, `containment`, `graceful`) are `Copy`.
-        let (proc, pipes, attached, elevation) = unsafe {
-            (
-                std::ptr::read(&this.proc),
-                std::ptr::read(&this.pipes),
-                std::ptr::read(&this.attached),
-                std::ptr::read(&this.elevation),
-            )
-        };
-        drop((pipes, elevation));
+    pub(crate) fn into_unreaped_parts(mut self) -> (crate::child::unreaped::Held, crate::child::unreaped::Retained) {
+        // `Drop` does nothing once disarmed, so a plain drop below releases the rest (`pipes`,
+        // `elevation`, `containment`, `graceful`) safely, closing the pipes' parent ends.
+        self.kill_on_drop = false;
+        let proc = self.proc.take().expect(PROC_TAKEN);
+        let attached = std::mem::take(&mut self.attached);
+        drop(self);
         let ProcHandle::Std(shared) = proc;
         (
             crate::child::unreaped::Held::Std(shared.into_inner()),
@@ -195,12 +201,12 @@ impl Child {
 
     /// Block until the child exits, returning its status.
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
-        self.proc.wait().map_err(Error::Io)
+        self.proc().wait().map_err(Error::Io)
     }
 
     /// Return the exit status if the child has already exited.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, Error> {
-        self.proc.try_wait().map_err(Error::Io)
+        self.proc().try_wait().map_err(Error::Io)
     }
 
     /// Is this a wrapper-elevated child a plain parent may be unable to signal?
@@ -218,7 +224,7 @@ impl Child {
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
         // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed
         // `ElevationErrorKind::Unkillable`.
-        self.proc
+        self.proc()
             .kill()
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
@@ -307,7 +313,7 @@ impl Child {
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
         let backstop = self
-            .proc
+            .proc()
             .kill()
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
@@ -391,7 +397,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        self.attached.terminate(self.proc.id())
+        self.attached.terminate(self.proc().id())
     }
 
     /// Take the parent's write end of the child's stdin pipe, if configured.
@@ -459,7 +465,7 @@ impl Child {
     /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())
+        crate::containment::windows::job_contains_pid(&self.attached, self.proc().id())
     }
 
     /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
@@ -567,7 +573,7 @@ impl Drop for Child {
         // not collect, since tokio owns that child and its own reaping. `src/tokio/` mirrors this
         // surface by hand with nothing enforcing parity, so both differences are deliberate, not
         // drift.
-        self.proc.teardown_on_drop();
+        self.proc().teardown_on_drop();
     }
 }
 
