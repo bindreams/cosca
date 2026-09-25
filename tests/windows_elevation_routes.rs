@@ -120,17 +120,19 @@ const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 /// kill, and recover before the outer wait could plausibly trip too. See `CHILD_EXIT_BOUND_MS`'s
 /// doc.
 ///
-/// The real worst case this has to clear is TWO sequential grandchild waits, not one:
-/// `spawn_attempts_with` tries `CreateProcessAsUserW` and then `CreateProcessWithTokenW` in the same
-/// call, each with its own `wait_for(GRANDCHILD_EXIT_BOUND_MS)`, so both can trip in turn before the
-/// outer `wait_for` in `logon_one_account` / `unelevated_caller_view` needs to see the whole thing
-/// finished. Each trip-kill-recover can itself take up to twice its own bound (the minimum ×2 margin
-/// `CHILD_EXIT_BOUND_MS`'s doc relies on), so the real worst case is
-/// `2 * (2 * GRANDCHILD_EXIT_BOUND_MS)` = `4 * GRANDCHILD_EXIT_BOUND_MS` before the outer wait could
-/// plausibly see it done — and this constant is kept at half of THAT figure again, an overall ×8
-/// margin, not ×4. `const _` below asserts the real relationship
-/// (`4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS`) holds so a future change to either
-/// constant cannot silently erode it.
+/// The real worst case this has to clear is FOUR sequential grandchild waits, not two: `measure`
+/// calls `spawn_attempts_with` twice — once for the linked token, once for the caller's own — and
+/// each of those calls itself loops over `CreateProcessAsUserW` then `CreateProcessWithTokenW`,
+/// each with its own `wait_for(GRANDCHILD_EXIT_BOUND_MS)`. That is 2 calls × 2 waits, all of which
+/// can trip in turn before the outer `wait_for` in `logon_one_account` / `unelevated_caller_view`
+/// needs to see the whole thing finished. Each trip-kill-recover can itself take up to twice its
+/// own bound (the minimum ×2 margin `CHILD_EXIT_BOUND_MS`'s doc relies on), so the real worst case
+/// is `4 * (2 * GRANDCHILD_EXIT_BOUND_MS)` = `8 * GRANDCHILD_EXIT_BOUND_MS` before the outer wait
+/// could plausibly see it done. At a tenth of `CHILD_EXIT_BOUND_MS`, that leaves only about ×1.25
+/// of headroom over the bare minimum — tight, not the wide margin a "kept well under" framing might
+/// suggest, but `const _` below still asserts the real relationship
+/// (`4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS`) holds, so a future change to either
+/// constant cannot silently erode it below break-even.
 const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 10;
 const _: () = assert!(4 * 2 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS);
 
@@ -346,14 +348,20 @@ fn describe(out: &mut String, label: &str, token: HANDLE) {
 /// as, or purporting to measure, someone else. Only what a freshly logged-on account needs to run
 /// anything at all (`SystemRoot`, `PATH`, `TEMP`/`TMP`, `COMSPEC`, `PATHEXT`), plus any
 /// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus whatever the
-/// caller passes in `extra`.
+/// caller passes in `extra`. `COSCA_PROBE_MARKERS` is carved out of that `COSCA_PROBE_*` pass-
+/// through: it names a directory this process's OWN account can write to, and a child spawned
+/// here under a different account (the whole point of several of these routes) cannot create or
+/// overwrite files there. A child that inherited it would panic trying to mark itself passed,
+/// which corrupts the very measurement being taken — so a spawned child never sees it and never
+/// marks a probe passed on the spawning process's behalf.
 fn env_block(extra: &[(&str, String)]) -> Vec<u16> {
     const ALLOWLIST: [&str; 6] = ["SYSTEMROOT", "PATH", "TEMP", "TMP", "COMSPEC", "PATHEXT"];
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
         let upper = k.to_ascii_uppercase();
-        if ALLOWLIST.contains(&upper.as_str()) || upper.starts_with("COSCA_PROBE_") {
+        if ALLOWLIST.contains(&upper.as_str()) || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
+        {
             map.insert(k, v.to_string_lossy().into_owned());
         }
     }
@@ -778,10 +786,15 @@ fn measure_this_token() {
     }
     print!("{out}");
     if let Some(dest) = report_to {
+        // Spawned by another probe (possibly under a different account): that probe's own
+        // `mark_probe_passed()` call already covers it, and this process may not even be able to
+        // reach the marker directory — see `env_block`'s doc.
         std::fs::write(&dest, &out)
             .unwrap_or_else(|e| panic!("could not write the report to {}: {e}", PathBuf::from(&dest).display()));
+    } else {
+        // A direct, unspawned `--ignored` run: nothing else marks this one passed.
+        mark_probe_passed();
     }
-    mark_probe_passed();
 }
 
 /// Read ANOTHER process's token, named by PID in `COSCA_PROBE_INSPECT_PID`.

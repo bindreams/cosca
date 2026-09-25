@@ -324,9 +324,8 @@ jobs:
       - name: Record the runner's own identity
         if: ${{ !cancelled() }}
         run: whoami /all
-      # A `probe_filter` matching no test, or only surveys, would otherwise pass having asserted
-      # nothing. Runs after a failure too, but not after cancellation, so the log shows which probes
-      # passed.
+      # A `probe_filter` matching no test would otherwise pass having asserted nothing. Runs after a
+      # failure too, but not after cancellation, so the log shows which probes passed.
       - name: Require that an executing probe ran
         if: ${{ !cancelled() }}
         shell: bash

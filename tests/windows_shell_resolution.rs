@@ -13,8 +13,7 @@
 //! earlier version of this rule let a probe that only surveys the platform print `INCONCLUSIVE` and
 //! PASS when the shell launched something without handing back a process handle to wait on —
 //! `does_a_trailing_dot_still_open_the_extensionless_file` did exactly that, on both architectures
-//! (see the PR description for which run caught it) — so an inconclusive run is now a hard failure
-//! everywhere it is genuinely inconclusive. That handoff (`LaunchOutcome::LaunchedNoHandle`) is NOT
+//! — so an inconclusive run is now a hard failure everywhere it is genuinely inconclusive. That handoff (`LaunchOutcome::LaunchedNoHandle`) is NOT
 //! inconclusive at all: `SEE_MASK_NOASYNC` is always set on every call (see
 //! `shell_execute_in_apartment`'s doc), so `ShellExecuteExW` does not return until the shell has
 //! finished invoking whatever it handed `lpFile` off to — a synchronous, measured fact, not a race.
@@ -106,10 +105,14 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 /// `TerminateProcess` itself fails, this returns an error immediately instead of waiting `INFINITE`
 /// on a process nothing here can make exit.
 ///
-/// This bound does not cover `ShellExecuteExW` itself failing to return a handle at all (measured
-/// intermittently, for an existing extensionless target — see `SHELL_EXECUTE_BOUND`'s doc). Every
-/// call site that hands `ShellExecuteExW` an existing extensionless target bounds that separately,
-/// via `shell_execute_bounded`.
+/// This bound does not stand alone: every call site that hands `ShellExecuteExW` an existing
+/// extensionless target also wraps the WHOLE call this bound lives inside of — `ShellExecuteExW`
+/// itself, then this wait, then the terminate-and-reap that follows it — in the outer
+/// `SHELL_EXECUTE_BOUND` (60s), via `shell_execute_bounded`. That outer bound tripping does not
+/// specifically mean `ShellExecuteExW` itself never returned (measured intermittently, for an
+/// existing extensionless target — see `SHELL_EXECUTE_BOUND`'s doc): it can equally mean this wait,
+/// or the terminate-and-reap after it, ran long enough to exhaust the remaining 60s. See
+/// `SHELL_EXECUTE_BOUND`'s doc for what that means for a child still running at that point.
 const CHILD_EXIT_BOUND_MS: u32 = 30_000;
 
 fn wide_nul(s: &std::ffi::OsStr) -> Vec<u16> {
@@ -336,26 +339,39 @@ fn shell_execute_in_apartment(
     Ok(LaunchOutcome::Waited)
 }
 
-/// The failure bound for `ShellExecuteExW` itself never returning at all — see the module doc for
-/// what was actually measured (an unexplained intermittent hang) and what is not (it is not
-/// established to be fixed by the COM-apartment init in `shell_execute_with`). Win32 gives this
-/// process no way to cancel a call already inside `ShellExecuteExW`, so the call's return is a
-/// genuinely external event this code cannot synchronize on — bounding it is the sanctioned
-/// exception to "don't synchronize via time", not a race against a clock this process controls.
-/// Hitting this bound is a FAILURE, not a passing answer: it means `ShellExecuteExW` did not return,
-/// so nothing about this probe's actual question was measured. Chosen well below
-/// `.config/nextest.toml`'s 180s `terminate-after` for this binary, so a genuine block is diagnosed
-/// here and reported with context, rather than only visible as a bare timeout kill with no
-/// diagnosis.
+/// The outer failure bound for the WHOLE `shell_execute_with` call, not `ShellExecuteExW` alone:
+/// when a launch does hand back a process handle, this also covers `CHILD_EXIT_BOUND_MS`'s own
+/// wait, terminate, and unbounded reap nested inside it — see that constant's doc. See the module
+/// doc for what was actually measured about `ShellExecuteExW` itself (an unexplained intermittent
+/// hang) and what is not (it is not established to be fixed by the COM-apartment init in
+/// `shell_execute_with`). Win32 gives this process no way to cancel a call already inside
+/// `ShellExecuteExW`, so its return is a genuinely external event this code cannot synchronize on
+/// — bounding the whole call is the sanctioned exception to "don't synchronize via time", not a
+/// race against a clock this process controls.
+///
+/// Hitting this bound is a FAILURE, not a passing answer: nothing about this probe's actual
+/// question was measured, whether the block sat inside `ShellExecuteExW` itself or inside the
+/// nested child wait and recovery. `shell_execute_bounded` deliberately leaks its worker thread
+/// when this bound trips (see that function's doc), so a child that WAS launched is not guaranteed
+/// to have been terminated by the time a probe reports this failure — it can be left running,
+/// uncontained, on the runner when that happens; acceptable only because a GitHub-hosted runner is
+/// an ephemeral VM torn down after the job regardless of what is still running inside it. Chosen
+/// well below `.config/nextest.toml`'s 180s `terminate-after` for this binary, so a genuine block
+/// is diagnosed here and reported with context, rather than only visible as a bare timeout kill
+/// with no diagnosis.
 const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
 
 /// Runs `f` (a `shell_execute_with` call) on its own thread and waits for it, bounded by
 /// `SHELL_EXECUTE_BOUND`. See that constant's doc for why a bound is warranted here at all, and why
 /// hitting it is always a failure.
 ///
-/// Returns `None` if `f` has not returned within the bound. Every call site below treats `None` as a
-/// hard failure — it panics rather than drawing any conclusion about `lpFile` resolution, since
-/// nothing about that question was actually measured when the call itself never returned.
+/// Returns `None` if `f` has not returned within the bound. `f` is the WHOLE `shell_execute_with`
+/// call, not just its `ShellExecuteExW` invocation — when a launch hands back a process handle, `f`
+/// also waits out, terminates, and reaps that child before returning (see `CHILD_EXIT_BOUND_MS`'s
+/// doc), so `None` here does not by itself say which part ran long. Every call site below treats
+/// `None` as a hard failure — it panics rather than drawing any conclusion about `lpFile`
+/// resolution, since nothing about that question was actually measured when the call itself never
+/// returned.
 ///
 /// If `f` itself panics, the channel disconnects immediately rather than timing out — that is
 /// reported here as what it is (a panic inside `f`, which DID return, by unwinding) rather than
