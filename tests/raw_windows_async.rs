@@ -154,18 +154,18 @@ async fn async_contained_raw_child_is_in_our_job() {
 ///
 /// With the bug, the helper's inner spawn would find and load the planted decoy from its own
 /// current directory (CWE-426/427) and report "loaded". Fixed, the bare argv[0] resolves through
-/// the crate's own resolver — the system directories (app dir, `System32`, the Windows directory)
-/// and then `PATH`, never any cwd for a bare name — so the planted copy is never loaded and the
-/// helper reports "notfound".
+/// the crate's own resolver — the system directories (`System32`, the Windows directory) and then
+/// `PATH`, never the app directory and never any cwd for a bare name — so the planted copy is
+/// never loaded and the helper reports "notfound".
 ///
 /// The decoy is planted under a FABRICATED name, never the literal "cosca_testbin" — see the sync
 /// twin's doc for why: that literal name can legitimately resolve via the runner's ACTUAL `PATH`
 /// (measured on CI, where it made an earlier, undiscriminating version of this test report
 /// "loaded" for a reason unrelated to the bug). A name that exists nowhere but the planted decoy
 /// means any successful resolution of it can only have come from the vulnerable cwd search — and,
-/// since the decoy lives ONLY in this tempdir cwd, never the app dir, `System32`, or the Windows
-/// directory either, the resolver's system-directory search step cannot accidentally find it and
-/// mask a cwd-search regression this test would otherwise catch.
+/// since the decoy lives ONLY in this tempdir cwd, never `System32` or the Windows directory
+/// either, the resolver's system-directory search step cannot accidentally find it and mask a
+/// cwd-search regression this test would otherwise catch.
 #[tokio::test]
 async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
