@@ -29,9 +29,13 @@ impl Fd {
     }
 }
 
+/// Infallible: `Fd` itself carries no validity requirement (a negative value round-trips fine
+/// through [`raw`](Fd::raw)). The one call site that must never hand a real spawn a negative
+/// descriptor is [`Command::fd`](crate::Command::fd), which checks explicitly and returns
+/// `Err` — not a `debug_assert!` here, which would panic in debug builds and do nothing at all
+/// in release (see I14).
 impl From<i32> for Fd {
     fn from(n: i32) -> Fd {
-        debug_assert!(n >= 0, "a file descriptor must be non-negative, got {n}");
         Fd(n)
     }
 }

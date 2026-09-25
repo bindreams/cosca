@@ -441,7 +441,7 @@ fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce
 // `src/tokio/child/reaper_tests.rs`: once `Drop` returns before the reap, only the
 // `#[cfg(test)]` probe offers an edge to sequence the no-zombie check after.
 
-// Arbitrary fd (n>=3) — Unix only, wired via command-fds (async mirror of spawn_io.rs) =====
+// Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 
 /// Async twin of sync `unix_fd3_pipe_round_trips`: the testbin's `fd3-echo` mode reads fd 3
 /// and copies it to stdout. Write a known payload into the parent write end, close it (EOF),
@@ -725,7 +725,7 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
 }
 
 /// fd >= 3 as a merge SOURCE into a piped Out target: the pre-pass routes the dup'd write
-/// end through command-fds (never silently dropped). testbin's `fd3-write` emits its token
+/// end through fd_map (never silently dropped). testbin's `fd3-write` emits its token
 /// on fd 3 — a dup of stdout's owned pipe — so the token arrives on the stdout reader.
 #[cfg(unix)]
 #[tokio::test]

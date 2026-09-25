@@ -103,6 +103,34 @@ fn explicit_pipe_out_on_fd3_attaches() {
     ));
 }
 
+/// I14: a negative fd number must be refused explicitly, in both debug and release builds — not
+/// silently accepted (and later dropped or aborted downstream), and not left to a debug-only
+/// `debug_assert!` inside `Fd`'s `From<i32>` (which would panic here rather than return `Err`,
+/// and would do nothing at all in release).
+#[test]
+fn fd_rejects_negative_slot_with_invalid_input() {
+    let mut cmd = Command::new();
+    let err = cmd.fd(-1, Stdio::null()).expect_err("a negative fd must be rejected");
+    match err {
+        crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+    // The rejection must not have inserted anything into the map.
+    assert!(cmd.fds().is_empty());
+}
+
+/// `i32::MIN` is the sharpest edge for the non-negativity check: `.abs()` or a naive negation
+/// would overflow on it. Also must be an explicit `Err`, not a panic.
+#[test]
+fn fd_rejects_i32_min_slot_with_invalid_input() {
+    let mut cmd = Command::new();
+    let err = cmd.fd(i32::MIN, Stdio::null()).expect_err("i32::MIN must be rejected");
+    match err {
+        crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+}
+
 #[test]
 fn kill_on_drop_defaults_true_and_toggles() {
     let mut cmd = Command::new();

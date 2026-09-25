@@ -394,7 +394,7 @@ fn null_stdout_discards() {
     assert!(status.success());
 }
 
-// Arbitrary fd (n>=3) — Unix only, wired via command-fds =====
+// Arbitrary fd (n>=3) — Unix only, wired via fd_map =====
 
 /// Prove that a child fd 3 configured as a pipe is reachable from the child:
 /// the testbin's `fd3-echo` mode reads fd 3 and copies it to stdout. We write
@@ -428,7 +428,7 @@ fn unix_fd3_pipe_round_trips() {
 
 /// Prove that fd 3 with Stdio::null() is accepted and spawns successfully.
 /// The child reads from fd 3 (which is /dev/null) and gets immediate EOF,
-/// producing no stdout output. Confirms the null path reaches command-fds.
+/// producing no stdout output. Confirms the null path reaches fd_map.
 #[cfg(unix)]
 #[test]
 fn unix_fd3_null_is_accepted() {
@@ -466,6 +466,56 @@ fn unix_fd3_inherit_is_rejected() {
         matches!(err, cosca::error::Error::Unsupported { .. }),
         "expected Unsupported, got {err:?}"
     );
+}
+
+/// I14 regression: an out-of-range but syscall-representable child fd (far beyond any real
+/// process' open-file limit) must fail the SPAWN with an ordinary `Err` — never `Ok` followed by
+/// the child dying of SIGABRT. Before the fix, `command-fds` wrapped a failed `dup2`'s `-1`
+/// return in an `OwnedFd` (nix-rust/nix#2797), which aborted the child instead of surfacing a
+/// clean error.
+#[cfg(unix)]
+#[test]
+fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
+    let mut cmd = Command::new();
+    cmd.executable(testbin())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(1_000_000, Stdio::null())
+        .expect("fd() itself accepts an out-of-range but representable number");
+    let err = cmd
+        .spawn()
+        .expect_err("dup2 onto an unachievable fd number must fail the spawn with Err, not abort");
+    assert!(
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error (propagated via the child's error pipe), got {err:?}"
+    );
+}
+
+/// I14 regression: `fd(i32::MAX, ...)` must fail — either at `Command::fd()` or at `spawn()` —
+/// with an ordinary `Err`, in both debug and release builds. Before the fix, `command-fds`
+/// computed a collision-avoidance temporary-fd floor via unchecked `i32` arithmetic
+/// (`max(...) + 1`), which overflowed for `i32::MAX` (panicking in debug, wrapping in release).
+/// cosca's own `fd_map` module rejects this in the PARENT, before any fork, with
+/// `InvalidInput` — verified here via `cmd.spawn()`, which is the one call site the bug could
+/// actually reach.
+#[cfg(unix)]
+#[test]
+fn unix_fd_i32_max_fails_spawn_in_both_profiles() {
+    let mut cmd = Command::new();
+    cmd.executable(testbin())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(i32::MAX, Stdio::null())
+        .expect("fd() itself accepts i32::MAX (only the collision-avoidance arithmetic overflows)");
+    let err = cmd
+        .spawn()
+        .expect_err("i32::MAX must be rejected by fd_map's parent-side checked arithmetic before any fork");
+    match err {
+        cosca::error::Error::Io(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "expected InvalidInput, got {e:?}"
+        ),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
 }
 
 /// Prove that fd 3 configured as a file is passed through to the child:
@@ -523,7 +573,7 @@ fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
 
 /// `.contain()` + `.fd(3, pipe_out())` on Linux: whatever mechanism is achieved, the child's fd 3
 /// carries exactly its own token, and containment is established. The cgroup `pre_exec` writes
-/// "0" to a pre-opened `cgroup.procs` fd, and command-fds' `pre_exec` dup2's the user's fd onto
+/// "0" to a pre-opened `cgroup.procs` fd, and fd_map's `pre_exec` dup2's the user's fd onto
 /// child fd 3; if they collided, the "0" would land in the stream or the pipe would break.
 #[cfg(target_os = "linux")]
 #[test]
@@ -538,7 +588,7 @@ fn linux_contain_with_fd3_delivers_the_exact_payload() {
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
-/// Regression: under a delegated cgroup, command-fds' dup2 onto fd 3 must not clobber the cgroup
+/// Regression: under a delegated cgroup, fd_map's dup2 onto fd 3 must not clobber the cgroup
 /// placement's `cgroup.procs` fd. A clobbered write degrades the spawn to a process group, so
 /// achieving `CgroupV2` is the proof.
 #[cfg(target_os = "linux")]
@@ -554,7 +604,7 @@ fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
     assert_eq!(
         containment,
         cosca::Containment::CgroupV2,
-        "the cgroup write must not be clobbered by command-fds' dup2"
+        "the cgroup write must not be clobbered by fd_map's dup2"
     );
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }

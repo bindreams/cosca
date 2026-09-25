@@ -261,7 +261,7 @@ fn a_dead_handle_finds_no_holders() {
 // Installing the marker on a spawn =====
 
 /// `preserved_fds` only clears FD_CLOEXEC — it does not renumber, so the marker keeps the
-/// parent's descriptor NUMBER inside the child. `command-fds`' user mappings `dup2` onto
+/// parent's descriptor NUMBER inside the child. `fd_map`'s user mappings `dup2` onto
 /// their `child_fd` numbers in the same forked child, closing whatever occupies them, so a
 /// marker on one of those numbers would be silently clobbered and the tree would silently
 /// lose membership. `F_DUPFD_CLOEXEC` never overwrites an open descriptor, so only `child_fd`
@@ -320,7 +320,7 @@ fn install_places_the_marker_above_every_reserved_child_fd() {
 #[test]
 fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
     let _serialize = test_spawn_lock();
-    use command_fds::{CommandFdExt, FdMapping};
+    use crate::child::spawn::fd_map::{self, FdMapping};
 
     let (_probe_r, probe_w) = std::io::pipe().expect("probe pipe");
     // The number `install` would pick with nothing reserved.
@@ -335,10 +335,13 @@ fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[natural]).expect("install");
     let handle = prepared.handle;
-    cmd.fd_mappings(vec![FdMapping {
-        parent_fd: filler.into(),
-        child_fd: natural,
-    }])
+    fd_map::install(
+        &mut cmd,
+        vec![FdMapping {
+            parent_fd: filler.into(),
+            child_fd: natural,
+        }],
+    )
     .expect("unique child fd");
 
     let mut child = cmd.spawn().expect("spawn sh");

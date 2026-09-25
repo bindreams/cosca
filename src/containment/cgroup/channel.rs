@@ -61,7 +61,7 @@ const PROCEED: u8 = b'P';
 /// and forever on one that never execs.
 ///
 /// Both ends sit at fd 3 or above. The child's stdio `dup2` cannot close its end there. The only
-/// later `dup2` is command-fds' mapping of fds 3 and up, whose hook the spawn registers after the
+/// later `dup2` is fd_map's mapping of fds 3 and up, whose hook the spawn registers after the
 /// placement hook: it can replace the child's end only once the report is sent.
 ///
 /// The wait is no longer than the one `std` intends: the child reaches its report on `std`'s own

@@ -448,6 +448,18 @@ impl Command {
     /// `executable` is set.
     pub fn fd(&mut self, slot: impl Into<Fd>, target: Stdio) -> Result<&mut Command, Error> {
         let slot = slot.into();
+        // I14: refuse a negative descriptor number explicitly, in both debug and release. A
+        // negative `Fd` reaching the spawn backends would either be silently filtered out (the
+        // `raw() >= 3` collection in `child::spawn`) or, worse, handed to a raw `dup2` as the
+        // target fd — undefined by POSIX, and observed to abort the child via a nix bug
+        // (nix-rust/nix#2797) rather than fail cleanly. Checked here, once, before the value
+        // reaches any of that.
+        if slot.raw() < 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("a file descriptor must be non-negative, got {}", slot.raw()),
+            )));
+        }
         let resolved = target.resolve(slot)?;
         self.fds.insert(slot, resolved);
         Ok(self)

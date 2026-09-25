@@ -12,7 +12,7 @@ use super::child::Child;
 /// # Limitations
 ///
 /// Mirror the sync API: arbitrary descriptors (fd ≥ 3) work on every platform — parent pipe ends
-/// via `Child::fd_read_end`/`Child::fd_write_end` (Unix wires them through `command-fds`; Windows
+/// via `Child::fd_read_end`/`Child::fd_write_end` (Unix wires them through `fd_map`; Windows
 /// through the raw `CreateProcessW` backend's MSVCRT fd-table). Merging into a *piped* target works
 /// on all platforms, in both directions; a merge whose target is itself a merge is rejected.
 #[derive(Debug, Default)]
