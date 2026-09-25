@@ -490,32 +490,30 @@ fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     );
 }
 
-/// I14 regression: `fd(i32::MAX, ...)` must fail — either at `Command::fd()` or at `spawn()` —
-/// with an ordinary `Err`, in both debug and release builds. Before the fix, `command-fds`
-/// computed a collision-avoidance temporary-fd floor via unchecked `i32` arithmetic
-/// (`max(...) + 1`), which overflowed for `i32::MAX` (panicking in debug, wrapping in release).
-/// cosca's own `fd_map` module rejects this in the PARENT, before any fork, with
-/// `InvalidInput` — verified here via `cmd.spawn()`, which is the one call site the bug could
-/// actually reach.
+/// I14 regression: `fd(i32::MAX, ...)` must fail — never abort the child — with an ordinary
+/// `Err` from `spawn()`. `Command::fd()` itself accepts `i32::MAX` (M1 removed the parent-side
+/// checked-arithmetic refusal that used to catch it before any fork); the failure now happens
+/// post-fork, at `dup2`, exactly like any other out-of-range child fd (`EBADF`).
+///
+/// Not `..._in_both_profiles`: an integration test file like this one does not run in CI's
+/// release job at all (that job is `--lib` only), so a name claiming "in both profiles" was
+/// never actually checked in release. `--lib` unit coverage for the same behavior lives in
+/// `child::spawn::fd_map::fd_map_tests`.
 #[cfg(unix)]
 #[test]
-fn unix_fd_i32_max_fails_spawn_in_both_profiles() {
+fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(i32::MAX, Stdio::null())
-        .expect("fd() itself accepts i32::MAX (only the collision-avoidance arithmetic overflows)");
+        .expect("fd() itself accepts i32::MAX — install() does too, since M1");
     let err = cmd
         .spawn()
-        .expect_err("i32::MAX must be rejected by fd_map's parent-side checked arithmetic before any fork");
-    match err {
-        cosca::error::Error::Io(e) => assert_eq!(
-            e.kind(),
-            std::io::ErrorKind::InvalidInput,
-            "expected InvalidInput, got {e:?}"
-        ),
-        other => panic!("expected Io(InvalidInput), got {other:?}"),
-    }
+        .expect_err("dup2 onto i32::MAX must fail the spawn with Err, not abort");
+    assert!(
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error (propagated via the child's error pipe), got {err:?}"
+    );
 }
 
 /// Prove that fd 3 configured as a file is passed through to the child:

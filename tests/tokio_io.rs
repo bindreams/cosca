@@ -511,6 +511,47 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
     assert_eq!(buf, b"fd3-token");
 }
 
+/// Async twin of sync `unix_fd_out_of_range_fails_spawn_cleanly_not_abort`: an out-of-range but
+/// syscall-representable child fd (far beyond any real process' open-file limit) must fail the
+/// SPAWN with an ordinary `Err` — never `Ok` followed by the child dying of SIGABRT.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(1_000_000, cosca::Stdio::null())
+        .expect("fd() itself accepts an out-of-range but representable number");
+    let err = cmd
+        .spawn()
+        .expect_err("dup2 onto an unachievable fd number must fail the spawn with Err, not abort");
+    assert!(
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error (propagated via the child's error pipe), got {err:?}"
+    );
+}
+
+/// Async twin of sync `unix_fd_i32_max_fails_spawn_cleanly_not_abort`: `fd(i32::MAX, ...)` must
+/// fail — never abort the child — with an ordinary `Err` from `spawn()`. `Command::fd()` itself
+/// accepts `i32::MAX` (M1 removed the parent-side checked-arithmetic refusal); the failure now
+/// happens post-fork, at `dup2`, exactly like any other out-of-range child fd (`EBADF`).
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(i32::MAX, cosca::Stdio::null())
+        .expect("fd() itself accepts i32::MAX — install() does too, since M1");
+    let err = cmd
+        .spawn()
+        .expect_err("dup2 onto i32::MAX must fail the spawn with Err, not abort");
+    assert!(
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error (propagated via the child's error pipe), got {err:?}"
+    );
+}
+
 /// A wrong-direction accessor must NOT consume the stashed end (the put-back arm): after
 /// the mismatched take returns `None`, the correctly-directioned accessor still yields a
 /// WORKING end — proven by a full round-trip, both directions.

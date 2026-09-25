@@ -260,7 +260,7 @@ fn a_dead_handle_finds_no_holders() {
 
 // Installing the marker on a spawn =====
 
-/// `preserved_fds` only clears FD_CLOEXEC — it does not renumber, so the marker keeps the
+/// `fd_map::install_preserved` only clears FD_CLOEXEC — it does not renumber, so the marker keeps the
 /// parent's descriptor NUMBER inside the child. `fd_map`'s user mappings `dup2` onto
 /// their `child_fd` numbers in the same forked child, closing whatever occupies them, so a
 /// marker on one of those numbers would be silently clobbered and the tree would silently
@@ -397,8 +397,8 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
 }
 
 /// A holder whose descriptor survives exec is NOT an imminent membership loss, so no warning
-/// is due. The check runs against a spawned child (whose copy `preserved_fds` has already
-/// un-CLOEXEC'd) rather than by mutating this process's own fd table, which a concurrent
+/// is due. The check runs against a spawned child (whose copy `fd_map::install_preserved` has
+/// already un-CLOEXEC'd) rather than by mutating this process's own fd table, which a concurrent
 /// fork+exec on another thread would leak. The assertion keys on the per-pid message
 /// (`fd marker {handle:#x}: holder pid {kid} will lose the marker…`), not on the handle alone:
 /// under a plain `cargo test`, which runs every test in this crate in one shared process, unit
@@ -431,7 +431,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
     let theirs = found.iter().find(|h| h.pid == kid).expect("the child holds the marker");
     assert!(
         !theirs.clexec,
-        "preserved_fds clears FD_CLOEXEC in the child, so the marker survives its next exec"
+        "fd_map::install_preserved clears FD_CLOEXEC in the child, so the marker survives its next exec"
     );
     assert!(
         !crate::log_capture::contains_since(
@@ -457,7 +457,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
 /// available to a unit test (`/bin/sh` has no `fcntl` builtin; a compiled testbin mode is
 /// unavailable here — Global Constraints) can do that post-exec. `std::io::pipe()` sets
 /// `FD_CLOEXEC` on both ends by default (the reason `install()` needs `F_DUPFD_CLOEXEC` +
-/// `preserved_fds` to make the write end survive an exec at all), so a bare pipe's write end,
+/// `fd_map::install_preserved` to make the write end survive an exec at all), so a bare pipe's write end,
 /// right here in this process, IS already the exact state under test — no fd-table mutation
 /// needed, so this does not touch the "never clear FD_CLOEXEC on this process's own
 /// descriptors" rule (that rule is about CLEARING an existing flag; this relies on the

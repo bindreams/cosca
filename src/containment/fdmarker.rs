@@ -516,8 +516,8 @@ pub(crate) struct PreparedMarker {
     /// letting `Marker` re-assert "this really is still my pipe" at sweep time without
     /// depending on the write side's state.
     pub read_handle: u64,
-    /// The descriptor number the marker occupies in the child (`preserved_fds` does not
-    /// renumber, so it is the parent's number too).
+    /// The descriptor number the marker occupies in the child (`fd_map::install_preserved` does
+    /// not renumber, so it is the parent's number too).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fd: RawFd,
 }

@@ -6,32 +6,46 @@
 //! [`Fd`](crate::stdio::Fd) either abort the child or silently vanish rather than fail the
 //! spawn cleanly:
 //!  - its `map_fds` computes `max(every parent/child fd) + 1` as a temporary-fd floor with
-//!    unchecked `i32` arithmetic, which overflows for `child_fd == i32::MAX`;
+//!    unchecked `i32` arithmetic, which overflows for `child_fd == i32::MAX` — and even when it
+//!    does not overflow, that single global floor can sit above the process' `RLIMIT_NOFILE`
+//!    even when plenty of lower numbers are free, refusing a spawn that should have succeeded;
 //!  - it calls nix 0.31.3's `dup2_raw`, which does not check `dup2`'s return value before
 //!    wrapping it in an `OwnedFd` — on ANY `dup2` failure (e.g. `EBADF` for an out-of-range
 //!    target) that constructs an `OwnedFd` around the sentinel `-1`, which aborts when std's
 //!    own file-descriptor validity checks later see it. Reported upstream as
 //!    nix-rust/nix#2797 (unfixed as of nix 0.31.3); not cosca's to fix.
 //!
+//! A negative `Fd` never reaches this module at all — [`Command::fd`](crate::Command::fd)
+//! rejects it before a [`FdMapping`] is ever built, via cosca's own `raw() >= 3` filter. It is
+//! not something `command-fds` ever handled correctly; there is no equivalent path here for it
+//! to "vanish" through.
+//!
 //! This module ports `command-fds`' actual algorithm (the collision-avoiding temporary-fd
-//! shuffle, and the `FD_CLOEXEC`-clearing `preserved_fds` the macOS fd marker uses) but:
-//!  - computes the temporary-fd floor with checked arithmetic in the PARENT, before any fork,
-//!    so an unrepresentable floor (only possible when a `child_fd` or `parent_fd` is
-//!    `i32::MAX`) is an ordinary `Err` from [`install`] rather than a child-side overflow;
-//!  - makes every syscall through raw `libc` calls whose return value is checked, never
-//!    through nix's `dup2_raw`;
+//! shuffle, and the `FD_CLOEXEC`-clearing `preserved_fds` the macOS fd marker uses, here
+//! [`install_preserved`]) but:
+//!  - picks each temporary with its own `F_DUPFD_CLOEXEC(fd, 3)` search, re-requesting above any
+//!    result that lands on another mapping's `child_fd`, instead of one global floor computed
+//!    from the highest fd anywhere in the set — so one distant `child_fd` no longer inflates
+//!    every other mapping's temporary past a tight `RLIMIT_NOFILE` (see [`dup_avoiding`]). That
+//!    retry is bounded by the number of `child_fd`s: `F_DUPFD_CLOEXEC` always returns a
+//!    genuinely free number, so at most one collision can occur per `child_fd`;
+//!  - relocates, in the parent before any fork, any mapping whose `parent_fd` sits below fd 3
+//!    (see [`install`]) — std's OWN stdio setup (`.stdin()`/`.stdout()`/`.stderr()`) runs its
+//!    `dup2`s in the child BEFORE any `pre_exec` hook, so a mapping source left at fd 0/1/2
+//!    would otherwise be silently clobbered before this module's own `pre_exec` ever ran;
+//!  - makes every post-fork syscall through raw `libc` calls whose return value is checked,
+//!    never through nix's `dup2_raw`;
 //!  - retries a syscall interrupted by `EINTR`, with no arbitrary bound (mirrors the
 //!    codebase's other `pre_exec`/raw-syscall retry sites — see e.g.
 //!    `containment::cgroup::channel`).
 //!
-//! An out-of-range but syscall-representable `child_fd` (e.g. 1_000_000) is deliberately NOT
-//! rejected here: it is a normal spawn-time condition (bounded by the child's own
-//! `RLIMIT_NOFILE`) and is left to fail exactly the way any other post-fork syscall failure
+//! An out-of-range but syscall-representable `child_fd` (e.g. 1_000_000, or `i32::MAX`) is
+//! deliberately NOT rejected here: it is a normal spawn-time condition (bounded by the child's
+//! own `RLIMIT_NOFILE`) and is left to fail exactly the way any other post-fork syscall failure
 //! does — `dup2` returns `EBADF`, the checked closure returns that as an `io::Error`, and
 //! std's own child-to-parent error pipe turns it into an ordinary `Err` from
-//! `Command::spawn`. Only a negative `Fd` ([`Command::fd`](crate::Command::fd)) and the
-//! checked temporary-fd arithmetic here are pre-empted in the parent; everything else is the
-//! kernel's call.
+//! `Command::spawn`. Only a negative `Fd` is pre-empted, upstream, in
+//! [`Command::fd`](crate::Command::fd); everything else here is the kernel's call.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -58,11 +72,12 @@ pub(crate) struct FdMapping {
 /// module docs for why that is a normal (child-side, `EBADF`) spawn failure rather than a
 /// parent-side refusal.
 ///
-/// Parent-side failure mode: the temporary-fd floor a parent/child fd collision would need is
-/// computed with checked arithmetic before any fork; if it does not fit in an `i32` (only
-/// possible when some `child_fd` or `parent_fd` is `i32::MAX`), this returns
-/// `Err(InvalidInput)` here rather than letting the post-fork computation overflow.
-pub(crate) fn install(std_cmd: &mut std::process::Command, mappings: Vec<FdMapping>) -> io::Result<()> {
+/// Before building the plan, relocates (in the parent, before any fork) any mapping whose
+/// `parent_fd` sits below fd 3, via `F_DUPFD_CLOEXEC(fd, 3)` — see the module docs for why a
+/// low-numbered source would otherwise be clobbered by std's own stdio setup. That relocation is
+/// the only parent-side failure mode left: an ordinary `Err` (e.g. `EMFILE`) if the duplicate
+/// itself cannot be made.
+pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdMapping>) -> io::Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
@@ -85,7 +100,20 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, mappings: Vec<FdMappi
          (callers build this from a BTreeMap<Fd, _>, whose keys already are)"
     );
 
-    let mut plan = Plan::build(mappings)?;
+    // M2: a mapping's `parent_fd` sitting at fd 0/1/2 would be clobbered by std's own stdio
+    // dup2, which runs in the child before any `pre_exec` hook (including this module's own).
+    // Move it out of the way here, in the parent, before the fork ever happens.
+    for m in mappings.iter_mut() {
+        let parent_raw = m.parent_fd.as_raw_fd();
+        if parent_raw < 3 {
+            let tmp = dup_fd_cloexec_at_or_above(parent_raw, 3)?;
+            // SAFETY: `tmp` was just returned by a successful F_DUPFD_CLOEXEC — a fresh,
+            // uniquely-owned descriptor nothing else references yet.
+            m.parent_fd = unsafe { OwnedFd::from_raw_fd(tmp) };
+        }
+    }
+
+    let mut plan = Plan::build(mappings);
     // SAFETY: `Plan::apply` makes only raw `dup2`/`fcntl` syscalls, checks every return value,
     // and reads the failure errno without allocating — the async-signal-safety `pre_exec`
     // requires.
@@ -114,49 +142,22 @@ pub(crate) fn install_preserved(std_cmd: &mut std::process::Command, fds: Vec<Ow
     }
 }
 
-/// The dup2 plan, precomputed in the parent so the `pre_exec` closure does no allocation and no
-/// unchecked arithmetic.
+/// The dup2 plan, precomputed in the parent so the `pre_exec` closure does no allocation.
 struct Plan {
     mappings: Vec<FdMapping>,
-    /// Every child fd number in `mappings`, sorted+deduped — used post-fork to detect a parent
-    /// fd that collides with ANOTHER mapping's child fd (needs a temporary first).
+    /// Every child fd number in `mappings`, sorted+deduped — used post-fork both to detect a
+    /// parent fd that collides with ANOTHER mapping's child fd (needs a temporary first) and,
+    /// via [`dup_avoiding`], to pick a temporary that avoids every one of them.
     child_fds: Vec<RawFd>,
-    /// The first fd number provably clear of every parent AND child fd `mappings` mentions —
-    /// safe to hand to `F_DUPFD_CLOEXEC` as a floor for a temporary. `None` only when
-    /// `mappings` is empty (`install` returns before `Plan::build` in that case, so `apply`
-    /// never actually needs it then either).
-    first_safe_fd: Option<RawFd>,
 }
 
 impl Plan {
-    fn build(mappings: Vec<FdMapping>) -> io::Result<Plan> {
+    fn build(mappings: Vec<FdMapping>) -> Plan {
         let mut child_fds: Vec<RawFd> = mappings.iter().map(|m| m.child_fd).collect();
         child_fds.sort_unstable();
         child_fds.dedup();
 
-        let mut first_safe_fd: Option<RawFd> = None;
-        for m in &mappings {
-            let hi = m.parent_fd.as_raw_fd().max(m.child_fd);
-            let bumped = hi.checked_add(1).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "fd {hi} has no representable fd number above it to use as a \
-                         temporary during fd-mapping setup"
-                    ),
-                )
-            })?;
-            first_safe_fd = Some(match first_safe_fd {
-                Some(cur) => cur.max(bumped),
-                None => bumped,
-            });
-        }
-
-        Ok(Plan {
-            mappings,
-            child_fds,
-            first_safe_fd,
-        })
+        Plan { mappings, child_fds }
     }
 
     /// Async-signal-safe: no allocation, every syscall's return value is checked, `EINTR` is
@@ -166,19 +167,16 @@ impl Plan {
         if self.mappings.is_empty() {
             return Ok(());
         }
-        let first_safe_fd = self
-            .first_safe_fd
-            .expect("computed in build() for every non-empty mapping set");
 
         // Pass 1: move any parent fd that collides with ANOTHER mapping's child fd to an
-        // FD_CLOEXEC temporary above `first_safe_fd`, so pass 2's dup2 onto that child fd
+        // FD_CLOEXEC temporary that avoids every `child_fd`, so pass 2's dup2 onto that child fd
         // number cannot close a not-yet-processed parent fd out from under it. Mappings whose
         // parent fd already sits on its OWN child fd number are exempt (pass 2 handles that
         // case by clearing CLOEXEC in place, without a dup2).
         for m in self.mappings.iter_mut() {
             let parent_raw = m.parent_fd.as_raw_fd();
-            if parent_raw != m.child_fd && self.child_fds.contains(&parent_raw) {
-                let tmp = dup_fd_cloexec_at_or_above(parent_raw, first_safe_fd)?;
+            if parent_raw != m.child_fd && self.child_fds.binary_search(&parent_raw).is_ok() {
+                let tmp = dup_avoiding(parent_raw, &self.child_fds)?;
                 // SAFETY: `tmp` was just returned by a successful F_DUPFD_CLOEXEC — a fresh,
                 // uniquely-owned descriptor nothing else references yet.
                 m.parent_fd = unsafe { OwnedFd::from_raw_fd(tmp) };
@@ -211,6 +209,37 @@ fn preserve(fds: &[OwnedFd]) -> io::Result<()> {
 /// lowest available number `>= min`. Retries `EINTR`.
 fn dup_fd_cloexec_at_or_above(fd: RawFd, min: RawFd) -> io::Result<RawFd> {
     retry_eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min) })
+}
+
+/// A `FD_CLOEXEC` temporary duplicate of `fd`, at a number not in `forbidden` (every `child_fd`
+/// in this mapping set). Starts the search at 3 and re-requests above any candidate that lands
+/// on a forbidden number, closing the collision first so its number is free again for whichever
+/// mapping actually wants it.
+///
+/// Bounded by `forbidden.len()` retries: each collision raises `min` past that exact number, and
+/// nothing in this loop ever frees a lower number back up, so the same forbidden number can
+/// never be returned twice — each retry permanently rules out one more element of `forbidden`.
+///
+/// Async-signal-safe: no allocation; the only failure path is `min`'s `checked_add` overflowing
+/// (only reachable when `forbidden` contains `i32::MAX`), which is reported as a plain
+/// `io::Error` without formatting.
+fn dup_avoiding(fd: RawFd, forbidden: &[RawFd]) -> io::Result<RawFd> {
+    let mut min: RawFd = 3;
+    loop {
+        let tmp = dup_fd_cloexec_at_or_above(fd, min)?;
+        if forbidden.binary_search(&tmp).is_err() {
+            return Ok(tmp);
+        }
+        // SAFETY: `tmp` was just returned by a successful F_DUPFD_CLOEXEC — a fresh,
+        // uniquely-owned descriptor nothing else references yet; closing it just frees its
+        // number back up for whichever mapping actually wants it.
+        unsafe {
+            libc::close(tmp);
+        }
+        min = tmp
+            .checked_add(1)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    }
 }
 
 /// `dup2(oldfd, newfd)` — closes `newfd` first if it was already open. Retries `EINTR`.
