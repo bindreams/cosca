@@ -13,20 +13,16 @@ $ErrorActionPreference = "Stop"
 
 # rustup-init.exe and the VC++ redistributable installer (below) are run via
 # `Start-Process ... -Wait -PassThru` rather than an inline `&` invocation, so their stdio
-# never interacts with this script's own PowerShell stream/error machinery. Historically
-# (when this script ran through Vagrant's shell provisioner) that mattered for correctness:
-# the provisioner's WinRM PSRP shell appended a trailer that turned rustup-init's benign
-# stderr progress lines into a false failure. That's no longer how this script runs -
-# devvm.py drives it directly via `vagrant winrm -c` (see run_windows_script's docstring),
-# whose communicator (plugins/communicators/winrm/shell.rb) appends no such trailer and
-# never inspects `$?` - only `$LASTEXITCODE`, which the explicit exit-code checks below
-# already set correctly either way. The `Start-Process` pattern is kept regardless: it's
-# simple, still correct, and every native call below has its own explicit exit-code/output
-# check immediately after it, which `throw`s on failure. cargo-nextest itself is never run
-# via `Start-Process` at all - it's fetched as a prebuilt release zip (Invoke-WebRequest plus
-# Expand-Archive, below) and its `--version` output is read via a plain `&`/subexpression
-# invocation, since that call only needs its stdout captured, not isolation from this
-# script's streams.
+# never interacts with this script's own PowerShell stream/error machinery. This script runs
+# via `vagrant winrm -c`, driven directly by devvm_windows.py (see run_windows_script's
+# docstring); that communicator (plugins/communicators/winrm/shell.rb) never inspects `$?` -
+# only `$LASTEXITCODE`, which the explicit exit-code checks below already set correctly
+# either way. The `Start-Process` pattern is kept regardless: it's simple, still correct, and
+# every native call below has its own explicit exit-code/output check immediately after it,
+# which `throw`s on failure. cargo-nextest itself is never run via `Start-Process` at all -
+# it's fetched as a prebuilt release zip (Invoke-WebRequest plus Expand-Archive, below) and
+# its `--version` output is read via a plain `&`/subexpression invocation, since that call
+# only needs its stdout captured, not isolation from this script's streams.
 
 # rustup-init doesn't update the CURRENT process's PATH after installing - re-derive cargo's
 # bin dir directly (matches rustup's own default: %USERPROFILE%\.cargo\bin) so the
@@ -60,8 +56,8 @@ if (Get-Command cargo -ErrorAction SilentlyContinue) {
 # Rust toolchain installed above doesn't need them itself. Measured directly (2026-09-23):
 # without this, invoking cargo-nextest.exe at all - even --version - fails immediately with
 # exit code -1073741515 (0xC0000135, STATUS_DLL_NOT_FOUND) and no stdout/stderr, which the
-# nextest-install block below (before this fix) silently swallowed into an empty version
-# string instead of catching. nextest-rs publishes no windows-gnu build (checked the
+# nextest-install block below silently swallows into an empty version string instead of
+# catching, unless this check runs first. nextest-rs publishes no windows-gnu build (checked the
 # cargo-nextest-0.9.137 release asset list - only *-pc-windows-msvc for both x86_64 and
 # aarch64), so switching targets isn't an option; the redistributable has to be installed.
 # This runs BEFORE the "is cargo-nextest already installed?" check below, since that check

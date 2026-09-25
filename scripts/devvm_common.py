@@ -131,7 +131,26 @@ def run_vagrant_streaming(
     return returncode, "".join(lines)
 
 
-def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float) -> subprocess.CompletedProcess[str]:
+@dataclass(frozen=True)
+class BoundedWinrmResult:
+    """Result of a bounded `vagrant winrm -c` call (see run_vagrant_winrm_bounded).
+
+    `timed_out` reports the specific subprocess.TimeoutExpired run_vagrant_winrm_bounded's own
+    `deadline` raised — vagrant/WinRM never answered in time, so the process was killed —
+    distinct from every other outcome, including an ordinary nonzero exit WinRM itself
+    returned in time. A caller that retries in a loop until its own deadline (e.g.
+    wait_for_windows_session) doesn't need the distinction — either way it just asks again. A
+    caller that makes a single bounded call and has to report a reason to a human right now
+    (get_windows_interactive_username's caller in devvm.py's cmd_run) does.
+    """
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+
+
+def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float) -> BoundedWinrmResult:
     """Like `subprocess.run(["vagrant", "winrm", "-c", powershell_cmd], ...)`, but bounded by
     `deadline` (a time.monotonic() value) instead of running unbounded.
 
@@ -142,10 +161,10 @@ def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float
     own process group, so a timeout kills the whole group via `os.killpg`, not just the
     launcher.
 
-    On timeout, returns a CompletedProcess with a nonzero returncode and empty stdout/stderr —
-    the same shape callers already treat as "WinRM isn't answering right now, keep waiting" (see
-    devvm_windows.get_windows_reboot_marker_present et al.) — so a caller's own deadline check on
-    the next loop iteration is what actually raises, not this function.
+    On a real timeout, returns `timed_out=True` with a nonzero returncode and empty
+    stdout/stderr — see BoundedWinrmResult's own docstring for why that's reported explicitly,
+    rather than folded into the same "nonzero returncode" shape an ordinary WinRM failure
+    produces.
     """
     remaining = max(deadline - time.monotonic(), 0.001)
     proc = subprocess.Popen(
@@ -162,8 +181,8 @@ def run_vagrant_winrm_bounded(guest: Guest, powershell_cmd: str, deadline: float
     except subprocess.TimeoutExpired:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         stdout, stderr = proc.communicate()
-        return subprocess.CompletedProcess(proc.args, 1, stdout, stderr)
-    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        return BoundedWinrmResult(1, stdout, stderr, timed_out=True)
+    return BoundedWinrmResult(proc.returncode, stdout, stderr, timed_out=False)
 
 
 def powershell_quote(value: str) -> str:

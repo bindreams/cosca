@@ -249,20 +249,52 @@ class CmdRunValidationTests(unittest.TestCase):
             f"--timeout must be at most {devvm.WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS}", stderr.getvalue()
         )
 
+    def test_timeout_of_one_is_accepted(self) -> None:
+        # Boundary case, the accept side: the reviewer mutation this guards against changed
+        # `timeout <= 0` to `timeout <= 1`, which would reject exactly 1 even though it's the
+        # smallest valid --timeout. test_non_positive_timeout_exits pins 0 as a reject; this
+        # pins 1 as an accept. get_windows_interactive_username (the first thing cmd_run calls
+        # once validation passes) is patched to raise a sentinel so this stops right there,
+        # without needing a real guest.
+        sentinel = RuntimeError("validation passed: reached get_windows_interactive_username")
+        args = argparse.Namespace(guest="windows-x64", unelevated=True, timeout=1, cmd=["whoami"])
+        with mock.patch.object(devvm, "get_windows_interactive_username", side_effect=sentinel):
+            with self.assertRaises(RuntimeError) as ctx:
+                devvm.cmd_run(args)
+        self.assertIs(ctx.exception, sentinel)
+
+    def test_timeout_of_max_is_accepted(self) -> None:
+        # Boundary case, the accept side: the reviewer mutation this guards against changed
+        # `timeout > MAX` to `timeout >= MAX`, which would reject exactly MAX even though it's
+        # the largest valid --timeout. test_timeout_over_max_exits pins MAX+1 as a reject; this
+        # pins MAX itself as an accept. Same sentinel-and-patch approach as
+        # test_timeout_of_one_is_accepted, for the same reason.
+        sentinel = RuntimeError("validation passed: reached get_windows_interactive_username")
+        args = argparse.Namespace(
+            guest="windows-x64",
+            unelevated=True,
+            timeout=devvm.WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS,
+            cmd=["whoami"],
+        )
+        with mock.patch.object(devvm, "get_windows_interactive_username", side_effect=sentinel):
+            with self.assertRaises(RuntimeError) as ctx:
+                devvm.cmd_run(args)
+        self.assertIs(ctx.exception, sentinel)
+
 
 class CmdUpValidationTests(unittest.TestCase):
     # cmd_up's own guard order (see its comment in devvm.py) runs --allow-elevation/--display
     # validation before dotfile_dir(guest).mkdir(...), so a real STATE_DIR is never even
     # consulted by a passing test. dotfile_dir is patched anyway, directly on `devvm` (the
-    # module object devvm.py's own `cmd_up` resolves that name against at call time) rather than
-    # on `devvm_common.STATE_DIR`: devvm.py imports `devvm_common` by inserting its own directory
-    # onto sys.path and doing `from devvm_common import (...)`, which registers a *different*
-    # module object under sys.modules["devvm_common"] than the one this test file's `from
-    # scripts import devvm_common` binds — confirmed empirically
-    # (`devvm.dotfile_dir is devvm_common.dotfile_dir` is False) — so patching
-    # `devvm_common.STATE_DIR` here would not affect what devvm.py's own `cmd_up` actually calls.
-    # run_vagrant and subprocess are also stubbed (see _forbid_subprocess_and_vagrant), as a
-    # second line of defense if a validation check regresses and falls through anyway.
+    # module object devvm.py's own `cmd_up` resolves that name against at call time): devvm.py
+    # imports it via `from devvm_common import (...)`, after inserting its own directory onto
+    # sys.path — that binds the name into devvm's own module globals, not into some other
+    # `devvm_common` module object reached a different way, so patching anything on a
+    # `devvm_common` reached that other way would not touch what devvm.py's own `cmd_up`
+    # actually calls (the same dual-module-identity trap `_forbid_subprocess_and_vagrant`'s own
+    # docstring above describes for `run_vagrant`). run_vagrant and subprocess are also stubbed
+    # (see _forbid_subprocess_and_vagrant), as a second line of defense if a validation check
+    # regresses and falls through anyway.
 
     def setUp(self) -> None:
         _forbid_subprocess_and_vagrant(self)

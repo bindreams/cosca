@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import time
+from enum import Enum
 from pathlib import Path
 
 # Sibling-module import, working whether devvm.py (the only importer of this module) is
@@ -68,6 +69,20 @@ WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES = 24 * 60
 WINDOWS_REBOOT_DEADLINE_SECONDS = 3600
 
 
+class InteractiveLookupFailure(Enum):
+    """Why get_windows_interactive_username found no interactive logon — see that function's
+    own docstring. devvm.py's cmd_run reports a distinct message per case, rather than
+    inferring the reason by comparing its own clock against the deadline after the fact (which
+    both guesses at a cause run_vagrant_winrm_bounded already knows for certain, and races: a
+    WinRM call that answers just slowly enough can still land after `deadline` has passed even
+    though it wasn't the timeout that stopped it).
+    """
+
+    TIMED_OUT = "timed out waiting for a WinRM response"
+    WINRM_FAILED = "WinRM ran the query but it failed"
+    NO_SESSION = "WinRM answered: no interactive session exists yet"
+
+
 def run_windows_script(
     guest: Guest,
     script_path: Path,
@@ -108,9 +123,8 @@ def run_windows_script(
     upload destination is fixed, dedicated scratch space (C:\\Windows\\Temp), deliberately NOT
     under C:\\cosca-stage/C:\\cosca: windows-clean-stage.ps1 wipes the former and
     windows-mirror-tree.ps1 mirrors-with-deletion into the latter, and either could race an
-    upload landing there depending on which script is currently running. Env vars are still
-    passed via a `$env:NAME = 'value'; ` prefix ahead of the `-File` invocation, same
-    mechanism as before.
+    upload landing there depending on which script is currently running. Env vars are passed
+    via a `$env:NAME = 'value'; ` prefix ahead of the `-File` invocation.
 
     Returns the combined stdout/stderr so callers (e.g. windows-account-and-uac.ps1's
     DEVVM_REBOOT_REQUIRED marker) can scan it. Raises via `run_vagrant_streaming`'s own
@@ -218,14 +232,17 @@ def get_windows_autologon_configured(guest: Guest, deadline: float) -> tuple[boo
     return None, combined_output
 
 
-def get_windows_interactive_username(guest: Guest, deadline: float) -> tuple[str | None, str]:
+def get_windows_interactive_username(
+    guest: Guest, deadline: float
+) -> tuple[str | None, InteractiveLookupFailure | None, str]:
     """The domain-qualified name of the guest's autologon account ("vagrant") if it currently
-    has a live interactive logon anywhere, or None if it doesn't yet or WinRM isn't answering —
-    paired with the raw WinRM stdout+stderr, for the same reason as
-    get_windows_reboot_marker_present. Used by wait_for_windows_session to confirm autologon
-    has actually produced a real interactive session — the thing
-    windows-run-unelevated.ps1's scheduled task borrows a filtered token from — not just that
-    the kernel has finished booting.
+    has a live interactive logon anywhere, paired with `None` for the failure and the raw
+    WinRM stdout+stderr — or, if it doesn't yet or WinRM isn't answering, `None` for the
+    username paired with an InteractiveLookupFailure saying which of the three distinct cases
+    happened (see that enum's own docstring) and the raw output. Used by
+    wait_for_windows_session to confirm autologon has actually produced a real interactive
+    session — the thing windows-run-unelevated.ps1's scheduled task borrows a filtered token
+    from — not just that the kernel has finished booting.
 
     The owner of a running `explorer.exe` (the desktop shell itself) is used rather than
     `Win32_ComputerSystem.UserName` (goes blank the moment an RDP logon takes over the console
@@ -252,10 +269,14 @@ def get_windows_interactive_username(guest: Guest, deadline: float) -> tuple[str
     )
     result = run_vagrant_winrm_bounded(guest, cmd, deadline)
     combined_output = result.stdout + result.stderr
+    if result.timed_out:
+        return None, InteractiveLookupFailure.TIMED_OUT, combined_output
     if result.returncode != 0:
-        return None, combined_output
+        return None, InteractiveLookupFailure.WINRM_FAILED, combined_output
     output = result.stdout.strip()
-    return (output or None), combined_output
+    if not output:
+        return None, InteractiveLookupFailure.NO_SESSION, combined_output
+    return output, None, combined_output
 
 
 def _require_guest_running(guest: Guest, deadline: float, *, what: str, last_output: str = "") -> None:
@@ -306,7 +327,7 @@ def wait_for_windows_session(guest: Guest, deadline: float) -> None:
         _require_guest_running(
             guest, deadline, what="an interactive (autologon) session", last_output=last_output
         )
-        username, last_output = get_windows_interactive_username(guest, deadline)
+        username, _failure, last_output = get_windows_interactive_username(guest, deadline)
         if username is not None:
             return
 

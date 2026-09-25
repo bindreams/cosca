@@ -53,7 +53,7 @@
 # entirely — confirmed by reading vagrant's plugins/commands/winrm/command.rb and
 # communicators/winrm/{communicator,shell}.rb end to end, none of which reference
 # `wait_for_reboot` or `reboot_detect`. The one legitimate reboot this guest ever needs
-# (EnableLUA/autologon changes only take effect at the next boot) is now issued and waited on
+# (EnableLUA/autologon changes only take effect at the next boot) is issued and waited on
 # directly by devvm_windows.py's reboot_windows_guest_and_wait, not Vagrant's `reboot: true` shell-
 # provisioner capability, which carries the exact same fuse plus its own `sleep 10` poll loop.
 

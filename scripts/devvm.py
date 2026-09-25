@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import math
 import shlex
 import shutil
 import subprocess
@@ -52,7 +53,11 @@ from devvm_common import (  # noqa: E402
     run_vagrant,
     stage_dir,
 )
-from devvm_windows import get_windows_interactive_username, provision_windows_guest  # noqa: E402
+from devvm_windows import (  # noqa: E402
+    InteractiveLookupFailure,
+    get_windows_interactive_username,
+    provision_windows_guest,
+)
 
 # windows-run-unelevated.ps1 (the guest side of `devvm.py run --unelevated --timeout`) feeds
 # -TimeoutSeconds, converted to milliseconds via its own Get-RemainingMs, into .NET
@@ -440,7 +445,7 @@ def cmd_ssh(args: argparse.Namespace) -> None:
     # alternatives instead: `run` for a one-off command, or RDP for an interactive session (the
     # loopback-only forwarded port every Windows guest already exposes — see that guest's
     # Vagrantfile). Don't bake in a host assumption beyond this check itself: on an actual
-    # Windows host, `vagrant powershell` works fine and is used as before.
+    # Windows host, `vagrant powershell` works fine.
     if not sys.platform.startswith("win"):
         print(
             f"error: `devvm.py ssh {guest.name}` runs `vagrant powershell`, which only works "
@@ -513,19 +518,28 @@ def cmd_run(args: argparse.Namespace) -> None:
     # a token from (see that script's own $currentUser comment) — resolved here, once, instead
     # of the guest-side script re-running the identical WMI query a second time.
     #
-    # Bounded by `timeout` itself, not a short hardcoded window: this is a real `vagrant winrm`
-    # round-trip against a guest that can be under TCG emulation, where even a trivial command
-    # commonly takes on the order of 30s — a fixed 30s budget here previously made this lookup
-    # itself the thing that timed out, which then misreported as "no interactive logon" instead
-    # of a timeout.
-    interactive_deadline = time.monotonic() + timeout
-    interactive_user, interactive_output = get_windows_interactive_username(guest, interactive_deadline)
+    # `deadline` is ONE budget for this whole --unelevated call, computed once, up front, and
+    # shared by both the interactive-logon lookup below and the guest script's own
+    # -TimeoutSeconds further down: the guest script gets whatever's left of `timeout` after
+    # the lookup, not a fresh `timeout` of its own. Giving each step the full `timeout`
+    # independently would let wall time run to ~2x --timeout instead of ~1x, and — on a guest
+    # that can be under TCG emulation, where even a trivial WinRM round-trip commonly takes on
+    # the order of 30s — the lookup alone can plausibly consume most of a short --timeout.
+    deadline = time.monotonic() + timeout
+    interactive_user, failure, interactive_output = get_windows_interactive_username(guest, deadline)
     if interactive_user is None:
-        if time.monotonic() >= interactive_deadline:
+        if failure is InteractiveLookupFailure.TIMED_OUT:
             print(
                 f"error: timed out after {timeout}s waiting for WinRM to report whether "
                 "'vagrant' has an interactive (session 1, console or RDP-redirected) logon. "
                 "Try a longer --timeout.",
+                file=sys.stderr,
+            )
+        elif failure is InteractiveLookupFailure.WINRM_FAILED:
+            print(
+                "error: the WinRM query for an interactive logon on 'vagrant' failed (see "
+                "output below) — this is a real failure WinRM reported, not a timeout or an "
+                "absence of any session.",
                 file=sys.stderr,
             )
         else:
@@ -538,6 +552,17 @@ def cmd_run(args: argparse.Namespace) -> None:
         if interactive_output.strip():
             print(f"Last WinRM output:\n{interactive_output}", file=sys.stderr)
         sys.exit(1)
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        print(
+            f"error: timed out after {timeout}s — the interactive-logon lookup above used up "
+            "the whole --timeout budget, leaving none for the probe itself. Try a longer "
+            "--timeout.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    remaining_timeout_seconds = math.ceil(remaining)
 
     inner = build_run_inner(guest, cmd_args, direct=False)
     encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
@@ -567,7 +592,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         "$global:LASTEXITCODE = $null; "
         f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)} "
         f"-InteractiveUser {powershell_quote(interactive_user)} "
-        f"-TimeoutSeconds {timeout}; "
+        f"-TimeoutSeconds {remaining_timeout_seconds}; "
         "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }; "
         "exit [int](-not $?)"
     )
