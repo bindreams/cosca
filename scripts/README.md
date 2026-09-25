@@ -50,6 +50,18 @@ uv run scripts/devvm.py run linux-x64 -- cargo test --features pty
 Always `destroy` (or at least `halt`) guests you're done with — nothing here auto-expires a
 running VM.
 
+**On a Windows guest, `run`'s own exit code only distinguishes success from failure, not the
+command's actual exit code.** Both the direct and `--unelevated` routes go through
+`vagrant winrm -c`, which collapses any nonzero remote exit code to exactly `1` — the real
+value doesn't survive to `devvm.py`'s own process exit. When the command itself actually ran
+and returned nonzero, the guest-side script prints the real code (`devvm: command exited N`)
+into the output `devvm.py` relays before it exits 1 — look for that line rather than relying
+on the shell's `%ERRORLEVEL%`. That line is specific to a command that ran to completion: it
+does not appear when `--unelevated` itself fails before the command ever runs, or times out —
+those paths print their own diagnostic instead (a trap-caught error, or a "did not finish
+within its deadline" message). Linux guests use `vagrant ssh -c` instead, which forwards the
+remote command's real exit code as-is.
+
 ## Guests
 
 | Guest           | Box                                    | Provider arch | Host arch it's native on |
@@ -86,20 +98,20 @@ qcow2" example) — this tool has no automation for that conversion.
 
 **Licensing.** `stromweld/windows-10` is a "vanilla Windows 10" box built with
 [Bento](https://github.com/chef/bento) from Microsoft's free evaluation media. Evaluation
-Windows installs activate on a timer and _expire_ (Windows 10 Enterprise eval is commonly
-90 days from the image's build date) — and expiry is not benign: measured directly
-(2026-09-24), once the eval period elapses `wlms.exe` (Windows License Manager Service,
-running as `NT AUTHORITY\SYSTEM`) issues a real ACPI shutdown on its own (guest System-log
-event 1074, "The license period for this installation of Windows has expired. The
-operating system is shutting down."), which takes the whole QEMU process down with it —
-mid-provisioning, if that's when it fires, with no crash report on the host side.
+Windows installs activate on a timer and _expire_ (Windows 10 Enterprise eval is commonly 90
+days from the image's build date) — and expiry is not benign: once the eval period elapses,
+`wlms.exe` (Windows License Manager Service, running as `NT AUTHORITY\SYSTEM`) issues a real
+ACPI shutdown on its own (guest System-log event 1074, "The license period for this
+installation of Windows has expired. The operating system is shutting down."), which takes
+the whole QEMU process down with it — mid-provisioning, if that's when it fires, with no
+crash report on the host side.
 
-`devvm.py up` guards against this itself: on every `up` (not on `sync` or a plain
-`provision` against an existing guest, which never reach this check — evaluation rearms are
-a limited, consumable resource, not something to spend every pass), before any other
-provisioning step, it reads
-the guest's license state via WMI (`SoftwareLicensingProduct.LicenseStatus`/
-`GracePeriodRemaining`, `SoftwareLicensingService.RemainingWindowsReArmCount` —
+`devvm.py up` guards against this itself: on every `up` (not on `sync` or a plain `provision`
+against an existing guest, which never reach this check — evaluation rearms are a limited,
+consumable resource, not something to spend every pass), before any other provisioning step,
+it reads the guest's license state via WMI
+(`SoftwareLicensingProduct.LicenseStatus`/`GracePeriodRemaining`,
+`SoftwareLicensingService.RemainingWindowsReArmCount` —
 `get_windows_license_state`/`ensure_windows_license_current` in `scripts/devvm.py`; no
 parsing of `slmgr`'s free-text output). If the license is expired or within a day of
 expiring, it runs `slmgr /rearm` and reboots (via `reboot_windows_guest_and_wait`) for the
@@ -124,7 +136,7 @@ reboot pending?" test (`reboot_detect.ps1`, vendored inside the `vagrant` gem) d
 check — it _schedules a real forced restart_ (`shutdown -f -r -t 60`) and then, if nothing was
 already pending, immediately cancels it (`shutdown -a`). That's a genuine, if normally
 self-cancelled, 60-second restart fuse on every ordinary `up`/`sync`, once per shell
-provisioner that used to be declared here. Measured directly (2026-09-24): every
+provisioner that used to be declared here. Every
 `vagrant provision` against this guest produced a matching guest System-log event 1074
 ("wininit.exe has initiated restart") followed by event 1075 ("aborted") — the owner watching
 the guest's console twice saw the real "you're about to be signed out" sign-off splash flash
@@ -134,15 +146,21 @@ never reaches that capability — confirmed by reading vagrant's
 `plugins/commands/winrm/command.rb` and `plugins/communicators/winrm/{communicator,shell}.rb`
 end to end — so driving each script that way removes the fuse entirely. The one legitimate
 reboot this guest ever needs (`EnableLUA`/autologon changes only take effect at the next boot)
-is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py`
-(a real `shutdown /r`, then a bounded wait for the guest to report a new boot time and then a
-real interactive/autologon session on top of it — no `sleep`, no arbitrarily-chosen poll
-interval, just an immediate retry, bounded by `vagrant status` failing fast the moment the
-guest stops running and by one overall wall-clock deadline reusing the Vagrantfile's own
-3600s `boot_timeout`/`winrm.timeout`), not Vagrant's own `reboot-if-needed`/`Reboot.reboot`
-capability, which carries the exact same fuse plus its own `sleep 10` wait loop. `vagrant
-winrm -c` itself has no readiness wait of its own (same source read as above), which is why
-this wait loop needs its own deadline rather than relying on one baked into `vagrant winrm`.
+is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py` (a
+real `shutdown /r`, then a bounded wait for a volatile registry marker — set before the
+reboot, guaranteed by Windows not to survive one — to clear). Separately,
+`provision_windows_guest` calls `wait_for_windows_session` once, unconditionally, at the end
+of provisioning, whenever `get_windows_autologon_configured` reports autologon is set — not
+just right after a reboot that configured it, but also on a guest an earlier `up` already
+configured, where this `up`'s own reboot decision (if any) has nothing to do with whether a
+session shows up. Both waits: no `sleep`, no arbitrarily-chosen poll interval, just an
+immediate retry, bounded by `vagrant status` failing fast the moment the guest stops running
+and by one wall-clock deadline reusing the Vagrantfile's own 3600s
+`boot_timeout`/`winrm.timeout`. Neither goes through Vagrant's own
+`reboot-if-needed`/`Reboot.reboot` capability, which carries the exact same fuse plus its own
+`sleep 10` wait loop. `vagrant winrm -c` itself has no readiness wait of its own (same source
+read as above), which is why these wait loops need their own deadline rather than relying on
+one baked into `vagrant winrm`.
 
 Whether this fuse explains any _specific_ historical "QEMU just disappeared" failure during
 `devvm.py run windows-x64 --unelevated` is **inferred, not measured**: `run`'s own code path
@@ -210,11 +228,17 @@ plain `2>` alone) or `-OutputFormat`, and treats a `#< CLIXML` prefix (written b
 non-interactive powershell.exe with redirected output) as serialized records to deserialize —
 throwing `Cannot process the XML from the 'Error' stream of '...': Data at the root level is
 invalid` if what follows isn't well-formed CLIXML. `windows-run-unelevated.ps1` avoids this by
-running its direct child via `Start-Process -RedirectStandardOutput ... -RedirectStandardError
-...`: those are real OS-level file handles, so PowerShell's stream reader never sees the
-stream. If you write your own variant of this wrapper, or invoke `powershell.exe`/`pwsh.exe` as
-a direct child of another PowerShell process elsewhere in this tooling, use the same
-`Start-Process` redirection rather than any PowerShell redirection operator.
+running the caller's command as a `cmd.exe` child (via
+`[System.Diagnostics.Process]::Start`, not PowerShell's `Start-Process` —
+`Start-Process -PassThru`, without `-Wait`, leaves `.ExitCode` unreadable even after
+`WaitForExit()` returns) with `cmd.exe`'s own `1>`/`2>` redirection to files: those are real
+OS-level file handles `cmd.exe` opens itself, so PowerShell's stream reader never sees the
+stream. The actual command text is written to a file first and run via `-File`, not passed
+inline on `cmd.exe`'s command line — `cmd.exe` caps its own command line at roughly 8191
+characters, well under what a longer command can reach once encoded. If you write your own
+variant of this wrapper, or invoke `powershell.exe`/`pwsh.exe` as a direct child of another
+PowerShell process elsewhere in this tooling, use the same `cmd.exe`-redirection-to-a-file
+approach rather than a PowerShell redirection operator or `Start-Process`.
 
 If a probe genuinely needs a human (or UI automation) to see and answer the secure-desktop
 prompt itself — rather than just observing its outcome — give the guest a display instead:
@@ -325,16 +349,15 @@ vagrant-qemu 0.6.3 hardcodes the SSH forward with no `host_ip` seam a Vagrantfil
 all, so `host_ip: "127.0.0.1"` in the Vagrantfile alone doesn't cover SSH.
 
 Because this reaches into a private method by name, it's pinned to exactly vagrant-qemu
-`0.6.3` (checked inside the patched `execute` itself, so only starting a new QEMU process
-— `vagrant up`/`vagrant reload` when the guest isn't already running — or an `export`/
-`package` `qemu-img` call refuses to run against any other installed version; `vagrant
-provision` on its own never reaches `Driver#execute` at all, running or not — confirmed by
-reading vagrant-qemu's `action.rb`, whose standalone `action_provision` goes straight to the
+`0.6.3` (checked inside the patched `execute` itself, so only starting a new QEMU process —
+`vagrant up`/`vagrant reload` when the guest isn't already running — or an `export`/`package`
+`qemu-img` call refuses to run against any other installed version; `vagrant provision` on
+its own never reaches `Driver#execute` at all, running or not — confirmed by reading
+vagrant-qemu's `action.rb`, whose standalone `action_provision` goes straight to the
 `Provision` action and never touches `StartInstance` — and `destroy`/`halt` don't either, so
 neither can ever leave a running QEMU process unstoppable after a plugin upgrade) and fails
-closed with a hard error if a rewritten forward is ever
-found still bound to a non-loopback address, rather than silently starting QEMU with a port
-exposed to the LAN.
+closed with a hard error if a rewritten forward is ever found still bound to a non-loopback
+address, rather than silently starting QEMU with a port exposed to the LAN.
 
 ## Known host issue: forwarded-port collisions on some macOS hosts
 

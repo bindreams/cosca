@@ -1,10 +1,12 @@
 """Host-side unit tests for devvm.py's pure/host-only logic.
 
-Deliberately small (per the round-2 review: "the owner said not to go crazy") — covers
-stage_tree's H1 (stale files not removed) and M6 (tracked-but-missing file crashes) fixes,
-the run-argv-splitting function, and powershell_quote. Everything else in devvm.py either
-shells out to vagrant/WinRM (only meaningfully testable inside a real guest, see
-scripts/README.md) or is a thin argparse/subprocess wrapper not worth a host-side test.
+Deliberately small, by design, not by omission — covers stage_tree's two fixed bugs (stale
+files not removed on re-stage; a tracked-but-since-deleted file crashing the stage instead of
+being skipped), the run-argv-splitting function, powershell_quote, and the diagnostic-route
+split (_diag_write/build_run_inner) that picks Write-Host vs [Console]::Error.WriteLine
+depending on whether WinRM has a host attached. Everything else in devvm.py either shells out
+to vagrant/WinRM (only meaningfully testable inside a real guest, see scripts/README.md) or is
+a thin argparse/subprocess wrapper not worth a host-side test.
 
 Run with: uv run python -m unittest scripts.devvm_test -v
 
@@ -23,6 +25,9 @@ from pathlib import Path
 from scripts import devvm
 
 TEST_GUEST = devvm.Guest(name="devvm-test-guest", communicator="ssh", box="unused/for-tests")
+TEST_WINDOWS_GUEST = devvm.Guest(
+    name="devvm-test-windows-guest", communicator="winrm", box="unused/for-tests", tree_path_posix="C:/cosca"
+)
 
 
 def _run_git(repo: Path, *args: str) -> None:
@@ -128,6 +133,47 @@ class PowershellQuoteTests(unittest.TestCase):
     def test_embedded_single_quote_is_doubled(self) -> None:
         quoted = devvm.powershell_quote("it's")
         self.assertIn("it''s", quoted)
+
+
+class DiagWriteTests(unittest.TestCase):
+    def test_direct_route_uses_write_host(self) -> None:
+        stmt = devvm._diag_write(True, '"devvm: $_"')
+        self.assertEqual(stmt, 'Write-Host "devvm: $_"')
+
+    def test_nested_route_uses_console_error_writeline(self) -> None:
+        stmt = devvm._diag_write(False, '"devvm: $_"')
+        self.assertEqual(stmt, '[Console]::Error.WriteLine("devvm: $_")')
+
+
+class BuildRunInnerTests(unittest.TestCase):
+    def test_direct_route_diagnostics_use_write_host_only(self) -> None:
+        inner = devvm.build_run_inner(TEST_WINDOWS_GUEST, ["cargo", "test"], direct=True)
+        self.assertIn("Write-Host", inner)
+        self.assertNotIn("[Console]::Error.WriteLine", inner)
+
+    def test_nested_route_diagnostics_use_console_error_only(self) -> None:
+        inner = devvm.build_run_inner(TEST_WINDOWS_GUEST, ["cargo", "test"], direct=False)
+        self.assertIn("[Console]::Error.WriteLine", inner)
+        self.assertNotIn("Write-Host", inner)
+
+    def test_command_tokens_are_individually_quoted(self) -> None:
+        inner = devvm.build_run_inner(TEST_WINDOWS_GUEST, ["cargo", "test", "it's a test"], direct=True)
+        self.assertIn("& 'cargo' 'test' 'it''s a test'", inner)
+
+    def test_exit_code_prefers_lastexitcode_falls_back_to_dollar_question(self) -> None:
+        # Checks the generated structure, not an exact verbatim string: this only confirms the
+        # PowerShell text sets up the LASTEXITCODE-preferred/$?-fallback decision and exits on
+        # $__devvmExit, not that PowerShell actually evaluates it as intended — no PowerShell
+        # engine runs in this test. The $?-survives-the-if-condition assumption this logic
+        # relies on is live-verified on the real guest instead (see build_run_inner's
+        # docstring): `run windows-x64 -- Get-Item C:\nope` exercises exactly this
+        # no-$LASTEXITCODE/$?-fallback branch and exits nonzero end to end.
+        inner = devvm.build_run_inner(TEST_WINDOWS_GUEST, ["cargo", "test"], direct=True)
+        self.assertIn("$null -ne $LASTEXITCODE", inner)
+        self.assertIn("$__devvmExit = $LASTEXITCODE", inner)
+        self.assertIn("$__devvmExit = [int](-not $?)", inner)
+        self.assertIn("$global:LASTEXITCODE = $null", inner)
+        self.assertTrue(inner.endswith("exit $__devvmExit"))
 
 
 if __name__ == "__main__":
