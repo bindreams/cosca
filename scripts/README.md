@@ -151,9 +151,9 @@ reboot this guest ever needs (`EnableLUA`/autologon changes only take effect at 
 is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py` (a
 real `shutdown /r`, then a bounded wait for a volatile registry marker — set before the
 reboot, guaranteed by Windows not to survive one — to clear). Separately,
-`provision_windows_guest` calls `wait_for_windows_session` once, unconditionally, at the end
-of provisioning, whenever `get_windows_autologon_configured` reports autologon is set — not
-just right after a reboot that configured it, but also on a guest an earlier `up` already
+`provision_windows_guest` calls `wait_for_windows_session` conditionally — only when
+`get_windows_autologon_configured` reports autologon is set — once, at the end of provisioning:
+not just right after a reboot that configured it, but also on a guest an earlier `up` already
 configured, where this `up`'s own reboot decision (if any) has nothing to do with whether a
 session shows up. Both waits: no `sleep`, no arbitrarily-chosen poll interval, just an
 immediate retry, bounded by `vagrant status` failing fast the moment the guest stops running
@@ -245,9 +245,11 @@ guest is the other option if a window on this Mac specifically isn't what's need
 
 RDP-ing into `vagrant` takes over its console (session 1) logon rather than opening a second,
 independent one — the account stays genuinely logged in, but `sync` and `run --unelevated`
-detect that logon by its `Win32_LogonSession`/`explorer.exe` ownership, not
-`Win32_ComputerSystem.UserName` (which goes blank the moment RDP takes the console over), so
-both keep working through an active RDP session. If `run --unelevated`'s scheduled task still
+detect that logon by its running `explorer.exe`'s ownership, not `Win32_ComputerSystem.UserName`
+(which goes blank the moment RDP takes the console over) and not `Win32_LoggedOnUser`/
+`Win32_LogonSession` (live-verified stale after a genuine sign-out — see
+`get_windows_interactive_username`'s docstring), so both keep working through an active RDP
+session. If `run --unelevated`'s scheduled task still
 fails to run — the account is logged on but its session is _disconnected_, not merely
 redirected, e.g. an RDP client that was closed without logging off — the error names this and
 gives the recovery: from inside the guest, `query session` lists session IDs and `tscon <id>

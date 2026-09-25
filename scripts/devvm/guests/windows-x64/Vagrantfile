@@ -3,8 +3,7 @@
 #
 # devvm guest: windows-x64 — the production consent route (ShellExecuteExW("runas") from an
 # unelevated process). Cross-arch-emulated (TCG) on an Apple Silicon host, so first boot of
-# a fresh install can be very slow; see scripts/README.md#windows-guests for measured
-# timings and the "too slow" escape hatch.
+# a fresh install can be very slow; see scripts/README.md#windows-guests for measured timings.
 #
 # Not meant to be run directly with `vagrant up` in this directory — use
 # `scripts/devvm.py up windows-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_STAGE_DIR so

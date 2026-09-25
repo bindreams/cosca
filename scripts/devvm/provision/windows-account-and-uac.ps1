@@ -22,8 +22,8 @@
 # why). It does NOT re-run this script afterward to re-verify the settings — the write above
 # already happened. Confirming a real interactive session exists on top of the reboot is a
 # separate concern: provision_windows_guest calls wait_for_windows_session for that,
-# unconditionally, once, at the end of its own flow — not something reboot_windows_guest_and_wait
-# itself does.
+# conditionally — only when get_windows_autologon_configured says autologon is set — once, at
+# the end of its own flow — not something reboot_windows_guest_and_wait itself does.
 
 $ErrorActionPreference = "Stop"
 $policyKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
