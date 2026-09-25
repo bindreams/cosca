@@ -206,8 +206,11 @@ enum CallState {
     /// "nothing exists yet" (`Calling`) apart from "a process exists, and only this worker thread
     /// can reap it, right now." A reaper's answer to THIS state is to join the worker instead of
     /// returning early — see `shell_execute_bounded`'s `Timeout` arm — and that join is bounded by
-    /// the worker's own remaining work (a terminate, then a wait that runs only if the terminate
-    /// already succeeded), never by an additional timer of its own.
+    /// the worker's own remaining, real work, never by an additional timer of its own: a terminate,
+    /// then a wait gated on that terminate having succeeded, a `CloseHandle`, the final state write,
+    /// this thread's own `CoUninitialize` (`in_com_apartment` runs the whole call, uninit included,
+    /// on this same worker thread — see that function's doc), sending the result back over the
+    /// channel, and the thread's own teardown as it exits.
     HeldNoDuplicate,
     /// `ShellExecuteExW` returned; the `ChildHandle` says what (if anything) a bound-trip reaper can
     /// act on.
@@ -621,15 +624,13 @@ pub(crate) const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
 /// duplicated for this reaper (`CallState::HeldNoDuplicate`) is different again: only the worker
 /// thread holds `info.hProcess` at all, so this function JOINS the worker instead of returning early
 /// — see that variant's doc and the `Timeout` arm below. That join is bounded by the worker's own
-/// remaining work (a terminate, then a wait that runs only if the terminate already succeeded),
-/// never by a timer of its own.
+/// remaining, real work — see `CallState::HeldNoDuplicate`'s doc for the full list — never by a
+/// timer of its own.
 ///
-/// What is NOT closed: if the outer bound trips while `f`'s state is still `CallState::Calling` —
-/// narrower now than before `HeldNoDuplicate` existed, since a `DuplicateHandle` failure no longer
-/// lingers here — nothing has been published here yet for either side to act on — see that
-/// variant's doc for the two ways a live process can already exist at that point even though
-/// nothing has been published — and Win32 gives this process no way to cancel a call already in
-/// progress. This function's own
+/// What is NOT closed: if the outer bound trips while `f`'s state is still `CallState::Calling`,
+/// nothing has been published here yet for either side to act on — see that variant's doc for the
+/// two ways a live process can already exist at that point even though nothing has been published —
+/// and Win32 gives this process no way to cancel a call already in progress. This function's own
 /// thread returns an `Err` here regardless, but the launched process (if one exists) is reaped only
 /// by the worker thread, on its own schedule, after this function has already returned. Separately,
 /// and regardless of whether the outer bound ever trips: a process the shell handed off to with NO
@@ -686,13 +687,29 @@ where
                 // orphaning window this state exists to close: if the caller then panics on this
                 // function's `Err`, `cargo nextest` tearing this OS process down could kill the
                 // worker mid-`TerminateProcess`. Join it instead — this cannot itself hang, since
-                // the worker's only remaining path is a terminate (which does not block) followed by
-                // a wait that runs only if that terminate already succeeded, a real kernel outcome,
-                // not a race against a second clock.
+                // everything left on the worker's path is real, already-in-flight work, not a wait
+                // on anything external: a terminate (which does not block), a wait gated on that
+                // terminate having succeeded, a `CloseHandle`, the final state write, this thread's
+                // own `CoUninitialize` (`in_com_apartment` runs the whole call, uninit included, on
+                // this same worker thread), sending the result back over `tx`, and the thread's own
+                // teardown as it exits.
                 return match worker.join() {
                     Err(payload) => std::panic::resume_unwind(payload),
                     Ok(()) => match rx.try_recv() {
-                        Ok(result) => result,
+                        // The `DuplicateHandle`-failure branch this state came from always returns
+                        // `Err` (see `shell_execute_in_apartment`) — wrap it so the message says what
+                        // actually happened: the OUTER bound tripped, not just that the worker had
+                        // its own trouble. `call_state_description` reused here, rather than a second
+                        // hand-written description, is what makes `CallState::HeldNoDuplicate`'s own
+                        // arm of that function reachable.
+                        Ok(result) => result.map_err(|worker_err| {
+                            format!(
+                                "ShellExecuteExW-based call did not return within \
+                                 {SHELL_EXECUTE_BOUND:?} ({}); the worker's own error, after \
+                                 joining it to let it finish reaping: {worker_err}",
+                                call_state_description(&prior)
+                            )
+                        }),
                         Err(_) => panic!(
                             "PROBE shell-execute: the worker thread ended without panicking and \
                              without sending a result after a HeldNoDuplicate join — this should be \
