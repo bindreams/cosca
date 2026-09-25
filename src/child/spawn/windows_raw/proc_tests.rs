@@ -80,3 +80,19 @@ fn a_refused_cwd_is_reported_as_its_win32_code() {
     assert_eq!(err.raw_os_error(), Some(267), "{err:?}");
     assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err:?}");
 }
+
+#[test]
+fn terminate_reads_access_denied_as_exit_underway() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE};
+    let denied = windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    assert!(matches!(
+        super::classify_terminate(Err(denied)),
+        super::Terminated::ExitUnderway
+    ));
+    let invalid = windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0));
+    assert!(matches!(
+        super::classify_terminate(Err(invalid)),
+        super::Terminated::Failed(_)
+    ));
+    assert!(matches!(super::classify_terminate(Ok(())), super::Terminated::Yes));
+}

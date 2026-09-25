@@ -71,13 +71,13 @@ impl Child {
     /// mechanism that addresses no pid keeps its own answer: an uncontained Windows child is
     /// `Unsupported` before and after the reap alike, because nothing was ever going to be sent
     /// to a pid in the first place.
-    pub fn terminate(&self) -> Result<(), Error> {
+    pub fn terminate(&self) -> Result<(), crate::tokio::Error> {
         let mechanism = self.graceful_mechanism();
         #[cfg(windows)]
         if mechanism.addresses_a_bare_pid() && !self.proc().pins_pid() {
-            return Err(self.unpinned_pid_refusal("terminate"));
+            return Err(self.unpinned_pid_refusal("terminate").into());
         }
-        crate::graceful::signal(mechanism, self.id())
+        crate::graceful::signal(mechanism, self.id()).map_err(Into::into)
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -123,7 +123,7 @@ impl Child {
     /// Needs a runtime with the IO **and** time drivers enabled (the `#[tokio::main]` /
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
-    pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
+    pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, crate::tokio::Error> {
         self.terminate()?;
         // A watch failure must not strand the child between the soft signal and the escalation —
         // kill and reap still run (grace unobservable => escalate now); the watch error surfaces
@@ -243,13 +243,13 @@ impl Child {
     /// than returning a typed error. On Windows the grace-wait runs on the blocking pool:
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
-    pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
+    pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, crate::tokio::Error> {
         // terminate_tree's own require_contained guard fires before any signal, so an
         // uncontained child errors up front.
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {
             fault::Forced::None => self.terminate_tree(),
-            kind => Err(fault::forced_terminate_error(kind)),
+            kind => Err(fault::forced_terminate_error(kind).into()),
         };
         #[cfg(not(test))]
         let term_result = self.terminate_tree();
@@ -330,7 +330,7 @@ impl Child {
             // never entered at all.
             #[cfg(test)]
             let sweep_result = if fault::take_force_kill_tree_error() {
-                Err(fault::forced_kill_tree_error())
+                Err(fault::forced_kill_tree_error().into())
             } else {
                 self.kill_tree()
             };
@@ -354,7 +354,7 @@ impl Child {
         }
         let status = self.wait().await?;
         if let Some(e) = watch_err {
-            return Err(e);
+            return Err(e.into());
         }
         // The tree is confirmed clear here — either the drain watch observed the whole tree
         // directly (`drained`), or the sweep just returned `Ok`: either way, positive,

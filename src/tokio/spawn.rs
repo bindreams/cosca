@@ -14,6 +14,7 @@ use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
 
 use super::child::{reap_now, Child, ProcSource};
+use crate::child::spawn::unkillable;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let child = spawn_uncommitted(cmd)?;
@@ -80,7 +81,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 };
                 // Set the report BEFORE handling the deferred password: a cleanup kill() in the
                 // write-failure path must see the elevated state so an EPERM maps to the typed
-                // Unkillable rather than leaking a raw Io.
+                // `ElevationErrorKind::Unkillable` rather than leaking a raw Io.
                 child.set_elevation(rw.report);
                 let written = rw.password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
                 return finish_elevated(child, written);
@@ -262,7 +263,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (mut prepared, mut child) = {
+    let (mut prepared, child) = {
         let _guard = crate::child::spawn::spawn_lock();
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
@@ -297,15 +298,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         let c = match tcmd.spawn().map_err(Error::Io) {
             Ok(c) => c,
             Err(e) => {
-                warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
-                return Err(e);
+                return Err(abandoned(prepared.abandon_before_verdict(), e));
             }
         };
         drop(tcmd);
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (mut prepared, mut child) = {
+    let (mut prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -371,8 +371,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 Err(e) => {
                     // Whatever tokio did with the child, the leaf's exchange says what became of
                     // it; without a leaf, nothing can tell.
-                    warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
-                    return Err(e);
+                    return Err(abandoned(prepared.abandon_before_verdict(), e));
                 }
             }
         };
@@ -383,16 +382,35 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // park and reap the child in between. Even if the child has already exited, tokio's held handle
     // pins the pid against reuse, so `ProcessId::of` still resolves it (as the sync spawn documents).
     let pid = child.id().expect("a freshly spawned, un-awaited tokio child has a pid");
+    // Until `attach_or_fault` succeeds, a child created `CREATE_SUSPENDED` is still suspended —
+    // on both teardown arms below, since identity is read before the attach.
+    #[cfg(windows)]
+    let suspended = prepared.created_suspended();
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process.
         other => {
             // The verdict first: tokio owns this child, so the leaf must not answer for it as an
-            // abandoned spawn's, reaping a pid tokio's own reap is about to.
-            prepared.settle_verdict(pid);
-            reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            // abandoned spawn's, reaping a pid tokio's own reap is about to. Retained (not
+            // dropped) when the verdict says the child was actually placed: otherwise `prepared`
+            // dropping here would cgroup.kill and drain-wait the tree before this error even
+            // returns — the caller's own `Unreaped` decides that instead (mirrors the
+            // attach-failure arm below, and the elevated path).
+            let attached = prepared.settle_verdict(pid);
+            // Never awaited — an already-Done child is impossible.
+            let handed_back = reap_now(
+                child,
+                pid,
+                false,
+                #[cfg(windows)]
+                suspended,
+                attached,
+            );
+            return Err(unkillable(
+                crate::child::spawn::spawn_identity_error(other),
+                handed_back,
+            ));
         }
     };
 
@@ -411,8 +429,17 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
-            reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
-            return Err(e);
+            // Never awaited — an already-Done child is impossible.
+            let handed_back = reap_now(
+                child,
+                pid,
+                false,
+                #[cfg(windows)]
+                suspended,
+                // The attach itself failed: nothing was ever attached to retain.
+                None,
+            );
+            return Err(unkillable(e, handed_back));
         }
     };
 
@@ -436,29 +463,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     Ok(child)
 }
 
-/// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking
-/// (`try_wait` cannot reap a just-killed child, so it would leak a zombie), and waits only on
-/// this kill.
+/// Async twin of the sync `finish_elevated` (see there).
 #[cfg(unix)]
-pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
-    let Err(write_err) = written else {
-        return Ok(child);
-    };
-    let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
-    let root_note = match child.kill() {
-        Ok(()) => {
-            child.wait_and_reap_blocking();
-            "the elevated child was terminated".to_string()
-        }
-        Err(e) => {
-            let _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
-        }
-    };
-    Err(Error::Elevation {
-        kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {root_note}{}", crate::child::spawn::tree_note(tree)),
-    })
+pub(super) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
+    match written {
+        Ok(()) => Ok(child),
+        Err(write_err) => Err(elevated_write_failed(child, write_err)),
+    }
 }
 
 #[cfg(windows)]
@@ -469,22 +480,27 @@ pub(crate) mod windows_raw;
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
 
-/// Say what a failed tokio spawn may have left behind of its child: nothing, a zombie nothing
-/// reaps, or a process nothing can reach.
+/// The error for a failed tokio spawn, given what it may have left behind of its child: nothing;
+/// a child that refused the kill, handed back in [`Error::Unreaped`]; a zombie nothing
+/// reaps; or a process nothing can reach.
 ///
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
 /// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
-/// "may". Each is once per errno at `warn`, then at `debug`, as a degraded containment is
-/// reported.
-fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &Error) {
+/// "may". The last two are warned about once per errno at `warn`, then at `debug`, as a degraded
+/// containment is reported.
+fn abandoned(child: crate::containment::AbandonedChild, error: Error) -> Error {
     use crate::containment::AbandonedChild;
 
     type Warned = std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>;
     static UNREAPED: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
     static UNREACHABLE: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
     let (warned, consequence) = match child {
-        AbandonedChild::Ended => return,
+        AbandonedChild::Ended => return error,
+        // Out of cosca's reach, but not the caller's: handed back.
+        AbandonedChild::HandedBack { kill, child } => {
+            return unkillable(error, Some((kill, child)));
+        }
         AbandonedChild::MaybeUnreaped => (
             &UNREAPED,
             "the child exits before `exec` but was left unreaped: it never reached the point where it \
@@ -496,7 +512,57 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
              without the child's pid",
         ),
     };
-    warn_after_fork_into(warned, error, consequence);
+    warn_after_fork_into(warned, &error, consequence);
+    error
+}
+
+/// The async twin of `crate::child::spawn::elevated_write_failed`: its tree is killed through its
+/// containment, then its root by its own handle; a root the kill cannot end is handed back in
+/// [`Error::Unreaped`]. The root's reap is blocking (`try_wait` cannot reap a just-killed child,
+/// so it would leak a zombie), and waits only on this kill.
+#[cfg(unix)]
+pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error {
+    use crate::child::unreaped::{kill_error_to_io, Checked};
+    let tree = crate::child::spawn::tree_note(child.containment().can_teardown().then(|| child.kill_tree_members()));
+    let auth_failed = |note: String| Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: format!("{write_err}; {note}{tree}"),
+    };
+    #[cfg(test)]
+    let killed = match crate::child::spawn::fault::take_force_kill_failure() {
+        Some((marker, kind)) => Err(Error::Io(std::io::Error::new(kind, marker))),
+        None => child.kill(),
+    };
+    #[cfg(not(test))]
+    let killed = child.kill();
+    let kill = match killed {
+        // SIGKILL is uncatchable, so this wait — which never kills again — is bounded.
+        Ok(()) => {
+            child.wait_and_reap_blocking();
+            return auth_failed("the elevated child was terminated".into());
+        }
+        Err(e) => kill_error_to_io(e),
+    };
+    let (held, retained) = child.into_unreaped_parts();
+    match held.check() {
+        Checked::Running(held) => Error::Unreaped {
+            error: Box::new(auth_failed(
+                "the elevated child could not be terminated and is handed back".into(),
+            )),
+            kill,
+            child: crate::Unreaped::with_retained(held, Some(retained)),
+        },
+        Checked::Reaped => auth_failed("the elevated child had already exited".into()),
+        Checked::Uncertain(e) => {
+            // The pid may already name another process: what this spawn retained is given up
+            // disarmed, not left to kill through a tree that may no longer be its own.
+            retained.attached.disarm();
+            auth_failed(format!(
+                "the elevated child could not be terminated ({kill}), and its ownership is uncertain ({e}); \
+                 it was released"
+            ))
+        }
+    }
 }
 
 /// Say that if the failed spawn forked, `consequence` — against an explicit "already warned" set,

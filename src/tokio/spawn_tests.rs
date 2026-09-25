@@ -108,73 +108,6 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
     }
 }
 
-/// A failed kill in the async spawn's error teardown is not waited on, and EPERM — a setuid
-/// child refusing SIGKILL — is not asserted, because it is reachable without a bug; any other
-/// kind is. The child is left alive, blocked on stdin, and exits when the failed spawn drops the
-/// pipe's parent end; tokio's own `Child` drop hands it to the runtime's orphan reaper, which the
-/// test drives until the child is reaped.
-#[test]
-fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
-    use crate::stdio::Stdio;
-    use std::io::ErrorKind;
-    for (kind, asserted) in [(ErrorKind::PermissionDenied, false), (ErrorKind::Other, true)] {
-        let runtime = ::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(async {
-                let mut cmd = crate::tokio::Command::new();
-                #[cfg(unix)]
-                cmd.args(["cat"]);
-                #[cfg(windows)]
-                cmd.args(["findstr", "x"]);
-                cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
-                fault::set_force_attach_failure(true);
-                fault::set_force_kill_failure_leaving_child_alive_as("cosca-async-kill-fail-5d2c", kind);
-                let err = cmd.spawn().err();
-                fault::set_force_attach_failure(false);
-                err
-            })
-        }));
-        assert_eq!(
-            fault::take_force_kill_failure(),
-            None,
-            "{kind:?}: the kill failure must be consumed"
-        );
-        assert_eq!(
-            outcome.is_err(),
-            asserted && cfg!(debug_assertions),
-            "{kind:?}: the debug_assert fires in exactly the builds that keep it, and never for EPERM"
-        );
-        if let Ok(err) = outcome {
-            err.expect("the forced arm must fail the spawn");
-        }
-        let captured = fault::take_captured().expect("seam captured the child's identity");
-        drive_until_reaped(&runtime, &captured);
-        fault::assert_child_reaped(captured);
-    }
-}
-
-/// Turn `runtime`'s driver, whose every turn reaps tokio's exited orphans, until the child
-/// `captured` names is reaped (Windows: has exited). Ends on the child's own exit, and never
-/// before: no interval, no bound.
-fn drive_until_reaped(
-    runtime: &::tokio::runtime::Runtime,
-    captured: &crate::identity::Resolved<crate::identity::ProcessId>,
-) {
-    let crate::identity::Resolved::Found(id) = captured else {
-        panic!("the seam must capture a resolved identity, got {captured:?}");
-    };
-    #[cfg(unix)]
-    let pending = || id.exists() == crate::identity::Existence::Present;
-    #[cfg(windows)]
-    let pending = || id.is_alive() != crate::identity::Liveness::Dead;
-    while pending() {
-        runtime.block_on(::tokio::task::yield_now());
-    }
-}
-
 /// A tokio spawn that fails with no cgroup leaf to kill through says a forked child may have been
 /// left running out of reach — tokio can drop a child it forked and return no pid. Here the seam
 /// forces that failure under a tree walk, which holds no leaf.
@@ -242,64 +175,6 @@ fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
     )
 }
 
-/// A post-fork tokio failure ends its child whether or not the child could send a pidfd — denied
-/// here in the child through an inherited seam — and whether or not it entered its leaf: cosca
-/// kills and reaps it by its checked pid, and warns about nothing. Only a child that refuses the
-/// kill and is outside its leaf is out of reach, and warned about; it is reaped once it exits.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() {
-    use crate::containment::cgroup::fault as cgroup_fault;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
-    crate::log_capture::install();
-    for (placed, refuses) in [(true, false), (false, false), (false, true)] {
-        let mut cmd = blocker();
-        cmd.contain();
-        let mark = crate::log_capture::mark();
-        // Armed in this thread, inherited by the child it forks, which takes them.
-        cgroup_fault::set_force_child_pidfd_failure(true);
-        if !placed {
-            cgroup_fault::set_force_placement_write_result(0);
-        }
-        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
-        if refuses {
-            cgroup_fault::set_force_child_kill_denied(true);
-            cgroup_fault::set_background_reap_notifier(reaped_tx);
-        }
-        fault::set_force_post_fork_failure(true);
-        assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
-        // This thread's own copies of the child's seams were never taken.
-        cgroup_fault::set_force_child_pidfd_failure(false);
-        let _ = cgroup_fault::take_force_placement_write_result();
-        let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
-        let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
-        let _ = fault::take_forgotten_leaf();
-
-        let case = format!("placed: {placed}, refuses the kill: {refuses}");
-        assert_eq!(
-            warned_for(mark, pid, "nothing can reach it"),
-            refuses,
-            "{case}: the warning must fire exactly when the child is out of reach"
-        );
-        if refuses {
-            assert!(!reaped_through(&pidfd), "{case}: the child is still running");
-            rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
-            reaped_rx.recv().expect("the background reaper must reap it");
-        } else {
-            assert!(
-                cgroup_fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
-                "{case}: the child must be killed by its pid"
-            );
-        }
-        assert!(reaped_through(&pidfd), "{case}: the child must be reaped");
-    }
-}
-
 /// On the identity-failure path tokio still owns the child, and reaps it: the leaf takes its
 /// verdict first, so it never reaps that child as an abandoned spawn's — which would race tokio's
 /// own reap for the same pid.
@@ -327,17 +202,18 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
-/// On the identity-failure path, a child tokio could not kill (`EPERM`) goes to tokio's orphan
-/// queue, which reaps it once it exits. The leaf, having taken its verdict first, answers only for
-/// the tree — its kill through the leaf — and never reaps that child as an abandoned spawn's,
-/// which would race tokio's reap for the same pid.
+/// On the identity-failure path, a child tokio could not kill (`EPERM`) is handed back running in
+/// [`Error::Unreaped`] — cosca keeps no background thread to reap it, so the caller must, not
+/// tokio's orphan queue. The leaf, having taken its verdict first, answers only for the tree — its
+/// kill through the leaf — and never reaps that child as an abandoned spawn's, which would race
+/// the caller's own reap of the same pid.
 ///
 /// The leaf may be left behind: its `Drop` removes it right after `cgroup.kill`, without waiting
 /// for the kill to land — a known exit-lag gap, not this.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio() {
+async fn cgroup_an_identity_failure_whose_kill_is_refused_hands_the_child_back_unreaped() {
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
@@ -352,19 +228,37 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
     cmd.contain();
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
-    err.expect("forced identity-vanish must make spawn return Err");
     assert_eq!(
         fault::take_force_kill_failure(),
         None,
         "the kill failure must be consumed"
     );
-    let _ = fault::take_captured();
+
+    let Some(Error::Unreaped { kill, mut child, .. }) = err else {
+        panic!("the unkillable child must be handed back, got {err:?}");
+    };
+    assert_eq!(
+        kill.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the kill's own error"
+    );
 
     assert_eq!(
         crate::containment::cgroup::fault::take_reaped_orphans(),
         Vec::new(),
         "the leaf must not reap a child tokio owns"
     );
+
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    assert_eq!(child.pid(), id.pid(), "the handed-back child is the spawned one");
+    // Handled explicitly rather than dropped: `Unreaped`'s `Drop` would block this async test's
+    // runtime thread waiting for the child.
+    crate::wait::kill(id).expect("end the child");
+    child.wait().await.expect("wait for the handed-back child");
+    fault::assert_child_reaped(captured);
 }
 
 /// An abandoned spawn's child writes nothing into its own stdio. With fds 1 and 2 closed, `std`'s
@@ -565,6 +459,58 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// The async twin of
+/// `child::spawn::spawn_tests::a_failed_password_write_whose_check_is_uncertain_disarms_its_retained_leaf`:
+/// a failed password write whose child's one check comes back with ownership uncertain (a genuine
+/// `ECHILD`) disarms what it retained, rather than leaving it armed to kill through a tree that may
+/// no longer be its own.
+///
+/// `Containment::Delegated`, not `CgroupV2`: this function's own tree-kill note at its top fires
+/// whenever `can_teardown()` is true, which would write `cgroup.kill` before the Uncertain arm is
+/// even reached, hiding the one write under test.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_password_write_whose_check_is_uncertain_disarms_its_retained_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-uncertain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::Delegated,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let child = blocker().spawn().expect("spawn the stand-in for the elevated child");
+    let pid = child.id().pid();
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-elevated-kill-eperm-uncertain-7c4e",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-async-password-write-fail-uncertain-0a5d")),
+    );
+
+    assert!(err.to_string().contains("ownership is uncertain"), "got {err}");
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "an uncertain-ownership release must disarm its retained leaf, not kill through it"
+    );
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since cosca released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+}
+
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
 #[cfg(target_os = "linux")]
 fn reaped(pid: u32) -> bool {
@@ -635,4 +581,442 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         detail.contains("its contained tree could not be killed"),
         "the tree's failure is reported, got {detail}"
     );
+}
+
+/// A post-fork tokio failure ends its child whether or not the child could send a pidfd — denied
+/// here in the child through an inherited seam — and whether or not it entered its leaf: cosca
+/// kills and reaps it by its checked pid, and warns about nothing. A child that refuses the kill
+/// and is outside its leaf is handed back in the error, still running, for the caller to wait for.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn cgroup_a_post_fork_tokio_failure_hands_back_a_child_out_of_reach() {
+    use crate::containment::cgroup::fault as cgroup_fault;
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    crate::log_capture::install();
+    for (placed, refuses) in [(true, false), (false, false), (false, true)] {
+        let mut cmd = blocker();
+        cmd.contain();
+        let mark = crate::log_capture::mark();
+        // Armed in this thread, inherited by the child it forks, which takes them.
+        cgroup_fault::set_force_child_pidfd_failure(true);
+        if !placed {
+            cgroup_fault::set_force_placement_write_result(0);
+        }
+        if refuses {
+            cgroup_fault::set_force_child_kill_denied(true);
+        }
+        fault::set_force_post_fork_failure(true);
+        let err = cmd.spawn().expect_err("the forced failure must fail the spawn");
+        // This thread's own copies of the child's seams were never taken.
+        cgroup_fault::set_force_child_pidfd_failure(false);
+        let _ = cgroup_fault::take_force_placement_write_result();
+        let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
+        let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+        let _ = fault::take_forgotten_leaf();
+
+        let case = format!("placed: {placed}, refuses the kill: {refuses}");
+        assert!(
+            !warned_for(mark, pid, "nothing can reach it"),
+            "{case}: a child with a handle is never warned about as out of reach"
+        );
+        if refuses {
+            let crate::error::Error::Unreaped { mut child, .. } = err else {
+                panic!("{case}: the child out of reach must be handed back, got {err:?}");
+            };
+            assert_eq!(child.pid(), pid, "{case}: the handed-back child is the forked one");
+            assert!(!reaped_through(&pidfd), "{case}: the child is still running");
+            rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+            child.wait().await.expect("wait for the handed-back child");
+        } else {
+            assert!(
+                cgroup_fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
+                "{case}: the child must be killed by its pid"
+            );
+        }
+        assert!(reaped_through(&pidfd), "{case}: the child must be reaped");
+    }
+}
+
+/// A child the async spawn's teardown could not kill is handed back in the error as a
+/// `cosca::tokio::Unreaped`, EPERM or not, and not waited on by the spawn. The child is left
+/// running, as a refused kill leaves it — one that exited first would be reaped by the teardown's
+/// one check, and nothing handed back — and the test ends it; the caller's `wait` then reaps it.
+#[test]
+fn a_child_the_async_teardown_cannot_kill_is_handed_back_in_the_error() {
+    use std::io::ErrorKind;
+    for (kind, marker) in [
+        (ErrorKind::PermissionDenied, "cosca-async-kill-eperm-5d2c"),
+        (ErrorKind::Other, "cosca-async-kill-fail-8a41"),
+    ] {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut cmd = blocker();
+            fault::set_force_attach_failure(true);
+            fault::set_force_kill_failure_leaving_child_alive_as(marker, kind);
+            let err = cmd.spawn().err();
+            fault::set_force_attach_failure(false);
+            assert_eq!(
+                fault::take_force_kill_failure(),
+                None,
+                "{kind:?}: the kill failure must be consumed"
+            );
+            let Some(Error::Unreaped { error, kill, mut child }) = err else {
+                panic!("{kind:?}: the unkillable child must be handed back, got {err:?}");
+            };
+            assert_eq!(kill.kind(), kind);
+            assert!(
+                matches!(*error, Error::Containment { .. }),
+                "why the spawn failed, got {error:?}"
+            );
+            let captured = fault::take_captured().expect("seam captured the child's identity");
+            let crate::identity::Resolved::Found(id) = captured else {
+                panic!("the seam must capture a resolved identity, got {captured:?}");
+            };
+            assert_eq!(child.pid(), id.pid());
+            crate::wait::kill(id).expect("end the child");
+            child.wait().await.expect("wait for the handed-back child");
+            fault::assert_child_reaped(captured);
+        });
+    }
+}
+
+/// The async twin of
+/// `child::spawn::spawn_tests::a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf`:
+/// `reap_now`'s teardown whose one check comes back with ownership uncertain (a genuine `ECHILD`)
+/// disarms what it retained, rather than leaving it armed to kill through a tree that may no
+/// longer be its own.
+///
+/// Calls `reap_now` directly: it is private, reachable from this submodule, and driving this exact
+/// arm through a full spawn would need attach failure, a real placed leaf and the ECHILD seam all
+/// armed together for one code path, proving nothing the direct call does not.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-teardown-uncertain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
+    let child = ::tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(false)
+        .spawn()
+        .expect("spawn a real child");
+    let pid = child.id().expect("a freshly spawned child has a pid");
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-teardown-kill-eperm-uncertain-6b2f",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+
+    let handed_back =
+        crate::tokio::child::reap_now(child, pid, false, Some(crate::containment::Attached::Cgroup(leaf)));
+
+    assert!(
+        handed_back.is_none(),
+        "an uncertain check releases the child, handing nothing back"
+    );
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "an uncertain-ownership release must disarm its retained leaf, not kill through it"
+    );
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since the teardown released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+}
+
+/// The async counterpart of the sync teardown's suspended-child test. A contained root is created
+/// `CREATE_SUSPENDED` and resumed only by a successful attach, so after a failed attach it cannot
+/// exit on its own. When `start_kill` fails, `reap_now` terminates it again through the handle it
+/// holds, and waits for it.
+#[cfg(windows)]
+#[test]
+fn a_suspended_child_the_async_teardown_could_not_kill_is_terminated_through_its_handle() {
+    crate::log_capture::install();
+    let marker = "cosca-async-kill-fail-suspended-4f93";
+    let mark = crate::log_capture::mark();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let mut cmd = blocker();
+            cmd.contain();
+            fault::set_force_attach_failure(true);
+            fault::set_force_kill_failure_leaving_child_alive(marker);
+            cmd.spawn().err()
+        })
+    }));
+    fault::set_force_attach_failure(false);
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    // The retry terminated it, so nothing is handed back and nothing panics.
+    let err = outcome.expect("no panic: the kill failure was recovered");
+    assert!(
+        matches!(err, Some(Error::Containment { .. }) | Some(Error::Io(_))),
+        "the spawn's own error, got {err:?}"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("{marker}; terminated it through its handle")),
+        "the failed kill must be logged as terminated through the handle, not left to a reaper"
+    );
+    // Dead on return: the teardown waited for the terminated child.
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// When the retry fails too, the suspended child is leaked, and `reap_now` says so. The test
+/// terminates it afterwards.
+#[cfg(windows)]
+#[test]
+fn a_suspended_child_the_async_teardown_cannot_terminate_is_reported_leaked() {
+    crate::log_capture::install();
+    let marker = "cosca-async-terminate-fail-suspended-a61e";
+    let mark = crate::log_capture::mark();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let mut cmd = blocker();
+            cmd.contain();
+            fault::set_force_attach_failure(true);
+            fault::set_force_kill_failure_leaving_child_alive_as(
+                "cosca-async-kill-eperm-suspended-d207",
+                std::io::ErrorKind::PermissionDenied,
+            );
+            fault::set_force_suspended_terminate_failure(marker);
+            cmd.spawn().err()
+        })
+    }));
+    fault::set_force_attach_failure(false);
+    assert_eq!(
+        fault::take_force_suspended_terminate_failure(),
+        None,
+        "the retry must consume its forced failure"
+    );
+    // The leak is asserted even though EPERM on the kill is not.
+    assert_eq!(outcome.is_err(), cfg!(debug_assertions));
+    assert!(
+        crate::log_capture::contains_since(mark, marker),
+        "the leaked suspended child must be reported"
+    );
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    crate::wait::kill(id).expect("terminate the leaked child");
+    crate::wait::block_until_exit(id, None).expect("watch the child's exit");
+    fault::assert_child_reaped(captured);
+}
+
+/// The async raw backend shares the sync raw teardown, so its suspended root is terminated
+/// through its handle the same way when the kill fails.
+#[cfg(windows)]
+#[test]
+fn a_suspended_child_the_async_raw_teardown_could_not_kill_is_terminated_through_its_handle() {
+    crate::log_capture::install();
+    let marker = "cosca-async-raw-kill-fail-suspended-37ad";
+    let mark = crate::log_capture::mark();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = runtime.block_on(async {
+        let mut cmd = blocker();
+        cmd.executable("ping").contain();
+        fault::set_force_attach_failure(true);
+        fault::set_force_kill_failure_leaving_child_alive(marker);
+        let err = cmd.spawn().err();
+        fault::set_force_attach_failure(false);
+        err
+    });
+    err.expect("the forced arm must fail the spawn");
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, marker),
+        "the failed kill must be logged"
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// When the retry fails too, the async raw teardown reports the leak. The test terminates the
+/// child afterwards.
+#[cfg(windows)]
+#[test]
+fn a_suspended_child_the_async_raw_teardown_cannot_terminate_is_reported_leaked() {
+    crate::log_capture::install();
+    let marker = "cosca-async-raw-terminate-fail-suspended-9b52";
+    let mark = crate::log_capture::mark();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let mut cmd = blocker();
+            cmd.executable("ping").contain();
+            fault::set_force_attach_failure(true);
+            fault::set_force_kill_failure_leaving_child_alive("cosca-async-raw-kill-fail-suspended-c410");
+            fault::set_force_suspended_terminate_failure(marker);
+            cmd.spawn().err()
+        })
+    }));
+    fault::set_force_attach_failure(false);
+    assert_eq!(
+        fault::take_force_suspended_terminate_failure(),
+        None,
+        "the retry must consume its forced failure"
+    );
+    assert_eq!(outcome.is_err(), cfg!(debug_assertions), "the leak is asserted");
+    assert!(
+        crate::log_capture::contains_since(mark, marker),
+        "the leaked suspended child must be reported"
+    );
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    crate::wait::kill(id).expect("terminate the leaked child");
+    crate::wait::block_until_exit(id, None).expect("watch the child's exit");
+    fault::assert_child_reaped(captured);
+}
+
+/// The async spawn reads identity BEFORE its attach, so a contained root whose identity read fails
+/// is still `CREATE_SUSPENDED` on that arm too. When its kill fails, the identity arm retries
+/// termination through the handle, as the attach arm does, and waits for it.
+#[cfg(windows)]
+#[test]
+fn a_suspended_child_the_async_identity_arm_could_not_kill_is_terminated_through_its_handle() {
+    crate::log_capture::install();
+    let marker = "cosca-async-identity-kill-fail-suspended-b61f";
+    let mark = crate::log_capture::mark();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let mut cmd = blocker();
+            cmd.contain();
+            fault::set_force_identity_vanished(true);
+            fault::set_force_kill_failure_leaving_child_alive(marker);
+            cmd.spawn().err()
+        })
+    }));
+    fault::set_force_identity_vanished(false);
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    // The retry terminated it, so nothing is handed back and nothing panics.
+    let err = outcome.expect("no panic: the kill failure was recovered");
+    assert!(
+        matches!(err, Some(Error::Containment { .. }) | Some(Error::Io(_))),
+        "the spawn's own error, got {err:?}"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("{marker}; terminated it through its handle")),
+        "the identity arm must retry termination through the handle"
+    );
+    // Dead on return: the teardown waited for the terminated child.
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// The async twin of the sync elevated hand-back: a failed password write whose child refuses the
+/// kill hands it back in `Error::Unreaped`, whose `error` is the elevation's `AuthFailed`.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_elevated_child_a_failed_password_write_cannot_kill_is_handed_back() {
+    let child = blocker().spawn().expect("spawn the stand-in for the elevated child");
+    let pid = child.id().pid();
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-elevated-kill-eperm-91c3",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let err: crate::tokio::Error = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-async-password-write-fail-2b6f")),
+    )
+    .into();
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    let Error::Unreaped { error, kill, mut child } = err else {
+        panic!("the unkillable elevated child must be handed back, got {err:?}");
+    };
+    assert_eq!(kill.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        matches!(
+            &*error,
+            Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                ..
+            }
+        ),
+        "why the spawn failed, got {error:?}"
+    );
+    assert_eq!(child.pid(), pid);
+    let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(pid) else {
+        panic!("the handed-back child is unreaped, so its identity resolves");
+    };
+    crate::wait::kill(id).expect("end the child");
+    child.wait().await.expect("wait for the handed-back child");
+    fault::assert_child_reaped(crate::identity::Resolved::Found(id));
+}
+
+/// The async twin: a suspended child whose kill and check both failed is still terminated through
+/// the handle tokio holds, since on Windows a failed check says nothing about ownership.
+#[cfg(windows)]
+#[test]
+fn a_suspended_child_whose_check_fails_in_the_async_teardown_is_still_terminated() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = runtime.block_on(async {
+        let mut cmd = blocker();
+        cmd.contain();
+        fault::set_force_attach_failure(true);
+        fault::set_force_kill_failure_leaving_child_alive("cosca-async-kill-fail-check-fail-6d0a");
+        fault::set_force_teardown_try_wait_error("cosca-async-check-fail-suspended-91e2");
+        let err = cmd.spawn().err();
+        fault::set_force_attach_failure(false);
+        err
+    });
+    assert_eq!(
+        fault::take_force_teardown_try_wait_error(),
+        None,
+        "the check failure must be consumed"
+    );
+    assert!(
+        matches!(err, Some(Error::Containment { .. })),
+        "the retry terminated it, so the spawn's own error comes back, got {err:?}"
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }

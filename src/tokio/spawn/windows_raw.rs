@@ -51,6 +51,12 @@ pub(crate) struct RawAsyncChild {
     runas: bool,
     #[cfg(test)]
     observer: Option<WaitObserver>,
+    /// Forces the NEXT [`wait_blocking`](RawAsyncChild::wait_blocking) on THIS child to fail
+    /// without touching the OS wait — the only way to exercise a `WaitForSingleObject` failure
+    /// deterministically (a real one needs a handle genuinely missing `SYNCHRONIZE`, which a
+    /// unit test cannot arrange).
+    #[cfg(test)]
+    force_wait_blocking_failure: Option<&'static str>,
 }
 
 impl RawAsyncChild {
@@ -62,6 +68,8 @@ impl RawAsyncChild {
             runas: false,
             #[cfg(test)]
             observer: None,
+            #[cfg(test)]
+            force_wait_blocking_failure: None,
         }
     }
 
@@ -74,11 +82,17 @@ impl RawAsyncChild {
             runas: true,
             #[cfg(test)]
             observer: None,
+            #[cfg(test)]
+            force_wait_blocking_failure: None,
         }
     }
 
     fn handle(&self) -> HANDLE {
         HANDLE(self.proc.as_raw_handle())
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.pid
     }
 
     /// Block until the child exits, returning its status. Runs the blocking handle wait on the
@@ -174,7 +188,7 @@ impl RawAsyncChild {
             // (b) a runas child is genuinely higher-integrity than us. A static `can_terminate`
             // probe (shared with the sync `RawChild`) separates them WITHOUT racing a `try_wait`.
             // Only (b) is a real denial → surface the `Io` error so `Child::kill` maps it to the
-            // typed `Unkillable`; (a) is Ok (signal-only, so never block here).
+            // typed `ElevationErrorKind::Unkillable`; (a) is Ok (signal-only, so never block here).
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !sync_raw::can_terminate(self.pid) {
                     Err(Error::Io(std::io::Error::from_raw_os_error(
@@ -193,22 +207,60 @@ impl RawAsyncChild {
         self.exited.is_some()
     }
 
-    /// Wait for the child's exit; the caller has already signalled it. **Never kills:** a second
-    /// `TerminateProcess` on an already-exiting child returns `ACCESS_DENIED`, and the classified
-    /// kill decision (including a genuinely-undeniable runas child) was already made by
-    /// [`start_kill`](RawAsyncChild::start_kill)'s `can_terminate` probe.
+    /// Wait for the child's exit, for the teardown reaper: the caller has already signalled it.
+    /// **Never kills:** a second `TerminateProcess` on an already-exiting child returns
+    /// `ACCESS_DENIED`, and the classified kill decision (including a genuinely-undeniable runas
+    /// child) was already made by [`start_kill`](RawAsyncChild::start_kill)'s `can_terminate`
+    /// probe. A prior successful kill is what makes a wait failure here a genuine tripwire rather
+    /// than an expected outcome — unlike [`wait_blocking`](RawAsyncChild::wait_blocking), which
+    /// carries no such precondition and returns a failure instead of asserting it away.
     pub(crate) fn wait_and_reap(&mut self) {
         if self.exited.is_some() {
             return;
         }
         // SAFETY: our live, owned process handle; INFINITE is bounded by the caller's kill.
         let waited = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
-        debug_assert!(
-            waited == WAIT_OBJECT_0,
-            "raw async teardown did not observe child {} exit: {waited:?}",
-            self.pid
-        );
-        let _ = waited;
+        if waited != WAIT_OBJECT_0 {
+            let e = std::io::Error::last_os_error();
+            // warn first: the assert is compiled out in release.
+            log::warn!("raw async teardown did not observe child {} exit: {e}", self.pid);
+            debug_assert!(
+                false,
+                "raw async teardown did not observe child {} exit: {waited:?} ({e})",
+                self.pid
+            );
+        }
+    }
+
+    /// Block until the child exits, without reaping it — for [`Unreaped`](crate::child::Unreaped)'s
+    /// own generic wait/`Drop` (via `Held::wait`'s `RawAsync` arm), which places no precondition on
+    /// a prior kill: unlike [`wait_and_reap`](RawAsyncChild::wait_and_reap) (the teardown reaper's
+    /// own post-kill wait), this child may never have been signalled at all — an `Unreaped` exists
+    /// exactly because a kill either failed (a genuinely-undeniable runas child, whose restricted
+    /// handle may also lack `SYNCHRONIZE`) or was never attempted (an identity failure before any
+    /// kill). A `WaitForSingleObject` failure here is therefore a real, expected-rare outcome, not
+    /// an internal bug, so it is returned as an `io::Error` rather than asserted away.
+    pub(crate) fn wait_blocking(&mut self) -> std::io::Result<()> {
+        if self.exited.is_some() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(marker) = self.force_wait_blocking_failure.take() {
+            return Err(std::io::Error::other(marker));
+        }
+        // SAFETY: our live, owned process handle; no cancel handle, so this only ever blocks or
+        // fails — it cannot resolve `Cancelled`.
+        match wait_handle_or_cancel(self.handle(), None)? {
+            WaitOutcome::Exited => Ok(()),
+            WaitOutcome::Cancelled => unreachable!("wait with no cancel handle cannot be cancelled"),
+        }
+    }
+
+    /// Force the NEXT [`wait_blocking`] on THIS child to fail with `marker` as the error, without
+    /// touching the OS wait.
+    #[cfg(test)]
+    pub(crate) fn set_force_wait_blocking_failure(&mut self, marker: &'static str) {
+        self.force_wait_blocking_failure = Some(marker);
     }
 
     /// Install the per-instance test wait observer on THIS child (see `WaitObserver`).
@@ -353,18 +405,26 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         graceful: crate::containment::windows::mechanism_from_flags(flags),
     };
     let raw_handle = proc.as_raw_handle();
+    // Read before `attach_or_fault` consumes `prepared`: a failed attach may leave it suspended.
+    let suspended = prepared.created_suspended();
     let attachment = match attach_or_fault(pid, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(e);
+            return Err(crate::child::spawn::unkillable(
+                e,
+                sync_raw::raw_spawn_teardown(proc, pid, suspended),
+            ));
         }
     };
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            // The attach succeeded, and with it the resume.
+            let handed_back = sync_raw::raw_spawn_teardown(proc, pid, false);
+            return Err(crate::child::spawn::unkillable(
+                crate::child::spawn::spawn_identity_error(other),
+                handed_back,
+            ));
         }
     };
 

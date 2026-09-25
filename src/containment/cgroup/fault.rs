@@ -11,7 +11,7 @@ thread_local! {
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
-    static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static FORCE_GROUP_KILL_FAILURE: Cell<Option<&'static str>> = const { Cell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -29,6 +29,7 @@ thread_local! {
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
+    static FORCE_END_CHILD_WAIT_EINVAL: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -264,12 +265,13 @@ pub(crate) fn take_force_child_kill_denied() -> bool {
     FORCE_CHILD_KILL_DENIED.with(|f| f.replace(false))
 }
 
-/// Have the NEXT background reap started on this thread report on `notify` once it has reaped.
-pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<()>) {
-    BACKGROUND_REAP_NOTIFY.with(|n| *n.borrow_mut() = Some(notify));
+/// Make the NEXT group kill of an abandoned child on this thread fail with `marker`, without
+/// signalling the group.
+pub(crate) fn set_force_group_kill_failure(marker: &'static str) {
+    FORCE_GROUP_KILL_FAILURE.with(|f| f.set(Some(marker)));
 }
-pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<()>> {
-    BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
+pub(crate) fn take_force_group_kill_failure() -> Option<&'static str> {
+    FORCE_GROUP_KILL_FAILURE.with(|f| f.take())
 }
 
 /// Have the NEXT verdict on this thread that cannot wait find its leaf busy (`EBUSY`), as one
@@ -308,6 +310,18 @@ pub(crate) fn run_between_check_and_kill() {
     if let Some(hook) = BETWEEN_CHECK_AND_KILL.with(|h| h.borrow_mut().take()) {
         hook();
     }
+}
+
+/// Make the FIRST `waitid` of `end_child`'s final reap on this thread — only while it is still
+/// trying its pidfd — fail with `EINVAL`, as `waitid(P_PIDFD, ...)` does on a kernel new enough for
+/// `pidfd_open` (Linux >= 5.3) but too old to wait through one (>= 5.4): proves the fallback to
+/// waiting by pid still reaps the child. Take semantics; a wait already reduced to waiting by pid
+/// (no pidfd in the intent) never consults this seam.
+pub(crate) fn set_force_end_child_wait_einval(on: bool) {
+    FORCE_END_CHILD_WAIT_EINVAL.with(|f| f.set(on));
+}
+pub(crate) fn take_force_end_child_wait_einval() -> bool {
+    FORCE_END_CHILD_WAIT_EINVAL.with(|f| f.replace(false))
 }
 
 /// Count an abandoned child signalled by its bare pid on this thread.
@@ -395,5 +409,41 @@ pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
         if let (true, PumpSeam::Batches(notify)) = (n.as_os_str() == name, seam) {
             let _ = notify.send(notified);
         }
+    }
+}
+
+type KillThreadHook = Box<dyn FnOnce(std::thread::ThreadId) + Send>;
+
+/// Kill-thread hooks, per leaf, process-wide: unlike this module's other seams, `cgroup.kill` can
+/// now run on a thread other than the one that armed it (a retained, still-armed leaf's `Drop`
+/// moves to the blocking pool — see H1's fix in `crate::tokio::unreaped::Unreaped::reaped`), which
+/// a thread-local hook could never observe. Keyed by the leaf's full path, not just its directory
+/// name: `tempfile::tempdir()` gives each test its own parent, but a hand-picked leaf name (as a
+/// test that does not need a temp-generated one may use) can collide with another test's leaf of
+/// the same name running in parallel under nextest's one-binary-many-threads model, and two tests'
+/// hooks would then race for the same key.
+static KILL_THREAD_HOOKS: std::sync::Mutex<Vec<(std::path::PathBuf, KillThreadHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `hook` with the id of the thread that performs the NEXT `cgroup.kill` write for the leaf
+/// at `path`.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_next_kill_thread_hook(
+    path: &std::path::Path,
+    hook: impl FnOnce(std::thread::ThreadId) + Send + 'static,
+) {
+    KILL_THREAD_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((path.to_path_buf(), Box::new(hook)));
+}
+pub(crate) fn run_kill_thread_hook(path: &std::path::Path) {
+    let hook = {
+        let mut hooks = KILL_THREAD_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let at = hooks.iter().position(|(p, _)| p == path);
+        at.map(|at| hooks.remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook(std::thread::current().id());
     }
 }

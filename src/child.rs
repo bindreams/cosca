@@ -15,6 +15,10 @@ pub(crate) mod pump;
 #[path = "child/spawn.rs"]
 pub(crate) mod spawn;
 
+#[path = "child/unreaped.rs"]
+pub(crate) mod unreaped;
+pub use unreaped::Unreaped;
+
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
 use proc_handle::ProcHandle;
@@ -66,10 +70,17 @@ pub(crate) fn root_pid_was_recycled(
     }
 }
 
+/// The `expect` behind [`Child::proc`]: taken only by [`Child::into_unreaped_parts`], which
+/// leaves nothing running on the handle afterward, so the accessor stays infallible everywhere
+/// else.
+const PROC_TAKEN: &str = "the child's process backend is taken only by into_unreaped_parts";
+
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
-    proc: ProcHandle,
+    /// `Option` so [`into_unreaped_parts`](Child::into_unreaped_parts) can take it out safely,
+    /// without `ManuallyDrop`/`ptr::read`. Read it through [`proc`](Child::proc), never directly.
+    proc: Option<ProcHandle>,
     /// Stable identity resolved immediately after spawn.
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
@@ -89,7 +100,7 @@ impl Child {
         attachment: crate::containment::Attachment,
     ) -> Child {
         Child {
-            proc,
+            proc: Some(proc),
             id,
             pipes,
             kill_on_drop,
@@ -100,10 +111,33 @@ impl Child {
         }
     }
 
+    /// The process backend. See [`PROC_TAKEN`] for who may empty `self.proc` before this runs.
+    fn proc(&self) -> &ProcHandle {
+        self.proc.as_ref().expect(PROC_TAKEN)
+    }
+
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
     /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
     pub(crate) fn commit_kill_on_drop(&self) {
         self.attached.honor_kill_on_drop(self.kill_on_drop);
+    }
+
+    /// Take this child apart for [`Unreaped`](crate::Unreaped), without its `Drop`'s teardown:
+    /// the std child to hold, and the containment to release after its reap. Its pipes' parent
+    /// ends close here: one held on would keep the child waiting on it.
+    #[cfg(unix)]
+    pub(crate) fn into_unreaped_parts(mut self) -> (crate::child::unreaped::Held, crate::child::unreaped::Retained) {
+        // `Drop` does nothing once disarmed, so a plain drop below releases the rest (`pipes`,
+        // `elevation`, `containment`, `graceful`) safely, closing the pipes' parent ends.
+        self.kill_on_drop = false;
+        let proc = self.proc.take().expect(PROC_TAKEN);
+        let attached = std::mem::take(&mut self.attached);
+        drop(self);
+        let ProcHandle::Std(shared) = proc;
+        (
+            crate::child::unreaped::Held::Std(shared.into_inner()),
+            crate::child::unreaped::Retained { attached },
+        )
     }
 
     // Set by the elevation spawn arms.
@@ -167,12 +201,12 @@ impl Child {
 
     /// Block until the child exits, returning its status.
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
-        self.proc.wait().map_err(Error::Io)
+        self.proc().wait().map_err(Error::Io)
     }
 
     /// Return the exit status if the child has already exited.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, Error> {
-        self.proc.try_wait().map_err(Error::Io)
+        self.proc().try_wait().map_err(Error::Io)
     }
 
     /// Is this a wrapper-elevated child a plain parent may be unable to signal?
@@ -188,8 +222,9 @@ impl Child {
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
-        // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed `Unkillable`.
-        self.proc
+        // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed
+        // `ElevationErrorKind::Unkillable`.
+        self.proc()
             .kill()
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
@@ -278,7 +313,7 @@ impl Child {
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
         let backstop = self
-            .proc
+            .proc()
             .kill()
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
@@ -362,7 +397,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        self.attached.terminate(self.proc.id())
+        self.attached.terminate(self.proc().id())
     }
 
     /// Take the parent's write end of the child's stdin pipe, if configured.
@@ -430,7 +465,7 @@ impl Child {
     /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        crate::containment::windows::job_contains_pid(&self.attached, self.proc.id())
+        crate::containment::windows::job_contains_pid(&self.attached, self.proc().id())
     }
 
     /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
@@ -538,7 +573,7 @@ impl Drop for Child {
         // not collect, since tokio owns that child and its own reaping. `src/tokio/` mirrors this
         // surface by hand with nothing enforcing parity, so both differences are deliberate, not
         // drift.
-        self.proc.teardown_on_drop();
+        self.proc().teardown_on_drop();
     }
 }
 
@@ -556,6 +591,13 @@ fn take_reader(pipes: &mut BTreeMap<Fd, ParentEnd>, fd: Fd) -> Option<PipeReader
 
 impl Command {
     /// Spawn the configured command.
+    ///
+    /// # A child the failed spawn could not kill
+    ///
+    /// A spawn that fails after creating its child kills and reaps it. One the kill cannot end — a
+    /// setuid child refuses it with `EPERM` — comes back in [`Error::Unreaped`](crate::error::Error::Unreaped) as an
+    /// [`Unreaped`](crate::Unreaped): the one check made did not find it exited or reaped
+    /// elsewhere, not necessarily still running, and dropping the error blocks until it exits.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         spawn::spawn(self)
     }

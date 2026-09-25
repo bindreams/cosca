@@ -111,11 +111,34 @@ pub enum RecordErrorKind {
 
 /// The crate's top-level error type.
 ///
+/// `C` is the type of the child [`Error::Unreaped`] hands back: [`cosca::Unreaped`](crate::Unreaped)
+/// by default, and [`cosca::tokio::Unreaped`](crate::tokio::Unreaped) in
+/// [`cosca::tokio::Error`](crate::tokio::Error). Every other variant is the same for both.
+///
+/// **Building one in an expression needs a type.** A default type parameter is not applied during
+/// inference, so `let e = Error::Io(err);` fails to compile (`E0283`, type annotations needed) when
+/// nothing else fixes `C`. Annotate it: `let e: cosca::error::Error = Error::Io(err);`, or build it
+/// where the expected type is already known, such as a function's `Err` return. Naming the type and
+/// matching on it are unaffected either way.
+///
+/// **`?` does NOT cross between [`cosca::error::Error`](crate::error::Error) and
+/// [`cosca::tokio::Error`](crate::tokio::Error).** Only one direction converts: a sync
+/// `cosca::error::Error` becomes a `cosca::tokio::Error`, never the reverse. `child.kill()?` inside
+/// a function returning `Result<_, cosca::error::Error>`, where `child.kill()` returns
+/// `Result<_, cosca::tokio::Error>`, fails to compile (`E0277`, the trait bound `?` needs is
+/// missing); `cmd.status().await?` from such a function fails the same way, and with the same code.
+/// Async code that calls tokio-flavored cosca APIs must itself return
+/// `cosca::tokio::Error`, not `cosca::error::Error` — the sync default only widens into the tokio
+/// type, not out of it.
+///
 /// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
 /// wildcard arm rather than have each new variant break them.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum Error<C = crate::Unreaped>
+where
+    C: std::fmt::Debug + Send + Sync + 'static,
+{
     #[error("argument parsing failed: {0}")]
     Quote(#[from] QuoteError),
     #[error(transparent)]
@@ -164,6 +187,31 @@ pub enum Error {
         #[source]
         source: Option<std::io::Error>,
     },
+    /// A spawn failed after creating its child, and the child could not be killed — a setuid
+    /// child refuses the kill with `EPERM`. `error` is why the spawn failed and `kill` why the kill
+    /// did. The one check made at that point did not find the child exited or reaped elsewhere —
+    /// on Unix, that check failing with anything other than `ECHILD` is handed back too, not just
+    /// a confirmed-running child; on Windows every check failure is, since the held handle still
+    /// pins the process regardless of why the check itself failed. Nothing after that point
+    /// watches the child, so by the time this error reaches the caller it may already have exited
+    /// on its own — reaping it, not just waiting for it, is the caller's, and dropping `child`
+    /// blocks until it does. See [`Unreaped`](crate::Unreaped).
+    ///
+    /// `error` is the spawn's own error, unchanged — an [`Elevation`](Self::Elevation) with kind
+    /// `AuthFailed` or `Untracked` only on the elevated paths that produce those, and otherwise
+    /// whatever the failed spawn itself returned.
+    ///
+    /// That one check (Unix only) can also come back with the child's ownership uncertain instead
+    /// — a genuine `ECHILD`: something else already reaped it. That outcome never reaches this
+    /// variant: there is nothing left to hand back, so the child is released on the spot and the
+    /// caller gets `error` back directly, with no `child` to reap.
+    #[error("a failed spawn's child could not be killed ({kill}) and is handed back unreaped")]
+    Unreaped {
+        #[source]
+        error: Box<Self>,
+        kill: std::io::Error,
+        child: C,
+    },
 }
 
 /// `source` with `context` prepended to its message and kept as the new error's
@@ -194,6 +242,37 @@ impl std::fmt::Display for IoContext {
 impl std::error::Error for IoContext {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<C: std::fmt::Debug + Send + Sync + 'static> Error<C> {
+    /// This error with its handed-back child, if any — at any depth — mapped by `f`.
+    pub(crate) fn map_child<D: std::fmt::Debug + Send + Sync + 'static>(self, f: &impl Fn(C) -> D) -> Error<D> {
+        match self {
+            Error::Quote(e) => Error::Quote(e),
+            Error::Io(e) => Error::Io(e),
+            Error::Unsupported { op, platform, detail } => Error::Unsupported { op, platform, detail },
+            Error::Containment { detail } => Error::Containment { detail },
+            Error::NoConsole { detail } => Error::NoConsole { detail },
+            Error::Elevation { kind, detail } => Error::Elevation { kind, detail },
+            Error::Unassessable { detail, source } => Error::Unassessable { detail, source },
+            Error::IdentityRecord { kind, detail, source } => Error::IdentityRecord { kind, detail, source },
+            Error::Unreaped { error, kill, child } => Error::Unreaped {
+                error: Box::new(error.map_child(f)),
+                kill,
+                child: f(child),
+            },
+        }
+    }
+}
+
+/// A sync spawn step's error in [`cosca::tokio`](crate::tokio): a handed-back child becomes an
+/// awaitable [`cosca::tokio::Unreaped`](crate::tokio::Unreaped).
+#[cfg(feature = "tokio")]
+impl From<Error> for Error<crate::tokio::Unreaped> {
+    fn from(e: Error) -> Self {
+        e.map_child(&crate::tokio::Unreaped::from_sync)
     }
 }
 

@@ -83,6 +83,10 @@ impl ProcessId {
     /// process; [`Resolved::Unknown`] means it refused the question (typically an
     /// unprivileged caller querying a service) — the process may well be running.
     pub fn of(pid: RawPid) -> Resolved<ProcessId> {
+        #[cfg(test)]
+        if unreadable::armed() {
+            return Resolved::Unknown;
+        }
         backend::start_token(pid).map(|start| ProcessId { pid, start })
     }
 
@@ -221,6 +225,22 @@ pub(crate) fn windows_identity_from_handle(
     backend::windows_identity_from_handle(handle, pid)
 }
 
+/// Test-only: make every identity read on THIS thread come back `Unknown`, as a `/proc` mounted
+/// with `hidepid=2` makes a setuid child's, until disarmed.
+#[cfg(test)]
+pub(crate) mod unreadable {
+    use std::cell::Cell;
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+    #[cfg_attr(not(all(target_os = "linux", feature = "tokio")), allow(dead_code))] // its one caller is a Linux tokio test
+    pub(crate) fn set(on: bool) {
+        ARMED.with(|a| a.set(on));
+    }
+    pub(crate) fn armed() -> bool {
+        ARMED.with(|a| a.get())
+    }
+}
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;

@@ -819,6 +819,11 @@ impl Command {
     }
 
     /// Run to completion capturing stdout+stderr (stdin is connected to null).
+    ///
+    /// If the spawn fails with a child it could not kill, the error carries it as
+    /// [`Error::Unreaped`], returned at once, as [`spawn`](Command::spawn) returns it. Dropping it
+    /// blocks until the child exits: match on `Error::Unreaped` to wait with your own timeout, move
+    /// it, or [`leak`](crate::Unreaped::leak) it.
     pub fn output(&mut self) -> Result<crate::Output, Error> {
         self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
@@ -828,6 +833,11 @@ impl Command {
     }
 
     /// Run to completion with inherited stdio, returning the exit status.
+    ///
+    /// If the spawn fails with a child it could not kill, the error carries it as
+    /// [`Error::Unreaped`], returned at once, as [`spawn`](Command::spawn) returns it. Dropping it
+    /// blocks until the child exits: match on `Error::Unreaped` to wait with your own timeout, move
+    /// it, or [`leak`](crate::Unreaped::leak) it.
     pub fn status(&mut self) -> Result<crate::ExitStatus, Error> {
         // Force inherit so a caller who previously called .stdout(pipe()) does
         // not get a pump-free wait() that deadlocks once the pipe buffer fills.
@@ -840,6 +850,11 @@ impl Command {
 
     /// Run to completion capturing stdout as a UTF-8 String (stdin=null,
     /// stderr inherited). Errors on invalid UTF-8; output is verbatim (no trim).
+    ///
+    /// If the spawn fails with a child it could not kill, the error carries it as
+    /// [`Error::Unreaped`], returned at once, as [`spawn`](Command::spawn) returns it. Dropping it
+    /// blocks until the child exits: match on `Error::Unreaped` to wait with your own timeout, move
+    /// it, or [`leak`](crate::Unreaped::leak) it.
     pub fn read(&mut self) -> Result<String, Error> {
         self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
