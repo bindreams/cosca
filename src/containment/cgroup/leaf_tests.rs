@@ -3430,16 +3430,10 @@ fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (leaf, kill) = occupied_entered_leaf(dir.path());
     let (child, stdin) = cat_child();
-    let leaf_name = kill
-        .parent()
-        .expect("cgroup.kill has a parent")
-        .file_name()
-        .expect("a leaf has a name")
-        .to_string_lossy()
-        .into_owned();
+    let leaf_path = kill.parent().expect("cgroup.kill has a parent").to_path_buf();
     let runtime_thread = std::thread::current().id();
     let (kill_thread_tx, kill_thread_rx) = std::sync::mpsc::channel();
-    crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_name, move |tid| {
+    crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |tid| {
         let _ = kill_thread_tx.send(tid);
     });
     runtime.block_on(async {
@@ -3465,4 +3459,108 @@ fn tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap() {
         "the kill on a still-occupied retained leaf must run on the blocking pool, not inline on \
          the runtime thread that awaited the reap"
     );
+}
+
+/// The same contract as `tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap`, but
+/// through `Unreaped::drop` after a cancelled `wait` already reaped the child and handed its
+/// retained leaf to a still-running `DrainTask`: `Drop`'s own claim-slot wait (`take_blocking`)
+/// reads the very same `RetainedDrain` state `wait`'s `await_draining` does, so the ordering bug
+/// that test catches (notifying before the real kill-through ran) would equally have hidden here.
+///
+/// Deterministic, not a race against `Drop`, the same way `dropping_during_a_blocking_reap_waits_for_it`
+/// is: an `after_drain_claim` gate holds the task claimed (not yet committed) until this test
+/// releases it, so `Drop` deterministically finds the task already claimed and must go through
+/// `take_blocking`, not `reclaim_before_start`'s direct-drop fast path. The `before_blocking_drop`
+/// hook then fires as `Drop` commits to blocking on the drain and releases the gate — from inside
+/// `Drop`'s own call frame, so the release cannot be observed to race `Drop`'s own transition to
+/// blocking. `take_blocking`'s return is therefore itself the proof the real drop already ran (see
+/// `RetainedDrain::take_blocking`'s wait loop): checking `kill.exists()` right after `drop(unreaped)`
+/// returns has nothing left to race.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn tokio_drop_leaves_the_retained_leaf_armed_after_a_successful_reap() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    drop(stdin); // the child exits at once
+    crate::child::unreaped::block_until_reapable(pid).expect("zombie");
+
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it; the
+    // `Mutex` costs nothing here, since each hook only ever touches its own once.
+    let claimed_tx = std::sync::Mutex::new(claimed_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    crate::tokio::unreaped::fault::set_after_drain_claim(Box::new(move || {
+        claimed_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(())
+            .expect("the test thread is waiting for the claim");
+        release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("the test thread releases the gate");
+    }));
+
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        let raw = pid as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = unreaped.wait() => panic!("wait completed instead of being cancelled: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+        assert!(
+            unreaped.hands_retained_to_draining_task(),
+            "the drain must still be tracked after the cancelled wait"
+        );
+
+        // Deterministic: wait for the drain task's own claim signal before dropping, so `Drop`
+        // below exercises the "wait for a claimed drain" branch of `take_blocking`, not "drop an
+        // unclaimed one inline". The task is now parked in the gate, not yet committed.
+        claimed_rx
+            .recv()
+            .expect("the drain task reaches the gate once it has claimed what it must drop");
+        assert!(
+            !kill.exists(),
+            "the gated task has claimed what it must drop but not yet run it"
+        );
+
+        // `before_blocking_drop` releases the gate from inside `Drop`'s own call frame, right as it
+        // commits to `take_blocking` — no separate thread, no race about when the release happens
+        // relative to `Drop`'s own transition to blocking.
+        unreaped.before_blocking_drop(Box::new(move || {
+            release_tx
+                .send(())
+                .expect("let the gated task proceed to the real drop");
+        }));
+        drop(unreaped); // blocks until the task's own drop (the real kill-through) has actually run
+        assert!(
+            kill.exists(),
+            "a successful reap's Drop must not return before it has left the retained leaf armed, \
+             so its own drop kills through whatever else still occupies it — the same as `wait`"
+        );
+    });
 }

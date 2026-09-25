@@ -20,5 +20,5 @@ test-group = 'windows-shell-execute'
 # `drop_on_a_saturated_blocking_pool_does_not_deadlock` blocks on an mpsc `recv()` with no
 # timeout of its own (syncing via a wall clock is forbidden) — a genuine deadlock hangs forever.
 # This is the human-facing failure bound surfaced for that case, not a synchronization device.
-filter = 'test(=drop_on_a_saturated_blocking_pool_does_not_deadlock)'
+filter = 'test(=tokio::unreaped::unreaped_tests::drop_on_a_saturated_blocking_pool_does_not_deadlock)'
 slow-timeout = { period = "10s", terminate-after = 3 }

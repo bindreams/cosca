@@ -180,9 +180,12 @@ async fn leak_drops_a_tokio_child_releasing_its_handles() {
 /// `leak` consumes `self`, taking `self.blocking`'s `Arc<BlockingReap>` half but discarding its
 /// `oneshot::Receiver` half — so this test swaps a dummy receiver into that slot first and keeps
 /// the real one, to await after `leak` returns. `leak` only ever reads the `Arc` half, so the
-/// swap does not change what it does; awaiting the real receiver afterward is what then proves
-/// the gated task's own `report` — the disarm under test — has actually run before the assertion
-/// below reads it, the same as awaiting the task's own `JoinHandle` would.
+/// swap does not change what it does; awaiting the real receiver afterward proves the gated task's
+/// own `report` — the disarm under test — has run, the same as awaiting the task's own
+/// `JoinHandle` would. That alone still races the task's own unwind, though: `report` sends this
+/// signal from inside a `&mut self` call, before `ReapTask::run` itself returns and so before its
+/// own clone of the `Arc` actually drops. A clone of the `Arc` kept here, and waited on past that
+/// unwind (see the loop below), closes that window before the assertion reads the file.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
@@ -227,12 +230,13 @@ async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
 
     // Swap the real `finished` receiver out for a dummy: `leak` below only reads the `Arc`
     // half of the tuple, so this does not change what it does, and it lets this test keep the
-    // real one to await once `leak` has consumed `self`.
+    // real one to await once `leak` has consumed `self`. Also keep our own clone of the `Arc`
+    // itself, independent of the one `leak` drops and the one the task's own `ReapTask` holds.
     let (_dummy_tx, dummy_rx) = ::tokio::sync::oneshot::channel();
-    let real_finished = std::mem::replace(
-        &mut unreaped.blocking.as_mut().expect("just handed to a blocking task").1,
-        dummy_rx,
-    );
+    let (shared, real_finished) = {
+        let blocking = unreaped.blocking.as_mut().expect("just handed to a blocking task");
+        (blocking.0.clone(), std::mem::replace(&mut blocking.1, dummy_rx))
+    };
 
     claimed_rx
         .recv()
@@ -240,6 +244,17 @@ async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
     unreaped.leak();
     release_tx.send(()).expect("let the gated task proceed");
     let _ = real_finished.await;
+
+    // Close the signal-before-release race: `report` sends this signal from inside a method call
+    // on the task, while the task itself — and so its own clone of `shared` — is still alive on
+    // its blocking-pool stack frame; only once `ReapTask::run` itself returns, just after, does
+    // that clone actually drop. Waiting for `shared`'s count to fall back to what only this test
+    // holds — cooperatively, no sleep, no arbitrary retry bound — proves the task (and whatever
+    // else its own drop might still be holding) is actually gone before this reads the file its
+    // report already decided the outcome of.
+    while std::sync::Arc::strong_count(&shared) > 1 {
+        ::tokio::task::yield_now().await;
+    }
 
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
@@ -482,7 +497,19 @@ fn dropping_during_a_blocking_reap_waits_for_it() {
                 .send(())
                 .expect("let the gated task proceed to its real reap");
         }));
+        // Kept so this can check the state `Drop` leaves behind, immediately after `Drop` itself
+        // returns — not merely that `Drop` didn't hang, which `blocked` alone already proves.
+        let shared = unreaped
+            .blocking
+            .as_ref()
+            .expect("the blocking task owns the child")
+            .0
+            .clone();
         drop(unreaped);
+        assert!(
+            matches!(*shared.state(), super::ReapState::Taken),
+            "Drop must not return before take_blocking has settled the state to Taken"
+        );
     });
     assert!(blocked.load(Ordering::SeqCst), "the drop blocked on the blocking reap");
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
@@ -592,6 +619,161 @@ fn drop_on_a_saturated_blocking_pool_does_not_deadlock() {
     assert!(
         finished,
         "DEADLOCK: Unreaped::drop on the only blocking thread never returned"
+    );
+    crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
+}
+
+/// H1 (round-5 review): cancelling `wait` while it awaits the retained drain — queued behind an
+/// occupied blocking pool, after the real reap has already run inside `reaped` — must not lose the
+/// exit status, nor detach the drain task. A second `wait` must return the real status (not the
+/// bogus "released elsewhere" fallback a lost status would produce), and `Drop` must actually wait
+/// for the drain rather than return while it is still running elsewhere.
+///
+/// The cancellation point is reached deterministically, not via any wall-clock wait: `_blocker`
+/// occupies the pool's one thread on a real channel gate (`gate_rx.recv()`, released only once this
+/// test sends to `gate_tx`), and the `select!`'s losing arm polls a raw `waitid(P_PID, WEXITED |
+/// WNOWAIT)` — cooperatively, via `yield_now`, no sleep — until it reports `ECHILD`. That only
+/// happens once the real reap inside `wait_on` (called from `wait`'s own first poll) has actually
+/// run; since the pool's one thread is occupied, that having happened is exactly the moment `wait`'s
+/// own future is parked awaiting the still-queued, unclaimed drain — the same moment `reaped` (now
+/// synchronous) already set `status`, before spawning it.
+#[cfg(unix)]
+#[test]
+fn cancel_during_retained_drain_preserves_status_and_drop_waits() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build a runtime with a single blocking thread");
+    let (child, stdin, id) = std_blocked_child();
+    drop(stdin); // the child exits at once
+    crate::child::unreaped::block_until_reapable(id.pid()).expect("zombie");
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    runtime.block_on(async {
+        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
+        // Occupies the pool's only blocking thread until this test releases `gate_tx`.
+        let _blocker = ::tokio::task::spawn_blocking(move || {
+            let _ = occ_tx.send(());
+            let _ = gate_rx.recv();
+        });
+        occ_rx.await.expect("the blocker parked");
+
+        let mut u = Unreaped::with_retained(
+            Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::None,
+            }),
+        );
+        let raw = id.pid() as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = u.wait() => panic!("wait completed while the drain is queued behind the occupied pool: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+
+        // H1: the cancelled wait must not have lost the status, nor detached the drain task.
+        assert_eq!(
+            u.status.and_then(|s| s.code()),
+            Some(0),
+            "status must survive the cancelled drain-await"
+        );
+        assert!(
+            u.hands_retained_to_draining_task(),
+            "the drain must still be tracked (queued behind the occupied pool), not detached"
+        );
+
+        // Free the pool's one thread, so the queued drain task can actually run, then re-await it.
+        gate_tx.send(()).expect("the blocker is still parked on this receiver");
+        let again = u.wait().await;
+        assert!(
+            matches!(again, Ok(s) if s.code() == Some(0)),
+            "a second wait after a cancelled drain-await must return the real status, not a bogus \
+             \"released elsewhere\" error: {again:?}"
+        );
+        assert!(
+            !u.hands_retained_to_draining_task(),
+            "the second wait must have consumed the drain"
+        );
+
+        // Drop must not hang: nothing is left to await, since the second `wait` already consumed
+        // the drain above — this proves the now-idle handle's ordinary Drop contract still holds.
+        drop(u);
+        crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
+    });
+}
+
+/// The same cancellation point as `cancel_during_retained_drain_preserves_status_and_drop_waits`,
+/// but this time nothing re-awaits the drain before the handle drops: `Drop` itself must block
+/// until the still-running drain task actually finishes, per H1's recipe step 4.
+#[cfg(unix)]
+#[test]
+fn drop_after_a_cancelled_wait_waits_for_the_running_drain() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build a runtime with a single blocking thread");
+    let (child, stdin, id) = std_blocked_child();
+    drop(stdin);
+    crate::child::unreaped::block_until_reapable(id.pid()).expect("zombie");
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel();
+    runtime.block_on(async {
+        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
+        let _blocker = ::tokio::task::spawn_blocking(move || {
+            let _ = occ_tx.send(());
+            let _ = gate_rx.recv();
+        });
+        occ_rx.await.expect("the blocker parked");
+
+        let mut u = Unreaped::with_retained(
+            Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::None,
+            }),
+        );
+        let raw = id.pid() as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = u.wait() => panic!("wait completed while the drain is queued behind the occupied pool: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+        assert!(u.hands_retained_to_draining_task(), "the drain must still be tracked");
+
+        // Free the pool's one thread so the drain can run, then drop `u` on a fresh blocking
+        // thread of its own — `Drop` blocks the thread it runs on, so it must not run here on this
+        // async task.
+        gate_tx.send(()).expect("the blocker is still parked on this receiver");
+        ::tokio::task::spawn_blocking(move || {
+            drop(u);
+            let _ = tx.send(());
+        })
+        .await
+        .expect("the drop task did not panic");
+    });
+    assert!(
+        rx.recv().is_ok(),
+        "Drop must return once the drain it waited for has actually finished"
     );
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
