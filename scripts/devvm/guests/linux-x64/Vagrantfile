@@ -5,7 +5,7 @@
 # Silicon host, natively virtualized (KVM/HVF) on an x86-64 host.
 #
 # Not meant to be run directly with `vagrant up` in this directory — use
-# `scripts/devvm.py up linux-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_REPO_ROOT so
+# `scripts/devvm.py up linux-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_STAGE_DIR so
 # all state lands under .tmp/devvm/ in the worktree, never in the box's own directory.
 #
 # Box: generic/ubuntu2204, provider qemu, version pinned below. Built by roboxes/generic;

@@ -20,9 +20,9 @@ else
     echo "devvm: installed $("$HOME/.cargo/bin/cargo" --version)"
 fi
 
-# This version matches the planned CI pin for cargo-nextest (the Skuld migration, #151) — not
-# a pin that exists in CI today. Installing the same version here means `devvm.py run <linux
-# guest> -- cargo nextest run ...` matches what CI is planned to run instead of whatever a
+# This version matches CI's own cargo-nextest pin (.github/workflows/ci.yaml, tool:
+# cargo-nextest@0.9.137). Installing the same version here means `devvm.py run <linux
+# guest> -- cargo nextest run ...` matches what CI actually runs, instead of whatever a
 # fresh install would resolve to today.
 #
 # Downloads nextest's own prebuilt release tarball rather than `cargo install

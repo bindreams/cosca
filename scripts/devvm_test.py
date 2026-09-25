@@ -101,6 +101,22 @@ class ParseRunArgvTests(unittest.TestCase):
         _head, _unelevated, _timeout, cmd_tail = devvm.parse_run_argv(["windows-x64"])
         self.assertEqual(cmd_tail, [])
 
+    def test_timeout_equals_form_is_extracted(self) -> None:
+        head, _unelevated, timeout, cmd_tail = devvm.parse_run_argv(["windows-x64", "--timeout=60", "--", "whoami"])
+        self.assertEqual(timeout, 60)
+        self.assertNotIn("--timeout=60", head)
+        self.assertEqual(cmd_tail, ["whoami"])
+
+    def test_bad_timeout_value_exits_cleanly_not_a_traceback(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            devvm.parse_run_argv(["windows-x64", "--timeout", "abc", "--", "whoami"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_bad_timeout_equals_value_exits_cleanly_not_a_traceback(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            devvm.parse_run_argv(["windows-x64", "--timeout=abc", "--", "whoami"])
+        self.assertEqual(ctx.exception.code, 2)
+
 
 class PowershellQuoteTests(unittest.TestCase):
     def test_plain_token_is_wrapped_in_single_quotes(self) -> None:

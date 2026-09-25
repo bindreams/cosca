@@ -1,9 +1,10 @@
-# Strips write access from the uploaded working-tree copy (see the windows-mirror-tree.ps1
-# provisioner in scripts/devvm/guests/windows-x64/Vagrantfile that runs just before this,
-# which mirrors the WinRM-uploaded staging copy into this path). Best-effort
-# footgun prevention, matching the rsync --chmod=F444 used for the Linux guests - not a
-# security boundary: the connecting account is itself an Administrator and can always
-# re-grant itself access, same as root can on the Linux guests.
+# Strips write access from the uploaded working-tree copy (see windows-mirror-tree.ps1,
+# which devvm.py's provision_windows_guest runs directly over `vagrant winrm` just before
+# this - not a Vagrantfile-declared provisioner; see that Vagrantfile's own comment on why -
+# and mirrors the WinRM-uploaded staging copy into this path). Best-effort footgun
+# prevention, matching the rsync --chmod=F444 used for the Linux guests - not a security
+# boundary: the connecting account is itself an Administrator and can always re-grant itself
+# access, same as root can on the Linux guests.
 
 $ErrorActionPreference = "Stop"
 $path = "C:\cosca"

@@ -11,52 +11,18 @@
 
 $ErrorActionPreference = "Stop"
 
-# rustup-init.exe and cargo-nextest are run in ways that keep their output off this script's
-# own real stderr handle. This isn't cosmetic - it's required for `devvm.py up`/`sync
-# windows-x64` to succeed at all, for a subtle reason specific to how Vagrant's shell
-# provisioner runs this script:
-#
-# Vagrant routes this script through WinRM's PSRP-based PowerShell shell (`lib/winrm/shells/
-# power_shell.rb` in the `winrm` gem - confirmed by reading vagrant 2.4.9's vendored copy
-# directly, 2026-09-23), which appends this trailer to whatever command it sends:
-#
-#   if (!$?) { if($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }
-#
-# That trailer runs in the OUTER session, once, after our *entire* `powershell -file
-# windows-rust.ps1` invocation completes, and checks that invocation's own `$?` - not
-# `$LASTEXITCODE` alone. Windows PowerShell 5.1 sets `$?` to `$false` for a native command
-# whenever anything reaches that command's real stderr stream, regardless of exit code. Since
-# `$LASTEXITCODE` is 0 (falsy in PowerShell's `if()`), `!$?` alone is enough to hit the
-# trailer's `else { exit 1 }` branch - an explicit `exit 0` at the end of this script does
-# NOT help (measured directly, 2026-09-23: the script's own process exit code was
-# independently confirmed 0 via a direct `vagrant winrm -c` invocation of the identical
-# command line - which doesn't route through this PSRP trailer - while `devvm.py up` still
-# failed).
-#
-# rustup-init.exe writes benign "info: ..." progress lines to stderr, and with nothing
-# redirecting that, it passes straight through to this script's own process - which is
-# itself a native command from the outer session's point of view - tripping the trailer.
-#
-# Two narrower fixes were tried and measured directly (2026-09-23) before landing on
-# `Start-Process`:
-#   1. Wrapping the whole script in a function and writing its merged output (`*>&1`) through
-#      `Write-Host`. This made things worse: piping a function's `*>&1` output through a
-#      downstream cmdlet, under `$ErrorActionPreference = "Stop"`, escalates a native
-#      command's stderr into an immediate *terminating* error instead of the non-terminating
-#      "displayed but continues" behavior PowerShell otherwise gives it - the script aborted
-#      at the very first rustup-init line, before any of its own output.
-#   2. Redirecting stderr at the call site with `2>$null` (e.g. `& $rustupInit ... 2>$null`).
-#      This suppressed every stderr line EXCEPT THE FIRST: PowerShell has a known quirk where
-#      a native command's very first stderr line can bypass `2>` redirection entirely (it's
-#      read and formatted as a `NativeCommandError` before the redirect target takes effect),
-#      so `devvm.py up` still failed on that one line.
-# `Start-Process ... -Wait -PassThru` sidesteps both: it launches rustup-init as a genuinely
-# separate process rather than an inline pipeline invocation, so none of its stdio interacts
-# with this script's own PowerShell stream/error machinery at all - proven by the VC++
-# redistributable install below, which has used this pattern from the start and has never
-# shown this problem across every test run so far. Actual failures are still caught: every
-# native call below has its own explicit exit-code/output check immediately after it, which
-# `throw`s on failure.
+# rustup-init.exe and cargo-nextest are run via `Start-Process ... -Wait -PassThru` rather
+# than an inline `&` invocation, so their stdio never interacts with this script's own
+# PowerShell stream/error machinery. Historically (when this script ran through Vagrant's
+# shell provisioner) that mattered for correctness: the provisioner's WinRM PSRP shell
+# appended a trailer that turned rustup-init's benign stderr progress lines into a false
+# failure. That's no longer how this script runs - devvm.py drives it directly via
+# `vagrant winrm -c` (see run_windows_script's docstring), whose communicator
+# (plugins/communicators/winrm/shell.rb) appends no such trailer and never inspects `$?` -
+# only `$LASTEXITCODE`, which the explicit exit-code checks below already set correctly
+# either way. The `Start-Process` pattern is kept regardless: it's simple, still correct, and
+# every native call below has its own explicit exit-code/output check immediately after it,
+# which `throw`s on failure.
 
 # rustup-init doesn't update the CURRENT process's PATH after installing - re-derive cargo's
 # bin dir directly (matches rustup's own default: %USERPROFILE%\.cargo\bin) so the
@@ -123,9 +89,9 @@ if ($vcRuntimeInstalled) {
     Write-Host "devvm: installed VC++ redistributable"
 }
 
-# This version matches the planned CI pin for cargo-nextest (the Skuld migration, #151) - not
-# a pin that exists in CI today. Installing the same version here means `devvm.py run
-# windows-x64 -- cargo nextest run ...` matches what CI is planned to run instead of whatever
+# This version matches CI's own cargo-nextest pin (.github/workflows/ci.yaml, tool:
+# cargo-nextest@0.9.137). Installing the same version here means `devvm.py run
+# windows-x64 -- cargo nextest run ...` matches what CI actually runs, instead of whatever
 # a fresh install would resolve to today.
 #
 # Downloads nextest's own prebuilt release binary rather than `cargo install

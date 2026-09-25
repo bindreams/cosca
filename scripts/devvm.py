@@ -23,7 +23,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,19 +151,15 @@ def require_tool(name: str) -> None:
         sys.exit(1)
 
 
-def vagrant_env(guest: Guest, *, auto_consent: bool = False, display: bool = False) -> dict[str, str]:
+def vagrant_env(guest: Guest, *, display: bool = False) -> dict[str, str]:
     env = dict(os.environ)
     env["VAGRANT_DOTFILE_PATH"] = str(dotfile_dir(guest))
-    env["DEVVM_REPO_ROOT"] = str(REPO_ROOT)
     env["DEVVM_STAGE_DIR"] = str(stage_dir(guest))
-    env["DEVVM_WINDOWS_AUTO_CONSENT"] = "1" if auto_consent else "0"
     env["DEVVM_WINDOWS_DISPLAY"] = "1" if display else "0"
     return env
 
 
-def run_vagrant(
-    guest: Guest, args: list[str], *, auto_consent: bool = False, display: bool = False, check: bool = True
-) -> int:
+def run_vagrant(guest: Guest, args: list[str], *, display: bool = False, check: bool = True) -> int:
     # For `vagrant winrm -c ...` specifically: measured directly (2026-09-23) by running a
     # remote command that exited {0, 1, 2, 42, 255} in turn — `vagrant winrm`'s own process
     # exit code was 0 for the zero case and exactly 1 for every nonzero case, never the
@@ -174,7 +169,7 @@ def run_vagrant(
     cwd = guest_dir(guest)
     cmd = ["vagrant", *args]
     print(f"+ (cd {cwd} && {shlex.join(cmd)})", file=sys.stderr)
-    result = subprocess.run(cmd, cwd=cwd, env=vagrant_env(guest, auto_consent=auto_consent, display=display))
+    result = subprocess.run(cmd, cwd=cwd, env=vagrant_env(guest, display=display))
     if check and result.returncode != 0:
         sys.exit(result.returncode)
     return result.returncode
@@ -184,7 +179,6 @@ def run_vagrant_streaming(
     guest: Guest,
     args: list[str],
     *,
-    auto_consent: bool = False,
     display: bool = False,
     check: bool = True,
 ) -> tuple[int, str]:
@@ -204,7 +198,7 @@ def run_vagrant_streaming(
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
-        env=vagrant_env(guest, auto_consent=auto_consent, display=display),
+        env=vagrant_env(guest, display=display),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -307,12 +301,31 @@ def parse_run_argv(rest: list[str]) -> tuple[list[str], bool, int | None, list[s
     args.unelevated False, with `cmd`'s REMAINDER eating `--unelevated` itself. Extracting both
     flags by hand, before argparse ever runs, sidesteps the quirk entirely and lets either flag
     appear on either side of `guest`.
+
+    The obvious alternative — drop REMAINDER, declare `cmd` as `nargs="*"`, and let argparse's
+    own `--` handling do this — does NOT work on Python 3.11 (this repo's pinned minimum, see
+    the `requires-python` header): confirmed directly with `uv run --python 3.11/3.12/3.13`,
+    `run windows-x64 --unelevated -- cargo test` parses correctly from 3.12 onward but raises
+    "unrecognized arguments: -- cargo test" on 3.11 — a stdlib argparse bug (`--` combined with
+    a preceding optional and a `nargs="*"` positional) fixed only in 3.12. Hand-rolling stays
+    necessary as long as 3.11 is supported.
+
+    Handles both `--timeout N` and `--timeout=N` spellings (argparse itself accepts both for a
+    single-value option, so this must too), and reports a bad integer the same way argparse
+    would — a one-line message on stderr and exit(2), not a raw traceback.
     """
     if "--" in rest:
         idx = rest.index("--")
         before, cmd_tail = rest[:idx], rest[idx + 1 :]
     else:
         before, cmd_tail = rest, []
+
+    def parse_timeout(raw: str) -> int:
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"devvm.py run: argument --timeout: invalid int value: {raw!r}", file=sys.stderr)
+            sys.exit(2)
 
     head: list[str] = []
     unelevated = False
@@ -327,8 +340,11 @@ def parse_run_argv(rest: list[str]) -> tuple[list[str], bool, int | None, list[s
             if i + 1 >= len(before):
                 print("devvm.py run: argument --timeout: expected one argument", file=sys.stderr)
                 sys.exit(2)
-            timeout = int(before[i + 1])
+            timeout = parse_timeout(before[i + 1])
             i += 2
+        elif tok.startswith("--timeout="):
+            timeout = parse_timeout(tok[len("--timeout=") :])
+            i += 1
         else:
             head.append(tok)
             i += 1
@@ -393,19 +409,34 @@ def run_windows_script(
     matching the shell provisioner's `privileged: true` without going anywhere near
     `wait_for_reboot`.
 
-    Sends the script's content itself (optionally prefixed with `$env:NAME = 'value'; `
-    assignments) as a base64/UTF-16LE `-EncodedCommand`, matching the same technique
-    `cmd_run`'s `--unelevated` path already uses to sidestep re-quoting a multi-line script
-    with embedded quotes through vagrant's own argv handling.
+    Uploads the script itself via `vagrant upload` (plain WinRM file transfer, no guest
+    process/command line involved) and runs it with `-File`, rather than inlining its content
+    as a base64/UTF-16LE `-EncodedCommand`. `-EncodedCommand`'s encoded text becomes part of
+    the guest-side `powershell.exe` command line, which Windows' CreateProcess caps at 32767
+    chars total - measured directly (2026-09-25): windows-rust.ps1 alone already encodes to a
+    ~25350-char command line, comfortably under that limit today but with no margin that's
+    guaranteed to hold as the script grows, and no PowerShell-side error if it's ever crossed
+    (CreateProcess just fails on the guest). `-File` sidesteps the limit entirely - the
+    command line is always the same small, fixed size regardless of script content. The
+    upload destination is fixed, dedicated scratch space (C:\\Windows\\Temp), deliberately NOT
+    under C:\\cosca-stage/C:\\cosca: windows-clean-stage.ps1 wipes the former and
+    windows-mirror-tree.ps1 mirrors-with-deletion into the latter, and either could race an
+    upload landing there depending on which script is currently running. Env vars are still
+    passed via a `$env:NAME = 'value'; ` prefix ahead of the `-File` invocation, same
+    mechanism as before.
 
     Returns the combined stdout/stderr so callers (e.g. windows-account-and-uac.ps1's
     DEVVM_REBOOT_REQUIRED marker) can scan it. Raises via `run_vagrant_streaming`'s own
-    check=True on a nonzero exit, same as a failing shell provisioner previously would.
+    check=True on a nonzero exit, same as a failing shell provisioner previously would (and via
+    `run_vagrant`'s own check=True if the upload itself fails).
     """
+    guest_script_path = f"C:\\Windows\\Temp\\devvm-{script_path.name}"
+    run_vagrant(guest, ["upload", str(script_path), guest_script_path], display=display)
     env_prefix = "".join(f"$env:{name} = {powershell_quote(value)}; " for name, value in (env or {}).items())
-    combined = env_prefix + script_path.read_text()
-    encoded = base64.b64encode(combined.encode("utf-16-le")).decode("ascii")
-    inner = f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}; exit $LASTEXITCODE"
+    inner = (
+        f"{env_prefix}powershell -NoProfile -ExecutionPolicy Bypass "
+        f"-File {powershell_quote(guest_script_path)}; exit $LASTEXITCODE"
+    )
     args = ["winrm"]
     if elevated:
         args.append("-e")
@@ -418,25 +449,39 @@ def get_windows_boot_time(guest: Guest) -> str | None:
     """The guest's current LastBootUpTime (an ISO-8601-ish CIM datetime string), or None if
     WinRM isn't answering right now. Used by reboot_windows_guest_and_wait to detect a real
     boot-time change rather than just "WinRM answered" (which can spuriously be true in the
-    few seconds between issuing `shutdown /r` and the guest actually going down)."""
-    try:
-        result = subprocess.run(
-            ["vagrant", "winrm", "-c", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o')"],
-            cwd=guest_dir(guest),
-            env=vagrant_env(guest),
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return None
+    few seconds between issuing `shutdown /r` and the guest actually going down).
+
+    No `timeout=` of our own on this subprocess call. `vagrant` is a Go launcher binary that
+    execs a Ruby child to do the actual work (confirmed directly, 2026-09-25: `file
+    $(which vagrant)` is a native Mach-O executable, and `ps -o pid,ppid,command` during a live
+    `vagrant winrm -c` call shows a `ruby .../vagrant winrm -c ...` child under it) - so a
+    `subprocess.run(..., timeout=N)` here would SIGKILL only that immediate Go process on
+    expiry, not its Ruby child, which keeps running, reparented to PID 1, orphaned on the HOST.
+    Reproduced directly the same way: a 2s-timeout probe against this exact command left a
+    `ruby .../vagrant winrm -c ...` process running under PPID 1 after Python's own timeout
+    fired - precisely the leaked-process hazard CLAUDE.local.md's sandbox rule exists to
+    prevent, and not something `start_new_session=True` + `os.killpg` fixes for free either
+    (the Go launcher would still need to actually forward the kill to its Ruby child for that
+    to help, which isn't guaranteed).
+    `vagrant winrm -c` already goes through Vagrant's own communicator-ready wait, bound by the
+    Windows Vagrantfile's own `winrm.timeout` (3600s - see scripts/README.md's measured-timings
+    table): a real, already-configured, human-facing failure bound, not a Python-side guess
+    layered on top of it.
+    """
+    result = subprocess.run(
+        ["vagrant", "winrm", "-c", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o')"],
+        cwd=guest_dir(guest),
+        env=vagrant_env(guest),
+        capture_output=True,
+        text=True,
+    )
     if result.returncode != 0:
         return None
     output = result.stdout.strip()
     return output or None
 
 
-def reboot_windows_guest_and_wait(guest: Guest, *, timeout_seconds: int = 600) -> None:
+def reboot_windows_guest_and_wait(guest: Guest) -> None:
     """Issue a real guest reboot ourselves and block until the guest reports a new boot time.
 
     Deliberately does NOT go through Vagrant's named `reboot-if-needed` shell provisioner /
@@ -447,18 +492,21 @@ def reboot_windows_guest_and_wait(guest: Guest, *, timeout_seconds: int = 600) -
     `Reboot.reboot` itself runs, confirmed by reading cap/reboot.rb) and then waiting for a
     genuine boot-time change avoids both.
 
-    No `time.sleep()` anywhere in the wait loop, and no chosen retry interval: each iteration
-    IS the wait — a real, bounded WinRM round-trip (get_windows_boot_time's own subprocess
-    timeout) — and failure just means "ask again immediately," not "nap, then ask again."
-    `timeout_seconds` is the overall failure bound surfaced to the human if the guest never
-    comes back, not a synchronization interval.
+    `shutdown /r`'s own exit code is checked (not previously): a nonzero exit means the reboot
+    was never scheduled at all (e.g. a permissions problem), so there would be no new boot time
+    to ever wait for — failing loudly here beats spending the rest of this function's time
+    (and get_windows_boot_time's own real winrm.timeout bound per call - could be a long wait)
+    on a reboot that was never going to happen.
 
-    Default is 600s, matching the Windows Vagrantfile's own `graceful_halt_timeout` — measured
-    directly (2026-09-24, applying a license rearm on this host) that a plain 300s default was
-    NOT enough: a real, successful reboot (new boot time confirmed moments later) still hadn't
-    reported back by the 300s deadline under this host's TCG emulation. This is a warm reboot
-    of an already-imported guest, not a cold `up`, so it doesn't need `boot_timeout`/
-    `winrm.timeout`'s 3600s, but it needs more than a first guess gave it.
+    No `time.sleep()` anywhere in the wait loop, and no chosen retry interval or deadline of
+    devvm.py's own: each iteration IS the wait — a real, bounded WinRM round-trip
+    (get_windows_boot_time's own comment explains its bound) — and failure just means "ask
+    again immediately," not "nap, then ask again." A separate wall-clock deadline here used to
+    be a second, uncoordinated guess (600s, tuned from a single measurement) sitting on top of
+    Vagrant's own already-real `winrm.timeout` bound (3600s): if the guest is genuinely gone,
+    each get_windows_boot_time call eventually fails via that bound and this function keeps
+    asking, rather than devvm.py inventing its own separate, shorter failure mode for the same
+    underlying condition.
     """
     before = get_windows_boot_time(guest)
     if before is None:
@@ -467,14 +515,15 @@ def reboot_windows_guest_and_wait(guest: Guest, *, timeout_seconds: int = 600) -
             "it — is WinRM answering at all?"
         )
     print(f"+ rebooting guest '{guest.name}' directly (shutdown /r) and waiting for a new boot time", file=sys.stderr)
-    run_vagrant(guest, ["winrm", "-c", 'shutdown /r /t 0 /f /d p:4:1 /c "devvm reboot"'], check=False)
-    deadline = time.monotonic() + timeout_seconds
+    returncode = run_vagrant(guest, ["winrm", "-c", 'shutdown /r /t 0 /f /d p:4:1 /c "devvm reboot"'], check=False)
+    if returncode != 0:
+        raise RuntimeError(
+            f"devvm: `shutdown /r` on guest '{guest.name}' failed (vagrant winrm exit "
+            f"{returncode}) — the reboot was never scheduled, so there is no new boot time to "
+            "wait for. (Only zero-vs-nonzero survives here, not the remote command's real exit "
+            "code — see run_vagrant's own comment on why.)"
+        )
     while True:
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"devvm: guest '{guest.name}' did not report a new boot time within "
-                f"{timeout_seconds}s of issuing the reboot — check the QEMU window/guest console."
-            )
         after = get_windows_boot_time(guest)
         if after is not None and after != before:
             return
@@ -528,16 +577,18 @@ def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> No
     image self-terminates once its evaluation period elapses - guest System event log ID 1074,
     initiator C:\\Windows\\system32\\wlms\\wlms.exe (the Windows License Manager Service)
     running as NT AUTHORITY\\SYSTEM, "The license period for this installation of Windows has
-    expired. The operating system is shutting down." That is a genuine ACPI shutdown - not a
-    devvm.py/cosca command, not a crash - so it ends the whole QEMU process regardless of
-    `-no-reboot` (which only ever concerns guest-initiated *reboots*, not power-offs).
+    expired. The operating system is shutting down." That is a genuine guest-initiated ACPI
+    power-off - not a devvm.py/cosca command, not a crash - so it ends the whole QEMU process.
     Confirmed via `slmgr /dlv` at the time: License Status: Notification, Notification Reason:
     0xC004FC07 (evaluation period exceeded). It took the guest down mid-provisioning, with no
     warning beyond the ID 1074 event a few seconds ahead of the actual shutdown.
 
-    Runs once per fresh `up` (create=True in provision_windows_guest) - not on every `sync` -
+    Runs on every `up` (create is always True in cmd_up's own call into
+    provision_windows_guest - `vagrant up` is itself idempotent, so this runs whether the guest
+    is being created for the first time or merely started again), not on every `sync` -
     because Windows evaluation rearms are a limited, consumable resource (this image ships
-    with 2), not something to spend on every provisioning pass.
+    with 2), not something to spend on every provisioning pass; `sync` (create=False) never
+    reaches this function at all.
 
     Direct `vagrant winrm -c` (no `-e`/elevated shell) is enough for `slmgr /rearm`, the same
     as `reboot_windows_guest_and_wait`'s `shutdown /r`: this box already hands WinRM sessions a
@@ -613,7 +664,7 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
         # the explicit `vagrant provision` call two lines down would run it a second,
         # redundant time. Skipping it here makes exactly one invocation happen either way
         # (create or not), driven explicitly below.
-        run_vagrant(guest, ["up", "--provider", "qemu", "--no-provision"], auto_consent=auto_consent, display=display)
+        run_vagrant(guest, ["up", "--provider", "qemu", "--no-provision"], display=display)
         ensure_windows_license_current(guest, display=display)
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-clean-stage.ps1", elevated=True, display=display)
     # The lone remaining Vagrantfile-declared provisioner: uploads the staged tree into
@@ -639,35 +690,11 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
             file=sys.stderr,
         )
         reboot_windows_guest_and_wait(guest)
-        verify_windows_account_settings(guest)
     elif REBOOT_MARKER_FALSE not in account_output:
         print(
             "error: windows-account-and-uac.ps1 did not print a DEVVM_REBOOT_REQUIRED "
             "marker — can't tell whether a reboot is needed, so refusing to guess. This is a "
             "bug in the provisioner script, not something to silently proceed past.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def verify_windows_account_settings(guest: Guest) -> None:
-    """Post-reboot sanity check that EnableLUA and autologon actually took effect."""
-    check_cmd = (
-        '$lua = (Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion'
-        '\\Policies\\System" -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA; '
-        '$auto = (Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows NT'
-        '\\CurrentVersion\\Winlogon" -Name AutoAdminLogon -ErrorAction SilentlyContinue)'
-        ".AutoAdminLogon; "
-        'Write-Host "DEVVM_VERIFY_LUA=$lua"; '
-        'Write-Host "DEVVM_VERIFY_AUTOLOGON=$auto"'
-    )
-    _, output = run_vagrant_streaming(guest, ["winrm", "-c", check_cmd])
-    lua_ok = "DEVVM_VERIFY_LUA=1" in output
-    autologon_ok = "DEVVM_VERIFY_AUTOLOGON=1" in output
-    if not lua_ok or not autologon_ok:
-        print(
-            "error: post-reboot verification failed — EnableLUA/autologon did not take "
-            f"effect as expected (lua_ok={lua_ok}, autologon_ok={autologon_ok}). Output:\n{output}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -716,7 +743,7 @@ def cmd_up(args: argparse.Namespace) -> None:
     if guest.communicator == "winrm":
         provision_windows_guest(guest, auto_consent=auto_consent, display=display, create=True)
     else:
-        run_vagrant(guest, ["up", "--provider", "qemu", "--provision"], auto_consent=auto_consent)
+        run_vagrant(guest, ["up", "--provider", "qemu", "--provision"])
     if guest.communicator == "ssh":
         print(f"note: the read-only working tree is synced to {guest.tree_path_posix} — run `devvm.py sync {guest.name}` after local changes.")
     else:
@@ -744,8 +771,27 @@ def cmd_ssh(args: argparse.Namespace) -> None:
     require_available(guest)
     if guest.communicator == "ssh":
         run_vagrant(guest, ["ssh"])
-    else:
-        run_vagrant(guest, ["powershell"])
+        return
+    # `vagrant powershell` shells out to a local powershell.exe/pwsh on the HOST, not the
+    # guest — Vagrant 2.4.9's plugins/commands/powershell/command.rb:74 raises HostUnsupported
+    # immediately on any host it doesn't detect as Windows. Refuse with the same message a
+    # developer would otherwise get from a raw Vagrant traceback, pointing at the two working
+    # alternatives instead: `run` for a one-off command, or RDP for an interactive session (the
+    # loopback-only forwarded port every Windows guest already exposes — see that guest's
+    # Vagrantfile). Don't bake in a host assumption beyond this check itself: on an actual
+    # Windows host, `vagrant powershell` works fine and is used as before.
+    if not sys.platform.startswith("win"):
+        print(
+            f"error: `devvm.py ssh {guest.name}` runs `vagrant powershell`, which only works "
+            "on a Windows host — Vagrant 2.4.9 raises HostUnsupported immediately on any other "
+            "host (plugins/commands/powershell/command.rb:74), before ever touching the guest. "
+            f"Use `devvm.py run {guest.name} -- <cmd>` for a one-off command, or RDP into the "
+            "guest for an interactive session (127.0.0.1:3389 by default — see the 'rdp' "
+            f"forwarded_port in scripts/devvm/guests/{guest.name}/Vagrantfile).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    run_vagrant(guest, ["powershell"])
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -826,6 +872,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     # value doesn't survive past this point either way: `run_vagrant`'s own `vagrant winrm -c`
     # call below collapses every nonzero exit code to 1 (see its comment) — only success vs.
     # failure reaches the caller, not which command in the chain failed or with what code.
+    #
+    # That belt-and-suspenders line only helps if windows-run-unelevated.ps1 actually reaches
+    # its own `exit $exitCode` — an uncaught terminating error there (the -TimeoutSeconds
+    # bound, a wrapper crash, a failed Register-ScheduledTask, ...) does NOT reach it, and
+    # without something catching it inside that script, propagates straight through this `&`
+    # call and out of this whole one-liner too, so `exit $LASTEXITCODE` below never runs
+    # either. Confirmed directly (2026-09-25): `vagrant winrm -c 'throw "x"; exit
+    # $LASTEXITCODE'` exits 0, not 1 — every failure path would silently report success to
+    # devvm.py and its caller. windows-run-unelevated.ps1 has its own script-scope `trap` for
+    # exactly this reason (see that script) that turns every terminating error into an
+    # explicit `exit 1` inside its own scope; that trap is what makes the belt-and-suspenders
+    # line below actually meaningful for failure paths, not just the script's own clean exit.
     outer = (
         f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)} "
         f"-TimeoutSeconds {timeout}; "

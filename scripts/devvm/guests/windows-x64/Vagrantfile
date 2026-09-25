@@ -7,10 +7,11 @@
 # timings and the "too slow" escape hatch.
 #
 # Not meant to be run directly with `vagrant up` in this directory — use
-# `scripts/devvm.py up windows-x64`, which sets VAGRANT_DOTFILE_PATH, DEVVM_REPO_ROOT and
-# DEVVM_STAGE_DIR so all state lands under .tmp/devvm/ in the worktree, never in the box's
-# own directory, and DEVVM_WINDOWS_AUTO_CONSENT so the UAC opt-in toggle only turns on when
-# `devvm.py up --allow-elevation` asked for it.
+# `scripts/devvm.py up windows-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_STAGE_DIR so
+# all state lands under .tmp/devvm/ in the worktree, never in the box's own directory. The
+# `--allow-elevation` UAC opt-in toggle is unrelated to this file — it's threaded straight
+# into windows-account-and-uac.ps1's own remote WinRM invocation (see
+# provision_windows_guest's run_windows_script call), never through Vagrantfile ENV at all.
 #
 # Box: stromweld/windows-10, provider qemu, version pinned below. A "vanilla Windows 10"
 # box built with Bento (chef-io/bento) from Microsoft's free evaluation media — evaluation

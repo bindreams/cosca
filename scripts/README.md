@@ -18,8 +18,10 @@ Install on the host yourself — this tool does not install anything for you:
 - [QEMU](https://www.qemu.org/): `brew install qemu`
 - [Vagrant](https://www.vagrantup.com/): `brew install --cask hashicorp-vagrant` (the
   Homebrew cask; the Vagrant.app installer works too)
-- The [vagrant-qemu](https://github.com/ppggff/vagrant-qemu) plugin, or an equivalent QEMU
-  provider for Vagrant: `vagrant plugin install vagrant-qemu`
+- The [vagrant-qemu](https://github.com/ppggff/vagrant-qemu) plugin, pinned to exactly the
+  version `fix_qemu_loopback_only.rb` is verified against (see that file's own comment for
+  why an "equivalent" provider or a different version isn't a safe substitute here):
+  `vagrant plugin install vagrant-qemu --plugin-version 0.6.3`
 - `rsync` (ships with macOS)
 - [`uv`](https://docs.astral.sh/uv/): `brew install uv` — runs `devvm.py` without a separate
   install step
@@ -92,9 +94,10 @@ event 1074, "The license period for this installation of Windows has expired. Th
 operating system is shutting down."), which takes the whole QEMU process down with it —
 mid-provisioning, if that's when it fires, with no crash report on the host side.
 
-`devvm.py up` guards against this itself: on every fresh VM creation (not on `sync` or a
-plain `provision` against an existing guest — evaluation rearms are a limited, consumable
-resource, not something to spend every pass), before any other provisioning step, it reads
+`devvm.py up` guards against this itself: on every `up` (not on `sync` or a plain
+`provision` against an existing guest, which never reach this check — evaluation rearms are
+a limited, consumable resource, not something to spend every pass), before any other
+provisioning step, it reads
 the guest's license state via WMI (`SoftwareLicensingProduct.LicenseStatus`/
 `GracePeriodRemaining`, `SoftwareLicensingService.RemainingWindowsReArmCount` —
 `get_windows_license_state`/`ensure_windows_license_current` in `scripts/devvm.py`; no
@@ -227,7 +230,7 @@ cross-arch emulation; one-time data point on 2026-09-23, not a guarantee):
 | Guest                      | `up` (import → provisioned)                                        | trivial command | `destroy` |
 | -------------------------- | ------------------------------------------------------------------ | --------------- | --------- |
 | `linux-arm64` (native HVF) | ~75s                                                               | <1s             | ~5s       |
-| `windows-x64` (TCG)        | ~13.5 min (import + first boot + WinRM ready + all 3 provisioners) | ~30s            | ~1 min    |
+| `windows-x64` (TCG)        | ~13.5 min (import + first boot + WinRM ready + full provisioning: file upload plus the 5 devvm.py-driven scripts — clean-stage, mirror-tree, lock-tree, account-and-uac, rust) | ~30s            | ~1 min    |
 
 `windows-x64`'s `boot_timeout`/`winrm.timeout` are set to 3600s to give real headroom for a
 slower host or a colder box cache; in practice first boot under TCG on this host landed
@@ -318,8 +321,10 @@ vagrant-qemu 0.6.3 hardcodes the SSH forward with no `host_ip` seam a Vagrantfil
 all, so `host_ip: "127.0.0.1"` in the Vagrantfile alone doesn't cover SSH.
 
 Because this reaches into a private method by name, it's pinned to exactly vagrant-qemu
-`0.6.3` (checked at load time — `vagrant up`/`vagrant provision` refuse to run against any
-other installed version) and fails closed with a hard error if a rewritten forward is ever
+`0.6.3` (checked inside the patched `execute` itself, so only starting QEMU — `vagrant up`,
+`vagrant provision`, `export`/`package` — refuses to run against any other installed version;
+`destroy`/`halt` never call `execute` at all, so a plugin upgrade can never leave a running
+QEMU process unstoppable) and fails closed with a hard error if a rewritten forward is ever
 found still bound to a non-loopback address, rather than silently starting QEMU with a port
 exposed to the LAN.
 

@@ -25,19 +25,24 @@
 # vagrant-qemu release changes Driver#execute's argv shape (e.g. no longer building the
 # hostfwd string this way at all) or the hardcoded SSH-forward construction described above.
 # Two independent guards against that:
-#   1. A version pin checked at load time, below — refuses to load at all against any
-#      vagrant-qemu other than the one this patch was verified against.
+#   1. A version pin checked inside execute() itself, below — refuses to run QEMU at all
+#      against any vagrant-qemu other than the one this patch was verified against.
+#      Deliberately NOT checked at load time (this file is require_relative'd unconditionally
+#      from every guest Vagrantfile, so a load-time check runs on EVERY `vagrant` invocation
+#      that touches this Vagrantfile, including `destroy`/`halt` against an already-running
+#      QEMU process): measured directly (2026-09-25), reading driver.rb end to end - `stop`
+#      (halt) sends QMP commands over the control port or SIGKILLs the process directly, and
+#      `delete` (destroy) only removes files - neither ever calls `execute`. A load-time
+#      check would mean that after a plugin upgrade to an unpinned vagrant-qemu version, THIS
+#      Ruby raise, not just a failed `vagrant up`, is what a developer hits when trying to
+#      `destroy`/`halt` a guest QEMU is still running - permanently orphaning it, with no
+#      `vagrant` command left able to stop it. Checking inside execute() instead means the
+#      pin only ever blocks *starting* a new QEMU process (or an `export`/`package`
+#      `qemu-img` call), never stopping/removing an existing one.
 #   2. A fail-closed post-rewrite assertion inside execute() itself, so even an in-range
 #      version whose behavior somehow doesn't match what's documented above turns into a hard
 #      `vagrant up` failure instead of a silent loopback-only guarantee that no longer holds.
 PINNED_VAGRANT_QEMU_VERSION = "0.6.3"
-installed_version = Vagrant::Plugin::Manager.instance.installed_plugins.dig("vagrant-qemu", "installed_gem_version")
-if installed_version != PINNED_VAGRANT_QEMU_VERSION
-  raise "devvm: fix_qemu_loopback_only.rb is pinned to vagrant-qemu #{PINNED_VAGRANT_QEMU_VERSION}, " \
-        "but #{installed_version.inspect} is installed. This file patches a private method " \
-        "(VagrantPlugins::QEMU::Driver#execute) by name; re-verify the hostfwd rewrite still " \
-        "applies against the new version, then update PINNED_VAGRANT_QEMU_VERSION."
-end
 
 module VagrantPlugins
   module QEMU
@@ -51,6 +56,14 @@ module VagrantPlugins
         HOSTFWD_HOSTADDR = /hostfwd=(?:tcp|udp):([^:]*):/
 
         def execute(*cmd, **opts, &block)
+          installed_version = Vagrant::Plugin::Manager.instance.installed_plugins.dig("vagrant-qemu", "installed_gem_version")
+          if installed_version != PINNED_VAGRANT_QEMU_VERSION
+            raise "devvm: fix_qemu_loopback_only.rb is pinned to vagrant-qemu #{PINNED_VAGRANT_QEMU_VERSION}, " \
+                  "but #{installed_version.inspect} is installed. This file patches a private method " \
+                  "(VagrantPlugins::QEMU::Driver#execute) by name; re-verify the hostfwd rewrite still " \
+                  "applies against the new version, then update PINNED_VAGRANT_QEMU_VERSION."
+          end
+
           cmd = cmd.map do |arg|
             if arg.is_a?(String)
               arg.gsub(/hostfwd=(tcp|udp)::/, "hostfwd=\\1:#{LOOPBACK}:")
@@ -63,7 +76,10 @@ module VagrantPlugins
             next unless arg.is_a?(String)
 
             arg.scan(HOSTFWD_HOSTADDR).each do |(hostaddr)|
-              if hostaddr.nil? || hostaddr.empty? || hostaddr == "0.0.0.0"
+              # Require exactly LOOPBACK, not just "not obviously wrong" (blank/0.0.0.0):
+              # any other concrete address (a LAN IP, "::1", a hostname, ...) is just as
+              # much a loopback-only violation and just as silent if let through.
+              if hostaddr != LOOPBACK
                 raise "devvm: QEMU hostfwd loopback rewrite did not take - found a " \
                       "non-loopback host address in: #{arg.inspect}. This means " \
                       "vagrant-qemu's Driver#execute argv shape no longer matches what this " \

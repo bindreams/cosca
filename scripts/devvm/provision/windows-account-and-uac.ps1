@@ -96,7 +96,8 @@ if ($autologonNeedsChange) {
     Write-Host "devvm: autologon for '$autoLogonUser' was not set (or stale), configured - this needs a reboot before a console session actually exists."
 }
 
-# Last line, always: devvm.py's cmd_up scans stdout for this exact marker.
+# Last line, always: devvm.py's provision_windows_guest scans this script's combined
+# stdout/stderr for this exact marker (REBOOT_MARKER_TRUE/REBOOT_MARKER_FALSE).
 if ($rebootNeeded) {
     Write-Host "DEVVM_REBOOT_REQUIRED=1"
 } else {
