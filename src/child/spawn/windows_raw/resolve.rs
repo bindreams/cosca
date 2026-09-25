@@ -9,7 +9,7 @@
 //! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate concern. The system-directory
 //! step exists to reproduce `CreateProcessW`'s own NULL-`lpApplicationName` search order minus the app
 //! directory, the current directory, and the 16-bit system directory (Win32 provides no function to query it,
-//! and this crate does not reconstruct it — see [`get_windows_directory`]'s doc). The app directory and the
+//! and this crate does not reconstruct it — see [`windows_system_dirs`]'s doc). The app directory and the
 //! current directory ARE queryable; see [`resolve_executable_in`]'s doc for why they are excluded anyway.
 //! [`ChildEnv`] is the child's environment, captured once per spawn from an [`EnvSnapshot`] and a
 //! recorded [`EnvOp`] sequence; resolution reads its `PATH` and [`ChildEnv::into_block`] gives
@@ -43,7 +43,22 @@ use crate::error::Error;
 /// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
 /// promises — and no second read of this process's environment can disagree with the block.
 pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    resolve_executable_in(exe, base, &windows_system_dirs, path, false)
+    resolve_executable_via(exe, base, &windows_system_dirs, path)
+}
+
+/// [`resolve_executable`] with `system_dirs` injectable — the exact function it calls, with only
+/// that one argument replaced. Tests use this, not [`resolve_executable_in`] (which many other
+/// tests also share, for unrelated shapes and both Win32 backends), to pin `resolve_executable`'s
+/// OWN delegation: a closure that panics if called at all proves a `Located` or absolute name never
+/// reaches it, and one that fails proves a bare name's error surfaces rather than being swallowed,
+/// through the same code `resolve_executable` itself runs.
+fn resolve_executable_via(
+    exe: &Path,
+    base: Option<&Path>,
+    system_dirs: &dyn Fn() -> Result<Vec<PathBuf>, Error>,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, Error> {
+    resolve_executable_in(exe, base, system_dirs, path, false)
 }
 
 /// A raw spawn's effective working directory: filled once per spawn, and the one value every later
@@ -112,61 +127,78 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// determined; see [`crate::resolve::ResolveInput::system_dirs`] for the full argument for why
 /// each is excluded and why that does not extend to `System32`/the Windows directory. Step 4 is
 /// left out because Win32 provides no function to query it, and this crate does not reconstruct
-/// it: see [`get_windows_directory`]'s doc. Queried here, at the one caller that has ambient OS
-/// access, rather than inside `crate::resolve` itself, which is deliberately parameterised so its
-/// rules stay exercisable from a POSIX host.
+/// it: Microsoft's own `CreateProcess` reference lists it as searched and says "There is no
+/// function that obtains the path of this directory... The name of this directory is System."
+/// `GetSystemDirectoryW`/`GetWindowsDirectoryW` cover only steps 3 and 5; step 4's path is
+/// conventionally `System` under the Windows directory step 5 returns, though Microsoft's text does
+/// not spell out that relationship explicitly, and this crate does not do that derivation — it
+/// omits step 4 rather than reconstruct a path Win32 itself provides no accessor for. Queried here,
+/// at the one caller that has ambient OS access, rather than inside `crate::resolve` itself, which
+/// is deliberately parameterised so its rules stay exercisable from a POSIX host.
 ///
 /// This function is [`crate::resolve::ResolveInput::system_dirs`] itself — `resolve_executable`
 /// passes it, unevaluated, as that field's closure, so `crate::resolve::resolve` only calls it from
 /// its `BareName` arm, after every shape refusal has already passed. A `Located` or absolute name
-/// never reaches this call at all, so a failed Win32 query cannot break resolving one; see
-/// `a_located_name_still_resolves_when_the_system_dirs_query_fails` in `resolve_tests` for that
-/// proven end to end.
+/// never reaches this call at all, so a failed Win32 query cannot break resolving one. Proven at the
+/// host-independent policy level by `a_located_name_still_resolves_when_the_system_dirs_query_fails`
+/// in `crate::resolve::resolve_tests`, and through this real Windows entry point by
+/// `a_located_and_an_absolute_name_never_query_system_dirs_through_the_real_entry_point` in
+/// `resolve_tests` below, which calls [`resolve_executable_via`] — the exact function
+/// `resolve_executable` delegates to — with a closure that panics if it is ever invoked.
 ///
 /// For a bare name, a step this process cannot determine fails that resolution, rather than being
 /// dropped and falling through to whatever is left: a failed `GetSystemDirectoryW` or
 /// `GetWindowsDirectoryW` call is returned to [`resolve_executable`]'s caller as a spawn error
 /// instead of letting resolution continue on the other directory, then `PATH`. This fails CLOSED,
 /// on purpose: it produces the same accidental widening [`crate::resolve::ResolveInput::system_dirs`]'s
-/// doc describes for a `system_dirs` returning no directories on purpose, so `windows_system_dirs`
-/// and its two accessors below all return the Win32 failure rather than discard it — an ordinary
-/// spawn error instead of a silent search-order change.
+/// doc describes for a `system_dirs` closure that returns no directories on purpose, so
+/// `windows_system_dirs` and [`windows_system_dirs_via`] both return the Win32 failure rather than
+/// discard it — an ordinary spawn error instead of a silent search-order change. Proven through this
+/// same real entry point, for each of the two queries independently, by
+/// `a_bare_name_names_get_system_directory_w_when_the_system_query_fails` and its
+/// `_windows_directory_w_` mirror below.
 fn windows_system_dirs() -> Result<Vec<PathBuf>, Error> {
-    Ok(vec![get_system_directory()?, get_windows_directory()?])
+    windows_system_dirs_via(
+        |buf| {
+            // SAFETY: `GetSystemDirectoryW` writes into the given buffer, or reports the required
+            // length via its return value when the buffer is too small; both are honoured by
+            // `grow_wide_buffer`.
+            unsafe { GetSystemDirectoryW(buf) }
+        },
+        |buf| {
+            // SAFETY: see the `GetSystemDirectoryW` closure above — `GetWindowsDirectoryW` has the
+            // identical contract.
+            unsafe { GetWindowsDirectoryW(buf) }
+        },
+    )
 }
 
-/// The 32-bit Windows system directory (`System32`) — step 3 of `CreateProcessW`'s search order.
-/// Step 1, the directory the running process's own image was loaded from (the app directory), and
-/// step 2, the parent's current directory, are both directories this crate deliberately never
-/// searches: see [`windows_system_dirs`]'s doc for why.
-fn get_system_directory() -> Result<PathBuf, Error> {
-    // SAFETY: `GetSystemDirectoryW` writes into the given buffer, or reports the required length
-    // via its return value when the buffer is too small; both are honoured by `grow_wide_buffer`.
-    get_system_directory_via(|buf| unsafe { GetSystemDirectoryW(buf) })
+/// [`windows_system_dirs`] with each Win32 call injectable — `sys` for `GetSystemDirectoryW`
+/// (`System32`, step 3), `win` for `GetWindowsDirectoryW` (the Windows directory, step 5) — the
+/// exact function `windows_system_dirs` calls, with only its two real closures replaced. A test can
+/// therefore force either query to fail independently and check that the resulting error names the
+/// correct API, which catches `windows_system_dirs` accidentally pairing the wrong closure with the
+/// wrong api-string — invisible on the success path, since both queries return an equally
+/// valid-looking directory — as well as it silently discarding a failure instead of propagating it.
+fn windows_system_dirs_via(
+    sys: impl Fn(Option<&mut [u16]>) -> u32,
+    win: impl Fn(Option<&mut [u16]>) -> u32,
+) -> Result<Vec<PathBuf>, Error> {
+    Ok(vec![get_system_directory_via(sys)?, get_windows_directory_via(win)?])
 }
 
-/// [`get_system_directory`] with the Win32 call injectable, so a test can force a failure through
-/// this exact function — the one `windows_system_dirs` actually calls — rather than through a
-/// re-typed copy of `"GetSystemDirectoryW"` that could drift from the literal above without either
-/// ever being run against the other.
+/// `GetSystemDirectoryW`, injectable — the exact call [`windows_system_dirs`] makes for `System32`
+/// (step 3 of `CreateProcessW`'s search order), through [`windows_system_dirs_via`]'s `sys`
+/// parameter. Step 1, the directory the running process's own image was loaded from (the app
+/// directory), and step 2, the parent's current directory, are both directories this crate
+/// deliberately never searches: see [`windows_system_dirs`]'s doc for why.
 fn get_system_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
     query_wide_dir("GetSystemDirectoryW", f)
 }
 
-/// The Windows directory — step 5 of `CreateProcessW`'s search order. Step 4, the 16-bit Windows
-/// system directory, is skipped here: Microsoft's own `CreateProcess` reference lists it as
-/// searched and says "There is no function that obtains the path of this directory... The name of
-/// this directory is System." `GetSystemDirectoryW`/`GetWindowsDirectoryW` cover only steps 3 and
-/// 5; step 4's path is conventionally `System` under the Windows directory this function returns,
-/// though Microsoft's text does not spell out that relationship explicitly, and this crate does
-/// not do that derivation — it omits step 4 rather than reconstruct a path Win32 itself provides
-/// no accessor for.
-fn get_windows_directory() -> Result<PathBuf, Error> {
-    // SAFETY: see `get_system_directory` — `GetWindowsDirectoryW` has the identical contract.
-    get_windows_directory_via(|buf| unsafe { GetWindowsDirectoryW(buf) })
-}
-
-/// [`get_windows_directory`] with the Win32 call injectable — see [`get_system_directory_via`].
+/// `GetWindowsDirectoryW`, injectable — the [`windows_system_dirs_via`] `win` mirror of
+/// [`get_system_directory_via`]; see its doc, and [`windows_system_dirs`]'s for why step 4 (the
+/// 16-bit system directory) is not derived from this one's result.
 fn get_windows_directory_via(f: impl Fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, Error> {
     query_wide_dir("GetWindowsDirectoryW", f)
 }

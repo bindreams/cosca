@@ -395,12 +395,18 @@ fn windows_system_dirs_are_real_existing_directories() {
         assert!(dir.is_dir(), "{dir:?} is not a real, existing directory");
     }
 
-    // Call each private accessor directly, not just the aggregate: the exact-list assertion below
-    // needs their individual return values to compare `dirs` against, and asserting each is
+    // Call each real Win32 accessor directly, not just the aggregate: the exact-list assertion
+    // below needs their individual return values to compare `dirs` against, and asserting each is
     // `Ok` here — rather than folding that into the comparison — gives a query failure its own
     // specific message instead of surfacing as a generic list mismatch.
-    let sys32 = get_system_directory();
-    let win = get_windows_directory();
+    let sys32 = get_system_directory_via(|buf| {
+        // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
+        unsafe { GetSystemDirectoryW(buf) }
+    });
+    let win = get_windows_directory_via(|buf| {
+        // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
+        unsafe { GetWindowsDirectoryW(buf) }
+    });
     assert!(
         sys32.is_ok(),
         "GetSystemDirectoryW should succeed under the test runner, got {sys32:?}"
@@ -420,12 +426,11 @@ fn windows_system_dirs_are_real_existing_directories() {
         "expected exactly [System32, Windows dir], got {dirs:?}"
     );
 
-    // The exact-list pin above only compares against `get_system_directory`/`get_windows_directory`
-    // themselves, so it cannot catch either of THOSE accessors wrongly returning the app directory.
-    // Check independently, against `current_exe()` directly: never the app directory (this crate
-    // treats it as a planting vector and must not search it) — see also
-    // `the_app_directory_is_not_searched` below, which proves this end to end through
-    // `resolve_executable`.
+    // The exact-list pin above only compares `dirs` against a second, independent pair of real
+    // Win32 calls, so it cannot catch BOTH sides wrongly returning the app directory. Check
+    // independently, against `current_exe()` directly: never the app directory (this crate treats
+    // it as a planting vector and must not search it) — see also `the_app_directory_is_not_searched`
+    // below, which proves this end to end through `resolve_executable`.
     let app_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     assert!(
         !dirs.contains(&app_dir),
@@ -440,8 +445,8 @@ fn windows_system_dirs_are_real_existing_directories() {
 /// `windows_system_dirs`'s doc for why a silent drop would be a WIDENING this module treats as no
 /// more acceptable than a deliberate one. No real Win32 failure is needed to exercise this:
 /// `query_wide_dir` takes the Win32 call as a closure, so a fake one that always reports failure
-/// exercises the exact propagation path `get_system_directory`/`get_windows_directory` rely on, on
-/// any host that compiles this module.
+/// exercises the exact propagation path `get_system_directory_via`/`get_windows_directory_via` rely
+/// on, on any host that compiles this module.
 #[test]
 fn a_system_directory_query_failure_is_not_silently_dropped() {
     let err = query_wide_dir("GetSystemDirectoryW", |_buf| 0).unwrap_err();
@@ -455,13 +460,14 @@ fn a_system_directory_query_failure_is_not_silently_dropped() {
     );
 }
 
-/// [`get_system_directory_via`] is the exact function [`get_system_directory`] calls with the real
-/// Win32 closure — `windows_system_dirs`, `resolve_executable`'s real chain, reaches it through no
-/// other path. Forcing failure HERE, rather than through a re-typed `query_wide_dir("...", ...)`
-/// call, is what would catch `get_system_directory`/`get_windows_directory` accidentally swapping
-/// which literal API name they hand to `query_wide_dir`: asserting the OTHER api string is absent,
-/// not just that the right one is present, is what makes a swap fail this test instead of silently
-/// passing it (both queries fail identically, so a wrong name would still "contain an API name").
+/// [`get_system_directory_via`] is the exact function [`windows_system_dirs`] calls, through
+/// [`windows_system_dirs_via`]'s `sys` parameter, for `System32` — `resolve_executable`'s real
+/// chain reaches it through no other path. Forcing failure HERE, rather than through a re-typed
+/// `query_wide_dir("...", ...)` call, is what would catch `get_system_directory_via`/
+/// `get_windows_directory_via` accidentally swapping which literal API name they hand to
+/// `query_wide_dir`: asserting the OTHER api string is absent, not just that the right one is
+/// present, is what makes a swap fail this test instead of silently passing it (both queries fail
+/// identically, so a wrong name would still "contain an API name").
 #[test]
 fn get_system_directory_via_names_its_own_api_on_failure() {
     let err = get_system_directory_via(|_buf| 0).unwrap_err();
@@ -486,36 +492,116 @@ fn get_windows_directory_via_names_its_own_api_on_failure() {
     assert!(!msg.contains("GetSystemDirectoryW"), "{msg:?}");
 }
 
-/// The real chain end to end, with only the Win32 call itself swapped for one that always fails:
-/// `get_system_directory_via`/`get_windows_directory_via` — the exact functions
-/// `get_system_directory`/`get_windows_directory` call, with only their real Win32 closure argument
-/// replaced — feed `resolve_executable_in`'s `system_dirs` closure directly, the same shape
-/// `windows_system_dirs` itself has. A bare name's resolution must surface the OS query's own
-/// error, naming which API failed, instead of silently falling through to `PATH` (which does have
-/// a matching file planted, so a pass here could only come from swallowing the failure).
+/// [`resolve_executable`]'s own delegation, not `resolve_executable_in`'s (which many other tests
+/// here also call, for unrelated shapes and cases, and so would still pass even if
+/// `resolve_executable` itself started querying `system_dirs` eagerly rather than lazily): a
+/// `Located` name (one containing a separator) and an absolute path both resolve through
+/// [`resolve_executable_via`] — the exact function `resolve_executable` calls, with only its
+/// `&windows_system_dirs` argument replaced — without ever invoking `system_dirs`, proven by a
+/// closure that PANICS if called at all, rather than one that merely returns an error a search
+/// could recover from by falling through to the next step. This is the real-entry-point mirror of
+/// `a_located_name_still_resolves_when_the_system_dirs_query_fails` in
+/// `crate::resolve::resolve_tests`, which proves the same property at the host-independent policy
+/// level with a fabricated closure rather than through `resolve_executable`'s own wiring.
 #[test]
-fn a_bare_name_fails_closed_naming_the_failed_api_through_the_real_chain() {
+fn a_located_and_an_absolute_name_never_query_system_dirs_through_the_real_entry_point() {
+    let panics =
+        || -> Result<Vec<PathBuf>, Error> { panic!("system_dirs must not be queried for a Located or absolute name") };
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("sp_via_located.exe");
+    std::fs::write(&file, b"x").unwrap();
+
+    // Located: the name contains a separator.
+    let located = Path::new(".").join(file.file_name().unwrap());
+    let got = resolve_executable_via(&located, Some(dir.path()), &panics, None).unwrap();
+    assert_eq!(got.canonicalize().unwrap(), file.canonicalize().unwrap());
+
+    // Absolute.
+    let got = resolve_executable_via(&file, Some(dir.path()), &panics, None).unwrap();
+    assert_eq!(got.canonicalize().unwrap(), file.canonicalize().unwrap());
+}
+
+/// A bare name's resolution error names `GetSystemDirectoryW` when that is the query that fails,
+/// through the real chain end to end: [`resolve_executable_via`] — the exact function
+/// `resolve_executable` calls — fed [`windows_system_dirs_via`] itself, the exact function
+/// `windows_system_dirs` calls, with only its `sys` closure replaced and `win` left real. Unlike
+/// `get_system_directory_via_names_its_own_api_on_failure`, which calls
+/// [`get_system_directory_via`] directly, this proves the naming survives `windows_system_dirs_via`'s
+/// own pairing of closure to api-string too, not just `query_wide_dir`'s. A matching file is planted
+/// on `PATH`, so a pass here could only come from swallowing the failure and falling through to it.
+#[test]
+fn a_bare_name_names_get_system_directory_w_when_the_system_query_fails() {
     let pathdir = tempfile::tempdir().unwrap();
-    std::fs::write(pathdir.path().join("sp_realchain.exe"), b"x").unwrap();
-    let system_dirs_fn = || -> Result<Vec<PathBuf>, Error> { Ok(vec![get_system_directory_via(|_buf| 0)?]) };
+    std::fs::write(pathdir.path().join("sp_sysfail.exe"), b"x").unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let err = resolve_executable_in(
-        std::path::Path::new("sp_realchain"),
+    let system_dirs_fn = || {
+        windows_system_dirs_via(
+            |_buf| 0,
+            |buf| {
+                // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
+                unsafe { GetWindowsDirectoryW(buf) }
+            },
+        )
+    };
+    let err = resolve_executable_via(
+        Path::new("sp_sysfail"),
         Some(cwd.path()),
         &system_dirs_fn,
         Some(pathdir.path().as_os_str()),
-        false,
     )
     .unwrap_err();
     let msg = match err {
         Error::Io(e) => e.to_string(),
         other => panic!("expected Io, got {other:?}"),
     };
-    assert!(
-        msg.contains("GetSystemDirectoryW"),
-        "the error should name which query failed, and not have been swallowed in favor of \
-         searching PATH: {msg:?}"
-    );
+    assert!(msg.contains("GetSystemDirectoryW"), "{msg:?}");
+    assert!(!msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+}
+
+/// The [`a_bare_name_names_get_system_directory_w_when_the_system_query_fails`] mirror, with `win`
+/// forced to fail and `sys` left real — see its doc.
+#[test]
+fn a_bare_name_names_get_windows_directory_w_when_the_windows_query_fails() {
+    let pathdir = tempfile::tempdir().unwrap();
+    std::fs::write(pathdir.path().join("sp_winfail.exe"), b"x").unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let system_dirs_fn = || {
+        windows_system_dirs_via(
+            |buf| {
+                // SAFETY: see `windows_system_dirs`'s own closures — identical contract.
+                unsafe { GetSystemDirectoryW(buf) }
+            },
+            |_buf| 0,
+        )
+    };
+    let err = resolve_executable_via(
+        Path::new("sp_winfail"),
+        Some(cwd.path()),
+        &system_dirs_fn,
+        Some(pathdir.path().as_os_str()),
+    )
+    .unwrap_err();
+    let msg = match err {
+        Error::Io(e) => e.to_string(),
+        other => panic!("expected Io, got {other:?}"),
+    };
+    assert!(msg.contains("GetWindowsDirectoryW"), "{msg:?}");
+    assert!(!msg.contains("GetSystemDirectoryW"), "{msg:?}");
+}
+
+/// A drive-relative name (`C:tool`) is refused as `InvalidInput` before any search — see
+/// [`resolve_executable_in`]'s doc — so `system_dirs` must never be consulted for it, even one that
+/// would panic if called, through the real entry point [`resolve_executable_via`].
+#[test]
+fn a_drive_relative_name_is_refused_without_querying_system_dirs() {
+    let panics =
+        || -> Result<Vec<PathBuf>, Error> { panic!("system_dirs must not be queried for a drive-relative name") };
+    let cwd = tempfile::tempdir().unwrap();
+    let err = resolve_executable_via(Path::new("C:tool"), Some(cwd.path()), &panics, None).unwrap_err();
+    match err {
+        Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e:?}"),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
 }
 
 /// [`query_wide_dir`] wraps the Win32 failure through [`crate::error::io_context`] rather than a

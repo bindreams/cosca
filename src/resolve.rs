@@ -103,7 +103,7 @@ pub(crate) struct ResolveInput<'a> {
     /// - The 16-bit system directory is left out because Win32 exposes no function to obtain its
     ///   path directly. This crate could in principle reconstruct it from the Windows directory
     ///   plus the name `System` Microsoft gives it, but does not (see
-    ///   `windows_raw::resolve::get_windows_directory`'s doc for Microsoft's own wording and why
+    ///   `windows_raw::resolve::windows_system_dirs`'s doc for Microsoft's own wording and why
     ///   not).
     /// - The current directory and the app directory (the directory this process's own image
     ///   loaded from) ARE queryable, and excluding both is a deliberate choice: each is a
@@ -132,13 +132,13 @@ pub(crate) struct ResolveInput<'a> {
     /// app directory pre-empt `PATH`.
     ///
     /// `System32` and the Windows directory keep their precedence over `PATH` regardless: a caller
-    /// leaving `system_dirs` empty — dropping them too — would be a straightforward WIDENING, not a
-    /// narrowing, letting a user-writable directory placed early on `PATH` (a dev toolchain
-    /// install, an `%LOCALAPPDATA%\...\WindowsApps` shim) shadow e.g. `System32\find.exe`, a way to
-    /// load the wrong binary that `CreateProcessW`'s own order (`System32` ahead of `PATH`)
-    /// prevents. The caller supplies this closure (rather than this module calling
-    /// `GetSystemDirectoryW`/`GetWindowsDirectoryW` itself) so the rule stays testable from a POSIX
-    /// host, exactly like `windows` below.
+    /// supplying a `system_dirs` closure that returns no directories — dropping them too — would be
+    /// a straightforward WIDENING, not a narrowing, letting a user-writable directory placed early
+    /// on `PATH` (a dev toolchain install, an `%LOCALAPPDATA%\...\WindowsApps` shim) shadow e.g.
+    /// `System32\find.exe`, a way to load the wrong binary that `CreateProcessW`'s own order
+    /// (`System32` ahead of `PATH`) prevents. The caller supplies this closure (rather than this
+    /// module calling `GetSystemDirectoryW`/`GetWindowsDirectoryW` itself) so the rule stays
+    /// testable from a POSIX host, exactly like `windows` below.
     pub system_dirs: &'a dyn Fn() -> Result<Vec<PathBuf>, Error>,
     /// The `PATH` the CHILD will see, after `env()`/`env_clear()`.
     pub path_var: Option<&'a OsStr>,
