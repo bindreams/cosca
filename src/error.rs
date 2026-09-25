@@ -189,8 +189,10 @@ where
     },
     /// A spawn failed after creating its child, and the child could not be killed — a setuid
     /// child refuses the kill with `EPERM`. `error` is why the spawn failed and `kill` why the kill
-    /// did. The child is still running, and is handed back: waiting for it is the caller's, and
-    /// dropping `child` blocks until it exits. See [`Unreaped`](crate::Unreaped).
+    /// did. The one check made at that point found it still running, but nothing after that point
+    /// watches it, so by the time this error reaches the caller it may already have exited on its
+    /// own — reaping it, not just waiting for it, is the caller's, and dropping `child` blocks
+    /// until it does. See [`Unreaped`](crate::Unreaped).
     #[error("a failed spawn's child could not be killed ({kill}) and is handed back unreaped")]
     Unreaped {
         #[source]
