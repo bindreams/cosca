@@ -7,8 +7,10 @@ session about — Linux guests never touch this module. Imports shared primitive
 run_vagrant, ...) from devvm_common.py rather than from devvm.py itself, so devvm.py can
 import this module without an import cycle.
 
-Not meaningfully testable on its own — every function here shells out to vagrant/WinRM and is
-only testable inside a real guest; see devvm_test.py's module docstring and scripts/README.md.
+Most of this module shells out to vagrant/WinRM and is only testable inside a real guest; see
+devvm_test.py's module docstring and scripts/README.md. The handful of functions pulled out as
+pure logic (should_wait_for_session, parse_reboot_required_marker) are the exception and have
+their own unit tests in devvm_test.py.
 """
 
 from __future__ import annotations
@@ -236,8 +238,8 @@ def get_windows_interactive_username(guest: Guest, deadline: float) -> tuple[str
     session.
 
     devvm.py's cmd_run passes the result of this through as -InteractiveUser to
-    windows-run-unelevated.ps1, which used to run this identical WMI query independently — see
-    that script's own $currentUser assignment.
+    windows-run-unelevated.ps1, which does not run this WMI query itself — see that script's own
+    $currentUser assignment.
 
     Bounded by `deadline` (a time.monotonic() value) via run_vagrant_winrm_bounded — see its
     docstring for why a plain `timeout=` isn't safe here.
@@ -489,6 +491,22 @@ def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> bo
     return True
 
 
+def parse_reboot_required_marker(account_output: str) -> bool | None:
+    """Parse windows-account-and-uac.ps1's own DEVVM_REBOOT_REQUIRED=0/1 marker out of its
+    combined WinRM output (see REBOOT_MARKER_TRUE/REBOOT_MARKER_FALSE). True/False mirror the
+    marker's own claim; None means neither marker string appeared at all — a bug in the
+    provisioner script, not something to silently proceed past. If both somehow appear, True
+    wins, matching this function's caller checking REBOOT_MARKER_TRUE first. Pulled out as its
+    own pure function, mirroring should_wait_for_session below, so this parsing has a unit test
+    independent of a live guest.
+    """
+    if REBOOT_MARKER_TRUE in account_output:
+        return True
+    if REBOOT_MARKER_FALSE in account_output:
+        return False
+    return None
+
+
 def should_wait_for_session(*, started_guest: bool, rebooted: bool) -> bool:
     """Whether provision_windows_guest's own invocation just produced a fresh boot, and so
     should wait for a real interactive (autologon) session before returning — see that
@@ -510,8 +528,8 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     clean of any wait_for_reboot call, so there's no reason to reimplement WinRM file upload
     by hand) re-populates C:\\cosca-stage; windows-mirror-tree.ps1 and windows-lock-tree.ps1
     depend on that upload; windows-account-and-uac.ps1 and windows-rust.ps1 are independent of
-    each other but both come last, matching the original order (rust installs before the
-    reboot-required check, same as before this refactor).
+    each other but both come last, with rust installed before the reboot-required check below
+    is acted on.
 
     The license-rearm check (create only) runs before every other provisioning step,
     including windows-clean-stage.ps1: an expired-eval shutdown can land mid-step regardless
@@ -539,7 +557,7 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-clean-stage.ps1", elevated=True, display=display)
     # The lone remaining Vagrantfile-declared provisioner: uploads the staged tree into
     # C:/cosca-stage. `run: "always"` on it means a plain `vagrant provision` re-runs it every
-    # time, same as before this refactor.
+    # time.
     run_vagrant(guest, ["provision"], display=display)
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-mirror-tree.ps1", elevated=True, display=display)
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-lock-tree.ps1", elevated=True, display=display)
@@ -552,7 +570,16 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     )
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-rust.ps1", elevated=False, display=display)
 
-    if REBOOT_MARKER_TRUE in account_output:
+    reboot_required = parse_reboot_required_marker(account_output)
+    if reboot_required is None:
+        print(
+            "error: windows-account-and-uac.ps1 did not print a DEVVM_REBOOT_REQUIRED "
+            "marker — can't tell whether a reboot is needed, so refusing to guess. This is a "
+            "bug in the provisioner script, not something to silently proceed past.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    elif reboot_required:
         print(
             "note: an EnableLUA or autologon change needs a reboot to take effect — "
             "rebooting the guest now directly (devvm.py-driven; see reboot_windows_guest_and_wait, "
@@ -561,14 +588,6 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
         )
         reboot_windows_guest_and_wait(guest)
         rebooted = True
-    elif REBOOT_MARKER_FALSE not in account_output:
-        print(
-            "error: windows-account-and-uac.ps1 did not print a DEVVM_REBOOT_REQUIRED "
-            "marker — can't tell whether a reboot is needed, so refusing to guess. This is a "
-            "bug in the provisioner script, not something to silently proceed past.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # A real interactive (autologon) session may not exist yet the moment this returns, and
     # windows-run-unelevated.ps1's scheduled task needs one to borrow a filtered token from —

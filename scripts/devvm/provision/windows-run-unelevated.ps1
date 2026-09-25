@@ -144,12 +144,12 @@ $logPath = "$env:TEMP\$taskName.log.txt"
 # "missing mandatory parameter: UserId".
 #
 # Resolved by the caller (devvm.py's cmd_run, via get_windows_interactive_username), not here:
-# that Python-side helper and this script used to run the identical explorer.exe-owner-via-WMI
-# query independently - see get_windows_interactive_username's own docstring in devvm.py for
-# the full "why explorer.exe, not Win32_ComputerSystem.UserName or
-# Win32_LoggedOnUser/Win32_LogonSession" reasoning, which applies equally to both call sites.
-# devvm.py already fails loudly there if nobody is logged on interactively, before this script
-# ever runs.
+# this script does not run its own explorer.exe-owner-via-WMI query - see
+# get_windows_interactive_username's own docstring in devvm_windows.py for the full "why
+# explorer.exe, not Win32_ComputerSystem.UserName or Win32_LoggedOnUser/Win32_LogonSession"
+# reasoning, which applies here too, since this script would otherwise just be re-running the
+# identical query a second time. devvm.py already fails loudly there if nobody is logged on
+# interactively, before this script ever runs.
 $currentUser = $InteractiveUser
 # RDP recovery guidance is threaded through to the two sites below that can surface a logon
 # that was usable when devvm.py resolved it but isn't by the time this script actually needs
@@ -217,6 +217,14 @@ function Invoke-Bounded {
       over, from `[Math]::Ceiling` rounding plus BeginStop overhead) — a second number that
       looks precise but adds no real information beyond the one budget the caller already
       knows and states in $TimeoutMessage.
+
+      Sets $script:InvokeBoundedStarted to $true only once BeginInvoke() has actually launched a
+      pipeline, $false at the start of every call otherwise (including the $TimeoutSeconds -le 0
+      case below, which throws before anything starts). A caller distinguishing "the call I made
+      actually started running and then timed out" (where an abandoned runspace may still be
+      live - see the BeginStop comment above) from "there was no budget left to even try" (where
+      nothing was ever started, so there is nothing to race) reads this flag right after
+      catching $TimeoutMessage - see Register-/Start-ScheduledTask's own $setupTimedOut below.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -228,6 +236,7 @@ function Invoke-Bounded {
         [Parameter(Mandatory = $true)]
         [string]$TimeoutMessage
     )
+    $script:InvokeBoundedStarted = $false
     if ($TimeoutSeconds -le 0) {
         throw $TimeoutMessage
     }
@@ -238,6 +247,7 @@ function Invoke-Bounded {
             [void]$ps.AddParameter($key, $Parameters[$key])
         }
         $asyncResult = $ps.BeginInvoke()
+        $script:InvokeBoundedStarted = $true
     } catch {
         # Setup itself failed before there was ever a pipeline actually running - safe (and
         # necessary) to dispose here, unlike the timeout path below.
@@ -254,8 +264,8 @@ function Invoke-Bounded {
             $ps.EndInvoke($asyncResult) | Out-Null
         } catch [System.Management.Automation.MethodInvocationException] {
             # A ScriptBlock that itself throws an uncaught terminating error (e.g.
-            # Register-ScheduledTask's own catch/throw below) surfaces here, not via
-            # $ps.HadErrors below: EndInvoke() rethrows it wrapped in a
+            # Register-ScheduledTask's own catch/throw below) surfaces here, not via the
+            # $ps.Streams.Error.Count check below: EndInvoke() rethrows it wrapped in a
             # MethodInvocationException whose own message is generic ("Exception calling
             # "EndInvoke" with "1" argument(s): ..."). Unwrap to the ScriptBlock's real
             # exception so callers see the friendly message it actually threw.
@@ -458,10 +468,12 @@ Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 # $scriptPath on the guest if, say, the pipe's SDDL construction or the NamedPipeServerStream
 # constructor itself threw in between.
 #
-# $setupTimedOut tracks whether Register-/Start-ScheduledTask's own Invoke-Bounded call timed
-# out specifically (as opposed to the ScriptBlock inside it throwing a normal, already-complete
-# error) - Invoke-Bounded's own contract on timeout is BeginStop (async) with no Dispose(), so
-# the abandoned runspace may still be actually running Register-/Start-ScheduledTask when this
+# $setupTimedOut tracks whether Register-/Start-ScheduledTask's own Invoke-Bounded call actually
+# started running and then timed out (as opposed to the ScriptBlock inside it throwing a normal,
+# already-complete error, or the call never starting at all because its budget was already
+# exhausted - see $script:InvokeBoundedStarted in Invoke-Bounded's own docstring) - Invoke-
+# Bounded's own contract on a real timeout is BeginStop (async) with no Dispose(), so the
+# abandoned runspace may still be actually running Register-/Start-ScheduledTask when this
 # script reaches its cleanup below. Unregistering the task or deleting its files in that window
 # would race that still-in-flight call: it could re-create the task (Register) or leave it
 # freshly started (Start) right after cleanup just removed it. The `finally` block below skips
@@ -502,8 +514,8 @@ try {
             # console on vagrant's desktop - QuickEdit-mode text selection in that window (or
             # any other way of pausing it) blocks a console write indefinitely, which would
             # block the wrapper before it ever reaches taskkill or its own pipe write. See "If
-            # a run hangs anyway" in the header above for the residual case even this doesn't
-            # cover, and why this script deliberately does not add a second timer for it.
+            # a run hangs" in the header above for the residual case even this doesn't cover,
+            # and why this script deliberately does not add a second timer for it.
             $action = New-ScheduledTaskAction -Execute "powershell" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $ScriptPath"
             $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
             # Without this, Task Scheduler applies its own default ExecutionTimeLimit (commonly
@@ -520,8 +532,8 @@ try {
                 # without -ErrorAction Stop here, a forced registration failure (e.g. no
                 # interactive session to borrow) writes to the error stream and returns
                 # normally, so this catch never runs and the friendly RDP-recovery message
-                # below never fires. Invoke-Bounded's own HadErrors check still catches that
-                # case and throws $ps.Streams.Error[0].Exception, so the caller does see a
+                # below never fires. Invoke-Bounded's own Streams.Error.Count check still catches
+                # that case and throws $ps.Streams.Error[0].Exception, so the caller does see a
                 # failure either way - just Register-ScheduledTask's own generic error, not
                 # this script's friendly RDP-recovery wrapping.
                 Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
@@ -530,7 +542,12 @@ try {
             }
         }
     } catch {
-        if ($_.Exception.Message -eq $registerTimeoutMessage) {
+        # -and $script:InvokeBoundedStarted: a budget that was already <= 0 when this call began
+        # (Get-RemainingSeconds already at/past zero) throws this same $registerTimeoutMessage
+        # without ever calling BeginInvoke - nothing is running on an abandoned runspace in that
+        # case, so there is no race for skipping cleanup below to protect against, only a
+        # scheduled task this run never even tried to register.
+        if ($_.Exception.Message -eq $registerTimeoutMessage -and $script:InvokeBoundedStarted) {
             $setupTimedOut = $true
         }
         throw
@@ -599,7 +616,10 @@ try {
                 Start-ScheduledTask -TaskName $TaskName
             }
     } catch {
-        if ($_.Exception.Message -eq $startTimeoutMessage) {
+        # Same reasoning as the Register-ScheduledTask catch above: -and
+        # $script:InvokeBoundedStarted excludes the already-exhausted-budget case, which never
+        # called BeginInvoke and so left nothing running to race.
+        if ($_.Exception.Message -eq $startTimeoutMessage -and $script:InvokeBoundedStarted) {
             $setupTimedOut = $true
         }
         throw
@@ -702,13 +722,12 @@ try {
                 -ScriptBlock {
                     param($TaskName)
                     # Existence-checked first, not -ErrorAction SilentlyContinue on
-                    # Unregister-ScheduledTask itself: that used to silently swallow a GENUINE
-                    # Unregister failure (as opposed to "there was nothing to unregister")
-                    # together with Invoke-Bounded's own (now-fixed) HadErrors bug, so a real
-                    # failure never reached the Write-Warning below. Checking existence first,
-                    # then using -ErrorAction Stop only once the task is confirmed present, lets
-                    # a genuine failure surface through Invoke-Bounded's already-fixed
-                    # EndInvoke-unwrap path instead of being swallowed twice over.
+                    # Unregister-ScheduledTask itself: -ErrorAction SilentlyContinue there would
+                    # swallow a GENUINE Unregister failure (as opposed to "there was nothing to
+                    # unregister") before it ever reaches the Write-Warning below. Checking
+                    # existence first, then using -ErrorAction Stop only once the task is
+                    # confirmed present, lets a genuine failure surface through Invoke-Bounded's
+                    # EndInvoke-unwrap path instead.
                     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
                     if ($task) {
                         # Best-effort: Stop-ScheduledTask kills the wrapper's action process if

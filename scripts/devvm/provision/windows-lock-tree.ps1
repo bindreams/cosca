@@ -1,5 +1,5 @@
 # Strips write access from the uploaded working-tree copy (see windows-mirror-tree.ps1,
-# which devvm.py's provision_windows_guest runs directly over `vagrant winrm` just before
+# which devvm_windows.py's provision_windows_guest runs directly over `vagrant winrm` just before
 # this - not a Vagrantfile-declared provisioner; see that Vagrantfile's own comment on why -
 # and mirrors the WinRM-uploaded staging copy into this path). Best-effort footgun
 # prevention, matching the rsync --chmod=F444 used for the Linux guests - not a security

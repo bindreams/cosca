@@ -360,14 +360,18 @@ def cmd_list(_args: argparse.Namespace) -> None:
 def cmd_up(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
-    dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
     display = bool(getattr(args, "display", False))
+    # Both flag-validity checks run before dotfile_dir's mkdir or any other side effect below:
+    # a validation check that's supposed to reject a flag combination should never let a real
+    # filesystem/subprocess side effect happen first, on this or a later line, if it fails to
+    # fire (e.g. a boundary-condition typo) — fail loudly with nothing to have already done.
     if args.allow_elevation and guest.communicator != "winrm":
         print("error: --allow-elevation only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
     if display and guest.communicator != "winrm":
         print("error: --display only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
+    dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
     if guest.communicator == "winrm":
         # `--allow-elevation`/`--no-allow-elevation` explicitly sets and persists the choice;
         # omitting the flag reuses whatever was last persisted (default off) instead of
@@ -508,15 +512,29 @@ def cmd_run(args: argparse.Namespace) -> None:
     # windows-run-unelevated.ps1's scheduled task needs an explicit interactive logon to borrow
     # a token from (see that script's own $currentUser comment) — resolved here, once, instead
     # of the guest-side script re-running the identical WMI query a second time.
-    interactive_deadline = time.monotonic() + 30
+    #
+    # Bounded by `timeout` itself, not a short hardcoded window: this is a real `vagrant winrm`
+    # round-trip against a guest that can be under TCG emulation, where even a trivial command
+    # commonly takes on the order of 30s — a fixed 30s budget here previously made this lookup
+    # itself the thing that timed out, which then misreported as "no interactive logon" instead
+    # of a timeout.
+    interactive_deadline = time.monotonic() + timeout
     interactive_user, interactive_output = get_windows_interactive_username(guest, interactive_deadline)
     if interactive_user is None:
-        print(
-            "error: no interactive (session 1, console or RDP-redirected) logon for 'vagrant' "
-            "was found, so there is no logon for --unelevated's scheduled task to borrow. See "
-            "windows-account-and-uac.ps1's autologon setup.",
-            file=sys.stderr,
-        )
+        if time.monotonic() >= interactive_deadline:
+            print(
+                f"error: timed out after {timeout}s waiting for WinRM to report whether "
+                "'vagrant' has an interactive (session 1, console or RDP-redirected) logon. "
+                "Try a longer --timeout.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "error: no interactive (session 1, console or RDP-redirected) logon for 'vagrant' "
+                "was found, so there is no logon for --unelevated's scheduled task to borrow. See "
+                "windows-account-and-uac.ps1's autologon setup.",
+                file=sys.stderr,
+            )
         if interactive_output.strip():
             print(f"Last WinRM output:\n{interactive_output}", file=sys.stderr)
         sys.exit(1)

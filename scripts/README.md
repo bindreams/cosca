@@ -110,7 +110,7 @@ consumable resource, not something to spend every pass), before any other provis
 it reads the guest's license state via WMI
 (`SoftwareLicensingProduct.LicenseStatus`/`GracePeriodRemaining`,
 `SoftwareLicensingService.RemainingWindowsReArmCount` —
-`get_windows_license_state`/`ensure_windows_license_current` in `scripts/devvm.py`; no
+`get_windows_license_state`/`ensure_windows_license_current` in `scripts/devvm_windows.py`; no
 parsing of `slmgr`'s free-text output). If the license is expired or within a day of
 expiring, it runs `slmgr /rearm` and reboots (via `reboot_windows_guest_and_wait`) for the
 rearm to take effect, then re-checks via WMI and fails loudly if the license still isn't
@@ -125,7 +125,7 @@ investigation.
 declares exactly one provisioner (the WinRM `file` upload). Every other Windows provisioning
 step (`windows-clean-stage.ps1`, `windows-mirror-tree.ps1`, `windows-lock-tree.ps1`,
 `windows-account-and-uac.ps1`, `windows-rust.ps1`) is driven directly by `devvm.py` over
-`vagrant winrm` (`provision_windows_guest`/`run_windows_script` in `scripts/devvm.py`), not
+`vagrant winrm` (`provision_windows_guest`/`run_windows_script` in `scripts/devvm_windows.py`), not
 through Vagrant's `config.vm.provision "shell", ...`. This was a deliberate fix, not a style
 choice: vagrant 2.4.9's shell-provisioner WinRM path (`provision_winrm`) calls the guest's
 `wait_for_reboot` capability **unconditionally**, at the start of every single shell-
@@ -144,7 +144,7 @@ never reaches that capability — confirmed by reading vagrant's
 `plugins/commands/winrm/command.rb` and `plugins/communicators/winrm/{communicator,shell}.rb`
 end to end — so driving each script that way removes the fuse entirely. The one legitimate
 reboot this guest ever needs (`EnableLUA`/autologon changes only take effect at the next boot)
-is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py` (a
+is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm_windows.py` (a
 real `shutdown /r`, then a bounded wait for a volatile registry marker — set before the
 reboot, guaranteed by Windows not to survive one — to clear). Separately,
 `provision_windows_guest` calls `wait_for_windows_session` conditionally — only when this

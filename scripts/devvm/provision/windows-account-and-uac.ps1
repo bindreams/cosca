@@ -5,7 +5,7 @@
 # (session 1) logon exists for windows-run-unelevated.ps1's Register-ScheduledTask
 # (-LogonType Interactive) probe runner to borrow. Idempotent: safe to re-run any time this
 # script runs, which is every `up`/`sync` — it's driven directly over `vagrant winrm` by
-# run_windows_script (scripts/devvm.py), not Vagrant's shell provisioner.
+# run_windows_script (scripts/devvm_windows.py), not Vagrant's shell provisioner.
 #
 # ConsentPromptBehaviorAdmin is only flipped away from the interactive default (5) when
 # DEVVM_WINDOWS_AUTO_CONSENT=1 is set — see scripts/devvm.py's --allow-elevation flag and
@@ -16,7 +16,7 @@
 # at the NEXT LOGON — changing them live does nothing for an already-running session. This
 # script only detects and applies changes (never blindly reboots on every run) and reports
 # whether one is needed via a DEVVM_REBOOT_REQUIRED marker on its last output line;
-# provision_windows_guest (scripts/devvm.py) scans for that marker and, if set, calls
+# provision_windows_guest (scripts/devvm_windows.py) scans for that marker and, if set, calls
 # reboot_windows_guest_and_wait to actually reboot (issued directly, not via Vagrant's
 # reboot-if-needed/wait_for_reboot capability — see the Vagrantfile's provisioning comment for
 # why). It does NOT re-run this script afterward to re-verify the settings — the write above
@@ -60,12 +60,18 @@ if ($null -eq $account) {
 if ($account.SID.Value.EndsWith("-500")) {
     throw "devvm: the account this tool connects as ('$($env:USERNAME)') is the built-in Administrator (RID 500), which Windows elevates without a UAC prompt. This box no longer matches the 'ordinary admin, UAC on' guest this tool promises - update scripts/devvm/guests/windows-x64/Vagrantfile to connect as a non-built-in admin account."
 }
-# -ErrorAction Stop, not SilentlyContinue: Get-LocalGroupMember is CDXML-backed like
-# Register-ScheduledTask (see windows-run-unelevated.ps1's own comment on that), so its failure
-# is a NON-terminating error regardless of $ErrorActionPreference unless the cmdlet call itself
-# is told to stop. Without this, a cmdlet failure (e.g. a transient WMI/LSA glitch) would leave
-# $members empty exactly like "the account genuinely isn't a member" does, and the throw below
-# would misreport a query failure as a real non-membership finding.
+# -ErrorAction Stop, not SilentlyContinue: Get-LocalGroupMember is backed by the LocalAccounts
+# module, a binary module (confirmed live: (Get-Module Microsoft.PowerShell.LocalAccounts).
+# ModuleType -eq 'Binary'), not CDXML like Register-ScheduledTask (see
+# windows-run-unelevated.ps1's own comment on that one) - it already honors this script's
+# top-of-file $ErrorActionPreference = "Stop" without needing -ErrorAction Stop here too
+# (confirmed live: an unknown -Group throws a terminating GroupNotFoundException under that
+# setting alone). -ErrorAction Stop is kept explicit anyway, matching this script's other
+# per-call ErrorAction usages, so this call's must-stop-on-failure intent doesn't silently
+# depend on staying under that top-of-file setting. Either way, SilentlyContinue here would
+# leave $members empty exactly like "the account genuinely isn't a member" does, and the throw
+# below would misreport a query failure as a real non-membership finding - explicit
+# -ErrorAction Stop plus this try/catch turns that failure into its own distinct error message.
 try {
     $members = Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop
 } catch {
@@ -114,8 +120,9 @@ if ($autologonNeedsChange) {
     Write-Host "devvm: autologon for '$autoLogonUser' was not set (or stale), configured - this needs a reboot before a console session actually exists."
 }
 
-# Last line, always: devvm.py's provision_windows_guest scans this script's combined
-# stdout/stderr for this exact marker (REBOOT_MARKER_TRUE/REBOOT_MARKER_FALSE).
+# Last line, always: devvm_windows.py's provision_windows_guest scans this script's combined
+# stdout/stderr for this exact marker (REBOOT_MARKER_TRUE/REBOOT_MARKER_FALSE), via
+# parse_reboot_required_marker.
 if ($rebootNeeded) {
     Write-Host "DEVVM_REBOOT_REQUIRED=1"
 } else {
