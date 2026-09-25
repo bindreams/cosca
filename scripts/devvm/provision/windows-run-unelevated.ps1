@@ -23,9 +23,12 @@
 # Completion is signalled over a named pipe, not a poll, and the pipe connection's own lifetime
 # is the liveness signal: the wrapper connects to a named pipe this script is already blocked
 # reading from as its very first action and keeps that connection open for its whole life,
-# recording its own $PID to a file along the way (so a timeout can kill the whole process
-# tree, not just the wrapper's own root), running the caller's command with output redirected
-# to a file, and writing its exit code to the still-open pipe as its very last action. If the
+# running the caller's command with output redirected to a file, and writing its exit code to
+# the still-open pipe as its very last action. This script (not the wrapper) captures the
+# wrapper's PID once that connection is established, via GetNamedPipeClientProcessId against
+# the now-connected pipe handle — a real OS query at the moment it's needed, not a value the
+# wrapper writes to a file that this script would otherwise have to race to read (so a timeout
+# can kill the whole process tree, not just the wrapper's own root). If the
 # wrapper dies anywhere after connecting — an unhandled error, being killed, a crash — the OS
 # tears down its end of the pipe the moment the process goes away, and the blocking read
 # unblocks immediately with EOF, reported as "exited without reporting a result", rather than
@@ -38,9 +41,10 @@
 # which the pipe-EOF liveness signal above already covers) would hang this script, and
 # devvm.py behind it, forever. It's now bounded the same way as the connect wait: a real
 # completion event (ReadLineAsync()'s Task, via its AsyncWaitHandle) raced against the
-# remaining deadline, not a poll. On expiry it kills the wrapper's whole process tree via its
-# recorded PID — which reliably exists by then, since the wrapper writes it immediately after
-# connecting, before it ever starts the caller's command (see Stop-WrapperProcessTree). The
+# remaining deadline, not a poll. On expiry it kills the wrapper's whole process tree via the
+# PID this script captured right after EndWaitForConnection — which reliably reflects the
+# actual connected wrapper process by construction, not a file this script has to hope was
+# already written (see Stop-WrapperProcessTree). The
 # wrapper's own pipe Connect() call (in the here-string below) is bounded too, for a case
 # neither of the above covers: a scheduled task that starts running only AFTER this script has
 # already given up on the connect wait and moved on — without a bound there, that late
@@ -78,8 +82,11 @@ $ErrorActionPreference = "Stop"
 # this script exists to provide - silently report success to devvm.py and its caller instead
 # of a nonzero exit. A script-scope trap is the one choke point that turns every terminating
 # error below into an explicit `exit 1`, regardless of which statement raised it; `finally`
-# blocks in try/finally regions further down still run first during unwinding, this only
-# catches the error once it propagates past them.
+# blocks in try/finally regions further down still run first during unwinding - measured
+# directly (2026-09-25): a `try { throw } finally { ... }` nested inside a function, under a
+# script-scope trap exactly like this one, ran its `finally` block before the trap fired - so
+# any `finally`-based cleanup elsewhere in this script still runs before this trap gets a
+# chance to catch the error.
 trap {
     Write-Host "devvm: unelevated probe failed: $($_.Exception.Message)"
     exit 1
@@ -90,7 +97,16 @@ $outputPath = "$env:TEMP\$taskName.out"
 $errorPath = "$env:TEMP\$taskName.err"
 $exitCodePath = "$env:TEMP\$taskName.exitcode"
 $scriptPath = "$env:TEMP\$taskName.ps1"
-$pidPath = "$env:TEMP\$taskName.pid"
+# No PID file: a file the wrapper writes its own $PID to is inherently racy from this script's
+# side (does it exist yet? has the write actually landed?) and was, in practice, only ever
+# reliably present at the read-wait timeout site below, not the connect-wait one. Instead, once
+# this script's own pipe server has a connected client (EndWaitForConnection), it asks the OS
+# directly which process is on the other end via GetNamedPipeClientProcessId - a real query
+# against the actual connected handle, not a value some other process wrote down earlier.
+Add-Type -Namespace Devvm -Name NativeMethods -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetNamedPipeClientProcessId(IntPtr Pipe, out uint ClientProcessId);
+'@
 # Measured directly (2026-09-24): the wrapper is a whole separate powershell.exe process (see
 # -File $scriptPath below), so it does NOT inherit this script's $ErrorActionPreference = Stop
 # — its own default is Continue, and an error thrown before the pipe-write step (e.g. by
@@ -138,20 +154,19 @@ function Read-WrapperTranscript {
 
 function Stop-WrapperProcessTree {
     <#
-      Best-effort: taskkill the wrapper's whole process tree via its recorded PID ($pidPath),
-      if that file exists yet. Shared by both timeout paths below — the pipe connect wait and
-      the result read wait. At the connect-wait site the PID file essentially never exists yet
-      (the wrapper only writes it AFTER Connect() returns, which is exactly what hasn't
-      happened); at the read-wait site it reliably does, since that write happens immediately
-      after connecting and well before the caller's command starts.
+      Best-effort: taskkill the wrapper's whole process tree via $TaskPid, a real client PID
+      this script obtained from GetNamedPipeClientProcessId against its own connected pipe
+      server handle (see the call site right after EndWaitForConnection below) - not a file the
+      wrapper wrote, so there is no "does the file exist yet, and is the write complete"
+      race. Only called from the read-wait timeout site, which runs after
+      EndWaitForConnection has already succeeded, so $TaskPid is always known there. The
+      connect-wait timeout site (no client ever connected) has no PID to give this function at
+      all - see its own comment - so it doesn't call this function.
     #>
-    if (-not (Test-Path $pidPath)) {
-        return
-    }
-    $taskPid = (Get-Content -Path $pidPath -Raw).Trim()
-    if (-not $taskPid) {
-        return
-    }
+    param(
+        [Parameter(Mandatory = $true)]
+        [uint32]$TaskPid
+    )
     # taskkill.exe via Start-Process + WaitForExit(30000): bounded (fixed 30s, independent of
     # the main $deadline which has already elapsed here - this is best-effort cleanup, not a
     # new failure to report) and, launched this way rather than invoked directly, its stderr
@@ -163,7 +178,7 @@ function Stop-WrapperProcessTree {
     $killOutPath = "$env:TEMP\$taskName.taskkill.out"
     $killErrPath = "$env:TEMP\$taskName.taskkill.err"
     try {
-        $killProcess = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/F", "/T", "/PID", $taskPid) `
+        $killProcess = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/F", "/T", "/PID", $TaskPid) `
             -PassThru -NoNewWindow -RedirectStandardOutput $killOutPath -RedirectStandardError $killErrPath
         if (-not $killProcess.WaitForExit(30000)) {
             $killProcess | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -246,16 +261,21 @@ function Invoke-Bounded {
 # text for the wrapper's own process to evaluate when it runs.
 # $exitCode starts at -1 (not 0) so that if the wrapper crashes before the caller's command
 # ever runs, the caller sees a nonzero/sentinel status rather than a false "succeeded". Connect()
-# is the wrapper's very first action, bounded by __CONNECT_TIMEOUT_MS__ - the remaining
-# -TimeoutSeconds budget at the moment this task was registered, converted to milliseconds and
-# baked into this template as a literal (a real .NET Connect(timeout) parameter, not a
-# hand-rolled poll). In the ordinary case a real server is already listening before
-# Start-ScheduledTask ever fires (see that ordering above), so this returns almost immediately.
-# The bound exists for the case that ordering doesn't cover: a task that starts running only
-# AFTER the outer script has already given up on its own connect wait and disposed the server
-# pipe. An unbounded Connect() there would block forever against a pipe with no listener,
-# leaking this wrapper (and Task Scheduler's record of it running) on the guest indefinitely;
-# with the bound, it times out, falls into the outer catch below, and this process exits.
+# is the wrapper's very first action, bounded by the same $deadline this script itself uses -
+# baked into this template as an absolute UTC instant (__DEADLINE_UTC_ISO__, a round-trip
+# ISO-8601 string), not a millisecond duration computed once at Register-ScheduledTask time. A
+# duration frozen at registration time is wrong by however long Task Scheduler takes to actually
+# dispatch the task: the wrapper instead computes its own remaining milliseconds from this
+# absolute instant right when it calls Connect(), so a dispatch delay shrinks its own budget
+# correctly instead of leaving it connecting against a stale allowance computed on this script's
+# clock, at a different moment, in a different process. In the ordinary case a real server is
+# already listening before Start-ScheduledTask ever fires (see that ordering above), so this
+# returns almost immediately. The bound exists for the case that ordering doesn't cover: a task
+# that starts running only AFTER the outer script has already given up on its own connect wait
+# and disposed the server pipe. An unbounded Connect() there would block forever against a pipe
+# with no listener, leaking this wrapper (and Task Scheduler's record of it running) on the guest
+# indefinitely; with the bound, it times out, falls into the outer catch below, and this process
+# exits.
 #
 # The pipe connection is kept open for the wrapper's entire life and only written to once, at
 # the very end - not reopened per write. That means the outer script's read of this connection
@@ -276,29 +296,47 @@ $pipe = $null
 $writer = $null
 try {
     $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', '__TASK_NAME__', [System.IO.Pipes.PipeDirection]::Out)
-    $pipe.Connect(__CONNECT_TIMEOUT_MS__)
+    $deadlineUtc = [DateTime]::Parse('__DEADLINE_UTC_ISO__', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $remainingMs = [Math]::Max(1, [int](($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds))
+    $pipe.Connect($remainingMs)
     $writer = New-Object System.IO.StreamWriter($pipe)
     try {
-        $PID | Out-File -FilePath '__PID_PATH__' -Encoding ascii
-        # The child runs via Start-Process with -RedirectStandardOutput/-RedirectStandardError, NOT
-        # a PowerShell redirection operator. PowerShell 5.1 parses a native child's stderr through
-        # its own stream reader regardless of which operator is used (`*>`, `2>&1`, even a plain
-        # `2>` alone) or -OutputFormat, and treats a `#< CLIXML` prefix (written by a nested
+        # The child runs via cmd.exe's own `1>`/`2>` redirection, performed by cmd.exe itself (a
+        # real OS-level file handle it opens before running its own child), NOT a PowerShell
+        # redirection operator. PowerShell 5.1 parses a native child's stderr through its own
+        # stream reader regardless of which operator is used (`*>`, `2>&1`, even a plain `2>`
+        # alone) or -OutputFormat, and treats a `#< CLIXML` prefix (written by a nested
         # non-interactive powershell.exe with redirected output) as serialized records to
-        # deserialize - throwing if what follows isn't well-formed CLIXML. Start-Process's
-        # -RedirectStandardOutput/-RedirectStandardError are real OS-level file handles, so that
-        # reader never sees the stream at all (see scripts/README.md).
-        # -PassThru without -Wait, then WaitForExit() on the Process object directly: PS 5.1's
-        # own Start-Process -Wait waits for the whole process tree (it waits on a Job object
-        # the descendants are assigned to), not just this immediate child - so a probe that
-        # deliberately leaves a detached/kill_on_drop(false) child running would hang here
-        # forever even after the immediate child (this one) has already exited.
-        # Process.WaitForExit() waits only for the process this handle actually refers to.
-        $childProcess = Start-Process -FilePath 'powershell' `
-            -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '__ENCODED_COMMAND__') `
-            -RedirectStandardOutput '__OUTPUT_PATH__' `
-            -RedirectStandardError '__ERROR_PATH__' `
-            -NoNewWindow -PassThru
+        # deserialize - throwing if what follows isn't well-formed CLIXML. cmd.exe's `1>`/`2>`
+        # never goes through that PowerShell stream reader at all (see scripts/README.md).
+        #
+        # Launched via [System.Diagnostics.Process]::Start($psi) directly, NOT PowerShell's
+        # Start-Process cmdlet: measured directly (2026-09-25) that Start-Process -PassThru
+        # -RedirectStandardOutput/-RedirectStandardError, without -Wait, returns a Process object
+        # whose .ExitCode reads back blank/$null even after WaitForExit() itself returns cleanly
+        # with no error - PS 5.1's Start-Process does not leave that object's handle in a state
+        # .ExitCode can read from afterward when used this way. [System.Diagnostics.Process]::
+        # Start() is the underlying .NET API Start-Process itself wraps; calling it directly
+        # returns a Process object whose WaitForExit() and .ExitCode both work correctly against
+        # the real handle - confirmed by the same measurement.
+        #
+        # cmd.exe is the immediate child (not the caller's command directly) so its own `1>`/`2>`
+        # can perform the OS-level redirection above; `cmd /c command` exits with `command`'s own
+        # exit code once `command` finishes, so $childProcess.ExitCode below is the caller's real
+        # exit code, not cmd.exe's own. `/d` skips any AutoRun registry command. WaitForExit()
+        # with no argument waits only for this immediate cmd.exe child, not any further
+        # descendant it spawns - so a probe that deliberately leaves a detached/
+        # kill_on_drop(false) child running still doesn't hang here even after cmd.exe (and the
+        # powershell.exe it ran) have both already exited. Output/error paths are wrapped in
+        # `"..."` for cmd.exe's own redirection syntax to tolerate spaces; __ENCODED_COMMAND__ is
+        # base64 (Convert.ToBase64String's own alphabet), so it has no cmd.exe metacharacters
+        # that would need escaping.
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'cmd.exe'
+        $psi.Arguments = '/d /c powershell -NoProfile -NonInteractive -EncodedCommand __ENCODED_COMMAND__ 1>"__OUTPUT_PATH__" 2>"__ERROR_PATH__"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $childProcess = [System.Diagnostics.Process]::Start($psi)
         $childProcess.WaitForExit()
         $exitCode = $childProcess.ExitCode
     } catch {
@@ -308,6 +346,17 @@ try {
 } catch {
     Write-Host "devvm wrapper: pipe connect failed: $($_.Exception.Message)"
 } finally {
+    # Stopped BEFORE the pipe write below, not after: the outer script's read of the pipe is
+    # what unblocks it to go read this transcript file back (see Read-WrapperTranscript and its
+    # call sites) - stopping the transcript first guarantees the file is fully flushed and closed
+    # by the time that read can possibly happen, instead of racing it. Wrapped in its own
+    # try/catch so a failing Stop-Transcript can never prevent the exit-code file or pipe write
+    # below - those are what the outer script actually depends on for correctness.
+    try {
+        Stop-Transcript | Out-Null
+    } catch {
+        Write-Host "devvm wrapper: Stop-Transcript failed: $($_.Exception.Message)"
+    }
     $exitCode | Out-File -FilePath '__EXITCODE_PATH__' -Encoding ascii
     if ($writer) {
         try {
@@ -321,26 +370,27 @@ try {
     if ($pipe) {
         $pipe.Close()
     }
-    Stop-Transcript | Out-Null
 }
 '@
 
-# Baked into the wrapper template as a literal, not read from an environment variable at
-# wrapper-run time: the wrapper is a whole separate process that may not start until well
-# after this point (see the LOW-11 case in the Connect() comment above), so its own idea of
-# "how much budget is left" has to be captured now, when this script still has an accurate
-# $deadline, not recomputed from scratch by a process that doesn't share it.
-$connectTimeoutMs = [Math]::Max(1, [int](Get-RemainingSeconds) * 1000)
+# Baked into the wrapper template as an absolute UTC instant, not a millisecond duration
+# computed here: the wrapper is a whole separate process that may not start running until well
+# after this point (the late-dispatched-task case described in the Connect() comment above), and
+# a fixed duration captured now would already be stale by however long that dispatch delay turns
+# out to be. The wrapper computes its OWN remaining time against this same real deadline, not a
+# number computed on this script's clock at a different moment in a different process. "o" is
+# .NET's round-trip format string; ToUniversalTime() first so the wrapper's UTC-based parse (see
+# the template above) never has to also account for this script's local time zone.
+$deadlineUtcIso = $deadline.ToUniversalTime().ToString("o")
 
 $taskCommand = $wrapperTemplate.
-    Replace('__PID_PATH__', $pidPath).
     Replace('__ENCODED_COMMAND__', $EncodedCommand).
     Replace('__OUTPUT_PATH__', $outputPath).
     Replace('__ERROR_PATH__', $errorPath).
     Replace('__EXITCODE_PATH__', $exitCodePath).
     Replace('__TASK_NAME__', $taskName).
     Replace('__TRANSCRIPT_PATH__', $transcriptPath).
-    Replace('__CONNECT_TIMEOUT_MS__', [string]$connectTimeoutMs)
+    Replace('__DEADLINE_UTC_ISO__', $deadlineUtcIso)
 Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 
 # Register-ScheduledTask with NO -Trigger at all: this task is only ever fired on demand via
@@ -431,15 +481,28 @@ try {
     # running" other than waiting up to some bound.
     $signaled = $connectResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds((Get-RemainingSeconds)))
     if (-not $signaled) {
-        Stop-WrapperProcessTree
+        # No client ever connected here, so there is no PID GetNamedPipeClientProcessId could
+        # give Stop-WrapperProcessTree - nothing to taskkill yet. Dispose the server pipe FIRST,
+        # before doing anything else: that's what makes the wrapper's own bounded Connect()
+        # (against this now-closed pipe) fail promptly if a late-dispatched task tries to connect
+        # after this point, rather than racing a kill attempt against a pipe still nominally open.
+        # A leftover scheduled-task process with nothing left to connect to will hit its own
+        # Connect() bound (see the wrapper template's comment) and exit on its own.
+        $pipeServer.Dispose()
         $transcriptNote = Read-WrapperTranscript
         if ($transcriptNote) {
             $transcriptNote = "`n--- wrapper transcript (captures anything the wrapper itself printed/threw before or instead of signaling completion) ---`n$transcriptNote"
         }
-        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - killed its whole process tree. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$transcriptNote"
+        throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - no wrapper ever connected. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$transcriptNote"
     }
 
     $pipeServer.EndWaitForConnection($connectResult)
+    # A real OS query against the now-connected handle, not a value some other process wrote to
+    # a file this script would otherwise have to race to read - see the file-level comment above.
+    # Only obtainable from here on: before EndWaitForConnection returns, no client has connected,
+    # so there is nothing for this call to report (see the connect-timeout branch above).
+    [uint32]$wrapperPid = 0
+    [void][Devvm.NativeMethods]::GetNamedPipeClientProcessId($pipeServer.SafePipeHandle.DangerousGetHandle(), [ref]$wrapperPid)
     $reader = New-Object System.IO.StreamReader($pipeServer)
     try {
         # ReadLineAsync() blocks until either a full line arrives or the connection is torn
@@ -455,11 +518,10 @@ try {
         $readSignaled = $remainingForRead -gt 0 -and
             ([IAsyncResult]$readTask).AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($remainingForRead))
         if (-not $readSignaled) {
-            # Unlike the connect-wait timeout above, the PID file reliably exists here: the
-            # wrapper's Connect() has already returned (that's how we got past
-            # EndWaitForConnection), and the wrapper writes $pidPath as its very next action,
-            # well before it starts the caller's command - see the wrapper template above.
-            Stop-WrapperProcessTree
+            # Unlike the connect-wait timeout above, a real PID is known here: the wrapper's
+            # Connect() has already returned (that's how we got past EndWaitForConnection) and
+            # this script captured its PID right then via GetNamedPipeClientProcessId, above.
+            Stop-WrapperProcessTree -TaskPid $wrapperPid
             $transcriptNote = Read-WrapperTranscript
             if ($transcriptNote) {
                 $transcriptNote = "`n--- wrapper transcript (captures anything the wrapper itself printed/threw before or instead of signaling completion) ---`n$transcriptNote"
@@ -540,7 +602,7 @@ try {
         # the real outcome of the probe above (success, or the timeout already thrown).
         Write-Warning $_.Exception.Message
     }
-    Remove-Item -Path $outputPath, $errorPath, $exitCodePath, $scriptPath, $pidPath, $transcriptPath -ErrorAction SilentlyContinue
+    Remove-Item -Path $outputPath, $errorPath, $exitCodePath, $scriptPath, $transcriptPath -ErrorAction SilentlyContinue
 }
 
 if ($output) {

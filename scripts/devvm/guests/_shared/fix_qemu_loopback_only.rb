@@ -12,10 +12,13 @@
 # windows-x64/Vagrantfile. This patch is defense-in-depth for those (belt-and-suspenders
 # against a future misconfigured port lacking host_ip) and the *only* fix for SSH.
 #
-# QEMU's hostfwd syntax is [tcp|udp]:[hostaddr]:hostport-[guestaddr]:guestport; an empty
-# hostaddr segment binds every interface. This patch rewrites any empty-hostaddr hostfwd
-# clause in the constructed QEMU argv to loopback-only, at the point Driver#execute actually
-# shells out to qemu-system-*, so it applies regardless of which code path built the string.
+# QEMU's hostfwd syntax is [tcp|udp]:[hostaddr]:hostport-[guestaddr]:guestport; the protocol
+# segment is itself optional (defaulting to tcp), so an unqualified forward can read
+# "hostfwd=::2222-:22" with no "tcp"/"udp" at all — this patch handles that form the same as
+# an explicit one. An empty hostaddr segment binds every interface. This patch rewrites any
+# empty-hostaddr hostfwd clause in the constructed QEMU argv to loopback-only, at the point
+# Driver#execute actually shells out to qemu-system-*, so it applies regardless of which code
+# path built the string.
 #
 # Loaded unconditionally from every guest Vagrantfile via require_relative, before `vagrant
 # up` starts QEMU, so no guest can accidentally expose SSH/WinRM/RDP to the LAN.
@@ -50,10 +53,11 @@ module VagrantPlugins
       module ForceLoopbackHostfwd
         LOOPBACK = "127.0.0.1"
         # Matches a hostfwd clause's host-address segment as actually rewritten above:
-        # hostfwd=tcp:127.0.0.1:2222-:22 → captures "127.0.0.1". Anything the gsub above
-        # didn't touch, or touched incorrectly, shows up here as an empty or "0.0.0.0"
-        # capture.
-        HOSTFWD_HOSTADDR = /hostfwd=(?:tcp|udp):([^:]*):/
+        # hostfwd=tcp:127.0.0.1:2222-:22 → captures "127.0.0.1". The protocol segment is
+        # optional (see the file-level comment above), so this also matches the protocol-less
+        # hostfwd=:127.0.0.1:2222-:22 form. Anything the gsub above didn't touch, or touched
+        # incorrectly, shows up here as an empty or "0.0.0.0" capture.
+        HOSTFWD_HOSTADDR = /hostfwd=(?:tcp|udp)?:([^:]*):/
 
         def execute(*cmd, **opts, &block)
           installed_version = Vagrant::Plugin::Manager.instance.installed_plugins.dig("vagrant-qemu", "installed_gem_version")
@@ -66,7 +70,10 @@ module VagrantPlugins
 
           cmd = cmd.map do |arg|
             if arg.is_a?(String)
-              arg.gsub(/hostfwd=(tcp|udp)::/, "hostfwd=\\1:#{LOOPBACK}:")
+              # (tcp|udp)? is optional: also rewrites the protocol-less "hostfwd=::2222-:22"
+              # form (empty capture) to "hostfwd=:127.0.0.1:2222-:22", not just the
+              # "hostfwd=tcp::"/"hostfwd=udp::" forms.
+              arg.gsub(/hostfwd=(tcp|udp)?::/, "hostfwd=\\1:#{LOOPBACK}:")
             else
               arg
             end

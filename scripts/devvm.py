@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +43,20 @@ WINDOWS_LICENSE_STATUS_LICENSED = 1
 # spending a rearm slightly early. One day's buffer is cheap next to the box's eval window
 # (on the order of months) and the two rearms this image ships with.
 WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES = 24 * 60
+
+# windows-run-unelevated.ps1 (the guest side of `devvm.py run --unelevated --timeout`) feeds
+# -TimeoutSeconds, converted to milliseconds, into .NET WaitHandle.WaitOne(int), which takes a
+# signed 32-bit millisecond count. A --timeout value whose *1000 doesn't fit in Int32 would
+# only fail on the guest, after a slow round-trip there and back - reject it here instead,
+# where the mistake is immediate and the error message is in front of the person who typed it.
+WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS = (2**31 - 1) // 1000
+
+# The human-facing failure bound for reboot_windows_guest_and_wait's post-reboot wait: a
+# guest reboot is a genuinely external event (it might never complete), and this is the same
+# already-configured, already-real bound the Windows Vagrantfile itself uses
+# (config.vm.boot_timeout / config.winrm.timeout, both 3600s in
+# scripts/devvm/guests/windows-x64/Vagrantfile) — not a second, uncoordinated guess.
+WINDOWS_REBOOT_DEADLINE_SECONDS = 3600
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -445,6 +460,34 @@ def run_windows_script(
     return output
 
 
+def get_vagrant_machine_state(guest: Guest) -> str:
+    """The guest's current state per `vagrant status --machine-readable` (e.g. "running",
+    "poweroff", "not_created", "stopped"). Used by reboot_windows_guest_and_wait to fail fast
+    once the guest is no longer running, instead of retrying `vagrant winrm` in a tight loop
+    against a guest that is never coming back on its own.
+
+    `vagrant status` reads local state via the qemu provider's own read_state action (a QMP
+    query against the guest's own QEMU process, confirmed directly 2026-09-25) — no WinRM
+    round-trip, so this stays fast and answers even when WinRM itself is unresponsive.
+    """
+    require_tool("vagrant")
+    result = subprocess.run(
+        ["vagrant", "status", "--machine-readable"],
+        cwd=guest_dir(guest),
+        env=vagrant_env(guest),
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        fields = line.split(",", 3)
+        if len(fields) >= 4 and fields[2] == "state":
+            return fields[3]
+    raise RuntimeError(
+        f"devvm: could not find a 'state' line in `vagrant status --machine-readable` for "
+        f"guest '{guest.name}' (exit {result.returncode}) — output:\n{result.stdout}"
+    )
+
+
 def get_windows_boot_time(guest: Guest) -> str | None:
     """The guest's current LastBootUpTime (an ISO-8601-ish CIM datetime string), or None if
     WinRM isn't answering right now. Used by reboot_windows_guest_and_wait to detect a real
@@ -463,10 +506,15 @@ def get_windows_boot_time(guest: Guest) -> str | None:
     prevent, and not something `start_new_session=True` + `os.killpg` fixes for free either
     (the Go launcher would still need to actually forward the kill to its Ruby child for that
     to help, which isn't guaranteed).
-    `vagrant winrm -c` already goes through Vagrant's own communicator-ready wait, bound by the
-    Windows Vagrantfile's own `winrm.timeout` (3600s - see scripts/README.md's measured-timings
-    table): a real, already-configured, human-facing failure bound, not a Python-side guess
-    layered on top of it.
+    `vagrant winrm -c` has NO readiness wait of its own — confirmed by reading vagrant's
+    `plugins/commands/winrm/command.rb` end to end: its `execute` calls
+    `machine.communicate.execute(cmd, opts)` directly, with no `wait_for_ready` call or any
+    other connection-readiness wait anywhere in the path. So a WinRM connection attempt against
+    a guest that isn't listening can fail (or hang) on its own schedule, not bounded by the
+    Windows Vagrantfile's `winrm.timeout` — that config value only bounds Vagrant's
+    `wait_for_communicator`/`wait_for_ready` capability, which this command never calls. The
+    real failure bound for a caller that loops on this function (reboot_windows_guest_and_wait)
+    is WINDOWS_REBOOT_DEADLINE_SECONDS, applied there — not anything inside this function.
     """
     result = subprocess.run(
         ["vagrant", "winrm", "-c", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o')"],
@@ -481,8 +529,50 @@ def get_windows_boot_time(guest: Guest) -> str | None:
     return output or None
 
 
+def get_windows_interactive_username(guest: Guest) -> str | None:
+    """The name logged into the guest's interactive (session 0 console / RDP session 1)
+    desktop right now, via `Win32_ComputerSystem.UserName`, or None if nobody is logged in yet
+    (blank result) or WinRM isn't answering. Used by reboot_windows_guest_and_wait to confirm
+    autologon has actually produced a real interactive session — the thing
+    windows-run-unelevated.ps1's scheduled task borrows a filtered token from — not just that
+    the kernel has finished booting.
+    """
+    result = subprocess.run(
+        ["vagrant", "winrm", "-c", "(Get-CimInstance Win32_ComputerSystem).UserName"],
+        cwd=guest_dir(guest),
+        env=vagrant_env(guest),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _require_guest_running(guest: Guest, deadline: float, *, what: str) -> None:
+    """Raise if the guest is no longer 'running' per vagrant, or if `deadline` (a
+    time.monotonic() value) has passed. Shared by reboot_windows_guest_and_wait's two wait
+    loops so a powered-off/crashed guest fails immediately instead of retrying WinRM forever,
+    and so both loops share the same single wall-clock failure bound.
+    """
+    state = get_vagrant_machine_state(guest)
+    if state != "running":
+        raise RuntimeError(
+            f"devvm: guest '{guest.name}' is no longer 'running' (vagrant status: {state!r}) "
+            f"while waiting for {what} — it will not come back on its own; run `devvm.py up` "
+            "to bring it back."
+        )
+    if time.monotonic() >= deadline:
+        raise RuntimeError(
+            f"devvm: guest '{guest.name}' did not finish {what} within "
+            f"{WINDOWS_REBOOT_DEADLINE_SECONDS}s of being rebooted."
+        )
+
+
 def reboot_windows_guest_and_wait(guest: Guest) -> None:
-    """Issue a real guest reboot ourselves and block until the guest reports a new boot time.
+    """Issue a real guest reboot ourselves and block until the guest reports a new boot time
+    and a real interactive (autologon) session on top of it.
 
     Deliberately does NOT go through Vagrant's named `reboot-if-needed` shell provisioner /
     `Reboot.reboot` capability: that path is itself a shell provisioner, so it still runs
@@ -492,21 +582,24 @@ def reboot_windows_guest_and_wait(guest: Guest) -> None:
     `Reboot.reboot` itself runs, confirmed by reading cap/reboot.rb) and then waiting for a
     genuine boot-time change avoids both.
 
-    `shutdown /r`'s own exit code is checked (not previously): a nonzero exit means the reboot
-    was never scheduled at all (e.g. a permissions problem), so there would be no new boot time
-    to ever wait for — failing loudly here beats spending the rest of this function's time
-    (and get_windows_boot_time's own real winrm.timeout bound per call - could be a long wait)
-    on a reboot that was never going to happen.
+    `shutdown /r /t 0`'s own exit code is NOT trusted as a pass/fail signal: measured directly
+    (2026-09-25), a `/t 0` shutdown tears down the guest (and its WinRM connection) essentially
+    immediately, so `vagrant winrm` can report a nonzero exit purely because the connection
+    dropped out from under it mid-response — not because the reboot failed to schedule. The
+    wait loop below is the real check that the reboot actually happened; a nonzero exit here
+    is logged but does not abort early on its own.
 
-    No `time.sleep()` anywhere in the wait loop, and no chosen retry interval or deadline of
-    devvm.py's own: each iteration IS the wait — a real, bounded WinRM round-trip
-    (get_windows_boot_time's own comment explains its bound) — and failure just means "ask
-    again immediately," not "nap, then ask again." A separate wall-clock deadline here used to
-    be a second, uncoordinated guess (600s, tuned from a single measurement) sitting on top of
-    Vagrant's own already-real `winrm.timeout` bound (3600s): if the guest is genuinely gone,
-    each get_windows_boot_time call eventually fails via that bound and this function keeps
-    asking, rather than devvm.py inventing its own separate, shorter failure mode for the same
-    underlying condition.
+    No `time.sleep()` anywhere in either wait loop, and no chosen retry interval of devvm.py's
+    own: each iteration IS the wait — a real WinRM round-trip or a real `vagrant status`
+    query — and failure just means "ask again immediately," not "nap, then ask again." Each
+    loop iteration is bounded by one shared wall-clock deadline
+    (WINDOWS_REBOOT_DEADLINE_SECONDS, reusing the Windows Vagrantfile's own 3600s
+    boot_timeout/winrm.timeout — a real, already-configured, human-facing failure bound for a
+    guest reboot genuinely never completing) and by `_require_guest_running` failing fast the
+    moment `vagrant status` reports the guest isn't running any more, instead of retrying
+    `vagrant winrm` in a tight loop against a guest that is never answering again (a powered-off
+    or crashed guest would otherwise burn a host core forever, since `vagrant winrm` itself has
+    no readiness wait — see get_windows_boot_time's docstring).
     """
     before = get_windows_boot_time(guest)
     if before is None:
@@ -517,15 +610,31 @@ def reboot_windows_guest_and_wait(guest: Guest) -> None:
     print(f"+ rebooting guest '{guest.name}' directly (shutdown /r) and waiting for a new boot time", file=sys.stderr)
     returncode = run_vagrant(guest, ["winrm", "-c", 'shutdown /r /t 0 /f /d p:4:1 /c "devvm reboot"'], check=False)
     if returncode != 0:
-        raise RuntimeError(
-            f"devvm: `shutdown /r` on guest '{guest.name}' failed (vagrant winrm exit "
-            f"{returncode}) — the reboot was never scheduled, so there is no new boot time to "
-            "wait for. (Only zero-vs-nonzero survives here, not the remote command's real exit "
-            "code — see run_vagrant's own comment on why.)"
+        print(
+            f"devvm: `vagrant winrm` reported a nonzero exit ({returncode}) issuing the "
+            f"reboot on guest '{guest.name}' — with `/t 0` that's expected even on a "
+            "successfully-scheduled reboot, since the connection drops out from under it "
+            "almost immediately. Proceeding to wait for a real boot-time change, which is the "
+            "actual check.",
+            file=sys.stderr,
         )
+
+    deadline = time.monotonic() + WINDOWS_REBOOT_DEADLINE_SECONDS
     while True:
+        _require_guest_running(guest, deadline, what="a new boot time")
         after = get_windows_boot_time(guest)
         if after is not None and after != before:
+            break
+
+    # LastBootUpTime changes as soon as the kernel finishes booting, which can still be ahead
+    # of autologon actually producing a real interactive session — the thing
+    # windows-run-unelevated.ps1's scheduled task needs to borrow a filtered token from. Wait
+    # for that explicitly too, under the same deadline, instead of letting the next unelevated
+    # probe race it.
+    while True:
+        _require_guest_running(guest, deadline, what="an interactive (autologon) session")
+        username = get_windows_interactive_username(guest)
+        if username is not None:
             return
 
 
@@ -813,6 +922,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     if timeout <= 0:
         print(f"error: --timeout must be positive, got {timeout}", file=sys.stderr)
         sys.exit(1)
+    if timeout > WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS:
+        print(
+            f"error: --timeout must be at most {WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS} "
+            f"(seconds*1000 must fit in a 32-bit millisecond count on the guest side), got "
+            f"{timeout}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if guest.communicator == "ssh":
         # `vagrant ssh -c` runs a non-interactive, non-login shell, which doesn't source
@@ -828,25 +945,44 @@ def cmd_run(args: argparse.Namespace) -> None:
     # PowerShell over WinRM: cd into the read-only copy, point Cargo's build output at a
     # writable directory outside it, then run the requested command.
     #
-    # No script-wide $ErrorActionPreference = "Stop" here (deliberately, and unlike the
-    # previous version of this function): Windows PowerShell 5.1 sets $? to $false for a
-    # native command whenever ANYTHING reaches that command's real stderr stream, regardless
-    # of exit code — e.g. cargo's own normal build-progress lines. Under a script-wide Stop,
-    # that turns a successful `cargo build` into a terminating NativeCommandError. Instead,
-    # `-ErrorAction Stop` is scoped to just the `Set-Location` call, so a genuinely bad --dir
-    # path still fails loudly without that scope swallowing the native command's own stderr
-    # noise. The trailing `exit $LASTEXITCODE` makes this script's own process exit code
-    # reflect the native command's real exit code, independent of $?. Every token — command
-    # name included — is quoted as a PowerShell string literal and passed through the `&`
-    # call operator, so args with spaces/quotes/special characters aren't re-parsed or
-    # re-split by PowerShell the way a naive `" ".join(...)` would allow.
+    # No script-wide $ErrorActionPreference = "Stop" here (deliberately): Windows PowerShell
+    # 5.1 sets $? to $false for a native command whenever ANYTHING reaches that command's real
+    # stderr stream, regardless of exit code — e.g. cargo's own normal build-progress lines.
+    # Under a script-wide Stop, that turns a successful `cargo build` into a terminating
+    # NativeCommandError. Instead, `-ErrorAction Stop` is scoped to just the `Set-Location`
+    # call, so a guest tree that's gone missing (e.g. `windows-mirror-tree.ps1` never ran)
+    # still fails loudly without that scope swallowing the requested command's own stderr
+    # noise.
+    #
+    # Getting the real exit code out reliably needs more than `exit $LASTEXITCODE`:
+    # $LASTEXITCODE is only ever set by a *native* command. A typo'd command name
+    # (CommandNotFoundException), the `Set-Location -ErrorAction Stop` failing, or `& $cmd`
+    # itself being a cmdlet rather than an external program (no native process ever ran) all
+    # leave $LASTEXITCODE at whatever it was before this one-liner started — often $null —
+    # which `exit $LASTEXITCODE` then turns into exit code 0, i.e. success. Confirmed directly
+    # (2026-09-25): `run windows-x64 -- carg test` (typo) and a missing tree directory both
+    # previously exited 0. Fixed by: a script-scope `trap` that turns any *terminating* error
+    # (the typo, the failed Set-Location, an uncaught throw) into an explicit `exit 1`
+    # regardless of $ErrorActionPreference; resetting $LASTEXITCODE to $null immediately before
+    # the real command runs, so a stale value from something earlier in the same PowerShell
+    # session can't leak through as a false success; and, after the command, preferring
+    # $LASTEXITCODE when it was actually set (the native-command case) and otherwise falling
+    # back to `$?` (the cmdlet-only case, mapped to a 0/1 process exit code) rather than
+    # assuming a native command ran at all.
+    #
+    # Every token — command name included — is quoted as a PowerShell string literal and
+    # passed through the `&` call operator, so args with spaces/quotes/special characters
+    # aren't re-parsed or re-split by PowerShell the way a naive `" ".join(...)` would allow.
     quoted_path = powershell_quote(guest.tree_path_posix)
     quoted_cmd = " ".join(powershell_quote(part) for part in cmd_args)
     inner = (
+        'trap { Write-Host "devvm: $_"; exit 1 }; '
         f"Set-Location -Path {quoted_path} -ErrorAction Stop; "
         f'$env:CARGO_TARGET_DIR = "$HOME\\cargo-target"; '
+        "$global:LASTEXITCODE = $null; "
         f"& {quoted_cmd}; "
-        "exit $LASTEXITCODE"
+        "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }; "
+        "exit [int](-not $?)"
     )
 
     if not args.unelevated:
@@ -865,29 +1001,32 @@ def cmd_run(args: argparse.Namespace) -> None:
     encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
     runner_path = f"{guest.tree_path_posix}/scripts/devvm/provision/windows-run-unelevated.ps1"
     # windows-run-unelevated.ps1 itself ends with `exit $exitCode` (the probe's real exit
-    # code, propagated through its named-pipe wait — see that script). The trailing
-    # `exit $LASTEXITCODE` here is belt-and-suspenders, not dead code: a .ps1 invoked via `&`
-    # does not by itself terminate the *calling* script's execution on a nonzero exit without
-    # this, it only sets $LASTEXITCODE for the calling script to act on. That said, the exact
-    # value doesn't survive past this point either way: `run_vagrant`'s own `vagrant winrm -c`
-    # call below collapses every nonzero exit code to 1 (see its comment) — only success vs.
-    # failure reaches the caller, not which command in the chain failed or with what code.
+    # code, propagated through its named-pipe wait — see that script), and has its own
+    # script-scope `trap` that turns every terminating error inside ITS OWN scope into an
+    # explicit `exit 1` before that. But this outer one-liner needs the same trap+reset+
+    # fallback pattern as `inner` above, for failures that never reach that inner scope at
+    # all: `& runner_path ...` itself throwing before the script body even starts (a bad
+    # `-EncodedCommand` value failing PowerShell's own parameter binding, the file having gone
+    # missing from the staged tree, ...) is a terminating error in THIS scope, not
+    # windows-run-unelevated.ps1's — its own trap never gets a chance to run, and without a
+    # trap here too, the error propagates straight out of this whole one-liner, silently
+    # exiting 0. Confirmed directly (2026-09-25): `vagrant winrm -c 'throw "x"; exit
+    # $LASTEXITCODE'` exits 0, not 1 — the same silent-success shape.
     #
-    # That belt-and-suspenders line only helps if windows-run-unelevated.ps1 actually reaches
-    # its own `exit $exitCode` — an uncaught terminating error there (the -TimeoutSeconds
-    # bound, a wrapper crash, a failed Register-ScheduledTask, ...) does NOT reach it, and
-    # without something catching it inside that script, propagates straight through this `&`
-    # call and out of this whole one-liner too, so `exit $LASTEXITCODE` below never runs
-    # either. Confirmed directly (2026-09-25): `vagrant winrm -c 'throw "x"; exit
-    # $LASTEXITCODE'` exits 0, not 1 — every failure path would silently report success to
-    # devvm.py and its caller. windows-run-unelevated.ps1 has its own script-scope `trap` for
-    # exactly this reason (see that script) that turns every terminating error into an
-    # explicit `exit 1` inside its own scope; that trap is what makes the belt-and-suspenders
-    # line below actually meaningful for failure paths, not just the script's own clean exit.
+    # When windows-run-unelevated.ps1's own `exit $exitCode` DOES run, that's a native-process-
+    # equivalent script exit and reliably sets $LASTEXITCODE (confirmed by that script's own
+    # `-TimeoutSeconds`/exit-code round-trip testing), so the `if ($null -ne $LASTEXITCODE)`
+    # branch below is what actually carries the probe's real exit code out. The exact value
+    # doesn't survive past this point either way: `run_vagrant`'s own `vagrant winrm -c` call
+    # below collapses every nonzero exit code to 1 (see its comment) — only success vs. failure
+    # reaches the caller, not which command in the chain failed or with what code.
     outer = (
+        'trap { Write-Host "devvm: $_"; exit 1 }; '
+        "$global:LASTEXITCODE = $null; "
         f"& {powershell_quote(runner_path)} -EncodedCommand {powershell_quote(encoded)} "
         f"-TimeoutSeconds {timeout}; "
-        "exit $LASTEXITCODE"
+        "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }; "
+        "exit [int](-not $?)"
     )
     run_vagrant(guest, ["winrm", "-c", outer])
 

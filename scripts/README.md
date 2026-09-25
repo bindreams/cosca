@@ -135,10 +135,14 @@ never reaches that capability — confirmed by reading vagrant's
 end to end — so driving each script that way removes the fuse entirely. The one legitimate
 reboot this guest ever needs (`EnableLUA`/autologon changes only take effect at the next boot)
 is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py`
-(a real `shutdown /r`, then a bounded wait for the guest to report a new boot time — no
-`sleep`, no arbitrarily-chosen poll interval, just an immediate retry bounded by an overall
-failure timeout), not Vagrant's own `reboot-if-needed`/`Reboot.reboot` capability, which
-carries the exact same fuse plus its own `sleep 10` wait loop.
+(a real `shutdown /r`, then a bounded wait for the guest to report a new boot time and then a
+real interactive/autologon session on top of it — no `sleep`, no arbitrarily-chosen poll
+interval, just an immediate retry, bounded by `vagrant status` failing fast the moment the
+guest stops running and by one overall wall-clock deadline reusing the Vagrantfile's own
+3600s `boot_timeout`/`winrm.timeout`), not Vagrant's own `reboot-if-needed`/`Reboot.reboot`
+capability, which carries the exact same fuse plus its own `sleep 10` wait loop. `vagrant
+winrm -c` itself has no readiness wait of its own (same source read as above), which is why
+this wait loop needs its own deadline rather than relying on one baked into `vagrant winrm`.
 
 Whether this fuse explains any _specific_ historical "QEMU just disappeared" failure during
 `devvm.py run windows-x64 --unelevated` is **inferred, not measured**: `run`'s own code path
@@ -321,10 +325,14 @@ vagrant-qemu 0.6.3 hardcodes the SSH forward with no `host_ip` seam a Vagrantfil
 all, so `host_ip: "127.0.0.1"` in the Vagrantfile alone doesn't cover SSH.
 
 Because this reaches into a private method by name, it's pinned to exactly vagrant-qemu
-`0.6.3` (checked inside the patched `execute` itself, so only starting QEMU — `vagrant up`,
-`vagrant provision`, `export`/`package` — refuses to run against any other installed version;
-`destroy`/`halt` never call `execute` at all, so a plugin upgrade can never leave a running
-QEMU process unstoppable) and fails closed with a hard error if a rewritten forward is ever
+`0.6.3` (checked inside the patched `execute` itself, so only starting a new QEMU process
+— `vagrant up`/`vagrant reload` when the guest isn't already running — or an `export`/
+`package` `qemu-img` call refuses to run against any other installed version; `vagrant
+provision` on its own never reaches `Driver#execute` at all, running or not — confirmed by
+reading vagrant-qemu's `action.rb`, whose standalone `action_provision` goes straight to the
+`Provision` action and never touches `StartInstance` — and `destroy`/`halt` don't either, so
+neither can ever leave a running QEMU process unstoppable after a plugin upgrade) and fails
+closed with a hard error if a rewritten forward is ever
 found still bound to a non-loopback address, rather than silently starting QEMU with a port
 exposed to the LAN.
 

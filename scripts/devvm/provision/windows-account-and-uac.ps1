@@ -2,8 +2,9 @@
 # that the account this tool connects as is an ordinary Administrators member — not the
 # built-in RID-500 Administrator, which Windows elevates silently, without a UAC prompt,
 # regardless of EnableLUA — and that the account autologs in at boot so a real interactive
-# (session 1) logon exists for windows-run-unelevated.ps1's schtasks /IT probe runner to
-# borrow. Idempotent: safe to re-run on every `vagrant up --provision`.
+# (session 1) logon exists for windows-run-unelevated.ps1's Register-ScheduledTask
+# (-LogonType Interactive) probe runner to borrow. Idempotent: safe to re-run on every
+# `vagrant up --provision`.
 #
 # ConsentPromptBehaviorAdmin is only flipped away from the interactive default (5) when
 # DEVVM_WINDOWS_AUTO_CONSENT=1 is set — see scripts/devvm.py's --allow-elevation flag and
@@ -17,7 +18,9 @@
 # provision_windows_guest (scripts/devvm.py) scans for that marker and, if set, calls
 # reboot_windows_guest_and_wait to actually reboot (issued directly, not via Vagrant's
 # reboot-if-needed/wait_for_reboot capability — see the Vagrantfile's provisioning comment for
-# why) and wait for the guest to come back, then re-verifies the settings.
+# why) and wait for the guest to come back with a real interactive session on top of it. It
+# does NOT re-run this script afterward to re-verify the settings — the write above already
+# happened and reboot_windows_guest_and_wait's own wait is the only post-reboot check.
 
 $ErrorActionPreference = "Stop"
 $policyKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
@@ -74,8 +77,9 @@ if ($autoConsent) {
 
 # 4. Autologon: the whole point of this guest is measuring the UNELEVATED interactive-session
 #    UAC path (see windows-run-unelevated.ps1) - that needs an actual active console (session
-#    1) logon for schtasks /IT to borrow a filtered token from, and a headless VM has no
-#    console session unless something logs in. AutoAdminLogon establishes that at every boot.
+#    1) logon for its Register-ScheduledTask (-LogonType Interactive) probe runner to borrow a
+#    filtered token from, and a headless VM has no console session unless something logs in.
+#    AutoAdminLogon establishes that at every boot.
 #    Also only takes effect at the next boot; only reboot if actually changing something.
 $currentAutoAdminLogon = (Get-ItemProperty -Path $winlogonKey -Name "AutoAdminLogon" -ErrorAction SilentlyContinue).AutoAdminLogon
 $currentDefaultUserName = (Get-ItemProperty -Path $winlogonKey -Name "DefaultUserName" -ErrorAction SilentlyContinue).DefaultUserName
