@@ -973,10 +973,27 @@ def cmd_run(args: argparse.Namespace) -> None:
     # Every token — command name included — is quoted as a PowerShell string literal and
     # passed through the `&` call operator, so args with spaces/quotes/special characters
     # aren't re-parsed or re-split by PowerShell the way a naive `" ".join(...)` would allow.
+    #
+    # `inner` runs unmodified in two different contexts: directly over WinRM (elevated) and
+    # nested inside windows-run-unelevated.ps1's headless `cmd.exe /d /c powershell
+    # -EncodedCommand ...` child (--unelevated). Only the second context is dangerous for
+    # `Write-Host`: PS 5.1's "Default Host" (no interactive console attached, exactly the case
+    # for that nested child) CLIXML-serializes Write-Host/progress-stream records onto the
+    # process's real stderr instead of writing plain text — confirmed live (2026-09-25): a
+    # failing unelevated command's stderr came back as a `#< CLIXML` blob with
+    # `<S N="Source">Write-Host</S>` inside it, not the plain "devvm: ..." message.
+    # `[Console]::Error.WriteLine` bypasses $Host entirely and writes straight to the process's
+    # stderr handle — the same reason cmd.exe's own `1>`/`2>` redirection avoids the *reader*
+    # side of this hazard (see windows-run-unelevated.ps1) now avoids the *writer* side too.
+    # `$ProgressPreference = 'SilentlyContinue'` (first statement, before anything that might
+    # trigger "Preparing modules for first use.") silences the other CLIXML source seen in that
+    # same live capture: PowerShell's own module-loading progress record, unrelated to
+    # anything `inner` itself prints.
     quoted_path = powershell_quote(guest.tree_path_posix)
     quoted_cmd = " ".join(powershell_quote(part) for part in cmd_args)
     inner = (
-        'trap { Write-Host "devvm: $_"; exit 1 }; '
+        "$ProgressPreference = 'SilentlyContinue'; "
+        'trap { [Console]::Error.WriteLine("devvm: $_"); exit 1 }; '
         f"Set-Location -Path {quoted_path} -ErrorAction Stop; "
         f'$env:CARGO_TARGET_DIR = "$HOME\\cargo-target"; '
         "$global:LASTEXITCODE = $null; "
