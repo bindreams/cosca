@@ -3515,6 +3515,84 @@ fn probe_leak_of_a_committed_drain_still_kills_through() {
     assert!(kill.exists(), "kill-through went ahead despite leak()");
 }
 
+/// The converse of `probe_leak_of_a_committed_drain_still_kills_through`: `leak` racing in BEFORE
+/// the queued `DrainTask` has claimed what it must drop — still `NotStarted`, queued behind an
+/// occupied blocking pool — reclaims it directly and disarms it, the same as
+/// `leaking_a_contained_child_leaves_it_running` does for a leaf that never moved to a drain at
+/// all. Nothing kills through it (round-7 review, mutant E: a `leak` that forgets to disarm an
+/// unclaimed drain's retained leaf leaves it armed, so the leaf's own later `Drop` — once `retained`
+/// itself goes out of scope at the end of that match arm — kills through it instead, even though
+/// `leak` itself never wrote `cgroup.kill`).
+///
+/// Deterministic: `max_blocking_threads(1)` plus a blocker parked on a gate occupies the pool's
+/// only thread, so the `DrainTask` the reap below queues cannot be claimed until this test releases
+/// it — `leak` below is guaranteed to find the task still `NotStarted`, not racing to get there
+/// first.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_leak_of_an_unclaimed_drain_disarms() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    drop(stdin); // the child exits at once
+    crate::child::unreaped::block_until_reapable(pid).expect("zombie");
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    runtime.block_on(async {
+        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
+        // Occupies the pool's only blocking thread until this test releases `gate_tx`, so the
+        // `DrainTask` the reap below queues can never be claimed.
+        let _blocker = ::tokio::task::spawn_blocking(move || {
+            let _ = occ_tx.send(());
+            let _ = gate_rx.recv();
+        });
+        occ_rx.await.expect("the blocker parked");
+
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained { attached: crate::containment::Attached::Cgroup(leaf) }),
+        );
+        let raw = pid as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = u.wait() => panic!("wait completed while the drain is queued behind the occupied pool: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+        assert!(
+            u.hands_retained_to_draining_task(),
+            "the drain must still be tracked (queued behind the occupied pool), not detached"
+        );
+
+        // The task cannot have claimed it yet: the pool's only thread is still occupied by
+        // `_blocker`. `leak` below reclaims it directly.
+        u.leak();
+        assert!(
+            !kill.exists(),
+            "leak() of an unclaimed drain must disarm what it retained, not leave it armed for \
+             its own later Drop to kill through"
+        );
+
+        // Release the blocker so the runtime can join the pool's thread when it drops below,
+        // instead of hanging on it.
+        gate_tx.send(()).expect("the blocker is still parked on this receiver");
+    });
+}
+
 /// M1 regression: a `wait` that returns `Ok` because the child's exit status was already cached
 /// (a previous, cancelled wait already reaped it) re-awaits what that reap retained — but if the
 /// runtime shuts down before the queued `DrainTask` ever claims it, that re-await reclaims the
@@ -3523,7 +3601,7 @@ fn probe_leak_of_a_committed_drain_still_kills_through() {
 /// through it.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
-fn probe_leak_after_a_refused_drain_kills_through() {
+fn probe_leak_after_a_refused_drain_disarms() {
     let runtime = ::tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let handle = runtime.handle().clone();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3555,15 +3633,16 @@ fn probe_leak_after_a_refused_drain_kills_through() {
     assert!(!kill.exists(), "leak() must disarm what the refused drain left behind, not kill through it");
 }
 
-/// The same contract as `tokio_wait_leaves_the_retained_leaf_armed_after_a_successful_reap`, but
+/// The same contract as `probe_tokio_wait_returns_only_after_the_retained_drop_ran`, but
 /// through `Unreaped::drop` after a cancelled `wait` already reaped the child and handed its
 /// retained leaf to a still-running `DrainTask`: `Drop`'s own claim-slot wait (`take_blocking`)
 /// reads the very same `RetainedDrain` state `wait`'s `await_draining` does, so the ordering bug
 /// that test catches (notifying before the real kill-through ran) would equally have hidden here.
 ///
-/// Deterministic, not a race against `Drop`, the same way `dropping_during_a_blocking_reap_waits_for_it`
-/// is: an `after_drain_claim` gate holds the task claimed (not yet committed) until this test
-/// releases it, so `Drop` deterministically finds the task already claimed and must go through
+/// Deterministic, not a race against `Drop`, the same way
+/// `dropping_during_a_blocking_reap_waits_for_it` is: an `after_drain_claim` gate holds the task
+/// claimed (state `Committed`, not yet `Finished`) until this test releases it, so `Drop`
+/// deterministically finds the task already claimed and must go through
 /// `take_blocking`, not `reclaim_before_start`'s direct-drop fast path. The `before_blocking_drop`
 /// hook then fires as `Drop` commits to blocking on the drain and releases the gate — from inside
 /// `Drop`'s own call frame, so the release cannot be observed to race `Drop`'s own transition to
@@ -3633,7 +3712,8 @@ fn tokio_drop_leaves_the_retained_leaf_armed_after_a_successful_reap() {
 
         // Deterministic: wait for the drain task's own claim signal before dropping, so `Drop`
         // below exercises the "wait for a claimed drain" branch of `take_blocking`, not "drop an
-        // unclaimed one inline". The task is now parked in the gate, not yet committed.
+        // unclaimed one inline". The task is now parked in the gate, claimed — and so already
+        // committed to kill-through (see `DrainState`'s doc) — but not yet having run it.
         claimed_rx
             .recv()
             .expect("the drain task reaches the gate once it has claimed what it must drop");
