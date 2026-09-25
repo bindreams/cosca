@@ -151,11 +151,15 @@ reboot this guest ever needs (`EnableLUA`/autologon changes only take effect at 
 is issued and waited on directly by `reboot_windows_guest_and_wait` in `scripts/devvm.py` (a
 real `shutdown /r`, then a bounded wait for a volatile registry marker — set before the
 reboot, guaranteed by Windows not to survive one — to clear). Separately,
-`provision_windows_guest` calls `wait_for_windows_session` conditionally — only when
-`get_windows_autologon_configured` reports autologon is set — once, at the end of provisioning:
-not just right after a reboot that configured it, but also on a guest an earlier `up` already
-configured, where this `up`'s own reboot decision (if any) has nothing to do with whether a
-session shows up. Both waits: no `sleep`, no arbitrarily-chosen poll interval, just an
+`provision_windows_guest` calls `wait_for_windows_session` conditionally — only when this
+invocation started or rebooted the guest (and, even then, only if
+`get_windows_autologon_configured` reports autologon is set) — once, at the end of
+provisioning. `sync` (which never starts the guest) can still trigger this: if
+windows-account-and-uac.ps1 decides a reboot is needed, `sync` waits for the session that
+reboot just invalidated, the same as `up` would. Merely having autologon already configured
+from an earlier run is not enough on its own to wait — an RDP sign-out elsewhere, for
+instance, must never turn the next `sync`/`up` into a silent up-to-an-hour wait for a session
+that was never going away. Both waits: no `sleep`, no arbitrarily-chosen poll interval, just an
 immediate retry, bounded by `vagrant status` failing fast the moment the guest stops running
 and by one monotonic deadline reusing the Vagrantfile's own 3600s
 `boot_timeout`/`winrm.timeout`. Neither goes through Vagrant's own
@@ -249,8 +253,10 @@ detect that logon by its running `explorer.exe`'s ownership, not `Win32_Computer
 (which goes blank the moment RDP takes the console over) and not `Win32_LoggedOnUser`/
 `Win32_LogonSession` (live-verified stale after a genuine sign-out — see
 `get_windows_interactive_username`'s docstring), so both keep working through an active RDP
-session. If `run --unelevated`'s scheduled task still
-fails to run — the account is logged on but its session is _disconnected_, not merely
+session. Signing out of RDP elsewhere doesn't make the next `sync`/`up` sit waiting for a fresh
+session either: that wait only runs when this invocation itself started or rebooted the
+guest, never merely because a session might currently be missing. If `run --unelevated`'s
+scheduled task still fails to run — the account is logged on but its session is _disconnected_, not merely
 redirected, e.g. an RDP client that was closed without logging off — the error names this and
 gives the recovery: from inside the guest, `query session` lists session IDs and `tscon <id>
 /dest:console` reattaches a disconnected session to the console; otherwise reboot the guest.

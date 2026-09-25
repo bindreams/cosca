@@ -92,11 +92,14 @@
 # with it; if a WER dialog is what's actually holding it, clear that first. `Get-Process
 # WerFault -ErrorAction SilentlyContinue` is deliberately NOT used here: -ErrorAction only
 # suppresses the error's message, not its effect on `$?` — with nothing named WerFault running
-# (the common case), `$?` is still left False, and devvm.py's remote-command wrapper falls back
-# to `$?` for its exit code whenever a command sets no `$LASTEXITCODE` of its own (true for a
-# pure PowerShell pipeline like this one), turning that "nothing to clean up" outcome into a
-# reported failure. Filtering client-side instead of via Get-Process's own -Name matching avoids
-# the error (and the `$?` it leaves behind) in the first place:
+# (the common case), `$?` is still left False at the end of the command. devvm.py's `run`
+# wrapper runs this `-Command` string inside a nested `powershell.exe -NoProfile -Command '...'`
+# child process, and that child's own process exit code mirrors ITS internal `$?` at exit
+# (measured directly, 2026-09-25: `Get-Process` on a nonexistent name with
+# `-ErrorAction SilentlyContinue` alone yields child `$LASTEXITCODE=1`) - the outer wrapper
+# then reads that as `$LASTEXITCODE` and reports it as a command failure, turning a "nothing to
+# clean up" outcome into a reported failure. Filtering client-side instead of via Get-Process's
+# own -Name matching avoids the error (and the `$?` it leaves behind) in the first place:
 #   uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-Process | Where-Object Name -eq WerFault | Stop-Process -Force'
 Param(
     [Parameter(Mandatory = $true)]
@@ -525,7 +528,17 @@ try {
             # script's own deadline is the only bound that should apply.
             $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)
             try {
-                Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                # -ErrorAction Stop: Register-ScheduledTask is CDXML-backed (a CIM cmdlet
+                # generated from a Task Scheduler CDXML definition, not native .NET), and a
+                # CDXML cmdlet's own failure is a NON-terminating error regardless of this
+                # runspace's default $ErrorActionPreference - measured directly (2026-09-25):
+                # without -ErrorAction Stop here, a forced registration failure (e.g. no
+                # interactive session to borrow) writes to the error stream and returns
+                # normally, so this catch never runs and the friendly RDP-recovery message
+                # below never fires; Invoke-Bounded's caller then sees only Register-
+                # ScheduledTask's own generic error, or none at all if nothing downstream
+                # inspects it.
+                Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
             } catch {
                 throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup.$RdpRecoveryNote"
             }
@@ -669,7 +682,7 @@ try {
         # this guest, well above Register-/Start-ScheduledTask's own. A failure bound surfaced
         # to the human via the warning below, not a synchronization interval.
         Invoke-Bounded -TimeoutSeconds 120 `
-            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment): uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | Unregister-ScheduledTask -Confirm:`$false'." `
+            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment):`n`nuv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | Unregister-ScheduledTask -Confirm:`$false'" `
             -Parameters @{ TaskName = $taskName } `
             -ScriptBlock {
                 param($TaskName)
