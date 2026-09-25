@@ -43,22 +43,7 @@ use crate::error::Error;
 /// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
 /// promises — and no second read of this process's environment can disagree with the block.
 pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    resolve_executable_via(exe, base, &windows_system_dirs, path)
-}
-
-/// [`resolve_executable`] with `system_dirs` injectable — the exact function it calls, with only
-/// that one argument replaced. Tests use this, not [`resolve_executable_in`] (which many other
-/// tests also share, for unrelated shapes and both Win32 backends), to pin `resolve_executable`'s
-/// OWN delegation: a closure that panics if called at all proves a `Located` or absolute name never
-/// reaches it, and one that fails proves a bare name's error surfaces rather than being swallowed,
-/// through the same code `resolve_executable` itself runs.
-fn resolve_executable_via(
-    exe: &Path,
-    base: Option<&Path>,
-    system_dirs: &dyn Fn() -> Result<Vec<PathBuf>, Error>,
-    path: Option<&OsStr>,
-) -> Result<PathBuf, Error> {
-    resolve_executable_in(exe, base, system_dirs, path, false)
+    resolve_executable_in(exe, base, &windows_system_dirs, path, false)
 }
 
 /// A raw spawn's effective working directory: filled once per spawn, and the one value every later
@@ -139,12 +124,15 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// This function is [`crate::resolve::ResolveInput::system_dirs`] itself — `resolve_executable`
 /// passes it, unevaluated, as that field's closure, so `crate::resolve::resolve` only calls it from
 /// its `BareName` arm, after every shape refusal has already passed. A `Located` or absolute name
-/// never reaches this call at all, so a failed Win32 query cannot break resolving one. Proven at the
-/// host-independent policy level by `a_located_name_still_resolves_when_the_system_dirs_query_fails`
-/// in `crate::resolve::resolve_tests`, and through this real Windows entry point by
-/// `a_located_and_an_absolute_name_never_query_system_dirs_through_the_real_entry_point` in
-/// `resolve_tests` below, which calls [`resolve_executable_via`] — the exact function
-/// `resolve_executable` delegates to — with a closure that panics if it is ever invoked.
+/// never reaches this call at all, so a failed Win32 query cannot break resolving one — proven at
+/// the host-independent policy level by `a_located_name_still_resolves_when_the_system_dirs_query_fails`
+/// in `crate::resolve::resolve_tests`, which takes `system_dirs` as a fabricated closure.
+/// `resolve_executable`'s own one-line body — passing `&windows_system_dirs` lazily, rather than
+/// calling it eagerly — is not something any test here proves: `windows_system_dirs` calls real
+/// Win32 functions that succeed under any test runner, so no portable test can force that exact
+/// binding to observe a failure and tell lazy from eager. That line is covered by review, not by a
+/// test; see `a_located_and_an_absolute_name_never_query_system_dirs_when_resolved_directly` below
+/// for what its sibling test through `resolve_executable_in` does and does not prove.
 ///
 /// For a bare name, a step this process cannot determine fails that resolution, rather than being
 /// dropped and falling through to whatever is left: a failed `GetSystemDirectoryW` or
@@ -152,11 +140,14 @@ pub(crate) fn reject_not_fully_qualified(what: &str, path: &Path) -> Result<(), 
 /// instead of letting resolution continue on the other directory, then `PATH`. This fails CLOSED,
 /// on purpose: it produces the same accidental widening [`crate::resolve::ResolveInput::system_dirs`]'s
 /// doc describes for a `system_dirs` closure that returns no directories on purpose, so
-/// `windows_system_dirs` and [`windows_system_dirs_via`] both return the Win32 failure rather than
-/// discard it — an ordinary spawn error instead of a silent search-order change. Proven through this
-/// same real entry point, for each of the two queries independently, by
-/// `a_bare_name_names_get_system_directory_w_when_the_system_query_fails` and its
-/// `_windows_directory_w_` mirror below.
+/// [`windows_system_dirs_via`] returns the Win32 failure rather than discard it — an ordinary spawn
+/// error instead of a silent search-order change. That propagation is proven through the real
+/// `windows_system_dirs_via` wiring, for each of the two queries independently (one leg real, one
+/// forced to fail), by `a_bare_name_names_get_system_directory_w_when_the_system_query_fails` and
+/// its `_windows_directory_w_` mirror below. `windows_system_dirs`'s own zero-argument body — which
+/// real closures it hands to `windows_system_dirs_via`, and that it does not discard the `Result` —
+/// is, like `resolve_executable`'s binding above, covered by review rather than by a test: nothing
+/// portable can make the real Win32 calls it hardcodes fail.
 fn windows_system_dirs() -> Result<Vec<PathBuf>, Error> {
     windows_system_dirs_via(
         |buf| {
