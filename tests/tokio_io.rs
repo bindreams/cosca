@@ -560,14 +560,14 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     );
 }
 
-/// Async twin of sync `unix_m2_fd3_does_not_leak_into_stderr_pipe`: with this process' own fd 2
-/// closed and freed, a plain `fd(3, null)` mapping must not end up readable as the child's
-/// stderr just because `install()`'s own bookkeeping happens to source or park something at
-/// that exact number. `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the parent's stderr
-/// pipe must receive nothing.
+/// Async twin of sync `a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed`: with
+/// this process' own fd 2 closed and freed, a plain `fd(3, null)` mapping must not end up
+/// readable as the child's stderr just because `install()`'s own bookkeeping happens to source
+/// or park something at that exact number. `sh -c 'echo LEAK >&3'` writes to the child's fd 3;
+/// the parent's stderr pipe must receive nothing.
 #[cfg(unix)]
 #[tokio::test]
-async fn async_unix_m2_fd3_does_not_leak_into_stderr_pipe() {
+async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     use tokio::io::AsyncReadExt;
 
     let _restore = common::RestoreStdio::close(&[2]);

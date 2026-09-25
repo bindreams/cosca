@@ -523,14 +523,14 @@ fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     );
 }
 
-/// M2 regression, through the public `Command` API: with this process' own fd 2 closed and
-/// freed, a plain `fd(3, null)` mapping must not end up readable as the child's stderr just
-/// because `install()`'s own bookkeeping happens to source or park something at that exact
-/// number. `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the parent's stderr pipe must
-/// receive nothing.
+/// Through the public `Command` API: with this process' own fd 2 closed and freed, a plain
+/// `fd(3, null)` mapping must not end up readable as the child's stderr just because
+/// `install()`'s own bookkeeping happens to source or park something at that exact number.
+/// `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the parent's stderr pipe must receive
+/// nothing.
 #[cfg(unix)]
 #[test]
-fn unix_m2_fd3_does_not_leak_into_stderr_pipe() {
+fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     let _restore = common::RestoreStdio::close(&[2]);
 
     let mut cmd = Command::new();
@@ -552,9 +552,9 @@ fn unix_m2_fd3_does_not_leak_into_stderr_pipe() {
     );
 }
 
-/// N1 regression, through the public `Command` API: with this process' own fd 1 and fd 2
-/// closed, `.stdout(Stdio::from_file(...))` and `.stderr(Stdio::from_file(...))` land their
-/// dup'd targets at exactly 1 and 2, and three ordinary child mappings follow (`fd(5, null)`,
+/// Through the public `Command` API: with this process' own fd 1 and fd 2 closed,
+/// `.stdout(Stdio::from_file(...))` and `.stderr(Stdio::from_file(...))` land their dup'd
+/// targets at exactly 1 and 2, and three ordinary child mappings follow (`fd(5, null)`,
 /// `fd(6, null)`, and the out-of-range `fd(1_000_000, null)`). Relocating a low mapping source
 /// out of `install()` must not free that exact number back to the OS before `std_cmd.spawn()`'s
 /// own internal fd allocation (its child-to-parent error-reporting pipe) is done with it — see
@@ -562,7 +562,7 @@ fn unix_m2_fd3_does_not_leak_into_stderr_pipe() {
 /// must receive nothing (no leaked exec-error-pipe bytes).
 #[cfg(unix)]
 #[test]
-fn unix_n1_relocating_a_low_parent_fd_does_not_corrupt_stds_error_pipe() {
+fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     use std::io::{Seek, SeekFrom};
 
     let out_f = tempfile::tempfile().expect("tempfile for stdout target");
