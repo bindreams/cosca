@@ -248,8 +248,9 @@ above. Off by default; pass it again on every `up` that needs it (not persisted)
 guest is the other option if a window on this Mac specifically isn't what's needed.
 
 RDP-ing into `vagrant` takes over its console (session 1) logon rather than opening a second,
-independent one — the account stays genuinely logged in, but `sync` and `run --unelevated`
-detect that logon by its running `explorer.exe`'s ownership, not `Win32_ComputerSystem.UserName`
+independent one — the account stays genuinely logged in, and both the session-wait `sync`/`up`
+conditionally run (see below) and `run --unelevated` detect that logon by its running
+`explorer.exe`'s ownership, not `Win32_ComputerSystem.UserName`
 (which goes blank the moment RDP takes the console over) and not `Win32_LoggedOnUser`/
 `Win32_LogonSession` (live-verified stale after a genuine sign-out — see
 `get_windows_interactive_username`'s docstring), so both keep working through an active RDP

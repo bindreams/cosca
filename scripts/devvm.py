@@ -53,8 +53,9 @@ WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES = 24 * 60
 WINDOWS_RUN_UNELEVATED_MAX_TIMEOUT_SECONDS = (2**31 - 1) // 1000
 
 # The human-facing failure bound for reboot_windows_guest_and_wait's post-reboot wait and
-# wait_for_windows_session's session wait (reused verbatim by provision_windows_guest even on
-# an `up` that never reboots): a guest coming back up, or a session appearing, is a genuinely
+# wait_for_windows_session's session wait (reused verbatim by provision_windows_guest for `up`
+# or `sync`, whenever this invocation started or rebooted the guest): a guest coming back up, or
+# a session appearing, is a genuinely
 # external event that might never complete, and this is the same already-configured,
 # already-real bound the Windows Vagrantfile itself uses (config.vm.boot_timeout /
 # config.winrm.timeout, both 3600s in scripts/devvm/guests/windows-x64/Vagrantfile) — not a
@@ -887,10 +888,10 @@ def ensure_windows_license_current(guest: Guest, *, display: bool = False) -> bo
     """Rearm the guest's time-based Windows evaluation license if it's expired or within
     WINDOWS_LICENSE_NEAR_EXPIRY_MINUTES of expiring, then reboot for the rearm to take effect.
 
-    Returns whether it rebooted the guest — provision_windows_guest ORs this into its own
-    `rebooted`, so the license-rearm reboot (this function's own, distinct from the
-    windows-account-and-uac.ps1 reboot) also counts toward the post-provisioning session-wait
-    gate instead of being invisible to it.
+    Returns whether it rebooted the guest — provision_windows_guest seeds its own `rebooted`
+    from this, so the license-rearm reboot (this function's own, distinct from the
+    windows-account-and-uac.ps1 reboot, which can still set `rebooted = True` again later) also
+    counts toward the post-provisioning session-wait gate instead of being invisible to it.
 
     Why this exists: the stromweld/windows-10 box's eval image self-terminates once its
     evaluation period elapses - the Windows License Manager Service (wlms.exe) issues a
@@ -983,10 +984,10 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     # finding it already running and doing nothing) — see the session-wait gating at the
     # bottom of this function for why that distinction, not merely `create`, is what matters.
     started_guest = False
-    # Set from ensure_windows_license_current's return value below (create only); ORed into
-    # `rebooted` once that variable exists, so a reboot the license rearm causes counts toward
-    # the session-wait gate exactly like the windows-account-and-uac.ps1 reboot does.
-    license_rebooted = False
+    # Set from ensure_windows_license_current's return value below (create only), so a reboot
+    # the license rearm causes counts toward the session-wait gate exactly like the
+    # windows-account-and-uac.ps1 reboot does.
+    rebooted = False
     if create:
         started_guest = get_vagrant_machine_state(guest) != "running"
         # --no-provision: a fresh `up` would otherwise auto-run the one remaining
@@ -995,7 +996,7 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
         # redundant time. Skipping it here makes exactly one invocation happen either way
         # (create or not), driven explicitly below.
         run_vagrant(guest, ["up", "--provider", "qemu", "--no-provision"], display=display)
-        license_rebooted = ensure_windows_license_current(guest, display=display)
+        rebooted = ensure_windows_license_current(guest, display=display)
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-clean-stage.ps1", elevated=True, display=display)
     # The lone remaining Vagrantfile-declared provisioner: uploads the staged tree into
     # C:/cosca-stage. `run: "always"` on it means a plain `vagrant provision` re-runs it every
@@ -1012,10 +1013,6 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     )
     run_windows_script(guest, WINDOWS_PROVISION_DIR / "windows-rust.ps1", elevated=False, display=display)
 
-    # Starts from license_rebooted (create only — see ensure_windows_license_current) so that
-    # reboot also counts toward the session-wait gate below, alongside the
-    # windows-account-and-uac.ps1 reboot this function itself may trigger next.
-    rebooted = license_rebooted
     if REBOOT_MARKER_TRUE in account_output:
         print(
             "note: an EnableLUA or autologon change needs a reboot to take effect — "
@@ -1039,24 +1036,19 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
     # but AutoAdminLogon (without ForceAutoLogon, which this tool does not set) only fires a
     # fresh logon at BOOT. So waiting for one is only ever correct when THIS invocation is what
     # just produced a boot: either it started the guest itself (`started_guest`, only ever True
-    # under `create`) or it rebooted the guest — via the license rearm above (`license_rebooted`,
-    # also create-only) or via the windows-account-and-uac.ps1 reboot just above, which `sync`
-    # can trigger too (create=False): that script re-runs on every `sync`, and can still decide
-    # a reboot is needed. Merely "autologon is configured" (true on every subsequent `up`/`sync`
-    # once windows-account-and-uac.ps1 has ever succeeded, regardless of whether a human RDP'd in
-    # and signed out since) is not such an event — waiting on that alone would block for up to
+    # under `create`) or it rebooted the guest — via the license rearm above (create-only) or via
+    # the windows-account-and-uac.ps1 reboot just above, which `sync` can trigger too
+    # (create=False): that script re-runs on every `sync`, and can still decide a reboot is
+    # needed. Merely "autologon is configured" (true on every subsequent `up`/`sync` once
+    # windows-account-and-uac.ps1 has ever succeeded, regardless of whether a human RDP'd in and
+    # signed out since) is not such an event — waiting on that alone would block for up to
     # WINDOWS_REBOOT_DEADLINE_SECONDS for a session that will not spontaneously reappear.
     # `run --unelevated` needs no proactive wait either — windows-run-unelevated.ps1's own
     # $currentUser check already fails immediately with RDP-recovery guidance when there is no
     # session to borrow.
     #
-    # No `create and` gate here: `started_guest` and `license_rebooted` are already only ever
-    # True when `create` is True (both are set inside the `if create:` block above), so they
-    # already imply it; gating on `create` in addition only mattered for the third source,
-    # `rebooted` via windows-account-and-uac.ps1 — and excluding that unconditionally under
-    # `sync` was the bug: `sync` DOES sometimes reboot the guest (same script, same
-    # DEVVM_REBOOT_REQUIRED marker, independent of `create`), and previously never waited for
-    # the session that reboot had just invalidated.
+    # No `create` gate: `sync` (create=False) can also reboot the guest via
+    # windows-account-and-uac.ps1, and needs the same wait `up` does.
     if started_guest or rebooted:
         # A None (WinRM not answering this particular check yet, even though every script above
         # just succeeded over it) is retried, not guessed at or treated as fatal on the first
@@ -1078,7 +1070,8 @@ def provision_windows_guest(guest: Guest, *, auto_consent: bool, display: bool =
                 "+ this run just started or rebooted the guest — waiting for vagrant's "
                 "autologon session to come up (needed by `run --unelevated`), up to "
                 f"{WINDOWS_REBOOT_DEADLINE_SECONDS}s. If this hangs: there is no vagrant desktop "
-                "session — RDP in as vagrant, or reboot the guest to force a fresh autologon.",
+                "session (or WinRM isn't answering) — RDP in as vagrant, or reboot the guest to "
+                "force a fresh autologon.",
                 file=sys.stderr,
             )
             wait_for_windows_session(guest, deadline)

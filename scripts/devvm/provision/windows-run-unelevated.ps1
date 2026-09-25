@@ -86,7 +86,9 @@
 # PowerShell-special characters inside it — a double-quoted `$false` here gets expanded by the
 # host shell before PowerShell ever sees it. `-PassThru` is also not a documented parameter of
 # Stop-ScheduledTask, so the pipeline below routes each task through ForEach-Object instead of
-# relying on it:
+# relying on it. Only run this when no other `run --unelevated` is in flight - the wildcard
+# matches every DevvmUnelevatedRun-* task, not just the hung one, so it would stop/unregister a
+# concurrent healthy run's task too:
 #   uv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | ForEach-Object { $_ | Stop-ScheduledTask; $_ | Unregister-ScheduledTask -Confirm:$false }'
 # removes the task(s) and, since Stop-ScheduledTask kills its action process, the stuck wrapper
 # with it; if a WER dialog is what's actually holding it, clear that first. `Get-Process
@@ -293,7 +295,17 @@ function Invoke-Bounded {
         throw $TimeoutMessage
     }
     try {
-        $ps.EndInvoke($asyncResult) | Out-Null
+        try {
+            $ps.EndInvoke($asyncResult) | Out-Null
+        } catch [System.Management.Automation.MethodInvocationException] {
+            # A ScriptBlock that itself throws an uncaught terminating error (e.g.
+            # Register-ScheduledTask's own catch/throw below) surfaces here, not via
+            # $ps.HadErrors below: EndInvoke() rethrows it wrapped in a
+            # MethodInvocationException whose own message is generic ("Exception calling
+            # "EndInvoke" with "1" argument(s): ..."). Unwrap to the ScriptBlock's real
+            # exception so callers see the friendly message it actually threw.
+            throw $_.Exception.InnerException
+        }
         if ($ps.HadErrors) {
             throw $ps.Streams.Error[0].Exception
         }
@@ -493,10 +505,13 @@ try {
     # interactive session" question that has nothing to do with a timeout. Instead, only the
     # actual Register-ScheduledTask cmdlet call, inside the ScriptBlock below, is wrapped - a
     # genuine cmdlet failure (e.g. no interactive session to borrow) gets the friendly
-    # RDP-recovery wrapping there and surfaces through Invoke-Bounded's own
-    # $ps.Streams.Error[0].Exception path already fully formatted, needing no further wrapping
-    # here. $rdpRecoveryNote is passed in via -Parameters since the ScriptBlock runs on its own
-    # runspace and cannot close over this script's variables.
+    # RDP-recovery wrapping there (an explicit `throw`, a terminating error inside the
+    # ScriptBlock's own runspace) and surfaces through Invoke-Bounded's unwrapped-EndInvoke
+    # path already fully formatted, needing no further wrapping here - not through
+    # $ps.Streams.Error[0].Exception, which only catches a ScriptBlock that leaves a
+    # non-terminating error unthrown (see Invoke-Bounded's own comment). $rdpRecoveryNote is
+    # passed in via -Parameters since the ScriptBlock runs on its own runspace and cannot close
+    # over this script's variables.
     #
     # Bounded by whatever's left of the caller's own -TimeoutSeconds, not a budget of its own —
     # so a timeout here means -TimeoutSeconds itself ran out during this step, not that Task
@@ -535,9 +550,10 @@ try {
                 # without -ErrorAction Stop here, a forced registration failure (e.g. no
                 # interactive session to borrow) writes to the error stream and returns
                 # normally, so this catch never runs and the friendly RDP-recovery message
-                # below never fires; Invoke-Bounded's caller then sees only Register-
-                # ScheduledTask's own generic error, or none at all if nothing downstream
-                # inspects it.
+                # below never fires. Invoke-Bounded's own HadErrors check still catches that
+                # case and throws $ps.Streams.Error[0].Exception, so the caller does see a
+                # failure either way - just Register-ScheduledTask's own generic error, not
+                # this script's friendly RDP-recovery wrapping.
                 Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
             } catch {
                 throw "devvm: Register-ScheduledTask failed: $($_.Exception.Message) - is there an active interactive (session 1) logon for it to borrow? See windows-account-and-uac.ps1's autologon setup.$RdpRecoveryNote"
@@ -682,7 +698,7 @@ try {
         # this guest, well above Register-/Start-ScheduledTask's own. A failure bound surfaced
         # to the human via the warning below, not a synchronization interval.
         Invoke-Bounded -TimeoutSeconds 120 `
-            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment):`n`nuv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask DevvmUnelevatedRun-* | Unregister-ScheduledTask -Confirm:`$false'" `
+            -TimeoutMessage "devvm: Unregister-ScheduledTask did not complete within 120s during cleanup - the task '$taskName' is left behind. Its name is GUID-suffixed and unique to THIS run, so a later run's Register-ScheduledTask -Force will NOT reuse/overwrite it (-Force only overwrites a task registered under the same name) - it will accumulate until removed by hand, routed through devvm.py (a bare 'vagrant winrm' lacks its environment):`n`nuv run scripts/devvm.py run windows-x64 -- powershell -NoProfile -Command 'Get-ScheduledTask $taskName | Unregister-ScheduledTask -Confirm:`$false'" `
             -Parameters @{ TaskName = $taskName } `
             -ScriptBlock {
                 param($TaskName)
