@@ -512,6 +512,60 @@ fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// A failed password write whose child's one check comes back with ownership uncertain (a
+/// genuine `ECHILD`: something else already reaped it) disarms what it retained, the same as a
+/// leaked or already-uncertain-owned child's: the pid may already name another process, so this
+/// spawn no longer treats itself as owning the tree to kill on drop.
+///
+/// `Containment::Delegated` here, not `CgroupV2`: this function's own tree-kill note at its top
+/// fires whenever `can_teardown()` is true, which would write `cgroup.kill` before the Uncertain
+/// arm is even reached, hiding the one write under test. `Delegated` skips that note, so the only
+/// thing that can still touch `cgroup.kill` is the retained leaf's own `Drop` — armed or not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_whose_check_is_uncertain_disarms_its_retained_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-uncertain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::Delegated,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let mut cmd = blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let pid = child.id().pid();
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-elevated-kill-eperm-uncertain-9e21",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-password-write-fail-uncertain-11ab")),
+    );
+
+    assert!(err.to_string().contains("ownership is uncertain"), "got {err}");
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "an uncertain-ownership release must disarm its retained leaf, not kill through it"
+    );
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since cosca released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+}
+
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
 #[cfg(target_os = "linux")]
 fn reaped(pid: u32) -> bool {
@@ -940,6 +994,54 @@ fn a_child_whose_one_check_fails_with_echild_after_a_failed_kill_is_released_not
     };
     let pid = nix::unistd::Pid::from_raw(id.pid() as i32);
     nix::sys::wait::waitpid(pid, None).expect("reap the child");
+}
+
+/// A teardown whose one check comes back with ownership uncertain (a genuine `ECHILD`) disarms
+/// what it retained, the same as a leaked or already-uncertain-owned child's: the pid may already
+/// name another process, so this spawn no longer treats itself as owning the tree to kill on
+/// drop.
+///
+/// Calls `teardown_unadopted` directly: it is private, reachable from this submodule, and driving
+/// this exact arm through a full spawn would need attach failure, a real occupied leaf and the
+/// ECHILD seam all armed together for one code path, proving nothing the direct call does not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-teardown-uncertain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
+    let std_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a real child");
+    let pid = std_child.id();
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-teardown-kill-eperm-uncertain-3f1a",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+
+    let handed_back = super::teardown_unadopted(std_child, Some(crate::containment::Attached::Cgroup(leaf)));
+
+    assert!(
+        handed_back.is_none(),
+        "an uncertain check releases the child, handing nothing back"
+    );
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"",
+        "an uncertain-ownership release must disarm its retained leaf, not kill through it"
+    );
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since the teardown released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
 }
 
 /// A `try_wait` error after a failed kill that is NOT `ECHILD` — a too-old kernel's `EINVAL` from

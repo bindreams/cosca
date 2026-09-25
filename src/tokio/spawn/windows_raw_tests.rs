@@ -128,6 +128,34 @@ async fn wait_blocking_returns_the_forced_failure_instead_of_asserting() {
         .expect("a real wait after the forced failure still succeeds");
 }
 
+/// The same seam, but driven through `crate::Unreaped::wait` — the actual caller of
+/// `Held::wait`'s `RawAsync` arm in production — not `wait_blocking` called directly as above.
+/// `wait_blocking_returns_the_forced_failure_instead_of_asserting` proves `wait_blocking` itself
+/// returns the forced error rather than asserting; this proves that error actually surfaces
+/// through the generic `Unreaped` path a real caller uses, rather than being swallowed or panicked
+/// on somewhere between `Held::wait` and `Unreaped::wait`.
+#[tokio::test]
+async fn unreaped_wait_returns_the_forced_wait_blocking_failure() {
+    use std::os::windows::io::OwnedHandle;
+
+    use super::RawAsyncChild;
+
+    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "__cosca_no_such_test__"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a quickly-exiting child");
+    let pid = child.id();
+    let mut raw = RawAsyncChild::new(OwnedHandle::from(child), pid);
+    raw.set_force_wait_blocking_failure("forced wait_blocking failure");
+    let unreaped = crate::Unreaped::new(crate::child::unreaped::Held::RawAsync(raw));
+    let err = unreaped
+        .wait()
+        .expect_err("the forced wait_blocking failure must surface through Unreaped::wait");
+    assert_eq!(err.to_string(), "forced wait_blocking failure");
+}
+
 /// The async twin of `a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance`.
 #[cfg(windows)]
 #[tokio::test]
