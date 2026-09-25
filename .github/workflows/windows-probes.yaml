@@ -13,8 +13,9 @@
 #         [-f elevating=true]
 #
 # `-f run_executing_probes=true` adds the `executing` job, which never runs any other way; its tests
-# take their own `-f probe_filter=`. To run only those, add `-f run_canary=false -f elevating=false`:
-# the path-resolution job is then skipped too, rather than run with nothing to assert.
+# take their own `-f probe_filter=`. To run only those, add `-f run_canary=false` (and leave
+# `elevating` at its default of `false`): the path-resolution job is then skipped too, rather than
+# run with nothing to assert.
 name: windows-probes
 
 on:
