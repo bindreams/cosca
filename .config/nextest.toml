@@ -3,6 +3,16 @@ nextest-version = { required = "0.9.137" }
 [profile.ci]
 fail-fast = false
 
+[[profile.ci.overrides]]
+# `ShellExecuteExW` itself can block before it ever returns a process handle (measured: it does,
+# for a trailing-dot extensionless target in `windows_shell_resolution.rs` — it hung with no output
+# past a 30-minute job timeout in run 36120443833). Nothing inside these binaries can bound that:
+# `CHILD_EXIT_BOUND_MS` only bounds the wait AFTER a handle is obtained. This is a failure bound on
+# an external process that might genuinely never return, so one hang fails one test instead of the
+# whole job.
+filter = 'binary(windows_shell_resolution) | binary(windows_elevation_routes)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [test-groups]
 # `tests/windows_shell_execute.rs` serializes its tests with an in-process mutex, a holdover from
 # when `cargo test` ran them all in one shared process — there PATH and one env var were also

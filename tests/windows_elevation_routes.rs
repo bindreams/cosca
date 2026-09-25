@@ -70,8 +70,10 @@ use std::os::windows::io::BorrowedHandle;
 use std::path::{Path, PathBuf};
 
 use cosca::Job;
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0};
+use windows::core::{HRESULT, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_OBJECT_0,
+};
 use windows::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, DuplicateTokenEx, FreeSid, GetSidSubAuthority,
     GetSidSubAuthorityCount, GetTokenInformation, LogonUserW, LookupPrivilegeNameW, SecurityImpersonation,
@@ -355,8 +357,23 @@ fn contain(pi: &PROCESS_INFORMATION, context: &str) -> Job {
             // SAFETY: `pi.hProcess` is a live, still-suspended process handle that was never
             // assigned to any job (assign just failed), so terminating and waiting it out
             // directly is the only way to reap it; both handles are closed exactly once after.
+            let terminated = unsafe { TerminateProcess(pi.hProcess, 1) };
+            if let Err(term_err) = terminated {
+                // Waiting INFINITE on a process this code could not even ask to terminate would
+                // be exactly the unbounded hang containment exists to prevent — abandon the
+                // handles instead of blocking forever on an exit nothing here can obtain.
+                unsafe {
+                    let _ = CloseHandle(pi.hThread);
+                    let _ = CloseHandle(pi.hProcess);
+                }
+                panic!(
+                    "{context}: could not contain the child in a kill-on-close job ({e}), and then \
+                     could not even terminate it directly ({term_err}) — it has been abandoned \
+                     rather than waited on unboundedly for an exit that TerminateProcess itself \
+                     could not obtain"
+                );
+            }
             unsafe {
-                let _ = TerminateProcess(pi.hProcess, 1);
                 let _ = WaitForSingleObject(pi.hProcess, INFINITE);
                 let _ = CloseHandle(pi.hThread);
                 let _ = CloseHandle(pi.hProcess);
@@ -391,10 +408,31 @@ fn wait_for(pi: &PROCESS_INFORMATION, job: &Job) -> Result<u32, String> {
     let waited = unsafe { WaitForSingleObject(pi.hProcess, CHILD_EXIT_BOUND_MS) };
     if waited != WAIT_OBJECT_0 {
         let killed = job.kill_tree();
-        // `kill_tree` already closed the job handle, so `job.wait_tree()` would fail immediately
-        // here instead of waiting for anything (see this function's doc comment). Wait on the
-        // child's own process handle instead — the one primitive still open that can actually
-        // observe the kill landing.
+        if let Err(kill_err) = &killed {
+            // `kill_tree` itself failed, so nothing has confirmed the job's members were ever
+            // actually asked to terminate. Fall back to terminating the immediate child directly,
+            // and check THAT result too, rather than waiting INFINITE below on a process nothing
+            // here has managed to ask to exit.
+            // SAFETY: `pi.hProcess` is still a valid, open handle to the child.
+            let terminated = unsafe { TerminateProcess(pi.hProcess, 1) };
+            if let Err(term_err) = terminated {
+                unsafe {
+                    let _ = CloseHandle(pi.hThread);
+                    let _ = CloseHandle(pi.hProcess);
+                }
+                return Err(format!(
+                    "the child did not exit within {CHILD_EXIT_BOUND_MS}ms; kill_tree failed \
+                     ({kill_err}) and the direct child could not be terminated either \
+                     ({term_err}) — it has been abandoned rather than waited on unboundedly for an \
+                     exit nothing here could obtain"
+                ));
+            }
+        }
+        // `kill_tree` already closed the job handle on success, so `job.wait_tree()` would fail
+        // immediately here instead of waiting for anything (see this function's doc comment).
+        // Either `kill_tree` succeeded, or the fallback `TerminateProcess` above did — either way
+        // the child has genuinely been asked to exit, so waiting on its own process handle now
+        // observes a real kernel outcome, not a clock race.
         // SAFETY: `pi.hProcess` is still a valid, open handle to the child; waiting on it does
         // not consume or invalidate it, so it is still safe to close below.
         let waited_after_kill = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
@@ -642,9 +680,9 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
 
 /// The body a child runs when a spawning probe re-execs this binary: `COSCA_PROBE_REPORT_TO` names
 /// the file to answer through, and `COSCA_PROBE_CHILD` suppresses the nested spawn attempts so a
-/// child never recurses. [`logon_one_account`] deliberately spawns its child WITHOUT
-/// `COSCA_PROBE_CHILD` set — see that function's doc comment — so that child runs the full chain,
-/// the same as [`linked_token_chain_here`] does when run directly.
+/// child never recurses. [`logon_one_account`] and [`unelevated_caller_view`] both deliberately
+/// spawn their child WITHOUT `COSCA_PROBE_CHILD` set — see each function's doc comment — so that
+/// child runs the full chain, the same as [`linked_token_chain_here`] does when run directly.
 ///
 /// A direct, unspawned `--ignored` run (no `COSCA_PROBE_REPORT_TO`) has no report destination to
 /// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
@@ -662,7 +700,7 @@ fn measure_this_token() {
     }
     let report_to = std::env::var_os("COSCA_PROBE_REPORT_TO");
     if report_to.is_some() && std::env::var_os("COSCA_PROBE_CHILD").is_none() {
-        // Spawned by `logon_one_account`: the child runs the whole chain.
+        // Spawned by `logon_one_account` or `unelevated_caller_view`: the child runs the whole chain.
         measure(&mut out);
     } else {
         // Either a child of `spawn_attempts_with` (`COSCA_PROBE_CHILD` is set, so it does not
@@ -674,6 +712,15 @@ fn measure_this_token() {
             Err(e) => {
                 let _ = writeln!(out, "  current process token: <{e}>");
             }
+        }
+        if report_to.is_none() {
+            // A direct, unspawned `--ignored` run: nothing else asserts this report says
+            // anything, so assert it here — a printed report that never actually describes a
+            // token is not a measurement.
+            assert!(
+                out.contains("integrity="),
+                "this process's own token could not be described, so nothing was measured"
+            );
         }
     }
     print!("{out}");
@@ -1109,7 +1156,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
     let bat_ran = marker.exists();
     println!(
         "PROBE createprocessw-pathext: started={started} bat_ran={bat_ran} err={:?}",
-        res.err()
+        res.as_ref().err()
     );
     if bat_ran {
         println!(
@@ -1120,6 +1167,16 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
     } else if started {
         panic!("PROBE createprocessw-pathext: INCONCLUSIVE: something started but was not the planted batch.");
     } else {
+        // `ERROR_FILE_NOT_FOUND` is the genuine negative measurement: CreateProcessW looked for
+        // `tool` and found nothing. Any other error means the harness could not even ask the
+        // question, and must not be mislabelled as this exact-image confirmation.
+        let err = res.as_ref().expect_err("`started` is false, so `res` is an `Err`");
+        assert_eq!(
+            err.code(),
+            HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0),
+            "PROBE createprocessw-pathext: CreateProcessW failed with an unexpected error (not \
+             ERROR_FILE_NOT_FOUND): {err} — the harness could not even ask the question"
+        );
         println!(
             "  => CreateProcessW refused a nonexistent extensionless lpApplicationName rather than \
              extending it. The documented exact-image semantics hold: this is the property a \
@@ -1389,7 +1446,8 @@ fn logon_one_account(account: &ScratchAccount) -> bool {
 #[ignore = "creates a local user account; opt in with --ignored on a throwaway host"]
 fn which_logon_types_return_a_filtered_token() {
     require_gate("COSCA_PROBE_ALLOW_ACCOUNTS", "creates and deletes local user accounts");
-    let mut measured = 0usize;
+    let mut measured_admin = false;
+    let mut measured_std = false;
     for admin in [true, false] {
         let name = if admin { "coscaprobeadm" } else { "coscaprobestd" };
         let account = match ScratchAccount::create(name, admin) {
@@ -1429,7 +1487,11 @@ fn which_logon_types_return_a_filtered_token() {
             match res {
                 Err(e) => println!("PROBE logon-type {label} ({group}): LogonUser FAILED {e:?}"),
                 Ok(()) => {
-                    measured += 1;
+                    if admin {
+                        measured_admin = true;
+                    } else {
+                        measured_std = true;
+                    }
                     let t = Token(h);
                     let mut out = String::new();
                     let _ = writeln!(out, "PROBE logon-type {label} ({group}): LogonUser OK");
@@ -1445,9 +1507,18 @@ fn which_logon_types_return_a_filtered_token() {
             }
         }
     }
+    // Both accounts must be measured, not just either one: the whole point of running both is the
+    // contrast between them, and a single successful logon says nothing about filtering on its own.
     assert!(
-        measured > 0,
-        "not one LogonUser call returned a token, so nothing was measured"
+        measured_admin,
+        "not one LogonUser call for the Administrators-member scratch account returned a token, so \
+         that half of the filtering question was never measured"
+    );
+    assert!(
+        measured_std,
+        "not one LogonUser call for the standard-user scratch account returned a token, so the \
+         contrast against the Administrators account — the whole point of running both — was never \
+         measured"
     );
 }
 
