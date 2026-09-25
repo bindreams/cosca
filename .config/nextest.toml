@@ -7,13 +7,22 @@ fail-fast = false
 # Both binaries already bound their own external waits in-process: `windows_shell_resolution.rs`
 # wraps every `ShellExecuteExW` call likely to hang in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
 # (60s), and `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
-# `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS`. This override is a second, redundant safety net
-# on top of those, at 300s (5 * 60s) — well above either in-process bound — for whatever an
-# in-process bound cannot cover: a wait this test binary cannot cancel (Win32 gives no way to cancel
-# a call already inside `ShellExecuteExW`), or a kill that itself does not land. One hang here fails
-# one test instead of the whole job. See the PR description for the run history that motivated it.
+# `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s). This override is a second, redundant
+# safety net on top of those, for whatever an in-process bound cannot cover: a wait this test binary
+# cannot cancel (Win32 gives no way to cancel a call already inside `ShellExecuteExW`), or a kill
+# that itself does not land.
+#
+# The per-test worst case, not the single-wait bound, is what this has to clear:
+# `does_create_process_with_logon_elevate` calls `logon_one_account` once per scratch account (an
+# administrator, then a standard user), and each call makes its own `CHILD_EXIT_BOUND_MS` (120s)
+# `wait_for` call in sequence — two 120s waits back to back, 240s, before any of the account-creation
+# and token-query overhead around them (`net user`, `icacls`, `LogonUser`/`CreateProcessWithLogonW`,
+# `describe`'s token queries) is even counted. 300s (5 * 60s) left only 60s of headroom over that
+# 240s floor for overhead this code does not bound, so it is raised here to 600s (10 * 60s) — the
+# same roughly 2.5x margin the original 300s kept over a single 120s wait, applied to the 240s floor
+# instead of the 120s one. One hang here fails one test instead of the whole job.
 filter = 'binary(windows_shell_resolution) | binary(windows_elevation_routes)'
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [test-groups]
 # `tests/windows_shell_execute.rs` serializes its tests with an in-process mutex, a holdover from

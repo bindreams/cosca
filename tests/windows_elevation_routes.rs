@@ -119,7 +119,14 @@ const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 /// left unset — there is enough headroom left in the outer bound for this inner one to trip,
 /// kill, and recover before the outer wait could plausibly trip too. See `CHILD_EXIT_BOUND_MS`'s
 /// doc.
+///
+/// An eighth leaves a ×4 margin beyond the minimum ×2 that "trip, kill, and recover before the
+/// outer wait trips too" requires: the inner wait plus its own kill-and-recover could in principle
+/// take up to twice its own bound before the outer one needs to see it finished, and this constant
+/// is kept at half of that ×2 figure again. `const _` below asserts the ×4 relationship holds so a
+/// future change to either constant cannot silently erode this margin.
 const GRANDCHILD_EXIT_BOUND_MS: u32 = CHILD_EXIT_BOUND_MS / 8;
+const _: () = assert!(4 * GRANDCHILD_EXIT_BOUND_MS < CHILD_EXIT_BOUND_MS);
 
 // ── token inspection ═════════════════════════════════════════════════════════════════
 
