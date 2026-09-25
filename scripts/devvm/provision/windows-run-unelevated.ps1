@@ -24,53 +24,41 @@
 # is the liveness signal: the wrapper connects to a named pipe this script is already blocked
 # reading from as its very first action and keeps that connection open for its whole life,
 # running the caller's command with output redirected to a file, and writing its exit code to
-# the still-open pipe as its very last action. This script (not the wrapper) captures the
-# wrapper's PID once that connection is established, via GetNamedPipeClientProcessId against
-# the now-connected pipe handle — a real OS query at the moment it's needed, not a value the
-# wrapper writes to a file that this script would otherwise have to race to read (so a timeout
-# can kill the whole process tree, not just the wrapper's own root). If the
-# wrapper dies anywhere after connecting — an unhandled error, being killed, a crash — the OS
-# tears down its end of the pipe the moment the process goes away, and the blocking read
-# unblocks immediately with EOF, reported as "exited without reporting a result", rather than
-# this script waiting out the rest of -TimeoutSeconds for a result that will never arrive.
+# the still-open pipe as its very last action. If the wrapper dies anywhere after connecting —
+# an unhandled error, being killed, a crash — the OS tears down its end of the pipe the moment
+# the process goes away, and the blocking read unblocks immediately with EOF, reported as
+# "exited without reporting a result", rather than this script waiting out the rest of
+# -TimeoutSeconds for a result that will never arrive.
 #
-# -TimeoutSeconds bounds every blocking wait in this script and the wrapper it launches, not
-# just the pipe connect: Register-ScheduledTask, Start-ScheduledTask, the pipe connect wait,
-# the result read that follows it, AND the wrapper's own child process (the caller's actual
-# command). This script's own deadline is monotonic (QueryPerformanceCounter-backed, via
+# -TimeoutSeconds bounds every blocking Task Scheduler RPC call this script itself makes
+# (Register-ScheduledTask, Start-ScheduledTask, Unregister-ScheduledTask — none has a timeout
+# of its own) and the pipe connect wait: a genuine external-event bound (Task Scheduler
+# actually dispatching the task and its wrapper reaching Connect()), not a poll. This script's
+# own deadline is monotonic (QueryPerformanceCounter-backed, via
 # [System.Diagnostics.Stopwatch]::GetTimestamp()/::Frequency), not wall-clock (Get-Date): this
 # guest's own clock has been observed to jump by hours across an ordinary reboot (NTP resync),
 # which would corrupt a Get-Date-based deadline mid-wait. GetTimestamp()/Frequency are static
-# OS-level values, consistent across processes on the same machine with no intervening reboot —
-# unlike a Stopwatch *instance*'s Elapsed state, which cannot cross the process boundary to the
-# wrapper template below, a raw absolute tick count can: it's baked into that template
-# (__DEADLINE_TICKS__) as a fixed grace margin EARLIER than this script's own deadline, not the
-# identical tick count - see $WrapperGraceSeconds's own comment below for why.
+# OS-level values, consistent across processes on the same machine with no intervening reboot,
+# so the identical absolute tick count can cross the process boundary to the wrapper template
+# below (baked in as __DEADLINE_TICKS__) — unlike a Stopwatch *instance*'s Elapsed state, which
+# cannot.
 #
-# The result read is bounded the same way as the connect wait: a real completion event
-# (ReadLineAsync()'s Task, via its AsyncWaitHandle) raced against the remaining deadline, not a
-# poll — a command that deadlocks inside the wrapper (as opposed to the wrapper itself dying,
-# which the pipe-EOF liveness signal above already covers) would otherwise hang this script,
-# and devvm.py behind it, forever. On expiry it kills the wrapper's whole process tree via the
-# PID this script captured right after EndWaitForConnection — which reliably reflects the
-# actual connected wrapper process by construction, not a file this script has to hope was
-# already written (see Stop-WrapperProcessTree). Because the wrapper's own deadline is earlier
-# than this script's, reaching this timeout at all means the wrapper already hit its own bound
-# and still didn't finish its own graceful shutdown within the grace margin — the expected case
-# is the wrapper's own bound firing first, unblocking this read with a result or a clean EOF
-# well before this script's later deadline is ever reached.
+# Once connected, this script's own read of the pipe has NO deadline of its own: it just blocks
+# until the wrapper either writes a result or its end of the pipe is torn down (EOF). That's
+# deterministic, not a bet on some grace period being "long enough" — the wrapper's own only
+# unbounded-otherwise wait after Connect(), its child process's WaitForExit(), is itself bounded
+# against the SAME __DEADLINE_TICKS__ this script uses, followed only by a fixed-30s taskkill of
+# that child and a Stop-Transcript/pipe-write/close that do no further waiting. So the wrapper
+# is guaranteed, by construction, to reach its own pipe write (or die, tearing the pipe down)
+# within bounded time of connecting: a second, independent deadline racing that from this
+# script's side would add no real protection, only a coin-flip between two different messages
+# for the same slow-command case depending on which timer happened to fire first.
 #
 # The wrapper's own pipe Connect() call (in the here-string below) is bounded too, for a case
-# neither of the above covers: a scheduled task that starts running only AFTER this script has
+# the above doesn't cover: a scheduled task that starts running only AFTER this script has
 # already given up on the connect wait and moved on — without a bound there, that late
 # wrapper's Connect() would block forever against a server pipe this script has by then
-# disposed, leaking a process on the guest indefinitely. And the wrapper's own child — the
-# caller's actual command, run via cmd.exe — is bounded the same way, against that same wrapper
-# deadline: without that bound, that child could outlive both a late-connecting wrapper this
-# script has already given up on (nothing left to taskkill it from this side) and this whole
-# script being interrupted (Ctrl-C) — nothing else on the guest would ever stop it. On expiry
-# the wrapper kills its own child's process tree via taskkill /F /T, the same mechanism this
-# script uses on the wrapper itself.
+# disposed, leaking a process on the guest indefinitely.
 #
 # That bound has to cover every blocking Task Scheduler RPC call, not just the pipe waits:
 # Register-ScheduledTask, Start-ScheduledTask, and Unregister-ScheduledTask have no timeout
@@ -122,20 +110,6 @@ $scriptPath = "$env:TEMP\$taskName.ps1"
 # base64/UTF-16LE-encoded and embedded directly in cmd's own Arguments string. A file has no
 # such cap.
 $innerScriptPath = "$env:TEMP\$taskName.inner.ps1"
-# No PID file: a file the wrapper writes its own $PID to is inherently racy from this script's
-# side (does it exist yet? has the write actually landed?) and was, in practice, only ever
-# reliably present at the read-wait timeout site below, not the connect-wait one. Instead, once
-# this script's own pipe server has a connected client (EndWaitForConnection), it asks the OS
-# directly which process is on the other end via GetNamedPipeClientProcessId - a real query
-# against the actual connected handle, not a value some other process wrote down earlier.
-Add-Type -Namespace Devvm -Name NativeMethods -MemberDefinition @'
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool GetNamedPipeClientProcessId(IntPtr Pipe, out uint ClientProcessId);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool CloseHandle(IntPtr hObject);
-'@
 # The wrapper is a whole separate powershell.exe process (see -File $scriptPath below), so it
 # does NOT inherit this script's $ErrorActionPreference = Stop — its own default is Continue,
 # and an error thrown before the pipe-write step (e.g. by something the wrapper itself does,
@@ -197,31 +171,14 @@ if (-not $currentUser) {
 }
 
 # Shared monotonic deadline for every blocking wait THIS script itself makes (Register-,
-# Start-, the pipe connect wait, the result read — see Invoke-Bounded and the header comment
-# above for why this is Stopwatch/QPC-based rather than Get-Date). One shared deadline instead
-# of a fresh $TimeoutSeconds per phase bounds total worst-case runtime to ~$TimeoutSeconds, not
-# some multiple of it.
+# Start-, the pipe connect wait — see Invoke-Bounded and the header comment above for why this
+# is Stopwatch/QPC-based rather than Get-Date). One shared deadline instead of a fresh
+# $TimeoutSeconds per phase bounds total worst-case runtime to ~$TimeoutSeconds, not some
+# multiple of it. The wrapper (a separate process — see __DEADLINE_TICKS__ below) computes its
+# own remaining time against this identical tick count, not a copy or an offset of it — see the
+# header comment above for why the result read that follows connecting relies on that rather
+# than racing a second deadline of its own.
 $deadlineTicks = [System.Diagnostics.Stopwatch]::GetTimestamp() + [long]($TimeoutSeconds * [System.Diagnostics.Stopwatch]::Frequency)
-
-# The wrapper (a separate process — see __DEADLINE_TICKS__ below) gets its OWN deadline, a
-# fixed grace margin earlier than $deadlineTicks above, not the identical tick count. With one
-# shared deadline, the outer script's own read-wait and the wrapper's internal bound (Connect,
-# then its child's WaitForExit) expire at the same instant — which one actually fires first is
-# a race, so an ordinary timeout could have this script taskkill the wrapper's whole process
-# tree (see the read-wait timeout below) while the wrapper was already mid-way through its own
-# graceful shutdown (killing its own child, flushing its transcript, writing its pipe result),
-# duplicating that work and discarding whatever the wrapper's own -1-sentinel result/transcript
-# would otherwise have reported. Giving the wrapper a deadline this much earlier instead makes
-# its own graceful shutdown the expected outcome: by the time this script's later read-wait
-# deadline could fire, the wrapper's pipe write/close (or the OS tearing the pipe down if it
-# dies outright) has already unblocked that read with a result or a clean EOF. This script's
-# own read-wait timeout is then reachable only if the wrapper hasn't even finished its own
-# graceful shutdown within the margin below - a genuine hang, not the expected case. The margin
-# has to cover the wrapper's own worst-case cleanup after its deadline hits: taskkill of its
-# child (bounded 30s, see the wrapper template) plus Stop-Transcript and the pipe write/close
-# (both fast) - 45s leaves real headroom above that 30s bound, not another too-tight guess.
-$WrapperGraceSeconds = 45
-$wrapperDeadlineTicks = $deadlineTicks - [long]($WrapperGraceSeconds * [System.Diagnostics.Stopwatch]::Frequency)
 
 function Get-RemainingSeconds {
     $remaining = ($deadlineTicks - [System.Diagnostics.Stopwatch]::GetTimestamp()) / [double][System.Diagnostics.Stopwatch]::Frequency
@@ -245,50 +202,6 @@ function Get-TranscriptNote {
     $transcript = Read-WrapperTranscript
     if (-not $transcript) { return "" }
     return "`n--- wrapper transcript (captures anything the wrapper itself printed or threw) ---`n$transcript"
-}
-
-function Stop-WrapperProcessTree {
-    <#
-      Best-effort: taskkill the wrapper's whole process tree via $TaskPid, a client PID this
-      script obtained from GetNamedPipeClientProcessId against its own connected pipe server
-      handle (see the call site right after EndWaitForConnection below) - not a file the
-      wrapper wrote, so there is no "does the file exist yet, and is the write complete" race.
-      Only called from the read-wait timeout site, which runs after EndWaitForConnection has
-      already succeeded - but $TaskPid can still be 0 there if GetNamedPipeClientProcessId
-      failed or the process had already exited by the time this script tried to pin it; guarded
-      below, not assumed away. The connect-wait timeout site (no client ever connected) has no
-      PID to give this function at all - see its own comment - so it doesn't call this function.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [uint32]$TaskPid
-    )
-    if ($TaskPid -eq 0) {
-        # GetNamedPipeClientProcessId either failed or the process had already exited by the
-        # time we tried to pin it (see the OpenProcess call site below) - PID 0 is the System
-        # Idle Process, never a real target.
-        Write-Warning "devvm: no usable wrapper PID to taskkill - refusing to touch PID 0."
-        return
-    }
-    # taskkill.exe via Start-Process + WaitForExit(30000): bounded (fixed 30s, independent of
-    # the main deadline which has already elapsed here - this is best-effort cleanup, not a
-    # new failure to report) and, launched this way rather than invoked directly, its stderr
-    # goes to a file instead of into this script's own error stream - sidestepping the
-    # PowerShell 5.1 hazard where ANY stderr from a directly-invoked native command sets $? to
-    # $false under $ErrorActionPreference = "Stop", which would otherwise turn a successful
-    # kill into a NativeCommandError masking the real timeout error thrown by the caller (the
-    # same hazard windows-rust.ps1 documents and works around for a direct invocation).
-    $killOutPath = "$env:TEMP\$taskName.taskkill.out"
-    $killErrPath = "$env:TEMP\$taskName.taskkill.err"
-    try {
-        $killProcess = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/F", "/T", "/PID", $TaskPid) `
-            -PassThru -NoNewWindow -RedirectStandardOutput $killOutPath -RedirectStandardError $killErrPath
-        if (-not $killProcess.WaitForExit(30000)) {
-            $killProcess | Stop-Process -Force -ErrorAction SilentlyContinue
-        }
-    } finally {
-        Remove-Item -Path $killOutPath, $killErrPath -ErrorAction SilentlyContinue
-    }
 }
 
 function Invoke-Bounded {
@@ -378,8 +291,7 @@ function Invoke-Bounded {
 # text for the wrapper's own process to evaluate when it runs.
 # $exitCode starts at -1 (not 0) so that if the wrapper crashes before the caller's command
 # ever runs, the caller sees a nonzero/sentinel status rather than a false "succeeded". Connect()
-# is the wrapper's very first action, bounded by this script's own deadline minus
-# $WrapperGraceSeconds (see that constant's own comment for why it's earlier, not identical) -
+# is the wrapper's very first action, bounded by this script's own deadline -
 # baked into this template as raw QPC ticks (__DEADLINE_TICKS__, see the header comment for why
 # Stopwatch/QPC rather than wall-clock), not a millisecond duration computed once at
 # Register-ScheduledTask time. A duration frozen at registration time is wrong by however long
@@ -401,13 +313,14 @@ function Invoke-Bounded {
 # doubles as the wrapper's liveness signal: if the wrapper dies for any reason after connecting
 # (an error escaping the inner try/catch, being killed, a crash) without ever reaching the
 # final WriteLine, the OS tears down this end of the pipe as the process exits, and the outer
-# script's blocking read unblocks immediately with EOF - a real, immediate signal, not another
-# timeout to wait out. If instead the wrapper is merely slow - its command hasn't finished, the
-# pipe is still open, nothing has died - the outer script's read is bounded by that same
-# remaining deadline and kills this whole process tree via taskkill /T on expiry (see
-# Stop-WrapperProcessTree there). The outer try/catch here only guards the connect step itself;
-# the inner try/catch/finally guards the caller's command and guarantees the pipe write happens
-# exactly once for every way the inner block can end.
+# script's blocking read unblocks immediately with EOF - a real, immediate signal, not a
+# timeout to wait out. If instead the wrapper's command is merely slow, the child WaitForExit
+# below (against this same deadline) is what bounds it, kills it, and still reaches the pipe
+# write in the finally block below with the -1 sentinel - the outer script's read needs no
+# timeout of its own to observe that; see the header comment above for why. The outer
+# try/catch here only guards the connect step itself; the inner try/catch/finally guards the
+# caller's command and guarantees the pipe write happens exactly once for every way the inner
+# block can end.
 $wrapperTemplate = @'
 Start-Transcript -Path '__TRANSCRIPT_PATH__' | Out-Null
 $exitCode = -1
@@ -466,9 +379,10 @@ try {
         # this child running forever on the guest, either because the outer script already gave
         # up on a late connect (nothing left there to kill it from) or because the outer
         # script/devvm.py itself was interrupted (Ctrl-C, the whole `vagrant winrm` call dying) -
-        # nothing else on the guest would ever stop it. On expiry this kills only the immediate cmd.exe
-        # child's own process tree (via taskkill /F /T, same as the outer script's
-        # Stop-WrapperProcessTree), not any further descendant it may have already detached.
+        # nothing else on the guest would ever stop it. On expiry this kills only the immediate
+        # cmd.exe child's own process tree (via taskkill /F /T), not any further descendant it
+        # may have already detached - the wrapper itself keeps running afterward to reach its
+        # own pipe write below, which is what the outer script's unbounded read relies on.
         if ($childProcess.WaitForExit((Get-RemainingMs))) {
             $exitCode = $childProcess.ExitCode
         } else {
@@ -535,7 +449,7 @@ $taskCommand = $wrapperTemplate.
     Replace('__INNER_SCRIPT_PATH__', $innerScriptPath).
     Replace('__TASK_NAME__', $taskName).
     Replace('__TRANSCRIPT_PATH__', $transcriptPath).
-    Replace('__DEADLINE_TICKS__', $wrapperDeadlineTicks.ToString())
+    Replace('__DEADLINE_TICKS__', $deadlineTicks.ToString())
 Set-Content -Path $scriptPath -Value $taskCommand -Encoding UTF8
 
 # Register-ScheduledTask with NO -Trigger at all: this task is only ever fired on demand via
@@ -607,13 +521,6 @@ $pipeServer = New-Object System.IO.Pipes.NamedPipeServerStream(
     0,
     $pipeSecurity
 )
-# Holds a real OS handle to the wrapper's process object once its PID is known (see the
-# EndWaitForConnection block below), so that PID number cannot be reassigned to a different,
-# unrelated process by the OS for as long as this handle stays open - a kernel-level guarantee,
-# not a best-effort narrowing of the race window. Declared here, not inside the try, so the
-# overall finally below can always safely check/close it, including on the connect-timeout path
-# where it's never assigned.
-$wrapperProcessHandle = [IntPtr]::Zero
 try {
     # Start waiting for the wrapper's pipe connection BEFORE starting the task, so the
     # wrapper's client-side Connect() can never race ahead of a server that isn't listening
@@ -634,11 +541,11 @@ try {
     # running" other than waiting up to some bound.
     $signaled = $connectResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds((Get-RemainingSeconds)))
     if (-not $signaled) {
-        # No client ever connected here, so there is no PID GetNamedPipeClientProcessId could
-        # give Stop-WrapperProcessTree - nothing to taskkill yet. Dispose the server pipe FIRST,
-        # before doing anything else: that's what makes the wrapper's own bounded Connect()
-        # (against this now-closed pipe) fail promptly if a late-dispatched task tries to connect
-        # after this point, rather than racing a kill attempt against a pipe still nominally open.
+        # No client ever connected here, so there is no wrapper process to signal at all.
+        # Dispose the server pipe FIRST, before doing anything else: that's what makes the
+        # wrapper's own bounded Connect() (against this now-closed pipe) fail promptly if a
+        # late-dispatched task tries to connect after this point, rather than blocking against a
+        # pipe still nominally open.
         # A leftover scheduled-task process with nothing left to connect to will hit its own
         # Connect() bound (see the wrapper template's comment) and exit on its own - defense in
         # depth, not the only thing standing between this and a late dispatch reading a deleted
@@ -650,56 +557,22 @@ try {
     }
 
     $pipeServer.EndWaitForConnection($connectResult)
-    # A real OS query against the now-connected handle, not a value some other process wrote to
-    # a file this script would otherwise have to race to read - see the file-level comment above.
-    # Only obtainable from here on: before EndWaitForConnection returns, no client has connected,
-    # so there is nothing for this call to report (see the connect-timeout branch above).
-    [uint32]$wrapperPid = 0
-    $gotPid = [Devvm.NativeMethods]::GetNamedPipeClientProcessId($pipeServer.SafePipeHandle.DangerousGetHandle(), [ref]$wrapperPid)
-    if ($gotPid -and $wrapperPid -ne 0) {
-        # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is enough to hold the reference; taskkill
-        # opens its own handle by PID when actually invoked, this one exists purely to keep
-        # that PID number allocated to the right process until then (see the declaration above).
-        $wrapperProcessHandle = [Devvm.NativeMethods]::OpenProcess(0x1000, $false, $wrapperPid)
-        if ($wrapperProcessHandle -eq [IntPtr]::Zero) {
-            # Already exited in the gap between GetNamedPipeClientProcessId and this call -
-            # nothing left to pin, and nothing left to taskkill either.
-            $wrapperPid = 0
-        }
-    } else {
-        Write-Warning "devvm: GetNamedPipeClientProcessId did not return a usable PID for the connected wrapper - a later timeout would have nothing to taskkill."
-        $wrapperPid = 0
-    }
     $reader = New-Object System.IO.StreamReader($pipeServer)
     try {
-        # ReadLineAsync() blocks until either a full line arrives or the connection is torn
-        # down, same as the synchronous ReadLine() this replaced, but its returned Task
-        # implements IAsyncResult, so it can be raced against the remaining deadline via
-        # AsyncWaitHandle.WaitOne() - the same real-completion-event pattern used for the
-        # connect wait and every Invoke-Bounded call above, not a poll. This is what actually
-        # bounds a deadlocked caller command: the wrapper dying is already covered by the EOF
-        # case below, but a command that just never returns needs its own bound, or this
-        # script (and devvm.py behind it) would wait forever.
-        $readTask = $reader.ReadLineAsync()
-        $remainingForRead = Get-RemainingSeconds
-        $readSignaled = $remainingForRead -gt 0 -and
-            ([IAsyncResult]$readTask).AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($remainingForRead))
-        if (-not $readSignaled) {
-            # Unlike the connect-wait timeout above, a real PID is known here: the wrapper's
-            # Connect() has already returned (that's how we got past EndWaitForConnection) and
-            # this script captured its PID right then via GetNamedPipeClientProcessId, above.
-            Stop-WrapperProcessTree -TaskPid $wrapperPid
-            throw "devvm: unelevated probe did not finish within ${TimeoutSeconds}s - killed its whole process tree. This is the failure bound, not a hang detector; pass -TimeoutSeconds explicitly if the probe is legitimately this slow.$(Get-TranscriptNote)"
-        }
+        # No deadline of its own: ReadLine() just blocks until either a full line arrives or
+        # the connection is torn down. See the header comment above for why that's
+        # deterministic rather than a hang risk - the wrapper's own child WaitForExit (the only
+        # otherwise-unbounded wait left in it after Connect()) is bounded against the identical
+        # __DEADLINE_TICKS__ this script uses, so the wrapper always reaches its own pipe write
+        # or dies within bounded time of connecting.
+        #
         # A torn-down connection can surface here as a clean EOF ($null) or, depending on OS
         # timing if the process dies while a read is already in flight, as a broken-pipe
         # IOException - both mean exactly the same thing (the wrapper is gone without having
         # written anything), so both are treated as $null below rather than as this script's
-        # own error. GetAwaiter().GetResult() (rather than .Result) surfaces that IOException
-        # directly instead of wrapped in an AggregateException, so the existing typed catch
-        # still matches it.
+        # own error.
         try {
-            $resultLine = $readTask.GetAwaiter().GetResult()
+            $resultLine = $reader.ReadLine()
         } catch [System.IO.IOException] {
             $resultLine = $null
         }
@@ -740,9 +613,6 @@ try {
     }
 } finally {
     $pipeServer.Dispose()
-    if ($wrapperProcessHandle -ne [IntPtr]::Zero) {
-        [void][Devvm.NativeMethods]::CloseHandle($wrapperProcessHandle)
-    }
     try {
         # Stopping BEFORE unregistering/deleting closes a race the connect-timeout path above
         # otherwise leaves open: Start-ScheduledTask having returned only means Task Scheduler
@@ -810,8 +680,9 @@ if ($output) {
 #     never reaching its own exit line, so $exitCode stays -1 and is what reaches `exit
 #     $exitCode` here. The "did not finish within its deadline" message on the wrapper's own
 #     transcript is what explains that case.
-#   - THIS script's own connect/read timeouts (the `throw`s above, e.g. "no wrapper ever
-#     connected" / "killed its whole process tree") firing instead: those are unhandled
-#     exceptions that terminate this script before it ever reaches this line at all - `exit
-#     $exitCode` never runs, and the -1 sentinel is irrelevant to that path.
+#   - THIS script's own connect-wait timeout (the "no wrapper ever connected" `throw` above)
+#     firing instead: that's an unhandled exception that terminates this script before it ever
+#     reaches this line at all - `exit $exitCode` never runs, and the -1 sentinel is irrelevant
+#     to that path. The result read that follows a successful connect has no timeout of its own
+#     (see the header comment above), so it cannot independently reach this comment's territory.
 exit $exitCode

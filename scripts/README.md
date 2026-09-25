@@ -57,10 +57,12 @@ value doesn't survive to `devvm.py`'s own process exit. When the command itself 
 and returned nonzero, the guest-side script prints the real code (`devvm: command exited N`)
 into the output `devvm.py` relays before it exits 1 — look for that line rather than relying
 on the shell's `%ERRORLEVEL%`. That line is specific to a command that ran to completion: it
-does not appear when `--unelevated` itself fails before the command ever runs, or times out —
-those paths print their own diagnostic instead (a trap-caught error, or a "did not finish
-within its deadline" message). Linux guests use `vagrant ssh -c` instead, which forwards the
-remote command's real exit code as-is.
+does not appear on either of `--unelevated`'s two other, deterministic failure paths, which
+print their own diagnostic instead — a trap-caught error if `--unelevated` itself fails before
+the command ever runs (e.g. no interactive session to borrow, or a Task Scheduler RPC that
+never completes), or, if the command runs past `--timeout` while executing, the wrapper's own
+"did not finish within its deadline" message. Linux guests use `vagrant ssh -c` instead, which
+forwards the remote command's real exit code as-is.
 
 ## Guests
 
