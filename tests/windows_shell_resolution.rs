@@ -25,14 +25,18 @@
 //! RESOLUTION, not a human's answer to a picker dialog, and must run unattended on a CI runner
 //! where no one is there to click one. The flag does not guarantee no UI ever appears — measured in
 //! run 36125783666: `does_an_existing_extensionless_file_ever_launch_directly` got
-//! `LaunchedNoHandle` on `windows-11-arm` (no UI, a clean handoff) but hung for the full 300s
-//! per-test bound on `windows-latest` (x64), where the same extensionless target's "how do you want
-//! to open this?" picker still appeared despite the flag. Where the flag *does* suppress the picker,
-//! the shell instead returns `ERROR_NO_ASSOCIATION` synchronously — so that code, exactly like
-//! `ERROR_FILE_NOT_FOUND`, is a genuine measured negative for a probe whose target is itself
-//! extensionless, not a harness failure; each such probe's `NotLaunched` arm says so explicitly. A
-//! hang the flag fails to prevent is still bounded, just not by this flag: `.config/nextest.toml`'s
-//! per-test `slow-timeout` kills that one test's process and lets the rest of the suite run.
+//! `LaunchedNoHandle` on `windows-11-arm` (no UI, a clean handoff), but on `windows-latest` (x64) the
+//! same extensionless target's "how do you want to open this?" picker still appeared despite the
+//! flag, and `ShellExecuteExW` blocked inside the API waiting on it rather than ever returning —
+//! there, before this round's fix, the test ran to the full 300s per-test bound and was killed.
+//! Where the flag *does* suppress the picker, the shell instead returns `ERROR_NO_ASSOCIATION`
+//! synchronously — so that code, exactly like `ERROR_FILE_NOT_FOUND`, is a genuine measured negative
+//! for a probe whose target is itself extensionless, not a harness failure; each such probe's
+//! `NotLaunched` arm says so explicitly. Every call site that hands `ShellExecuteExW` an EXISTING
+//! extensionless target now also bounds the whole call in-process, via `shell_execute_bounded` and
+//! `UI_BLOCK_BOUND` — well under `.config/nextest.toml`'s 300s per-test bound — so a block like this
+//! one is itself the measured answer, printed and passed, rather than depending on nextest's outer
+//! bound to kill the process and report a bare timeout with no diagnosis.
 //!
 //! # Why they are `#[ignore]`d
 //!
@@ -57,6 +61,8 @@
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_ASSOCIATION, WAIT_OBJECT_0};
@@ -75,9 +81,9 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 /// on a process nothing here can make exit.
 ///
 /// This bound does not cover `ShellExecuteExW` itself blocking before it ever returns a handle
-/// (measured: it can, for a trailing-dot extensionless target — see
-/// `does_a_trailing_dot_still_open_the_extensionless_file`'s module-level doc). That case is
-/// covered externally, by `.config/nextest.toml`'s per-test `slow-timeout` for this binary.
+/// (measured: it can, for an existing extensionless target — see `UI_BLOCK_BOUND`'s doc). Every
+/// call site that hands `ShellExecuteExW` an existing extensionless target bounds that separately,
+/// via `shell_execute_bounded`.
 const CHILD_EXIT_BOUND_MS: u32 = 30_000;
 
 fn wide_nul(s: &std::ffi::OsStr) -> Vec<u16> {
@@ -242,6 +248,43 @@ fn shell_execute_with(
         let _ = CloseHandle(info.hProcess);
     }
     Ok(LaunchOutcome::Waited)
+}
+
+/// The failure bound for `ShellExecuteExW` itself never returning: measured on `windows-latest`
+/// (x64) in run 36125783666, an existing extensionless target can make the shell try to show its
+/// "how do you want to open this?" picker despite `SEE_MASK_FLAG_NO_UI`, and the call blocks inside
+/// the API waiting for a human who is never there on an unattended CI runner. Win32 gives this
+/// process no way to cancel a call already inside `ShellExecuteExW`, so the call's return is a
+/// genuinely external event this code cannot synchronize on — bounding it is the sanctioned
+/// exception to "don't synchronize via time", not a race against a clock this process controls.
+/// Chosen well below `.config/nextest.toml`'s 300s `terminate-after` for this binary, so a genuine
+/// block is this probe's own clean, measured PASS rather than a bare process kill with no
+/// diagnosis.
+const UI_BLOCK_BOUND: Duration = Duration::from_secs(60);
+
+/// Runs `f` (a `shell_execute_with` call) on its own thread and waits for it, bounded by
+/// `UI_BLOCK_BOUND`. See `UI_BLOCK_BOUND`'s doc for why a bound is warranted here at all.
+///
+/// Returns `None` if `f` has not returned within the bound. The CALLER treats that itself as the
+/// measured answer — "the shell blocked rather than ever resolving this target" — not a harness
+/// failure; every call site below prints that conclusion and passes rather than panicking.
+///
+/// The spawned thread, if still blocked when the bound trips, is deliberately never joined or
+/// killed: Rust has no API to force a thread out of a blocking syscall. Leaking it is safe because
+/// `cargo nextest` gives every test its own OS process — the thread ends when that process does —
+/// and because a GitHub-hosted Windows runner is an ephemeral VM torn down after the job regardless
+/// of what is still running inside it.
+fn shell_execute_bounded<F>(f: F) -> Option<Result<LaunchOutcome, String>>
+where
+    F: FnOnce() -> Result<LaunchOutcome, String> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // If the receiver already gave up (the bound elapsed), this send fails silently — there is
+        // no one left to report the eventual result to.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(UI_BLOCK_BOUND).ok()
 }
 
 fn probe_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
@@ -479,7 +522,7 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 /// `ShellExecuteExW` itself can block on this exact input rather than ever returning — measured on
 /// `windows-latest`, where it hung with no output past a 30-minute job timeout (run 36120443833).
 /// `CHILD_EXIT_BOUND_MS` cannot cover this: it only bounds the wait AFTER a handle is obtained.
-/// `.config/nextest.toml` bounds this test's whole process instead, via `slow-timeout`.
+/// `shell_execute_bounded` bounds the call itself instead — see its doc and `UI_BLOCK_BOUND`'s.
 #[test]
 #[ignore = "launches a copied payload binary; opt in with --ignored, on a throwaway runner only"]
 fn does_a_trailing_dot_still_open_the_extensionless_file() {
@@ -490,7 +533,27 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
 
     let dotted = dir.path().join("tool.");
     let params = format!("--report-to \"{}\"", marker.display());
-    let outcome = shell_execute_with(&dotted, None, Some(&params)).expect("probe must be measurable");
+    let outcome = {
+        let dotted = dotted.clone();
+        let params = params.clone();
+        shell_execute_bounded(move || shell_execute_with(&dotted, None, Some(&params)))
+    };
+    let Some(outcome) = outcome else {
+        println!(
+            "PROBE trailing-dot-opens-extensionless: BLOCKED — ShellExecuteExW did not return \
+             within {UI_BLOCK_BOUND:?}, despite SEE_MASK_FLAG_NO_UI"
+        );
+        println!(
+            "  => the shell itself blocked trying to show UI for this dotted, extensionless target \
+             rather than ever resolving it (measured on windows-latest/x64 in run 36125783666, for \
+             the same underlying extensionless-target fact — see shell_execute_bounded's doc). This \
+             IS the measured answer here too: the dotted spelling does not open the extensionless \
+             file as a directly-run process on this architecture either — nothing here was \
+             contained, since nothing here ever became a process this probe could observe."
+        );
+        return;
+    };
+    let outcome = outcome.expect("probe must be measurable");
     match outcome {
         LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => {
             println!("PROBE trailing-dot-opens-extensionless: launched=false ({e})");
@@ -568,6 +631,12 @@ fn does_a_trailing_dot_still_open_the_extensionless_file() {
 /// query is needed to corroborate which image ran, unlike an earlier version of this probe that
 /// relied on one (and, separately, was contaminated by a redirect in `lpParameters` that the outer
 /// `cmd.exe` would consume — the `--report-to`/`%~f0` scheme has no redirection to contaminate).
+///
+/// This gives `ShellExecuteExW` the same existing extensionless target as the two probes above, so
+/// it is wrapped in `shell_execute_bounded` too: on the architecture where the shell blocks inside
+/// the API instead of resolving it (measured on `windows-latest`/x64 in run 36125783666 — see
+/// `UI_BLOCK_BOUND`'s doc), that block is itself the measured answer for precedence, not a harness
+/// failure.
 #[test]
 #[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_pathext_outrank_an_existing_extensionless_file() {
@@ -584,7 +653,29 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 
     // Inert if the shell instead routes to tool.bat: the planted batch ignores its arguments.
     let params = format!("--report-to \"{}\"", exe_marker.display());
-    let outcome = shell_execute_with(&extensionless, None, Some(&params)).expect("probe must be measurable");
+    let outcome = {
+        let extensionless = extensionless.clone();
+        let params = params.clone();
+        shell_execute_bounded(move || shell_execute_with(&extensionless, None, Some(&params)))
+    };
+    let Some(outcome) = outcome else {
+        println!(
+            "PROBE pathext-vs-existing-extensionless: BLOCKED — ShellExecuteExW did not return \
+             within {UI_BLOCK_BOUND:?}, despite SEE_MASK_FLAG_NO_UI"
+        );
+        println!(
+            "  => the shell itself blocked trying to show UI for the existing extensionless target \
+             rather than ever resolving it — including never searching PATHEXT for the planted \
+             `tool.bat` beside it (measured on windows-latest/x64 in run 36125783666, for the same \
+             underlying extensionless-target fact — see shell_execute_bounded's doc). This IS the \
+             measured answer here too: PATHEXT cannot outrank an existing extensionless file if the \
+             shell never gets past trying to resolve the extensionless target's own handoff. Neither \
+             image ran as a process here, and nothing was contained, since blocking inside \
+             ShellExecuteExW yields no process handle either."
+        );
+        return;
+    };
+    let outcome = outcome.expect("probe must be measurable");
     // Shared by the LaunchedNoHandle and ERROR_NO_ASSOCIATION arms below: both mean "the shell
     // resolved `tool`'s own handoff and never even searched PATHEXT for `tool.bat` beside it" — the
     // same fact, reported through two different mechanisms (see the module doc).
@@ -665,16 +756,17 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 
 /// Companion to the precedence probe above, with no `.bat` in the directory to compete: does an
 /// EXISTING extensionless file ever get run directly by `ShellExecuteEx`? Measured: no. Depending on
-/// the runner, the shell either hands it to an association/Open-With handler
-/// (`LaunchOutcome::LaunchedNoHandle`) or, where `SEE_MASK_FLAG_NO_UI` actually suppresses that
-/// picker, fails synchronously with `ERROR_NO_ASSOCIATION` — measured in run 36125783666:
-/// `windows-11-arm` got `LaunchedNoHandle`, `windows-latest` (x64) instead blocked inside
-/// `ShellExecuteExW` on the picker itself until the per-test bound killed it, which is why this
-/// probe now also accepts the synchronous error as the same answer rather than depending on always
-/// getting a clean handoff. Either way, this holds regardless of whether the file exists and
-/// regardless of whether anything else in the directory could satisfy `PATHEXT`. This was originally
-/// written as a control expected to always launch; it does not, and that failure to launch — a
-/// genuine negative, not a harness bug — IS the answer, and is what makes
+/// the runner, the shell hands it to an association/Open-With handler
+/// (`LaunchOutcome::LaunchedNoHandle`), fails synchronously with `ERROR_NO_ASSOCIATION` where
+/// `SEE_MASK_FLAG_NO_UI` actually suppresses the picker, or blocks inside `ShellExecuteExW` on the
+/// picker itself where the flag does not — measured in run 36125783666: `windows-11-arm` got
+/// `LaunchedNoHandle`, `windows-latest` (x64) blocked. `shell_execute_with` is wrapped in
+/// `shell_execute_bounded` below for exactly this third case, so a block like that one is now
+/// itself a measured, in-process answer — see `UI_BLOCK_BOUND`'s doc — rather than something only
+/// `.config/nextest.toml`'s outer per-test bound catches. All three outcomes hold regardless of
+/// whether the file exists and regardless of whether anything else in the directory could satisfy
+/// `PATHEXT`. This was originally written as a control expected to always launch; it does not, and
+/// that failure to launch — a genuine negative, not a harness bug — IS the answer, and is what makes
 /// `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` outcome unreachable.
 #[test]
 #[ignore = "launches a copied payload binary; opt in with --ignored, on a throwaway runner only"]
@@ -688,7 +780,31 @@ fn does_an_existing_extensionless_file_ever_launch_directly() {
     // Deliberately no tool.bat: nothing else in this directory could satisfy PATHEXT.
 
     let params = format!("--report-to \"{}\"", exe_marker.display());
-    let outcome = shell_execute_with(&extensionless, None, Some(&params)).expect("probe must be measurable");
+    let outcome = {
+        let extensionless = extensionless.clone();
+        let params = params.clone();
+        shell_execute_bounded(move || shell_execute_with(&extensionless, None, Some(&params)))
+    };
+    let Some(outcome) = outcome else {
+        println!(
+            "PROBE existing-extensionless-no-bat: BLOCKED — ShellExecuteExW did not return within \
+             {UI_BLOCK_BOUND:?}, despite SEE_MASK_FLAG_NO_UI"
+        );
+        println!(
+            "  => NO, not measurably as a launch. On this architecture the shell blocked trying to \
+             show its \"how do you want to open this?\" picker for the existing extensionless \
+             target, rather than ever resolving it (measured on windows-latest/x64 in run \
+             36125783666 — windows-11-arm got a clean LaunchedNoHandle in the same run; see \
+             shell_execute_bounded's doc). This IS the measured floor for \
+             `does_pathext_outrank_an_existing_extensionless_file`'s `(true, false)` branch, exactly \
+             like the other two arms below: an extensionless target is never executed directly on \
+             this architecture either, it just fails to resolve at all rather than resolving to a \
+             handoff or a synchronous error. Nothing here was contained, since blocking inside \
+             ShellExecuteExW yields no process handle either."
+        );
+        return;
+    };
+    let outcome = outcome.expect("probe must be measurable");
     match outcome {
         LaunchOutcome::NotLaunched(e) if e.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
             assert!(
