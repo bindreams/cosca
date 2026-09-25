@@ -20,6 +20,7 @@ use windows::Win32::Security::{
     TokenPrivileges, TOKEN_ACCESS_MASK, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
     TOKEN_LINKED_TOKEN, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
+use windows::Win32::System::JobObjects::IsProcessInJob;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
     ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS,
@@ -28,15 +29,25 @@ use windows::Win32::System::Threading::{
 
 /// A child is an external process that might never exit, so this is the honest failure bound
 /// surfaced to whoever reads the log — not a synchronisation device. [`wait_for`] gives this to
-/// `Job::wait_tree_timeout`, which drains the WHOLE job tree (the child and every grandchild it
-/// spawned) through a real kernel primitive, not just the immediate child. If it trips, `wait_for`
-/// kills the whole tree, then waits (unboundedly) on the child's OWN process handle for that kill
-/// to land, and only then reports that the tree did not finish; it never silently continues. On
-/// that kill/timeout fallback path, only the immediate child can still be confirmed gone — the job
-/// handle is consumed by `kill_tree` by the time the fallback wait runs, so there is no way to
-/// re-confirm the rest of the tree — but on the (common) success path, the whole tree, not just the
-/// immediate child, is confirmed exited before `wait_for` returns, so it is safe for the caller to
-/// touch any file or account any member of the tree might otherwise still hold open.
+/// `Job::wait_tree_timeout`, which drains the WHOLE job tree assigned via THIS SAME `contain` call
+/// through a real kernel primitive, not just the immediate child. If it trips, `wait_for` kills the
+/// whole tree, then waits (unboundedly) on the child's OWN process handle for that kill to land, and
+/// only then reports that the tree did not finish; it never silently continues. On that kill/timeout
+/// fallback path, only the immediate child can still be confirmed gone — the job handle is consumed
+/// by `kill_tree` by the time the fallback wait runs, so there is no way to re-confirm the rest of
+/// the tree — but on the (common) success path, the whole tree, not just the immediate child, is
+/// confirmed exited before `wait_for` returns, so it is safe for the caller to touch any file or
+/// account any member of the tree might otherwise still hold open.
+///
+/// A grandchild `[spawn_attempts_with]` spawns is a member of THIS job only if ordinary Windows job
+/// inheritance already carried it into whatever job its own creator belongs to, before
+/// `spawn_attempts_with`'s own `contain` call explicitly assigns it to a second, independent job of
+/// its own — nesting the two only if that inheritance already happened. Whether it does is NOT
+/// assumed here: `spawn_attempts_with` measures it directly with `IsProcessInJob`, once per spawn
+/// route, before its own `contain` call runs (see that function). The two routes are not assumed to
+/// agree — `CreateProcessWithTokenW` creates the process through the Secondary Logon service, a
+/// process outside this job tree entirely, which is exactly the kind of case ordinary parent-job
+/// inheritance would not reach.
 ///
 /// This is the bound for a process this test binary spawns and waits on directly. Some of those
 /// children — `logon_routes::logon_one_account`'s and `token_filtering::unelevated_caller_view`'s,
@@ -44,8 +55,9 @@ use windows::Win32::System::Threading::{
 /// wait on a grandchild through [`spawn_attempts_with`]. That inner wait is given
 /// [`GRANDCHILD_EXIT_BOUND_MS`], a strictly smaller bound, on purpose: if the grandchild hangs, the
 /// child's own `wait_for` call trips, kills, and recovers well within this constant's 120s, so this
-/// outer wait still finishes on schedule. If this outer wait ever trips instead, that names the
-/// immediate child itself as stuck — not a grandchild the child was already recovering from.
+/// outer wait still finishes on schedule. Which phase actually consumed the time if this outer wait
+/// trips anyway is NOT something a trip on its own establishes — see [`GRANDCHILD_EXIT_BOUND_MS`]'s
+/// doc for why no phase attribution is claimed here.
 pub(crate) const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
 /// The bound for [`spawn_attempts_with`]'s own wait on the children it spawns. Kept well under
@@ -503,6 +515,11 @@ pub(crate) fn wait_for(pi: &PROCESS_INFORMATION, job: &Job, bound_ms: u32) -> Re
 /// still be confirmed gone this way, since `kill_tree` consumes the job handle a tree-wide wait
 /// would otherwise need. The returned message says what happened to the child at every step,
 /// including a `TerminateProcess` failure, rather than only ever blaming the original wait.
+///
+/// Every `Err` this returns therefore leaves the REST of the tree — any grandchild — in an
+/// unconfirmed state, not a confirmed-gone one. A caller that turns this `Err` into a `panic!` and
+/// unwinds through a `TempDir` or a scratch account it owns is racing whatever of the tree could
+/// not be confirmed gone against that resource's removal; each such panic site says so itself.
 fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<u32, WaitFailure> {
     let killed = job.kill_tree();
     if let Err(kill_err) = &killed {
@@ -520,7 +537,10 @@ fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<
             return Err(WaitFailure(format!(
                 "{reason}; kill_tree failed ({kill_err}) and the direct child could not be \
                  terminated either ({term_err}) — it has been abandoned rather than waited on \
-                 unboundedly for an exit nothing here could obtain"
+                 unboundedly for an exit nothing here could obtain. Only the immediate child was \
+                 ever in scope here; nothing about the rest of the tree is confirmed either way, so \
+                 a caller that unwinds through a TempDir or scratch account it owns after this Err \
+                 races that removal against whatever of the tree is still alive"
             )));
         }
     }
@@ -539,7 +559,10 @@ fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<
         let _ = CloseHandle(pi.hProcess);
     }
     Err(WaitFailure(format!(
-        "{reason}; kill_tree={killed:?} wait_after_kill={waited_after_kill:?}"
+        "{reason}; kill_tree={killed:?} wait_after_kill={waited_after_kill:?}. This confirms only \
+         the immediate child is gone, never the rest of the tree — a caller that unwinds through a \
+         TempDir or scratch account it owns after this Err races that removal against whatever \
+         grandchild could not be confirmed gone"
     )))
 }
 
@@ -751,10 +774,29 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE) {
                 let _ = writeln!(out, "  {step} [{which} token]: FAILED {e:?}");
             }
             Ok(()) => {
+                // Answers open question C: is this grandchild already a member of SOME job the
+                // instant the OS created it — i.e. did ordinary parent-job inheritance carry it
+                // into whatever job THIS process (its creator, or seclogon acting on this
+                // process's behalf for the WithTokenW route) belongs to — before `contain` below
+                // ever explicitly assigns it anywhere? Measured here, before `contain`, because
+                // `contain`'s own assignment would make the answer TRUE unconditionally and hide
+                // the ambient-inheritance question. `None` asks "in ANY job", not one specific
+                // handle, since this process holds no handle to any job an ancestor process may
+                // have created — only PID/job membership, not handles, cross those boundaries.
+                // SAFETY: `pi.hProcess` is a live, just-created (suspended) process handle.
+                let mut in_any_job = windows::core::BOOL(0);
+                let in_any_job = match unsafe { IsProcessInJob(pi.hProcess, None, &mut in_any_job) } {
+                    Ok(()) => in_any_job.as_bool().to_string(),
+                    Err(e) => format!("<IsProcessInJob failed: {e}>"),
+                };
                 let job = contain(&pi, &format!("PROBE spawn-attempts[{which}/{step}]"));
                 let exit = wait_for(&pi, &job, GRANDCHILD_EXIT_BOUND_MS)
                     .map_or_else(|e| e.to_string(), |c| format!("exit=0x{c:08x}"));
-                let _ = writeln!(out, "  {step} [{which} token]: STARTED, {exit}. The child reports:");
+                let _ = writeln!(
+                    out,
+                    "  {step} [{which} token]: STARTED (pre-contain IsProcessInJob(_, None)={in_any_job}), \
+                     {exit}. The child reports:"
+                );
                 splice_child_report(out, &report);
             }
         }

@@ -4,7 +4,7 @@
 //! account or logging anyone on; [`crate::logon_routes`] covers the routes that do either of those.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE};
@@ -186,8 +186,11 @@ fn measure_another_process_token() {
         }
     }
     if expect_explorer {
+        let file_name = Path::new(&image_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase());
         assert!(
-            image_path.to_lowercase().ends_with("explorer.exe"),
+            file_name.as_deref() == Some("explorer.exe"),
             "pid {pid} was found via tasklist as explorer.exe, but the handle this probe opened \
              reports its image as {image_path} instead — the PID was almost certainly reused by \
              an unrelated process between the tasklist snapshot and OpenProcess, so the token \
@@ -424,7 +427,11 @@ fn unelevated_caller_view() {
                     Err(e) => panic!(
                         "PROBE unelevated-view: {route}'s medium child's exit could not be \
                          confirmed, so this route's measurement is incomplete and must not be \
-                         trusted: {e}"
+                         trusted: {e}. If that error came through kill_and_reap's fallback, only \
+                         the immediate child's death is confirmed there — never the rest of the \
+                         tree — and unwinding from this panic drops this probe's own temp \
+                         directory, racing any grandchild that could still be alive and writing \
+                         into it."
                     ),
                 };
                 println!("PROBE unelevated-view: {route} started a medium child, {exit}. It reports:");

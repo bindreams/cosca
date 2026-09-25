@@ -177,12 +177,15 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
 }
 
 /// Same question as the probe above, but with `SEE_MASK_CLASSNAME`/`lpClass = "exefile"` set,
-/// matching production's actual elevated call (`launch_runas_with_host`,
-/// `src/elevation/windows.rs`). Forcing the class tells the shell the file's type is already known
-/// and dispatches straight to `HKCR\exefile\shell\<verb>\command`, skipping its own class-detection
-/// step — a materially different resolution path than letting the shell infer the class itself,
-/// which is what every OTHER probe in this suite does. See the module doc's "The lpClass
-/// divergence" section for why this probe exists and what it settles.
+/// matching production's actual elevated call (`launch_runas_with_host`, `src/elevation/windows.rs`)
+/// in that ONE respect — the forced class. This probe still uses the default verb, not `runas`, and
+/// still sets `SEE_MASK_FLAG_NO_UI`, which production does not; see the module doc's "Why no
+/// elevation is involved" and NO_UI paragraphs for why both divergences are deliberate here. Forcing
+/// the class tells the shell the file's type is already known and dispatches straight to
+/// `HKCR\exefile\shell\<verb>\command`, skipping its own class-detection step — a materially
+/// different resolution path than letting the shell infer the class itself, which is what every
+/// OTHER probe in this suite does. See the module doc's "The lpClass divergence" section for why
+/// this probe exists and what it settles.
 ///
 /// Both a `tool.exe` (a copy of `cosca_testbin_image`, self-reporting via `--report-to`) and a
 /// `tool.bat` are planted side by side: PATHEXT's default order resolves a bare `tool` to whichever
@@ -217,9 +220,12 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile() {
                 "  => under SEE_MASK_CLASSNAME/lpClass=\"exefile\", a path-less lpFile is NOT found \
                  via lpDirectory search — neither the planted tool.exe nor tool.bat ran. This \
                  matches plan_runas's (src/elevation/windows.rs) note of 'no App Paths, no \
-                 bare-name search' for an elevated caller under this same class, and means the \
-                 no-class probe above does NOT transfer to production's actual call: completing the \
-                 name closes a hazard the forced class was never exposed to in the first place."
+                 bare-name search' for an elevated caller under this same forced class (the one \
+                 respect in which this call matches production; the verb here is the default, not \
+                 production's runas, and SEE_MASK_FLAG_NO_UI is set where production leaves it \
+                 unset — see the module doc). So the no-class probe above does NOT transfer to a \
+                 call under this forced class: completing the name closes a hazard the forced class \
+                 was never exposed to in the first place."
             );
         }
         LaunchOutcome::NotLaunched(e) => panic!(
@@ -244,12 +250,16 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile() {
             match (exe_ran, bat_ran) {
                 (Some(_), None) => println!(
                     "  => under SEE_MASK_CLASSNAME/lpClass=\"exefile\", a path-less lpFile IS still \
-                     searched, PATHEXT applied and lpDirectory consulted, and here it resolved to \
-                     the planted tool.exe (tool.bat was also planted, but did not run). The forced \
-                     class does NOT close this hazard for an .exe placeholder, contrary to \
-                     plan_runas's (src/elevation/windows.rs) note (measured only for an elevated \
-                     caller). This conclusion is scoped to tool.exe: it is NOT established that \
-                     tool.bat is also reachable this way — see the `tool.bat`-only probe above."
+                     searched and lpDirectory consulted, and here it resolved to the planted \
+                     tool.exe (tool.bat was also planted, but did not run) — .exe was appended; \
+                     since only one extension was ever observed to run, this alone does not \
+                     establish that the FULL PATHEXT list was walked, only that .exe-completion \
+                     happened. The forced class does NOT close this hazard for an .exe placeholder, \
+                     contrary to plan_runas's (src/elevation/windows.rs) note (measured only for an \
+                     elevated caller). This conclusion is scoped to tool.exe: it is NOT established \
+                     that tool.bat is also reachable under this forced class — the no-class probe \
+                     above (`does_shellexecute_search_lpdirectory_for_a_pathless_lpfile`) plants only \
+                     tool.bat, not under SEE_MASK_CLASSNAME."
                 ),
                 (None, Some(_)) => println!(
                     "  => under SEE_MASK_CLASSNAME/lpClass=\"exefile\", a path-less lpFile IS still \

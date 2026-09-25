@@ -201,7 +201,12 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
                 Ok(code) => format!("exit=0x{code:08x}"),
                 Err(e) => panic!(
                     "PROBE createprocesswithlogon[{role}]: the logged-on child's exit could not be \
-                     confirmed, so this probe's measurement is incomplete and must not be trusted: {e}"
+                     confirmed, so this probe's measurement is incomplete and must not be trusted: \
+                     {e}. If that error came through kill_and_reap's fallback, only the immediate \
+                     child's death is confirmed there — never the rest of the tree — and unwinding \
+                     from this panic drops both this probe's temp directory and the caller's scratch \
+                     account (its `net user /delete` runs on drop), racing any grandchild that could \
+                     still be alive and using either."
                 ),
             };
             println!("PROBE createprocesswithlogon[{role}]: STARTED, {exit}. The child reports:");
