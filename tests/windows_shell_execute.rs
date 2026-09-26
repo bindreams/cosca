@@ -30,6 +30,9 @@
 //! under nextest.
 #![cfg(windows)]
 
+#[path = "common/windows_probe.rs"]
+mod windows_probe;
+
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -38,7 +41,6 @@ use std::sync::{Mutex, MutexGuard};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS,
@@ -218,15 +220,7 @@ enum Failure {
 /// as this one's.
 fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Path) -> Result<Report, Failure> {
     debug_assert!(!report.exists(), "every launch reports to a fresh path: {report:?}");
-    // SAFETY: paired with the `CoUninitialize` below on this thread.
-    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    if com.is_err() {
-        return Err(Failure::Other(format!("CoInitializeEx: {com:?}")));
-    }
-    let launched = launch_in_apartment(verb, file, dir, class, report);
-    // SAFETY: balances the successful `CoInitializeEx` above.
-    unsafe { CoUninitialize() };
-    launched
+    windows_probe::in_com_apartment(Failure::Other, || launch_in_apartment(verb, file, dir, class, report))
 }
 
 fn launch_in_apartment(
@@ -287,29 +281,6 @@ fn launch_in_apartment(
         (Some(image), Some(cwd)) => Ok(Report { image, cwd }),
         _ => Err(Failure::Other(format!("exit {code}, incomplete report: {body:?}"))),
     }
-}
-
-fn mark_passed() {
-    let Some(dir) = std::env::var_os("COSCA_CANARY_MARKERS") else {
-        return;
-    };
-    let name = std::thread::current()
-        .name()
-        .expect("libtest names each test's thread")
-        .replace("::", ".");
-    std::fs::write(Path::new(&dir).join(name), b"").expect("write the canary marker");
-}
-
-/// Whether `image` is `want`, by file name: every payload copy has a name of its own, and the
-/// image path comes back long (`runneradmin`) where the temp path may be 8.3 (`RUNNER~1`).
-fn same_file(image: &str, want: &Path) -> bool {
-    let want = want
-        .file_name()
-        .expect("a payload path has a file name")
-        .to_string_lossy();
-    Path::new(image)
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&want))
 }
 
 /// The scratch layout both tests use: `a\cosca_probe_a.exe`, `b\cosca_probe_b.exe`,
@@ -379,7 +350,8 @@ fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Opt
 }
 
 fn ends_with(got: &Result<Report, Failure>, path: &Path) -> bool {
-    got.as_ref().is_ok_and(|r| same_file(&r.image, path))
+    got.as_ref()
+        .is_ok_and(|r| windows_probe::same_file(Path::new(&r.image), path))
 }
 
 fn failed_with(got: &Result<Report, Failure>, hresult: i32) -> bool {
@@ -482,7 +454,7 @@ fn classname_runas_needs_a_full_path() {
 
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
-    mark_passed();
+    windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }
 
 /// Canary: `ShellExecuteExW` consults an HKLM App Paths registration for a bare name, for `runas`
@@ -518,7 +490,7 @@ fn exefile_skips_the_app_paths_lookup() {
     }
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
-    mark_passed();
+    windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }
 
 /// Canary: launched as `exefile`, a `%` is taken literally, in `lpFile` and in `lpDirectory`
@@ -571,5 +543,5 @@ fn exefile_takes_percent_literally() {
     }
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
-    mark_passed();
+    windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }

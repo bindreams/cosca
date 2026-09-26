@@ -54,18 +54,23 @@ regex = "1"
 # `windows_path_resolution`'s `provenance.rs` needs it, for `RtlGetVersion` (stamps each
 # measurement with its OS build). Declaring it here, in dev-dependencies, keeps it out of the
 # published crate's own dependency footprint for downstream consumers who only pull in
-# `[dependencies]`. `windows_path_resolution` also calls GetFullPathNameW,
-# GetFileInformationByHandleEx, CreateProcessW, SetHandleInformation and RegGetValueW directly, to
-# MEASURE the platform rather than to use cosca; `windows_shell_execute` calls ShellExecuteExW from
-# an STA and writes one volatile App Paths key in HKLM and one in HKCU (see its module doc).
+# `[dependencies]`. The `windows_*` probes call GetFullPathNameW, GetFileInformationByHandleEx,
+# ShellExecuteExW, the token APIs, the CreateProcess* family, SetHandleInformation, RtlGetVersion,
+# RegGetValueW and CompareStringOrdinal directly (RtlGetVersion and RegGetValueW stamp each
+# measurement with its OS build; CompareStringOrdinal orders an environment block's keys the same
+# case-insensitive way CreateProcess* itself does) to MEASURE the platform rather than to use
+# cosca; `windows_shell_execute` calls ShellExecuteExW from an STA and writes one volatile App
+# Paths key in HKLM and one in HKCU (see its module doc).
 windows = { version = "0.62", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
