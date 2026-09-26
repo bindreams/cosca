@@ -19,6 +19,11 @@ fn file_with(content: &str) -> File {
 
 /// Spawn `/bin/sh -c script` with `mappings` installed exactly as a real `Command::fd()` caller
 /// would, and return its captured stdout as a `String`.
+///
+/// Scripts below read a mapped fd via `/dev/fd/N` rather than the shell's own `<&N` redirection:
+/// on Debian/Ubuntu `/bin/sh` is dash, whose `<&N` only parses a single digit, so any fd >= 10
+/// fails with "Bad fd number". `cargo test`'s threaded runner routinely allocates fds that high;
+/// `/dev/fd/N` has no such limit and works the same way on Linux and macOS.
 fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script).stdout(Stdio::piped());
@@ -56,7 +61,7 @@ fn a_mapping_onto_its_own_current_number_clears_cloexec_so_the_fd_survives_exec(
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
     let out = run_sh(
-        &format!("cat <&{raw}"),
+        &format!("cat /dev/fd/{raw}"),
         vec![FdMapping {
             parent_fd: owned,
             child_fd: raw,
@@ -81,7 +86,7 @@ fn colliding_mappings_deliver_each_files_own_content() {
     let a_raw = a_owned.as_raw_fd();
     let b_raw = b_owned.as_raw_fd();
     let out = run_sh(
-        &format!("cat <&{b_raw}; cat <&{a_raw}"),
+        &format!("cat /dev/fd/{b_raw}; cat /dev/fd/{a_raw}"),
         vec![
             FdMapping {
                 parent_fd: a_owned,
@@ -114,7 +119,7 @@ fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
     let b_raw = b_owned.as_raw_fd();
     let c_raw = c_owned.as_raw_fd();
     let out = run_sh(
-        &format!("cat <&{a_raw}; cat <&{b_raw}; cat <&{c_raw}"),
+        &format!("cat /dev/fd/{a_raw}; cat /dev/fd/{b_raw}; cat /dev/fd/{c_raw}"),
         vec![
             FdMapping {
                 parent_fd: c_owned,
@@ -180,7 +185,7 @@ fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
     let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(format!("cat <&{raw}")).stdout(Stdio::piped());
+    cmd.arg("-c").arg(format!("cat /dev/fd/{raw}")).stdout(Stdio::piped());
     install_preserved(&mut cmd, vec![owned]);
     let out = cmd.output().expect("spawn");
     assert!(out.status.success());
@@ -199,7 +204,7 @@ fn without_install_preserved_the_fd_is_closed_at_exec() {
     let raw = owned.as_raw_fd();
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("cat <&{raw} 2>/dev/null || echo CLOSED"))
+        .arg(format!("cat /dev/fd/{raw} 2>/dev/null || echo CLOSED"))
         .stdout(Stdio::piped());
     let out = cmd.output().expect("spawn");
     drop(owned); // keep it alive in the parent until after spawn, exactly like a real caller
@@ -306,7 +311,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("cat <&{b_raw}; cat <&{a_raw}"))
+        .arg(format!("cat /dev/fd/{b_raw}; cat /dev/fd/{a_raw}"))
         .stdout(Stdio::piped());
 
     // Lower the CHILD's RLIMIT_NOFILE to 256 before `install`'s own pre_exec hook runs.
