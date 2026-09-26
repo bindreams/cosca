@@ -1045,6 +1045,9 @@ async fn wait_returns_only_after_the_retained_drop_ran() {
     }
     release_tx.send(()).expect("the drain is parked on the gate");
     let status = wait.await.expect("wait for the child");
-    assert_eq!(status.code(), Some(0), "{status:?}");
+    // `blocked_child`'s Windows child is `findstr x`: closed stdin gives it no input to match, so
+    // it exits `1`, not `0` — the same platform split `a_cancelled_wait_leaves_the_caller_holding`
+    // already accounts for.
+    assert_eq!(status.code(), Some(if cfg!(windows) { 1 } else { 0 }), "{status:?}");
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
