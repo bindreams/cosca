@@ -20,6 +20,48 @@ fn drain_reports_none_when_no_event_pending() {
     child.wait().expect("reap");
 }
 
+/// `Cancel::signal` must wake a `kevent` blocked on the shared kqueue even though the real filter
+/// armed alongside it (`EVFILT_PROC` on a child that outlives the test) never fires on its own: if
+/// `signal` did nothing, the waiter thread below would block forever and this test would hang
+/// rather than fail — a real (non-timing) proof that the wake-up, not the child's exit, is what
+/// ends the wait.
+#[test]
+fn cancel_wakes_a_kevent_blocked_on_the_shared_kqueue() {
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn blocker");
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+
+    let (cancel, kq) = super::Cancel::arm().expect("arm a cancel filter");
+    super::arm_note_exit_on(&kq, id.pid())
+        .expect("arm the real filter")
+        .expect("a live child arms");
+
+    let waiter = std::thread::spawn(move || {
+        super::block_on_kqueue(&kq, None, false, |event| {
+            if super::Cancel::is_signal(event) {
+                return Ok(Some(true)); // cancelled
+            }
+            Ok(Some(false)) // the child exited — this test's own bug, since it never should
+        })
+    });
+
+    cancel.signal().expect("signal the cancel filter");
+    let cancelled = waiter
+        .join()
+        .expect("the waiter thread must not panic")
+        .expect("block_on_kqueue must not fail");
+    assert!(
+        cancelled,
+        "the wait must end because of the cancel, not the child's (never-happening) exit"
+    );
+
+    child.kill().expect("cleanup");
+    child.wait().expect("reap");
+}
+
 /// `kill(0, sig)` would signal the caller's ENTIRE process group, so pid 0 must never reach
 /// `kill(2)`. Two independent layers stop it, and this pins the outer one: the identity
 /// re-verify. `ProcessId::of(0)` resolves on macOS (`kernel_task`), but to a token that no

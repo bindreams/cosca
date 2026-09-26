@@ -163,6 +163,76 @@ pub(crate) fn block_on_kqueue<T: Copy>(
     }
 }
 
+/// A cross-thread wake-up for a `block_on_kqueue` wait blocked on a filter that might otherwise
+/// never fire: `leak()` cancelling a teardown already in flight needs exactly this, since neither
+/// `waitid` nor a bare `kevent` wait gives this crate any other way to interrupt a wait it does not
+/// own the far end of. Shares ONE kqueue with the real filter (`EVFILT_PROC`/`EVFILT_READ`) the
+/// wait arms: kqueue keys knotes by `(ident, filter)`, so this private `EVFILT_USER` filter never
+/// collides with a real filter reusing the same ident number.
+///
+/// `Kqueue` has no safe way to wrap an existing fd (its one field is private — nix 0.31's
+/// `sys::event`), so the kqueue itself, not just this handle, is shared: `arm` creates a fresh one
+/// and returns both an `Arc` the wait's own filter must also be armed on, and this handle, which
+/// keeps its own clone alive so `signal` stays safe to call for as long as `Cancel` lives, even
+/// after the waiter has already returned.
+#[derive(Clone)]
+pub(crate) struct Cancel {
+    kq: std::sync::Arc<Kqueue>,
+}
+
+impl Cancel {
+    /// The shared kqueue this cancel's `EVFILT_USER` filter lives on. A caller that wants a
+    /// wait to be cancellable arms its OWN real filter on this same kqueue (see `arm`'s doc for
+    /// why one shared kqueue, not two, is what makes cancellation observable at all), then
+    /// blocks on it directly rather than going through `signal`/`is_signal`.
+    pub(crate) fn kqueue(&self) -> &Kqueue {
+        &self.kq
+    }
+
+    /// The only ident this filter ever uses. Distinct from a real filter's `(ident, filter)` key
+    /// regardless of its numeric value, since the two are never the same filter type.
+    const IDENT: usize = 0;
+
+    /// Create a fresh kqueue with a private, edge-triggered `EVFILT_USER` filter already armed on
+    /// it, and a handle that triggers it from any thread. `EV_CLEAR` latches the trigger: a
+    /// `signal()` that races ahead of the wait even starting is not lost — the very first `kevent`
+    /// call on the returned kqueue reports it.
+    pub(crate) fn arm() -> Result<(Cancel, std::sync::Arc<Kqueue>), Error> {
+        let kq = std::sync::Arc::new(Kqueue::new().map_err(|e| Error::Io(e.into()))?);
+        let change = KEvent::new(
+            Self::IDENT,
+            EventFilter::EVFILT_USER,
+            EvFlags::EV_ADD | EvFlags::EV_CLEAR | EvFlags::EV_RECEIPT,
+            FilterFlag::empty(),
+            0,
+            0,
+        );
+        let add_result = add_with_receipt(&kq, change)?;
+        if add_result != 0 {
+            return Err(Error::Io(std::io::Error::from_raw_os_error(add_result as i32)));
+        }
+        Ok((Cancel { kq: kq.clone() }, kq))
+    }
+
+    /// Wake a `kevent` blocked on the shared kqueue, from any thread. Idempotent (`EV_CLEAR`), and
+    /// safe to call after the waiter has already returned: this only ever touches the kqueue
+    /// itself, never the real filter's own fd/pid.
+    pub(crate) fn signal(&self) -> Result<(), Error> {
+        let trigger = KEvent::new(Self::IDENT, EventFilter::EVFILT_USER, EvFlags::empty(), FilterFlag::NOTE_TRIGGER, 0, 0);
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        self.kq
+            .kevent(&[trigger], &mut [], Some(zero))
+            .map_err(|e| Error::Io(e.into()))?;
+        Ok(())
+    }
+
+    /// Whether `event` is this cancel firing, for an `interpret` closure to check before its own
+    /// filter-specific logic.
+    pub(crate) fn is_signal(event: &KEvent) -> bool {
+        event.filter() == Ok(EventFilter::EVFILT_USER)
+    }
+}
+
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};
     use nix::unistd::Pid;

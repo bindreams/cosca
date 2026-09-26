@@ -353,7 +353,7 @@ impl Attached {
             #[cfg(windows)]
             Attached::JobObject(job) => job.wait_drained(deadline, None),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.wait_drained(deadline),
+            Attached::FdMarker(m) => m.wait_drained(deadline, None),
             _ => Err(Error::Unsupported {
                 op: "wait for the contained tree to drain".into(),
                 platform: std::env::consts::OS,

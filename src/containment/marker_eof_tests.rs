@@ -110,12 +110,12 @@ fn probe_on_an_invalid_descriptor_reports_an_io_error() {
 fn block_until_drained_with_a_past_deadline_behaves_like_a_one_shot_probe() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now())), None).expect("probe"),
         TreeDrain::MembersRemain
     );
     drop(stdin);
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("unbounded wait"),
         TreeDrain::AllMarkersClosed
     );
     child.wait().expect("reap");
@@ -134,7 +134,7 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
     let already_past = Instant::now();
     drop(w); // drained before the deadline below is even evaluated
     assert_eq!(
-        block_until_drained(r.as_fd(), Some(Some(already_past))).expect("probe"),
+        block_until_drained(r.as_fd(), Some(Some(already_past)), None).expect("probe"),
         TreeDrain::AllMarkersClosed,
         "an already-drained tree must be reported as drained even past a stale deadline"
     );
@@ -207,13 +207,13 @@ fn an_unassessable_write_end_check_refuses_only_an_unbounded_wait() {
     // Bounded (a real, already-past deadline): proceeds past the write-end guard, then fails
     // for the ordinary reason (not a pipe, so `EVFILT_READ` cannot be armed on it) — never
     // `Error::Unassessable`.
-    let bounded = block_until_drained(f.as_fd(), Some(Some(Instant::now())));
+    let bounded = block_until_drained(f.as_fd(), Some(Some(Instant::now())), None);
     assert!(
         !matches!(bounded, Err(crate::error::Error::Unassessable { .. })),
         "a bounded wait must not be refused on an Unassessable write-end check, got {bounded:?}"
     );
     // Unbounded: refused outright.
-    let unbounded = block_until_drained(f.as_fd(), None);
+    let unbounded = block_until_drained(f.as_fd(), None, None);
     assert!(
         matches!(unbounded, Err(crate::error::Error::Unassessable { .. })),
         "an unbounded wait must be refused on an Unassessable write-end check, got {unbounded:?}"
@@ -226,15 +226,49 @@ fn a_live_member_holds_the_edge_shut_and_releases_it_on_exit() {
     // only thing that ends it, so the drain is caused by an event, never awaited on a clock.
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now())), None).expect("probe"),
         TreeDrain::MembersRemain,
         "a live marker holder must hold the edge shut"
     );
     drop(stdin); // cat sees EOF on stdin and exits
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("unbounded wait"),
         TreeDrain::AllMarkersClosed
     );
+    child.wait().expect("reap");
+}
+
+/// `Cancel::signal` must end an unbounded `block_until_drained` wait blocked on a live holder
+/// that never exits on its own — mirrors Windows' `JobHandle::wait_drained`'s own `cancel`
+/// parameter exactly: a cancelled wait reports `MembersRemain` (the drain state is simply
+/// unknown at that point, same as a timeout), never an error, and the verdict must come from
+/// the cancel, not a coincidental exit — the holder here is never closed, so only the cancel
+/// can end the wait, and a broken cancel would hang this test rather than fail it.
+#[test]
+fn cancel_ends_an_unbounded_wait_blocked_on_a_live_holder() {
+    let (child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let (cancel, _kq) = crate::wait::backend::Cancel::arm().expect("arm a cancel filter");
+    let waiting_cancel = cancel.clone();
+    let marker_fd = marker.as_raw_fd();
+    let waiter = std::thread::spawn(move || {
+        // SAFETY: `marker_fd` stays valid for this thread's whole run: `marker` (the `OwnedFd`
+        // behind it) is held alive in the parent thread until `waiter.join()` below returns.
+        let read_end = unsafe { BorrowedFd::borrow_raw(marker_fd) };
+        super::block_until_drained(read_end, None, Some(&waiting_cancel))
+    });
+
+    cancel.signal().expect("signal the cancel filter");
+    let verdict = waiter
+        .join()
+        .expect("the waiter thread must not panic")
+        .expect("block_until_drained must not fail on cancellation");
+    assert_eq!(
+        verdict,
+        TreeDrain::MembersRemain,
+        "a cancelled wait reports the drain state as unknown, never a guessed AllMarkersClosed"
+    );
+
+    child.kill().expect("cleanup");
     child.wait().expect("reap");
 }
 
@@ -246,7 +280,7 @@ fn the_edge_is_sticky_for_a_waiter_that_arrives_late() {
     drop(stdin);
     child.wait().expect("reap");
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("late wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("late wait"),
         TreeDrain::AllMarkersClosed
     );
 }
@@ -257,7 +291,7 @@ fn a_member_that_closes_the_marker_leaves_the_set_early() {
     // descriptor, so the edge fires while the member is demonstrably still running.
     let (child, marker, stdin) = spawn_marker_holder("exec 3>&-; exec cat >/dev/null");
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("wait"),
         TreeDrain::AllMarkersClosed,
         "a member that closed the marker must leave the membership set"
     );
@@ -311,14 +345,14 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     assert_eq!(ppid, 1, "the orphan must be reparented to launchd");
 
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now())), None).expect("probe"),
         TreeDrain::MembersRemain,
         "an orphan at ppid=1 must hold the edge shut after the root is gone"
     );
 
     drop(stdin); // the orphan's only exit path — no signal, no timer
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("unbounded wait"),
         TreeDrain::AllMarkersClosed,
         "the edge must fire when the orphan exits"
     );
@@ -350,21 +384,21 @@ fn all_markers_closed_requires_every_simultaneous_holder_to_exit() {
     let stdin_b = child.fd_write_end(5.into()).expect("holder B stdin write end");
 
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now())), None).expect("probe"),
         TreeDrain::MembersRemain,
         "two live holders must hold the edge shut"
     );
 
     drop(stdin_a); // holder A sees EOF on its own stdin and exits; holder B is untouched
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("probe"),
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now())), None).expect("probe"),
         TreeDrain::MembersRemain,
         "one holder exiting while a second remains must not be mistaken for a full drain"
     );
 
     drop(stdin_b); // holder B sees EOF and exits; no holder remains
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("unbounded wait"),
         TreeDrain::AllMarkersClosed,
         "the edge must fire only once the LAST simultaneous holder is gone"
     );
@@ -402,13 +436,13 @@ fn small_bytes_from_a_member_are_not_a_drain() {
         .expect("the child wrote to fd 3 before this returns");
 
     assert_eq!(
-        block_until_drained(marker.as_fd(), Some(Some(Instant::now()))).expect("zero-deadline check"),
+        block_until_drained(marker.as_fd(), Some(Some(Instant::now())), None).expect("zero-deadline check"),
         TreeDrain::MembersRemain,
         "a handful of buffered bytes under the low-water clamp must not be mistaken for a drain"
     );
     drop(stdin);
     assert_eq!(
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait"),
+        block_until_drained(marker.as_fd(), None, None).expect("unbounded wait"),
         TreeDrain::AllMarkersClosed
     );
     child.wait().expect("reap");
@@ -474,7 +508,8 @@ fn bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict() {
     assert_eq!(
         block_until_drained(
             marker.as_fd(),
-            Some(Instant::now().checked_add(Duration::from_secs(10)))
+            Some(Instant::now().checked_add(Duration::from_secs(10))),
+            None
         )
         .expect("wait past the low-water clamp"),
         TreeDrain::AllMarkersClosed,
@@ -512,7 +547,7 @@ fn a_quiet_live_holder_blocks_without_spending_cpu() {
     let deadline = Duration::from_millis(300);
     let cpu_before = self_thread_cpu_time();
     let wall_before = Instant::now();
-    let verdict = block_until_drained(marker.as_fd(), Some(Instant::now().checked_add(deadline)))
+    let verdict = block_until_drained(marker.as_fd(), Some(Instant::now().checked_add(deadline)), None)
         .expect("bounded wait against a quiet holder");
     let wall_elapsed = wall_before.elapsed();
     let cpu_elapsed = self_thread_cpu_time() - cpu_before;
@@ -551,7 +586,7 @@ fn a_sustained_writer_never_exceeds_the_deadline() {
 
     let deadline = Duration::from_millis(300);
     let wall_before = Instant::now();
-    let verdict = block_until_drained(marker.as_fd(), Some(Instant::now().checked_add(deadline)))
+    let verdict = block_until_drained(marker.as_fd(), Some(Instant::now().checked_add(deadline)), None)
         .expect("bounded wait against a sustained writer");
     let wall_elapsed = wall_before.elapsed();
 
@@ -593,7 +628,7 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
             std::thread::sleep(window);
             child.kill().expect("kill the sustained writer");
         });
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait against a sustained writer")
+        block_until_drained(marker.as_fd(), None, None).expect("unbounded wait against a sustained writer")
     });
     let wall_elapsed = wall_before.elapsed();
     let cpu_elapsed = self_thread_cpu_time() - cpu_before;

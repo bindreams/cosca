@@ -919,6 +919,7 @@ impl Marker {
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<Instant>>,
+        cancel: Option<&crate::wait::backend::Cancel>,
     ) -> Result<crate::containment::TreeDrain, Error> {
         self.check_read_end_still_valid()?;
         // This process is the supervisor: it must have closed its own copy of the write end at
@@ -933,7 +934,7 @@ impl Marker {
             crate::containment::marker_eof::WriteEndCheck::HeldByUs,
             "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
         );
-        crate::containment::marker_eof::block_until_drained(self.read_end(), deadline)
+        crate::containment::marker_eof::block_until_drained(self.read_end(), deadline, cancel)
     }
 
     /// `Err` distinguishes a genuine teardown-mechanism failure (`Error::Io`/`Unsupported`,
