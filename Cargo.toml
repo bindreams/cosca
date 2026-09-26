@@ -48,9 +48,14 @@ serde_json = "1"
 regex = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
-# Integration tests cannot reach the crate's own dependencies, and `windows_path_resolution` calls
-# GetFullPathNameW, GetFileInformationByHandleEx, CreateProcessW, SetHandleInformation,
-# RtlGetVersion and RegGetValueW directly (the last two stamp each measurement with its OS build) to
+# Every feature below except `Wdk_System_SystemServices` is already enabled on the main `windows`
+# dependency further down this file — integration tests reach that dependency directly, they are
+# not walled off from it. `Wdk_System_SystemServices` is the one genuine addition: only
+# `windows_path_resolution`'s `provenance.rs` needs it, for `RtlGetVersion` (stamps each
+# measurement with its OS build). Declaring it here, in dev-dependencies, keeps it out of the
+# published crate's own dependency footprint for downstream consumers who only pull in
+# `[dependencies]`. `windows_path_resolution` also calls GetFullPathNameW,
+# GetFileInformationByHandleEx, CreateProcessW, SetHandleInformation and RegGetValueW directly, to
 # MEASURE the platform rather than to use cosca; `windows_shell_execute` calls ShellExecuteExW from
 # an STA and writes one volatile App Paths key in HKLM and one in HKCU (see its module doc).
 windows = { version = "0.62", features = [
@@ -94,13 +99,6 @@ windows = { version = "0.62", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
-
-[target.'cfg(unix)'.dev-dependencies]
-# Integration tests cannot reach the crate's own dependencies (see the Windows dev-dependencies
-# comment above) — `tests/common`'s `RestoreStdio` needs raw `fcntl`/`close`/`dup2` to reproduce
-# the fd_map low-fd regressions through the public `Command` API (see tests/common's RestoreStdio
-# users).
-libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
