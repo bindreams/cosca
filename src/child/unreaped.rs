@@ -498,6 +498,10 @@ impl Drop for Unreaped {
                     "waiting for unkillable child {} failed ({e}); it stays unreaped",
                     self.pid
                 );
+            } else {
+                // Dropping is the implicit path: unlike `wait`, nothing else here ever narrates
+                // that this child was reaped at all.
+                log::info!("reaped unkillable child {} via drop", self.pid);
             }
             #[cfg(unix)]
             settle_after_wait(held, &waited);

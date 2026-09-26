@@ -114,6 +114,22 @@ fn drop_blocks_until_the_child_exits_and_reaps_it() {
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 
+/// `Drop` is the implicit path, unlike `wait`: it logs one line on the success path too, not only
+/// on a failed wait (see `drop_blocks_until_the_child_exits_and_reaps_it` for the reap itself).
+#[test]
+fn drop_logs_when_it_reaps_the_child() {
+    crate::log_capture::install();
+    let child = crate::test_child::spawn_a_process_that_exits();
+    let pid = child.id();
+    let unreaped = Unreaped::new(Held::Std(child));
+    let mark = crate::log_capture::mark();
+    drop(unreaped);
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("reaped unkillable child {pid}")),
+        "an implicit drop must be logged even when the wait succeeds"
+    );
+}
+
 /// `leak` gives the child up without reaping it, and says so: here the child, once it exits, is
 /// still this process's to reap, which only an unreaped child is.
 #[cfg(unix)]
