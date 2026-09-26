@@ -499,7 +499,10 @@ fn a_cloexec_holder_is_reported_and_warned_about() {
 #[test]
 fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     let _serialize = test_spawn_lock();
-    let mut cmd = std::process::Command::new("/bin/sh");
+    // marker_fd is always >= 64 (see the module docs); a dash-family shell parses only a
+    // single digit after `>&` and fails the whole script with "not found" past fd 9, so this
+    // needs a shell without that limit.
+    let mut cmd = std::process::Command::new("/bin/bash");
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
@@ -690,7 +693,10 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
 #[test]
 fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let _serialize = test_spawn_lock();
-    let mut cmd = std::process::Command::new("/bin/sh");
+    // marker_fd is always >= 64 (see the module docs); a dash-family shell parses only a
+    // single digit after `>&` and fails the whole script with "not found" past fd 9, so this
+    // needs a shell without that limit.
+    let mut cmd = std::process::Command::new("/bin/bash");
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
