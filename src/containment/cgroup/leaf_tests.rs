@@ -3749,8 +3749,17 @@ fn probe_tokio_wait_returns_only_after_the_retained_drop_ran() {
 
 /// The drain's own commit to kill-through, once claimed, cannot be recalled: `leak` racing in
 /// after the drain has already claimed what it must drop (M2) finds it parked mid `cgroup.kill`
-/// (via the same gate as the probe above) and returns at once, without waiting for it — the kill
-/// still goes ahead once released.
+/// (via the same gate as the probe above) and now blocks on it, exactly as `Drop` would, rather
+/// than returning early while the kill-through it can no longer stop keeps running unowned — the
+/// kill goes ahead, and `leak` itself does not return until it has.
+///
+/// The gate holds the drain task strictly until `release_tx` is sent, so `leak` is spawned onto
+/// its own thread and joined only afterward: releasing before spawning `leak` (rather than after,
+/// as the pre-blocking version of this test did) is required now — sending the release first and
+/// calling a now-blocking `leak` after would still work here (the gate only opens once `release_tx`
+/// is sent, whichever thread calls `leak`), but joining the thread before that send would deadlock,
+/// the same way `leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_then_disarms`'s
+/// doc explains for the reap-side twin.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
 fn probe_leak_of_a_committed_drain_still_kills_through() {
@@ -3783,14 +3792,17 @@ fn probe_leak_of_a_committed_drain_still_kills_through() {
         ::tokio::select! { biased; r = u.wait() => panic!("wait completed while the drain is parked: {r:?}"), _ = at_kill_rx => {} }
         u
     });
-    // The drain is parked inside cgroup.kill; leak now returns without waiting.
-    unreaped.leak();
     assert!(
         kill.exists(),
         "the kill write already ran (the hook fires just after it)"
     );
+    // The drain is parked inside cgroup.kill, committed; `leak` now blocks on it, so it runs on
+    // its own thread here, joined only once the gate below has released the drain and it has
+    // reported.
+    let leak_thread = std::thread::spawn(move || unreaped.leak());
     release_tx.send(()).expect("the drain is parked on the gate");
     done_rx.recv().expect("the drain finishes once released");
+    leak_thread.join().expect("leak must not panic");
     assert!(kill.exists(), "kill-through went ahead despite leak()");
 }
 
