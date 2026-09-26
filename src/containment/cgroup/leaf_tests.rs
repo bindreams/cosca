@@ -3714,7 +3714,10 @@ fn probe_tokio_wait_returns_only_after_the_retained_drop_ran() {
     crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |tid| {
         let _ = at_kill_tx.send(tid);
         // Err once the test drops `release_tx` (on a failed assertion): never hangs.
-        let _ = release_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
+        let _ = release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
     });
     runtime.block_on(async {
         let mut unreaped = crate::tokio::Unreaped::with_retained(
@@ -3751,7 +3754,10 @@ fn probe_tokio_wait_returns_only_after_the_retained_drop_ran() {
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
 fn probe_leak_of_a_committed_drain_still_kills_through() {
-    let runtime = ::tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let dir = tempfile::tempdir().expect("tempdir");
     let (leaf, kill) = occupied_entered_leaf(dir.path());
     let (child, stdin) = cat_child();
@@ -3763,7 +3769,10 @@ fn probe_leak_of_a_committed_drain_still_kills_through() {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |_| {
         let _ = at_kill_tx.send(());
-        let _ = release_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
+        let _ = release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
         let _ = done_tx.send(());
     });
     let unreaped = runtime.block_on(async {
@@ -3776,7 +3785,10 @@ fn probe_leak_of_a_committed_drain_still_kills_through() {
     });
     // The drain is parked inside cgroup.kill; leak now returns without waiting.
     unreaped.leak();
-    assert!(kill.exists(), "the kill write already ran (the hook fires just after it)");
+    assert!(
+        kill.exists(),
+        "the kill write already ran (the hook fires just after it)"
+    );
     release_tx.send(()).expect("the drain is parked on the gate");
     done_rx.recv().expect("the drain finishes once released");
     assert!(kill.exists(), "kill-through went ahead despite leak()");
@@ -3822,7 +3834,9 @@ fn probe_leak_of_an_unclaimed_drain_disarms() {
 
         let mut u = crate::tokio::Unreaped::with_retained(
             crate::child::unreaped::Held::Std(child),
-            Some(crate::child::unreaped::Retained { attached: crate::containment::Attached::Cgroup(leaf) }),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
         );
         let raw = pid as libc::id_t;
         let reaped_by_us = move || unsafe {
@@ -3869,7 +3883,10 @@ fn probe_leak_of_an_unclaimed_drain_disarms() {
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[test]
 fn probe_leak_after_a_refused_drain_disarms() {
-    let runtime = ::tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let handle = runtime.handle().clone();
     let dir = tempfile::tempdir().expect("tempdir");
     let (leaf, kill) = occupied_entered_leaf(dir.path());
@@ -3878,7 +3895,9 @@ fn probe_leak_after_a_refused_drain_disarms() {
     let mut u = runtime.block_on(async {
         let mut u = crate::tokio::Unreaped::with_retained(
             crate::child::unreaped::Held::Std(child),
-            Some(crate::child::unreaped::Retained { attached: crate::containment::Attached::Cgroup(leaf) }),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
         );
         crate::tokio::unreaped::fault::set_force_not_yet_reapable();
         {
@@ -3897,7 +3916,10 @@ fn probe_leak_after_a_refused_drain_disarms() {
     assert!(r.is_ok(), "the cached status must still be returned: {r:?}");
     assert!(!kill.exists(), "nothing killed through yet: the drain task never ran");
     u.leak();
-    assert!(!kill.exists(), "leak() must disarm what the refused drain left behind, not kill through it");
+    assert!(
+        !kill.exists(),
+        "leak() must disarm what the refused drain left behind, not kill through it"
+    );
 }
 
 /// The same contract as `probe_tokio_wait_returns_only_after_the_retained_drop_ran`, but

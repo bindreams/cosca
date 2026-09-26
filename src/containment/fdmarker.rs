@@ -1470,7 +1470,10 @@ impl Drop for Marker {
             return;
         }
         if let Err(e) = self.hard_kill() {
-            log::warn!("fd marker {:#x}: hard_kill on drop did not fully tear down its tree: {e}", self.handle);
+            log::warn!(
+                "fd marker {:#x}: hard_kill on drop did not fully tear down its tree: {e}",
+                self.handle
+            );
         }
     }
 }

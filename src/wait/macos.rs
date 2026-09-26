@@ -219,7 +219,14 @@ impl Cancel {
     /// safe to call after the waiter has already returned: this only ever touches the kqueue
     /// itself, never the real filter's own fd/pid.
     pub(crate) fn signal(&self) -> Result<(), Error> {
-        let trigger = KEvent::new(Self::IDENT, EventFilter::EVFILT_USER, EvFlags::empty(), FilterFlag::NOTE_TRIGGER, 0, 0);
+        let trigger = KEvent::new(
+            Self::IDENT,
+            EventFilter::EVFILT_USER,
+            EvFlags::empty(),
+            FilterFlag::NOTE_TRIGGER,
+            0,
+            0,
+        );
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         self.kq
             .kevent(&[trigger], &mut [], Some(zero))

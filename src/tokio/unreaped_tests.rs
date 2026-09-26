@@ -905,7 +905,9 @@ fn leak_of_a_committed_drain_logs_that_it_is_still_running() {
         u.leak();
         let records = crate::log_capture::records_since(mark, &format!("child {}", id.pid()));
         assert!(
-            records.iter().any(|r| r.contains("is killing through it on the blocking pool")),
+            records
+                .iter()
+                .any(|r| r.contains("is killing through it on the blocking pool")),
             "leak of a Committed drain must say it is still running: {records:?}"
         );
         assert!(
@@ -992,11 +994,15 @@ fn leak_of_a_finished_drain_logs_that_it_already_ran() {
         u.leak();
         let records = crate::log_capture::records_since(mark, &format!("child {}", id.pid()));
         assert!(
-            records.iter().any(|r| r.contains("finished killing through it before leak ran")),
+            records
+                .iter()
+                .any(|r| r.contains("finished killing through it before leak ran")),
             "leak of a Finished drain must say it already finished: {records:?}"
         );
         assert!(
-            !records.iter().any(|r| r.contains("is killing through it on the blocking pool")),
+            !records
+                .iter()
+                .any(|r| r.contains("is killing through it on the blocking pool")),
             "must not claim the drain is still running once it has Finished: {records:?}"
         );
     });
