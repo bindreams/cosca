@@ -33,8 +33,11 @@
 //!    (see [`install`]) — std's OWN stdio setup (`.stdin()`/`.stdout()`/`.stderr()`) runs its
 //!    `dup2`s in the child BEFORE any `pre_exec` hook, so a mapping source left at fd 0/1/2
 //!    would otherwise be silently clobbered before this module's own `pre_exec` ever ran;
-//!  - makes every post-fork syscall through raw `libc` calls whose return value is checked,
-//!    never through nix's `dup2_raw`;
+//!  - makes every post-fork syscall through raw `libc` calls whose return value is checked and
+//!    turned into an `io::Error` on failure — except the one `close` of a temporary this module
+//!    exclusively owns (see [`dup_avoiding`]), where a failure would be a logic bug, not a
+//!    recoverable condition, so it is `debug_assert!`ed instead — never through nix's
+//!    `dup2_raw`;
 //!  - retries a syscall interrupted by `EINTR`, with no arbitrary bound (mirrors the
 //!    codebase's other `pre_exec`/raw-syscall retry sites — see e.g.
 //!    `containment::cgroup::channel`).
@@ -43,9 +46,19 @@
 //! deliberately NOT rejected here: it is a normal spawn-time condition (bounded by the child's
 //! own `RLIMIT_NOFILE`) and is left to fail exactly the way any other post-fork syscall failure
 //! does — `dup2` returns `EBADF`, the checked closure returns that as an `io::Error`, and
-//! std's own child-to-parent error pipe turns it into an ordinary `Err` from
-//! `Command::spawn`. Only a negative `Fd` is pre-empted, upstream, in
-//! [`Command::fd`](crate::Command::fd); everything else here is the kernel's call.
+//! std's own child-to-parent error pipe turns that into an ordinary `Err` from `Command::spawn`.
+//!
+//! That last step has one known exception: std allocates its error pipe itself, inside
+//! `spawn()`, AFTER this module's own dup2 plan has already been built from the caller's
+//! `child_fd`s. Nothing here steers a `child_fd` away from whatever number that pipe's write end
+//! lands on. If a caller's `child_fd` equals that number, this module's own pass 2 dup2s the
+//! caller's mapping onto it — closing std's error channel before the child ever calls `exec`. A
+//! dup2 or exec failure after that point (including the out-of-range case above) writes std's
+//! errno bytes into the caller's mapped fd instead of reaching the parent, and `spawn()` wrongly
+//! returns `Ok`. Not fixed here: filed as #192, to land with a cosca-owned error channel.
+//!
+//! Only a negative `Fd` is pre-empted, upstream, in [`Command::fd`](crate::Command::fd);
+//! everything else here is the kernel's call.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -101,17 +114,8 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdM
          (callers build this from a BTreeMap<Fd, _>, whose keys already are)"
     );
 
-    // A mapping's `parent_fd` sitting at fd 0/1/2 would be clobbered by std's own stdio dup2,
-    // which runs in the child before any `pre_exec` hook (including this module's own). Move it
-    // out of the way here, in the parent, before the fork ever happens.
-    //
-    // The ORIGINAL low-numbered descriptor is kept open in `retired`, not closed here: closing
-    // it would free that exact number back to the OS right before `std_cmd.spawn()` does its own
-    // internal fd allocation (its child-to-parent error-reporting pipe, or any piped stdio),
-    // which can then claim that same number and collide with a dup2 std performs in the child
-    // before any `pre_exec` hook runs. `retired` is carried inside `Plan`, which the `pre_exec`
-    // closure below owns, so it only actually closes once `std_cmd` itself drops — well after
-    // `spawn()` (and everything it internally allocates) has completed.
+    // Relocate any source at fd 0/1/2 before the fork — see the doc comment above for why the
+    // original stays open in `retired`.
     let mut retired: Vec<OwnedFd> = Vec::new();
     for m in mappings.iter_mut() {
         let parent_raw = m.parent_fd.as_raw_fd();
@@ -180,9 +184,10 @@ impl Plan {
         }
     }
 
-    /// Async-signal-safe: no allocation, every syscall's return value is checked, `EINTR` is
-    /// retried with no arbitrary bound (matches the codebase's other `pre_exec`/raw-syscall
-    /// retry sites).
+    /// Async-signal-safe: no allocation, every syscall's return value is checked (module docs:
+    /// except `dup_avoiding`'s own temporary-fd `close`, which is asserted, not propagated),
+    /// `EINTR` is retried with no arbitrary bound (matches the codebase's other
+    /// `pre_exec`/raw-syscall retry sites).
     fn apply(&mut self) -> io::Result<()> {
         if self.mappings.is_empty() {
             return Ok(());
@@ -254,9 +259,17 @@ fn dup_avoiding(fd: RawFd, forbidden: &[RawFd]) -> io::Result<RawFd> {
         // SAFETY: `tmp` was just returned by a successful F_DUPFD_CLOEXEC — a fresh,
         // uniquely-owned descriptor nothing else references yet; closing it just frees its
         // number back up for whichever mapping actually wants it.
-        unsafe {
-            libc::close(tmp);
-        }
+        let close_ret = unsafe { libc::close(tmp) };
+        // A failure here (only possible as `EBADF`, since `tmp` is ours alone and no other
+        // syscall can race to close it first) would be a logic bug in this function, not a
+        // recoverable spawn-time condition — there is no cleanup left to do with a `close` that
+        // failed on a descriptor we exclusively own, so this asserts rather than returns `Err`.
+        debug_assert_eq!(
+            close_ret,
+            0,
+            "close({tmp}) on a fresh, uniquely-owned F_DUPFD_CLOEXEC duplicate failed: {}",
+            io::Error::last_os_error()
+        );
         min = tmp
             .checked_add(1)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;

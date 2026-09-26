@@ -498,10 +498,7 @@ fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
 /// `Err` from `spawn()`. `Command::fd()` itself accepts `i32::MAX`; the failure happens
 /// post-fork, at `dup2`, exactly like any other out-of-range child fd (`EBADF`).
 ///
-/// Not `..._in_both_profiles`: an integration test file like this one does not run in CI's
-/// release job at all (that job is `--lib` only), so a name claiming "in both profiles" was
-/// never actually checked in release. `--lib` unit coverage for the same behavior lives in
-/// `child::spawn::fd_map::fd_map_tests`.
+/// Unit coverage for the same behavior lives in `child::spawn::fd_map::fd_map_tests`.
 #[cfg(unix)]
 #[test]
 fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {

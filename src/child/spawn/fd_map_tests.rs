@@ -411,4 +411,12 @@ fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
     );
 
     drop(cmd); // only now may the retired original actually close
+
+    // Once `cmd` (and the `Plan`/`retired` it owned) has dropped, fd 2 must actually be freed —
+    // proving `_retired` isn't just leaked open for the life of the process.
+    let closed_after_drop = unsafe { libc::fcntl(2, libc::F_GETFD) } == -1;
+    assert!(
+        closed_after_drop,
+        "the retired original fd (2) must be closed once std_cmd drops, not leaked open"
+    );
 }

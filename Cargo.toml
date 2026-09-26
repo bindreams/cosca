@@ -98,7 +98,8 @@ nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"
 [target.'cfg(unix)'.dev-dependencies]
 # Integration tests cannot reach the crate's own dependencies (see the Windows dev-dependencies
 # comment above) — `tests/common`'s `RestoreStdio` needs raw `fcntl`/`close`/`dup2` to reproduce
-# the fd_map low-fd regressions (N1, M2) through the public `Command` API.
+# the fd_map low-fd regressions through the public `Command` API (see tests/common's RestoreStdio
+# users).
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
