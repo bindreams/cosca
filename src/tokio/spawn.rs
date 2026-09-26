@@ -547,8 +547,11 @@ pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error
         Checked::Reaped => auth_failed("the elevated child had already exited".into()),
         Checked::Uncertain(e) => {
             // The pid may already name another process: what this spawn retained is given up
-            // disarmed, not left to kill through a tree that may no longer be its own.
-            retained.attached.disarm();
+            // abandoned, not left to kill through a tree that may no longer be its own — and not
+            // merely disarmed: the tree-kill note above may already have fired the kill on this
+            // same leaf, and a bare `disarm` would let a still-occupied leaf's `Drop` re-fire
+            // `cgroup.kill` and block draining a kill this give-up never asked for.
+            retained.attached.abandon();
             auth_failed(format!(
                 "the elevated child could not be terminated ({kill}), and its ownership is uncertain ({e}); \
                  it was released"

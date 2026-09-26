@@ -270,6 +270,25 @@ impl Attached {
         }
     }
 
+    /// Give this attachment up for a caller that never gets to kill through it and never made any
+    /// kill this handle's own `killed`-style bookkeeping might already record: `Unreaped`'s
+    /// `leak()`, `release()`, and a failed `wait`/`Drop`'s own give-up of what it retained.
+    ///
+    /// Unlike [`disarm`](Self::disarm), which still waits for a kill the SAME handle already fired
+    /// through `kill_tree()`/`hard_kill()`, `abandon` clears that record too, so a later `Drop`
+    /// never re-fires a kill or blocks on one this give-up never asked for — see
+    /// [`CgroupLeaf::abandon`](crate::containment::cgroup::CgroupLeaf::abandon)'s own doc for why a
+    /// cgroup leaf is the one variant where this distinction is observable: only it has a `killed`
+    /// flag a kill made before hand-back can leave set. Every other variant's drop either never
+    /// kills or has nothing equivalent to wait on, so `abandon` is exactly `disarm` for them.
+    pub(crate) fn abandon(&self) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(leaf) => leaf.abandon(),
+            _ => self.disarm(),
+        }
+    }
+
     /// Whether this mechanism fires `killpg` against a pgid subject to the reap-then-recycle
     /// hazard `Child::kill_tree`/`terminate_tree`'s precondition assert guards against: the OS
     /// reaping the leader and recycling its pid/pgid onto a different, live process group

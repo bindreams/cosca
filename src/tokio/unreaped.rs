@@ -716,7 +716,10 @@ impl Unreaped {
         }
         self.released = Some(e.to_string());
         if let Some(retained) = self.retained.take() {
-            retained.attached.disarm();
+            // Abandoned, not merely disarmed: nothing here made a kill, but an elevated
+            // teardown's own tree-kill note may already have fired one on this leaf before it was
+            // ever handed back — see `Attached::abandon`'s doc.
+            retained.attached.abandon();
         }
         e
     }
@@ -802,9 +805,12 @@ impl Unreaped {
                 // Never claimed by the task: disarm directly, rather than leave it queued behind a
                 // blocking pool that may never schedule it.
                 Some(retained) => {
-                    retained.attached.disarm();
+                    // Abandoned, not merely disarmed: see `Attached::abandon`'s doc for why a bare
+                    // `disarm` over a leaf a kill already reached before hand-back would let its
+                    // `Drop` re-fire `cgroup.kill` and block draining it.
+                    retained.attached.abandon();
                     log::warn!(
-                        "leaking unkillable child {}: disarming what it retained rather than killing \
+                        "leaking unkillable child {}: abandoning what it retained rather than killing \
                          through it, before its drain ran",
                         self.pid
                     );
@@ -847,7 +853,8 @@ impl Unreaped {
             if let Some((held, retained)) = shared.reclaim_before_start() {
                 (*held).release();
                 if let Some(retained) = retained {
-                    retained.attached.disarm();
+                    // Abandoned, not merely disarmed: see `Attached::abandon`'s doc.
+                    retained.attached.abandon();
                 }
                 log::warn!("leaking unkillable child {}, unreaped", self.pid);
                 return;
@@ -870,7 +877,8 @@ impl Unreaped {
                 unreachable!("take_blocking only ever hands back a Finished report")
             };
             if let Some(retained) = retained {
-                retained.attached.disarm();
+                // Abandoned, not merely disarmed: see `Attached::abandon`'s doc.
+                retained.attached.abandon();
             }
             match reaped {
                 Some(Ok(Some(_))) => {
@@ -907,7 +915,8 @@ impl Unreaped {
                 (*held).release();
             }
             if let Some(retained) = retained {
-                retained.attached.disarm();
+                // Abandoned, not merely disarmed: see `Attached::abandon`'s doc.
+                retained.attached.abandon();
             }
             log::warn!("leaking unkillable child {}, unreaped", self.pid);
         }
@@ -1127,7 +1136,8 @@ impl Drop for Unreaped {
         if let Some(retained) = self.retained.take() {
             // See `reaped`: a successful reap leaves what it retained armed.
             if failed {
-                retained.attached.disarm();
+                // Abandoned, not merely disarmed: see `Attached::abandon`'s doc.
+                retained.attached.abandon();
             }
         }
     }

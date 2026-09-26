@@ -278,16 +278,17 @@ pub(crate) fn error_to_io<C: std::fmt::Debug + Send + Sync + 'static>(e: crate::
 
 /// What an [`Unreaped`] releases only after its child is reaped: the containment of the spawn
 /// that created it, whose tree teardown belongs after the root's reap. Given up with the child,
-/// it is disarmed first, so nothing the leaked child leads is killed; a cgroup leaf it still
-/// occupies is then never removed by cosca, and stays until the delegated parent's owner removes
-/// it.
+/// it is abandoned first, so nothing the leaked child leads is killed — including a kill an
+/// elevated teardown's own tree-kill note already fired on the root before handing it back (see
+/// `Attached::abandon`'s doc) — a cgroup leaf it still occupies is then never removed by cosca,
+/// and stays until the delegated parent's owner removes it.
 pub(crate) struct Retained {
     pub(crate) attached: crate::containment::Attached,
 }
 
 impl Retained {
     fn give_up(self) {
-        self.attached.disarm();
+        self.attached.abandon();
     }
 }
 

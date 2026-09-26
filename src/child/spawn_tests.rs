@@ -566,6 +566,64 @@ fn a_failed_password_write_whose_check_is_uncertain_disarms_its_retained_leaf() 
     unsafe { libc::waitpid(pid as i32, &mut status, 0) };
 }
 
+/// A `CgroupV2` spawn's OWN tree-kill note fires `hard_kill` on line one of `elevated_write_failed`
+/// — before the `Checked::Uncertain` arm is ever reached — so the retained leaf's `killed` flag is
+/// already set by the time that arm gives it up. That give-up must not fire `cgroup.kill` a second
+/// time: `disarm` alone (the regression this test guards against) leaves the leaf `armed == false,
+/// killed == true`, and its own `Drop`, finding the leaf still occupied (unremovable), re-fires
+/// `cgroup.kill` on the `rmdir` failure — an unbounded wait `leak`-style teardown must never pay for
+/// a kill this function already made.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_over_cgroupv2_whose_check_is_uncertain_does_not_rekill_the_leaf_its_own_tree_kill_already_killed(
+) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-uncertain-leaf-cgroupv2");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let mut cmd = blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let pid = child.id().pid();
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-elevated-kill-eperm-uncertain-cgroupv2-4f18",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_force_teardown_try_wait_echild();
+    crate::containment::cgroup::fault::record_leaf_steps();
+
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other(
+            "cosca-password-write-fail-uncertain-cgroupv2-6a02",
+        )),
+    );
+
+    assert!(err.to_string().contains("ownership is uncertain"), "got {err}");
+    let steps = crate::containment::cgroup::fault::take_leaf_steps();
+    let kills = steps.iter().filter(|s| s.as_str() == "kill").count();
+    assert_eq!(
+        kills, 1,
+        "the tree-kill note's own hard_kill must be the only kill written; the Uncertain arm's \
+         give-up of an already-killed leaf must not re-fire cgroup.kill: {steps:?}"
+    );
+
+    // The real child is still alive: the kill above was faked. End it for real and reap it
+    // ourselves, since cosca released it as ownership-uncertain without waiting.
+    // SAFETY: `pid` is this process's own unreaped child.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: as above; a blocking reap of this process's own child.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+}
+
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
 #[cfg(target_os = "linux")]
 fn reaped(pid: u32) -> bool {

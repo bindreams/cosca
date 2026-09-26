@@ -185,6 +185,24 @@ impl CgroupLeaf {
         self.armed.store(false, Ordering::Relaxed);
     }
 
+    /// Give this leaf up, for a caller that never gets to kill through it and never made the kill
+    /// a `killed` flag might already record: `leak()`, `release()`, and a failed `wait`/`Drop`'s
+    /// own give-up of an [`Unreaped`]'s retained leaf.
+    ///
+    /// Unlike [`disarm`](Self::disarm), which still waits for a kill the SAME handle already fired
+    /// through `kill_tree()`/`hard_kill()` (see its own doc), `abandon` clears `killed` too: nothing
+    /// here made that kill on this handle's own behalf — an elevated teardown's tree-kill note may
+    /// have fired `hard_kill` on the root before this leaf was ever handed back, so `killed` can
+    /// already be `true` by the time the give-up runs, and a bare `disarm` would then walk `Drop`'s
+    /// disarmed-but-killed branch: an unbounded `block_until_drained()` wait, and a second
+    /// `cgroup.kill` write, over a kill this give-up never asked for. `abandon` instead takes
+    /// `Drop`'s "never killed" branch — a single non-blocking `cgroup.events` read, never a wait —
+    /// exactly as `leak`'s and `release`'s documented "never kills, never blocks" contract requires.
+    pub(crate) fn abandon(&self) {
+        self.armed.store(false, Ordering::Relaxed);
+        self.killed.store(false, Ordering::Relaxed);
+    }
+
     /// Whether this leaf's `Drop` may still block waiting for a drain: the child entered, `Drop`
     /// is disarmed, and a kill this handle already fired (`hard_kill`/`Child::kill_tree`) means
     /// `Drop`'s disarmed-but-killed branch waits for that kill's drain exactly as an armed
