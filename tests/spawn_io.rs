@@ -21,39 +21,19 @@ fn testbin() -> &'static str {
 /// themselves through `log` — Linux's cgroup leaf (`cgroup::log_degrade`) and macOS's fd marker
 /// (`fdmarker::install`) — so routing only the Linux one leaves the macOS reasons on the floor
 /// on the host that has them.
+///
+/// A thin alias for [`common::install_log_capture`], not a logger of its own: `log::set_logger`
+/// is once-per-process, so a test file that kept a second, competing logger here would panic
+/// whichever call lost the race against a test that wants to capture and assert on records too
+/// (`common::install_log_capture`) — a real panic hit by `cargo test`'s default one-binary,
+/// many-tests-per-process model (nextest's one-process-per-test does not have this problem, but
+/// local `cargo test` runs do). Sharing the one logger removes the race instead of picking a
+/// winner: it already echoes every record to stderr, in the same `[LEVEL] text` format this
+/// module used to print itself.
 #[cfg(unix)]
 mod stderr_log {
-    use std::sync::OnceLock;
-
-    struct StderrLog;
-
-    impl log::Log for StderrLog {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            eprintln!("[{}] {}", record.level(), record.args());
-        }
-        fn flush(&self) {}
-    }
-
-    static INSTALLED: OnceLock<()> = OnceLock::new();
-
-    /// Idempotent: `log::set_logger` is once-per-process, so every test that wants the
-    /// library's reasoning calls this and the first one wins.
     pub fn install() {
-        INSTALLED.get_or_init(|| {
-            log::set_logger(&StderrLog).expect("first logger in this test binary");
-            // `Debug`, because a degrade reason is only reported at `warn` the FIRST time this
-            // process sees it — `cgroup::log_degrade` reports every repeat at `debug`. A
-            // narrower filter therefore keeps whichever test happened to degrade first and
-            // discards every repeat — `log!` checks `max_level()` before any logger is reached,
-            // so a filtered-out record is never emitted to capture in the first place.
-            //
-            // `Debug` is the full set and costs nothing beyond it: this crate emits no `trace`
-            // records at all, and libtest prints a passing test's stderr nowhere.
-            log::set_max_level(log::LevelFilter::Debug);
-        });
+        crate::common::install_log_capture();
     }
 }
 
@@ -1300,6 +1280,56 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
         !leaf.exists(),
         "an opted-out handle must still remove the leaf of a drained tree: {}",
         leaf.display()
+    );
+    drop((root, grand));
+}
+
+/// #194: after `kill_on_drop(false)`, an explicit `kill_tree()` must still make `Drop` wait for
+/// the leaf to drain before its `rmdir` — exactly as the `kill_on_drop` (armed) path already
+/// does. `cgroup.kill` is asynchronous: writing it returns before the kernel has finished
+/// reaping the tree and clearing `populated`, so a `Drop` that tries its `rmdir` once, without
+/// waiting, can race that, fail `EBUSY`, and leak the leaf while logging that it was left behind.
+///
+/// Unlike `linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree`, this test does
+/// NOT call `wait_tree()` before dropping: an explicit wait would force the drain itself and mask
+/// exactly the race under test. `drop(child)` follows `kill_tree()` directly.
+///
+/// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
+/// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the
+/// drain happens to finish first — which `let _ = child.wait()` reaping the root just above makes
+/// likely, since the kernel has to reap every member before that call returns. The unit test
+/// `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains` (`leaf_tests.rs`)
+/// is what deterministically forces the race and proves `Drop` itself waits — no sleeps, no
+/// polling from the test.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain() {
+    common::cgroup::require_lane();
+    common::install_log_capture();
+    let EchoTree {
+        child,
+        root,
+        grand,
+        grand_pid,
+    } = spawn_contained_echo_tree(false);
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+
+    let mark = common::log_mark();
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait(); // reap the root
+    drop(child); // no wait_tree(): Drop alone must wait for the drain before its rmdir
+
+    assert!(
+        !leaf.exists(),
+        "an explicit kill_tree(), even through a handle that opted out of kill_on_drop, must \
+         wait for the leaf to drain before Drop's rmdir: {}",
+        leaf.display()
+    );
+    assert!(
+        !common::contains_since(mark, &format!("{} was not removed", leaf.display())),
+        "Drop must not report this leaf left behind once it waited for the drain"
     );
     drop((root, grand));
 }

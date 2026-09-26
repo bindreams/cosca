@@ -631,7 +631,18 @@ impl Child {
 
 impl Child {
     /// Leave the child (and its contained tree) running after this handle drops. The drop then
-    /// neither kills the tree nor waits for it.
+    /// never kills the tree itself — though it still waits for a kill this handle already made
+    /// through [`kill_tree`](Self::kill_tree) before giving up the leaf.
+    ///
+    /// **That wait runs on the dropping thread, not a reaper thread.** A disarmed `Child` never
+    /// enters the reaper handoff described on [`Drop`](#impl-Drop-for-Child) — that handoff exists
+    /// to move the *root's* reap off this thread, and only
+    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop) arms it. Detaching skips it
+    /// unconditionally, so if this handle's own `kill_tree()` already
+    /// ran, the leaf's `Drop` blocks here until the kernel reports the cgroup drained — the same
+    /// blocking-in-`Drop` the sync [`Child`](crate::Child) always does, just reachable from async
+    /// code on this one opt-out path. Call [`wait_tree`](Self::wait_tree) before dropping to avoid
+    /// blocking the calling thread on it.
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
         self.os.attached.disarm();
@@ -692,9 +703,10 @@ impl Child {
 /// That divergence from the sync `Child`, which still blocks, is otherwise deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
-        // The opt-out/`detach()` contract: nothing is signalled. The leaf's own `Drop` still
-        // reports a leaf the tree occupies: at `debug` for a running tree, at `warn` for one killed
-        // that has not drained.
+        // The opt-out/`detach()` contract: nothing is signalled here. The leaf's own `Drop` still
+        // reports a leaf a still-running tree occupies, at `debug` — but for one this handle
+        // already killed through `kill_tree()`/`hard_kill()`, it waits for that kill's drain and
+        // retries the `rmdir` first, reporting at `warn` only if that retry still fails.
         if !self.kill_on_drop {
             return;
         }

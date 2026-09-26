@@ -403,6 +403,55 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
     assert_async_opted_out_tree_survives(false, drop);
 }
 
+/// #194, async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
+/// in `spawn_io.rs`: `kill_on_drop(false)` hits `Child::drop`'s early return (see its doc), so
+/// tokio's own teardown never runs — but `os.attached` (the `CgroupLeaf`) still drops as an
+/// ordinary struct field the moment `Child::drop` returns, on this thread, and its own `Drop`
+/// must wait for an already-fired `kill_tree()`'s drain before its `rmdir`, exactly as the sync
+/// `Child` does.
+///
+/// No `wait_tree()` before the drop: that would force the drain itself and mask the race.
+///
+/// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
+/// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the
+/// drain happens to finish first — which `let _ = child.wait().await` reaping the root just above
+/// makes likely, since the kernel has to reap every member before that call returns. The unit test
+/// `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains` (`leaf_tests.rs`)
+/// is what deterministically forces the race and proves `Drop` itself waits — no sleeps, no
+/// polling from the test.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain() {
+    common::cgroup::require_lane();
+    common::install_log_capture();
+    let common::AsyncEchoTree {
+        mut child,
+        root,
+        grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async(false);
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+
+    let mark = common::log_mark();
+    child.kill_tree().expect("kill_tree");
+    let _ = child.wait().await; // reap the root
+    drop(child); // no wait_tree(): Drop alone must wait for the drain before its rmdir
+
+    assert!(
+        !leaf.exists(),
+        "an explicit kill_tree(), even through a handle that opted out of kill_on_drop, must \
+         wait for the leaf to drain before Drop's rmdir: {}",
+        leaf.display()
+    );
+    assert!(
+        !common::contains_since(mark, &format!("{} was not removed", leaf.display())),
+        "Drop must not report this leaf left behind once it waited for the drain"
+    );
+    drop((root, grand));
+}
+
 /// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
 /// the handle through `opt_out`, prove both members alive, then remove the leaf the tree keeps.
 #[cfg(target_os = "linux")]

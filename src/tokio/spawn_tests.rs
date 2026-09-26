@@ -332,8 +332,9 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
 /// the tree — its kill through the leaf — and never reaps that child as an abandoned spawn's,
 /// which would race tokio's reap for the same pid.
 ///
-/// The leaf may be left behind: its `Drop` removes it right after `cgroup.kill`, without waiting
-/// for the kill to land — a known exit-lag gap, not this.
+/// The leaf may still be left behind: its `Drop` does wait for the kill to drain before its
+/// retried `rmdir` (see `CgroupLeaf`'s `Drop`), so this is not that exit-lag gap — a leftover here
+/// would mean the retried `rmdir` itself still failed once the leaf drained.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]

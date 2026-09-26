@@ -539,10 +539,13 @@ impl Command {
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
-    /// but never kills to empty it. A tree still running keeps it, and so does one torn down with
-    /// [`kill_tree`](crate::Child::kill_tree) or [`terminate_tree`](crate::Child::terminate_tree)
-    /// that has not finished exiting, which [`wait_tree`](crate::Child::wait_tree) before the drop
-    /// prevents. cosca does not come back
+    /// but never kills to empty it itself. A tree still running keeps it, and so does one torn
+    /// down with [`terminate_tree`](crate::Child::terminate_tree) that has not finished exiting —
+    /// a `SIGTERM` is catchable, so the tree may outlive it — which
+    /// [`wait_tree`](crate::Child::wait_tree) before the drop is what proves either case is done.
+    /// [`kill_tree`](crate::Child::kill_tree) is different: that kill is atomic, so a drop after
+    /// it waits for that kill's drain before giving up the leaf, the same as it would with
+    /// `kill_on_drop` left on. cosca does not come back
     /// for a leaf it left: the empty `cosca-*` directory stays until something else removes it,
     /// such as systemd removing a stopped unit's cgroup subtree.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {

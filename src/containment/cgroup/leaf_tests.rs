@@ -535,18 +535,23 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     );
 }
 
-/// A disarmed leaf whose tree the caller KILLED is not left behind for a live detached tree: it
-/// is a leaf `cgroup.kill` had not yet drained when the handle dropped (`kill_on_drop(false)`,
-/// `kill_tree()`, no `wait_tree()`). It is reported as the leak it is, at `warn`, like every
-/// other leaf cosca fails to remove.
+/// A disarmed leaf whose tree the caller KILLED (`kill_on_drop(false)`, `kill_tree()`, no
+/// `wait_tree()`) is not simply left behind for a live detached tree: #194's fix makes `Drop`
+/// wait for that kill's drain before retrying the `rmdir`, exactly as the armed path does (see
+/// `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains`, which proves the
+/// retried `rmdir` succeeds once a — there, simulated — drain completes). This leaf's directory
+/// has no `cgroup.events`, so its drain watch arms as already-gone (see `DrainWatch::arm`) and the
+/// wait is a no-op — the retried `rmdir` still fails here on `ENOTEMPTY`, from the leftover
+/// `occupant` and `cgroup.kill` files left in the directory, a genuine leftover unrelated to the
+/// drain. It is reported once, at `warn`, like every other leaf `Drop` fails to remove.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_disarmed_leaf_whose_tree_was_killed_warns_that_it_was_not_removed() {
+fn a_disarmed_leaf_whose_tree_was_killed_but_still_refuses_rmdir_is_reported_once() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-killed-opted-out-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the still-dying tree");
+    std::fs::write(leaf_path.join("occupant"), "").expect("leftover file that makes rmdir fail with ENOTEMPTY");
     std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
 
     let leaf = entered_leaf_at(leaf_path);
@@ -632,7 +637,7 @@ fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
     );
 }
 
-// Drop's two flags -----
+// Drop's three flags -----
 // See the truth table in `CgroupLeaf`'s `Drop`.
 
 /// All four combinations, each against an occupied leaf whose verdict is taken: only both-set
@@ -674,7 +679,7 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
     }
 }
 
-// An armed Drop's drain -----
+// A killed leaf's drain, armed and disarmed -----
 // Each test gives a fake leaf cgroupfs's `rmdir` answers through the rmdir hook, and drives it from
 // another thread that acts only once the drop's drain wait is about to block.
 
@@ -735,6 +740,49 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     assert!(
         after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
         "every rmdir after the kill must wait for the drain, got {steps:?}"
+    );
+}
+
+/// #194 regression, disarmed twin of `an_armed_drop_removes_its_leaf_only_after_it_drains`: a
+/// leaf whose caller explicitly killed the tree (`hard_kill`, mirroring `Child::kill_tree()`)
+/// and THEN disarmed `Drop`'s own teardown (`kill_on_drop(false)`) must still have its `Drop`
+/// wait for that kill's drain before its retried `rmdir` — not fire one unwaited `rmdir` and
+/// report the leaf left behind while the kill it already made is still draining.
+///
+/// Deterministic, no sleeps: `on_each_drain_block` drives the fake leaf's `populated` flag from
+/// another thread, released only once `Drop`'s wait is actually blocked on it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-disarmed-draining-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+    leaf.hard_kill().expect("kill the tree");
+
+    fault::record_leaf_steps();
+    drop(leaf);
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    assert!(
+        !fake.leaf.exists(),
+        "a disarmed Drop must still remove a leaf its caller already killed, once it drains, got {steps:?}"
+    );
+    // The kill already happened before `record_leaf_steps()`, so it leaves no "kill" step here —
+    // only the doomed first `rmdir` (still populated) and the retried one, after the drain.
+    assert_eq!(
+        steps,
+        vec!["rmdir populated 1", "rmdir populated 0"],
+        "a disarmed leaf's already-fired kill must be retried only once it drains, got {steps:?}"
     );
 }
 

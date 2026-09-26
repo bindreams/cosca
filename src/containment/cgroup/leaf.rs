@@ -99,9 +99,11 @@ pub(crate) enum DrainStep {
 /// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report channel: the child
 /// needs them only until its `exec`.
 ///
-/// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill`, waits
-/// for the leaf to drain, removes its child cgroups and tries once more — but only if the child reported entering it and the leaf was not
-/// [`disarm`](Self::disarm)ed.
+/// `Drop` removes the leaf directory, but only if the child reported entering it. If the leaf is
+/// still occupied, it fires `cgroup.kill` itself — but only while still armed (not
+/// [`disarm`](Self::disarm)ed) — then, either way a kill is now in flight (its own, or one the
+/// caller already made through [`kill_tree`](Self::kill_tree)/[`hard_kill`](Self::hard_kill)),
+/// waits for the leaf to drain, removes its child cgroups, and tries the `rmdir` once more.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`, for reports.
@@ -167,8 +169,12 @@ impl CgroupLeaf {
     /// `rmdir` always fails (`EBUSY`). `Child::drop` opting out via `kill_on_drop` does not
     /// help — the leaf is a field of that `Child` and its own `Drop` runs regardless.
     ///
-    /// A disarmed `Drop` still tries the `rmdir` once — detach gives up the kill, not the
-    /// tidying — and notes at `debug`, never `warn`, when the live tree keeps the leaf.
+    /// A disarmed `Drop` never fires `cgroup.kill` itself, and gives up the leaf without
+    /// retrying when the tree was never killed (noted at `debug`, never `warn`) — whether or not
+    /// it is still live. But it does not give up on a kill the caller already made through
+    /// `kill_tree()`/`hard_kill()`: that kill's drain is waited for exactly as an armed `Drop`'s
+    /// is, so the `rmdir` retries once the leaf drains, and only reports the leaf as left behind
+    /// if it still fails after that.
     pub(crate) fn disarm(&self) {
         self.armed.store(false, Ordering::Relaxed);
     }
@@ -680,14 +686,14 @@ impl Drop for CgroupLeaf {
         let Err(first) = self.rmdir_leaf() else {
             return;
         };
-        // `Drop` kills only when both hold:
+        // `Drop` kills only when the child entered the leaf and it is still armed:
         //
-        // | entered | armed | Drop                                                 |
-        // |---------|-------|------------------------------------------------------|
-        // | true    | true  | rmdir; if it fails, cgroup.kill, drain, sweep, rmdir |
-        // | true    | false | one rmdir: the caller opted the tree out             |
-        // | false   | true  | one rmdir: the child never entered the leaf          |
-        // | false   | false | one rmdir: the child never entered the leaf          |
+        // | entered | armed | killed | Drop                                                                      |
+        // |---------|-------|--------|---------------------------------------------------------------------------|
+        // | true    | true  | –      | rmdir; if it fails, cgroup.kill, drain, sweep, rmdir                      |
+        // | true    | false | true   | rmdir; if it fails, wait for the already-fired kill's drain, sweep, rmdir |
+        // | true    | false | false  | one rmdir: the caller opted the tree out and never killed it              |
+        // | false   | –     | –      | one rmdir: the child never entered the leaf                               |
         if !self.child_entered() {
             if !removed_after_drain(&first) {
                 warn_leaf_left_behind(
@@ -697,18 +703,21 @@ impl Drop for CgroupLeaf {
             }
             return;
         }
-        // Opted out (see `disarm`): the single `rmdir` above is all Drop may do. An `ENOENT` or
-        // `ENODEV` from it proves the leaf is gone ([`removed_after_drain`]). Otherwise a tree
-        // the caller killed has not drained yet (`cgroup.kill` is asynchronous), and its leaf is a
-        // leak like any other; a tree left running keeps its leaf by request.
+        // Opted out (see `disarm`): Drop itself never fires `cgroup.kill`. But opting out of
+        // Drop's own teardown is not opting out of a kill the caller already did through
+        // `kill_tree()`/`hard_kill()`: that kill is real and its drain is exactly as awaitable as
+        // the armed path's. An `ENOENT` or `ENODEV` from the first `rmdir` proves the leaf is
+        // already gone ([`removed_after_drain`]). Otherwise, a tree the caller killed has not
+        // drained yet (`cgroup.kill` is asynchronous) — wait for it, then retry, as the armed path
+        // does. A tree left running (never killed) keeps its leaf by request, with no retry.
         if !self.armed.load(Ordering::Relaxed) {
             if removed_after_drain(&first) {
                 return;
             }
             if self.killed.load(Ordering::Relaxed) {
-                warn_leaf_left_behind(
-                    &self.leaf_path,
-                    format_args!("rmdir failed ({first}) before the killed tree drained; the handle opted out of teardown, so Drop did not retry"),
+                self.drain_and_remove(
+                    true,
+                    "after an explicit kill through a handle that opted out of Drop's own teardown",
                 );
             } else {
                 log::debug!(

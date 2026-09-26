@@ -69,9 +69,19 @@ pub fn block_until_zombie(pid: cosca::identity::RawPid) {
     }
 }
 
-/// A capturing `log::Log` for asserting on log output from an integration-test process — a fresh
-/// copy of `src/log_capture.rs`'s `pub(crate)`-private original, which a separate compilation unit
-/// like this one cannot name.
+/// The ONE `log::Log` this test crate installs. A capturing logger, for asserting on log output
+/// from an integration-test process — a fresh copy of `src/log_capture.rs`'s `pub(crate)`-private
+/// original, which a separate compilation unit like this one cannot name, extended to also echo
+/// every record to stderr (in the same `[LEVEL] text` format `spawn_io.rs`'s `stderr_log` used to
+/// print through a logger of its own) so a failing `assert_eq!(…, CgroupV2)`'s degrade reason
+/// still reaches CI output — libtest captures a failing test's stderr and prints it with the
+/// failure.
+///
+/// `log::set_logger` is once-per-process, so a second, competing logger in the same test binary
+/// would race this one and panic whichever call lost — a real failure under `cargo test`'s
+/// default one-binary, many-tests-per-process model (nextest's one-process-per-test does not hit
+/// it, but local `cargo test` runs do). [`install_log_capture`] is therefore the only installer
+/// left in this crate: `spawn_io.rs`'s `stderr_log::install` is now a thin alias for it.
 mod log_capture {
     use std::sync::{Mutex, OnceLock};
 
@@ -84,11 +94,19 @@ mod log_capture {
             true
         }
         fn log(&self, record: &log::Record<'_>) {
-            RECORDS.lock().unwrap().push(record.args().to_string());
+            let text = record.args().to_string();
+            eprintln!("[{}] {text}", record.level());
+            RECORDS.lock().unwrap().push(text);
         }
         fn flush(&self) {}
     }
 
+    /// `Trace`, the full set: this crate emits no `trace` records at all, and a degrade reason
+    /// is only reported at `warn` the FIRST time this process sees it — `cgroup::log_degrade`
+    /// reports every repeat at `debug` — so a filter narrower than `Debug` would keep whichever
+    /// test happened to degrade first and silently discard every repeat's record before it ever
+    /// reached this logger (`log!` checks `max_level()` first). `Trace` costs nothing beyond
+    /// `Debug` and removes any need to pick between the two.
     pub fn install() {
         INSTALLED.get_or_init(|| {
             log::set_logger(&CaptureLog).expect("first logger in this test process");
