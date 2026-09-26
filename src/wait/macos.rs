@@ -180,6 +180,7 @@ pub(crate) struct Cancel {
     kq: std::sync::Arc<Kqueue>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // production caller is leak()'s still-pending macOS drain/reap cancellation wiring
 impl Cancel {
     /// The shared kqueue this cancel's `EVFILT_USER` filter lives on. A caller that wants a
     /// wait to be cancellable arms its OWN real filter on this same kqueue (see `arm`'s doc for
