@@ -302,7 +302,12 @@ fn attached_fd_marker_is_actionable() {
         fd: write.as_fd().as_raw_fd(),
     };
     let marker = crate::containment::fdmarker::Marker::new(prepared, None, None, false);
-    assert!(Attached::FdMarker(marker).is_actionable());
+    let attached = Attached::FdMarker(marker);
+    assert!(attached.is_actionable());
+    // This fixture's `write` end never left this process (no child was ever spawned), so a
+    // real kill-through sweep on drop would find the fixture itself as a "holder" and trip
+    // the self-exclusion guard. Disarm: this test is only about `is_actionable`, not teardown.
+    attached.disarm();
 }
 
 /// `prepare` must thread the caller's reserved child fds through to the placement, or a user
@@ -469,6 +474,12 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
             .expect("unbounded wait after the holder exits"),
         TreeDrain::AllMarkersClosed
     );
+
+    // `handle`/`read_handle` here both stand in with the READ end's own handle (see the
+    // comment above), which the real, now-exited `cat` never held — so a kill-through sweep
+    // on drop would find nothing to signal except, potentially, this fixture's own retained
+    // read fd. Disarm: this test is only about `wait_drained`, not teardown.
+    attached.disarm();
 }
 
 /// The UAC-elevated attachment bypasses `mechanism_from_flags` entirely — nothing in the flag
@@ -711,4 +722,92 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
         b"1",
         "the default is still a kill-on-drop teardown"
     );
+}
+
+// A retained FdMarker's plain drop must kill through, like CgroupLeaf/JobHandle (macOS) =====
+//
+// `Retained`'s ordinary teardown (used by `into_unreaped_parts`, e.g. the elevation-failure
+// path) is a PLAIN field drop of `Attached` — it calls no `hard_kill` itself, unlike
+// `Child::drop`, which calls `self.attached.hard_kill()` explicitly before its fields drop.
+// `CgroupLeaf`/`JobHandle` already tolerate this because THEIR OWN `Drop` kills through an
+// armed resource regardless of which path let them fall out of scope. `Marker` had no such
+// `Drop` at all, so a retained-then-plain-dropped `FdMarker` silently left its tracked tree
+// running. Every test below uses `ContainMode::TreeWalk`: it carries no pgid
+// (`Marker::has_pgid` is false), so the marker-fd holder sweep is the ONLY channel that could
+// still kill the root, proving `hard_kill` itself ran rather than some other mechanism.
+
+/// The bug this section fixes: today, dropping a retained `FdMarker` leaves its tracked root
+/// running. After the fix, the same drop kills it — proven by a blocking, event-driven reap
+/// (`std::process::Child::wait`), never a timeout.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_retained_fdmarker_is_killed_through_on_plain_drop() {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sleep", "30"]);
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let child = cmd.spawn().expect("spawn a TreeWalk-contained root");
+    let (held, retained) = child.into_unreaped_parts();
+    drop(retained);
+    let crate::child::unreaped::Held::Std(mut std_child) = held else {
+        panic!("a sync spawn's Held is always Held::Std");
+    };
+    let status = std_child
+        .wait()
+        .expect("reap the retained root after its drop kills it through");
+    assert!(
+        !status.success(),
+        "a retained FdMarker's plain drop must kill through the tracked root, got {status:?}"
+    );
+}
+
+/// `kill_on_drop(false)` must disarm the retained-drop kill-through too, exactly as it already
+/// disarms `CgroupLeaf`/`JobHandle`: the caller opted the tree out, so neither `Child::drop`'s
+/// own teardown NOR the resource's own `Drop` may kill it.
+#[cfg(target_os = "macos")]
+#[test]
+fn kill_on_drop_false_disarms_an_fdmarker() {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sleep", "30"]);
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    cmd.kill_on_drop(false);
+    let child = cmd.spawn().expect("spawn a TreeWalk-contained root");
+    let pid = child.id().pid();
+    drop(child);
+    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+    assert!(
+        alive,
+        "kill_on_drop(false) must disarm the marker; the root must still be alive right after drop"
+    );
+    // Cleanup: this test's own kill, never the mechanism under test.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    unsafe {
+        libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+    }
+}
+
+/// `Child::detach()` must disarm the retained-drop kill-through too — the same contract as
+/// `kill_on_drop(false)`, reached through the other public opt-out.
+#[cfg(target_os = "macos")]
+#[test]
+fn detach_disarms_an_fdmarker() {
+    let mut cmd = crate::Command::new();
+    cmd.args(["sleep", "30"]);
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let child = cmd.spawn().expect("spawn a TreeWalk-contained root");
+    let pid = child.id().pid();
+    child.detach();
+    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+    assert!(
+        alive,
+        "detach() must disarm the marker; the root must still be alive right after drop"
+    );
+    // Cleanup: this test's own kill, never the mechanism under test.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    unsafe {
+        libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+    }
 }

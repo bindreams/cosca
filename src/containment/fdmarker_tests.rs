@@ -1018,6 +1018,10 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
         "a Denied re-check on a supposedly-known holder must report incomplete (true), not \
          silently succeed"
     );
+    // `cmd` above is never spawned, so the write end this marker installed never left this
+    // process — a real kill-through sweep on drop would find this fixture itself as a
+    // "holder". Disarm: this test is only about `kill_holder`'s own logic, not teardown.
+    marker.disarm();
 }
 
 /// `Marker::sweep`'s top-level `incomplete`/`Err` return, end to end through the REAL public
@@ -1043,4 +1047,8 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
         result.is_err(),
         "a sweep whose only pass was blind must report Err, not silently converge as Ok(())"
     );
+    // `cmd` above is never spawned, so the write end this marker installed never left this
+    // process — a second, un-blinded kill-through sweep on drop would find this fixture itself
+    // as a "holder". Disarm: this test is only about the blind-pass Err path, not teardown.
+    marker.disarm();
 }

@@ -759,6 +759,7 @@ pub(crate) mod fault {
 // The attached mechanism =====
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
@@ -789,6 +790,12 @@ pub(crate) struct Marker {
     /// `holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy`, and the CI failure that
     /// motivated it, #59).
     own_fd: RawFd,
+    /// Whether the caller still wants cosca to kill through on drop. Cleared by
+    /// [`disarm`](Self::disarm), for `detach()`, `kill_on_drop(false)`, and a leaked
+    /// `Unreaped` — mirrors `CgroupLeaf::armed`. `Drop` kills only while this holds: a plain
+    /// drop of a `Marker` retained past its `Child` (e.g. `Retained`'s field-wise drop) does
+    /// no killing on its own, so this is the only thing that still does.
+    armed: AtomicBool,
 }
 
 impl std::fmt::Debug for Marker {
@@ -864,7 +871,15 @@ impl Marker {
             root_denied,
             pgid,
             own_fd: prepared.fd,
+            armed: AtomicBool::new(true),
         }
+    }
+
+    /// Neutralize `Drop`'s kill-through, for `detach()`, `kill_on_drop(false)`, and a leaked
+    /// `Unreaped`. Mirrors `CgroupLeaf::disarm`: a disarmed `Marker` still closes its read end
+    /// on drop (that alone kills nothing), it just skips the `hard_kill` sweep.
+    pub(crate) fn disarm(&self) {
+        self.armed.store(false, Ordering::Relaxed);
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // consumed by Child::test_marker_handle (test-only)
@@ -1438,6 +1453,24 @@ impl Marker {
                 crate::containment::treewalk::kill_by_identity(id, signal)
                     == crate::containment::treewalk::KillOutcome::NotAttempted
             }
+        }
+    }
+}
+
+/// Kill through an armed marker before it falls out of scope, exactly like `CgroupLeaf`/
+/// `JobHandle` — mirrored here so a `Marker` retained past its `Child` (e.g. handed out by
+/// `into_unreaped_parts` and then plain-dropped, as `Retained`'s field-wise drop does) still
+/// tears its tree down. `Child::drop` also calls `hard_kill` explicitly before its fields
+/// drop, in the ordinary `kill_on_drop(true)` path; this makes that call redundant but
+/// harmless there (a second sweep over an already-drained tree finds no holders), same as it
+/// already is for `Cgroup`/`JobObject`.
+impl Drop for Marker {
+    fn drop(&mut self) {
+        if !self.armed.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = self.hard_kill() {
+            log::warn!("fd marker {:#x}: hard_kill on drop did not fully tear down its tree: {e}", self.handle);
         }
     }
 }
