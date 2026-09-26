@@ -130,6 +130,44 @@ fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
     assert_eq!(out, "CCCAAABBB");
 }
 
+// A duplicate child fd is rejected in every build profile =====
+
+/// Two mappings that both target `child_fd: 5` must be rejected by `install` itself, as an
+/// ordinary `io::Error`, in a RELEASE build exactly as reliably as in a debug build. Both
+/// production callers build their mapping set from a `BTreeMap<Fd, _>`, whose keys are already
+/// unique, so this is unreachable from them — but `install` takes a plain `Vec<FdMapping>`, and
+/// nothing about that signature stops some OTHER caller (present or future) from handing it a
+/// duplicate. A check that only fires via `debug_assert!` protects debug builds and nothing else:
+/// in release, `Plan::apply`'s pass 2 would dup2 both mappings onto fd 5 in order, so the second
+/// mapping's source silently wins and the first is silently misrouted with no error and no crash
+/// — a strictly weaker disposition than an explicit `Err`.
+#[test]
+fn install_rejects_a_duplicate_child_fd_in_every_build_profile() {
+    let a = file_with("A");
+    let b = file_with("B");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg("true");
+    let err = install(
+        &mut cmd,
+        vec![
+            FdMapping {
+                parent_fd: a.into(),
+                child_fd: 5,
+            },
+            FdMapping {
+                parent_fd: b.into(),
+                child_fd: 5,
+            },
+        ],
+    )
+    .expect_err("a duplicate child fd must be rejected by install itself, in every build profile");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "expected InvalidInput (mirrors Command::fd's own negative-fd rejection), got {err:?}"
+    );
+}
+
 // preserved_fds equivalent =====
 
 #[cfg(target_os = "macos")]
@@ -165,7 +203,7 @@ fn without_install_preserved_the_fd_is_closed_at_exec() {
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "CLOSED");
 }
 
-// Very large child fds fail at spawn, not at install (I14) =====
+// Very large child fds fail at spawn, not at install =====
 
 /// `child_fd == i32::MAX` must be ACCEPTED by `install` in the parent — its per-mapping
 /// `F_DUPFD_CLOEXEC` search starts at 3 and never computes `i32::MAX + 1` at all — and fails only
@@ -196,13 +234,37 @@ fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
 /// An out-of-range but representable child fd (e.g. one far beyond any real process' open-file
 /// limit) is NOT a parent-side rejection — `install` accepts it, and the resulting spawn fails
 /// at `dup2` in the child instead, surfaced as an ordinary `Err` from `Command::spawn` rather
-/// than an abort. This is the process-level I14 regression test; `cosca::Command::fd`-level
-/// coverage lives in `tests/spawn_io.rs`.
+/// than an abort. This is the process-level regression test; `cosca::Command::fd`-level coverage
+/// lives in `tests/spawn_io.rs`.
+///
+/// Lowers the CHILD's own `RLIMIT_NOFILE` to 256 via a `pre_exec` hook registered BEFORE
+/// `install`'s (the same technique `a_distant_high_target_...` above already uses), so
+/// `1_000_000` is guaranteed out of range for THIS spawn regardless of the host's own ambient
+/// `ulimit -n`. Without it, this would depend on the runner: on Linux, a soft limit raised past
+/// `1_000_000` is entirely ordinary (see `tests/common::RestoreRlimitNofile`'s doc), so the same
+/// `dup2` this test expects to fail could instead succeed.
 #[test]
 fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
     let f = file_with("x");
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg("true").stdout(Stdio::piped());
+
+    // SAFETY: `pre_exec` runs post-fork, pre-exec, in the child only; `setrlimit` is a checked,
+    // non-allocating raw syscall. Registered BEFORE `install` below, since `install` documents
+    // that its own hook must be registered LAST.
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     install(
         &mut cmd,
         vec![FdMapping {
@@ -317,9 +379,24 @@ impl Drop for RestoreFd2 {
     fn drop(&mut self) {
         // SAFETY: dup2 back onto 2; `self.saved` stays valid (and is closed normally by its own
         // Drop) regardless of this call's outcome.
-        unsafe {
-            libc::dup2(self.saved.as_raw_fd(), 2);
-        }
+        //
+        // Retries EINTR the same way `fd_map::dup2_onto` does, so a signal landing mid-restore
+        // cannot leave fd 2 unrestored, and asserts the final result: a restore failure here would
+        // silently leave this test process' own fd 2 in the wrong state for every test that runs
+        // after it.
+        let ret = loop {
+            let ret = unsafe { libc::dup2(self.saved.as_raw_fd(), 2) };
+            if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break ret;
+            }
+        };
+        debug_assert_eq!(
+            ret,
+            2,
+            "dup2({}, 2) while restoring fd 2 failed: {}",
+            self.saved.as_raw_fd(),
+            std::io::Error::last_os_error()
+        );
     }
 }
 

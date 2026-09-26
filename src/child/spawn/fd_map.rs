@@ -1,7 +1,7 @@
 //! cosca-owned fd-mapping `pre_exec`: dup2's parent-process descriptors onto child descriptor
 //! numbers, replacing the `command-fds` dependency.
 //!
-//! # Why cosca owns this now (I14)
+//! # Why cosca owns this now
 //! `command-fds` 0.3.3 has two bugs that together made an out-of-range [`Fd`](crate::stdio::Fd)
 //! either abort the child or silently vanish rather than fail the spawn cleanly:
 //!  - its `map_fds` computes `max(every parent/child fd) + 1` as a temporary-fd floor with
@@ -15,10 +15,7 @@
 //!    nix-rust/nix#2797 (unfixed as of nix 0.31.3); not cosca's to fix.
 //!
 //! A negative `Fd` never reaches this module at all: [`Command::fd`](crate::Command::fd) rejects
-//! it directly, via its own `slot.raw() < 0` check. Before that check existed, a negative `Fd`
-//! would have silently vanished via the `fd.raw() >= 3` filter that `child::spawn::spawn_unelevated`
-//! uses to collect which configured slots become mappings in the first place — that filter, not
-//! anything in this module, is what used to make a negative `Fd` disappear.
+//! it directly, via its own `slot.raw() < 0` check.
 //!
 //! This module ports `command-fds`' actual algorithm (the collision-avoiding temporary-fd
 //! shuffle, and the `FD_CLOEXEC`-clearing `preserved_fds` the macOS fd marker uses, here
@@ -35,9 +32,10 @@
 //!    would otherwise be silently clobbered before this module's own `pre_exec` ever ran;
 //!  - makes every post-fork syscall through raw `libc` calls whose return value is checked and
 //!    turned into an `io::Error` on failure — except the one `close` of a temporary this module
-//!    exclusively owns (see [`dup_avoiding`]), where a failure would be a logic bug, not a
-//!    recoverable condition, so it is `debug_assert!`ed instead — never through nix's
-//!    `dup2_raw`;
+//!    exclusively owns (see [`dup_avoiding`]), whose result is intentionally ignored: on Linux a
+//!    same-process `close` can legitimately report `EIO`/`EINTR` well after the descriptor is
+//!    released (e.g. a flush error on an NFS/FUSE-backed mapping source), so treating that as
+//!    fatal would abort an otherwise-fine spawn — never through nix's `dup2_raw`;
 //!  - retries a syscall interrupted by `EINTR`, with no arbitrary bound (mirrors the
 //!    codebase's other `pre_exec`/raw-syscall retry sites — see e.g.
 //!    `containment::cgroup::channel`).
@@ -56,9 +54,6 @@
 //! dup2 or exec failure after that point (including the out-of-range case above) writes std's
 //! errno bytes into the caller's mapped fd instead of reaching the parent, and `spawn()` wrongly
 //! returns `Ok`. Not fixed here: filed as #192, to land with a cosca-owned error channel.
-//!
-//! Only a negative `Fd` is pre-empted, upstream, in [`Command::fd`](crate::Command::fd);
-//! everything else here is the kernel's call.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -81,16 +76,27 @@ pub(crate) struct FdMapping {
 ///
 /// Every `child_fd` must already be non-negative — enforced once, upstream, at
 /// [`Command::fd`](crate::Command::fd); only asserted here, not re-checked (it is a contract,
-/// not user input at this point). An out-of-range `child_fd` is NOT rejected here — see the
-/// module docs for why that is a normal (child-side, `EBADF`) spawn failure rather than a
-/// parent-side refusal.
+/// not user input at this point). A duplicate `child_fd` IS re-checked here, in every build
+/// profile, and rejected with an ordinary `Err`: both production callers build `mappings` from a
+/// `BTreeMap<Fd, _>`, whose keys are already unique, but nothing about this function's own
+/// `Vec<FdMapping>` signature enforces that for every caller. An out-of-range `child_fd` is NOT
+/// rejected here — see the module docs for why that is a normal (child-side, `EBADF`) spawn
+/// failure rather than a parent-side refusal.
 ///
 /// Before building the plan, relocates (in the parent, before any fork) any mapping whose
 /// `parent_fd` sits below fd 3, via `F_DUPFD_CLOEXEC(fd, 3)` — see the module docs for why a
 /// low-numbered source would otherwise be clobbered by std's own stdio setup. That relocation is
 /// the only parent-side failure mode left: an ordinary `Err` (e.g. `EMFILE`) if the duplicate
-/// itself cannot be made. The vacated original number is deliberately NOT freed at this point —
-/// it stays open, owned by the returned `Plan`, until `std_cmd` itself drops (see `Plan::_retired`).
+/// itself cannot be made.
+///
+/// The vacated original number is deliberately NOT freed at this point: it stays open, owned by
+/// the returned `Plan` (see `Plan::_retired`), until `std_cmd` itself drops. Freeing it any
+/// earlier would let `std_cmd.spawn()`'s own internal fd allocation — most importantly its
+/// child-to-parent CLOEXEC error-reporting pipe, which `spawn()` opens at the lowest free number —
+/// claim that exact number in the parent. Std's OWN child-side stdio dup2 runs before any
+/// `pre_exec` hook (including this module's own), so if that pipe's write end landed on a freed
+/// 0/1/2 slot, std's own dup2 would close it before this module's `pre_exec` ever got a chance to
+/// run, and a post-fork failure would then have nowhere left to report to.
 pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdMapping>) -> io::Result<()> {
     if mappings.is_empty() {
         return Ok(());
@@ -102,17 +108,23 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, mut mappings: Vec<FdM
             m.child_fd
         );
     }
-    debug_assert!(
-        {
-            let mut child_fds: Vec<RawFd> = mappings.iter().map(|m| m.child_fd).collect();
-            let before = child_fds.len();
-            child_fds.sort_unstable();
-            child_fds.dedup();
-            child_fds.len() == before
-        },
-        "duplicate child fd in a mapping set: child fd numbers must be unique \
-         (callers build this from a BTreeMap<Fd, _>, whose keys already are)"
-    );
+    // Both production callers build `mappings` from a `BTreeMap<Fd, _>`, whose keys are already
+    // unique, so this is unreachable from them today — but `install` itself takes a plain
+    // `Vec<FdMapping>`, and nothing about that signature stops some OTHER caller from handing it
+    // a duplicate. Checked in every build profile, not just debug: a release build that hit this
+    // would otherwise have `Plan::apply`'s pass 2 dup2 both mappings onto the same child fd in
+    // order, silently letting the second mapping's source win and misrouting the first — no
+    // error, no crash.
+    {
+        let mut child_fds: Vec<RawFd> = mappings.iter().map(|m| m.child_fd).collect();
+        child_fds.sort_unstable();
+        if let Some(dup) = child_fds.windows(2).find(|w| w[0] == w[1]).map(|w| w[0]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate child fd {dup} in a mapping set: child fd numbers must be unique"),
+            ));
+        }
+    }
 
     // Relocate any source at fd 0/1/2 before the fork — see the doc comment above for why the
     // original stays open in `retired`.
@@ -167,7 +179,8 @@ struct Plan {
     /// Original low-numbered (`< 3`) `parent_fd`s that `install` relocated before this `Plan` was
     /// built, kept open here purely so their numbers stay busy in the parent — not read by
     /// `apply`, dropped (closing them) only when this `Plan`, and so this whole `pre_exec`
-    /// closure, drops. See `install`'s own comment for why closing them any earlier is unsafe.
+    /// closure, drops. See `install`'s own doc comment for why closing them any earlier is
+    /// unsafe.
     _retired: Vec<OwnedFd>,
 }
 
@@ -185,9 +198,9 @@ impl Plan {
     }
 
     /// Async-signal-safe: no allocation, every syscall's return value is checked (module docs:
-    /// except `dup_avoiding`'s own temporary-fd `close`, which is asserted, not propagated),
-    /// `EINTR` is retried with no arbitrary bound (matches the codebase's other
-    /// `pre_exec`/raw-syscall retry sites).
+    /// except `dup_avoiding`'s own temporary-fd `close`, whose result is intentionally ignored —
+    /// see `dup_avoiding`'s own comment for why), `EINTR` is retried with no arbitrary bound
+    /// (matches the codebase's other `pre_exec`/raw-syscall retry sites).
     fn apply(&mut self) -> io::Result<()> {
         if self.mappings.is_empty() {
             return Ok(());
@@ -259,17 +272,20 @@ fn dup_avoiding(fd: RawFd, forbidden: &[RawFd]) -> io::Result<RawFd> {
         // SAFETY: `tmp` was just returned by a successful F_DUPFD_CLOEXEC — a fresh,
         // uniquely-owned descriptor nothing else references yet; closing it just frees its
         // number back up for whichever mapping actually wants it.
-        let close_ret = unsafe { libc::close(tmp) };
-        // A failure here (only possible as `EBADF`, since `tmp` is ours alone and no other
-        // syscall can race to close it first) would be a logic bug in this function, not a
-        // recoverable spawn-time condition — there is no cleanup left to do with a `close` that
-        // failed on a descriptor we exclusively own, so this asserts rather than returns `Err`.
-        debug_assert_eq!(
-            close_ret,
-            0,
-            "close({tmp}) on a fresh, uniquely-owned F_DUPFD_CLOEXEC duplicate failed: {}",
-            io::Error::last_os_error()
-        );
+        //
+        // The result is intentionally ignored — the same way `OwnedFd`'s own `Drop` ignores
+        // `close`'s result. On Linux, `close` runs the file's `f_op->flush` on EVERY close, not
+        // just the last reference, so closing a dup of an NFS file with a pending writeback error
+        // (`EIO`), or of a FUSE-backed file whose daemon returned an error to `FUSE_FLUSH`
+        // (likewise `EIO`), can return -1 even though the fd table slot is released regardless.
+        // `close` can also report `EINTR` for the same reason (the kernel maps a restarted signal
+        // to `EINTR` after the slot is already cleared). A mapping's `parent_fd` is any
+        // caller-supplied `Stdio::from_file`, so it can live on either. Treating that as fatal —
+        // worse, as a `debug_assert!`ed logic bug — would panic this post-fork child on a `close`
+        // that did exactly what it was asked; std aborts a panicking child silently, so
+        // `spawn()` would then wrongly return `Ok` for a child that never reached `exec`, which is
+        // exactly the failure class this module exists to close off.
+        let _ = unsafe { libc::close(tmp) };
         min = tmp
             .checked_add(1)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;

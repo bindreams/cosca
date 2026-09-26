@@ -489,9 +489,24 @@ impl Drop for RestoreStdio {
         for (fd, dup) in &self.saved {
             // SAFETY: dup2 back onto `fd`; `dup` stays valid (closed normally by its own Drop,
             // right after) regardless of this call's outcome.
-            unsafe {
-                libc::dup2(dup.as_raw_fd(), *fd);
-            }
+            //
+            // Retries EINTR the same way `fd_map::dup2_onto` does, so a signal landing mid-restore
+            // cannot leave `fd` unrestored, and asserts the final result: a restore failure here
+            // would silently leave this test process' own fd in the wrong state for every test
+            // that runs after it, defeating this guard's whole purpose.
+            let ret = loop {
+                let ret = unsafe { libc::dup2(dup.as_raw_fd(), *fd) };
+                if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break ret;
+                }
+            };
+            debug_assert_eq!(
+                ret,
+                *fd,
+                "dup2({}, {fd}) while restoring a guarded fd failed: {}",
+                dup.as_raw_fd(),
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -544,11 +559,21 @@ impl RestoreRlimitNofile {
 #[cfg(unix)]
 impl Drop for RestoreRlimitNofile {
     fn drop(&mut self) {
-        // SAFETY: restores exactly the limit `getrlimit` reported before this guard lowered it —
-        // raising a soft limit back up to (at most) its own untouched hard limit always succeeds
-        // for an unprivileged process.
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &self.original);
-        }
+        // SAFETY: restores exactly the limit `getrlimit` reported before this guard lowered it.
+        let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.original) };
+        // Raising a soft limit back up to (at most) its own untouched hard limit always succeeds
+        // for an unprivileged process — asserted, not just documented in prose, matching
+        // `lower_to`'s own checked `getrlimit`/`setrlimit` calls: if that guarantee is ever wrong
+        // (a hardened sandbox, a future refactor that also lowers `rlim_max`), this fails loudly
+        // here instead of silently leaving a lowered limit in place for every fd-hungry test that
+        // runs in this process afterward.
+        debug_assert_eq!(
+            ret,
+            0,
+            "setrlimit(RLIMIT_NOFILE, restore to {{cur: {}, max: {}}}) failed: {}",
+            self.original.rlim_cur,
+            self.original.rlim_max,
+            std::io::Error::last_os_error()
+        );
     }
 }
