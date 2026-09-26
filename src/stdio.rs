@@ -20,18 +20,21 @@ impl Fd {
         self.0
     }
 
-    /// Rebuild an `Fd` from a raw descriptor number, without the non-negativity
-    /// debug-assert of `From<i32>`. Used by the Windows raw spawn backend to walk
-    /// a dense `0..=maxfd` fd-table; unused (hence `dead_code`-allowed) on Unix.
+    /// Rebuild an `Fd` from a raw descriptor number. Used by the Windows raw spawn backend to
+    /// walk a dense `0..=maxfd` fd-table; unused (hence `dead_code`-allowed) on Unix.
     #[allow(dead_code)]
     pub(crate) fn from_raw(n: i32) -> Fd {
         Fd(n)
     }
 }
 
+/// Infallible: `Fd` itself carries no validity requirement (a negative value round-trips fine
+/// through [`raw`](Fd::raw)). The one call site that must never hand a real spawn a negative
+/// descriptor is [`Command::fd`](crate::Command::fd), which checks explicitly and returns
+/// `Err` — not a `debug_assert!` here, which would panic in debug builds and do nothing at all
+/// in release.
 impl From<i32> for Fd {
     fn from(n: i32) -> Fd {
-        debug_assert!(n >= 0, "a file descriptor must be non-negative, got {n}");
         Fd(n)
     }
 }

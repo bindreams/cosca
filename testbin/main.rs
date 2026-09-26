@@ -1252,7 +1252,7 @@ fn main() {
         "fd3-echo" => {
             // Read all bytes from fd 3 and echo them to stdout. Used by the
             // arbitrary-fd tests to prove the child received its fd 3 mapping.
-            // Safety: fd 3 is passed in by the test (via command-fds); this is
+            // Safety: fd 3 is passed in by the test (via fd_map); this is
             // the only caller and it always provides a valid, open fd 3.
             use std::os::fd::FromRawFd;
             let mut f = unsafe { std::fs::File::from_raw_fd(3) };
@@ -1261,9 +1261,9 @@ fn main() {
         #[cfg(unix)]
         "fd3-write" => {
             // Write the token bytes to fd 3 and flush. Used by the cgroup-clobber
-            // test: if command-fds' dup2 ran before the cgroup self-placement, a
+            // test: if fd_map's dup2 ran before the cgroup self-placement, a
             // stray "0" would corrupt this fd's stream; an exact match proves no
-            // clobber. Safety: fd 3 is passed in by the test (via command-fds);
+            // clobber. Safety: fd 3 is passed in by the test (via fd_map);
             // this is the only caller and it always provides a valid, open fd 3.
             use std::os::fd::FromRawFd;
             let token = &args[2];

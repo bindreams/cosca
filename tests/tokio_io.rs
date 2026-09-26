@@ -441,7 +441,7 @@ fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce
 // `src/tokio/child/reaper_tests.rs`: once `Drop` returns before the reap, only the
 // `#[cfg(test)]` probe offers an edge to sequence the no-zombie check after.
 
-// Arbitrary fd (n>=3) — Unix only, wired via command-fds (async mirror of spawn_io.rs) =====
+// Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 
 /// Async twin of sync `unix_fd3_pipe_round_trips`: the testbin's `fd3-echo` mode reads fd 3
 /// and copies it to stdout. Write a known payload into the parent write end, close it (EOF),
@@ -509,6 +509,142 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
     fd3_reader.read_to_end(&mut buf).await.expect("read fd 3");
     let _ = child.wait().await;
     assert_eq!(buf, b"fd3-token");
+}
+
+/// Async twin of sync `unix_fd_out_of_range_fails_spawn_cleanly_not_abort`: an out-of-range but
+/// syscall-representable child fd (far beyond any real process' open-file limit) must fail the
+/// SPAWN with an ordinary `Err` — never `Ok` followed by the child dying of SIGABRT.
+///
+/// Deliberately NOT `i32::MAX` (that's `async_unix_fd_i32_max_fails_spawn_cleanly_not_abort`,
+/// the pathological edge that used to overflow `command-fds`' own arithmetic): this test's own
+/// `child_fd`, 100_000, only fails because `RestoreRlimitNofile` deterministically lowers this
+/// process' `RLIMIT_NOFILE` first — see the sync twin's doc for why a fixed large value alone is
+/// runner-dependent on Linux.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
+    let _rlimit_guard = common::RestoreRlimitNofile::lower_to(256);
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(100_000, cosca::Stdio::null())
+        .expect("fd() itself accepts an out-of-range but representable number");
+    let err = cmd
+        .spawn()
+        .expect_err("dup2 onto an unachievable fd number must fail the spawn with Err, not abort");
+    let cosca::error::Error::Io(io_err) = err else {
+        panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
+    };
+    assert_eq!(
+        io_err.raw_os_error(),
+        Some(libc::EBADF),
+        "dup2 onto an out-of-range target must fail with EBADF specifically, got {io_err:?}"
+    );
+}
+
+/// Async twin of sync `unix_fd_i32_max_fails_spawn_cleanly_not_abort`: `fd(i32::MAX, ...)` must
+/// fail — never abort the child — with an ordinary `Err` from `spawn()`. `Command::fd()` itself
+/// accepts `i32::MAX`; the failure happens post-fork, at `dup2`, exactly like any other
+/// out-of-range child fd (`EBADF`).
+#[cfg(unix)]
+#[tokio::test]
+async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "exit", "0"])
+        .fd(i32::MAX, cosca::Stdio::null())
+        .expect("fd() itself accepts i32::MAX — install() does too");
+    let err = cmd
+        .spawn()
+        .expect_err("dup2 onto i32::MAX must fail the spawn with Err, not abort");
+    let cosca::error::Error::Io(io_err) = err else {
+        panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
+    };
+    assert_eq!(
+        io_err.raw_os_error(),
+        Some(libc::EBADF),
+        "dup2 onto i32::MAX must fail with EBADF specifically, got {io_err:?}"
+    );
+}
+
+/// Async twin of sync `a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed`: with
+/// this process' own fd 2 closed and freed, a plain `fd(3, null)` mapping must not end up
+/// readable as the child's stderr just because `install()`'s own bookkeeping happens to source
+/// or park something at that exact number. `sh -c 'echo LEAK >&3'` writes to the child's fd 3;
+/// the parent's stderr pipe must receive nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
+    use tokio::io::AsyncReadExt;
+
+    let _restore = common::RestoreStdio::close(&[2]);
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
+    cmd.stderr(cosca::Stdio::pipe()).expect("stderr pipe");
+    cmd.fd(3, cosca::Stdio::null()).expect("fd 3 null");
+    let mut child = cmd.spawn().expect("spawn");
+    let mut stderr = child.stderr().expect("stderr reader");
+    let mut buf = Vec::new();
+    stderr.read_to_end(&mut buf).await.expect("read stderr");
+    let _ = child.wait().await;
+
+    assert!(
+        buf.is_empty(),
+        "the stderr pipe must not receive fd 3's bytes ('LEAK'), got {buf:?}"
+    );
+}
+
+/// Async twin of sync `relocating_a_low_parent_fd_keeps_spawn_errors_reported`: with this
+/// process' own fd 1 and fd 2 closed, `.stdout(Stdio::from_file(...))` and
+/// `.stderr(Stdio::from_file(...))`'s `try_clone`s land their dup'd targets at 3 or above (the
+/// from_file source files are already open at some higher number before `spawn()` even starts
+/// resolving anything). What lands at fd 1 and fd 2 instead are the `fd(5, null)` and `fd(6,
+/// null)` mappings' own null sources — the lowest numbers free at the point each is opened —
+/// followed by an always-invalid `fd(i32::MAX, null)` mapping (`i32::MAX` exceeds Linux's
+/// `nr_open` ceiling, so it fails `dup2` regardless of the runner's own `ulimit -n`; the exact
+/// numeric value isn't otherwise significant here — only that it reliably fails). Relocating a
+/// low mapping source out of `install()` must not free that exact number back to the OS before
+/// `std_cmd.spawn()`'s own internal fd allocation (its child-to-parent error-reporting pipe) is
+/// done with it — see `fd_map::install`'s module docs. The spawn must fail cleanly (`Err`), and
+/// the stderr file must receive nothing (no leaked exec-error-pipe bytes).
+#[cfg(unix)]
+#[tokio::test]
+async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let out_f = tempfile::tempfile().expect("tempfile for stdout target");
+    let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
+
+    let _restore = common::RestoreStdio::close(&[1, 2]);
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "true"]);
+    cmd.stdout(cosca::Stdio::from_file(out_f.try_clone().expect("clone stdout target")))
+        .expect("stdout from_file");
+    cmd.stderr(cosca::Stdio::from_file(err_f.try_clone().expect("clone stderr target")))
+        .expect("stderr from_file");
+    cmd.fd(5, cosca::Stdio::null()).expect("fd 5 null");
+    cmd.fd(6, cosca::Stdio::null()).expect("fd 6 null");
+    cmd.fd(i32::MAX, cosca::Stdio::null()).expect("fd i32::MAX null");
+
+    let err = cmd
+        .spawn()
+        .expect_err("a relocated low parent fd must fail the spawn cleanly, not corrupt it into Ok");
+
+    let mut buf = Vec::new();
+    err_f.seek(SeekFrom::Start(0)).expect("seek stderr target");
+    err_f.read_to_end(&mut buf).expect("read stderr target");
+
+    assert!(
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error, got {err:?}"
+    );
+    assert!(
+        buf.is_empty(),
+        "the stderr target file must receive nothing — no leaked exec-error-pipe bytes, got {buf:?}"
+    );
 }
 
 /// A wrong-direction accessor must NOT consume the stashed end (the put-back arm): after
@@ -725,7 +861,7 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
 }
 
 /// fd >= 3 as a merge SOURCE into a piped Out target: the pre-pass routes the dup'd write
-/// end through command-fds (never silently dropped). testbin's `fd3-write` emits its token
+/// end through fd_map (never silently dropped). testbin's `fd3-write` emits its token
 /// on fd 3 — a dup of stdout's owned pipe — so the token arrives on the stdout reader.
 #[cfg(unix)]
 #[tokio::test]

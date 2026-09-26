@@ -49,7 +49,7 @@ pub(crate) struct OsResources {
     pub(crate) proc: Option<ProcSource>,
     pub(crate) attached: Attached,
     /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
-    /// [`fd_write_end`](Child::fd_write_end). Unix: `command-fds`-wired reactor pipes; Windows: the
+    /// [`fd_write_end`](Child::fd_write_end). Unix: `fd_map`-wired reactor pipes; Windows: the
     /// raw backend's overlapped async ends (empty on the std path, which routes fd >= 3 to the raw
     /// backend).
     pub(crate) pipes: FdPipes,

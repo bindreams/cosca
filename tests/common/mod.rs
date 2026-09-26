@@ -449,3 +449,131 @@ pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
         .unwrap_or_else(|e| panic!("{who} must echo the byte back while alive: {e}"));
     assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
 }
+
+/// Duplicate each of `fds` aside and close it, restoring all of them (on drop, even if the test
+/// panics) so the CURRENT process's own low-numbered descriptors are free for a test to reuse —
+/// then land back where they started. Some fd_map regression tests need this THIS process's own
+/// fd 1 and/or fd 2 closed to reproduce a bug that only manifests when a mapping's parent-side
+/// source, or a `Stdio::from_file` target, gets allocated one of those exact numbers.
+///
+/// Safe only because this workspace's test runner (`cargo nextest`) puts every test function in
+/// its own OS process — a plain `cargo test` run shares one process across parallel test
+/// threads, so this would race with (and could disable output from) unrelated tests.
+#[cfg(unix)]
+pub struct RestoreStdio {
+    saved: Vec<(libc::c_int, std::os::fd::OwnedFd)>,
+}
+
+#[cfg(unix)]
+impl RestoreStdio {
+    pub fn close(fds: &[libc::c_int]) -> RestoreStdio {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut saved = Vec::with_capacity(fds.len());
+        for &fd in fds {
+            // SAFETY: F_DUPFD_CLOEXEC(fd, 3) duplicates fd to a fresh number >= 3, checked below.
+            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(dup >= 0, "dup fd {fd} aside before closing it");
+            // SAFETY: `dup` was just returned by a successful F_DUPFD_CLOEXEC.
+            let dup = unsafe { OwnedFd::from_raw_fd(dup) };
+            assert_eq!(unsafe { libc::close(fd) }, 0, "close the test process' fd {fd}");
+            saved.push((fd, dup));
+        }
+        RestoreStdio { saved }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreStdio {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        for (fd, dup) in &self.saved {
+            // SAFETY: dup2 back onto `fd`; `dup` stays valid (closed normally by its own Drop,
+            // right after) regardless of this call's outcome.
+            //
+            // Retries EINTR the same way `fd_map::dup2_onto` does, so a signal landing mid-restore
+            // cannot leave `fd` unrestored, and asserts the final result: a restore failure here
+            // would silently leave this test process' own fd in the wrong state for every test
+            // that runs after it, defeating this guard's whole purpose.
+            let ret = loop {
+                let ret = unsafe { libc::dup2(dup.as_raw_fd(), *fd) };
+                if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break ret;
+                }
+            };
+            debug_assert_eq!(
+                ret,
+                *fd,
+                "dup2({}, {fd}) while restoring a guarded fd failed: {}",
+                dup.as_raw_fd(),
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Lower this process' own `RLIMIT_NOFILE` soft limit to `to`, for the life of the guard,
+/// restoring the original soft limit on drop (even if the test panics).
+///
+/// A forked child inherits its parent's rlimits at fork time, before any `pre_exec` hook runs —
+/// so lowering the limit HERE, in the process that calls `spawn()`, is what makes an ordinary,
+/// valid-looking child fd number deterministically exceed the CHILD's own limit and fail its
+/// `dup2` with `EBADF`, regardless of whatever the host's real `ulimit -n` happens to be (on
+/// Linux, a soft limit raised past `1_000_000` is entirely ordinary, so a test that assumes a
+/// large but fixed child fd is always out of range is otherwise runner-dependent).
+///
+/// Safe only because this workspace's test runner (`cargo nextest`) puts every test function in
+/// its own OS process — see `RestoreStdio`'s doc for why a plain `cargo test` run would not be.
+#[cfg(unix)]
+pub struct RestoreRlimitNofile {
+    original: libc::rlimit,
+}
+
+#[cfg(unix)]
+impl RestoreRlimitNofile {
+    pub fn lower_to(to: libc::rlim_t) -> RestoreRlimitNofile {
+        let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: `original` is a valid, correctly-sized out-param.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0,
+            "getrlimit(RLIMIT_NOFILE): {}",
+            std::io::Error::last_os_error()
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: to,
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: `lowered` only ever lowers `rlim_cur`; `rlim_max` is passed through unchanged,
+        // so this cannot raise the process' hard ceiling.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) },
+            0,
+            "setrlimit(RLIMIT_NOFILE, {{cur: {to}, max: {}}}): {}",
+            original.rlim_max,
+            std::io::Error::last_os_error()
+        );
+        RestoreRlimitNofile { original }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreRlimitNofile {
+    fn drop(&mut self) {
+        // SAFETY: restores exactly the limit `getrlimit` reported before this guard lowered it.
+        let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.original) };
+        // Raising a soft limit back up to (at most) its own untouched hard limit always succeeds
+        // for an unprivileged process — asserted, not just documented in prose, matching
+        // `lower_to`'s own checked `getrlimit`/`setrlimit` calls: if that guarantee is ever wrong
+        // (a hardened sandbox, a future refactor that also lowers `rlim_max`), this fails loudly
+        // here instead of silently leaving a lowered limit in place for every fd-hungry test that
+        // runs in this process afterward.
+        debug_assert_eq!(
+            ret,
+            0,
+            "setrlimit(RLIMIT_NOFILE, restore to {{cur: {}, max: {}}}) failed: {}",
+            self.original.rlim_cur,
+            self.original.rlim_max,
+            std::io::Error::last_os_error()
+        );
+    }
+}

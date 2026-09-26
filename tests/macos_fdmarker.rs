@@ -237,7 +237,7 @@ async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_sp
 /// production wiring (`child_ends.keys()` in `src/child/spawn.rs`, feeding `prepare`'s
 /// `reserved` argument) — not `super::install()` called directly with a hand-typed reserved
 /// slice (`fdmarker_tests.rs`'s `install_places_the_marker_above_every_reserved_child_fd`,
-/// which never spawns) nor a hand-built `command_fds::FdMapping` bypassing `cosca::Command`
+/// which never spawns) nor a hand-built `fd_map::FdMapping` bypassing `cosca::Command`
 /// entirely (`a_child_with_a_colliding_fd_mapping_still_holds_the_marker`). Neither of those
 /// exercises the collection logic this test targets, so a future bug there (an fd mapping
 /// added after `prepare()` is called, or a merge-slot fd omitted from the `reserved` vec) would

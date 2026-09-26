@@ -200,20 +200,20 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let reserved: Vec<i32> = Vec::new();
 
     // Phase 1 (before spawn): root detection + pre-spawn containment setup. This
-    // MUST run before the command-fds block below so that command-fds installs
+    // MUST run before the fd_map block below so that fd_map installs
     // the LAST pre_exec hook. Why ordering matters: pre_exec hooks run in
     // registration order in the forked child. The Linux cgroup self-placement
     // hook (registered inside `prepare`) writes "0" to a pre-opened cgroup.procs
     // fd (CLOEXEC, which is still open between fork and exec). If
-    // command-fds' dup2 ran FIRST, it could dup2 the user's fd over the number
+    // fd_map's dup2 ran FIRST, it could dup2 the user's fd over the number
     // that cgroup.procs fd occupies — closing/replacing it — so the later cgroup
     // write would hit a closed/wrong fd (silent CgroupV2->ProcessGroup downgrade,
-    // or a stray "0" corrupting the user's fd). By running command-fds LAST, the
-    // cgroup write+close happens while its fd is still valid; command-fds may then
+    // or a stray "0" corrupting the user's fd). By running fd_map LAST, the
+    // cgroup write+close happens while its fd is still valid; fd_map may then
     // freely reuse the now-closed slot. The same holds for the channel the child
     // reports that write's outcome through (`cgroup::ReportChannel`). Net child order: std stdio
     // (0/1/2) -> the `raw_executable()` chdir (`build_std_command`'s `enter_in_child`) ->
-    // containment pre_execs (cgroup placement / setsid) -> command-fds dup2 (last).
+    // containment pre_execs (cgroup placement / setsid) -> fd_map dup2 (last).
     //
     // On macOS, `prepare` also clears FD_CLOEXEC on the marker write end for the forked
     // child only (the supervisor's own copy stays CLOEXEC — see `fdmarker::install`'s doc
@@ -237,26 +237,21 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.env_ops(),
         )?;
 
-        // On Unix, hand n>=3 child ends to command-fds. This installs a pre_exec hook
+        // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
         // that dup2's each OwnedFd to its target number post-fork. It is registered
         // LAST (after `prepare` above) so its dup2 cannot clobber the cgroup
         // self-placement fd; std also dup2's 0/1/2 before any pre_exec runs (std
         // disables posix_spawn when hooks are registered), so our n>=3 mappings never
-        // clobber the std stdio fds either. FdMappingCollision is unreachable:
+        // clobber the std stdio fds either. A duplicate child fd number is unreachable:
         // child_ends keys come from a BTreeMap, so each child fd number is unique.
-        use command_fds::{CommandFdExt, FdMapping};
-        let mappings: Vec<FdMapping> = child_ends
+        let mappings: Vec<fd_map::FdMapping> = child_ends
             .into_iter()
-            .map(|(fd, owned)| FdMapping {
+            .map(|(fd, owned)| fd_map::FdMapping {
                 parent_fd: owned,
                 child_fd: fd.raw(),
             })
             .collect();
-        if !mappings.is_empty() {
-            std_cmd
-                .fd_mappings(mappings)
-                .expect("child fd numbers are unique (BTreeMap keys)");
-        }
+        fd_map::install(&mut std_cmd, mappings).map_err(Error::Io)?;
 
         let c = std_cmd.spawn().map_err(Error::Io)?;
         drop(std_cmd);
@@ -273,24 +268,18 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.env_ops(),
         )?;
 
-        // On Unix, hand n>=3 child ends to command-fds. See the macOS branch above for why
+        // On Unix, hand n>=3 child ends to fd_map. See the macOS branch above for why
         // this is registered LAST (after `prepare`).
         #[cfg(unix)]
         {
-            use command_fds::{CommandFdExt, FdMapping};
-
-            let mappings: Vec<FdMapping> = child_ends
+            let mappings: Vec<fd_map::FdMapping> = child_ends
                 .into_iter()
-                .map(|(fd, owned)| FdMapping {
+                .map(|(fd, owned)| fd_map::FdMapping {
                     parent_fd: owned,
                     child_fd: fd.raw(),
                 })
                 .collect();
-            if !mappings.is_empty() {
-                std_cmd
-                    .fd_mappings(mappings)
-                    .expect("child fd numbers are unique (BTreeMap keys)");
-            }
+            fd_map::install(&mut std_cmd, mappings).map_err(Error::Io)?;
         }
 
         // The std Child is owned here so containment can job-assign + resume it. Serialize the
@@ -612,7 +601,7 @@ pub(crate) enum PipeOwnership {
 }
 
 /// Shared stdio-resolution core for both spawn paths. `slots` is the resolution order (0/1/2
-/// always; the sync path adds Unix n>=3); the per-caller tails (fd>=3 policy, command-fds wiring,
+/// always; the sync path adds Unix n>=3); the per-caller tails (fd>=3 policy, fd_map wiring,
 /// final `Stdio` assignment) stay with each spawn.
 pub(crate) fn resolve_stdio(
     fds: &BTreeMap<Fd, ResolvedStdio>,
@@ -1141,6 +1130,11 @@ pub(crate) mod fault {
 #[path = "spawn/batch_gate.rs"]
 mod batch_gate;
 pub(crate) use batch_gate::reject_batch_path;
+
+// cosca-owned fd-mapping pre_exec (replaces `command-fds` — see the module docs).
+#[cfg(unix)]
+#[path = "spawn/fd_map.rs"]
+pub(crate) mod fd_map;
 
 // Windows raw `CreateProcessW` spawn backend.
 #[cfg(windows)]

@@ -171,7 +171,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir)?;
             // Merging slots: each gets a dup of the child end. A merging slot with
             // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
-            // assignable as std stdio: it joins the fd >= 3 child-ends collection the command-fds
+            // assignable as std stdio: it joins the fd >= 3 child-ends collection the fd_map
             // block consumes, dup2'd into the child like any other fd >= 3 end — sync parity,
             // never silently dropped.
             let mergers: Vec<Fd> = fds
@@ -201,7 +201,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // Resolve our-owned child ends via the shared core. Piped STD slots are tokio-owned
     // (`Deferred`): they get no child end here and are assigned `Stdio::piped()` below.
     // Slots the merge pre-pass assigned are excluded — resolving them would fabricate
-    // inherit ends that could leak into the command-fds mappings.
+    // inherit ends that could leak into the fd_map mappings.
     let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
     let resolve_std_slots = std_slots.iter().copied().filter(|s| !preassigned.contains_key(s));
     #[cfg(unix)]
@@ -256,7 +256,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let reserved: Vec<i32> = Vec::new();
 
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, registered before
-    // command-fds' dup2 pre_exec so the latter runs LAST in the child (see the ordering
+    // fd_map's dup2 pre_exec so the latter runs LAST in the child (see the ordering
     // rationale in child/spawn.rs). On macOS the spawn lock is widened to enclose `prepare`
     // through `drop(tcmd)` — see child/spawn.rs's matching comment for the race this closes
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
@@ -280,19 +280,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
         }
 
-        use command_fds::{CommandFdExt, FdMapping};
-        let mappings: Vec<FdMapping> = child_ends
+        use crate::child::spawn::fd_map;
+        let mappings: Vec<fd_map::FdMapping> = child_ends
             .into_iter()
-            .map(|(fd, owned)| FdMapping {
+            .map(|(fd, owned)| fd_map::FdMapping {
                 parent_fd: owned,
                 child_fd: fd.raw(),
             })
             .collect();
-        if !mappings.is_empty() {
-            tcmd.as_std_mut()
-                .fd_mappings(mappings)
-                .expect("child fd numbers are unique (BTreeMap keys)");
-        }
+        fd_map::install(tcmd.as_std_mut(), mappings).map_err(Error::Io)?;
 
         let c = match tcmd.spawn().map_err(Error::Io) {
             Ok(c) => c,
@@ -323,24 +319,20 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
         }
 
-        // On Unix, hand n>=3 child ends to command-fds — registered AFTER `prepare` so its dup2
+        // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
         #[cfg(unix)]
         {
-            use command_fds::{CommandFdExt, FdMapping};
+            use crate::child::spawn::fd_map;
 
-            let mappings: Vec<FdMapping> = child_ends
+            let mappings: Vec<fd_map::FdMapping> = child_ends
                 .into_iter()
-                .map(|(fd, owned)| FdMapping {
+                .map(|(fd, owned)| fd_map::FdMapping {
                     parent_fd: owned,
                     child_fd: fd.raw(),
                 })
                 .collect();
-            if !mappings.is_empty() {
-                tcmd.as_std_mut()
-                    .fd_mappings(mappings)
-                    .expect("child fd numbers are unique (BTreeMap keys)");
-            }
+            fd_map::install(tcmd.as_std_mut(), mappings).map_err(Error::Io)?;
         }
 
         // Serialize the spawn against the raw backend's inheritable-handle window via the shared
@@ -416,7 +408,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         }
     };
 
-    // fd >= 3 parent ends: Unix's `command-fds`-wired reactor pipes; on Windows the std path
+    // fd >= 3 parent ends: Unix's `fd_map`-wired reactor pipes; on Windows the std path
     // resolves none (fd >= 3 routes to the raw backend), so `parent_ends` is provably empty and the
     // Windows `FdPipes` (overlapped async ends) is empty.
     #[cfg(unix)]

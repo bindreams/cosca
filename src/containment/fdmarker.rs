@@ -475,7 +475,7 @@ pub(crate) fn marker_wanted(mode: Option<ContainMode>, is_root: bool, suppressed
 }
 
 /// A descriptor number clear of everything that could overwrite the marker inside the forked
-/// child: `command-fds` `dup2`s each user mapping onto its `child_fd`, std `dup2`s the stdio
+/// child: `fd_map` `dup2`s each user mapping onto its `child_fd`, std `dup2`s the stdio
 /// slots before any `pre_exec` hook runs, AND ordinary, non-adversarial shell scripts and
 /// libraries conventionally claim LOW numbers for their own redirections (`exec 3>&1`,
 /// `exec 4<file`, a library's own `dup2` bookkeeping) — `dup2` silently closes whatever
@@ -516,8 +516,8 @@ pub(crate) struct PreparedMarker {
     /// letting `Marker` re-assert "this really is still my pipe" at sweep time without
     /// depending on the write side's state.
     pub read_handle: u64,
-    /// The descriptor number the marker occupies in the child (`preserved_fds` does not
-    /// renumber, so it is the parent's number too).
+    /// The descriptor number the marker occupies in the child (`fd_map::install_preserved` does
+    /// not renumber, so it is the parent's number too).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fd: RawFd,
 }
@@ -525,19 +525,17 @@ pub(crate) struct PreparedMarker {
 /// Create the marker pipe and hand its write end to `std_cmd`. `reserved` is every child fd
 /// number the spawn will `dup2` into (the caller's `fd()` mappings).
 ///
-/// `preserved_fds` registers a `pre_exec` hook that clears `FD_CLOEXEC` on the descriptor
-/// **in the forked child only**, so the supervisor's copy stays CLOEXEC and is never inherited
-/// by a concurrent, unrelated spawn's EXEC'D process image. `command-fds`' own doc comment
-/// notes the `Command` retains ownership of (and does not close) the write end until the
-/// `Command` itself is dropped — so the CALLER must drop `std_cmd` promptly after `.spawn()`
-/// returns to bound the (documented, non-zero) window where a truly concurrent `fork()` in this
-/// same process could transiently see this fd before its own `exec`; see the module docs.
+/// `fd_map::install_preserved` registers a `pre_exec` hook that clears `FD_CLOEXEC` on the
+/// descriptor **in the forked child only**, so the supervisor's copy stays CLOEXEC and is never
+/// inherited by a concurrent, unrelated spawn's EXEC'D process image. `std_cmd` retains
+/// ownership of (and does not close) the write end until the `Command` itself is dropped — so
+/// the CALLER must drop `std_cmd` promptly after `.spawn()` returns to bound the (documented,
+/// non-zero) window where a truly concurrent `fork()` in this same process could transiently see
+/// this fd before its own `exec`; see the module docs.
 ///
 /// `None` on any failure — the caller falls back to the pre-existing mechanism rather than
 /// failing the spawn.
 pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -> Option<PreparedMarker> {
-    use command_fds::CommandFdExt;
-
     let (read, write) = match create_pipe() {
         Ok(p) => p,
         Err(e) => {
@@ -627,7 +625,7 @@ pub(crate) fn install(std_cmd: &mut std::process::Command, reserved: &[RawFd]) -
         return None;
     }
 
-    std_cmd.preserved_fds(vec![write]);
+    crate::child::spawn::fd_map::install_preserved(std_cmd, vec![write]);
     Some(PreparedMarker {
         read: OwnedFd::from(read),
         handle,
