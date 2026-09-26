@@ -752,7 +752,9 @@ fn a_retained_fdmarker_is_killed_through_on_plain_drop() {
     // own `std::process::Child::wait` — without assuming which variant this build compiles: a
     // `--no-default-features` build (no `tokio`) narrows `Held` to `Std` alone on macOS, which
     // would make a direct `Held::Std(..)` destructure irrefutable.
-    let status = held.wait().expect("reap the retained root after its drop kills it through");
+    let status = held
+        .wait()
+        .expect("reap the retained root after its drop kills it through");
     assert!(
         !status.success(),
         "a retained FdMarker's plain drop must kill through the tracked root, got {status:?}"
