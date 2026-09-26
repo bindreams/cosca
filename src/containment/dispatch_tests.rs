@@ -746,14 +746,13 @@ fn a_retained_fdmarker_is_killed_through_on_plain_drop() {
     cmd.args(["sleep", "30"]);
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn a TreeWalk-contained root");
-    let (held, retained) = child.into_unreaped_parts();
+    let (mut held, retained) = child.into_unreaped_parts();
     drop(retained);
-    let crate::child::unreaped::Held::Std(mut std_child) = held else {
-        panic!("a sync spawn's Held is always Held::Std");
-    };
-    let status = std_child
-        .wait()
-        .expect("reap the retained root after its drop kills it through");
+    // `Held::wait` blocks and reaps through whichever handle a spawn held — here `Held::Std`'s
+    // own `std::process::Child::wait` — without assuming which variant this build compiles: a
+    // `--no-default-features` build (no `tokio`) narrows `Held` to `Std` alone on macOS, which
+    // would make a direct `Held::Std(..)` destructure irrefutable.
+    let status = held.wait().expect("reap the retained root after its drop kills it through");
     assert!(
         !status.success(),
         "a retained FdMarker's plain drop must kill through the tracked root, got {status:?}"
