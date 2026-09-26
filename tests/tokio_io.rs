@@ -514,13 +514,21 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
 /// Async twin of sync `unix_fd_out_of_range_fails_spawn_cleanly_not_abort`: an out-of-range but
 /// syscall-representable child fd (far beyond any real process' open-file limit) must fail the
 /// SPAWN with an ordinary `Err` — never `Ok` followed by the child dying of SIGABRT.
+///
+/// Deliberately NOT `i32::MAX` (that's `async_unix_fd_i32_max_fails_spawn_cleanly_not_abort`,
+/// the pathological edge that used to overflow `command-fds`' own arithmetic): this test's own
+/// `child_fd`, 100_000, only fails because `RestoreRlimitNofile` deterministically lowers this
+/// process' `RLIMIT_NOFILE` first — see the sync twin's doc for why a fixed large value alone is
+/// runner-dependent on Linux.
 #[cfg(unix)]
 #[tokio::test]
 async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
+    let _rlimit_guard = common::RestoreRlimitNofile::lower_to(256);
+
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "exit", "0"])
-        .fd(1_000_000, cosca::Stdio::null())
+        .fd(100_000, cosca::Stdio::null())
         .expect("fd() itself accepts an out-of-range but representable number");
     let err = cmd
         .spawn()
@@ -594,11 +602,13 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
 /// from_file source files are already open at some higher number before `spawn()` even starts
 /// resolving anything). What lands at fd 1 and fd 2 instead are the `fd(5, null)` and `fd(6,
 /// null)` mappings' own null sources — the lowest numbers free at the point each is opened —
-/// followed by the out-of-range `fd(1_000_000, null)` mapping. Relocating a low mapping source
-/// out of `install()` must not free that exact number back to the OS before `std_cmd.spawn()`'s
-/// own internal fd allocation (its child-to-parent error-reporting pipe) is done with it — see
-/// `fd_map::install`'s module docs. The spawn must fail cleanly (`Err`), and the stderr file
-/// must receive nothing (no leaked exec-error-pipe bytes).
+/// followed by an always-invalid `fd(i32::MAX, null)` mapping (`i32::MAX` exceeds Linux's
+/// `nr_open` ceiling, so it fails `dup2` regardless of the runner's own `ulimit -n`; the exact
+/// numeric value isn't otherwise significant here — only that it reliably fails). Relocating a
+/// low mapping source out of `install()` must not free that exact number back to the OS before
+/// `std_cmd.spawn()`'s own internal fd allocation (its child-to-parent error-reporting pipe) is
+/// done with it — see `fd_map::install`'s module docs. The spawn must fail cleanly (`Err`), and
+/// the stderr file must receive nothing (no leaked exec-error-pipe bytes).
 #[cfg(unix)]
 #[tokio::test]
 async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
@@ -617,7 +627,7 @@ async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
         .expect("stderr from_file");
     cmd.fd(5, cosca::Stdio::null()).expect("fd 5 null");
     cmd.fd(6, cosca::Stdio::null()).expect("fd 6 null");
-    cmd.fd(1_000_000, cosca::Stdio::null()).expect("fd 1_000_000 null");
+    cmd.fd(i32::MAX, cosca::Stdio::null()).expect("fd i32::MAX null");
 
     let err = cmd
         .spawn()

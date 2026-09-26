@@ -495,3 +495,60 @@ impl Drop for RestoreStdio {
         }
     }
 }
+
+/// Lower this process' own `RLIMIT_NOFILE` soft limit to `to`, for the life of the guard,
+/// restoring the original soft limit on drop (even if the test panics).
+///
+/// A forked child inherits its parent's rlimits at fork time, before any `pre_exec` hook runs —
+/// so lowering the limit HERE, in the process that calls `spawn()`, is what makes an ordinary,
+/// valid-looking child fd number deterministically exceed the CHILD's own limit and fail its
+/// `dup2` with `EBADF`, regardless of whatever the host's real `ulimit -n` happens to be (on
+/// Linux, a soft limit raised past `1_000_000` is entirely ordinary, so a test that assumes a
+/// large but fixed child fd is always out of range is otherwise runner-dependent).
+///
+/// Safe only because this workspace's test runner (`cargo nextest`) puts every test function in
+/// its own OS process — see `RestoreStdio`'s doc for why a plain `cargo test` run would not be.
+#[cfg(unix)]
+pub struct RestoreRlimitNofile {
+    original: libc::rlimit,
+}
+
+#[cfg(unix)]
+impl RestoreRlimitNofile {
+    pub fn lower_to(to: libc::rlim_t) -> RestoreRlimitNofile {
+        let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: `original` is a valid, correctly-sized out-param.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0,
+            "getrlimit(RLIMIT_NOFILE): {}",
+            std::io::Error::last_os_error()
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: to,
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: `lowered` only ever lowers `rlim_cur`; `rlim_max` is passed through unchanged,
+        // so this cannot raise the process' hard ceiling.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) },
+            0,
+            "setrlimit(RLIMIT_NOFILE, {{cur: {to}, max: {}}}): {}",
+            original.rlim_max,
+            std::io::Error::last_os_error()
+        );
+        RestoreRlimitNofile { original }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreRlimitNofile {
+    fn drop(&mut self) {
+        // SAFETY: restores exactly the limit `getrlimit` reported before this guard lowered it —
+        // raising a soft limit back up to (at most) its own untouched hard limit always succeeds
+        // for an unprivileged process.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &self.original);
+        }
+    }
+}
