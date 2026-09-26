@@ -1,3 +1,9 @@
+//! A runtime-chosen fd can be >= 10 (any runner, or a parent already holding many fds, can hand
+//! one out) — such fds are read here via `/dev/fd/N`, not the shell's `<&N`. `/bin/sh` on
+//! Debian/Ubuntu is dash, whose `<&N` only parses a single digit and fails with "Bad fd number"
+//! past 9; `/dev/fd/N` isn't parsed by the shell, so it has no digit limit. The fixed single-digit
+//! literals (`<&5`, `<&3`) are unaffected and stay as `<&`.
+
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -19,11 +25,6 @@ fn file_with(content: &str) -> File {
 
 /// Spawn `/bin/sh -c script` with `mappings` installed exactly as a real `Command::fd()` caller
 /// would, and return its captured stdout as a `String`.
-///
-/// Scripts below read a mapped fd via `/dev/fd/N` rather than the shell's own `<&N` redirection:
-/// on Debian/Ubuntu `/bin/sh` is dash, whose `<&N` only parses a single digit, so any fd >= 10
-/// fails with "Bad fd number". `cargo test`'s threaded runner routinely allocates fds that high;
-/// `/dev/fd/N` has no such limit and works the same way on Linux and macOS.
 fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script).stdout(Stdio::piped());
