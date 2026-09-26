@@ -15,7 +15,7 @@ use crate::child::unreaped::{Held, Retained};
 /// its process handle — then reaps it. It takes
 /// `&mut self`, so a cancelled `wait` — the losing arm of a `select!` — leaves the caller still
 /// holding the child. [`leak`](Unreaped::leak) gives the child up without waiting for it — except
-/// for one still-blocking case, below, pending its own cancellation.
+/// for two still-blocking cases, below, each pending its own cancellation.
 ///
 /// **Its `Drop` blocks** the thread it runs on until the child exits, then reaps it, so it never
 /// lingers as a zombie. Don't let it drop implicitly on a runtime thread: `wait().await` it, move
@@ -47,7 +47,10 @@ use crate::child::unreaped::{Held, Retained};
 /// holds in `draining`. That move, and the `wait` awaiting it, sets `status` first: a cancelled `wait`
 /// never loses the exit status to the drain it queued, only re-awaits that drain on its next call
 /// before returning the status it already has. `leak` and `Drop` read `draining` the same way they
-/// read `blocking` — `Drop` blocks on it, `leak` disarms an unclaimed one.
+/// read `blocking`: an unclaimed one is disarmed directly, but once the task has claimed it, it has
+/// committed to killing through it (see `DrainState`'s doc), and both `Drop` and `leak` block on its
+/// report rather than leave that kill-through running unowned — the same temporary trade as the
+/// blocking-reap case above, lifted once this task, too, can watch a real cancel signal.
 #[must_use = "an unkillable child must be waited for or explicitly leaked"]
 pub struct Unreaped {
     /// `None` once reaped or leaked, so `Drop` does nothing more. Boxed, so an
@@ -779,20 +782,20 @@ impl Unreaped {
     /// A child a cancelled `wait` left with its blocking-pool task is never given up mid-wait:
     /// **`leak` blocks here**, exactly as `Drop` would, until that task reports — a tracer that
     /// never releases a traced child stalls this exactly as long as it would have stalled `wait` or
-    /// `Drop`. This is the one blocking case: unlike every other path through `leak`, cosca has no
-    /// cancel signal yet for this task to wake on instead of the child's own exit, and returning
-    /// without waiting would leave the task running with nothing left to reach it, wait on it, or
-    /// bound how long that takes — exactly what `leak` must never do. It is lifted, back to
+    /// `Drop`. This is the first of two blocking cases: unlike every other path through `leak`,
+    /// cosca has no cancel signal yet for this task to wake on instead of the child's own exit, and
+    /// returning without waiting would leave the task running with nothing left to reach it, wait on
+    /// it, or bound how long that takes — exactly what `leak` must never do. It is lifted, back to
     /// signalling and returning, once that cancel signal exists (tracked alongside the
     /// cross-platform drain-cancellation work below).
     ///
     /// A child a cancelled `wait` already reaped, whose retained drain a blocking-pool task still
-    /// has running, is different: a drain already claimed has, by that same claim, committed to
+    /// has running, is the second: a drain already claimed has, by that same claim, committed to
     /// kill-through (see `DrainState`'s doc) and is not recalled — `leak` disarms it only if it has
-    /// not yet been claimed; otherwise it returns while the kill-through it can no longer stop keeps
-    /// running, unbounded, on the blocking pool. This case is unchanged and not yet cancellable
-    /// either; `leak` does not block on it, since a drain never reports a status this caller could
-    /// otherwise wait on and its kill-through, not an external wait, decides how long it takes.
+    /// not yet been claimed; otherwise, for the same reason as the case above, `leak` **blocks here
+    /// too**, until that task reports, rather than return while the kill-through it can no longer
+    /// stop keeps running unbounded, unowned, on the blocking pool. Also temporary, lifted once this
+    /// task, too, has a real cancel signal to watch instead of only its own kill-through finishing.
     pub fn leak(mut self) {
         if let Some((shared, _)) = self.draining.take() {
             match shared.reclaim_before_start() {
@@ -811,13 +814,18 @@ impl Unreaped {
                 // real kill-through or has already finished it: only `reclaim_before_start`'s
                 // `NotStarted` check above tells the two apart from `Taken`, so peek again here,
                 // for the log alone, to tell `Committed` apart from `Finished` — the log is only as
-                // fresh as this peek, since the task may still be running concurrently.
+                // fresh as this peek, since the task may still be running concurrently. Either way,
+                // `take_blocking` below is called next: temporary, like the reap-side twin above —
+                // there is no cancel signal yet for this task to wake on instead, so returning early
+                // here would leave a `Committed` kill-through running unowned, which `leak` must
+                // never do. Lifted once this task has a real cancel signal too.
                 None => {
                     if matches!(*shared.state(), DrainState::Committed) {
                         log::warn!(
                             "leaking unkillable child {}: a drain already claimed what it retained \
-                             and is killing through it on the blocking pool; leak returns without \
-                             waiting for it",
+                             and is killing through it on the blocking pool; leak blocks on it here \
+                             instead of leaving it running unowned; lifted once it has a real cancel \
+                             signal to watch instead",
                             self.pid
                         );
                     } else {
@@ -827,6 +835,7 @@ impl Unreaped {
                             self.pid
                         );
                     }
+                    shared.take_blocking();
                 }
             }
             return;

@@ -836,14 +836,34 @@ fn drop_after_a_cancelled_wait_waits_for_the_running_drain() {
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 
-/// L-1 (round-7 review): `leak` of a drain already claimed by its task — before this fix — logged
-/// one message for both `Committed` (still running the real kill-through) and `Finished` (already
-/// ran it), even though the two are very different news. This is the `Committed` case: gated via
-/// `after_drain_claim`, the same as `drop_after_a_cancelled_wait_waits_for_the_running_drain`
-/// above, so `leak` deterministically runs while the task is still parked mid-claim.
-#[cfg(unix)]
+/// L-1 (round-7 review): `leak` of a drain already claimed by its task used to log one message for
+/// both `Committed` (still running the real kill-through) and `Finished` (already ran it), even
+/// though the two are very different news. Since then, `leak` was also required to never abandon a
+/// `Committed` drain unowned: it must block on the task's own report exactly as `Drop` does (see
+/// `leak`'s own doc), not merely log and return while the kill-through it can no longer stop keeps
+/// running unbounded on the blocking pool. This test proves both: the log still tells `Committed`
+/// apart from `Finished` at the moment `leak` peeks, and `leak` itself does not return until the
+/// real kill-through the task committed to has actually run — checked here through a real cgroup
+/// leaf's `cgroup.kill`, the same way
+/// `leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_then_disarms` checks the
+/// reap-side twin.
+///
+/// Gated via `after_drain_claim`, so the peek deterministically sees `Committed`, not a race
+/// against the task's own progress. `before_take_blocking_wait` — the same seam
+/// `drop_after_a_cancelled_wait_waits_for_the_running_drain` uses for `Drop` — proves `leak`
+/// genuinely reached `take_blocking`'s wait loop rather than skipping it (round-7 review, mutant
+/// B's `while false && ...` can never reach this line on any schedule).
+///
+/// A real cgroup leaf is Linux-only, the same as `test_support::entered_leaf_at` and
+/// `leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_then_disarms` above.
+#[cfg(target_os = "linux")]
 #[test]
-fn leak_of_a_committed_drain_logs_that_it_is_still_running() {
+fn leak_of_a_committed_drain_blocks_until_the_real_kill_through_runs() {
+    enum Event {
+        EnteredWait,
+        LeakFinished,
+    }
+
     crate::log_capture::install();
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -852,6 +872,13 @@ fn leak_of_a_committed_drain_logs_that_it_is_still_running() {
     let (child, stdin, id) = std_blocked_child();
     drop(stdin); // the child exits at once
     crate::child::unreaped::block_until_reapable(id.pid()).expect("zombie");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-leaked-committed-drain-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
 
     let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -870,11 +897,11 @@ fn leak_of_a_committed_drain_logs_that_it_is_still_running() {
             .expect("the test thread releases the gate");
     }));
 
-    runtime.block_on(async {
+    let u = runtime.block_on(async {
         let mut u = Unreaped::with_retained(
             Held::Std(child),
             Some(crate::child::unreaped::Retained {
-                attached: crate::containment::Attached::None,
+                attached: crate::containment::Attached::Cgroup(leaf),
             }),
         );
         let raw = id.pid() as libc::id_t;
@@ -900,23 +927,63 @@ fn leak_of_a_committed_drain_logs_that_it_is_still_running() {
         claimed_rx
             .recv()
             .expect("the drain task reaches the gate once it has claimed what it must drop");
-
-        let mark = crate::log_capture::mark();
-        u.leak();
-        let records = crate::log_capture::records_since(mark, &format!("child {}", id.pid()));
-        assert!(
-            records
-                .iter()
-                .any(|r| r.contains("is killing through it on the blocking pool")),
-            "leak of a Committed drain must say it is still running: {records:?}"
-        );
-        assert!(
-            !records.iter().any(|r| r.contains("finished killing through")),
-            "must not claim the drain already finished while it is still Committed: {records:?}"
-        );
-
-        release_tx.send(()).expect("the drain is parked on the gate");
+        {
+            let (shared, _) = u.draining.as_ref().expect("the drain task owns what was retained");
+            assert!(
+                matches!(*shared.state(), super::DrainState::Committed),
+                "the gate must hold the task Committed before leak runs"
+            );
+        }
+        u
     });
+
+    let mark = crate::log_capture::mark();
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+    let hook_tx = event_tx.clone();
+    let leak_thread = std::thread::spawn(move || {
+        super::fault::set_before_take_blocking_wait(Box::new(move || {
+            let _ = hook_tx.send(Event::EnteredWait);
+        }));
+        u.leak();
+        let _ = event_tx.send(Event::LeakFinished);
+    });
+
+    match event_rx.recv().expect("the leak thread reports one of the two events") {
+        Event::EnteredWait => {
+            assert_eq!(
+                std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+                b"",
+                "the real kill-through must not have run yet: leak is still parked on the gate"
+            );
+            release_tx
+                .send(())
+                .expect("let the gated task proceed to the real kill-through");
+            leak_thread.join().expect("the leak thread must not panic");
+        }
+        Event::LeakFinished => panic!(
+            "leak returned via take_blocking without ever reaching the wait loop \
+             (round-7 review, mutant B)"
+        ),
+    }
+
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"1",
+        "leak of a Committed drain must block until the real kill-through has actually run"
+    );
+    let records = crate::log_capture::records_since(mark, &format!("child {}", id.pid()));
+    assert!(
+        records
+            .iter()
+            .any(|r| r.contains("is killing through it on the blocking pool")),
+        "leak of a Committed drain must say it is still running: {records:?}"
+    );
+    assert!(
+        !records.iter().any(|r| r.contains("finished killing through")),
+        "must not claim the drain already finished while it was still Committed at the peek: {records:?}"
+    );
+
+    drop(runtime);
     crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 
