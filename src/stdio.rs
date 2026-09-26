@@ -32,7 +32,7 @@ impl Fd {
 /// through [`raw`](Fd::raw)). The one call site that must never hand a real spawn a negative
 /// descriptor is [`Command::fd`](crate::Command::fd), which checks explicitly and returns
 /// `Err` — not a `debug_assert!` here, which would panic in debug builds and do nothing at all
-/// in release (see I14).
+/// in release.
 impl From<i32> for Fd {
     fn from(n: i32) -> Fd {
         Fd(n)

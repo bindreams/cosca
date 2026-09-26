@@ -103,7 +103,7 @@ fn explicit_pipe_out_on_fd3_attaches() {
     ));
 }
 
-/// I14: a negative fd number must be refused explicitly, in both debug and release builds — not
+/// A negative fd number must be refused explicitly, in both debug and release builds — not
 /// silently accepted (and later dropped or aborted downstream), and not left to a debug-only
 /// `debug_assert!` inside `Fd`'s `From<i32>` (which would panic here rather than return `Err`,
 /// and would do nothing at all in release).

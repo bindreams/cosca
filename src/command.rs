@@ -448,7 +448,7 @@ impl Command {
     /// `executable` is set.
     pub fn fd(&mut self, slot: impl Into<Fd>, target: Stdio) -> Result<&mut Command, Error> {
         let slot = slot.into();
-        // I14: refuse a negative descriptor number explicitly, in both debug and release. A
+        // Refuse a negative descriptor number explicitly, in both debug and release. A
         // negative `Fd` reaching the spawn backends would either be silently filtered out (the
         // `raw() >= 3` collection in `child::spawn`) or, worse, handed to a raw `dup2` as the
         // target fd — undefined by POSIX, and observed to abort the child via a nix bug

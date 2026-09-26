@@ -468,11 +468,9 @@ fn unix_fd3_inherit_is_rejected() {
     );
 }
 
-/// I14 regression: an out-of-range but syscall-representable child fd (far beyond any real
-/// process' open-file limit) must fail the SPAWN with an ordinary `Err` — never `Ok` followed by
-/// the child dying of SIGABRT. Before the fix, `command-fds` wrapped a failed `dup2`'s `-1`
-/// return in an `OwnedFd` (nix-rust/nix#2797), which aborted the child instead of surfacing a
-/// clean error.
+/// An out-of-range but syscall-representable child fd (far beyond any real process' open-file
+/// limit) must fail the SPAWN with an ordinary `Err` — never `Ok` followed by the child dying of
+/// SIGABRT.
 ///
 /// Deliberately NOT `i32::MAX` (that's `unix_fd_i32_max_fails_spawn_cleanly_not_abort`, the
 /// pathological edge that used to overflow `command-fds`' own arithmetic): this test's own
@@ -503,7 +501,7 @@ fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     );
 }
 
-/// I14 regression: `fd(i32::MAX, ...)` must fail — never abort the child — with an ordinary
+/// `fd(i32::MAX, ...)` must fail — never abort the child — with an ordinary
 /// `Err` from `spawn()`. `Command::fd()` itself accepts `i32::MAX`; the failure happens
 /// post-fork, at `dup2`, exactly like any other out-of-range child fd (`EBADF`).
 ///

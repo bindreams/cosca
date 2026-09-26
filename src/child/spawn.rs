@@ -1131,7 +1131,7 @@ pub(crate) mod fault {
 mod batch_gate;
 pub(crate) use batch_gate::reject_batch_path;
 
-// cosca-owned fd-mapping pre_exec (replaces `command-fds` — see the module docs for I14).
+// cosca-owned fd-mapping pre_exec (replaces `command-fds` — see the module docs).
 #[cfg(unix)]
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
