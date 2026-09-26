@@ -274,6 +274,22 @@ impl Attached {
         }
     }
 
+    /// Whether a disarmed handle's resource-drop may still block waiting for a drain, because a
+    /// kill this handle already fired needs that drain waited for before the resource gives up
+    /// (see [`CgroupLeaf::disarmed_kill_may_block_drop`](crate::containment::cgroup::CgroupLeaf::disarmed_kill_may_block_drop)).
+    /// The async `Child::drop` reads this to route that wait off the dropping thread and onto
+    /// the reaper pool instead of letting it block a runtime worker. `false` for every other
+    /// mechanism: a pgroup/`TreeWalk`/fd-marker drop never itself blocks, and a Job Object's
+    /// disarmed handle close is a fast, non-blocking `CloseHandle`.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn disarmed_kill_may_block_drop(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(leaf) => leaf.disarmed_kill_may_block_drop(),
+            _ => false,
+        }
+    }
+
     /// Whether this handle owns a mechanism with a kernel drain edge — mirrors
     /// [`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain),
     /// checked against the concrete resource rather than the reported enum so the two can

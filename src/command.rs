@@ -543,9 +543,11 @@ impl Command {
     /// down with [`terminate_tree`](crate::Child::terminate_tree) that has not finished exiting —
     /// a `SIGTERM` is catchable, so the tree may outlive it — which
     /// [`wait_tree`](crate::Child::wait_tree) before the drop is what proves either case is done.
-    /// [`kill_tree`](crate::Child::kill_tree) is different: that kill is atomic, so a drop after
-    /// it waits for that kill's drain before giving up the leaf, the same as it would with
-    /// `kill_on_drop` left on. cosca does not come back
+    /// [`kill_tree`](crate::Child::kill_tree) is different: that kill is atomic, so once it has
+    /// returned `Ok`, a drop after it waits for that kill's drain before giving up the leaf, the
+    /// same as it would with `kill_on_drop` left on (for the async handle, that wait happens off
+    /// the dropping thread — see that `Drop`'s rustdoc). A `kill_tree()` that returned `Err`
+    /// leaves nothing for the drop to wait for. cosca does not come back
     /// for a leaf it left: the empty `cosca-*` directory stays until something else removes it,
     /// such as systemd removing a stopped unit's cgroup subtree.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {

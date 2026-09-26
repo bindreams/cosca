@@ -403,7 +403,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
     assert_async_opted_out_tree_survives(false, drop);
 }
 
-/// #194, async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
+/// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
 /// in `spawn_io.rs`: `kill_on_drop(false)` hits `Child::drop`'s early return (see its doc), so
 /// tokio's own teardown never runs — but `os.attached` (the `CgroupLeaf`) still drops as an
 /// ordinary struct field the moment `Child::drop` returns, on this thread, and its own `Drop`

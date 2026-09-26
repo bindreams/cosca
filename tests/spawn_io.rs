@@ -22,14 +22,9 @@ fn testbin() -> &'static str {
 /// (`fdmarker::install`) — so routing only the Linux one leaves the macOS reasons on the floor
 /// on the host that has them.
 ///
-/// A thin alias for [`common::install_log_capture`], not a logger of its own: `log::set_logger`
-/// is once-per-process, so a test file that kept a second, competing logger here would panic
-/// whichever call lost the race against a test that wants to capture and assert on records too
-/// (`common::install_log_capture`) — a real panic hit by `cargo test`'s default one-binary,
-/// many-tests-per-process model (nextest's one-process-per-test does not have this problem, but
-/// local `cargo test` runs do). Sharing the one logger removes the race instead of picking a
-/// winner: it already echoes every record to stderr, in the same `[LEVEL] text` format this
-/// module used to print itself.
+/// A thin alias for [`common::install_log_capture`], not a logger of its own — see that
+/// function's doc for why only one logger may exist in this test binary. It already echoes
+/// every record to stderr, in the same `[LEVEL] text` format this module used to print itself.
 #[cfg(unix)]
 mod stderr_log {
     pub fn install() {
@@ -1284,7 +1279,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
     drop((root, grand));
 }
 
-/// #194: after `kill_on_drop(false)`, an explicit `kill_tree()` must still make `Drop` wait for
+/// After `kill_on_drop(false)`, an explicit `kill_tree()` must still make `Drop` wait for
 /// the leaf to drain before its `rmdir` — exactly as the `kill_on_drop` (armed) path already
 /// does. `cgroup.kill` is asynchronous: writing it returns before the kernel has finished
 /// reaping the tree and clearing `populated`, so a `Drop` that tries its `rmdir` once, without
