@@ -51,7 +51,7 @@ fn empty_mappings_installs_nothing_and_spawns_normally() {
 // The "already on the right number" branch (fcntl F_SETFD only, no dup2) =====
 
 #[test]
-fn a_mapping_onto_its_own_current_number_clears_cloexec_without_dup2() {
+fn a_mapping_onto_its_own_current_number_clears_cloexec_so_the_fd_survives_exec() {
     let f = file_with("self-mapped");
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
