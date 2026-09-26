@@ -161,9 +161,10 @@ async fn leak_drops_a_tokio_child_releasing_its_handles() {
 }
 
 /// `leak` on a child whose blocking-pool task has already claimed it (state `Running`) — not
-/// still `NotStarted`, not yet `Finished` — hits the `Running -> Leaked` arm: it marks the state
-/// `Leaked` and returns, leaving the task's own `report` (once its reap completes) to release the
-/// held child and disarm what it retained.
+/// still `NotStarted`, not yet `Finished` — now blocks on that task's own report instead of
+/// marking it `Leaked` and returning early: this proves `leak` does not return until the task has
+/// actually finished and its own disarm has already happened, so by the time this test's call to
+/// `leak` itself returns, the assertion below needs no further synchronization.
 ///
 /// Goes through the real `spawn_blocking_reap` (via the same cancelled-wait,
 /// `force_not_yet_reapable` path `a_cancelled_blocking_reap_is_resumed_by_the_next_wait` uses),
@@ -173,22 +174,19 @@ async fn leak_drops_a_tokio_child_releasing_its_handles() {
 ///
 /// The `after_claim` hook runs inside the task's real `run`, right after its real `claim`
 /// succeeds and before it waits for the exit, and blocks there until this test releases it. That
-/// makes the state deterministically `Running` when `leak` is called below — `claim` updates it
-/// strictly before the hook that unblocks the `recv` runs — rather than racing the task's own
-/// progress toward `Finished`.
+/// makes the state deterministically `Running` when this test releases the gate and calls `leak`
+/// — `claim` updates it strictly before the hook that unblocks the `recv` runs — rather than
+/// racing the task's own progress toward `Finished`. Releasing the gate before calling `leak`
+/// (rather than after, as the pre-blocking version of this test did) is required now: `leak`
+/// itself blocks until the gated task proceeds, so releasing it afterward would deadlock both.
 ///
-/// `leak` consumes `self`, taking `self.blocking`'s `Arc<BlockingReap>` half but discarding its
-/// `oneshot::Receiver` half — so this test swaps a dummy receiver into that slot first and keeps
-/// the real one, to await after `leak` returns. `leak` only ever reads the `Arc` half, so the
-/// swap does not change what it does; awaiting the real receiver afterward proves the gated task's
-/// own `report` — the disarm under test — has run, the same as awaiting the task's own
-/// `JoinHandle` would. That alone still races the task's own unwind, though: `report` sends this
-/// signal from inside a `&mut self` call, before `ReapTask::run` itself returns and so before its
-/// own clone of the `Arc` actually drops. A clone of the `Arc` kept here, and waited on past that
-/// unwind (see the loop below), closes that window before the assertion reads the file.
+/// `leak` is itself a blocking call once it reaches this path, so it runs on the blocking pool
+/// here too — matching how this crate's own docs tell a caller to run it, and leaving this test's
+/// own worker thread free for the runtime machinery `cancel_after_one_pending_poll` (and, before
+/// it, the real `spawn_blocking_reap`) already depends on.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
+async fn leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_then_disarms() {
     let (child, stdin, id) = std_blocked_child();
     drop(stdin); // the child exits at once, so the task's own reap below does not hang
     let dir = tempfile::tempdir().expect("tempdir");
@@ -228,33 +226,16 @@ async fn leaking_while_the_blocking_reap_is_running_disarms_what_it_retained() {
         "the real spawn_blocking_reap must have handed the child to a blocking-pool task"
     );
 
-    // Swap the real `finished` receiver out for a dummy: `leak` below only reads the `Arc`
-    // half of the tuple, so this does not change what it does, and it lets this test keep the
-    // real one to await once `leak` has consumed `self`. Also keep our own clone of the `Arc`
-    // itself, independent of the one `leak` drops and the one the task's own `ReapTask` holds.
-    let (_dummy_tx, dummy_rx) = ::tokio::sync::oneshot::channel();
-    let (shared, real_finished) = {
-        let blocking = unreaped.blocking.as_mut().expect("just handed to a blocking task");
-        (blocking.0.clone(), std::mem::replace(&mut blocking.1, dummy_rx))
-    };
-
     claimed_rx
         .recv()
         .expect("the task reaches the gate once it has claimed the child");
-    unreaped.leak();
     release_tx.send(()).expect("let the gated task proceed");
-    let _ = real_finished.await;
 
-    // Close the signal-before-release race: `report` sends this signal from inside a method call
-    // on the task, while the task itself — and so its own clone of `shared` — is still alive on
-    // its blocking-pool stack frame; only once `ReapTask::run` itself returns, just after, does
-    // that clone actually drop. Waiting for `shared`'s count to fall back to what only this test
-    // holds — cooperatively, no sleep, no arbitrary retry bound — proves the task (and whatever
-    // else its own drop might still be holding) is actually gone before this reads the file its
-    // report already decided the outcome of.
-    while std::sync::Arc::strong_count(&shared) > 1 {
-        ::tokio::task::yield_now().await;
-    }
+    // `leak` now blocks until the gated task's own `report` has run: by the time this returns,
+    // the disarm under test has already happened, with no further synchronization needed.
+    ::tokio::task::spawn_blocking(move || unreaped.leak())
+        .await
+        .expect("leak on the blocking pool");
 
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),

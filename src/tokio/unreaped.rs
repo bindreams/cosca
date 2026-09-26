@@ -14,7 +14,8 @@ use crate::child::unreaped::{Held, Retained};
 /// it holds — tokio's own child; on Linux a pidfd, on macOS a kqueue filter on its pid, on Windows
 /// its process handle — then reaps it. It takes
 /// `&mut self`, so a cancelled `wait` — the losing arm of a `select!` — leaves the caller still
-/// holding the child. [`leak`](Unreaped::leak) gives the child up without waiting for it.
+/// holding the child. [`leak`](Unreaped::leak) gives the child up without waiting for it — except
+/// for one still-blocking case, below, pending its own cancellation.
 ///
 /// **Its `Drop` blocks** the thread it runs on until the child exits, then reaps it, so it never
 /// lingers as a zombie. Don't let it drop implicitly on a runtime thread: `wait().await` it, move
@@ -26,10 +27,14 @@ use crate::child::unreaped::{Held, Retained};
 /// happened, so only the tracer's release can still delay that wait — and a tracer that never
 /// releases it never lets the wait end: it ends once the child is reapable, not within any bound
 /// on how long that takes. A `wait` cancelled meanwhile leaves the task holding the child: the next
-/// `wait` takes its result, and `Drop` blocks until the task has finished. `leak` gives the task up
-/// instead of waiting on it: the task keeps running, unowned, and disarms what the child retained
-/// once it finally reaps it — for as long as a stalled tracer holds it, with nothing left
-/// afterward to reach the task, wait on it, or bound how long that takes.
+/// `wait` takes its result, and `Drop` blocks until the task has finished. **`leak`, called while
+/// that task is still running, blocks on it too** — the same as `Drop`, for as long as a stalled
+/// tracer holds it — rather than returning and leaving the task running unowned. This is temporary:
+/// it holds only until this task can watch a real cancel signal alongside the child's own exit, the
+/// same way the retained-drain task below is meant to (macOS already has the cancellable kqueue
+/// filter for this, `crate::wait::macos::Cancel`, not yet wired to either task); once that lands,
+/// `leak` goes back to signalling and returning without waiting. Whichever way it learns the task
+/// is done, `leak` disarms what it retained rather than killing through it.
 ///
 /// If the runtime shuts down before that task ever runs, it is dropped unrun, still `NotStarted`.
 /// `wait` and `Drop` tell that apart from a real report by reclaiming the child back from
@@ -38,8 +43,8 @@ use crate::child::unreaped::{Held, Retained};
 /// and waits for it synchronously instead of hanging on a task that will never report.
 ///
 /// A successful reap moves what it retained to a second, similar blocking-pool task — see
-/// [`reaped`](Unreaped::reaped) — whose own claim slot ([`RetainedDrain`]) this holds in
-/// `draining`. That move, and the `wait` awaiting it, sets `status` first: a cancelled `wait`
+/// `reaped` (private: called from `wait`, below) — whose own claim slot (`RetainedDrain`) this
+/// holds in `draining`. That move, and the `wait` awaiting it, sets `status` first: a cancelled `wait`
 /// never loses the exit status to the drain it queued, only re-awaits that drain on its next call
 /// before returning the status it already has. `leak` and `Drop` read `draining` the same way they
 /// read `blocking` — `Drop` blocks on it, `leak` disarms an unclaimed one.
@@ -99,8 +104,6 @@ enum ReapState {
         Option<Box<Retained>>,
         Option<std::io::Result<Option<ExitStatus>>>,
     ),
-    /// `leak` gave the child up while the task held it: the task disarms what it retained.
-    Leaked,
     /// The holder took what the task handed back, or reclaimed it directly.
     Taken,
 }
@@ -160,8 +163,8 @@ struct ReapTask {
     signal: Option<::tokio::sync::oneshot::Sender<()>>,
     /// Run once, right after `claim` succeeds (state is now `Running`, on this task's own
     /// blocking-pool thread), for a test. Lets a test gate the task there, so it can call `leak`
-    /// while state is deterministically `Running` — proving the `Running -> Leaked` arm without
-    /// racing the task's own progress to `Finished`.
+    /// while state is deterministically `Running` — proving `leak` blocks on this task's own
+    /// report rather than racing its progress to `Finished`.
     #[cfg(test)]
     after_claim: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
@@ -205,13 +208,9 @@ impl ReapTask {
         let mut state = self.shared.state();
         match *state {
             ReapState::Running => *state = ReapState::Finished(held, retained, reaped),
-            // Given up: the reap, if it ran, is done, and nothing the child leads is killed.
-            ReapState::Leaked => {
-                (*held).release();
-                if let Some(retained) = retained {
-                    retained.attached.disarm();
-                }
-            }
+            // `leak` no longer marks a `Running` task `Leaked` and returns early — it blocks on
+            // this same report instead (see `Unreaped::leak`) — so this task always finds `Running`
+            // here; a future real cancellation may reintroduce a state this arm needs to handle.
             ReapState::NotStarted(..) | ReapState::Finished(..) | ReapState::Taken => {
                 unreachable!("a blocking reap reports once, after claiming")
             }
@@ -767,29 +766,33 @@ impl Unreaped {
         self.draining.is_some() && self.retained.is_none()
     }
 
-    /// Give the child up without waiting for it: it runs on, and nothing of cosca's reaps it. A
-    /// tokio child goes to tokio's process-global orphan queue, whose reap is best-effort: it runs
-    /// only when a live runtime sees a later `SIGCHLD`, and otherwise the child stays a zombie (see
-    /// `crate::child::unreaped`'s **Releasing**). Logged at `warn`.
+    /// Give the child up: nothing of cosca's reaps it — unless a cancelled `wait` already left it
+    /// with a blocking-pool task, below. A tokio child otherwise goes to tokio's process-global
+    /// orphan queue, whose reap is best-effort: it runs only when a live runtime sees a later
+    /// `SIGCHLD`, and otherwise the child stays a zombie (see `crate::child::unreaped`'s
+    /// **Releasing**). Logged at `warn`.
     ///
     /// Nothing the child leads is killed. A cgroup v2 leaf it still occupies is left in place, and
     /// cosca never removes it — not even once the tree has exited: the empty `cosca-*` leaf stays
     /// until the owner of the delegated parent cgroup removes it.
     ///
-    /// Leaking a child a cancelled `wait` left with its blocking-pool task does not stop that task:
-    /// the child has exited, and the task still reaps it, then disarms what it retained instead of
-    /// releasing it. The same does NOT hold for a child a cancelled `wait` already reaped, whose
-    /// retained drain a blocking-pool task still has running: a drain already claimed has, by that
-    /// same claim, committed to kill-through (see `DrainState`'s doc), and is not recalled — `leak`
-    /// disarms it only if it has not yet been claimed; otherwise it returns while the kill-through
-    /// it can no longer stop keeps running.
+    /// A child a cancelled `wait` left with its blocking-pool task is never given up mid-wait:
+    /// **`leak` blocks here**, exactly as `Drop` would, until that task reports — a tracer that
+    /// never releases a traced child stalls this exactly as long as it would have stalled `wait` or
+    /// `Drop`. This is the one blocking case: unlike every other path through `leak`, cosca has no
+    /// cancel signal yet for this task to wake on instead of the child's own exit, and returning
+    /// without waiting would leave the task running with nothing left to reach it, wait on it, or
+    /// bound how long that takes — exactly what `leak` must never do. It is lifted, back to
+    /// signalling and returning, once that cancel signal exists (tracked alongside the
+    /// cross-platform drain-cancellation work below).
     ///
-    /// That still-running task is, in both cases, unbounded, and `leak` neither bounds it nor hands
-    /// back anything that could: the reap task blocks in `waitid` until the child is reapable — a
-    /// tracer that never releases it stalls the task exactly as long as it would have stalled `wait`
-    /// or `Drop` — and the drain task blocks the same way on whatever the kill-through itself
-    /// blocks on. `wait` can be cancelled again and `Drop` blocks on the same wait itself; `leak`
-    /// gives up both, so from its return the task runs on, unowned, for as long as that takes.
+    /// A child a cancelled `wait` already reaped, whose retained drain a blocking-pool task still
+    /// has running, is different: a drain already claimed has, by that same claim, committed to
+    /// kill-through (see `DrainState`'s doc) and is not recalled — `leak` disarms it only if it has
+    /// not yet been claimed; otherwise it returns while the kill-through it can no longer stop keeps
+    /// running, unbounded, on the blocking pool. This case is unchanged and not yet cancellable
+    /// either; `leak` does not block on it, since a drain never reports a status this caller could
+    /// otherwise wait on and its kill-through, not an external wait, decides how long it takes.
     pub fn leak(mut self) {
         if let Some((shared, _)) = self.draining.take() {
             match shared.reclaim_before_start() {
@@ -830,62 +833,60 @@ impl Unreaped {
         }
         #[cfg(unix)]
         if let Some((shared, _)) = self.blocking.take() {
-            let mut state = shared.state();
-            match std::mem::replace(&mut *state, ReapState::Taken) {
-                // Never claimed by the task: reclaim directly, rather than leave it queued
-                // behind a blocking pool that may never schedule it.
-                ReapState::NotStarted(held, retained) => {
-                    drop(state);
-                    (*held).release();
-                    if let Some(retained) = retained {
-                        retained.attached.disarm();
-                    }
-                    log::warn!("leaking unkillable child {}, unreaped", self.pid);
-                    return;
+            // Never claimed by the task: reclaim directly, rather than leave it queued behind a
+            // blocking pool that may never schedule it.
+            if let Some((held, retained)) = shared.reclaim_before_start() {
+                (*held).release();
+                if let Some(retained) = retained {
+                    retained.attached.disarm();
                 }
-                ReapState::Running => {
-                    *state = ReapState::Leaked;
+                log::warn!("leaking unkillable child {}, unreaped", self.pid);
+                return;
+            }
+            // Already claimed: `Running`, or already `Finished` and unawaited. `take_blocking`
+            // returns at once in the latter case; in the former it blocks until the task's own
+            // report — this is the one place `leak` still blocks on the child. Temporary: there is
+            // no cancel signal yet for this task to wake on instead (see `leak`'s doc), so returning
+            // early here would leave it running unowned, which `leak` must never do.
+            if matches!(*shared.state(), ReapState::Running) {
+                log::warn!(
+                    "leaking unkillable child {}: its blocking reap is still waiting for it to \
+                     become reapable — unbounded if a tracer holds it — leak blocks on it here \
+                     instead of leaving it running unowned; lifted once it has a real cancel signal \
+                     to watch instead",
+                    self.pid
+                );
+            }
+            let ReapState::Finished(held, retained, reaped) = shared.take_blocking() else {
+                unreachable!("take_blocking only ever hands back a Finished report")
+            };
+            if let Some(retained) = retained {
+                retained.attached.disarm();
+            }
+            match reaped {
+                Some(Ok(Some(_))) => {
+                    (*held).release();
                     log::warn!(
-                        "leaking unkillable child {}: its blocking reap is still waiting for it to become \
-                         reapable — unbounded if a tracer holds it — and will keep running, unowned, until \
-                         it does, then release what it retained (disarmed, not killed through)",
+                        "leaking unkillable child {}, already reaped by its blocking reap",
                         self.pid
                     );
-                    return;
                 }
-                // Finished, unawaited: settle it here, as a leak — nothing the child leads is killed.
-                ReapState::Finished(held, retained, reaped) => {
-                    drop(state);
-                    if let Some(retained) = retained {
-                        retained.attached.disarm();
-                    }
-                    match reaped {
-                        Some(Ok(Some(_))) => {
-                            (*held).release();
-                            log::warn!(
-                                "leaking unkillable child {}, already reaped by its blocking reap",
-                                self.pid
-                            );
-                        }
-                        Some(Err(e)) if crate::child::unreaped::releases_ownership(&e) => {
-                            (*held).release_uncertain();
-                            log::warn!(
-                                "leaking unkillable child {}, released: something else reaped it",
-                                self.pid
-                            );
-                        }
-                        // `Ok(None)` here is reapable yet unreaped, not a foreign reap (only
-                        // `ECHILD` reports that — see `crate::child::unreaped`'s module doc):
-                        // releasing it would zombie-leak the child, so it is kept, unreaped.
-                        Some(Ok(None)) | Some(Err(_)) | None => {
-                            (*held).release();
-                            log::warn!("leaking unkillable child {}, unreaped", self.pid);
-                        }
-                    }
-                    return;
+                Some(Err(e)) if crate::child::unreaped::releases_ownership(&e) => {
+                    (*held).release_uncertain();
+                    log::warn!(
+                        "leaking unkillable child {}, released: something else reaped it",
+                        self.pid
+                    );
                 }
-                ReapState::Leaked | ReapState::Taken => unreachable!("a holder leaks once"),
+                // `Ok(None)` here is reapable yet unreaped, not a foreign reap (only
+                // `ECHILD` reports that — see `crate::child::unreaped`'s module doc):
+                // releasing it would zombie-leak the child, so it is kept, unreaped.
+                Some(Ok(None)) | Some(Err(_)) | None => {
+                    (*held).release();
+                    log::warn!("leaking unkillable child {}, unreaped", self.pid);
+                }
             }
+            return;
         }
         // These are independent: a cancelled wait can leave `retained` reclaimed here (see
         // `await_draining`'s doc, above) with `held` already `None` from an earlier successful

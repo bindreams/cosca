@@ -437,11 +437,10 @@ impl Unreaped {
 
     /// Block until the child exits, and reap it. A failed wait always releases the child — this
     /// `Unreaped` never returns still holding it. On Unix only the manner depends on
-    /// `releases_ownership`: [`release_uncertain`](Held::release_uncertain) if the failure makes
-    /// ownership uncertain, [`release`](Held::release) otherwise (see the module's **Releasing**
-    /// for what each does). On Windows the held handle always pins its process, so `release` is
-    /// the only manner either way — unlike [`leak`](Unreaped::leak), which always releases a
-    /// still-owned child.
+    /// `releases_ownership`: `Held::release_uncertain` if the failure makes ownership uncertain,
+    /// `Held::release` otherwise (see the module's **Releasing** for what each does). On Windows
+    /// the held handle always pins its process, so `release` is the only manner either way —
+    /// unlike [`leak`](Unreaped::leak), which always releases a still-owned child.
     pub fn wait(mut self) -> std::io::Result<ExitStatus> {
         let mut held = *self
             .held
