@@ -1,12 +1,10 @@
-//! A runtime-chosen fd can be >= 10 (any runner, or a parent already holding many fds, can hand
-//! one out) — such fds are read here via `/dev/fd/N`, not the shell's `<&N`. `/bin/sh` on
-//! Debian/Ubuntu is dash, whose `<&N` only parses a single digit and fails with "Bad fd number"
-//! past 9; `/dev/fd/N` isn't parsed by the shell, so it has no digit limit. The fixed single-digit
-//! literals (`<&5`, `<&3`) are unaffected and stay as `<&`.
+//! Runtime-chosen fds can be >= 10. `/bin/sh` on Debian/Ubuntu is dash, whose `<&N` parses only a
+//! single digit and fails with "Bad fd number" past 9 — so reads go through `/dev/fd/N`
+//! (`read_fd`).
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
@@ -34,13 +32,18 @@ fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     String::from_utf8(out.stdout).expect("utf8 stdout")
 }
 
+/// A shell snippet that reads `fd` via `/dev/fd/N`, never via `<&N` (see the module docs).
+fn read_fd(fd: RawFd) -> String {
+    format!("cat /dev/fd/{fd}")
+}
+
 // Basic mapping =====
 
 #[test]
 fn a_simple_mapping_lands_the_parent_fd_on_the_requested_child_number() {
     let f = file_with("hello-fd5");
     let out = run_sh(
-        "cat <&5",
+        &read_fd(5),
         vec![FdMapping {
             parent_fd: f.into(),
             child_fd: 5,
@@ -62,7 +65,7 @@ fn a_mapping_onto_its_own_current_number_clears_cloexec_so_the_fd_survives_exec(
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
     let out = run_sh(
-        &format!("cat /dev/fd/{raw}"),
+        &read_fd(raw),
         vec![FdMapping {
             parent_fd: owned,
             child_fd: raw,
@@ -87,7 +90,7 @@ fn colliding_mappings_deliver_each_files_own_content() {
     let a_raw = a_owned.as_raw_fd();
     let b_raw = b_owned.as_raw_fd();
     let out = run_sh(
-        &format!("cat /dev/fd/{b_raw}; cat /dev/fd/{a_raw}"),
+        &format!("{}; {}", read_fd(b_raw), read_fd(a_raw)),
         vec![
             FdMapping {
                 parent_fd: a_owned,
@@ -120,7 +123,7 @@ fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
     let b_raw = b_owned.as_raw_fd();
     let c_raw = c_owned.as_raw_fd();
     let out = run_sh(
-        &format!("cat /dev/fd/{a_raw}; cat /dev/fd/{b_raw}; cat /dev/fd/{c_raw}"),
+        &format!("{}; {}; {}", read_fd(a_raw), read_fd(b_raw), read_fd(c_raw)),
         vec![
             FdMapping {
                 parent_fd: c_owned,
@@ -186,7 +189,7 @@ fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
     let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(format!("cat /dev/fd/{raw}")).stdout(Stdio::piped());
+    cmd.arg("-c").arg(read_fd(raw)).stdout(Stdio::piped());
     install_preserved(&mut cmd, vec![owned]);
     let out = cmd.output().expect("spawn");
     assert!(out.status.success());
@@ -205,7 +208,7 @@ fn without_install_preserved_the_fd_is_closed_at_exec() {
     let raw = owned.as_raw_fd();
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("cat /dev/fd/{raw} 2>/dev/null || echo CLOSED"))
+        .arg(format!("{} 2>/dev/null || echo CLOSED", read_fd(raw)))
         .stdout(Stdio::piped());
     let out = cmd.output().expect("spawn");
     drop(owned); // keep it alive in the parent until after spawn, exactly like a real caller
@@ -312,7 +315,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("cat /dev/fd/{b_raw}; cat /dev/fd/{a_raw}"))
+        .arg(format!("{}; {}", read_fd(b_raw), read_fd(a_raw)))
         .stdout(Stdio::piped());
 
     // Lower the CHILD's RLIMIT_NOFILE to 256 before `install`'s own pre_exec hook runs.
@@ -431,7 +434,7 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg("cat <&3 >&1; echo unrelated-stderr >&2")
+        .arg(format!("{} >&1; echo unrelated-stderr >&2", read_fd(3)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     install(
