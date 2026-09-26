@@ -99,9 +99,11 @@ pub(crate) enum DrainStep {
 /// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report channel: the child
 /// needs them only until its `exec`.
 ///
-/// `Drop` removes the leaf directory. If the leaf is still occupied, it fires `cgroup.kill`, waits
-/// for the leaf to drain, removes its child cgroups and tries once more — but only if the child reported entering it and the leaf was not
-/// [`disarm`](Self::disarm)ed.
+/// `Drop` removes the leaf directory, but only if the child reported entering it. If the leaf is
+/// still occupied, it fires `cgroup.kill` itself — but only while still armed (not
+/// [`disarm`](Self::disarm)ed) — then, either way a kill is now in flight (its own, or one the
+/// caller already made through [`kill_tree`](Self::kill_tree)/[`hard_kill`](Self::hard_kill)),
+/// waits for the leaf to drain, removes its child cgroups, and tries the `rmdir` once more.
 #[cfg(target_os = "linux")]
 pub(crate) struct CgroupLeaf {
     /// Absolute path to the leaf directory, e.g. `/sys/fs/cgroup/…/cosca-<pid>`, for reports.
@@ -135,6 +137,12 @@ pub(crate) struct CgroupLeaf {
     /// tell a tree the caller killed, whose leaf has not drained yet, from one left running.
     /// [`terminate`](Self::terminate) does not set it: a SIGTERM can be caught.
     killed: AtomicBool,
+    /// Whether a [`hard_kill`](Self::hard_kill) call failed for a real mechanism reason (not
+    /// "leaf already gone", which sets `killed` above instead). A disarmed `Drop` reads it to
+    /// `warn` that the caller's own `kill_tree()` never actually reached this leaf, rather than
+    /// silently folding a genuine failure into the same `debug` note used for a tree the caller
+    /// never asked to kill at all.
+    kill_attempt_failed: AtomicBool,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -167,10 +175,25 @@ impl CgroupLeaf {
     /// `rmdir` always fails (`EBUSY`). `Child::drop` opting out via `kill_on_drop` does not
     /// help — the leaf is a field of that `Child` and its own `Drop` runs regardless.
     ///
-    /// A disarmed `Drop` still tries the `rmdir` once — detach gives up the kill, not the
-    /// tidying — and notes at `debug`, never `warn`, when the live tree keeps the leaf.
+    /// A disarmed `Drop` never fires `cgroup.kill` itself, and gives up the leaf without
+    /// retrying when the tree was never killed (noted at `debug`, never `warn`) — whether or not
+    /// it is still live. But it does not give up on a kill the caller already made through
+    /// `kill_tree()`/`hard_kill()`: that kill's drain is waited for exactly as an armed `Drop`'s
+    /// is, so the `rmdir` retries once the leaf drains, and only reports the leaf as left behind
+    /// if it still fails after that.
     pub(crate) fn disarm(&self) {
         self.armed.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether this leaf's `Drop` may still block waiting for a drain: the child entered, `Drop`
+    /// is disarmed, and a kill this handle already fired (`hard_kill`/`Child::kill_tree`) means
+    /// `Drop`'s disarmed-but-killed branch waits for that kill's drain exactly as an armed
+    /// `Drop`'s does (see the table on [`Drop`](#impl-Drop-for-CgroupLeaf) above). `Child::drop`
+    /// (async) reads this to decide whether that wait needs routing off the dropping thread and
+    /// onto the reaper pool, so it never blocks a runtime worker.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn disarmed_kill_may_block_drop(&self) -> bool {
+        self.child_entered() && !self.armed.load(Ordering::Relaxed) && self.killed.load(Ordering::Relaxed)
     }
 
     /// The leaf's directory, for a test that must find this leaf and no other. Its one user is the
@@ -482,7 +505,10 @@ impl CgroupLeaf {
                 log::debug!("cgroup.kill: leaf {} is already gone", path.display());
                 Ok(())
             }
-            Err(e) => Err(crate::error::Error::Io(e)),
+            Err(e) => {
+                self.kill_attempt_failed.store(true, Ordering::Relaxed);
+                Err(crate::error::Error::Io(e))
+            }
         }
     }
 
@@ -650,6 +676,7 @@ impl CgroupLeaf {
             abandoned: false,
             armed: AtomicBool::new(true),
             killed: AtomicBool::new(false),
+            kill_attempt_failed: AtomicBool::new(false),
         }
     }
 
@@ -680,14 +707,14 @@ impl Drop for CgroupLeaf {
         let Err(first) = self.rmdir_leaf() else {
             return;
         };
-        // `Drop` kills only when both hold:
+        // `Drop` kills only when the child entered the leaf and it is still armed:
         //
-        // | entered | armed | Drop                                                 |
-        // |---------|-------|------------------------------------------------------|
-        // | true    | true  | rmdir; if it fails, cgroup.kill, drain, sweep, rmdir |
-        // | true    | false | one rmdir: the caller opted the tree out             |
-        // | false   | true  | one rmdir: the child never entered the leaf          |
-        // | false   | false | one rmdir: the child never entered the leaf          |
+        // | entered | armed | killed | Drop                                                                        |
+        // |---------|-------|--------|-----------------------------------------------------------------------------|
+        // | true    | true  | –      | rmdir; if it fails, cgroup.kill, drain, sweep, rmdir                        |
+        // | true    | false | true   | rmdir; if it fails, re-fire cgroup.kill, wait for the drain, sweep, rmdir   |
+        // | true    | false | false  | rmdir; if `populated 0` already, sweep, rmdir; else one rmdir, left running |
+        // | false   | –     | –      | one rmdir: the child never entered the leaf                                 |
         if !self.child_entered() {
             if !removed_after_drain(&first) {
                 warn_leaf_left_behind(
@@ -697,24 +724,61 @@ impl Drop for CgroupLeaf {
             }
             return;
         }
-        // Opted out (see `disarm`): the single `rmdir` above is all Drop may do. An `ENOENT` or
-        // `ENODEV` from it proves the leaf is gone ([`removed_after_drain`]). Otherwise a tree
-        // the caller killed has not drained yet (`cgroup.kill` is asynchronous), and its leaf is a
-        // leak like any other; a tree left running keeps its leaf by request.
+        // Opted out (see `disarm`): Drop itself never fires `cgroup.kill`. But opting out of
+        // Drop's own teardown is not opting out of a kill the caller already did through
+        // `kill_tree()`/`hard_kill()`: that kill is real and its drain is exactly as awaitable as
+        // the armed path's. An `ENOENT` or `ENODEV` from the first `rmdir` proves the leaf is
+        // already gone ([`removed_after_drain`]). Otherwise, a tree the caller killed has not
+        // drained yet (`cgroup.kill` is asynchronous) — wait for it, then retry, as the armed path
+        // does. A tree left running (never killed) keeps its leaf by request, with no retry.
         if !self.armed.load(Ordering::Relaxed) {
             if removed_after_drain(&first) {
                 return;
             }
             if self.killed.load(Ordering::Relaxed) {
-                warn_leaf_left_behind(
-                    &self.leaf_path,
-                    format_args!("rmdir failed ({first}) before the killed tree drained; the handle opted out of teardown, so Drop did not retry"),
+                // A stale `killed` flag must not make this wait forever: re-fire the kill before
+                // waiting on its drain. An occupant that migrated in after the first kill was
+                // never targeted, and on a kernel before 6.14 a process that forked while that
+                // kill was in flight could escape it (`cgroup: fix race between fork and
+                // cgroup.kill`, Linux 6.14) — either way, `drain_and_remove(false, ..)` re-runs
+                // `hard_kill()` first, exactly as the armed path's own kill-then-wait does.
+                self.drain_and_remove(
+                    false,
+                    "after an explicit kill through a handle that opted out of Drop's own teardown",
                 );
-            } else {
-                log::debug!(
-                    "cgroup leaf {} is left behind for a tree that opted out of teardown ({first})",
-                    self.leaf_path.display()
-                );
+                return;
+            }
+            // Never killed: the caller asked for this tree to be left running, and Drop honors
+            // that — it does not kill. But "left running" and "already exited on its own" are
+            // different questions: a leaf whose `cgroup.events` already reads `populated 0` has
+            // nothing left to wait for, so its empty child cgroups are worth one sweep and one
+            // more `rmdir`, exactly as a killed leaf's are, before anything is reported. A leaf
+            // that is still populated keeps the old single-rmdir, debug-only behaviour — the
+            // caller asked for this, so it is not a leak.
+            match self.drain_now() {
+                Ok(crate::containment::TreeDrain::AllMembersExited) => {
+                    self.sweep_and_retry_rmdir("after a caller-opted-out tree exited on its own");
+                }
+                // Still populated (or unreadable): the tree was never killed. If the caller's own
+                // kill_tree()/hard_kill() had actually been attempted and failed, that is not the
+                // "opted out and left running" case this leaf's own doc promises — it is a
+                // mechanism failure, reported exactly as loudly as the armed path's own kill
+                // failure is.
+                _ if self.kill_attempt_failed.load(Ordering::Relaxed) => {
+                    warn_leaf_left_behind(
+                        &self.leaf_path,
+                        format_args!(
+                            "rmdir failed ({first}); its cgroup.kill failed, so the tree that \
+                             opted out of Drop's own teardown is still running"
+                        ),
+                    );
+                }
+                _ => {
+                    log::debug!(
+                        "cgroup leaf {} is left behind for a tree that opted out of teardown ({first})",
+                        self.leaf_path.display()
+                    );
+                }
             }
             return;
         }
@@ -844,6 +908,29 @@ impl CgroupLeaf {
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed ({e}) {context}, after its kill, drain and sweep: {LEFT_BEHIND_CAUSES}"),
+            ),
+            Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
+        }
+    }
+
+    /// Remove a leaf [`drain_now`](Self::drain_now) already found at `populated 0` on its own —
+    /// nothing was killed, so nothing needs waiting for. Removes the leaf's now-empty child
+    /// cgroups and makes one more `rmdir`; any failure of that `rmdir` other than the leaf already
+    /// being gone is reported, the same way [`drain_and_remove`](Self::drain_and_remove)'s own
+    /// post-drain sweep is.
+    fn sweep_and_retry_rmdir(&mut self, context: &str) {
+        if let Err(e) = self.dir.remove_children() {
+            return warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
+            );
+        }
+        match self.rmdir_leaf() {
+            Ok(()) => {}
+            Err(e) if removed_after_drain(&e) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed ({e}) {context}, after its sweep: {LEFT_BEHIND_CAUSES}"),
             ),
             Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
         }
@@ -1245,6 +1332,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         abandoned: false,
         armed: AtomicBool::new(true),
         killed: AtomicBool::new(false),
+        kill_attempt_failed: AtomicBool::new(false),
     })
 }
 

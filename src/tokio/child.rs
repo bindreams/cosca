@@ -631,7 +631,19 @@ impl Child {
 
 impl Child {
     /// Leave the child (and its contained tree) running after this handle drops. The drop then
-    /// neither kills the tree nor waits for it.
+    /// never kills the tree itself — though if [`kill_tree`](Self::kill_tree) already returned
+    /// `Ok` on this handle, its `Drop` still waits for that kill's drain before giving up the
+    /// leaf. A `kill_tree()` that returned `Err` leaves nothing to wait for.
+    ///
+    /// **That wait never blocks the dropping thread.** A disarmed handle skips the root-kill this
+    /// method's sibling paragraph on [`Drop`](#impl-Drop-for-Child) describes, but a drain this
+    /// handle's own prior `kill_tree()` started is routed through the same reaper-pool handoff:
+    /// the drop hands the leaf to a reaper thread and returns at once, exactly like the armed
+    /// path. The one exception is a root already reaped by the time `drop` runs, which releases
+    /// inline — nothing left to wait for. This is the async handle's own behaviour; the sync
+    /// [`Child`](crate::Child) has no reaper pool to hand off to and always blocks the caller's
+    /// thread for this same wait. Call [`wait_tree`](Self::wait_tree) before dropping if the
+    /// caller needs to observe the drain itself rather than merely not block on it.
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
         self.os.attached.disarm();
@@ -668,11 +680,27 @@ impl Child {
 /// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
 /// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
 ///
-/// The reap is handed to a small fixed pool of reaper threads (currently two) that starts on
-/// the first kill-on-drop drop and persists for the process's life. It is guaranteed except on
-/// the two paths below, both of which are loud. Under thread exhaustion the pool cannot start,
-/// and the child goes to the runtime's orphan handling instead — an `error` per child, and each
-/// drop then costs at most that many failing spawn syscalls.
+/// The reap — and, for a `Cgroup`-contained tree, the leaf's own drain wait — is handed to a
+/// small fixed pool of reaper threads (currently two) that starts on the first kill-on-drop drop
+/// and persists for the process's life. A disarmed but already-killed handle (see
+/// [`detach`](Child::detach)) hands its leaf's drain wait to the same pool, for the same reason:
+/// so that wait, too, never runs on whichever thread called `drop`.
+///
+/// **Exactly two things make this handle's `Drop` block the calling thread instead:**
+/// - **The root is already reaped when `drop` runs.** Nothing is submitted — there is no reap
+///   left to move off this thread — and the resources release right here, in place. For a
+///   `Cgroup` leaf this still runs that leaf's own (synchronous) `Drop`, which blocks on the
+///   drain if this handle's kill already fired and the tree has not yet cleared; this is the
+///   same wait the cgroup leaf's own (private, internal) `Drop` documents, not one this type
+///   adds.
+/// - **The reaper pool cannot start at all** (thread exhaustion on the very first kill-on-drop
+///   drop of the process). This is loud (an `error` log) and degrades to releasing the job in
+///   hand right here rather than queuing it — which, for a `Cgroup` leaf, blocks on that same
+///   drain for the same reason as above. Each further drop while the pool stays unstarted costs
+///   at most that many failing spawn syscalls before retrying.
+///
+/// Neither exception is specific to the disarmed-but-killed path added above: both apply equally
+/// to the ordinary kill-on-drop reap. Outside them, this handle's `Drop` never blocks.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -692,10 +720,45 @@ impl Child {
 /// That divergence from the sync `Child`, which still blocks, is otherwise deliberate.
 impl Drop for Child {
     fn drop(&mut self) {
-        // The opt-out/`detach()` contract: nothing is signalled. The leaf's own `Drop` still
-        // reports a leaf the tree occupies: at `debug` for a running tree, at `warn` for one killed
-        // that has not drained.
+        // The opt-out/`detach()` contract: nothing is signalled here. The leaf's own `Drop` still
+        // reports a leaf a still-running tree occupies, at `debug` — but for one this handle
+        // already killed through `kill_tree()`/`hard_kill()`, it waits for that kill's drain and
+        // retries the `rmdir` first, reporting at `warn` only if that retry still fails.
         if !self.kill_on_drop {
+            // That wait can block: route it through the same reaper handoff the armed path below
+            // uses, so it never runs on whichever thread called `drop` (a runtime worker,
+            // routinely). Every other disarmed leaf — never killed, or a mechanism whose drop
+            // cannot block at all — has nothing to route and returns immediately below.
+            if self.os.attached.disarmed_kill_may_block_drop() {
+                #[cfg(test)]
+                let probe = reaper::test_probe::take();
+                #[cfg(test)]
+                if let Some(p) = probe.as_ref() {
+                    let _ = p.entered.send(std::thread::current().id());
+                }
+                let pid = self.id.pid();
+                let mut os = std::mem::take(&mut self.os);
+                // Already reaped: `wait_and_reap`'s precondition (a wait bounded by a signal this
+                // handle knows was sent) does not hold as cheaply here — nothing left to wait for,
+                // so release inline, exactly as the armed path does just below.
+                if os.proc_mut().is_reaped() {
+                    return;
+                }
+                reaper::submit(reaper::ReapJob {
+                    os,
+                    pid,
+                    #[cfg(test)]
+                    origin: std::thread::current().id(),
+                    #[cfg(test)]
+                    probe,
+                    #[cfg(test)]
+                    force_panic: false,
+                    #[cfg(test)]
+                    force_release_panic: false,
+                    #[cfg(test)]
+                    force_glue_panic: false,
+                });
+            }
             return;
         }
         #[cfg(test)]

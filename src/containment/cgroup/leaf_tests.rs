@@ -477,6 +477,9 @@ fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the detached tree");
     std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    // `populated 1`: a real cgroupfs always has this file, and Drop's never-killed branch reads
+    // it to tell a leaf still holding its tree from one that already drained on its own.
+    std::fs::write(leaf_path.join("cgroup.events"), b"populated 1\nfrozen 0\n").expect("create cgroup.events");
 
     let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
     let mark = crate::log_capture::mark();
@@ -535,18 +538,23 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     );
 }
 
-/// A disarmed leaf whose tree the caller KILLED is not left behind for a live detached tree: it
-/// is a leaf `cgroup.kill` had not yet drained when the handle dropped (`kill_on_drop(false)`,
-/// `kill_tree()`, no `wait_tree()`). It is reported as the leak it is, at `warn`, like every
-/// other leaf cosca fails to remove.
+/// A disarmed leaf whose tree the caller KILLED (`kill_on_drop(false)`, `kill_tree()`, no
+/// `wait_tree()`) is not simply left behind for a live detached tree: this fix makes `Drop`
+/// wait for that kill's drain before retrying the `rmdir`, exactly as the armed path does (see
+/// `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains`, which proves the
+/// retried `rmdir` succeeds once a — there, simulated — drain completes). This leaf's directory
+/// has no `cgroup.events`, so its drain watch arms as already-gone (see `DrainWatch::arm`) and the
+/// wait is a no-op — the retried `rmdir` still fails here on `ENOTEMPTY`, from the leftover
+/// `occupant` and `cgroup.kill` files left in the directory, a genuine leftover unrelated to the
+/// drain. It is reported once, at `warn`, like every other leaf `Drop` fails to remove.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_disarmed_leaf_whose_tree_was_killed_warns_that_it_was_not_removed() {
+fn a_disarmed_leaf_whose_tree_was_killed_but_still_refuses_rmdir_is_reported_once() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-killed-opted-out-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::write(leaf_path.join("occupant"), "").expect("stand in for the still-dying tree");
+    std::fs::write(leaf_path.join("occupant"), "").expect("leftover file that makes rmdir fail with ENOTEMPTY");
     std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
 
     let leaf = entered_leaf_at(leaf_path);
@@ -593,6 +601,9 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
                         // SAFETY: the parent's copy of the read end, closed once.
     unsafe { libc::close(ready[0]) };
     std::fs::write(leaf_path.join("cgroup.procs"), format!("{member}\n")).expect("list the member");
+    // `populated 1`: the member is still alive, and Drop's never-killed branch reads this file
+    // to tell a leaf still holding its tree from one that already drained on its own.
+    std::fs::write(leaf_path.join("cgroup.events"), b"populated 1\nfrozen 0\n").expect("create cgroup.events");
 
     let leaf = entered_leaf_at(leaf_path);
     leaf.disarm();
@@ -632,7 +643,7 @@ fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
     );
 }
 
-// Drop's two flags -----
+// Drop's three flags -----
 // See the truth table in `CgroupLeaf`'s `Drop`.
 
 /// All four combinations, each against an occupied leaf whose verdict is taken: only both-set
@@ -674,7 +685,7 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
     }
 }
 
-// An armed Drop's drain -----
+// A killed leaf's drain, armed and disarmed -----
 // Each test gives a fake leaf cgroupfs's `rmdir` answers through the rmdir hook, and drives it from
 // another thread that acts only once the drop's drain wait is about to block.
 
@@ -735,6 +746,262 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     assert!(
         after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
         "every rmdir after the kill must wait for the drain, got {steps:?}"
+    );
+}
+
+/// Disarmed twin of `an_armed_drop_removes_its_leaf_only_after_it_drains`: a
+/// leaf whose caller explicitly killed the tree (`hard_kill`, mirroring `Child::kill_tree()`)
+/// and THEN disarmed `Drop`'s own teardown (`kill_on_drop(false)`) must still have its `Drop`
+/// wait for that kill's drain before its retried `rmdir` — not fire one unwaited `rmdir` and
+/// report the leaf left behind while the kill it already made is still draining.
+///
+/// Deterministic, no sleeps: `on_each_drain_block` drives the fake leaf's `populated` flag from
+/// another thread, released only once `Drop`'s wait is actually blocked on it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-disarmed-draining-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+    leaf.hard_kill().expect("kill the tree");
+
+    fault::record_leaf_steps();
+    drop(leaf);
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    assert!(
+        !fake.leaf.exists(),
+        "a disarmed Drop must still remove a leaf its caller already killed, once it drains, got {steps:?}"
+    );
+    // The first kill happened before `record_leaf_steps()`, so it leaves no step here — but
+    // `Drop` re-fires `cgroup.kill` before waiting (see the next test), which does show up.
+    assert_eq!(
+        steps,
+        vec!["rmdir populated 1", "kill", "rmdir populated 0"],
+        "a disarmed leaf's kill must be re-fired and then retried only once it drains, got {steps:?}"
+    );
+}
+
+/// #194 follow-up: a disarmed `Drop` re-fires `cgroup.kill` right before waiting on the drain, so
+/// an occupant that migrated into the leaf after the caller's own kill — or one that escaped it by
+/// forking while the kill was in flight, on a kernel before 6.14 (`cgroup: fix race between fork
+/// and cgroup.kill`) — cannot make `Drop` wait on a drain nothing is driving. A stale `killed` flag
+/// must not by itself excuse `Drop` from killing again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-disarmed-repopulated-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+    leaf.hard_kill().expect("kill the tree");
+    // The first kill's tree fully drains, then an occupant migrates in (or a fork escapes a kill
+    // in flight, pre-6.14): the leaf reads populated again, though `killed` is still set from the
+    // first, successful write.
+    FakeLeaf::set_populated(&fake.events, false);
+    FakeLeaf::set_populated(&fake.events, true);
+
+    fault::record_leaf_steps();
+    drop(leaf);
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    assert!(
+        !fake.leaf.exists(),
+        "Drop must still remove the leaf once its re-fired kill drains, got {steps:?}"
+    );
+    let killed_at = steps
+        .iter()
+        .position(|s| s == "kill")
+        .unwrap_or_else(|| panic!("a re-populated leaf must be killed again before Drop waits, got {steps:?}"));
+    let after_kill = &steps[killed_at + 1..];
+    assert!(
+        !after_kill.is_empty(),
+        "the drop must retry the rmdir after re-firing the kill, got {steps:?}"
+    );
+    assert!(
+        after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
+        "every rmdir after the re-fired kill must wait for the drain, got {steps:?}"
+    );
+}
+
+/// The predicate `Child::drop` (async) uses to route a disarmed leaf's drain wait off the
+/// dropping thread and onto the reaper pool: true only once the child entered, `Drop` is
+/// disarmed, and a kill this handle already fired means `Drop` still waits for that kill's drain
+/// (see `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains` above) —
+/// false for an armed leaf (its own `Drop` kills and waits synchronously by design) and false for
+/// a disarmed leaf nothing has killed yet (nothing to wait for).
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn disarmed_kill_may_block_drop_is_true_only_once_entered_disarmed_and_killed() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    // Not populated: if `Drop` runs at the end of this test, its drain wait (armed or disarmed)
+    // reads already-drained and returns at once, so no hook is needed to avoid a hang.
+    let fake = FakeLeaf::new("cosca-disarmed-predicate-leaf", false);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    assert!(
+        !leaf.disarmed_kill_may_block_drop(),
+        "an armed leaf's own Drop kills and waits itself; it never needs routing"
+    );
+
+    leaf.disarm();
+    assert!(
+        !leaf.disarmed_kill_may_block_drop(),
+        "a disarmed leaf nothing has killed yet has no drain to wait for"
+    );
+
+    leaf.hard_kill().expect("kill the tree");
+    assert!(
+        leaf.disarmed_kill_may_block_drop(),
+        "a disarmed leaf this handle already killed still waits for the drain in Drop, and that \
+         wait must be routed off the caller's thread"
+    );
+}
+
+/// #194 follow-up: in `Drop`'s never-killed branch, a first `rmdir` that fails is not always the
+/// caller's tree left running by request — a leaf can drain on its own (no kill needed) yet still
+/// hold an empty child cgroup a grandchild left behind. `cgroup.events` already reading
+/// `populated 0` is `Drop`'s cue to sweep that child cgroup away and retry, exactly as the killed
+/// path already does, rather than reporting — or silently keeping — a leaf nothing is running in.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_never_killed_leaf_sweeps_and_retries_once_it_has_already_drained() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-disarmed-self-drained-leaf", false);
+    std::fs::create_dir(fake.leaf.join("leftover-child")).expect("leave an empty child cgroup behind");
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    // Real cgroupfs `rmdir` semantics: `EBUSY` while a child cgroup exists, same errno as while
+    // populated — neither is proof of anything else ([`removed_after_drain`] never applies to it).
+    fault::set_rmdir_hook(move |path| {
+        if !path.exists() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        if path.join("leftover-child").exists() {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        FakeLeaf::rmdir(&leaf, &events)
+    });
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+    fault::take_rmdir_hook();
+
+    assert!(
+        !fake.leaf.exists(),
+        "a leaf that already drained on its own must be removed once its leftover child cgroup is swept"
+    );
+    assert!(
+        !crate::log_capture::levels_since(mark, "cosca-disarmed-self-drained-leaf").contains(&log::Level::Warn),
+        "a clean sweep-and-retry is success, not a leak"
+    );
+}
+
+/// The sibling of the previous test: a leaf that never killed its tree and is STILL populated
+/// keeps the old single-`rmdir`, debug-only behaviour — the caller asked for the tree to be left
+/// running, and `Drop` must not sweep a child cgroup a still-live tree may yet be using.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_never_killed_leaf_still_populated_does_not_sweep() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-disarmed-still-populated-leaf", true);
+    std::fs::create_dir(fake.leaf.join("live-child")).expect("a live tree's own child cgroup");
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    let sweeps = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = sweeps.clone();
+    fault::set_rmdir_hook(move |path| {
+        if !path.exists() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        if path.join("live-child").exists() {
+            counted.set(counted.get() + 1);
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        FakeLeaf::rmdir(&leaf, &events)
+    });
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+    fault::take_rmdir_hook();
+
+    assert_eq!(
+        sweeps.get(),
+        1,
+        "a still-populated leaf gets exactly the one, doomed rmdir, no retry"
+    );
+    assert!(
+        fake.leaf.join("live-child").exists(),
+        "a live tree's child cgroup must not be swept away"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-disarmed-still-populated-leaf"),
+        vec![log::Level::Debug],
+        "a tree the caller left running is not a leak"
+    );
+}
+
+/// A disarmed leaf whose caller's own `kill_tree()`/`hard_kill()` genuinely FAILED (not merely
+/// "already gone") is not the "opted out and left running by request" case the debug-level message
+/// promises: the caller was told the opposite of the truth if this is buried at `debug`. It is
+/// reported exactly as loudly as the armed path reports its own kill failure.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::log_capture::install();
+    let fake = FakeLeaf::new("cosca-disarmed-kill-failed-leaf", true);
+    // A directory, not a file, in `cgroup.kill`'s place: opening it for writing fails `EISDIR`,
+    // unconditionally — no permission bit a privileged test process could bypass.
+    std::fs::remove_file(fake.leaf.join("cgroup.kill")).expect("remove the real cgroup.kill");
+    std::fs::create_dir(fake.leaf.join("cgroup.kill")).expect("make cgroup.kill unwritable");
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+    leaf.hard_kill()
+        .expect_err("a directory cannot be written as cgroup.kill");
+
+    let mark = crate::log_capture::mark();
+    drop(leaf);
+    fault::take_rmdir_hook();
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cosca-disarmed-kill-failed-leaf"),
+        vec![log::Level::Warn],
+        "a kill_tree() that actually failed is a mechanism failure, not an opt-out"
     );
 }
 
