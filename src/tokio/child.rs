@@ -691,8 +691,8 @@ impl Child {
 ///   left to move off this thread — and the resources release right here, in place. For a
 ///   `Cgroup` leaf this still runs that leaf's own (synchronous) `Drop`, which blocks on the
 ///   drain if this handle's kill already fired and the tree has not yet cleared; this is the
-///   same wait [`CgroupLeaf`](crate::containment::cgroup::CgroupLeaf)'s own `Drop` documents, not
-///   one this type adds.
+///   same wait the cgroup leaf's own (private, internal) `Drop` documents, not one this type
+///   adds.
 /// - **The reaper pool cannot start at all** (thread exhaustion on the very first kill-on-drop
 ///   drop of the process). This is loud (an `error` log) and degrades to releasing the job in
 ///   hand right here rather than queuing it — which, for a `Cgroup` leaf, blocks on that same
