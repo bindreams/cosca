@@ -523,43 +523,51 @@ fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     );
 }
 
-/// Through the public `Command` API: with this process' own fd 2 closed and freed, a plain
-/// `fd(3, null)` mapping must not end up readable as the child's stderr just because
-/// `install()`'s own bookkeeping happens to source or park something at that exact number.
-/// `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the parent's stderr pipe must receive
-/// nothing.
+/// Through the public `Command` API: with this process' own fd 2 closed and freed,
+/// `.stderr(Stdio::from_file(...))`'s `try_clone` lands its dup'd target at 3 or above (this
+/// process' own fd 2 is still free at that point), leaving fd 2 itself free for the `fd(3,
+/// null)` mapping's null source to land on. `install()` must relocate that low-numbered source
+/// out of fd 2 before the fork — otherwise std's own child-side dup2 (which runs before any
+/// `pre_exec` hook) clobbers exactly it, and the mapping ends up reading whatever std put there
+/// instead. `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the stderr file must stay empty.
 #[cfg(unix)]
 #[test]
 fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
+    use std::io::{Seek, SeekFrom};
+
+    let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
+
     let _restore = common::RestoreStdio::close(&[2]);
 
     let mut cmd = Command::new();
-    cmd.executable("/bin/sh")
-        .args(["sh", "-c", "echo LEAK >&3"])
-        .stderr(Stdio::pipe())
-        .expect("stderr pipe")
-        .fd(3, Stdio::null())
-        .expect("fd 3 null");
-    let mut child = cmd.spawn().expect("spawn");
-    let mut stderr = child.stderr().expect("stderr reader");
-    let mut buf = Vec::new();
-    stderr.read_to_end(&mut buf).expect("read stderr");
+    cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
+    cmd.stderr(Stdio::from_file(err_f.try_clone().expect("clone stderr target")))
+        .expect("stderr from_file");
+    cmd.fd(3, Stdio::null()).expect("fd 3 null");
+    let child = cmd.spawn().expect("spawn");
     let _ = child.wait();
+
+    let mut buf = Vec::new();
+    err_f.seek(SeekFrom::Start(0)).expect("seek stderr target");
+    err_f.read_to_end(&mut buf).expect("read stderr target");
 
     assert!(
         buf.is_empty(),
-        "the stderr pipe must not receive fd 3's bytes ('LEAK'), got {buf:?}"
+        "the stderr target file must not receive fd 3's bytes ('LEAK'), got {buf:?}"
     );
 }
 
 /// Through the public `Command` API: with this process' own fd 1 and fd 2 closed,
-/// `.stdout(Stdio::from_file(...))` and `.stderr(Stdio::from_file(...))` land their dup'd
-/// targets at exactly 1 and 2, and three ordinary child mappings follow (`fd(5, null)`,
-/// `fd(6, null)`, and the out-of-range `fd(1_000_000, null)`). Relocating a low mapping source
-/// out of `install()` must not free that exact number back to the OS before `std_cmd.spawn()`'s
-/// own internal fd allocation (its child-to-parent error-reporting pipe) is done with it — see
-/// `fd_map::install`'s module docs. The spawn must fail cleanly (`Err`), and the stderr file
-/// must receive nothing (no leaked exec-error-pipe bytes).
+/// `.stdout(Stdio::from_file(...))` and `.stderr(Stdio::from_file(...))`'s `try_clone`s land
+/// their dup'd targets at 3 or above (the from_file source files are already open at some
+/// higher number before `spawn()` even starts resolving anything). What lands at fd 1 and fd 2
+/// instead are the `fd(5, null)` and `fd(6, null)` mappings' own null sources — the lowest
+/// numbers free at the point each is opened — followed by the out-of-range `fd(1_000_000,
+/// null)` mapping. Relocating a low mapping source out of `install()` must not free that exact
+/// number back to the OS before `std_cmd.spawn()`'s own internal fd allocation (its
+/// child-to-parent error-reporting pipe) is done with it — see `fd_map::install`'s module docs.
+/// The spawn must fail cleanly (`Err`), and the stderr file must receive nothing (no leaked
+/// exec-error-pipe bytes).
 #[cfg(unix)]
 #[test]
 fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {

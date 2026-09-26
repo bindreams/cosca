@@ -588,6 +588,55 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
     );
 }
 
+/// Async twin of sync `relocating_a_low_parent_fd_keeps_spawn_errors_reported`: with this
+/// process' own fd 1 and fd 2 closed, `.stdout(Stdio::from_file(...))` and
+/// `.stderr(Stdio::from_file(...))`'s `try_clone`s land their dup'd targets at 3 or above (the
+/// from_file source files are already open at some higher number before `spawn()` even starts
+/// resolving anything). What lands at fd 1 and fd 2 instead are the `fd(5, null)` and `fd(6,
+/// null)` mappings' own null sources — the lowest numbers free at the point each is opened —
+/// followed by the out-of-range `fd(1_000_000, null)` mapping. Relocating a low mapping source
+/// out of `install()` must not free that exact number back to the OS before `std_cmd.spawn()`'s
+/// own internal fd allocation (its child-to-parent error-reporting pipe) is done with it — see
+/// `fd_map::install`'s module docs. The spawn must fail cleanly (`Err`), and the stderr file
+/// must receive nothing (no leaked exec-error-pipe bytes).
+#[cfg(unix)]
+#[tokio::test]
+async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let out_f = tempfile::tempfile().expect("tempfile for stdout target");
+    let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
+
+    let _restore = common::RestoreStdio::close(&[1, 2]);
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "true"]);
+    cmd.stdout(cosca::Stdio::from_file(out_f.try_clone().expect("clone stdout target")))
+        .expect("stdout from_file");
+    cmd.stderr(cosca::Stdio::from_file(err_f.try_clone().expect("clone stderr target")))
+        .expect("stderr from_file");
+    cmd.fd(5, cosca::Stdio::null()).expect("fd 5 null");
+    cmd.fd(6, cosca::Stdio::null()).expect("fd 6 null");
+    cmd.fd(1_000_000, cosca::Stdio::null()).expect("fd 1_000_000 null");
+
+    let err = cmd
+        .spawn()
+        .expect_err("a relocated low parent fd must fail the spawn cleanly, not corrupt it into Ok");
+
+    let mut buf = Vec::new();
+    err_f.seek(SeekFrom::Start(0)).expect("seek stderr target");
+    err_f.read_to_end(&mut buf).expect("read stderr target");
+
+    assert!(
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error, got {err:?}"
+    );
+    assert!(
+        buf.is_empty(),
+        "the stderr target file must receive nothing — no leaked exec-error-pipe bytes, got {buf:?}"
+    );
+}
+
 /// A wrong-direction accessor must NOT consume the stashed end (the put-back arm): after
 /// the mismatched take returns `None`, the correctly-directioned accessor still yields a
 /// WORKING end — proven by a full round-trip, both directions.
