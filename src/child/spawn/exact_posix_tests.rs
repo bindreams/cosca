@@ -159,9 +159,10 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
 /// `--cap-drop SETUID,SETGID`, back when dropping DAC bypass meant `setuid()`; now that it means
 /// dropping two specific capabilities instead (see that function's doc for why), no `--cap-drop`
 /// combination this suite's own CI lanes exercise still makes it fail this way. A real failure IS
-/// still forceable — a seccomp filter that makes `capset` itself return `EPERM` reproduces it —
-/// just not portably enough to run as an ordinary `cargo test`; [`reports_and_exits_on_an_injected_dac_bypass_failure`]
-/// below exercises the reporting end-to-end without needing one.
+/// still forceable — `strace -f -e trace=capset -e inject=capset:error=EPERM`, measured — just
+/// not portably enough to run as an ordinary `cargo test`;
+/// [`reports_and_exits_on_an_injected_dac_bypass_failure`] below exercises the reporting
+/// end-to-end via [`crate::test_privilege::INJECT_FAILURE_ENV`]'s seam instead.
 fn dac_bypass_failure(e: &std::io::Error) -> (String, i32) {
     (format!("precondition: dropping DAC bypass: {e}"), PRECONDITION_FAILED)
 }
@@ -176,10 +177,12 @@ fn dac_bypass_failure_names_the_precondition_and_keeps_the_error() {
 }
 
 /// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`]'s own `drop_dac_bypass`-failure handling,
-/// factored out so [`fixture_reports_and_exits_on_an_injected_dac_bypass_failure`] can drive it
-/// with a manufactured error via the `cfg(test)` seam below, rather than needing an environment
-/// that can force `drop_dac_bypass` itself to fail for real (see [`dac_bypass_failure`]'s doc for
-/// why that is not portable enough to be this test).
+/// factored out only so [`dac_bypass_failure`]'s message-and-code pair has one place to read from —
+/// NOT itself the seam [`reports_and_exits_on_an_injected_dac_bypass_failure`] drives: that drives
+/// [`crate::test_privilege::drop_dac_bypass`] itself via
+/// [`crate::test_privilege::INJECT_FAILURE_ENV`], through the REAL call site below, rather than
+/// calling this helper directly — a mutant that drops the real call to `drop_dac_bypass` at that
+/// call site entirely (measured) is invisible to a test that bypasses the call site.
 fn report_and_exit_on_dac_bypass_failure(result: std::io::Result<()>) {
     if let Err(e) = result {
         let (msg, code) = dac_bypass_failure(&e);
@@ -188,47 +191,28 @@ fn report_and_exit_on_dac_bypass_failure(result: std::io::Result<()>) {
     }
 }
 
-/// The value carried by [`crate::test_child::fixture_command`]'s env var of the same purpose is
-/// only "a deliberate re-exec happened"; this one additionally carries the message the injected
-/// error must display, since [`fixture_reports_and_exits_on_an_injected_dac_bypass_failure`]
-/// needs one piece of fixture-specific data `is_fixture_reexec` alone does not carry.
-const FIXTURE_INJECT_DAC_BYPASS_FAILURE_ENV: &str = "COSCA_FIXTURE_INJECT_DAC_BYPASS_FAILURE";
-
-/// Inert in an ordinary suite run. Re-executed by
-/// [`reports_and_exits_on_an_injected_dac_bypass_failure`], it calls
-/// [`report_and_exit_on_dac_bypass_failure`] with a manufactured `Err` — the one seam that proves
-/// the reporting path (real stderr, exit `90`) actually works, without needing an environment
-/// that can make [`crate::test_privilege::drop_dac_bypass`] itself fail.
-#[test]
-fn fixture_reports_and_exits_on_an_injected_dac_bypass_failure() {
-    let Some(injected) = std::env::var_os(FIXTURE_INJECT_DAC_BYPASS_FAILURE_ENV) else {
-        return;
-    };
-    if !crate::test_child::is_fixture_reexec() {
-        return;
-    }
-    report_and_exit_on_dac_bypass_failure(Err(std::io::Error::other(injected.to_string_lossy().into_owned())));
-    panic!("report_and_exit_on_dac_bypass_failure must not return on Err");
-}
-
 /// Pins the wiring [`dac_bypass_failure_names_the_precondition_and_keeps_the_error`] cannot: that
-/// a real `drop_dac_bypass` failure is reported to this process's REAL stderr (not swallowed by
-/// libtest's capture, which the child's `Stdio::null()` stdout would otherwise hide — see
-/// [`report`]'s doc) and exits `90`, not merely that the message text would be right if something
-/// downstream ever looked at it.
+/// a `drop_dac_bypass` failure hit at the REAL call site inside
+/// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`] — forced via
+/// [`crate::test_privilege::INJECT_FAILURE_ENV`], not a stand-in that calls
+/// [`report_and_exit_on_dac_bypass_failure`] directly — is reported to this process's REAL stderr
+/// (not swallowed by libtest's capture, which the child's `Stdio::null()` stdout would otherwise
+/// hide — see [`report`]'s doc) and exits `90`. The fixture's own gate ([`FIXTURE_UNREACHABLE_CWD_ENV`]
+/// plus `is_fixture_reexec()`) still needs satisfying, even though this run never reaches the
+/// stdin-gated part of the fixture's body: the injected error fires before that point.
 #[test]
 fn reports_and_exits_on_an_injected_dac_bypass_failure() {
     let child = {
         let _guard = crate::child::spawn::spawn_lock();
-        let mut cmd = crate::test_child::fixture_command(crate::test_child::fixture_path!(
-            fixture_reports_and_exits_on_an_injected_dac_bypass_failure
-        ));
-        cmd.env(FIXTURE_INJECT_DAC_BYPASS_FAILURE_ENV, "injected boom")
-            .output()
+        crate::test_child::fixture_command(FIXTURE_UNREACHABLE_CWD_TEST)
+            .env(FIXTURE_UNREACHABLE_CWD_ENV, "/cosca-test-unreached")
+            .env(crate::test_privilege::INJECT_FAILURE_ENV, "injected boom")
+            .spawn()
             .expect("spawn the fixture")
     };
-    assert_eq!(child.status.code(), Some(PRECONDITION_FAILED), "{child:?}");
-    let stderr = String::from_utf8_lossy(&child.stderr);
+    let output = child.wait_with_output().expect("wait for the fixture");
+    assert_eq!(output.status.code(), Some(PRECONDITION_FAILED), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("dropping DAC bypass"), "{stderr}");
     assert!(stderr.contains("injected boom"), "{stderr}");
 }

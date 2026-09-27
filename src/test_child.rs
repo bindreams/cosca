@@ -281,16 +281,31 @@ const FIXTURE_PARENT_PID_ENV: &str = "COSCA_FIXTURE_PARENT_PID";
 /// otherwise make every fixture silently no-op and every driver test still pass, since "the
 /// fixture did nothing" and "the fixture ran and asserted nothing false" look identical from the
 /// outside.
+///
+/// A caller with more to check before it is really safe to treat this as "gate passed" — a
+/// `marker_env` still to read, a cwd still to assert, as [`expected_cwd`] has — must NOT call
+/// this: writing the line here would happen before that caller's own checks run, so a fixture
+/// whose `marker_env` turns out to be unset would still have the line written, and would still
+/// look like it ran, before its own early return. Such a caller uses [`parent_pid_matches`]
+/// instead, and writes the line itself only once every one of ITS checks has passed.
 #[cfg(unix)]
 pub(crate) fn is_fixture_reexec() -> bool {
-    let reexec = std::env::var(FIXTURE_PARENT_PID_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .is_some_and(|pid| pid == std::os::unix::process::parent_id());
+    let reexec = parent_pid_matches();
     if reexec {
         write_gate_passed();
     }
     reexec
+}
+
+/// The check [`is_fixture_reexec`] makes, without its side effect — see that function's doc for
+/// why a caller with more of its own gate left to check (namely [`expected_cwd`]) must use this
+/// instead.
+#[cfg(unix)]
+fn parent_pid_matches() -> bool {
+    std::env::var(FIXTURE_PARENT_PID_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|pid| pid == std::os::unix::process::parent_id())
 }
 
 /// The line a fixture's own re-exec gate ([`is_fixture_reexec`], or [`expected_cwd`] for a
@@ -364,7 +379,7 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
 /// reading `std::env::current_dir()` directly, so that check is never skippable by omission.
 pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
     #[cfg(unix)]
-    if !is_fixture_reexec() {
+    if !parent_pid_matches() {
         return None;
     }
     let expected = std::path::PathBuf::from(std::env::var_os(marker_env)?);
