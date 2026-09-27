@@ -2,8 +2,20 @@
 
 /// Fork a child that runs `body` and exits with `_exit(0)`. `body` must be async-signal-safe:
 /// this process has other threads.
+///
+/// `body` never `exec`s, so the child inherits every fd this process has open, and, unless it's
+/// signal-killed, never exits until `body` returns on its own. Many callers gate that return on a
+/// write only they send later (`block_on`/a pipe), so a panic anywhere between the fork and that
+/// write would otherwise leave the child running and unreaped: an orphan holding inherited fds
+/// hangs any reader of this binary's stdout to EOF (`cargo test | cat`, a wrapping `.output()`).
+/// Under `cargo nextest` (what CI runs), the same leak is reported as `LEAK`, not a hang.
+///
+/// The returned [`KillOnDrop`] guards against exactly that: it SIGKILLs and reaps the child on
+/// drop unless [`defused`](KillOnDrop::defuse), so a panic anywhere in the caller cleans it up
+/// during unwind.
 #[cfg(target_os = "linux")]
-pub(crate) fn fork_running(body: impl FnOnce()) -> u32 {
+#[must_use = "dropping this immediately kills and reaps the child; bind it for as long as the child must live"]
+pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
     // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
     // `_exit`s without unwinding or running destructors.
     match unsafe { libc::fork() } {
@@ -13,7 +25,101 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> u32 {
             // SAFETY: async-signal-safe.
             unsafe { libc::_exit(0) }
         }
-        pid => pid as u32,
+        raw_pid => {
+            let pid = raw_pid as u32;
+            // Race-free: opened immediately after the fork, while the child is guaranteed still
+            // unreaped under this exact pid. `pidfd_open` binds to whatever process holds the
+            // number at the call moment, and only an unreaped child can hold it here — the same
+            // approach `leaf.rs`'s `end_child` uses to name a child it must not mistarget.
+            let child = rustix::process::Pid::from_raw(raw_pid).expect("fork returned a positive pid");
+            let pidfd = if crate::containment::cgroup::fault::take_force_fork_running_pidfd_failure() {
+                Err(rustix::io::Errno::MFILE)
+            } else {
+                rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty())
+            };
+            match pidfd {
+                Ok(pidfd) => KillOnDrop {
+                    pid,
+                    pidfd: Some(pidfd),
+                },
+                Err(e) => {
+                    // No `KillOnDrop` exists yet to protect this child, and none can: a pidfd is
+                    // exactly what failed to open. It is still unreaped and this process's only
+                    // child under this number, so the bare pid is safe here, this one time,
+                    // before anything else could reap or recycle it.
+                    //
+                    // A test's own probe, opened independently on the same child before it dies,
+                    // lets a test confirm this without racing that same reuse window itself.
+                    if let Ok(probe) = rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty()) {
+                        crate::containment::cgroup::fault::record_fork_running_pidfd_failure_probe(probe);
+                    }
+                    // SAFETY: `raw_pid` is this process's own child, forked immediately above.
+                    unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+                    let mut status = 0;
+                    // SAFETY: as above.
+                    unsafe { libc::waitpid(raw_pid, &mut status, 0) };
+                    panic!("pidfd_open its own just-forked child: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// SIGKILLs and reaps a not-yet-reaped child on drop, unless [`defuse`](Self::defuse)d.
+///
+/// Named by a pidfd opened right after the fork, not by the bare pid number: the kernel may
+/// recycle that number onto an unrelated process once this one is reaped, and a stale-number kill
+/// or reap would then hit the wrong process. Signalling or reaping through the pidfd instead
+/// always targets the exact process it was opened on, however the number gets reused after.
+#[cfg(target_os = "linux")]
+#[must_use = "dropping this immediately kills and reaps the child; bind it for as long as the child must live"]
+pub(crate) struct KillOnDrop {
+    pid: u32,
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl KillOnDrop {
+    /// The guarded pid, without disarming the guard.
+    ///
+    /// Callers must not reap through this number: only this guard's own pidfd may reap the child
+    /// it names, so an independent `waitpid`/`reap(pid)` on the bare number would race this
+    /// guard's `Drop` over the same exit status. Disarm first with
+    /// [`defuse`](Self::defuse) if the caller needs to take over.
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Disarm the guard and hand the pid back: its `Drop` no longer kills or reaps, so the caller
+    /// takes over that responsibility, by whatever means it needs (its own pidfd, `waitpid`, ...).
+    #[must_use = "the pid still needs reaping by some other means; dropping it here leaks the child"]
+    pub(crate) fn defuse(mut self) -> u32 {
+        self.pidfd = None;
+        self.pid
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        use std::os::fd::AsFd;
+
+        let Some(pidfd) = self.pidfd.take() else {
+            return;
+        };
+        let killed = rustix::process::pidfd_send_signal(pidfd.as_fd(), rustix::process::Signal::KILL);
+        let reaped = rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        );
+        if std::thread::panicking() {
+            // Already unwinding a panic: asserting here would abort instead of completing that
+            // unwind, so this is surfaced, not asserted.
+            eprintln!("KillOnDrop: pidfd_send_signal: {killed:?}, waitid: {reaped:?}");
+        } else {
+            debug_assert!(killed.is_ok(), "pidfd_send_signal: {killed:?}");
+            debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");
+        }
     }
 }
 
@@ -194,3 +300,7 @@ pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
         Err(e) => panic!("remove the leaf: {e}"),
     }
 }
+
+#[cfg(test)]
+#[path = "test_support_tests.rs"]
+mod test_support_tests;

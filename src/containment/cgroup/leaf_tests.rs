@@ -588,7 +588,7 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let (ready_read, ready_write) = std::io::pipe().expect("pipe");
     let ready_write_fd = ready_write.as_raw_fd();
-    let member = fork_running(move || {
+    let guard = fork_running(move || {
         // SAFETY (in the child): `signal`, `write`, `_exit` and `pause` are async-signal-safe.
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
@@ -603,7 +603,7 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
     drop(ready_write);
     block_on(ready_read.as_raw_fd()); // the member ignores SIGTERM from here on
     drop(ready_read);
-    std::fs::write(leaf_path.join("cgroup.procs"), format!("{member}\n")).expect("list the member");
+    std::fs::write(leaf_path.join("cgroup.procs"), format!("{}\n", guard.pid())).expect("list the member");
     // `populated 1`: the member is still alive, and Drop's never-killed branch reads this file
     // to tell a leaf still holding its tree from one that already drained on its own.
     std::fs::write(leaf_path.join("cgroup.events"), b"populated 1\nfrozen 0\n").expect("create cgroup.events");
@@ -613,9 +613,7 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
     leaf.terminate().expect("signal the tree");
     let mark = crate::log_capture::mark();
     drop(leaf);
-    // SAFETY: `member` is this process's own unreaped child.
-    unsafe { libc::kill(member as i32, libc::SIGKILL) };
-    reap(member);
+    drop(guard); // SIGKILLs and reaps the member through its pidfd
 
     let records = crate::log_capture::records_since(mark, "cosca-terminate-survivor-leaf");
     assert_eq!(
@@ -2251,11 +2249,13 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
+    // Not yet wired into the guard's protection across this test — a follow-up does that.
     let pid = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
         let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    });
+    })
+    .defuse();
     // SAFETY: the parent's own copy, closed once; the child keeps its own.
     unsafe { libc::close(procs_fd) };
     let received = channel.shut();
@@ -2641,11 +2641,13 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
+    // Not yet wired into the guard's protection across this test — a follow-up does that.
     let pid = fork_running(move || {
         // SAFETY: this child's inherited copy of the channel's child end.
         let _ = unsafe { slot.send_intent() };
         block_on(gate);
-    });
+    })
+    .defuse();
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
     gate_write.write_all(b"x").expect("release the child");
     // Reaped as `std` reaps it: before the exchange is abandoned.
@@ -3003,11 +3005,13 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
+    // Not yet wired into the guard's protection across this test — a follow-up does that.
     let pid = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
         let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    });
+    })
+    .defuse();
     // SAFETY: the parent's own copy, closed once.
     unsafe { libc::close(procs_fd) };
     drop(gate_read);
