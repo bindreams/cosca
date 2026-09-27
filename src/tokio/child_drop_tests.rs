@@ -192,7 +192,11 @@ async fn a_failed_start_kill_still_routes_an_armed_leafs_release_through_the_rea
     drop(child);
 
     let dropping = entered.recv().expect("the armed path must reach the reaper handoff");
-    assert_eq!(dropping, std::thread::current().id(), "#[tokio::test] is current-thread");
+    assert_eq!(
+        dropping,
+        std::thread::current().id(),
+        "#[tokio::test] is current-thread"
+    );
     let executing = started.recv().expect("a worker must take the job");
     assert_ne!(
         executing, dropping,
@@ -257,7 +261,11 @@ async fn an_already_reaped_root_still_routes_an_armed_leafs_release_through_the_
     drop(child);
 
     let dropping = entered.recv().expect("the armed path must reach the reaper handoff");
-    assert_eq!(dropping, std::thread::current().id(), "#[tokio::test] is current-thread");
+    assert_eq!(
+        dropping,
+        std::thread::current().id(),
+        "#[tokio::test] is current-thread"
+    );
     let executing = started.recv().expect("a worker must take the job");
     assert_ne!(
         executing, dropping,

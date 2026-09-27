@@ -264,7 +264,10 @@ async fn leak_after_a_cancelled_wait_on_a_live_recyclable_child_neither_blocks_n
          waiting on its exit — the exit had not happened yet at the time of the poll, so nothing \
          must have been parked waiting for it off this future"
     );
-    assert!(unreaped.held.is_some(), "the child is still held after the cancelled wait");
+    assert!(
+        unreaped.held.is_some(),
+        "the child is still held after the cancelled wait"
+    );
 
     // Safe to call directly, not merely inferred: `blocking` being `None` above means `leak`
     // cannot take the branch that would otherwise block on that task's own report (see `leak`'s
