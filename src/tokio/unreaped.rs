@@ -488,14 +488,19 @@ impl Unreaped {
         Unreaped::with_retained(held, retained)
     }
 
-    /// Test-only: whether this `Unreaped` retained a containment mechanism to give up or await
-    /// (rather than nothing) — see [`with_retained`](Unreaped::with_retained)'s own doc for who
-    /// has one and who does not. Windows-only: its one caller is the async raw-spawn-teardown
-    /// regression test, and the raw async backend itself is Windows-only, so this is dead code on
-    /// every other target.
+    /// Test-only: whether what this `Unreaped` retained is specifically a `JobObject` — stronger
+    /// than a bare `is_some()` check, which a retention of ANY kind (including one no longer
+    /// actionable) would also satisfy (round-3's test-quality finding on `spawn_tests.rs`'s async
+    /// raw-teardown regression test). Windows-only: its one caller is that regression test, and
+    /// the raw async backend itself is Windows-only, so this is dead code on every other target.
     #[cfg(all(test, windows))]
-    pub(crate) fn has_retained(&self) -> bool {
-        self.retained.is_some()
+    pub(crate) fn retains_a_job_object(&self) -> bool {
+        matches!(
+            self.retained.as_deref(),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::JobObject(_)
+            })
+        )
     }
 
     /// The child's process id. It stays this child's until the child is reaped.

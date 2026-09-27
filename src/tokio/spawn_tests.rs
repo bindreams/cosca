@@ -982,18 +982,26 @@ fn an_async_raw_teardown_retains_the_attached_job_through_an_identity_failure() 
     let Some(Error::Unreaped { mut child, .. }) = err else {
         panic!("the unkillable, unidentified child must be handed back, got {err:?}");
     };
+    // Stronger than a bare `has_retained()` (round-3's test-quality finding): `is_some()` alone
+    // is also satisfied by a retention of ANY kind, or one already disarmed/inert, so it would
+    // not catch a regression that retained the wrong mechanism, or one no longer actionable.
+    // This asserts the SPECIFIC mechanism `contain_with(Strongest)` on a root attaches — a real
+    // Job Object — is what survived.
     assert!(
-        child.has_retained(),
+        child.retains_a_job_object(),
         "attach_or_fault succeeded (Strongest on a root attaches a real Job Object) before the \
-         identity read failed — the async raw backend's teardown must retain that attachment in \
-         the SAME tokio::Unreaped the caller gets, not drop it (and, via KILL_ON_JOB_CLOSE, tear \
-         the tree down) before Error::Unreaped is even constructed"
+         identity read failed — the async raw backend's teardown must retain that SAME Job \
+         Object attachment in the SAME tokio::Unreaped the caller gets, not drop it (and, via \
+         KILL_ON_JOB_CLOSE, tear the tree down) before Error::Unreaped is even constructed"
     );
 
     let captured = fault::take_captured().expect("seam captured the child's identity");
     let crate::identity::Resolved::Found(id) = captured else {
         panic!("the seam must capture a resolved identity, got {captured:?}");
     };
+    // The tree survives until THIS explicit kill, not before: were the Job Object already torn
+    // down at hand-back (the very regression `retains_a_job_object` above guards against), the
+    // child would already be dead here, and this kill would find nothing left to end.
     crate::wait::kill(id).expect("end the child");
     runtime.block_on(child.wait()).expect("wait for the handed-back child");
     fault::assert_child_reaped(captured);
