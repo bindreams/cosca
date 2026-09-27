@@ -1,7 +1,9 @@
 //! `Unreaped`'s contract, on a child held as a spawn teardown holds it: `wait` reaps and returns
 //! the status, `leak` gives the child up unreaped, and `Drop` blocks until the child exits.
 
-use super::{Held, Retained, Unreaped};
+#[cfg(target_os = "macos")]
+use super::Retained;
+use super::{Held, Unreaped};
 use crate::identity::{ProcessId, Resolved};
 
 /// A child blocked reading stdin until the returned end drops, and its identity.
@@ -181,7 +183,8 @@ fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie
     let marker = crate::containment::fdmarker::Marker::new(prepared, None, Some(pid as i32), false);
     let key = marker.hard_kill_test_key();
 
-    let zombie_at_sweep: std::sync::Arc<std::sync::Mutex<Option<bool>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let zombie_at_sweep: std::sync::Arc<std::sync::Mutex<Option<bool>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let flag = std::sync::Arc::clone(&zombie_at_sweep);
     crate::containment::fdmarker::fault::set_hard_kill_hook(
         key,

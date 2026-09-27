@@ -196,9 +196,7 @@ impl ReapTask {
             // `sweep_recyclable_pgid_before_reap`'s doc — before the reap a few lines below frees
             // it. A no-op, leaving `self.retained` unchanged, for every other kind of retention.
             if let Some(retained) = self.retained.take() {
-                self.retained = Some(crate::child::unreaped::sweep_recyclable_pgid_before_reap(
-                    pid, retained,
-                ));
+                self.retained = Some(crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, retained));
             }
             self.held.as_mut().expect("claimed above").try_reap()
         });
@@ -527,7 +525,11 @@ impl Unreaped {
                 .retained
                 .as_ref()
                 .is_some_and(|retained| retained.attached.carries_recyclable_pgid());
-            let outcome = if recyclable { Err(Failed::NotYetReapable) } else { wait_on(held).await };
+            let outcome = if recyclable {
+                Err(Failed::NotYetReapable)
+            } else {
+                wait_on(held).await
+            };
             match outcome {
                 Ok(status) => {
                     let status = self.reaped(status);

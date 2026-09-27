@@ -2,7 +2,9 @@
 //! child, `leak` gives it up unreaped, and `Drop` blocks until the child exits.
 
 use super::Unreaped;
-use crate::child::unreaped::{Held, Retained};
+use crate::child::unreaped::Held;
+#[cfg(target_os = "macos")]
+use crate::child::unreaped::Retained;
 use crate::identity::{ProcessId, Resolved};
 
 /// `reap_failed` and `classify_tokio_wait` are the async side of cosca's single Unix ownership
@@ -80,28 +82,35 @@ async fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_
     use std::os::unix::process::CommandExt;
 
     // See `blocked_child`'s own guard: a real install()+spawn() must not race a concurrent fork
-    // elsewhere in this shared test binary while the marker's write end is open.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
-    let mut std_cmd = std::process::Command::new("cat");
-    std_cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .process_group(0); // a fresh pgid == this child's own pid, with no other members
-    let prepared = crate::containment::fdmarker::install(&mut std_cmd, &[]).expect("install");
-    *tcmd.as_std_mut() = std_cmd;
-    let mut child = tcmd.spawn().expect("spawn a child blocked on stdin");
-    // `install`'s own contract: drop the command promptly, so this supervisor's copy of the
-    // marker's write end (which the command itself still owns post-spawn) does not linger and get
-    // found as a "holder" by this marker's own sweep below.
-    drop(tcmd);
+    // elsewhere in this shared test binary while the marker's write end is open. Scoped to a block
+    // so the guard drops before this function's own `.await` below — clippy's
+    // `await_holding_lock` is right that holding a std `Mutex` guard across an await point is a
+    // hazard in general, even though nothing else here ever awaits while holding it.
+    let (mut child, prepared) = {
+        let _guard = crate::child::spawn::spawn_lock();
+        let mut std_cmd = std::process::Command::new("cat");
+        std_cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .process_group(0); // a fresh pgid == this child's own pid, with no other members
+        let prepared = crate::containment::fdmarker::install(&mut std_cmd, &[]).expect("install");
+        let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
+        *tcmd.as_std_mut() = std_cmd;
+        let child = tcmd.spawn().expect("spawn a child blocked on stdin");
+        // `install`'s own contract: drop the command promptly, so this supervisor's copy of the
+        // marker's write end (which the command itself still owns post-spawn) does not linger and
+        // get found as a "holder" by this marker's own sweep below.
+        drop(tcmd);
+        (child, prepared)
+    };
     let stdin = child.stdin.take().expect("piped stdin");
     let pid = child.id().expect("an unreaped child has a pid");
 
     let marker = crate::containment::fdmarker::Marker::new(prepared, None, Some(pid as i32), false);
     let key = marker.hard_kill_test_key();
 
-    let zombie_at_sweep: std::sync::Arc<std::sync::Mutex<Option<bool>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let zombie_at_sweep: std::sync::Arc<std::sync::Mutex<Option<bool>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let flag = std::sync::Arc::clone(&zombie_at_sweep);
     crate::containment::fdmarker::fault::set_hard_kill_hook(
         key,

@@ -496,7 +496,10 @@ impl Unreaped {
         // — see `sweep_recyclable_pgid_before_reap`'s doc for why the order is load-bearing. A
         // no-op, returning `retained` unchanged, for every other kind of retention.
         #[cfg(unix)]
-        let retained = self.retained.take().map(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
+        let retained = self
+            .retained
+            .take()
+            .map(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
         #[cfg(windows)]
         let retained = self.retained.take();
         let waited = held.wait();
@@ -546,7 +549,10 @@ impl Drop for Unreaped {
         // doc. Taken before `self.held`, on purpose: the pid must not be reaped between this and
         // the wait a few lines down.
         #[cfg(unix)]
-        let retained = self.retained.take().map(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
+        let retained = self
+            .retained
+            .take()
+            .map(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
         #[cfg(windows)]
         let retained = self.retained.take();
         if let Some(held) = self.held.take() {

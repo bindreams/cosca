@@ -814,8 +814,9 @@ pub(crate) mod fault {
     /// run on a tokio blocking-pool thread the registering test never touches directly (see
     /// `tokio::unreaped::ReapTask`), so a thread-local would silently never fire.
     #[allow(clippy::type_complexity)]
-    static HARD_KILL_HOOKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Box<dyn FnOnce() + Send>>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    static HARD_KILL_HOOKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<u64, Box<dyn FnOnce() + Send>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     /// Register a one-shot hook to run from inside the next `hard_kill` call keyed on `key`.
     /// Consumed at most once — see [`run_hard_kill_hook`].
