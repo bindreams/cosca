@@ -1,7 +1,7 @@
 //! `Unreaped`'s contract, on a child held as a spawn teardown holds it: `wait` reaps and returns
 //! the status, `leak` gives the child up unreaped, and `Drop` blocks until the child exits.
 
-use super::{Held, Unreaped};
+use super::{Held, Retained, Unreaped};
 use crate::identity::{ProcessId, Resolved};
 
 /// A child blocked reading stdin until the returned end drops, and its identity.
@@ -147,6 +147,72 @@ fn leak_gives_the_child_up_unreaped_and_logs_it() {
     drop(stdin);
     let pid = nix::unistd::Pid::from_raw(id.pid() as i32);
     nix::sys::wait::waitpid(pid, None).expect("a leaked child is left unreaped");
+}
+
+/// Regression test for the pid/pgid recycle hazard `sweep_recyclable_pgid_before_reap` fixes:
+/// before that fix, `wait`'s own `held.wait()` reaped the root FIRST, and only then dropped
+/// `self.retained` — whose `Drop for Marker` (armed, unconditionally) fires `hard_kill`'s pass-1
+/// `killpg` (see its own doc) on a pgid the OS was, by then, already free to have recycled onto an
+/// unrelated, live process group. This observes the sweep from the inside — a hook fired from
+/// within `Marker::hard_kill` itself (see `fault::set_hard_kill_hook`'s doc) — and asserts the
+/// root pid was still a reapable zombie, never yet actually reaped (so its pgid could not yet
+/// have been recycled), at the exact moment the sweep ran.
+#[cfg(target_os = "macos")]
+#[test]
+fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie() {
+    use std::os::unix::process::CommandExt;
+
+    // See `blocked_child`'s own guard: a real install()+spawn() must not race a concurrent
+    // fork elsewhere in this shared test binary while the marker's write end is open.
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid, with no other members
+    let prepared = crate::containment::fdmarker::install(&mut cmd, &[]).expect("install");
+    let mut child = cmd.spawn().expect("spawn a child blocked on stdin");
+    // `install`'s own contract: drop `cmd` promptly, so this supervisor's copy of the marker's
+    // write end (which `cmd` itself still owns post-spawn) does not linger and get found as a
+    // "holder" by this marker's own sweep below.
+    drop(cmd);
+    let stdin = child.stdin.take().expect("piped stdin");
+    let pid = child.id();
+
+    let marker = crate::containment::fdmarker::Marker::new(prepared, None, Some(pid as i32), false);
+    let key = marker.hard_kill_test_key();
+
+    let zombie_at_sweep: std::sync::Arc<std::sync::Mutex<Option<bool>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let flag = std::sync::Arc::clone(&zombie_at_sweep);
+    crate::containment::fdmarker::fault::set_hard_kill_hook(
+        key,
+        Box::new(move || {
+            // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`. `WNOWAIT`
+            // never reaps, so this can never disturb `wait`'s own reap a few lines below.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            *flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(rc == 0);
+        }),
+    );
+
+    let retained = Retained {
+        attached: crate::containment::Attached::FdMarker(marker),
+    };
+    let unreaped = Unreaped::with_retained(Held::Std(child), Some(retained));
+    drop(stdin); // let the child exit on EOF
+    unreaped.wait().expect("wait for the child");
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(key),
+        1,
+        "the retained marker must be swept exactly once on this path"
+    );
+    assert_eq!(
+        *zombie_at_sweep.lock().unwrap_or_else(|e| e.into_inner()),
+        Some(true),
+        "the sweep must run while the root pid is still a zombie (reapable, unrecycled) — before \
+         wait's own reap frees it for a new process group to take. Got the pid already reaped \
+         (Some(false)), or the sweep never ran at all (None)."
+    );
 }
 
 /// A tokio child that exits promptly, needing no external binary: this same test binary, re-run

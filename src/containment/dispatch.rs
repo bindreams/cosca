@@ -289,6 +289,25 @@ impl Attached {
         }
     }
 
+    /// Neutralize ONLY the fd-marker mechanism's own re-fire, after this handle's own explicit
+    /// `hard_kill()` call already swept the tree once (see `Child::drop`). Every other mechanism
+    /// is left untouched, unlike the blanket [`disarm`](Self::disarm) this replaced at that call
+    /// site: a `CgroupLeaf`'s `killed` flag already tracks whether ITS write from that same sweep
+    /// actually succeeded, and its own `Drop` needs to retry the write if it did not (see
+    /// `CgroupLeaf::hard_kill`'s doc) — disarming it unconditionally right after the sweep
+    /// suppressed that retry regardless of whether the sweep had succeeded, silently giving up on
+    /// an occupied leaf. A pgroup/`TreeWalk`/Job Object's own resource-drop never re-kills at all
+    /// (see `disarm`'s own per-variant notes), so leaving them untouched here changes nothing for
+    /// them either — only the fd marker's `Drop` (which unconditionally re-fires `killpg`, see its
+    /// own doc) needs this.
+    pub(crate) fn disarm_after_own_sweep(&self) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.disarm(),
+            _ => {}
+        }
+    }
+
     /// Whether this mechanism fires `killpg` against a pgid subject to the reap-then-recycle
     /// hazard `Child::kill_tree`/`terminate_tree`'s precondition assert guards against: the OS
     /// reaping the leader and recycling its pid/pgid onto a different, live process group

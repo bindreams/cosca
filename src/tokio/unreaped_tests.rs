@@ -2,7 +2,7 @@
 //! child, `leak` gives it up unreaped, and `Drop` blocks until the child exits.
 
 use super::Unreaped;
-use crate::child::unreaped::Held;
+use crate::child::unreaped::{Held, Retained};
 use crate::identity::{ProcessId, Resolved};
 
 /// `reap_failed` and `classify_tokio_wait` are the async side of cosca's single Unix ownership
@@ -67,6 +67,72 @@ fn blocked_child() -> (::tokio::process::Child, ::tokio::process::ChildStdin, Pr
         panic!("an unreaped child resolves");
     };
     (child, stdin, id)
+}
+
+/// The async twin of `crate::child::unreaped_tests`'s
+/// `wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie` — see that
+/// test's doc for the hazard this guards against. Here the sweep runs off the tokio blocking pool
+/// (see `ReapTask::run`'s doc), not inline on the caller's own thread, which is exactly why
+/// `fault::set_hard_kill_hook`'s registry is process-global rather than thread-local.
+#[cfg(target_os = "macos")]
+#[::tokio::test]
+async fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie() {
+    use std::os::unix::process::CommandExt;
+
+    // See `blocked_child`'s own guard: a real install()+spawn() must not race a concurrent fork
+    // elsewhere in this shared test binary while the marker's write end is open.
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
+    let mut std_cmd = std::process::Command::new("cat");
+    std_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid, with no other members
+    let prepared = crate::containment::fdmarker::install(&mut std_cmd, &[]).expect("install");
+    *tcmd.as_std_mut() = std_cmd;
+    let mut child = tcmd.spawn().expect("spawn a child blocked on stdin");
+    // `install`'s own contract: drop the command promptly, so this supervisor's copy of the
+    // marker's write end (which the command itself still owns post-spawn) does not linger and get
+    // found as a "holder" by this marker's own sweep below.
+    drop(tcmd);
+    let stdin = child.stdin.take().expect("piped stdin");
+    let pid = child.id().expect("an unreaped child has a pid");
+
+    let marker = crate::containment::fdmarker::Marker::new(prepared, None, Some(pid as i32), false);
+    let key = marker.hard_kill_test_key();
+
+    let zombie_at_sweep: std::sync::Arc<std::sync::Mutex<Option<bool>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let flag = std::sync::Arc::clone(&zombie_at_sweep);
+    crate::containment::fdmarker::fault::set_hard_kill_hook(
+        key,
+        Box::new(move || {
+            // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`. `WNOWAIT`
+            // never reaps, so this can never disturb the reap that follows this sweep.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            *flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(rc == 0);
+        }),
+    );
+
+    let retained = Retained {
+        attached: crate::containment::Attached::FdMarker(marker),
+    };
+    let mut unreaped = Unreaped::with_retained(Held::Tokio(Box::new(child)), Some(retained));
+    drop(stdin); // let the child exit on EOF
+    unreaped.wait().await.expect("wait for the child");
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(key),
+        1,
+        "the retained marker must be swept exactly once on this path"
+    );
+    assert_eq!(
+        *zombie_at_sweep.lock().unwrap_or_else(|e| e.into_inner()),
+        Some(true),
+        "the sweep must run while the root pid is still a zombie (reapable, unrecycled) — before \
+         the reap frees it for a new process group to take. Got the pid already reaped \
+         (Some(false)), or the sweep never ran at all (None)."
+    );
 }
 
 /// Poll `wait` once, assert it is pending — so it really started waiting — and drop it, as the

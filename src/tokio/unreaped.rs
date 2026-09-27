@@ -190,8 +190,18 @@ impl ReapTask {
         if let Some(hook) = self.after_claim.take() {
             hook();
         }
-        let held = self.held.as_mut().expect("claimed above");
-        let reaped = crate::child::unreaped::block_until_reapable(held.pid()).and_then(|()| held.try_reap());
+        let pid = self.held.as_ref().expect("claimed above").pid();
+        let reaped = crate::child::unreaped::block_until_reapable(pid).and_then(|()| {
+            // Sweep a recyclable-pgid retention now, while `pid` is still a zombie — see
+            // `sweep_recyclable_pgid_before_reap`'s doc — before the reap a few lines below frees
+            // it. A no-op, leaving `self.retained` unchanged, for every other kind of retention.
+            if let Some(retained) = self.retained.take() {
+                self.retained = Some(crate::child::unreaped::sweep_recyclable_pgid_before_reap(
+                    pid, retained,
+                ));
+            }
+            self.held.as_mut().expect("claimed above").try_reap()
+        });
         self.report(Some(reaped));
     }
 
@@ -507,7 +517,18 @@ impl Unreaped {
             let Some(held) = self.held.as_mut() else {
                 return Err(self.released_error());
             };
-            match wait_on(held).await {
+            // `wait_on`'s own inline reap (`held.try_reap()`, past its `watch_exit`) has no sweep
+            // of its own — unlike the blocking-pool `ReapTask`'s (see its `run`'s doc) — so a
+            // recyclable-pgid retention must never reach it: force the same `NotYetReapable`
+            // routing `wait_on` itself would take if the exit watch fired before the zombie
+            // existed, sending it to `spawn_blocking_reap` below instead, without ever calling
+            // `wait_on` (and therefore never reaping through it) at all.
+            let recyclable = self
+                .retained
+                .as_ref()
+                .is_some_and(|retained| retained.attached.carries_recyclable_pgid());
+            let outcome = if recyclable { Err(Failed::NotYetReapable) } else { wait_on(held).await };
+            match outcome {
                 Ok(status) => {
                     let status = self.reaped(status);
                     self.await_draining().await;
@@ -1125,6 +1146,16 @@ impl Drop for Unreaped {
         // Only the fallback synchronous wait just below, or just above, can still leave
         // `retained` to settle here: `reaped`, `release` and `leak` all take it themselves.
         let mut failed = false;
+        // Sweep BEFORE the reap below, exactly as the sync twin's `Drop` does (and for the same
+        // reason) — see `sweep_recyclable_pgid_before_reap`'s doc. Taken before `self.held`, on
+        // purpose: the pid must not be reaped between this and the wait a few lines down.
+        #[cfg(unix)]
+        let retained = self
+            .retained
+            .take()
+            .map(|retained| crate::child::unreaped::sweep_recyclable_pgid_before_reap(self.pid, retained));
+        #[cfg(windows)]
+        let retained = self.retained.take();
         if let Some(held) = self.held.take() {
             let mut held = *held;
             let waited = held.wait();
@@ -1140,8 +1171,9 @@ impl Drop for Unreaped {
             #[cfg(windows)]
             drop(held);
         }
-        if let Some(retained) = self.retained.take() {
-            // See `reaped`: a successful reap leaves what it retained armed.
+        if let Some(retained) = retained {
+            // See `reaped`: a successful reap leaves what it retained armed (and a swept
+            // recyclable-pgid retention is already disarmed by then regardless).
             if failed {
                 // Abandoned, not merely disarmed: see `Attached::abandon`'s doc.
                 retained.attached.abandon();

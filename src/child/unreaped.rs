@@ -298,7 +298,7 @@ impl Retained {
 /// wait is bounded by the exit, which has happened, and by any tracer's release: a traced child
 /// (`strace -f`) becomes reapable by its parent only once its tracer lets it go. Blocking, so the
 /// async wait runs it on the blocking pool. `ECHILD`: something else reaped it.
-#[cfg(all(unix, any(test, feature = "tokio")))]
+#[cfg(unix)]
 pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
     // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -312,6 +312,36 @@ pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
             return Err(err);
         }
     }
+}
+
+/// If `retained` carries a pid/pgid the OS could recycle onto an unrelated live process group
+/// once `pid` is reaped (see [`Attached::carries_recyclable_pgid`](crate::containment::Attached::carries_recyclable_pgid)'s
+/// doc), sweep it now — while `pid` is still a zombie, so its group id cannot yet have been
+/// recycled — then hand it back disarmed, so neither the caller's own reap nor the returned
+/// value's eventual `Drop` fires a second, now-unsafe sweep. Every other `retained` is returned
+/// completely unchanged, to settle on the caller's own success/failure branch exactly as before.
+///
+/// Callers MUST call this before reaping `pid` themselves: a zombie's pid (and, for `FdMarker`,
+/// its pgid — which a mode that creates one always sets equal to the root pid) stays allocated
+/// until reaped (POSIX), so sweeping first is what makes the swept `killpg` provably safe. Doing
+/// this after the reap — the bug this exists to fix — reopens the exact hazard `disarm_after_own_sweep`
+/// closes for `Child::drop`'s OWN sweep, for the retained value's sweep instead.
+#[cfg(unix)]
+pub(crate) fn sweep_recyclable_pgid_before_reap(pid: u32, retained: Box<Retained>) -> Box<Retained> {
+    if !retained.attached.carries_recyclable_pgid() {
+        return retained;
+    }
+    if let Err(e) = block_until_reapable(pid) {
+        log::warn!(
+            "could not confirm unreaped child {pid} was still a zombie before sweeping what it \
+             retained ({e}); sweeping it now regardless, though its pgid may already be recycled"
+        );
+    }
+    if let Err(e) = retained.attached.hard_kill() {
+        log::warn!("pre-reap sweep of what unreaped child {pid} retained did not fully succeed: {e}");
+    }
+    retained.attached.disarm_after_own_sweep();
+    retained
 }
 
 /// `waitid` for a [`Held::Bare`] child, through its pidfd if it has one, else by its pid.
@@ -462,16 +492,24 @@ impl Unreaped {
             .held
             .take()
             .expect("an Unreaped holds its child until it is consumed");
+        // Sweep a recyclable-pgid retention BEFORE the reap below, while `pid` is still a zombie
+        // — see `sweep_recyclable_pgid_before_reap`'s doc for why the order is load-bearing. A
+        // no-op, returning `retained` unchanged, for every other kind of retention.
+        #[cfg(unix)]
+        let retained = self.retained.take().map(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
+        #[cfg(windows)]
+        let retained = self.retained.take();
         let waited = held.wait();
         #[cfg(unix)]
         settle_after_wait(held, &waited);
         #[cfg(windows)]
         drop(held);
-        if let Some(retained) = self.retained.take() {
+        if let Some(retained) = retained {
             // A successful reap leaves what it retained armed: its own teardown belongs after
             // the root's reap (see `Retained`'s doc), so it still kills through a failed spawn's
             // grandchildren left behind. Only a failed wait, which never confirmed the reap, gives
-            // it up disarmed.
+            // it up disarmed. (A recyclable-pgid retention swept above is already disarmed by
+            // then, so `give_up`'s own disarm is a harmless no-op for it either way.)
             if waited.is_err() {
                 retained.give_up();
             }
@@ -504,6 +542,13 @@ impl Drop for Unreaped {
         // Only the fallback synchronous wait below can still leave `retained` to settle here:
         // `wait` and `leak` both take it themselves before this ever runs.
         let mut failed = false;
+        // Sweep BEFORE the reap below, exactly as `wait` does — see `sweep_recyclable_pgid_before_reap`'s
+        // doc. Taken before `self.held`, on purpose: the pid must not be reaped between this and
+        // the wait a few lines down.
+        #[cfg(unix)]
+        let retained = self.retained.take().map(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
+        #[cfg(windows)]
+        let retained = self.retained.take();
         if let Some(held) = self.held.take() {
             let mut held = *held;
             let waited = held.wait();
@@ -523,8 +568,9 @@ impl Drop for Unreaped {
             #[cfg(windows)]
             drop(held);
         }
-        if let Some(retained) = self.retained.take() {
-            // See `wait`: a successful reap leaves what it retained armed.
+        if let Some(retained) = retained {
+            // See `wait`: a successful reap leaves what it retained armed (and a swept
+            // recyclable-pgid retention is already disarmed by then regardless).
             if failed {
                 retained.give_up();
             }

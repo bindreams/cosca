@@ -806,6 +806,34 @@ pub(crate) mod fault {
     pub(crate) fn next_hard_kill_test_key() -> u64 {
         NEXT_HARD_KILL_TEST_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// One-shot hooks a regression test registers to observe `Marker::hard_kill`'s call site
+    /// from the inside, keyed on the same never-reused `hard_kill_test_key` as
+    /// [`HARD_KILL_CALLS`] (for the identical reason — see that map's doc). Process-global, not
+    /// thread-local: unlike this module's other fault seams, the sweep this hook observes can
+    /// run on a tokio blocking-pool thread the registering test never touches directly (see
+    /// `tokio::unreaped::ReapTask`), so a thread-local would silently never fire.
+    #[allow(clippy::type_complexity)]
+    static HARD_KILL_HOOKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Box<dyn FnOnce() + Send>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    /// Register a one-shot hook to run from inside the next `hard_kill` call keyed on `key`.
+    /// Consumed at most once — see [`run_hard_kill_hook`].
+    pub(crate) fn set_hard_kill_hook(key: u64, hook: Box<dyn FnOnce() + Send>) {
+        HARD_KILL_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, hook);
+    }
+
+    /// Run and consume `key`'s hook, if one is registered. A no-op for every ordinary (non-test)
+    /// sweep and for every key no test ever registered a hook for.
+    pub(crate) fn run_hard_kill_hook(key: u64) {
+        let hook = HARD_KILL_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 // The attached mechanism =====
@@ -1034,6 +1062,11 @@ impl Marker {
         // always-on fault modules), so the call site must be gated the same way.
         #[cfg(test)]
         fault::record_hard_kill_call(self.hard_kill_test_key);
+        // Test-only: lets a regression test observe, from the inside, exactly when this sweep
+        // runs relative to the caller's own reap (see `fault::HARD_KILL_HOOKS`'s doc). A no-op
+        // unless a test registered a hook for this marker's own key.
+        #[cfg(test)]
+        fault::run_hard_kill_hook(self.hard_kill_test_key);
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
