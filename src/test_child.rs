@@ -412,7 +412,23 @@ fn check_traversable_by(dir: &std::path::Path, uid: libc::uid_t) -> Result<(), S
 /// nulls stdout rather than piping it) can start from this and override just the stdio it needs
 /// changed, rather than hand-rolling the argv/env setup a third time.
 pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    // On Linux, `/proc/self/exe` rather than `std::env::current_exe()`'s resolved path: this
+    // binary itself can end up somewhere a POST-drop caller cannot reach by path at all — measured
+    // running under `cargo-nextest --archive-file`, which extracts the archived test binaries
+    // under `$TMPDIR` (a `pam_tmpdir`-style foreign-owned, `0700` `TMPDIR` then makes even a
+    // FIXTURE'S OWN re-exec of itself, e.g. `stat_errno_via_grandchild`'s grandchild spawn, fail
+    // with `PermissionDenied`, since it needs to traverse INTO that ambient directory to reach the
+    // extracted binary). `/proc/self/exe` is a magic symlink the kernel resolves for whichever
+    // process asks, granting it access to its OWN running executable image regardless of that
+    // image's own directory permissions — `/proc` and `/proc/self` themselves need no special
+    // permission to traverse. Correct for every caller of this function, not just the fixture: at
+    // `execve` time inside a freshly forked child, `/proc/self/exe` still names the PARENT's (this
+    // process's) own image, which is exactly the binary being re-exec'd either way.
+    #[cfg(target_os = "linux")]
+    let program = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let program = std::env::current_exe().expect("current_exe");
+    let mut cmd = std::process::Command::new(program);
     cmd.args(["--test-threads=1", "--exact", fixture])
         .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
         .stdout(std::process::Stdio::piped())
