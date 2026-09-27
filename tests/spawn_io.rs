@@ -596,16 +596,17 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     );
 }
 
-/// A deliberate, always-panicking probe for `RestoreStdio::close`'s panic-hook fix. NEVER runs on
-/// its own: without `COSCA_TEST_TRIGGER_MUTANT_C` set it no-ops, so an ordinary suite pass (which
-/// never sets that var) never sees it fail. Only
-/// [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below invokes it, deliberately, to prove
-/// the fix: before that fix, a panic while `RestoreStdio` held fd 2 closed had its message
-/// silently swallowed (the default panic hook's write to a closed fd 2 fails, and the hook drops
-/// that failure rather than panicking again), so this probe's own message would never reach
-/// anywhere the prover below could see it.
+/// A deliberate, always-panicking probe for `RestoreStdio::close`'s panic-hook fix. `#[ignore]`d
+/// so it never runs as part of an ordinary suite pass, even swept up by a bare `--include-ignored`
+/// (its own `COSCA_TEST_TRIGGER_MUTANT_C` env-var gate is a second, independent no-op guard for
+/// exactly that case). Only [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below invokes
+/// it, deliberately, to prove the fix: before it, a panic while `RestoreStdio` held fd 2 closed
+/// had its message silently swallowed (the default panic hook's write to a closed fd 2 fails, and
+/// the hook drops that failure rather than panicking again), so this probe's own message would
+/// never reach anywhere the prover below could see it.
 #[cfg(unix)]
 #[test]
+#[ignore = "probe"]
 fn cosca_test_mutant_c_deliberate_panic_while_fd2_closed() {
     if std::env::var_os("COSCA_TEST_TRIGGER_MUTANT_C").is_none() {
         return;
@@ -617,27 +618,38 @@ fn cosca_test_mutant_c_deliberate_panic_while_fd2_closed() {
     panic!("COSCA_TEST_MUTANT_C_MARKER: this message must survive fd 2 being closed");
 }
 
-/// Proves `RestoreStdio::close`'s panic-hook fix (see its own doc for the mechanism): re-execs
-/// the deliberately-panicking probe above (opted in via its own env-var gate, so the probe never
-/// runs as part of an ordinary pass) and asserts the probe's own marker message actually reached
-/// somewhere readable — not silently lost to a closed fd 2. Before the fix, this assertion fails:
-/// the probe's process exits non-zero with no trace of its own panic message anywhere in its
-/// captured output.
+/// Proves `RestoreStdio::close`'s panic-hook fix (see its own doc for the mechanism).
+///
+/// Invokes the probe above DIRECTLY with the exact `alone()`-isolated shape — `COSCA_TEST_ALONE`
+/// set to the probe's own name, plus the full `ALONE_ARGS` — so the probe's OWN `alone()` call
+/// matches immediately and does NOT re-exec a second time: one process runs the probe, not two.
+/// This is load bearing, not cosmetic: an extra `alone()` layer in between would convert a
+/// genuine process ABORT (this guard's `Drop` wrongly calling `std::panic::set_hook` during
+/// unwind — which itself panics, uncaught, so the process aborts with no defined exit code,
+/// commonly reported as 134/SIGABRT) into that MIDDLE process's own, entirely ordinary panic (a
+/// clean exit 101, from `alone()`'s own `assert!` on the grandchild's failed
+/// `wait_with_output`) — masking the abort completely behind a passing-looking `!success()`
+/// check. Asserting the probe's own exit code is EXACTLY `101` (libtest's ordinary
+/// panic-in-test exit, not merely "nonzero") is what makes an abort fail this test.
 #[cfg(unix)]
 #[test]
 fn a_panic_while_fd_2_is_closed_still_reaches_stderr() {
+    const PROBE: &str = "cosca_test_mutant_c_deliberate_panic_while_fd2_closed";
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-    cmd.args([
-        "cosca_test_mutant_c_deliberate_panic_while_fd2_closed",
-        "--exact",
-        "--include-ignored",
-        "--nocapture",
-    ])
-    .env("COSCA_TEST_TRIGGER_MUTANT_C", "1");
+    cmd.arg(PROBE)
+        .args(common::ALONE_ARGS)
+        .env("COSCA_TEST_ALONE", PROBE)
+        .env("COSCA_TEST_TRIGGER_MUTANT_C", "1");
     let out = common::output_locked(&mut cmd).expect("run the probe");
-    assert!(
-        !out.status.success(),
-        "the probe is designed to always panic; a success means it silently no-oped instead"
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the probe must fail with an ordinary libtest panic exit (101) — anything else, \
+         including an abort with no exit code at all, means its own panic was not a clean test \
+         failure. got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     let combined = format!(
         "{}{}",
