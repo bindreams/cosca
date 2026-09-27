@@ -1,7 +1,8 @@
 # Design principles
 
 The rules every cosca change follows. Known places where `main` doesn't follow them yet are tracked
-as issues labelled [`tech-debt`](https://github.com/bindreams/cosca/issues?q=is%3Aissue+is%3Aopen+label%3Atech-debt),
+as issues labelled
+[`tech-debt`](https://github.com/bindreams/cosca/issues?q=is%3Aissue+is%3Aopen+label%3Atech-debt),
 grouped by module.
 
 ## 1. No unowned state
@@ -18,7 +19,7 @@ them chose.
 
 **Applies to:** anything that happens later, such as reaps, drain waits, `rmdir`, watchers, retries.
 The cgroup leaf's drain pump ([`watcher.rs`](../src/containment/cgroup/watcher.rs)) is the compliant
-shape: the leaf's first blocking wait starts it, and the leaf's `Drop` stops and joins it.
+shape: the first wait that blocks starts it, and the leaf's `Drop` stops and joins it.
 
 ## 2. Never block a tokio runtime thread
 
@@ -41,29 +42,35 @@ context ([tokio shutdown.rs]).
 
 Async `Drop` may send a bounded number of signals, and may write `cgroup.kill`, which is one bounded
 file write. It never waits for a process exit or a cgroup drain. Completion is explicit and async:
-`wait_tree().await`, or `wait().await` for the root alone. A bare drop that leaves work unfinished
-leaves the resource behind and logs a warning naming it.
+`wait().await` for the root, plus `wait_tree().await` for the tree where the mechanism has a drain
+edge (cgroup, Job Object, fd marker). A bare drop that leaves work unfinished leaves the resource
+behind and logs a warning naming it.
 
-A dropped, still-running async root goes to tokio's own orphan queue, which is tokio's state, not
-cosca's. That queue reaps with `waitpid(pid)`, the one by-number reap cosca accepts (principle 4):
-the only alternative is a reaper cosca would own (principle 1). On evidence of a foreign reap at
-drop time, cosca forgets tokio's child instead of handing it over. What remains is a foreign reap
-after the handoff, which the queue cannot detect.
+A dropped, still-running async root is left to tokio's drop of its `Child`: an in-drop `try_wait`
+([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
+cosca's, and both reap with `waitpid(pid)`, the one by-number reap cosca accepts (principle 4). The
+alternatives are a reaper cosca would own (principle 1), a wait in `Drop` (principle 3), or a leaked
+zombie. On evidence of a foreign reap at drop time, cosca forgets tokio's child instead of handing
+it over. The queue drops a PID that is already reaped, on `ECHILD` ([tokio orphan.rs]). What it
+can't detect is a foreign reap followed by the number's reuse for another child of ours, which it
+would then reap.
 
-**Why:** a kill is not an exit (a process stuck in I/O on a hung NFS mount outlives `SIGKILL`), so
+**Why:** a kill is not an exit (a process stuck in uninterruptible I/O can outlive `SIGKILL`), so
 any wait in `Drop` is unbounded. tokio's predecessor, tokio-process, removed its blocking wait from
 `Drop` for this reason ([tokio-process#51]). Global reapers (`waitpid(-1)`, a subreaper) belong to
 programs that own the whole process, such as tini and the containerd shim. Embeddable libraries
 decline the role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), and runc's Go `libcontainer`
-requires its embedder to supply the reaper ([runc CHANGELOG]).
+requires its embedder to supply the reaper for containers without their own PID namespace ([runc
+CHANGELOG]).
 
 **Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns. The
 sync [`Child`](../src/child.rs) kills and reaps in its `Drop`, which is allowed.
 
 ## 4. Don't act on a bare PID after it may be reused
 
-On Unix a PID is pinned only while its process is an unreaped child (a zombie at worst); on Windows,
-while a handle to the process is open. Signal and wait through a handle that names the process:
+On Unix cosca can rely on a PID only while its process is an unreaped child (a zombie at worst); on
+Windows, only while a handle to the process is open. Signal and wait through a handle that names the
+process:
 
 - on Linux, a `pidfd` opened while the child is provably ours, or the child's own pidfd from before
   `exec`;
@@ -73,7 +80,8 @@ while a handle to the process is open. Signal and wait through a handle that nam
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
-One by-number reap is accepted: tokio's orphan queue reaping a dropped async root (principle 3).
+One by-number reap is accepted: tokio's drop of a still-running async root's `Child`, meaning its
+in-drop `try_wait` and then its orphan queue (principle 3).
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
@@ -126,8 +134,11 @@ documented-only contract breaks silently when a future caller violates it.
 No sleep-then-check, and a timeout's expiry is never taken as proof of a state. A timeout is allowed
 only as a failure bound, whose expiry fails the test or reports an error, like a nextest
 `terminate-after` ([`.config/nextest.toml`](../.config/nextest.toml)); library code sets none on
-work cosca controls. A backoff that re-checks a deterministic condition, with no cap, is fine. No
-arbitrary retry or loop caps.
+work cosca controls. A timeout a caller passes to cosca is the caller's policy: cosca honours it,
+re-reads state at expiry and reports what it finds (`wait_timeout` returns `Ok(None)`,
+`wait_tree_timeout` returns `MembersRemain`, and `graceful_shutdown`'s grace escalates to a kill). A
+backoff that re-checks a deterministic condition, with no cap, is fine. No arbitrary retry or loop
+caps.
 
 **Why:** a sleep is a bet that something has happened by then, and loses on a slow or loaded
 machine.
@@ -151,19 +162,17 @@ whichever tests share the process.
 ## 10. System-affecting tests run in a sandbox
 
 Tests that touch real system state run in a container, VM or CI, never on a developer's host:
-cgroups, Job Objects, elevation, signals to processes the test didn't spawn, and anything under
-`sudo`. Ordinary tests that spawn only this repo's own short-lived children run normally on a host,
-including process-group `kill_tree` tests on those children.
+cgroups, Job Objects, elevation, process-group and session signals, `kqueue` or `waitpid` teardown
+of trees, signals to processes the test didn't spawn, and anything under `sudo`. The only exemption
+is a test that spawns this repo's own short-lived children and signals them by their own handle.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
-correctness, has to be what protects it.
+correctness, has to be what protects it. A recycled process group is reachable on the ordinary
+spawn-then-teardown path, so a group kill in a test can hit an unrelated group on the host.
 
-**Applies to:** all tests. A default run skips the cgroup, elevation, setuid and registry tests,
-which are `#[ignore]`d or gated on an environment variable. Contained tests still create system
-state on two platforms: a cgroup leaf on Linux, whenever the test process's cgroup is writable, and
-a Job Object on Windows. So the suite runs directly on a macOS host, and on Linux and Windows in
-[devvm](../scripts/README.md), a container or CI. CI's cgroup lane runs in a fresh cgroup on a
-throwaway runner ([`ci.yaml`](../.github/workflows/ci.yaml)).
+**Applies to:** all tests. The suite runs in [devvm](../scripts/README.md), a container or CI, and
+its macOS and Windows lanes run on CI. CI's cgroup lane runs in a fresh cgroup on a throwaway
+runner ([`ci.yaml`](../.github/workflows/ci.yaml)).
 
 ## 11. Prefer a dependency over hand-rolled code
 
@@ -187,4 +196,7 @@ step consistent with these principles.
 [tokio-process#51]: https://github.com/alexcrichton/tokio-process/issues/51
 [tokio shutdown.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/blocking/shutdown.rs#L51-L54
 [sd-event.c]: https://github.com/systemd/systemd/blob/885fe07ee37cff7316680b5088d11081e01813b1/src/libsystemd/sd-event/sd-event.c#L3753-L3765
-[runc CHANGELOG]: https://github.com/opencontainers/runc/blob/41b74772b651b3b42a1f04a43a803db16f0e7e9b/CHANGELOG.md#L1219-L1222
+[runc CHANGELOG]: https://github.com/opencontainers/runc/blob/41b74772b651b3b42a1f04a43a803db16f0e7e9b/CHANGELOG.md?plain=1#L1217-L1220
+[tokio reap.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/reap.rs#L122-L128
+[tokio pidfd_reaper.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/pidfd_reaper.rs#L203-L209
+[tokio orphan.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/orphan.rs#L118-L124

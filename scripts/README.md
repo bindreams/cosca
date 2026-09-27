@@ -7,6 +7,11 @@ and reaping all reach outside a single process. **Those tests must never run aga
 machine.** `scripts/devvm.py` provisions throwaway VMs for that purpose, so the blast radius
 of a scratch script bug is a disposable VM, not your laptop.
 
+The only exemption is a test that spawns this repo's own short-lived children and signals them
+by their own handle; process-group signals and tree teardown are not exempt. macOS and Windows
+lanes run on CI. See
+[principle 10](../docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
+
 This is developer tooling, not shipped code and not a CI replacement — CI keeps the
 regression probes; this is for the tests CI structurally cannot run (see
 [Windows guests](#windows-guests) below).
