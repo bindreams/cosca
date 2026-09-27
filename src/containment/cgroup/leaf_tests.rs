@@ -768,7 +768,15 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
 /// test-quality finding). `Child::drop`'s own tree-level `hard_kill`, fired unconditionally near
 /// its top, is what this test forces to fail — the earlier version's hand-called one, done
 /// before `Child` even existed, is gone.
-#[cfg(target_os = "linux")]
+///
+/// Release only: `Child::drop`'s own `debug_assert!(!is_teardown_mechanism_failure(e), ...)`
+/// exists precisely to catch a genuine `Error::Io` reaching that tree-level `hard_kill` call
+/// silently (see `child_tests.rs`'s own regression test for that assert) — which is exactly what
+/// this test forces, on purpose, to drive the leaf into the state it needs. Debug builds assert
+/// the precondition instead of reaching the code this test is actually about, the same tradeoff
+/// `a_child_reaped_elsewhere_is_decided_without_signalling_its_pid` makes for the identical
+/// reason; the release-only CI lane exists to cover it.
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
 #[test]
 fn an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
     use crate::containment::cgroup::fault;
