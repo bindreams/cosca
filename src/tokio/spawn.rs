@@ -538,13 +538,13 @@ pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error
     let kill = match killed {
         // SIGKILL is uncatchable, so this wait — which never kills again — is bounded.
         Ok(()) => {
+            // `wait_and_reap_blocking` confirms the exit via WNOWAIT WITHOUT reaping: the root is
+            // still an unreaped zombie when this returns (the actual reap happens later, when
+            // `child`'s own drop — here, the ordinary one below — collects it). So the SECOND
+            // `hard_kill` call `Child::drop` makes unconditionally, right after this, still lands
+            // on a confirmed-unrecycled pgid: safe, not the hazard it looks like at a glance
+            // (round-4 finding 5; probed against a real kernel). An ordinary drop is correct here.
             child.wait_and_reap_blocking();
-            // The tree is already killed (above) and the root is already killed and reaped (just
-            // above) — an ordinary drop of `child` here would still run `Child::drop`'s OWN
-            // unconditional `hard_kill()` call, AFTER this reap, on a pgid that reap may already
-            // have freed for recycling. `detach()` opts out of that: there is nothing left for it
-            // to do.
-            child.detach();
             return auth_failed("the elevated child was terminated".into());
         }
         Err(e) => kill_error_to_io(e),
