@@ -88,6 +88,7 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
+        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -369,6 +370,7 @@ async fn a_failed_start_kill_still_routes_an_armed_leafs_release_through_the_rea
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
+        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -439,6 +441,7 @@ async fn an_already_reaped_root_still_routes_an_armed_leafs_release_through_the_
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
+        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -640,6 +643,7 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
+        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();

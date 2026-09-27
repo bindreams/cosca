@@ -88,6 +88,11 @@ pub struct Child {
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
     /// `Child`). Drives the universal-teardown kill mapping.
     elevation: Option<crate::elevation::ElevationReport>,
+    /// Whether THIS handle's own [`wait`](Child::wait)/[`try_wait`](Child::try_wait) has ever
+    /// observed the root already exited. Set ONLY by those two calls, NEVER inferred from a
+    /// fresh kernel poll in `Drop` — mirrors the sync `Child`'s identical field; see its doc for
+    /// why a fast-exiting root's own construction-time reap must NOT trip this.
+    reaped_via_public_wait: bool,
 }
 
 impl Child {
@@ -112,6 +117,7 @@ impl Child {
             containment: attachment.containment,
             graceful: attachment.graceful,
             elevation: None,
+            reaped_via_public_wait: false,
         }
     }
 
@@ -456,11 +462,17 @@ impl Child {
     /// Block until the child exits, returning its status. For a bounded wait use
     /// `tokio::time::timeout(d, child.wait())`.
     pub async fn wait(&mut self) -> Result<ExitStatus, crate::tokio::Error> {
-        self.proc_mut().wait().await.map_err(Into::into)
+        let status: ExitStatus = self.proc_mut().wait().await.map_err(crate::tokio::Error::from)?;
+        self.reaped_via_public_wait = true;
+        Ok(status)
     }
     /// Exit status if the child has already exited (non-blocking).
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, crate::tokio::Error> {
-        self.proc_mut().try_wait().map_err(Into::into)
+        let status = self.proc_mut().try_wait().map_err(crate::tokio::Error::from)?;
+        if status.is_some() {
+            self.reaped_via_public_wait = true;
+        }
+        Ok(status)
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
@@ -880,13 +892,13 @@ impl Drop for Child {
         // returns.
         //
         // A recyclable-pgid mechanism's `hard_kill` below would `killpg` a possibly-RECYCLED pgid
-        // if the root was already reaped before this `Drop` ran — e.g. by the caller's own prior
-        // `wait()`, entirely outside this handle's knowledge. Confirm it non-blockingly first:
-        // `Err` (in practice `ECHILD`) means already reaped, so the kill below is skipped, not
-        // risked — matching the sync twin's identical guard.
+        // if the caller's own prior `wait()`/`try_wait()` already reaped the root, entirely
+        // outside this `Drop`'s control. Gated on `reaped_via_public_wait` specifically — not a
+        // fresh kernel poll — matching the sync twin's identical guard; see its doc for why a
+        // fresh poll cannot tell that apart from the ordinary, harmless tokio-internal reap of a
+        // fast-exiting root during spawn itself.
         #[cfg(unix)]
-        let already_reaped =
-            self.os.attached.carries_recyclable_pgid() && crate::child::unreaped::poll_reapable(self.id.pid()).is_err();
+        let already_reaped = self.os.attached.carries_recyclable_pgid() && self.reaped_via_public_wait;
         #[cfg(not(unix))]
         let already_reaped = false;
         let tree = if already_reaped {
