@@ -1877,44 +1877,37 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
 // `pidfd_open` can fail (a full fd table, a seccomp filter). Waiting on the report channel's EOF
 // instead could block forever, so the verdict closes the leaf or learns the child is in it.
 
-/// A leaf with no report and no member is removed, so the child can never enter it, and the spawn
-/// degrades once per errno — warned the first time, `debug` after.
+/// A leaf with no report and no member is removed, so the child can never enter it, and the
+/// spawn degrades to `NotPlaced::Unwaitable` with the pidfd seam's forced errno.
+///
+/// The degrade's log level is not asserted here: this scenario's forced `EMFILE` and
+/// `std::process::id()` match `dispatch_tests::a_leaf_without_a_pidfd_degrades_without_a_kill`'s
+/// exactly, so both tests' `log_degrade` calls would write indistinguishable records into the
+/// shared capture buffer and race when they run concurrently.
+/// `degrade_tests::an_unwaitable_verdict_logs_at_warn` covers the `Unwaitable` log path with its
+/// own unique marker instead.
 #[cfg(target_os = "linux")]
 #[test]
 fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
-    use crate::containment::cgroup::{DegradeCondition, DegradeKind, DegradeReason};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unwaitable");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
-    crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
-    let mut levels = Vec::new();
-    for _ in 0..2 {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let leaf_path = dir.path().join("cosca-unwaitable");
-        std::fs::create_dir(&leaf_path).expect("create the leaf");
-        let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
+    let verdict = leaf.take_placement(std::process::id()).expect("decidable");
+    assert!(
+        !crate::containment::cgroup::fault::pidfd_failure_armed(),
+        "the seam must be consumed by the wait"
+    );
 
-        crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-        let verdict = leaf.take_placement(std::process::id()).expect("decidable");
-        assert!(
-            !crate::containment::cgroup::fault::pidfd_failure_armed(),
-            "the seam must be consumed by the wait"
-        );
-
-        let reason = match verdict {
-            Err(reason @ NotPlaced::Unwaitable { .. }) => reason,
-            other => panic!("expected Unwaitable, got {other:?}"),
-        };
-        assert_eq!(
-            reason.condition(),
-            DegradeCondition {
-                kind: DegradeKind::PidfdUnavailable,
-                errno: Some(libc::EMFILE),
-            }
-        );
-        assert!(!leaf_path.exists(), "the leaf must be closed to the child");
-        levels.push(crate::containment::cgroup::log_degrade_into(&warned, &reason));
+    match verdict {
+        Err(NotPlaced::Unwaitable { source, .. }) => {
+            assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
+        }
+        other => panic!("expected Unwaitable, got {other:?}"),
     }
-    assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
+    assert!(!leaf_path.exists(), "the leaf must be closed to the child");
 }
 
 /// A report already sent is final, pidfd or not, and the leaf is left alone.

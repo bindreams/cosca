@@ -101,12 +101,8 @@ mod log_capture {
         fn flush(&self) {}
     }
 
-    /// `Trace`, the full set: this crate emits no `trace` records at all, and a degrade reason
-    /// is only reported at `warn` the FIRST time this process sees it — `cgroup::log_degrade`
-    /// reports every repeat at `debug` — so a filter narrower than `Debug` would keep whichever
-    /// test happened to degrade first and silently discard every repeat's record before it ever
-    /// reached this logger (`log!` checks `max_level()` first). `Trace` costs nothing beyond
-    /// `Debug` and removes any need to pick between the two.
+    /// `Trace`, the full set: no narrower filter can drop a record before it reaches this
+    /// logger (`log!` checks `max_level()` first).
     pub fn install() {
         INSTALLED.get_or_init(|| {
             log::set_logger(&CaptureLog).expect("first logger in this test process");

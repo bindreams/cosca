@@ -199,30 +199,54 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
 }
 
-/// The warning is once per errno: the first failure at `warn`, every repeat at `debug`.
+/// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
+/// entry point.
 #[test]
-fn the_unreachable_child_warning_is_once_per_errno() {
-    let warned = std::sync::Mutex::default();
-    let error = || Error::Io(std::io::Error::from_raw_os_error(libc::EMFILE));
-    let levels: Vec<_> = (0..2)
-        .map(|_| super::warn_after_fork_into(&warned, &error(), "it was left running"))
-        .collect();
-    assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
-    let other = Error::Io(std::io::Error::from_raw_os_error(libc::ENOMEM));
-    assert_eq!(
-        super::warn_after_fork_into(&warned, &other, "it was left running"),
-        log::Level::Warn
-    );
+fn the_unreachable_child_warning_is_every_time() {
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let error = || Error::Io(std::io::Error::other("cosca-abandoned-warn-probe-6f21"));
+    let marker = "cosca-abandoned-warn-probe-6f21";
+
+    for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned_child(child, &error());
+        super::warn_for_abandoned_child(child, &error());
+
+        assert_eq!(
+            crate::log_capture::levels_since(mark, marker),
+            [log::Level::Warn, log::Level::Warn]
+        );
+    }
 }
 
-/// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` — the seam's
-/// error names it — and so of this test's spawn, whatever other tests log meanwhile.
+/// `AbandonedChild::Ended` means nothing of the child runs and it is reaped or will be — not a
+/// degraded guarantee, so it logs nothing at all.
+#[test]
+fn ended_abandoned_child_logs_nothing() {
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let error = Error::Io(std::io::Error::other("cosca-abandoned-ended-probe-3a17"));
+    let marker = "cosca-abandoned-ended-probe-3a17";
+
+    let mark = crate::log_capture::mark();
+    super::warn_for_abandoned_child(AbandonedChild::Ended, &error);
+
+    assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
+}
+
+/// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` at `warn` —
+/// the seam's error names it — and so of this test's spawn, whatever other tests log meanwhile.
+/// Checks the level too: a demoted repeat still carries the same text.
 #[cfg(target_os = "linux")]
 fn warned_for(mark: usize, pid: u32, marker: &str) -> bool {
     let spawn = format!("for child {pid})");
     crate::log_capture::records_since(mark, marker)
         .iter()
-        .any(|record| record.contains(&spawn))
+        .zip(crate::log_capture::levels_since(mark, marker))
+        .any(|(record, level)| record.contains(&spawn) && level == log::Level::Warn)
 }
 
 /// Whether the child `pidfd` names has been reaped — which a pidfd, unlike a pid, can answer after

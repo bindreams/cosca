@@ -467,45 +467,20 @@ mod spawn_tests;
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
 /// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
-/// "may". Each is once per errno at `warn`, then at `debug`, as a degraded containment is
-/// reported.
+/// "may". Reported at `warn` every time.
 fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &Error) {
     use crate::containment::AbandonedChild;
 
-    type Warned = std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>;
-    static UNREAPED: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
-    static UNREACHABLE: Warned = std::sync::Mutex::new(std::collections::BTreeSet::new());
-    let (warned, consequence) = match child {
+    let consequence = match child {
         AbandonedChild::Ended => return,
-        AbandonedChild::MaybeUnreaped => (
-            &UNREAPED,
+        AbandonedChild::MaybeUnreaped => {
             "the child exits before `exec` but was left unreaped: it never reached the point where it \
-             names itself, so nothing holds its pid",
-        ),
-        AbandonedChild::MaybeUnreachable => (
-            &UNREACHABLE,
+             names itself, so nothing holds its pid"
+        }
+        AbandonedChild::MaybeUnreachable => {
             "the child was left running and nothing can reach it: only a cgroup v2 leaf is killed \
-             without the child's pid",
-        ),
+             without the child's pid"
+        }
     };
-    warn_after_fork_into(warned, error, consequence);
-}
-
-/// Say that if the failed spawn forked, `consequence` — against an explicit "already warned" set,
-/// returning the level it chose.
-fn warn_after_fork_into(
-    warned: &std::sync::Mutex<std::collections::BTreeSet<Option<i32>>>,
-    error: &Error,
-    consequence: &str,
-) -> log::Level {
-    let errno = match error {
-        Error::Io(e) => e.raw_os_error(),
-        _ => None,
-    };
-    let level = crate::warn_once::report_level(warned, errno);
-    log::log!(
-        level,
-        "tokio spawn failed ({error}); if it failed after forking, {consequence}"
-    );
-    level
+    log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");
 }
