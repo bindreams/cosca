@@ -396,9 +396,14 @@ pub struct Unreaped {
 impl Unreaped {
     /// Hold `held`, which its one check did not find exited or reaped elsewhere, with nothing
     /// retained. Its remaining production callers are Linux's cgroup teardown
-    /// (`containment::cgroup::leaf`) and Windows' elevation/raw-spawn teardown — both of which
-    /// never have containment to retain at their call site — so it is dead code on a macOS build,
-    /// where every production path now goes through `with_retained` instead.
+    /// (`containment::cgroup::leaf`) and Windows' elevation teardown (`elevation::windows`) —
+    /// both of which never have containment to retain at their call site — so it is dead code on
+    /// a macOS build, where every production path now goes through `with_retained` instead. The
+    /// raw-spawn teardown (`child::spawn::windows_raw::raw_spawn_teardown`) is NOT one of these
+    /// callers despite also being Windows-only: unlike the other two, it may have a real mechanism
+    /// to retain (e.g. a Job Object, past a successful attach followed by an identity-read
+    /// failure), so it always calls `with_retained` directly, passing `None` itself when it has
+    /// nothing to retain rather than going through this wrapper.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn new(held: Held) -> Unreaped {
         Unreaped::with_retained(held, None)
@@ -412,6 +417,16 @@ impl Unreaped {
             held: Some(Box::new(held)),
             retained: retained.map(Box::new),
         }
+    }
+
+    /// Test-only: whether this `Unreaped` retained a containment mechanism to give up or await
+    /// (rather than nothing) — see [`with_retained`](Unreaped::with_retained)'s own doc for who
+    /// has one and who does not. Windows-only: its one caller is the raw-spawn-teardown
+    /// regression test, and `raw_spawn_teardown` itself is Windows-only, so this is dead code on
+    /// every other target.
+    #[cfg(all(test, windows))]
+    pub(crate) fn has_retained(&self) -> bool {
+        self.retained.is_some()
     }
 
     /// The child's process id. It stays this child's until the child is reaped.

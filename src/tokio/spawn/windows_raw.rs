@@ -410,17 +410,23 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let attachment = match attach_or_fault(pid, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
+            // A real attach FAILURE retains nothing (mirrors `attach_or_fault`'s own fault seam
+            // doc): there is no attachment here to retain, unlike the identity-failure arm below.
             return Err(crate::child::spawn::unkillable(
                 e,
-                sync_raw::raw_spawn_teardown(proc, pid, suspended),
+                sync_raw::raw_spawn_teardown(proc, pid, suspended, None),
             ));
         }
     };
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            // The attach succeeded, and with it the resume.
-            let handed_back = sync_raw::raw_spawn_teardown(proc, pid, false);
+            // The attach succeeded, and with it the resume. Retain `attachment.attached` in the
+            // teardown rather than letting it drop here: on Windows that would close the Job
+            // Object BEFORE the caller ever sees the `Unreaped` this constructs, and a Job
+            // Object's `Drop` fires `KILL_ON_JOB_CLOSE` — silently tearing the tree down before
+            // `Error::Unreaped` gives the caller any say.
+            let handed_back = sync_raw::raw_spawn_teardown(proc, pid, false, Some(attachment.attached));
             return Err(crate::child::spawn::unkillable(
                 crate::child::spawn::spawn_identity_error(other),
                 handed_back,

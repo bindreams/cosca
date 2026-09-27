@@ -175,17 +175,24 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let attachment = match attach_or_fault(pid, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
+            // A real attach FAILURE retains nothing (mirrors `attach_or_fault`'s own fault seam
+            // doc): there is no attachment here to retain, unlike the identity-failure arm below.
             return Err(crate::child::spawn::unkillable(
                 e,
-                raw_spawn_teardown(proc, pid, suspended),
+                raw_spawn_teardown(proc, pid, suspended, None),
             ));
         }
     };
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            // The attach succeeded, and with it the resume.
-            let handed_back = raw_spawn_teardown(proc, pid, false);
+            // The attach succeeded, and with it the resume. Retain `attachment.attached` in the
+            // teardown rather than letting it drop here: on Windows that would close the Job
+            // Object BEFORE the caller ever sees the `Unreaped` this constructs, and a Job
+            // Object's `Drop` fires `KILL_ON_JOB_CLOSE` — silently tearing the tree down before
+            // `Error::Unreaped` gives the caller any say. `raw_spawn_teardown` decides the
+            // attachment's actual fate (retain for the caller, or disarm on uncertain ownership).
+            let handed_back = raw_spawn_teardown(proc, pid, false, Some(attachment.attached));
             return Err(crate::child::spawn::unkillable(
                 crate::child::spawn::spawn_identity_error(other),
                 handed_back,
@@ -430,20 +437,32 @@ pub(crate) fn app_name_wide(image: Option<&Path>) -> Result<Vec<u16>, Error> {
 /// resumes it, failed. Such a child cannot exit on its own, so it is never handed back: a failed
 /// kill is retried through `proc`, as
 /// [`retry_terminate_suspended`](crate::child::spawn::retry_terminate_suspended) describes.
+///
+/// `attached`: the mechanism `attach_or_fault` attached before the failure this teardown is
+/// unwinding, if any — `None` from the attach-failure arm (nothing was ever attached there), and
+/// the identity-failure arm's own `attachment.attached` otherwise. Retained in the SAME `Unreaped`
+/// a still-running child is handed back in (mirrors `teardown_unadopted`'s identical parameter):
+/// dropping it here instead, unretained, would run its `Drop` — on Windows a Job Object's own
+/// `KILL_ON_JOB_CLOSE` — before `Error::Unreaped` ever reaches the caller, tearing the tree down
+/// with no say from whoever is supposed to decide its fate through `Unreaped::wait`/`leak`.
 #[must_use]
 pub(crate) fn raw_spawn_teardown(
     proc: OwnedHandle,
     pid: u32,
     suspended: bool,
+    attached: Option<crate::containment::Attached>,
 ) -> Option<(std::io::Error, crate::child::unreaped::Unreaped)> {
-    use crate::child::unreaped::{Checked, Held, Unreaped};
+    use crate::child::unreaped::{Checked, Held, Retained, Unreaped};
     let raw = proc.as_raw_handle();
     let rc = RawChild::new(proc, pid);
     if let Err(kill) = kill_for_teardown(&rc) {
         return match Held::Raw(rc).check() {
             Checked::Running(mut held) => {
                 if !suspended {
-                    return Some((kill, Unreaped::new(held)));
+                    return Some((
+                        kill,
+                        Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
+                    ));
                 }
                 // `held` keeps the handle open for the retry.
                 if crate::child::spawn::retry_terminate_suspended(raw, pid) {
@@ -462,6 +481,12 @@ pub(crate) fn raw_spawn_teardown(
             // It had exited, which makes the kill's failure moot.
             Checked::Reaped => None,
             Checked::Uncertain(e) => {
+                // The pid may already name another process: what this spawn retained is given up
+                // disarmed, not left to kill (on Windows, via `KILL_ON_JOB_CLOSE`) through a tree
+                // that may no longer be its own — mirrors `teardown_unadopted`'s identical arm.
+                if let Some(attached) = attached {
+                    attached.disarm();
+                }
                 log::warn!(
                     "raw spawn teardown could not kill pid {pid} ({kill}), and its ownership is \
                      uncertain ({e}); released it without waiting"
