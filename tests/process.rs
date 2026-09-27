@@ -212,37 +212,167 @@ fn foreign_kill_terminates_the_process() {
     p.kill().expect("second kill on a dead process must be Ok");
 }
 
-// pid 1 (init/launchd) is world-resolvable AND non-root-unkillable on Linux and macOS:
-// procfs / sysctl KERN_PROC both resolve it, and a non-root kill(1) returns EPERM, which
-// Process::kill must SURFACE as Err (not swallow into Ok). The ROOT branch stays
-// Linux-only: Linux provably discards unhandled SIGKILL to pid 1 (SIGNAL_UNKILLABLE);
-// XNU's launchd protection is unverified, and being wrong panics the machine — so as
-// root on non-Linux we refuse to signal pid 1 at all.
+/// Runtime preconditions for `#[skuld::test(requires = [...])]`. Each one is `fn() -> Result<(),
+/// String>`; an unmet one reports the test as `ignored` with the `Err`'s text, instead of a
+/// silent skip or a hard failure on every environment that doesn't happen to run as root.
 #[cfg(unix)]
-#[skuld::test]
+mod preconditions {
+    /// `geteuid() == 0`. cosca's tests that must run as an actual privileged caller (as opposed
+    /// to merely a foreign, same-uid one) declare this instead of assuming CI happens to run
+    /// that way — see `README.md`'s "Running tests" section for how a human opts in locally.
+    pub fn root() -> Result<(), String> {
+        // SAFETY: geteuid() takes no arguments and has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            Ok(())
+        } else {
+            Err(
+                "requires root — rerun as root, e.g. `sudo cargo nextest run --test process -E \
+                 'test(=foreign_kill_surfaces_permission_denied)'`"
+                    .into(),
+            )
+        }
+    }
+}
+
+/// The target's uid/gid: an ordinary unprivileged account, distinct from both root (0) and
+/// `READER_UID` below. No `/etc/passwd` entry is required for either — `setuid`/`execve` only
+/// need a number, and neither the target nor the reader ever looks itself up by name.
+#[cfg(unix)]
+const TARGET_UID: u32 = 65534;
+/// The uid/gid `foreign_kill_surfaces_permission_denied` re-execs itself as, to make the actual
+/// `Process::kill` call under test. Different from `TARGET_UID`: this proves a GENUINELY foreign,
+/// unprivileged caller gets `EPERM`, not merely "some non-root uid or other."
+#[cfg(unix)]
+const READER_UID: u32 = 65533;
+
+/// Set by [`foreign_kill_surfaces_permission_denied`] on its own re-exec of this binary, routing
+/// `fn main` (bottom of this file) to [`foreign_kill_helper_main`] instead of the skuld harness —
+/// checked before skuld ever parses argv, so the re-exec'd process never itself becomes a skuld
+/// test run.
+#[cfg(unix)]
+const ENV_TARGET_PID: &str = "COSCA_FOREIGN_KILL_TARGET_PID";
+
+/// Kills and reaps a raw `std::process::Child` on drop, including mid-unwind — so a panic
+/// anywhere in [`foreign_kill_surfaces_permission_denied`] cannot orphan the target. The target
+/// runs under `TARGET_UID`, never root, so THIS kill (issued by the test itself, which only runs
+/// at all once `preconditions::root` has passed) can never itself come back `EPERM`.
+#[cfg(unix)]
+struct KillOnDrop(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A genuinely foreign, unprivileged caller's `kill` on a genuinely foreign, unprivileged target
+/// must surface `EPERM` as `Err`, never swallow it into `Ok`. Runs only as root
+/// (`preconditions::root`): the test needs `CAP_SETUID`/`CAP_SETGID` to drop into two DIFFERENT
+/// unprivileged identities of its own choosing, rather than depending on whatever uid CI happens
+/// to run tests as (see `README.md`'s "Running tests" section for the local `sudo` invocation).
+///
+/// Both the target and the actual caller under test run as ordinary child PROCESSES of this
+/// (root) one — never as this process itself — so root can always name and clean up the target
+/// regardless of what the assertions below do.
+///
+/// Identity crosses the uid boundary as a bare pid (`ENV_TARGET_PID`), not a pidfd: no reuse
+/// window exists to protect against in the first place. This (root) process holds the target's
+/// `std::process::Child` open, UNREAPED, for the target's entire lifetime — the kernel cannot
+/// recycle its pid until this process reaps it, which happens only after the reader below has
+/// already run and reported its verdict. `cosca::Process::from_pid` then does its own identity
+/// resolution (a pidfd on Linux, the platform's equivalent elsewhere) from that pid, at the
+/// instant the reader actually uses it — the same safety property a passed-down pidfd would give,
+/// obtained here for free from the pid simply staying valid throughout.
+#[cfg(unix)]
+#[skuld::test(requires = [preconditions::root])]
 fn foreign_kill_surfaces_permission_denied() {
-    let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
-    assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must be alive");
-    // SAFETY: geteuid() takes no arguments and is always safe.
-    let root = unsafe { libc::geteuid() } == 0;
-    #[cfg(not(target_os = "linux"))]
-    if root {
-        // Fail LOUD, never silently pass unverified (the repo's no-silent-skip rule):
-        panic!(
-            "inconclusive: refusing to SIGKILL pid 1 as root on this platform \
-             (unverified kernel semantics) — run this test unprivileged"
-        );
+    use std::net::TcpListener;
+    use std::os::unix::process::CommandExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+    let addr = listener.local_addr().unwrap().to_string();
+
+    // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
+    // such concept), so this one spawn uses `std::process::Command` directly, replicating
+    // `tests/common/mod.rs`'s `spawn_control` handshake by hand instead of reusing it.
+    let target = std::process::Command::new(common::testbin())
+        .args(["control-block", &addr, "R"])
+        .uid(TARGET_UID)
+        .gid(TARGET_UID)
+        .spawn()
+        .expect("spawn the target under an unprivileged uid");
+    let target_pid = target.id();
+    let (mut sock, _) = listener.accept().expect("accept the target's control connection");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read the target's ready tag");
+
+    // From here on, any panic below (an assertion, or `Command::status()` itself) must still
+    // reach this — see the struct doc for why this kill can never itself return EPERM.
+    let _target_guard = KillOnDrop(Some(target));
+
+    // The actual caller under test: re-exec THIS SAME test binary as READER_UID. Its result
+    // crosses back as an exit code ONLY (never parsed text) — see `foreign_kill_helper_main`'s
+    // doc for the exact mapping.
+    let exe = std::env::current_exe().expect("this test binary's own path");
+    let status = std::process::Command::new(&exe)
+        .uid(READER_UID)
+        .gid(READER_UID)
+        .env(ENV_TARGET_PID, target_pid.to_string())
+        .status()
+        .expect("re-exec this binary as the unprivileged reader");
+
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the unprivileged reader did not confirm EPERM (see its stderr, above, for which check \
+         failed) — got exit code {:?}",
+        status.code()
+    );
+
+    // `_target_guard`'s Drop kills and reaps the target; the OS reclaims the reader's own
+    // resources on its own exit.
+}
+
+/// [`foreign_kill_surfaces_permission_denied`]'s re-exec'd helper mode — dispatched from `fn
+/// main` (bottom of this file) via `ENV_TARGET_PID`, before skuld ever sees argv. Reports its
+/// verdict PURELY via the process exit code, per the caller's own assertion:
+/// - `0`: `Process::kill` on the target surfaced `EPERM` as `Err` — the expected outcome.
+/// - `10`: `kill` unexpectedly returned `Ok(())`.
+/// - `11`: `kill` returned an `Err` other than `Io(EPERM)`.
+/// - `12`: the target pid did not resolve at all.
+/// - `13`: this process is still euid 0 — the uid drop to `READER_UID` silently failed, so the
+///   scenario below never actually ran as an unprivileged caller in the first place.
+///
+/// Every code above `0` also writes a one-line diagnostic to stderr — for a human reading CI
+/// output, never for the test itself to parse back.
+#[cfg(unix)]
+fn foreign_kill_helper_main() -> i32 {
+    // SAFETY: geteuid() takes no arguments and has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("foreign_kill_helper: still euid 0 — the uid drop to READER_UID silently failed");
+        return 13;
     }
-    let r = init.kill();
-    if !root {
-        assert!(
-            matches!(r, Err(cosca::error::Error::Io(_))),
-            "non-root kill of init must surface EPERM as Err, got {r:?}"
-        );
-    } else {
-        assert!(r.is_ok(), "as root, SIGKILL to init is kernel-ignored => Ok, got {r:?}");
+    let pid_str = std::env::var(ENV_TARGET_PID).expect("ENV_TARGET_PID set by the caller");
+    let pid: cosca::identity::RawPid = pid_str.parse().expect("ENV_TARGET_PID is a valid pid");
+    let Some(target) = cosca::Process::from_pid(pid).found() else {
+        eprintln!("foreign_kill_helper: target pid {pid} did not resolve");
+        return 12;
+    };
+    match target.kill() {
+        Err(cosca::error::Error::Io(e)) if e.raw_os_error() == Some(libc::EPERM) => 0,
+        Ok(()) => {
+            eprintln!("foreign_kill_helper: kill() unexpectedly succeeded");
+            10
+        }
+        other => {
+            eprintln!("foreign_kill_helper: kill() returned an unexpected result: {other:?}");
+            11
+        }
     }
-    assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must survive");
 }
 
 #[cfg(unix)]
@@ -636,5 +766,12 @@ fn pid_one_has_no_parent() {
 }
 
 fn main() {
+    // Routes to `foreign_kill_helper_main` on the ONE re-exec `foreign_kill_surfaces_permission_
+    // denied` performs of this same binary — checked first, so that re-exec never itself becomes
+    // a (root-owned, wrongly-uid'd) skuld test run.
+    #[cfg(unix)]
+    if std::env::var_os(ENV_TARGET_PID).is_some() {
+        std::process::exit(foreign_kill_helper_main());
+    }
     skuld::run_all();
 }

@@ -27,6 +27,20 @@ nextest doesn't run doctests, so CI runs those separately with `cargo test --doc
 today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an
 agent can't run that step locally either — it only runs in CI.
 
+### Tests that need root
+
+A few tests (e.g. `foreign_kill_surfaces_permission_denied` in `tests/process.rs`) declare a
+runtime precondition instead of assuming the environment happens to run as root: an ordinary
+`cargo nextest run` reports them `ignored`, with the reason, rather than skipping them silently
+or failing on every unprivileged machine. CI provisions root for exactly these tests (see
+`.github/workflows/ci.yaml`'s "Run root-precondition tests" step) on Linux and macOS.
+
+To run them locally, filter to the test by name and run as root:
+
+```sh
+sudo cargo nextest run --test process -E 'test(=foreign_kill_surfaces_permission_denied)'
+```
+
 ## License
 
 <img align="right" width="150px" height="150px" src="https://www.apache.org/foundation/press/kit/img/the-apache-way-badge/ASF_Badge_apacheway-purple.png">
