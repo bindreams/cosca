@@ -684,7 +684,7 @@ fn wait_bounded_drains_stdout_and_stderr_concurrently() {
 /// of `tests/spawn_io.rs`'s `panic_while_fd2_closed_probe`, proving the SAME mechanism
 /// (`SAVED_STDERR`/`ensure_stderr_panic_hook`) on `RestoreFd2`, not just `RestoreStdio`.
 /// `#[ignore]`d; see that sibling's doc for why a bare `--include-ignored` sweep still executes
-/// but no-ops it (its own env-var gate below).
+/// but now fails loudly instead of no-oping (its own env-var gate below).
 #[test]
 #[ignore = "probe"]
 fn panic_while_fd2_closed_via_restore_fd2_probe() {

@@ -632,8 +632,9 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 /// so an ordinary suite pass never even selects it; a bare `--include-ignored` sweep (one that
 /// does not target it specifically) DOES still run it — libtest executes an ignored test under
 /// that flag — but its own `COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE` env-var gate makes
-/// that a no-op: it returns immediately, touching nothing. Only
-/// [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below sets that var and invokes it,
+/// that fail loudly instead: it `assert!`s the var is set rather than silently returning, so a
+/// bare sweep that reaches here without it fails the sweep instead of reporting a vacuous pass.
+/// Only [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below sets that var and invokes it,
 /// deliberately, to prove the fix: before it, a panic while `RestoreStdio` held fd 2 closed had
 /// its message silently swallowed (the default panic hook's write to a closed fd 2 fails, and the
 /// hook drops that failure rather than panicking again), so this probe's own message would never
@@ -695,7 +696,7 @@ fn a_panic_while_fd_2_is_closed_still_reaches_stderr() {
 /// `RestoreStdio` guards on fd 2 without dropping the first, which — before the fix — deadlocked
 /// this thread instead of panicking. `#[ignore]`d and env-gated exactly like
 /// [`panic_while_fd2_closed_probe`] above; see there for why a bare `--include-ignored` sweep
-/// still executes but no-ops it.
+/// still executes but now fails loudly instead of no-oping.
 ///
 /// The intervening `tempfile::tempfile()` matters: without it, the second `close(&[2])` would
 /// try to dup an ALREADY-CLOSED fd 2 (closed by the first guard) and panic on THAT `fcntl`
