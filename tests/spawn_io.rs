@@ -770,6 +770,171 @@ fn two_overlapping_fd2_closes_do_not_deadlock() {
     }
 }
 
+/// A deliberate probe reproducing the SAME overlap as [`two_overlapping_fd2_closes_probe`], but
+/// panicking with a MARKER right after both guards exist instead of relying on the internal
+/// `debug_assert!` alone.
+///
+/// In a RELEASE build, `_second`'s construction succeeds silently (the debug_assert compiles
+/// out), so execution reaches this probe's own `panic!` with BOTH guards still alive — the only
+/// way to observe, from outside the process, whether `SAVED_STDERR` still holds the FIRST guard's
+/// dup (correct) or the SECOND's (a reintroduced "overwrite unconditionally" bug): the marker's
+/// presence in the captured stderr answers that directly, which
+/// [`two_overlapping_fd2_closes_do_not_deadlock`]'s release-mode exit-code-only check cannot.
+///
+/// In a DEBUG build, `_second`'s construction panics via the pre-existing `debug_assert!` before
+/// this probe's own `panic!` ever runs — the SAME exit code (101) results either way, just via a
+/// different panic; see the prover below for how it accounts for that.
+#[cfg(unix)]
+#[test]
+#[ignore = "probe"]
+fn two_overlapping_fd2_closes_then_panic_probe() {
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_THEN_PANIC_PROBE").is_some(),
+        "this probe must only be invoked via \
+         two_overlapping_fd2_closes_then_panic_lands_on_the_right_stderr (which sets \
+         COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_THEN_PANIC_PROBE) — a bare \
+         --include-ignored sweep that reaches here without it is not exercising the probe, and \
+         must not pass vacuously"
+    );
+    if !common::alone("two_overlapping_fd2_closes_then_panic_probe") {
+        return;
+    }
+    let _first = common::RestoreStdio::close(&[2]);
+    let _file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
+    let _second = common::RestoreStdio::close(&[2]);
+    panic!(
+        "TWO_OVERLAPPING_FD2_CLOSES_THEN_PANIC_MARKER: this message must land on the real, \
+         originally-captured stderr, not wherever the second guard's own dup points"
+    );
+}
+
+/// Proves the "set only if empty" half of the `SAVED_STDERR` overlap fix by OBSERVABLE behavior,
+/// not only via the internal `debug_assert!` that
+/// [`two_overlapping_fd2_closes_do_not_deadlock`] relies on — which cannot prove this in a
+/// RELEASE build, since the debug_assert no-ops there and that prover only checks the exit code.
+/// If `close` reverted to unconditionally overwriting `SAVED_STDERR` on every take (instead of
+/// only when the slot is empty), this probe's own panic message would route into whatever the
+/// SECOND, overlapping guard's own dup pointed at (the throwaway tempfile) instead of the real,
+/// captured stderr, and the marker check below would fail.
+///
+/// Exit 101 holds in both build profiles — via this probe's own explicit panic in release, or via
+/// the pre-existing debug_assert in debug (see the probe's own doc) — but the marker check only
+/// applies to release: a debug build's `_second` never finishes constructing, so the probe's own
+/// `panic!` is unreachable there regardless of whether the mutation is present.
+#[cfg(unix)]
+#[test]
+fn two_overlapping_fd2_closes_then_panic_lands_on_the_right_stderr() {
+    const PROBE: &str = "two_overlapping_fd2_closes_then_panic_probe";
+    let out = common::run_probe_directly(
+        PROBE,
+        &[("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_THEN_PANIC_PROBE", "1")],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the probe must fail with an ordinary libtest panic exit (101) in both build profiles — \
+         got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !cfg!(debug_assertions) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("TWO_OVERLAPPING_FD2_CLOSES_THEN_PANIC_MARKER"),
+            "the probe's own panic message must reach the real captured stderr, not the second \
+             guard's own dup — got:\n{combined}"
+        );
+    }
+}
+
+/// A deliberate probe reproducing the same overlap once more, but explicitly dropping the SECOND
+/// guard (and the tempfile) before panicking, with the FIRST guard still alive. Only in a RELEASE
+/// build does `_second` finish constructing far enough to be explicitly dropped this way — see
+/// [`two_overlapping_fd2_closes_then_panic_probe`]'s doc for the debug-build panic that preempts
+/// it there.
+///
+/// If `Drop` reverted to unconditionally clearing `SAVED_STDERR` (instead of only when it still
+/// holds ITS OWN dup), dropping the second, non-owning guard here would wipe out the FIRST guard's
+/// still-valid registration — even though the first guard is still alive and has not dropped —
+/// and this probe's own panic message would be lost (default-hook-written into whatever the fd 2
+/// slot the second guard's own restore left behind, not the real captured stderr).
+#[cfg(unix)]
+#[test]
+#[ignore = "probe"]
+fn two_overlapping_fd2_closes_then_drop_second_then_panic_probe() {
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_THEN_DROP_SECOND_THEN_PANIC_PROBE").is_some(),
+        "this probe must only be invoked via \
+         two_overlapping_fd2_closes_then_drop_second_then_panic_lands_on_the_right_stderr (which \
+         sets COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_THEN_DROP_SECOND_THEN_PANIC_PROBE) — \
+         a bare --include-ignored sweep that reaches here without it is not exercising the probe, \
+         and must not pass vacuously"
+    );
+    if !common::alone("two_overlapping_fd2_closes_then_drop_second_then_panic_probe") {
+        return;
+    }
+    let _first = common::RestoreStdio::close(&[2]);
+    let file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
+    let second = common::RestoreStdio::close(&[2]);
+    drop(second);
+    drop(file);
+    // `_first` is STILL ALIVE here (it drops only when this function unwinds below) — the whole
+    // point is to panic while the FIRST guard's registration is the only one that should still be
+    // live in `SAVED_STDERR`.
+    panic!(
+        "TWO_OVERLAPPING_FD2_CLOSES_THEN_DROP_SECOND_THEN_PANIC_MARKER: this message must land on \
+         the real, originally-captured stderr via the FIRST guard's still-live registration"
+    );
+}
+
+/// Proves the "clear only own dup" half of the `SAVED_STDERR` overlap fix by OBSERVABLE behavior
+/// — the `Drop`-time counterpart to
+/// [`two_overlapping_fd2_closes_then_panic_lands_on_the_right_stderr`]'s construction-time check.
+/// Neither that prover nor [`two_overlapping_fd2_closes_do_not_deadlock`] ever lets the SECOND
+/// guard finish constructing AND be explicitly dropped while the FIRST is still alive in a way
+/// that observes `Drop`'s clearing behavior specifically — this one does, in release builds.
+///
+/// Exit 101 and the marker-in-release rules are the same as the construction-time prover above:
+/// see its doc for why debug builds never reach the explicit panic here either.
+#[cfg(unix)]
+#[test]
+fn two_overlapping_fd2_closes_then_drop_second_then_panic_lands_on_the_right_stderr() {
+    const PROBE: &str = "two_overlapping_fd2_closes_then_drop_second_then_panic_probe";
+    let out = common::run_probe_directly(
+        PROBE,
+        &[(
+            "COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_THEN_DROP_SECOND_THEN_PANIC_PROBE",
+            "1",
+        )],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the probe must fail with an ordinary libtest panic exit (101) in both build profiles — \
+         got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !cfg!(debug_assertions) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("TWO_OVERLAPPING_FD2_CLOSES_THEN_DROP_SECOND_THEN_PANIC_MARKER"),
+            "the probe's own panic message must reach the real captured stderr via the FIRST \
+             guard's still-live registration, not be lost to a wrongly-cleared slot — got:\n{combined}"
+        );
+    }
+}
+
 /// A deliberate probe for `require_process_per_test` itself: calls `RestoreStdio::close(&[2])`
 /// directly, deliberately NOT wrapped in `common::alone()` first. `#[ignore]`d and env-gated
 /// exactly like the other probes above (see e.g. [`panic_while_fd2_closed_probe`]'s doc) so a bare

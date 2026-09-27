@@ -814,6 +814,148 @@ fn two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock() {
     }
 }
 
+/// A deliberate probe reproducing the same overlap as
+/// `two_overlapping_fd2_closes_via_restore_fd2_probe`, but panicking with a MARKER right after
+/// both guards exist — the lib's own copy of `tests/spawn_io.rs`'s
+/// `two_overlapping_fd2_closes_then_panic_probe`. See there for why this observes, in a RELEASE
+/// build, whether `SAVED_STDERR` still holds the FIRST guard's dup or the SECOND's.
+#[test]
+#[ignore = "probe"]
+fn two_overlapping_fd2_closes_via_restore_fd2_then_panic_probe() {
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_PANIC_PROBE").is_some(),
+        "this probe must only be invoked via \
+         two_overlapping_fd2_closes_via_restore_fd2_then_panic_lands_on_the_right_stderr (which \
+         sets COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_PANIC_PROBE) — a \
+         bare --include-ignored sweep that reaches here without it is not exercising the probe, \
+         and must not pass vacuously"
+    );
+    if !crate::containment::cgroup::test_support::alone(
+        "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_then_panic_probe",
+    ) {
+        return;
+    }
+    let _first = RestoreFd2::take();
+    let _file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
+    let _second = RestoreFd2::take();
+    panic!(
+        "TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_PANIC_MARKER: this message must land on \
+         the real, originally-captured stderr, not wherever the second guard's own dup points"
+    );
+}
+
+/// Proves the "set only if empty" half of the `SAVED_STDERR` overlap fix on `RestoreFd2` by
+/// OBSERVABLE behavior — the lib's own copy of `tests/spawn_io.rs`'s
+/// `two_overlapping_fd2_closes_then_panic_lands_on_the_right_stderr`. See there for why the
+/// marker check only applies in release builds.
+#[test]
+fn two_overlapping_fd2_closes_via_restore_fd2_then_panic_lands_on_the_right_stderr() {
+    const PROBE: &str =
+        "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_then_panic_probe";
+    let out = run_probe_directly(
+        PROBE,
+        &[(
+            "COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_PANIC_PROBE",
+            "1",
+        )],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the probe must fail with an ordinary libtest panic exit (101) in both build profiles — \
+         got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !cfg!(debug_assertions) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_PANIC_MARKER"),
+            "the probe's own panic message must reach the real captured stderr, not the second \
+             guard's own dup — got:\n{combined}"
+        );
+    }
+}
+
+/// A deliberate probe reproducing the same overlap once more, but explicitly dropping the SECOND
+/// guard (and the tempfile) before panicking, with the FIRST guard still alive — the lib's own
+/// copy of `tests/spawn_io.rs`'s `two_overlapping_fd2_closes_then_drop_second_then_panic_probe`.
+#[test]
+#[ignore = "probe"]
+fn two_overlapping_fd2_closes_via_restore_fd2_then_drop_second_then_panic_probe() {
+    assert!(
+        std::env::var_os(
+            "COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_DROP_SECOND_THEN_PANIC_PROBE"
+        )
+        .is_some(),
+        "this probe must only be invoked via \
+         two_overlapping_fd2_closes_via_restore_fd2_then_drop_second_then_panic_lands_on_the_right_stderr \
+         (which sets \
+         COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_DROP_SECOND_THEN_PANIC_PROBE) \
+         — a bare --include-ignored sweep that reaches here without it is not exercising the \
+         probe, and must not pass vacuously"
+    );
+    if !crate::containment::cgroup::test_support::alone(
+        "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_then_drop_second_then_panic_probe",
+    ) {
+        return;
+    }
+    let _first = RestoreFd2::take();
+    let file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
+    let second = RestoreFd2::take();
+    drop(second);
+    drop(file);
+    // `_first` is STILL ALIVE here — the whole point is to panic while the FIRST guard's
+    // registration is the only one that should still be live in `SAVED_STDERR`.
+    panic!(
+        "TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_DROP_SECOND_THEN_PANIC_MARKER: this \
+         message must land on the real, originally-captured stderr via the FIRST guard's \
+         still-live registration"
+    );
+}
+
+/// Proves the "clear only own dup" half of the `SAVED_STDERR` overlap fix on `RestoreFd2` by
+/// OBSERVABLE behavior — the lib's own copy of `tests/spawn_io.rs`'s
+/// `two_overlapping_fd2_closes_then_drop_second_then_panic_lands_on_the_right_stderr`.
+#[test]
+fn two_overlapping_fd2_closes_via_restore_fd2_then_drop_second_then_panic_lands_on_the_right_stderr() {
+    const PROBE: &str =
+        "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_then_drop_second_then_panic_probe";
+    let out = run_probe_directly(
+        PROBE,
+        &[(
+            "COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_DROP_SECOND_THEN_PANIC_PROBE",
+            "1",
+        )],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the probe must fail with an ordinary libtest panic exit (101) in both build profiles — \
+         got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !cfg!(debug_assertions) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_THEN_DROP_SECOND_THEN_PANIC_MARKER"),
+            "the probe's own panic message must reach the real captured stderr via the FIRST \
+             guard's still-live registration, not be lost to a wrongly-cleared slot — got:\n{combined}"
+        );
+    }
+}
+
 /// A deliberate probe for `require_process_per_test` itself — the lib's own copy of
 /// `tests/spawn_io.rs`'s `close_without_alone_probe`: calls `RestoreFd2::take()` directly,
 /// deliberately NOT wrapped in `crate::containment::cgroup::test_support::alone()` first.
