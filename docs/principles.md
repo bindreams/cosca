@@ -166,9 +166,8 @@ how to opt out explicitly. A test that mutates process-wide state (fds 0–2, rl
 signal dispositions) runs in its own re-exec'd process (`alone()` in
 [`test_support.rs`](../src/containment/cgroup/test_support.rs), `run_fixture_with_cwd()` in
 [`src/test_child.rs`](../src/test_child.rs)), or relies on nextest's process-per-test and asserts
-that it does, through the `alone()`/`require_process_per_test` gate ([#201], [#210]). The gate
-accepts nextest's `NEXTEST_EXECUTION_MODE=process-per-test`, or `alone()`'s `COSCA_TEST_ALONE`
-marker together with its exact argv. `RestoreFd2` is brought under it by [#201] and tracked in
+that it does, through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv
+shape, not just an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in
 [#223].
 
 **Why:** a skipped test reports the same pass as a working one, and a process-wide mutation corrupts
