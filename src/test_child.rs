@@ -212,38 +212,28 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
 /// isolate. [`is_fixture_reexec`] is what the fixture checks, since there is no per-fixture marker
 /// here to carry it instead.
 ///
-/// Also creates a scratch directory and passes it to the fixture via [`FIXTURE_SCRATCH_ROOT_ENV`],
-/// for a fixture that needs to build its OWN tempdir after dropping privilege — a fixture that
-/// called `tempfile::tempdir()` there directly would depend on `TMPDIR` naming a directory the
-/// POST-drop identity can still write to, which the caller's ambient `TMPDIR` has no reason to
-/// guarantee (measured: a `--read-only` rootfs with `TMPDIR` pointing at the one `rw` `tmpfs` mount
-/// — a real CI shape, not a contrived one — fails a `tempdir()` call inside a fixture this
-/// function once forced onto a hardcoded `/tmp` instead, which is read-only in that same
-/// container). Built here, before the drop, with THIS thread's still-undropped privilege, from
-/// this DRIVER's own ambient `TMPDIR` — precisely what `main`'s equivalent fixtures do, and why
-/// this matches their behavior rather than substituting a hardcoded path.
+/// Gives the fixture a scratch directory it can build its OWN tempdir under after dropping
+/// privilege — a fixture that called `tempfile::tempdir()` there directly would depend on
+/// `TMPDIR` naming a directory the POST-drop identity can still write to, which the caller's
+/// ambient `TMPDIR` has no reason to guarantee (measured: a `--read-only` rootfs with `TMPDIR`
+/// pointing at the one `rw` `tmpfs` mount — a real CI shape, not a contrived one — fails a
+/// `tempdir()` call inside a fixture this function once forced onto a hardcoded `/tmp` instead,
+/// which is read-only in that same container). `scratch` itself is built here, before the drop,
+/// with THIS thread's still-undropped privilege, under this DRIVER's own ambient `TMPDIR` —
+/// precisely what `main`'s equivalent fixtures do.
 ///
-/// TWO separate things must be usable by the post-drop identity, not one: `scratch` ITSELF (its
-/// OWNERSHIP, fixed below), and every directory ABOVE it up to and including the ambient `TMPDIR`
-/// value (their TRAVERSAL bit) — a path lookup checks EVERY ancestor component, not just the
-/// final target, so `scratch` being reachable does not by itself make it reachable THROUGH an
-/// ancestor that refuses search permission. Measured: `TMPDIR` pointing at a directory `chown`'d
-/// to a foreign uid, `chmod 0700`'d (the shape `pam_tmpdir` leaves behind for a `sudo -E`
-/// invocation that preserved a non-root caller's own `TMPDIR`) — a root driver still creates
-/// `scratch` inside it fine (its own DAC bypass is undropped), but the CHILD, even at `scratch`
-/// itself owning every bit it needs, fails to `tempdir_in` a subdirectory there with
-/// `PermissionDenied`, because it cannot even traverse INTO that foreign-owned ancestor to reach
-/// `scratch` in the first place. So: this DRIVER (its own DAC bypass never drops) grants the
-/// AMBIENT `TMPDIR` directory itself search access for "other" — traversal only, nothing content-
-/// bearing, and nothing this crate did not already rely on `/tmp` itself conventionally granting
-/// (`1777`) before this function stopped hardcoding it. `scratch` itself is `chown`'d to
-/// [`crate::test_privilege::UNPRIVILEGED`] on non-Linux, when this driver is itself root — the
-/// only case where the fixture's OWN identity changes after the drop (Linux never changes uid —
-/// see [`crate::test_privilege::drop_dac_bypass`] — and an unprivileged driver's own
-/// `drop_root_uid` is a no-op, so the driver's own uid already owns `scratch` either way; a
-/// `chown` from a non-root driver would itself fail with `EPERM`). Removed on return, including on
-/// panic: `scratch`'s `Drop` runs during unwind, and this DRIVER still holds full DAC bypass, so it
-/// can remove a directory the CHILD `chown`'d into and wrote under regardless.
+/// A path lookup checks EVERY ancestor component, not just the final target — `scratch` being
+/// reachable does not by itself make it reachable THROUGH an ancestor that refuses the post-drop
+/// identity search permission. An earlier version of this function tried to fix that by loosening
+/// the AMBIENT `TMPDIR` itself with a `chmod` — measured broken: that permanently widened a THIRD
+/// PARTY's directory beyond what "traversal only" could promise (a `pam_tmpdir`-style `0700`
+/// directory a bare `chmod +x` turns into `0701`, at which point the dropped uid can also read
+/// any file in it BY NAME, not just traverse through it), it could race a concurrent test's own
+/// use of the same directory while trying to restore the original mode afterward, and it still
+/// did not reach the actual bug: an ancestor ABOVE the one directly `chmod`'d (a `0700` home
+/// directory two levels up, say) was never touched at all. See [`open_scratch_fd`] for what
+/// replaced it on Linux, and [`assert_dropped_identity_can_traverse_tmpdir`] for why non-Linux
+/// gets a loud precondition failure instead of an equivalent workaround.
 ///
 /// See [`run_fixture_with_cwd`]'s doc for the re-exec rationale, the panic conditions, and why
 /// `fixture` should come from [`fixture_path!`].
@@ -253,94 +243,153 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
 #[cfg(unix)]
 pub(crate) fn run_fixture(fixture: &str) {
     let scratch = tempfile::tempdir().expect("tempdir for fixture scratch root");
-    ensure_traversable(&std::env::temp_dir());
-    // Only a root driver's fixture actually changes uid on the drop (`drop_root_uid` is a no-op
-    // otherwise, same check) — an unprivileged driver's own uid already owns `scratch`, and a
-    // `chown` to an arbitrary uid from a non-root caller would itself fail with `EPERM`.
-    #[cfg(not(target_os = "linux"))]
-    if unsafe { libc::geteuid() } == 0 {
-        use std::os::unix::ffi::OsStrExt as _;
-        let path = std::ffi::CString::new(scratch.path().as_os_str().as_bytes())
-            .expect("scratch root path has no interior NUL");
-        // SAFETY: `path` is a valid, NUL-terminated C string for a directory this call just
-        // created; `chown` on it fails closed (checked below) rather than touching anything else.
-        let rc = unsafe {
-            libc::chown(
-                path.as_ptr(),
-                crate::test_privilege::UNPRIVILEGED,
-                crate::test_privilege::UNPRIVILEGED,
-            )
-        };
-        if rc != 0 {
-            panic!(
-                "chown scratch root to the fixture's post-drop identity: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
     let mut cmd = fixture_command(fixture);
-    cmd.env(FIXTURE_SCRATCH_ROOT_ENV, scratch.path());
+
+    #[cfg(target_os = "linux")]
+    let _fd_guard = {
+        let fd = open_scratch_fd(scratch.path());
+        cmd.env(FIXTURE_SCRATCH_FD_ENV, fd.0.to_string());
+        fd
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Only a root driver's fixture actually changes uid on the drop (`drop_root_uid` is a
+        // no-op otherwise, same check as that function's own) — an unprivileged driver's own
+        // `tempfile::tempdir()` call just above already PROVES its ambient `TMPDIR` is usable
+        // post-drop, since that identity does not change; only a root driver's does.
+        if unsafe { libc::geteuid() } == 0 {
+            assert_dropped_identity_can_traverse_tmpdir();
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = std::ffi::CString::new(scratch.path().as_os_str().as_bytes())
+                .expect("scratch root path has no interior NUL");
+            // SAFETY: `path` is a valid, NUL-terminated C string for a directory this call just
+            // created — OUR OWN, unlike the ambient `TMPDIR` checked above; `chown` on it fails
+            // closed (checked below) rather than touching anything else.
+            let rc = unsafe {
+                libc::chown(
+                    path.as_ptr(),
+                    crate::test_privilege::UNPRIVILEGED,
+                    crate::test_privilege::UNPRIVILEGED,
+                )
+            };
+            if rc != 0 {
+                panic!(
+                    "chown scratch root to the fixture's post-drop identity: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        cmd.env(FIXTURE_SCRATCH_ROOT_ENV, scratch.path());
+    }
+
     run_fixture_command(fixture, cmd);
 }
 
-/// Adds the "other" execute (search) bit to `dir`'s existing mode, so a path lookup through it —
-/// by whatever uid the fixture drops to — does not fail at this ONE ancestor component regardless
-/// of what else is below it. Every OTHER bit is preserved as-is: this grants traversal only,
-/// nothing content-bearing, matching what `/tmp` itself already conventionally grants (`1777`) —
-/// see [`run_fixture`]'s doc for why an arbitrary ambient `TMPDIR` cannot be assumed to grant the
-/// same.
-///
-/// A no-op, attempting no `chmod` at all, whenever `dir`'s OWNER already matches the uid the
-/// fixture will actually run as post-drop — owner permission bits already cover that case, with
-/// no need to touch "other" at all. That covers every ordinary run: on Linux the fixture never
-/// changes uid (see [`crate::test_privilege::drop_dac_bypass`]), so the driver's own ambient
-/// `TMPDIR` (almost always owned by the driver's own uid) already matches; on non-Linux, an
-/// UNPRIVILEGED driver's own `drop_root_uid` is a no-op, so its ambient `TMPDIR` (owned by that
-/// same uid) matches too. This distinction matters beyond least-privilege: `chmod` on some
-/// ambient `TMPDIR`s fails even for the OWNER — measured, macOS's own per-user `$TMPDIR` under
-/// `/var/folders` carries a SIP `com.apple.rootless` attribute that refuses `chmod` outright, `sudo`
-/// included — so reaching the `chmod` call at all in the ordinary (non-adversarial, uid-matching)
-/// case would break every macOS run, not just skip an unneeded step. The one case this does still
-/// `chmod` is the deliberately adversarial one: a ROOT driver whose ambient `TMPDIR` names a
-/// directory owned by neither uid 0 NOR (on non-Linux) [`crate::test_privilege::UNPRIVILEGED`] —
-/// simulating a leftover foreign `TMPDIR` — where root's own undropped `CAP_FOWNER` (a driver
-/// never drops DAC bypass) is what makes the `chmod` itself possible.
-#[cfg(unix)]
-fn ensure_traversable(dir: &std::path::Path) {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let post_drop_uid = {
-        let euid = unsafe { libc::geteuid() };
-        #[cfg(target_os = "linux")]
-        {
-            euid
+/// A raw directory fd, closed on `Drop` — including during unwind (a fixture's own assertion
+/// failure panics [`run_fixture_command`]), matching `scratch`'s own `TempDir` cleanup. Closing it
+/// matters beyond tidiness: `run_fixture` runs once per DRIVER `#[test]`, all inside the same
+/// long-lived, shared, multi-threaded suite process, so a fd this never closed would accumulate
+/// for as long as that process keeps running tests.
+#[cfg(target_os = "linux")]
+struct OwnedRawFd(std::os::unix::io::RawFd);
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedRawFd {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was opened by `open_scratch_fd`, uniquely owned by this value, and
+        // this is the only place that closes it.
+        unsafe {
+            libc::close(self.0);
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            if euid == 0 {
-                crate::test_privilege::UNPRIVILEGED
-            } else {
-                euid
-            }
-        }
-    };
-    let meta = std::fs::metadata(dir).expect("stat the ambient TMPDIR");
-    if meta.uid() == post_drop_uid {
-        return; // owner permission bits already cover the fixture's post-drop identity
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o001 != 0 {
-        return; // "other" already has search access — no chmod needed, none attempted
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o001))
-        .expect("chmod the ambient TMPDIR traversable");
 }
 
-/// The env var [`run_fixture`] passes a fixture its scratch directory through — see that
-/// function's doc for why a fixture needing its own tempdir after dropping privilege must build
-/// it under this path (e.g. via `tempfile::Builder::new().tempdir_in(..)`) rather than call
-/// `tempfile::tempdir()`, which trusts an ambient `TMPDIR` this crate makes no promise about.
-#[cfg(unix)]
+/// Opens `dir` (the scratch root [`run_fixture`] just created) `O_DIRECTORY`, deliberately WITHOUT
+/// `O_CLOEXEC` — this fd must survive the fixture's own `execve`, unlike every other fd this
+/// process holds. `std::fs::File::open` cannot be used for this: it always sets close-on-exec.
+///
+/// The fixture reads this fd's NUMBER (env-carried — see [`FIXTURE_SCRATCH_FD_ENV`]) and builds
+/// its own paths under `/proc/<its own pid>/fd/<that number>/...` rather than under `dir` itself.
+/// A lookup through that `/proc` magic link is resolved against the fd's OWN target directly,
+/// without re-walking `dir`'s ancestor chain — so an ambient `TMPDIR` this crate does not own, and
+/// must not `chmod` (see [`run_fixture`]'s doc), no longer needs to be traversable by the
+/// post-drop identity AT ALL; only `dir` itself does, and this driver (never dropping its own DAC
+/// bypass) already has full access to what it just created. Measured: a directory `chmod 0o000`'d
+/// BELOW this fd's target (`locked_then_open`'s own precondition, in `resolve_base_tests.rs`)
+/// still answers `EACCES` for the dropped identity — the ancestor-skipping is scoped to what is
+/// ABOVE the fd's target, never to what a fixture builds under it for its own purposes.
+///
+/// The PID form, not `/proc/self/fd/<n>`: a probe run as a GRANDCHILD of the fixture (see
+/// `resolve_base_tests.rs`'s `stat_errno_via_grandchild`) does not inherit this fd — a fresh
+/// re-exec starts its own fd table — so `self` there would resolve against the GRANDCHILD's own,
+/// unrelated fd `<n>` (or none at all). `/proc/<fixture's own pid>/fd/<n>` instead resolves
+/// against the FIXTURE's fd table by walking `/proc`, which needs no inheritance and works for ANY
+/// reader, related or not, for as long as the FIXTURE process (whose pid names the link) is still
+/// alive to hold the fd open — true for the whole time any grandchild it spawns is running, since
+/// the fixture blocks on that grandchild's exit before doing anything else.
+#[cfg(target_os = "linux")]
+fn open_scratch_fd(dir: &std::path::Path) -> OwnedRawFd {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("scratch root path has no interior NUL");
+    // SAFETY: `path` is a valid, NUL-terminated C string for a directory this call just created.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_DIRECTORY | libc::O_RDONLY) };
+    if fd < 0 {
+        panic!("open scratch root as O_DIRECTORY: {}", std::io::Error::last_os_error());
+    }
+    OwnedRawFd(fd)
+}
+
+/// The env var [`run_fixture`] passes the scratch directory's fd NUMBER through, on Linux — see
+/// [`open_scratch_fd`]'s doc for why a fixture needing its own tempdir after dropping privilege
+/// must build it under `/proc/<its own pid>/fd/<this number>/...` rather than trust an ambient
+/// `TMPDIR` this crate makes no promise about.
+#[cfg(target_os = "linux")]
+pub(crate) const FIXTURE_SCRATCH_FD_ENV: &str = "COSCA_FIXTURE_SCRATCH_FD";
+
+/// The env var [`run_fixture`] passes a fixture its scratch directory through, on non-Linux —
+/// [`open_scratch_fd`]'s `/proc` trick has no non-Linux equivalent, so there the fixture is simply
+/// handed `scratch`'s real path directly (e.g. for `tempfile::Builder::new().tempdir_in(..)`), and
+/// [`assert_dropped_identity_can_traverse_tmpdir`] is what makes that safe to trust for a root
+/// driver rather than a `tempfile::tempdir()` call that might silently test the wrong thing.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const FIXTURE_SCRATCH_ROOT_ENV: &str = "COSCA_FIXTURE_SCRATCH_ROOT";
+
+/// Fails loudly, naming the directory, rather than trying to fix it — the owner's rule is that a
+/// test declares its precondition instead of working around an environment that does not meet it
+/// (see [`run_fixture`]'s doc for why loosening someone else's directory is not an option here).
+/// Only called for a ROOT driver on non-Linux, where [`crate::test_privilege::drop_dac_bypass`]
+/// (via its non-Linux `drop_root_uid`) changes the fixture's uid away from this driver's own — the
+/// one case an already-successful `tempfile::tempdir()` call does NOT already prove the ambient
+/// `TMPDIR` usable post-drop, since an unprivileged driver's own uid never changes, so ITS
+/// successful call already is that proof.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn assert_dropped_identity_can_traverse_tmpdir() {
+    let tmpdir = std::env::temp_dir();
+    if let Err(e) = check_traversable_by(&tmpdir, crate::test_privilege::UNPRIVILEGED) {
+        panic!("{e}");
+    }
+}
+
+/// The pure check [`assert_dropped_identity_can_traverse_tmpdir`] panics on — split out so the
+/// logic is checkable against an arbitrary directory and uid, not just this process's real
+/// `TMPDIR` and [`crate::test_privilege::UNPRIVILEGED`].
+#[cfg(all(unix, not(target_os = "linux")))]
+fn check_traversable_by(dir: &std::path::Path, uid: libc::uid_t) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let meta = std::fs::metadata(dir).expect("stat the ambient TMPDIR");
+    let owned_by_dropped_identity = meta.uid() == uid;
+    let other_can_search = meta.permissions().mode() & 0o001 != 0;
+    if owned_by_dropped_identity || other_can_search {
+        Ok(())
+    } else {
+        Err(format!(
+            "precondition: ambient TMPDIR {dir:?} is not traversable by the uid this fixture \
+             drops to ({uid}) — point TMPDIR at a directory that uid can search before running \
+             as root"
+        ))
+    }
+}
 
 /// The `std::process::Command` common to every fixture re-exec: this binary, filtered to exactly
 /// one test, single-threaded, with both stdio streams captured for [`run_fixture_command`], and
