@@ -1083,3 +1083,7 @@ mod resolve_loadable_tests;
 #[cfg(test)]
 #[path = "resolve_base_tests.rs"]
 mod resolve_base_tests;
+
+#[cfg(all(test, windows))]
+#[path = "resolve_windows_tests.rs"]
+mod resolve_windows_tests;

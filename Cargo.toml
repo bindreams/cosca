@@ -61,11 +61,18 @@ regex = "1"
 # case-insensitive way CreateProcess* itself does) to MEASURE the platform rather than to use
 # cosca; `windows_shell_execute` calls ShellExecuteExW from an STA and writes one volatile App
 # Paths key in HKLM and one in HKCU (see its module doc).
+# `Win32_Security_Authorization` is the one addition beyond the main `windows` dependency's own
+# feature list, below: only `resolve_windows_tests.rs` needs it, for `SetNamedSecurityInfoW`,
+# `GetNamedSecurityInfoW`, `SetEntriesInAclW`, `EXPLICIT_ACCESS_W` and `TRUSTEE_W`, to build a
+# real deny ACE on a real Windows host rather than simulate one. Test-only, so it stays out of
+# the published crate's dependency footprint for downstream consumers who only pull in
+# `[dependencies]`, same reasoning as `Wdk_System_SystemServices` above.
 windows = { version = "0.62", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Registry",
