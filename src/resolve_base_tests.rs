@@ -289,6 +289,45 @@ fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
         .and_then(std::io::Error::raw_os_error)
 }
 
+/// Joins two directories into the `;`-separated `PATH` value [`search_tool`]'s `windows: true`
+/// expects to parse — deliberately not `std::env::join_paths`, which would use THIS HOST's own
+/// separator (`:` on Unix) rather than the Windows one every caller here means to test, splitting
+/// nothing at all once handed to [`split_path_var_windows`]. Panics if either directory's own path
+/// contains a literal `;`: `join_paths` refuses exactly that case, for the same reason — a
+/// component holding the separator would silently merge two entries into one instead of raising
+/// an error — and an ambient `TMPDIR` (every caller's tempdir is built under one) is not this
+/// crate's own to control, so this is a real precondition to assert, not a theoretical one.
+#[cfg(unix)]
+fn windows_path_var(first: &Path, second: &Path) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt;
+    for dir in [first, second] {
+        assert!(
+            !dir.as_os_str().as_bytes().contains(&b';'),
+            "precondition: {dir:?} must not itself contain the Windows PATH separator"
+        );
+    }
+    let mut path = first.as_os_str().to_os_string();
+    path.push(";");
+    path.push(second);
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_path_var_joins_two_ordinary_directories() {
+    let path = windows_path_var(Path::new("/tmp/a"), Path::new("/tmp/b"));
+    assert_eq!(path, OsStr::new("/tmp/a;/tmp/b"));
+}
+
+/// The precondition this crate cannot control — an ambient `TMPDIR` containing the Windows `PATH`
+/// separator — must fail loudly, not silently merge two entries into one.
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "must not itself contain the Windows PATH separator")]
+fn windows_path_var_refuses_a_component_holding_the_separator() {
+    windows_path_var(Path::new("/tmp/a;evil"), Path::new("/tmp/b"));
+}
+
 /// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
 ///
 /// The first entry is a symlink to itself: resolving `<loop>/tool.exe` always yields `ELOOP`,
@@ -316,9 +355,7 @@ fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
         !is_absence(&e),
         "precondition: {candidate:?} must be undeterminable, not a definite absence: {e}"
     );
-    let mut path = looping.into_os_string();
-    path.push(";");
-    path.push(&open);
+    let path = windows_path_var(&looping, &open);
     (root, open, path)
 }
 
@@ -389,9 +426,7 @@ fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString
         "precondition: {candidate:?} must be denied to this caller, not {e} — did the caller \
          forget to drop_dac_bypass() first?"
     );
-    let mut path = locked.0.clone().into_os_string();
-    path.push(";");
-    path.push(&open);
+    let path = windows_path_var(&locked.0, &open);
     (root, locked, open, path)
 }
 
