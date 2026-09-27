@@ -367,16 +367,38 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 
 // A parent_fd below fd 3 must not be clobbered by std's own stdio dup2 =====
 
+/// Require that this test is running under `cargo nextest`'s one-process-per-test model before
+/// any caller closes a process-wide fd. A plain `cargo test`/`cargo test --lib` run shares one
+/// process across every test thread in the binary, so closing a real fd 0/1/2 there races with,
+/// and can corrupt, whatever unrelated test's thread next opens something and gets handed the
+/// freed number.
+///
+/// A copy of `tests/common/mod.rs`'s identical helper — this file is a separate compilation unit
+/// (the lib's own unit tests) and cannot name that one. `NEXTEST_EXECUTION_MODE` is nextest's own
+/// documented marker (<https://nexte.st/book/env-vars.html>, currently always
+/// `"process-per-test"` — nextest notes more values may exist once it can run multiple tests in
+/// one process, so this checks equality, not just presence). Fails loudly and immediately, before
+/// touching anything, rather than silently skipping: see cosca#196 for the long-term structural
+/// fix (a Skuld-style `io` serial group, so this stops depending on nextest specifically).
+fn require_process_per_test(what: &str) {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "{what}; run under cargo nextest (one process per test) — see cosca#196"
+    );
+}
+
 /// Dup fd 2 aside and close the original, so the CURRENT test process's fd 2 is free for the
-/// test to reuse — restoring it on drop even if the test panics. Safe because this workspace's
-/// test runner (`cargo nextest`) puts every test function in its own OS process, so this cannot
-/// affect any other test.
+/// test to reuse — restoring it on drop even if the test panics.
+///
+/// `take` asserts [`require_process_per_test`] before touching anything: see there for why.
 struct RestoreFd2 {
     saved: OwnedFd,
 }
 
 impl RestoreFd2 {
     fn take() -> RestoreFd2 {
+        require_process_per_test("closes process-wide fd 2");
         // SAFETY: F_DUPFD_CLOEXEC(2, 3) duplicates fd 2 to a fresh number >= 3, checked below.
         let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
         assert!(saved >= 0, "dup fd 2 aside before closing it");

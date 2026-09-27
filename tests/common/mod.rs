@@ -464,15 +464,34 @@ pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
     assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
 }
 
+/// Require that this test is running under `cargo nextest`'s one-process-per-test model before
+/// any caller touches a process-wide resource (here: closing this process's own low-numbered
+/// fds). A plain `cargo test` run shares one process across every test thread in the binary, so
+/// closing a real fd 0/1/2 there races with, and can corrupt, whatever unrelated test's thread
+/// next opens something and gets handed the freed number.
+///
+/// `NEXTEST_EXECUTION_MODE` is nextest's own documented marker
+/// (<https://nexte.st/book/env-vars.html>, currently always `"process-per-test"` — nextest notes
+/// more values may exist once it can run multiple tests in one process, so this checks equality,
+/// not just presence). Fails loudly and immediately, before touching anything, rather than
+/// silently skipping: see cosca#196 for the long-term structural fix (a Skuld-style `io` serial
+/// group, so this stops depending on nextest specifically).
+#[cfg(unix)]
+fn require_process_per_test(what: &str) {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "{what}; run under cargo nextest (one process per test) — see cosca#196"
+    );
+}
+
 /// Duplicate each of `fds` aside and close it, restoring all of them (on drop, even if the test
 /// panics) so the CURRENT process's own low-numbered descriptors are free for a test to reuse —
 /// then land back where they started. Some fd_map regression tests need this THIS process's own
 /// fd 1 and/or fd 2 closed to reproduce a bug that only manifests when a mapping's parent-side
 /// source, or a `Stdio::from_file` target, gets allocated one of those exact numbers.
 ///
-/// Safe only because this workspace's test runner (`cargo nextest`) puts every test function in
-/// its own OS process — a plain `cargo test` run shares one process across parallel test
-/// threads, so this would race with (and could disable output from) unrelated tests.
+/// `close` asserts [`require_process_per_test`] before touching anything: see there for why.
 #[cfg(unix)]
 pub struct RestoreStdio {
     saved: Vec<(libc::c_int, std::os::fd::OwnedFd)>,
@@ -482,6 +501,11 @@ pub struct RestoreStdio {
 impl RestoreStdio {
     pub fn close(fds: &[libc::c_int]) -> RestoreStdio {
         use std::os::fd::{FromRawFd, OwnedFd};
+        let listed = fds.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+        require_process_per_test(&format!(
+            "closes process-wide fd{} {listed}",
+            if fds.len() == 1 { "" } else { "s" }
+        ));
         let mut saved = Vec::with_capacity(fds.len());
         for &fd in fds {
             // SAFETY: F_DUPFD_CLOEXEC(fd, 3) duplicates fd to a fresh number >= 3, checked below.
