@@ -130,9 +130,10 @@ pub(crate) fn is_fixture_reexec() -> bool {
 
 /// The check [`is_fixture_reexec`] makes, without its side effect — see that function's doc for
 /// why a caller with more of its own gate left to check (namely [`expected_cwd`]) must use this
-/// instead.
+/// instead. Also `pub(crate)`: [`crate::test_privilege::drop_dac_bypass`]'s own contract assert
+/// uses it directly — it needs the check without the write, same as `expected_cwd` does.
 #[cfg(unix)]
-fn parent_pid_matches() -> bool {
+pub(crate) fn parent_pid_matches() -> bool {
     std::env::var(FIXTURE_PARENT_PID_ENV)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -196,7 +197,7 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
 }
 
 /// Reads `marker_env`'s value as the directory [`run_fixture_with_cwd`]'s caller prepared, and
-/// returns `None` when it is unset, or (on unix) when [`is_fixture_reexec`] says this is not
+/// returns `None` when it is unset, or (on unix) when [`parent_pid_matches`] says this is not
 /// really a deliberate re-exec — either way, a fixture is picked up by an ordinary, unfiltered
 /// suite run too, where it must no-op rather than assert against whatever the suite's own ambient
 /// cwd happens to be, or against a `marker_env` some unrelated process happened to leave behind.
@@ -220,8 +221,10 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
         expected.canonicalize().expect("canonicalize expected cwd"),
         "this fixture's OS-level cwd must be the directory run_fixture_with_cwd's caller prepared",
     );
-    // Windows has no `is_fixture_reexec` to have written this already (no `parent_id()` there);
-    // unix already did, via that call above, so this second write is a harmless duplicate.
+    // The only write on any platform: `parent_pid_matches` (unlike `is_fixture_reexec`) has no
+    // side effect of its own, precisely so this line stays unwritten until the marker read and
+    // the cwd assert above have BOTH succeeded — see `parent_pid_matches`'s doc for why that
+    // order matters.
     write_gate_passed();
     Some(expected)
 }

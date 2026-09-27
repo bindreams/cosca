@@ -207,6 +207,12 @@ fn reports_and_exits_on_an_injected_dac_bypass_failure() {
         crate::test_child::fixture_command(FIXTURE_UNREACHABLE_CWD_TEST)
             .env(FIXTURE_UNREACHABLE_CWD_ENV, "/cosca-test-unreached")
             .env(crate::test_privilege::INJECT_FAILURE_ENV, "injected boom")
+            // The real fixture reads a gate byte from stdin AFTER the point this injection
+            // fires, so this run should never reach that read — but a mutant that discards the
+            // injected error (W2) makes it fall through to the real stdin read instead, and an
+            // inherited interactive stdin (a real terminal) would then block forever rather than
+            // fail fast. Measured hanging exactly that way before this fix.
+            .stdin(std::process::Stdio::null())
             .spawn()
             .expect("spawn the fixture")
     };
@@ -267,7 +273,9 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("tempdir");
-    // Reachable by the unprivileged user a root fixture drops to; `tempdir` makes it 0700.
+    // Reachable once `crate::test_privilege::drop_dac_bypass` has run — an unprivileged uid on
+    // non-Linux, or (on Linux) still uid 0 but without the capabilities that would otherwise
+    // read past `tempdir`'s own `0700` regardless of these bits.
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
