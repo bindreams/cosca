@@ -9,6 +9,9 @@ cosca is a library, not a service. It holds no process-lifetime background threa
 queues or retries carried across calls. A helper, even a thread, is allowed only if a handle the
 caller holds owns it and that handle's `Drop` tears it down deterministically.
 
+No process-lifetime state includes log deduplication. Every event is logged at its natural level
+each time it happens; rate-limiting belongs to the application's log handler.
+
 **Why:** state no caller owns cannot be released by any caller, and does its work at moments none of
 them chose.
 
@@ -23,6 +26,10 @@ shape: the leaf's first blocking wait starts it, and the leaf's `Drop` stops and
 - `reap_in_background` in [`src/child/spawn.rs`](../src/child/spawn.rs) and
   [`src/containment/cgroup/leaf.rs`](../src/containment/cgroup/leaf.rs) detaches a thread per child
   a failed spawn could not kill. [#165] (open) hands that child back to the caller instead.
+- The warn-once sets `WARNED` in [`degrade.rs`](../src/containment/cgroup/degrade.rs) and
+  `UNREAPED`/`UNREACHABLE` in [`src/tokio/spawn.rs`](../src/tokio/spawn.rs), through
+  [`warn_once.rs`](../src/warn_once.rs), are process-lifetime state; a PR removing them is in
+  progress.
 
 ## 2. Never block a tokio runtime thread
 
