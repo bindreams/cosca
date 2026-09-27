@@ -320,7 +320,17 @@ fn foreign_kill_surfaces_permission_denied() {
     // subject to the very same umask. A copy into a directory THIS process explicitly chmods,
     // right before use, is the only way to stop depending on whatever umask happens to be
     // ambient in whatever environment (CI's `sudo`, or a human's own shell) runs this test.
-    let scratch = tempfile::tempdir().expect("scratch directory for world-executable copies");
+    //
+    // `tempdir_in("/tmp")`, not plain `tempfile::tempdir()`: the latter honors `$TMPDIR`, which
+    // on macOS is a PER-USER directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, under `/var/folders`)
+    // whose ANCESTORS — not just the leaf this creates — are owned by whichever user is running
+    // this process and are not traversable by another uid, no matter what this leaf itself is
+    // chmod'd to (measured: root's own `$TMPDIR` under `sudo` reproduces the exact same
+    // "Permission denied" spawning the target, even after the chmod below). `/tmp` itself
+    // (`/private/tmp` on macOS) is the one path both platforms guarantee world-traversable.
+    let scratch = tempfile::Builder::new()
+        .tempdir_in("/tmp")
+        .expect("scratch directory for world-executable copies");
     std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
         .expect("chmod the scratch directory world-traversable");
     let target_bin = world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
