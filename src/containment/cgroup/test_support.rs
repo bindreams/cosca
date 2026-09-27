@@ -71,30 +71,78 @@ pub(crate) fn childs_copy(
     (end, slot)
 }
 
+/// The re-exec args [`alone`] passes after the test name, and the shape [`alone_marker_matches`]
+/// demands this process's own argv match before trusting a `COSCA_TEST_ALONE` env var — shared by
+/// both, and by `child::spawn::fd_map::fd_map_tests`' `require_process_per_test` (a separate file in this
+/// same compilation unit), so all three can never drift apart into different ideas of "the
+/// isolated shape".
+#[cfg(unix)]
+pub(crate) const ALONE_ARGS: [&str; 4] = ["--exact", "--include-ignored", "--nocapture", "--test-threads=1"];
+
+/// True only if `value` is `Some` AND this process's own argv (skipping argv[0], the binary path)
+/// is exactly `[value, ALONE_ARGS...]` — proof that libtest itself was invoked to run exactly one
+/// named test, not merely that some env var happens to be set.
+///
+/// A `COSCA_TEST_ALONE` env var alone is not enough: it is inherited by every child of the
+/// process that set it, including — if a caller ever exports it into their own shell, or it leaks
+/// from an outer re-exec — the whole, ordinary, many-threads `cargo test` run itself. That run's
+/// OWN argv is never this exact one-test-and-no-more shape, so checking argv here is what a
+/// forged or leaked env var cannot fake: argv is controlled by whatever actually invoked THIS
+/// process, which for the genuine isolated child is [`alone`] itself and nothing else. Measured:
+/// without this check, an inherited `COSCA_TEST_ALONE=<a real test's name>` made that one test's
+/// guard accept a plain, many-threads `cargo test` run as "isolated" and corrupt others.
+///
+/// A copy of `tests/common/mod.rs`'s identical function — see `alone`'s own doc for why this
+/// crate keeps one copy per compilation unit rather than a shared dependency.
+#[cfg(unix)]
+pub(crate) fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool {
+    let Some(value) = value else { return false };
+    argv.len() == ALONE_ARGS.len() + 1
+        && argv[0] == value
+        && argv[1..].iter().map(String::as_str).eq(ALONE_ARGS.iter().copied())
+}
+
 /// Run the test `name` (its full path) alone, in a copy of this test binary, and assert it passed.
 /// `true` in the copy, which runs the test's body; `false` in the caller, which returns.
 ///
 /// For a test that closes the parent's end of a channel and needs the child to see that close: any
 /// process another test forks meanwhile holds a copy of that end until its own `exec`, and keeps
-/// the socket open past the close. `child::spawn::fd_map_tests` also uses this, for the same
+/// the socket open past the close. `child::spawn::fd_map::fd_map_tests` also uses this, for the same
 /// reason but a plainer one: a test that closes this process's own fd 0/1/2 (process-wide, not
 /// per-thread) must not run alongside any other test in the same binary, on any Unix, not just
 /// Linux — hence `unix` rather than this file's otherwise Linux-only gate. Sets `COSCA_TEST_ALONE`
 /// in the copy so a precondition assert guarding the actual mutation (e.g.
 /// `tests/common::require_process_per_test`, a separate copy in a separate compilation unit that
 /// cannot name this one) can accept either this or nextest's own
-/// `NEXTEST_EXECUTION_MODE=process-per-test`.
+/// `NEXTEST_EXECUTION_MODE=process-per-test` — see [`alone_marker_matches`] for why the env var
+/// alone does not suffice.
+///
+/// Spawns under `crate::child::spawn::spawn_lock()`, waits outside it: on macOS, a fork here that
+/// lands while another test's fd-marker write end happens to have its `CLOEXEC` cleared (a real,
+/// bounded window `child::spawn`'s own `prepare`-to-`drop(std_cmd)` comment names) would
+/// transiently inherit it and carry it past this re-exec's own `exec`, becoming an unrelated
+/// bystander a concurrent sweep can misidentify. `spawn_lock()` is the same lock every
+/// cosca-originated spawn in this process already takes. The lock is a plain, non-reentrant
+/// mutex: every caller here calls `alone` FIRST, while holding nothing else, and must keep doing
+/// so — nesting a second `spawn_lock()`-taking call inside an already-locked scope deadlocks.
 #[cfg(unix)]
 pub(crate) fn alone(name: &str) -> bool {
     const ALONE: &str = "COSCA_TEST_ALONE";
-    if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if alone_marker_matches(std::env::var(ALONE).ok().as_deref(), &argv) {
         return true;
     }
-    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
-        .env(ALONE, name)
-        .output()
-        .expect("run the test alone");
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(std::iter::once(name).chain(ALONE_ARGS))
+            .env(ALONE, name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the test alone")
+    };
+    let out = child.wait_with_output().expect("wait for the test alone");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("1 passed"),
@@ -199,5 +247,50 @@ pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
         Err(e) => panic!("remove the leaf: {e}"),
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod alone_marker_tests {
+    use super::{alone_marker_matches, ALONE_ARGS};
+
+    fn genuine_argv(name: &str) -> Vec<String> {
+        std::iter::once(name.to_string())
+            .chain(ALONE_ARGS.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_genuine_re_exec_shape_matches() {
+        assert!(alone_marker_matches(Some("some_test"), &genuine_argv("some_test")));
+    }
+
+    #[test]
+    fn no_env_value_never_matches() {
+        assert!(!alone_marker_matches(None, &genuine_argv("some_test")));
+    }
+
+    #[test]
+    fn an_inherited_env_value_with_the_ordinary_suites_own_argv_does_not_match() {
+        // The exact corruption measured: `COSCA_TEST_ALONE` set (e.g. leaked from an outer
+        // shell or re-exec) to some real test's name, but THIS process's own argv is whatever
+        // an ordinary `cargo test` run passes — never the isolated one-test-exact shape.
+        assert!(!alone_marker_matches(Some("some_test"), &[]));
+        assert!(!alone_marker_matches(Some("some_test"), &["some_test".to_string()]));
+    }
+
+    #[test]
+    fn a_name_mismatch_does_not_match_even_with_the_right_shape() {
+        let mut argv = genuine_argv("some_test");
+        argv[0] = "other_test".to_string();
+        assert!(!alone_marker_matches(Some("some_test"), &argv));
+    }
+
+    #[test]
+    fn a_trailing_extra_argument_does_not_match() {
+        let mut argv = genuine_argv("some_test");
+        argv.push("--extra".to_string());
+        assert!(!alone_marker_matches(Some("some_test"), &argv));
     }
 }
