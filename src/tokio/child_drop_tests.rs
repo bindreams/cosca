@@ -123,6 +123,153 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
     );
 }
 
+/// Regression test for adversarial round-3 finding 5: the ARMED `kill_on_drop` path's own
+/// `start_kill`-failure early return used to drop `os` — and so `os.attached` — inline, on
+/// whichever thread called `drop`. The tree-level `hard_kill` a few lines above it runs
+/// unconditionally, before `start_kill` is even attempted, so a `Cgroup` leaf is armed or
+/// already killed by the time this early return is reached regardless of whether `start_kill`
+/// (a separate, root-specific kill) then succeeds — its own `Drop` can still block waiting for a
+/// drain. This forces `start_kill` to fail via the same seam `child_wait_tests` uses, then
+/// asserts the release still runs on a reaper thread, not the dropping one.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_start_kill_still_routes_an_armed_leafs_release_through_the_reaper_pool() {
+    use std::sync::mpsc;
+
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::Attached;
+    use crate::identity::ProcessId;
+
+    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
+    use super::{Child, OsResources, ProcSource};
+
+    let fake = FakeLeaf::new("cosca-async-failed-startkill-routing", false);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    assert!(
+        leaf.drop_may_block(),
+        "test setup: a freshly entered, still-armed leaf must be one Drop routes off the \
+         calling thread"
+    );
+
+    let proc = {
+        let _guard = crate::child::spawn::spawn_lock();
+        ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child that exits")
+    };
+    let pid = proc.id().expect("a freshly spawned child has a pid");
+
+    let child = Child {
+        os: OsResources {
+            proc: Some(ProcSource::Tokio(proc)),
+            attached: Attached::Cgroup(leaf),
+            pipes: Default::default(),
+            owned_std: Default::default(),
+        },
+        id: ProcessId::from_parts_for_test(pid, 0),
+        kill_on_drop: true,
+        containment: crate::containment::Containment::CgroupV2,
+        graceful: crate::graceful::GracefulMechanism::Process,
+        elevation: None,
+    };
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (outcome_tx, outcome) = mpsc::channel();
+    arm(DropProbe {
+        entered: entered_tx,
+        started: started_tx,
+        gate: gate_rx,
+        outcome: outcome_tx,
+    });
+    drop(gate_tx);
+
+    super::reaper::fault::set_force_kill_failure(true);
+    drop(child);
+
+    let dropping = entered.recv().expect("the armed path must reach the reaper handoff");
+    assert_eq!(dropping, std::thread::current().id(), "#[tokio::test] is current-thread");
+    let executing = started.recv().expect("a worker must take the job");
+    assert_ne!(
+        executing, dropping,
+        "an armed leaf's release must run on a reaper thread, never the thread that called drop, \
+         even though this handle's own start_kill failed for the root"
+    );
+    assert!(
+        matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+        "the job must complete via the reaper pool"
+    );
+}
+
+/// Sibling of the test above: the root already reaped (`os.proc: None`) by the time `drop` runs
+/// is the OTHER early return in the armed path — it must route the same way, for the same
+/// reason: the tree-level `hard_kill` a few lines above already leaves the leaf armed or killed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_already_reaped_root_still_routes_an_armed_leafs_release_through_the_reaper_pool() {
+    use std::sync::mpsc;
+
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::Attached;
+    use crate::identity::ProcessId;
+
+    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
+    use super::{Child, OsResources};
+
+    let fake = FakeLeaf::new("cosca-async-already-reaped-routing", false);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    assert!(
+        leaf.drop_may_block(),
+        "test setup: a freshly entered, still-armed leaf must be one Drop routes off the \
+         calling thread"
+    );
+
+    let child = Child {
+        os: OsResources {
+            proc: None,
+            attached: Attached::Cgroup(leaf),
+            pipes: Default::default(),
+            owned_std: Default::default(),
+        },
+        id: ProcessId::from_parts_for_test(std::process::id(), 0),
+        kill_on_drop: true,
+        containment: crate::containment::Containment::CgroupV2,
+        graceful: crate::graceful::GracefulMechanism::Process,
+        elevation: None,
+    };
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (outcome_tx, outcome) = mpsc::channel();
+    arm(DropProbe {
+        entered: entered_tx,
+        started: started_tx,
+        gate: gate_rx,
+        outcome: outcome_tx,
+    });
+    drop(gate_tx);
+
+    drop(child);
+
+    let dropping = entered.recv().expect("the armed path must reach the reaper handoff");
+    assert_eq!(dropping, std::thread::current().id(), "#[tokio::test] is current-thread");
+    let executing = started.recv().expect("a worker must take the job");
+    assert_ne!(
+        executing, dropping,
+        "an armed leaf's release must run on a reaper thread, never the thread that called drop, \
+         even though the root was already reaped"
+    );
+    assert!(
+        matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+        "the job must complete via the reaper pool"
+    );
+}
+
 /// Sibling of the routing test above: a disarmed leaf that was NEVER killed has nothing to wait
 /// for, so its drop must NOT engage the reaper handoff at all — an armed probe must be left
 /// untouched for whatever later drop it was meant for.

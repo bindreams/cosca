@@ -214,6 +214,21 @@ impl CgroupLeaf {
         self.child_entered() && !self.armed.load(Ordering::Relaxed) && self.killed.load(Ordering::Relaxed)
     }
 
+    /// Whether this leaf's `Drop` may block waiting for a drain in EITHER of its two blocking
+    /// branches (see the table on [`Drop`](#impl-Drop-for-CgroupLeaf)'s own doc): armed and
+    /// entered — the ordinary kill-then-drain wait — or [`disarmed_kill_may_block_drop`]'s
+    /// disarmed-but-already-killed case. Broader than that method alone (round-3 finding 5):
+    /// `Child::drop`'s two early-return releases (the root already reaped, or its own
+    /// `start_kill` failed) read this, not that, since at either point this leaf may still be
+    /// armed — its own tree-level `hard_kill` ran unconditionally before either release, whether
+    /// or not `start_kill` separately then failed for the root's own handle. A leaf never
+    /// entered, or entered but never armed and never killed, releases inline: nothing to wait
+    /// for.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn drop_may_block(&self) -> bool {
+        self.child_entered() && (self.armed.load(Ordering::Relaxed) || self.killed.load(Ordering::Relaxed))
+    }
+
     /// The leaf's directory, for a test that must find this leaf and no other. Its one user is the
     /// tokio spawn's post-fork failure seam.
     #[cfg(all(test, feature = "tokio"))]

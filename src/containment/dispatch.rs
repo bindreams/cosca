@@ -359,6 +359,26 @@ impl Attached {
         }
     }
 
+    /// Whether this attachment's `Drop` may block the thread that runs it, in ANY state —
+    /// broader than [`disarmed_kill_may_block_drop`](Self::disarmed_kill_may_block_drop), which
+    /// covers only the disarmed-and-killed `Cgroup` case (round-3 finding 5). The async
+    /// `Child::drop`'s two early-return releases (the root already reaped, or its own
+    /// `start_kill` failed) read this to decide whether releasing `self` needs routing off the
+    /// dropping thread and onto the reaper pool — WITHOUT waiting for the root's own exit there
+    /// (see `reaper::ReapJob::skip_wait`'s doc for why that wait is never bounded in either of
+    /// those two cases) — rather than falling, unconditionally, into whichever of `Drop`'s
+    /// branches its current armed/killed state happens to take. `false` for every other
+    /// mechanism: a pgroup/`TreeWalk`/fd-marker drop never itself blocks, and a Job Object's
+    /// handle close is a fast, non-blocking `CloseHandle`.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn drop_may_block(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(leaf) => leaf.drop_may_block(),
+            _ => false,
+        }
+    }
+
     /// Whether this handle owns a mechanism with a kernel drain edge — mirrors
     /// [`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain),
     /// checked against the concrete resource rather than the reported enum so the two can

@@ -89,6 +89,7 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
             ..Default::default()
         },
         pid,
+        skip_wait: false,
         origin,
         probe,
         force_panic: false,

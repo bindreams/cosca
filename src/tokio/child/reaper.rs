@@ -62,6 +62,15 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) struct ReapJob {
     pub(crate) os: super::OsResources,
     pub(crate) pid: u32,
+    /// Release `os` directly, without `wait_and_reap`ing the root first (round-3 finding 5).
+    /// `run_teardown`'s wait is only ever bounded by a signal this job's sender KNOWS was sent
+    /// (see its own doc) — a job whose root was already reaped, or whose own `start_kill` failed,
+    /// has no such guarantee, so it is never waited on here either; only released, off the
+    /// dropping thread, because `os.attached`'s own `Drop` may still block regardless (an armed
+    /// cgroup leaf, or one an earlier, separate tree-level kill already reached: see
+    /// `Attached::drop_may_block`). `false` for every other job: the ordinary kill-then-reap path
+    /// this always was.
+    pub(crate) skip_wait: bool,
     /// The thread `Drop` ran on. `run_teardown` gates only when it is executing elsewhere.
     #[cfg(test)]
     pub(crate) origin: std::thread::ThreadId,
@@ -308,6 +317,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
     let force_glue_panic = job.force_glue_panic;
     let mut os = job.os;
     let pid = job.pid;
+    let skip_wait = job.skip_wait;
 
     // `os` is BORROWED into this region, never moved: an unwind must not destroy a resource whose
     // release the region below owns and orders.
@@ -329,7 +339,9 @@ pub(crate) fn run_teardown(job: ReapJob) {
         if force_panic {
             panic!("forced teardown panic (test seam)");
         }
-        os.wait_and_reap(pid);
+        if !skip_wait {
+            os.wait_and_reap(pid);
+        }
     }));
 
     // The glue. Only a seeded fault reaches this, and only to give `work`'s recovery guard the

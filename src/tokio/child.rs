@@ -770,21 +770,17 @@ impl Child {
 /// [`detach`](Child::detach)) hands its leaf's drain wait to the same pool, for the same reason:
 /// so that wait, too, never runs on whichever thread called `drop`.
 ///
-/// **Exactly two things make this handle's `Drop` block the calling thread instead:**
-/// - **The root is already reaped when `drop` runs.** Nothing is submitted — there is no reap
-///   left to move off this thread — and the resources release right here, in place. For a
-///   `Cgroup` leaf this still runs that leaf's own (synchronous) `Drop`, which blocks on the
-///   drain if this handle's kill already fired and the tree has not yet cleared; this is the
-///   same wait the cgroup leaf's own (private, internal) `Drop` documents, not one this type
-///   adds.
-/// - **The reaper pool cannot start at all** (thread exhaustion on the very first kill-on-drop
-///   drop of the process). This is loud (an `error` log) and degrades to releasing the job in
-///   hand right here rather than queuing it — which, for a `Cgroup` leaf, blocks on that same
-///   drain for the same reason as above. Each further drop while the pool stays unstarted costs
-///   at most that many failing spawn syscalls before retrying.
-///
-/// Neither exception is specific to the disarmed-but-killed path added above: both apply equally
-/// to the ordinary kill-on-drop reap. Outside them, this handle's `Drop` never blocks.
+/// **One thing makes this handle's `Drop` block the calling thread anyway: the reaper pool
+/// cannot start at all** (thread exhaustion on the very first kill-on-drop drop of the process).
+/// This is loud (an `error` log) and degrades to releasing the job in hand right here rather
+/// than queuing it — which, for a `Cgroup` leaf whose own `Drop` may still block (armed, or
+/// already killed by a kill this handle fired), blocks on that leaf's drain in place. Each
+/// further drop while the pool stays unstarted costs at most that many failing spawn syscalls
+/// before retrying. This applies uniformly to every path that submits a job — the ordinary
+/// kill-on-drop reap, the disarmed-but-killed path, and the two early-return releases below (the
+/// root already reaped, or this handle's own `start_kill` having failed for it) — every one of
+/// which otherwise routes any release that may block off the dropping thread and onto the
+/// reaper pool. Outside this one case, this handle's `Drop` never blocks.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -831,6 +827,7 @@ impl Drop for Child {
                 reaper::submit(reaper::ReapJob {
                     os,
                     pid,
+                    skip_wait: false,
                     #[cfg(test)]
                     origin: std::thread::current().id(),
                     #[cfg(test)]
@@ -880,13 +877,21 @@ impl Drop for Child {
 
         let pid = self.id.pid();
         // The WHOLE resource group moves, so a field added to `OsResources` is carried here
-        // without touching this function. On every early return below it drops in group order,
-        // on this thread — exactly where it dropped before the reap moved off it.
+        // without touching this function. On every early return below it releases in group
+        // order — inline here, or off the dropping thread via `release_possibly_blocking` — but
+        // never waits for the root itself: neither early return below has a signal this handle
+        // KNOWS reached it (round-3 finding 5), which `wait_and_reap`'s own doc requires.
         let mut os = std::mem::take(&mut self.os);
         // Already reaped, or (Unix only) its ownership already given up and the backend forgotten
         // by an earlier `wait_and_reap` — `proc` is `None` only then, since `Drop` is what empties
         // it otherwise: no signal to issue and no exit to wait for either way.
         if os.proc.as_ref().is_none_or(ProcSource::is_reaped) {
+            release_possibly_blocking(
+                os,
+                pid,
+                #[cfg(test)]
+                probe,
+            );
             return;
         }
         // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
@@ -906,13 +911,51 @@ impl Drop for Child {
             if !matches!(os.proc_mut().try_wait(), Ok(Some(_))) {
                 log::warn!("async child {pid} could not be terminated on drop; leaving it running");
             }
-            // An unsignalled child is never submitted: its wait is unbounded, and a worker parked
-            // on it would never come back. Its resources release with this handle instead.
+            // Never WAITED on: this handle has no confirmation the root was ever signalled (the
+            // tree-level kill above may not have reached it — an uncontained child, say), and
+            // `wait_and_reap`'s wait is only ever bounded by a signal known to have been sent. Its
+            // resources still release off the dropping thread if `os.attached`'s own `Drop` may
+            // block regardless (round-3 finding 5) — the tree-level kill above ran unconditionally,
+            // whether or not this separate, root-specific kill then failed.
+            release_possibly_blocking(
+                os,
+                pid,
+                #[cfg(test)]
+                probe,
+            );
             return;
         }
         reaper::submit(reaper::ReapJob {
             os,
             pid,
+            skip_wait: false,
+            #[cfg(test)]
+            origin: std::thread::current().id(),
+            #[cfg(test)]
+            probe,
+            #[cfg(test)]
+            force_panic: false,
+            #[cfg(test)]
+            force_release_panic: false,
+            #[cfg(test)]
+            force_glue_panic: false,
+        });
+    }
+}
+
+/// Release `os`, routing it to the reaper pool — WITHOUT waiting for the root, via
+/// [`ReapJob::skip_wait`] — when `os.attached`'s own `Drop` may still block regardless; released
+/// right here otherwise. Shared by `Child::drop`'s two early-return releases (round-3 finding
+/// 5): the root already reaped, and this handle's own `start_kill` having failed for it — neither
+/// carries a confirmed-sent signal for `wait_and_reap` to bound its wait on, so neither ever
+/// waits, but `os.attached` (an armed cgroup leaf, or one an earlier, separate tree-level kill
+/// already reached) can still block whichever thread drops it regardless of that.
+fn release_possibly_blocking(os: OsResources, pid: u32, #[cfg(test)] probe: Option<reaper::test_probe::DropProbe>) {
+    if os.attached.drop_may_block() {
+        reaper::submit(reaper::ReapJob {
+            os,
+            pid,
+            skip_wait: true,
             #[cfg(test)]
             origin: std::thread::current().id(),
             #[cfg(test)]
