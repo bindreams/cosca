@@ -1,7 +1,8 @@
 # Design principles
 
-The rules every cosca change follows. Where `main` does not follow a rule yet, a **Being brought
-into line** note says where, so the gap is not mistaken for the design.
+The rules every cosca change follows. Known places where `main` doesn't follow them yet are tracked
+as issues labelled [`tech-debt`](https://github.com/bindreams/cosca/issues?q=is%3Aissue+is%3Aopen+label%3Atech-debt),
+grouped by module.
 
 ## 1. No unowned state
 
@@ -9,8 +10,8 @@ cosca is a library, not a service. It holds no process-lifetime background threa
 queues or retries carried across calls. A helper, even a thread, is allowed only if a handle the
 caller holds owns it and that handle's `Drop` tears it down deterministically.
 
-No process-lifetime state includes log deduplication. Every event is logged at its natural level
-each time it happens; rate-limiting belongs to the application's log handler.
+The same goes for log deduplication. Every event is logged at its natural level each time it
+happens; rate-limiting belongs to the application's log handler.
 
 **Why:** state no caller owns cannot be released by any caller, and does its work at moments none of
 them chose.
@@ -18,18 +19,6 @@ them chose.
 **Applies to:** anything that happens later, such as reaps, drain waits, `rmdir`, watchers, retries.
 The cgroup leaf's drain pump ([`watcher.rs`](../src/containment/cgroup/watcher.rs)) is the compliant
 shape: the leaf's first blocking wait starts it, and the leaf's `Drop` stops and joins it.
-
-**Being brought into line:**
-
-- The async `Child`'s process-lifetime reaper pool
-  ([`src/tokio/child/reaper.rs`](../src/tokio/child/reaper.rs), added in [#120]) is being removed.
-- `reap_in_background` in [`src/child/spawn.rs`](../src/child/spawn.rs) and
-  [`src/containment/cgroup/leaf.rs`](../src/containment/cgroup/leaf.rs) detaches a thread per child
-  a failed spawn could not kill. [#165] (open) hands that child back to the caller instead.
-- The warn-once sets `WARNED` in [`degrade.rs`](../src/containment/cgroup/degrade.rs) and
-  `UNREAPED`/`UNREACHABLE` in [`src/tokio/spawn.rs`](../src/tokio/spawn.rs), through
-  [`warn_once.rs`](../src/warn_once.rs), are process-lifetime state; a PR removing them is in
-  progress.
 
 ## 2. Never block a tokio runtime thread
 
@@ -47,17 +36,6 @@ stops the runtime. tokio itself panics rather than block when a `Runtime` is dro
 context ([tokio shutdown.rs]).
 
 **Applies to:** every spawn, control and teardown path under [`src/tokio/`](../src/tokio/).
-
-**Being brought into line:**
-
-- The sync `kill_tree()`/`terminate_tree()` of [`tokio::Child`](../src/tokio/child.rs) and
-  [`tokio::Process`](../src/tokio/process.rs) run `Attached::hard_kill()`'s unbounded sweeps on the
-  caller's runtime worker, including from the async `graceful_shutdown_tree`.
-- Async spawn error paths reap on the caller's runtime worker ([#112]), and elevation's setup blocks
-  it ([#176]).
-- When a contained spawn's placement is undecidable, `fail_closed` in
-  [`leaf.rs`](../src/containment/cgroup/leaf.rs) waits for the child's exit and the leaf's drain on
-  that worker.
 
 ## 3. Async `Drop` does only bounded work
 
@@ -82,14 +60,6 @@ requires its embedder to supply the reaper ([runc CHANGELOG]).
 **Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns. The
 sync [`Child`](../src/child.rs) kills and reaps in its `Drop`, which is allowed.
 
-**Being brought into line:**
-
-- The async `Drop` hands the wait to the reaper pool (principle 1) rather than to tokio, and checks
-  for a foreign reap nowhere (principle 5).
-- `Attached::hard_kill()` does unbounded work on the dropping thread ([#111]).
-- The async `Drop` blocks on a cgroup leaf's drain when the root is already reaped, its kill fails,
-  or the reaper pool cannot start (see [`Command::kill_on_drop`](../src/command.rs)'s rustdoc).
-
 ## 4. Don't act on a bare PID after it may be reused
 
 On Unix a PID is pinned only while its process is an unreaped child (a zombie at worst); on Windows,
@@ -110,43 +80,6 @@ unrelated process.
 
 **Applies to:** every kill, signal and wait on a process.
 
-**Being brought into line:**
-
-- `kill_tree()` after the root is reaped can `killpg` a recycled group ([#54]), and so can `Drop`
-  ([#107]). The root is reaped by `wait()`, or already inside `spawn` for a fast-exiting child (see
-  `kill_tree` in [`src/child.rs`](../src/child.rs)).
-- The cgroup graceful signal goes to bare PIDs ([#106]).
-- Kill-by-identity re-verifies and then signals non-atomically ([#55], [#64]); macOS has an
-  identity-bound signal cosca does not use yet ([#55]).
-- These signal by number, which is safe only if nothing else reaps the child (principle 5):
-  - the single-process kill of an owned Unix child (`Child::kill()`, both `Drop` impls,
-    `kill_unadopted` in [`src/child/spawn.rs`](../src/child/spawn.rs)), which goes through std's
-    `Child::kill`, `SharedChild::kill` or tokio's `start_kill` to `kill(2)`;
-  - `fail_closed` in [`leaf.rs`](../src/containment/cgroup/leaf.rs), for the child and its group;
-  - `end_child` in the same file, for the child's group, and for the child itself when
-    `pidfd_send_signal` is refused.
-- These wait and reap by number, so after a foreign reap they can reap another child of ours. Units
-  named are from [#165]'s split plan.
-  - sync `Child::wait`, `try_wait` and the timed wait (`ProcHandle::wait_deadline`) in
-    [`proc_handle.rs`](../src/child/proc_handle.rs), through `SharedChild` to std's `waitpid(pid)`:
-    untracked;
-  - async `Child::wait` and `try_wait` in [`src/tokio/child.rs`](../src/tokio/child.rs), through
-    tokio to std's `try_wait`, on its pidfd path too: untracked;
-  - sync `Drop` (`ProcHandle::teardown_on_drop`): UA, and UM on macOS;
-  - tokio's in-drop `try_wait` and orphan-queue handoff when cosca's async `Drop` releases tokio's
-    child, with no foreign-reap check first: UA;
-  - `reap_unadopted` in [`src/child/spawn.rs`](../src/child/spawn.rs): UA, UM and U6;
-  - `reap_in_background` in [`src/child/spawn.rs`](../src/child/spawn.rs): removed in U6;
-  - `end_child` without a pidfd, and `reap_in_background` without a pidfd, in
-    [`leaf.rs`](../src/containment/cgroup/leaf.rs): UA and U7.
-- These wait by number without reaping (`WNOWAIT`), so they can wait on another child of ours:
-  `fail_closed` in [`leaf.rs`](../src/containment/cgroup/leaf.rs) (UA), and `wait_and_reap` in
-  [`src/tokio/child.rs`](../src/tokio/child.rs) (U1, UA, UM).
-- The async `Child::kill` rustdoc in [`src/tokio/child.rs`](../src/tokio/child.rs) says it is
-  handle-bound and cannot race a recycled PID, but it reaches `kill(2)` by number (UA).
-- `ReportChannel::wait` ([`channel.rs`](../src/containment/cgroup/channel.rs)) opens its pidfd from
-  a bare PID, which names the child only if nothing else reaped it.
-
 ## 5. A foreign reap is a handled case, not a contract violation
 
 The application or another library may reap cosca's children (`SIGCHLD` set to `SIG_IGN`, or
@@ -163,18 +96,6 @@ After a foreign reap:
 reap everything are legitimate hosts.
 
 **Applies to:** every reap and every wait on a child.
-
-**Being brought into line:** [`Command::contain`](../src/command.rs) documents a foreign reap as a
-forbidden precondition. These debug-assert on it:
-
-- `fail_closed` and `end_child` in [`leaf.rs`](../src/containment/cgroup/leaf.rs);
-- `ReportChannel::wait` in [`channel.rs`](../src/containment/cgroup/channel.rs);
-- `teardown_unadopted` in [`src/child/spawn.rs`](../src/child/spawn.rs), which runs without
-  `contain()` too;
-- `reap_now` and `wait_and_reap` in [`src/tokio/child.rs`](../src/tokio/child.rs).
-
-Principle 3's by-number waits and reaps check for a foreign reap nowhere; its note says what fixes
-each.
 
 ## 6. Good defaults, with escape hatches for advanced users
 
@@ -200,19 +121,6 @@ documented-only contract breaks silently when a future caller violates it.
 
 **Applies to:** all code.
 
-**Being brought into line:**
-
-- Both `Child::drop` impls ([`src/child.rs`](../src/child.rs),
-  [`src/tokio/child.rs`](../src/tokio/child.rs)) debug-assert that the tree kill did not fail with
-  `Error::Io` (such as a failed `cgroup.kill` write) or an `Error::Unassessable` carrying an OS
-  error.
-- `kill_tree` and `terminate_tree` debug-assert that the root's PID was not recycled, which their
-  own comments say is reachable.
-- `take_owned_out`, `take_owned_in`, `fd_read_end` and `fd_write_end` on Unix in
-  [`src/tokio/child.rs`](../src/tokio/child.rs) debug-assert that registering a pipe with tokio's
-  reactor succeeded, which the kernel can refuse (`ENOMEM`, `ENOSPC`).
-- The foreign-reap asserts in principle 5 are the same kind.
-
 ## 8. Synchronise on events, not time
 
 No sleep-then-check, and a timeout's expiry is never taken as proof of a state. A timeout is allowed
@@ -225,24 +133,6 @@ arbitrary retry or loop caps.
 machine.
 
 **Applies to:** all code and tests.
-
-**Being brought into line:** in [`marker_eof_tests.rs`](../src/containment/marker_eof_tests.rs):
-
-- `async_wait_never_drains_past_the_low_water_clamp` takes a `tokio::time::timeout` expiring on
-  cosca's own wait as proof that it never resolves.
-- `a_sustained_writer_never_exceeds_the_deadline` asserts on wall-clock time.
-- `a_quiet_live_holder_blocks_without_spending_cpu` measures over a fixed window and calls itself an
-  exception this principle does not grant.
-- `an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu` borrows its reasoning,
-  and sleeps for the window before killing.
-
-Elsewhere:
-
-- `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`
-  ([`graceful_tests.rs`](../src/tokio/child/graceful_tests.rs)) asserts on wall-clock time.
-- `cgroup_wait_drained_tracks_two_real_members_through_exit`
-  ([`leaf_tests.rs`](../src/containment/cgroup/leaf_tests.rs)) describes its bounded wait as
-  settling time for the membership checks that follow.
 
 ## 9. Tests fail loudly and never silently skip
 
@@ -257,26 +147,6 @@ that it does.
 whichever tests share the process.
 
 **Applies to:** all tests.
-
-**Being brought into line:**
-
-- `cgroup_wait_drained_tracks_two_real_members_through_exit` and
-  `cgroup_leaf_procs_fd_is_not_inherited_across_exec`
-  ([`leaf_tests.rs`](../src/containment/cgroup/leaf_tests.rs)) pass without running when
-  `COSCA_TEST_CGROUP` is unset (the pattern [#80] tracks).
-- The gated tests in [`tests/elevation.rs`](../tests/elevation.rs) pass without running when their
-  `COSCA_TEST_ELEVATION*` variable is unset, or when the runner's elevation doesn't suit them.
-- The suite accepts degraded containment as a pass ([#154]).
-- These mutate process-wide state without isolating themselves or asserting process-per-test:
-  - `RestoreStdio` and `RestoreRlimitNofile` in [`tests/common/mod.rs`](../tests/common/mod.rs), and
-    `RestoreFd2` in [`fd_map_tests.rs`](../src/child/spawn/fd_map_tests.rs) ([#196], [#201]);
-  - `EnvVar::set` in [`windows_shell_execute.rs`](../tests/windows_shell_execute.rs), isolated only
-    by an in-binary mutex;
-  - `drop_se_debug_privilege` in [`windows_fixture.rs`](../src/identity/windows_fixture.rs), which
-    removes a privilege from the test process's own token;
-  - `a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak`
-    ([`leaf_tests.rs`](../src/containment/cgroup/leaf_tests.rs)), whose pipe lacks close-on-exec and
-    so leaks into concurrently spawned children ([#205]).
 
 ## 10. System-affecting tests run in a sandbox
 
@@ -314,21 +184,6 @@ step consistent with these principles.
 
 **Applies to:** plans and PRs.
 
-[#54]: https://github.com/bindreams/cosca/issues/54
-[#55]: https://github.com/bindreams/cosca/issues/55
-[#64]: https://github.com/bindreams/cosca/issues/64
-[#80]: https://github.com/bindreams/cosca/issues/80
-[#106]: https://github.com/bindreams/cosca/issues/106
-[#107]: https://github.com/bindreams/cosca/issues/107
-[#111]: https://github.com/bindreams/cosca/issues/111
-[#112]: https://github.com/bindreams/cosca/issues/112
-[#120]: https://github.com/bindreams/cosca/pull/120
-[#154]: https://github.com/bindreams/cosca/issues/154
-[#165]: https://github.com/bindreams/cosca/pull/165
-[#176]: https://github.com/bindreams/cosca/issues/176
-[#196]: https://github.com/bindreams/cosca/issues/196
-[#201]: https://github.com/bindreams/cosca/pull/201
-[#205]: https://github.com/bindreams/cosca/pull/205
 [tokio-process#51]: https://github.com/alexcrichton/tokio-process/issues/51
 [tokio shutdown.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/blocking/shutdown.rs#L51-L54
 [sd-event.c]: https://github.com/systemd/systemd/blob/885fe07ee37cff7316680b5088d11081e01813b1/src/libsystemd/sd-event/sd-event.c#L3753-L3765
