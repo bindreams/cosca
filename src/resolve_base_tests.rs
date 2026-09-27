@@ -346,6 +346,19 @@ impl Drop for Locked {
     }
 }
 
+/// A tempdir built under [`crate::test_child::run_fixture`]'s scratch root rather than
+/// `tempfile::tempdir()`'s ambient `TMPDIR` — every caller of this function runs after
+/// [`crate::test_privilege::drop_dac_bypass`], whose post-drop identity the scratch root, not
+/// necessarily the ambient `TMPDIR`, is guaranteed writable to (see `run_fixture`'s doc).
+#[cfg(unix)]
+fn fixture_scratch_tempdir() -> tempfile::TempDir {
+    let root = std::env::var_os(crate::test_child::FIXTURE_SCRATCH_ROOT_ENV)
+        .expect("COSCA_FIXTURE_SCRATCH_ROOT must be set by run_fixture");
+    tempfile::Builder::new()
+        .tempdir_in(root)
+        .expect("tempdir_in the fixture scratch root")
+}
+
 /// A `PATH` entry whose candidate cannot be checked because its directory is unreadable, followed
 /// by one that holds the name. Unlike [`loop_then_open`], this is a real permission denial — the
 /// one failure whose kind is `PermissionDenied`, as an unreadable `PATH` directory yields — not a
@@ -361,7 +374,7 @@ impl Drop for Locked {
 /// cover, fails loudly instead of silently testing nothing.
 #[cfg(unix)]
 fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
-    let root = tempfile::tempdir().unwrap();
+    let root = fixture_scratch_tempdir();
     let locked = root.path().join("locked");
     let open = root.path().join("open");
     std::fs::create_dir(&locked).unwrap();
@@ -555,8 +568,12 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
 /// `drop_dac_bypass`'s postcondition already asks the kernel `no_new_privs()` and fails closed if
 /// that answer is `false` — which catches a mutant that deletes the `set_no_new_privs` CALL alone
 /// (measured: `--cap-drop SETPCAP`, deleting only the call fails this test, the other two real-
-/// `EACCES` tests, AND `exact_posix_tests`'s real spawn test, all via that same postcondition,
-/// with no exec needed). What that postcondition does NOT cover is a mutant that also removes ITS
+/// `EACCES` tests, AND all three of `exact_posix_tests`'s own cwd-spawn tests
+/// (`an_exact_program_runs_in_a_cwd_that_has_no_path`,
+/// `a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path`,
+/// `an_already_elevated_exact_program_runs_in_a_cwd_that_has_no_path` — each re-execs its own
+/// fixture, which also calls `drop_dac_bypass`), all via that same postcondition, with no exec
+/// needed here). What that postcondition does NOT cover is a mutant that also removes ITS
 /// OWN check alongside the call: nothing then asks the kernel anything, so nothing here would
 /// notice — except this test, which does not ask the kernel's opinion on this thread's OWN state
 /// at all. It asks what a REAL uid-0 thread's `execve` of an ordinary binary actually grants a

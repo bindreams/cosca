@@ -157,9 +157,11 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
 /// [`crate::test_privilege::drop_dac_bypass`] failure, split out so the message text is checkable
 /// (below) without forcing that failure for real. It used to be forceable with root started under
 /// `--cap-drop SETUID,SETGID`, back when dropping DAC bypass meant `setuid()`; now that it means
-/// dropping two specific capabilities instead (see that function's doc for why), no `--cap-drop`
-/// combination this suite's own CI lanes exercise still makes it fail this way. A real failure IS
-/// still forceable — `strace -f -e trace=capset -e inject=capset:error=EPERM`, measured — just
+/// dropping two specific capabilities instead (see that function's doc for why), no plain
+/// `--cap-drop` combination reaches it that way any more — measured against every root/capability
+/// lane this repo's own mutation testing has exercised so far (see the PR that introduced this),
+/// not against CI, which does not yet run a root lane at all (tracked separately). A real failure
+/// IS still forceable — `strace -f -e trace=capset -e inject=capset:error=EPERM`, measured — just
 /// not portably enough to run as an ordinary `cargo test`;
 /// [`reports_and_exits_on_an_injected_dac_bypass_failure`] below exercises the reporting
 /// end-to-end via [`crate::test_privilege::INJECT_FAILURE_ENV`]'s seam instead.
