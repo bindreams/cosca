@@ -372,11 +372,77 @@ pub(crate) fn sweep_recyclable_pgid_before_reap(pid: u32, retained: Box<Retained
         );
         return Some(retained);
     }
+    sweep_confirmed_zombie(pid, &retained);
+    None
+}
+
+/// Non-blocking twin of [`sweep_recyclable_pgid_before_reap`], for a caller whose own kill just
+/// FAILED: `pid` may still be genuinely running, and such a caller (spawn error-teardown, not yet
+/// committed to blocking) must not park on [`block_until_reapable`] waiting for an exit that may
+/// be arbitrarily far off. `Ok(true)`/confirmed-a-zombie sweeps exactly as the blocking twin does;
+/// `Ok(false)` (not yet exited — the ordinary case when the caller's own kill failed) and `Err`
+/// (the confirmatory poll itself failed, in practice `ECHILD` from something else already having
+/// reaped it) both hand `retained` back UNSWEPT, same as the blocking twin's one failure case —
+/// this is not a second, weaker failure mode, only a second way `pid` can fail to be a CONFIRMED
+/// zombie yet. The caller's own subsequent ownership check (`Held::check`) independently observes
+/// either outcome (still running, or the same `ECHILD`) and settles `retained` on its own
+/// Running/Reaped/Uncertain branch exactly as if this had never run.
+#[cfg(unix)]
+pub(crate) fn sweep_recyclable_pgid_before_reap_nonblocking(
+    pid: u32,
+    retained: Box<Retained>,
+) -> Option<Box<Retained>> {
+    if !retained.attached.carries_recyclable_pgid() {
+        return Some(retained);
+    }
+    match poll_reapable(pid) {
+        Ok(true) => {
+            sweep_confirmed_zombie(pid, &retained);
+            None
+        }
+        Ok(false) => Some(retained),
+        Err(e) => {
+            log::warn!(
+                "could not confirm unreaped child {pid} was still a zombie before sweeping what it \
+                 retained ({e}); skipping the sweep, since its pgid may already be recycled — a \
+                 later check of the same pid will abandon it instead"
+            );
+            Some(retained)
+        }
+    }
+}
+
+/// The one place that actually sweeps: `pid` is a CONFIRMED zombie (by whichever of the two
+/// callers above established that), so `retained`'s `hard_kill` is provably safe — its pgid
+/// cannot yet have been recycled. Callers always fully consume `retained` themselves afterward
+/// (`None`); shared so neither duplicates the kill-then-disarm step.
+#[cfg(unix)]
+fn sweep_confirmed_zombie(pid: u32, retained: &Retained) {
     if let Err(e) = retained.attached.hard_kill() {
         log::warn!("pre-reap sweep of what unreaped child {pid} retained did not fully succeed: {e}");
     }
     retained.attached.disarm_after_own_sweep();
-    None
+}
+
+/// Non-blocking poll of whether this process's unreaped child `pid` is already a zombie —
+/// `waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)` — WITHOUT reaping it. `Ok(true)`: confirmed a
+/// zombie (safe to sweep). `Ok(false)`: not yet exited. `Err`: the poll itself failed, in practice
+/// `ECHILD` (something else already reaped `pid`). Unlike [`block_until_reapable`], this never
+/// blocks: for [`sweep_recyclable_pgid_before_reap_nonblocking`]'s caller, `pid` may still be
+/// genuinely running for as long as the process it names runs.
+#[cfg(unix)]
+pub(crate) fn poll_reapable(pid: u32) -> std::io::Result<bool> {
+    #[cfg(test)]
+    if let Some(marker) = crate::child::spawn::fault::take_force_poll_reapable_error() {
+        return Err(std::io::Error::other(marker));
+    }
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+    let rpid = Pid::from_raw(pid as i32).ok_or_else(|| std::io::Error::other("pid 0"))?;
+    Ok(waitid(
+        WaitId::Pid(rpid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+    )?
+    .is_some())
 }
 
 /// `waitid` for a [`Held::Bare`] child, through its pidfd if it has one, else by its pid.
