@@ -414,8 +414,25 @@ impl Drop for Locked {
 /// A tempdir built under [`crate::test_child::run_fixture`]'s scratch root rather than
 /// `tempfile::tempdir()`'s ambient `TMPDIR` — every caller of this function runs after
 /// [`crate::test_privilege::drop_dac_bypass`], whose post-drop identity the scratch root, not
-/// necessarily the ambient `TMPDIR`, is guaranteed writable to (see `run_fixture`'s doc).
-#[cfg(unix)]
+/// necessarily the ambient `TMPDIR`, is guaranteed reachable by (see `run_fixture`'s doc).
+///
+/// On Linux, that root is `/proc/<this process's own pid>/fd/<the fd number `run_fixture` env-
+/// carried>` — see [`crate::test_child::open_scratch_fd`]'s doc for why a `/proc` magic link,
+/// rather than the real path, is what makes the ambient `TMPDIR`'s own traversal bits irrelevant.
+/// Elsewhere, the real path `run_fixture` handed over directly.
+#[cfg(target_os = "linux")]
+fn fixture_scratch_tempdir() -> tempfile::TempDir {
+    let fd: i32 = std::env::var(crate::test_child::FIXTURE_SCRATCH_FD_ENV)
+        .expect("COSCA_FIXTURE_SCRATCH_FD must be set by run_fixture")
+        .parse()
+        .expect("COSCA_FIXTURE_SCRATCH_FD must be an fd number");
+    let root = format!("/proc/{}/fd/{fd}", std::process::id());
+    tempfile::Builder::new()
+        .tempdir_in(root)
+        .expect("tempdir_in the fixture scratch root")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn fixture_scratch_tempdir() -> tempfile::TempDir {
     let root = std::env::var_os(crate::test_child::FIXTURE_SCRATCH_ROOT_ENV)
         .expect("COSCA_FIXTURE_SCRATCH_ROOT must be set by run_fixture");
