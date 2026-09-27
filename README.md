@@ -30,16 +30,35 @@ agent can't run that step locally either — it only runs in CI.
 ### Tests that need root
 
 A few tests (e.g. `foreign_kill_surfaces_permission_denied` in `tests/process.rs`) declare a
-runtime precondition instead of assuming the environment happens to run as root: an ordinary
-`cargo nextest run` reports them `ignored`, with the reason, rather than skipping them silently
-or failing on every unprivileged machine. CI provisions root for exactly these tests (see
+runtime precondition and carry a `ROOT` label instead of assuming the environment happens to run
+as root. `cargo test` reports an unmet one as `ignored`, with the reason; nextest (what CI and
+this section both use) has no way to surface that reason text, only a bare skip — this repo's
+`nextest.toml` at least prints `SKIP <name>` for it. Either way: never a silent skip, never a
+false pass on every unprivileged machine. CI provisions root for exactly these tests (see
 `.github/workflows/ci.yaml`'s "Run root-precondition tests" step) on Linux and macOS.
 
-To run them locally, filter to the test by name and run as root:
+To run them locally:
 
 ```sh
-sudo cargo nextest run --test process -E 'test(=foreign_kill_surfaces_permission_denied)'
+cargo nextest run                     # first, unprivileged: creates target/debug/.skuld.db as you
+cargo nextest archive --archive-file /tmp/root.tar.zst
+sudo SKULD_LABELS=ROOT "$(command -v cargo-nextest)" nextest run \
+    --archive-file /tmp/root.tar.zst --workspace-remap "$PWD" -E 'binary(process)'
+sudo chown "$(id -u):$(id -g)" target/debug/.skuld.db* 2>/dev/null || true
 ```
+
+A few things this works around:
+- Plain `sudo cargo ...` doesn't find `cargo` at all on a stock Debian/Ubuntu install — `sudo`'s
+  `secure_path` doesn't include `~/.cargo/bin` (rustup's install location) regardless of your own
+  `PATH`. Resolving `cargo-nextest`'s own path first, then invoking that directly, sidesteps it.
+- `SKULD_LABELS=ROOT`, not `-E 'test(=...)'` naming a test by hand: this filters by skuld's own
+  `ROOT` label instead (nextest itself has no notion of skuld labels), so it also covers whatever
+  other test picks up that label later.
+- Running the plain suite once first, unprivileged, creates skuld's own coordination database
+  (`target/debug/.skuld.db`) under your own uid. If root creates it instead (e.g. by running the
+  `sudo` command first, on a fresh checkout), every later *unprivileged* run in that `target/`
+  fails outright with "attempt to write a readonly database" — reproduced. The final `chown` is a
+  safety net for whatever WAL/SHM side files root's run may still have touched.
 
 ## License
 
