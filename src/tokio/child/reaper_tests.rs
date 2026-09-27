@@ -449,12 +449,14 @@ async fn skip_wait_releases_without_ever_reaping_a_live_child() {
     };
     super::submit_to(pool, job);
 
-    // Bounded: a bug in THIS test (not `skip_wait`'s correctness) must fail loudly, not hang the
-    // suite — the same sanctioned exception `child_drop_tests`'s D3 regression test uses.
-    let outcome = ends.outcome.recv_timeout(std::time::Duration::from_secs(20));
+    // No timeout here: syncing on our own code with a wall clock is forbidden. A regression that
+    // parks the worker on this still-live child hangs, which nextest's own `slow-timeout` for
+    // this test (`.config/nextest.toml`) bounds — a failure surfaced to a human, not a
+    // synchronization device.
+    let outcome = ends.outcome.recv();
     assert!(
         matches!(outcome, Ok(ReapOutcome::Reaped(_))),
-        "the job must complete promptly even for a live child, got {outcome:?}"
+        "the job must complete even for a live child, got {outcome:?}"
     );
 
     // Only now, with the outcome already confirmed, is the child released: `skip_wait: true`

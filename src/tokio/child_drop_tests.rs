@@ -225,18 +225,14 @@ async fn a_disarmed_killed_drop_with_an_already_reaped_root_releases_inline_not_
 /// both leave nothing for this test's own `waitpid` to find, for unrelated reasons, so that
 /// version passed and failed for the wrong reason either way.
 ///
-/// Waiting on `outcome` is bounded by a generous, one-shot `recv_timeout` — not a synchronization
-/// mechanism this test's correctness depends on, but the failure bound CLAUDE.md's own timing
-/// rule carves out: an external event (the reaper-pool worker's own report) that, under exactly
-/// the regression this test exists to catch, genuinely never comes, because the child never
-/// exits. A timeout here IS the failure, surfaced loudly instead of hanging the suite; stdin is
-/// closed unconditionally afterward either way, so a real regression still unwedges its own
-/// worker for later tests rather than leaking it forever.
+/// Waits on `outcome` with a plain, untimed `recv()`: the reaper pool is our own code, so syncing
+/// on it with a wall clock is forbidden — a regression that parks the worker genuinely hangs, and
+/// nextest's own `slow-timeout` for this test (`.config/nextest.toml`) is the failure bound
+/// surfaced to a human instead.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_disarmed_killed_drop_whose_kill_missed_the_root_does_not_park_a_reaper_worker_on_it() {
     use std::sync::mpsc;
-    use std::time::Duration;
 
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
     use crate::containment::Attached;
@@ -303,20 +299,22 @@ async fn a_disarmed_killed_drop_whose_kill_missed_the_root_does_not_park_a_reape
         executing, dropping,
         "the release must run on a reaper thread, never the dropping one"
     );
-    let result = outcome.recv_timeout(Duration::from_secs(20));
+    let result = outcome.recv();
 
-    // Whatever `result` says, let the child exit now: a real regression parks the worker in
-    // `wait_and_reap` on it, and this unblocks that worker (and lets the child itself be cleaned
-    // up, one way or another) for the rest of this process's tests. Not asserted further: once
-    // `os.proc` is dropped it is tokio's own orphan queue that may reap it, racing harmlessly
-    // with whatever else in this shared test binary next triggers a `SIGCHLD` sweep — the same
-    // best-effort cleanup `Unreaped::leak` documents elsewhere, not this test's concern.
+    // Only reached once `outcome` actually reports: a real regression parks the worker in
+    // `wait_and_reap` on this still-blocked child forever, which nextest's own `slow-timeout` for
+    // this test bounds by terminating the process — the same OS-level teardown that ends the
+    // child too, so nothing here needs to unblock it by hand in that case. Not asserted further
+    // in the ordinary case either: once `os.proc` is dropped it is tokio's own orphan queue that
+    // may reap it, racing harmlessly with whatever else in this shared test binary next triggers
+    // a `SIGCHLD` sweep — the same best-effort cleanup `Unreaped::leak` documents elsewhere, not
+    // this test's concern.
     drop(stdin);
 
     assert!(
         matches!(result, Ok(ReapOutcome::Reaped(_))),
-        "the release must complete promptly, without parking a reaper-pool worker waiting for a \
-         root this leaf's kill never actually signalled (got {result:?} within the bound)"
+        "the release must complete without parking a reaper-pool worker waiting for a root this \
+         leaf's kill never actually signalled, got {result:?}"
     );
 }
 
@@ -568,9 +566,10 @@ async fn an_armed_async_leaf_retries_cgroup_kill_after_its_own_failed_attempt() 
 
     let _dropping = entered.recv().expect("the armed path must reach the reaper handoff");
     let _executing = started.recv().expect("a worker must take the job");
-    // Bounded, not a bare `recv()`: a bug in this test's own retry-detection (rather than the
-    // production code under test) must fail loudly instead of hanging the suite.
-    let result = outcome.recv_timeout(std::time::Duration::from_secs(20));
+    // No timeout: syncing on our own reaper pool with a wall clock is forbidden. nextest's own
+    // `slow-timeout` for this test (`.config/nextest.toml`) is the human-facing failure bound if
+    // this ever genuinely hangs.
+    let result = outcome.recv();
     assert!(
         matches!(result, Ok(ReapOutcome::Reaped(_))),
         "the job must complete via the reaper pool, got {result:?}"
