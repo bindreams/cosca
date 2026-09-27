@@ -30,6 +30,11 @@ cosca's async methods, and the sync methods of its async types, never block the 
 run on: no wait for a process exit or a cgroup drain, and no sweep of unbounded length. Work that
 must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 
+One exception: spawning blocks until `exec`, as tokio's own `Command::spawn` does. That includes
+cosca's placement report ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which
+completes before `exec`. The wait is bounded by the child's own progress to `exec`; a child stopped
+or stuck in D state between `fork` and `exec` holds the thread, as it would under tokio's spawn.
+
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async
 context ([tokio shutdown.rs]).
