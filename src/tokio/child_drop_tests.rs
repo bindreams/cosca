@@ -198,3 +198,67 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
     // `Command::kill_on_drop(false)` on a plain tokio child, which the runtime's own orphan
     // handling reaps in the background — nothing further to release here.
 }
+
+/// Async twin of `child_tests.rs`'s
+/// `dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once` — see that test's doc for the
+/// full hazard. `Child::drop` (tokio, `kill_on_drop` true, the default) sweeps the contained tree
+/// itself via its own explicit `self.os.attached.hard_kill()` call, then hands the root's reap off
+/// to the reaper pool (`reaper::submit`). Once that job's `run_teardown` reaps the root and drops
+/// `os` (dropping `os.attached`, an `Attached::FdMarker` on macOS), `Drop for Marker` runs — before
+/// this fix, still armed, firing `hard_kill` a SECOND, unconditional time, exactly like the sync
+/// twin.
+///
+/// Uses the real `reaper::test_probe` handoff (not a sleep) to wait until `run_teardown` has
+/// dropped `os` on the reaper thread — `run_teardown` sends `outcome` strictly AFTER `drop(os)` —
+/// before inspecting the marker's call count.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once() {
+    use std::sync::mpsc;
+
+    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable("/usr/bin/true");
+    cmd.arg("true"); // argv[0]; `executable` alone selects the loaded image, not argv
+    cmd.contain_with(crate::ContainMode::Strongest);
+    let child = cmd.spawn().expect("spawn a contained macOS root");
+    // Keyed on this marker's own handle, not a bare process-global count — see
+    // `fault::HARD_KILL_CALLS`'s own doc for why a bare count cannot tell this Child's sweeps
+    // apart from a concurrent, unrelated test's.
+    let handle = child
+        .test_marker_handle()
+        .expect("Strongest attaches FdMarker on macOS");
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (outcome_tx, outcome) = mpsc::channel();
+    arm(DropProbe {
+        entered: entered_tx,
+        started: started_tx,
+        gate: gate_rx,
+        outcome: outcome_tx,
+    });
+    drop(gate_tx); // never held: nothing here needs the teardown parked open
+
+    drop(child); // kill_on_drop defaults to true: this is the armed path under test.
+
+    entered
+        .recv()
+        .expect("an armed, not-yet-reaped drop must reach the reaper handoff");
+    started.recv().expect("a worker must take the job");
+    assert!(
+        matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+        "the job must complete via the reaper pool"
+    );
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(handle),
+        1,
+        "Child::drop's own explicit hard_kill must be the ONLY sweep of this tree; a second \
+         (from an armed Drop for Marker still running after the reaper thread's drop(os) already \
+         tore the tree down) unconditionally re-fires killpg on a pgid that may since have been \
+         recycled"
+    );
+}

@@ -754,6 +754,39 @@ pub(crate) mod fault {
     pub(crate) fn lock_for_log_assertion() -> std::sync::MutexGuard<'static, ()> {
         LOG_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// How many times [`Marker::hard_kill`](super::Marker::hard_kill) has run, per marker
+    /// `handle` — not a single bare count: this crate's test binary runs every test in one
+    /// shared process, routinely with several unrelated markers sweeping concurrently, and a
+    /// process-global count would attribute another test's sweep to this one (measured: a bare
+    /// counter read 10 under the full suite, not the 1-or-2 either scenario this seam exists to
+    /// tell apart). Keyed on `handle` instead, the same disambiguator
+    /// `sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member`'s
+    /// own log-line assertion already relies on: a pipe object's handle cannot be reissued while
+    /// this process holds its read end, so no simultaneously-live marker can share one.
+    ///
+    /// Process-global (not thread-local): a regression test for "`Child::drop`'s own explicit
+    /// `hard_kill` plus a redundant one from `Drop for Marker`" needs to see this from BOTH the
+    /// thread that calls `Child::drop` and whichever reaper thread later drops a retained/async
+    /// `Marker` — those are frequently different threads (`cosca::tokio::Child`'s own `Drop`
+    /// hands the final release to a pooled reaper thread), so a thread-local counter would
+    /// silently miss the second call.
+    static HARD_KILL_CALLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    fn hard_kill_calls() -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, usize>> {
+        HARD_KILL_CALLS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn record_hard_kill_call(handle: u64) {
+        *hard_kill_calls().entry(handle).or_insert(0) += 1;
+    }
+
+    /// Read-and-remove this handle's count, so each test starts from a clean slate regardless of
+    /// what earlier or concurrent tests left behind for OTHER handles.
+    pub(crate) fn take_hard_kill_calls(handle: u64) -> usize {
+        hard_kill_calls().remove(&handle).unwrap_or(0)
+    }
 }
 
 // The attached mechanism =====
@@ -961,6 +994,13 @@ impl Marker {
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
     pub(crate) fn hard_kill(&self) -> Result<(), Error> {
+        // Test-only bookkeeping: a regression test counts calls (keyed on this marker's own
+        // handle) across the whole lifetime of a `Child` to prove a redundant `Drop for Marker`
+        // kill (see that impl's doc) never runs after `Child::drop`'s own explicit sweep already
+        // tore the tree down. `fault` is `#[cfg(test)]`-only (unlike some sibling mechanisms'
+        // always-on fault modules), so the call site must be gated the same way.
+        #[cfg(test)]
+        fault::record_hard_kill_call(self.handle);
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's

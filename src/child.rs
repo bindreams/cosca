@@ -472,7 +472,6 @@ impl Child {
 
     /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
     #[cfg(all(test, target_os = "macos"))]
-    #[allow(dead_code)] // awaits a unit-test consumer; not visible to integration tests (pub(crate))
     pub(crate) fn test_marker_handle(&self) -> Option<u64> {
         match &self.attached {
             crate::containment::Attached::FdMarker(m) => Some(m.handle()),
@@ -568,6 +567,17 @@ impl Drop for Child {
             );
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
+        // Disarm now that this handle's own sweep just ran: whatever falls out of scope below
+        // (the field-wise drop of `self.attached` at the end of this function) must not run a
+        // SECOND, redundant sweep of its own. That would matter little for a mechanism gated on
+        // real occupancy (`Cgroup`'s `Drop` only re-kills if `rmdir` still finds the leaf
+        // occupied — a fact, not a stale identifier), but `FdMarker`'s `Drop` (see its own doc)
+        // fires `hard_kill`'s pass 1 unconditionally on EVERY call, with no occupancy check —
+        // and by the time `teardown_on_drop` below has reaped the root, the pgid this handle just
+        // swept may already have been recycled onto an unrelated, live process group. `disarm`
+        // does not opt out of AWAITING a kill this same handle already sent (see its own doc) —
+        // only out of sending a new one nothing here asked for.
+        self.attached.disarm();
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
         // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals, handing

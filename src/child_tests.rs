@@ -121,3 +121,47 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
     // ...)` must not fire here. If the laundering regresses, this line panics.
     drop(child);
 }
+
+/// Regression test: `Child::drop` (`kill_on_drop` true, the default) sweeps the contained tree
+/// itself via its own explicit `self.attached.hard_kill()` call, then reaps the root
+/// (`teardown_on_drop`). Once that has happened, `self.attached` (an `Attached::FdMarker` on
+/// macOS) falls out of scope and runs `Drop for Marker`, which — before this fix — was still
+/// armed and fired `hard_kill` a SECOND time, unconditionally re-sending `sweep_pass`'s pass-1
+/// group signal (`killpg` on the marker's `pgid`) over a process group `Child::drop`'s own sweep
+/// already tore down.
+///
+/// That second, unconditional `killpg` is not harmless: `sweep_pass`'s pass-1 fire has no
+/// liveness gate (see its own doc — only a LATER pass's re-fire is gated on a freshly confirmed
+/// live member), so it reaches whatever the OS may since have recycled that pgid number onto,
+/// entirely unrelated to this `Child`'s own tree. This test does not need to engineer an actual
+/// recycled pgid (a race against the kernel's own allocator, not something to synchronize on) —
+/// counting `Marker::hard_kill` invocations across one `Child::drop` proves the hazard directly:
+/// every invocation's OWN first pass fires the group signal unconditionally, so two invocations
+/// means two unconditional `killpg` calls, the second one blind to whatever now holds the pgid.
+#[cfg(target_os = "macos")]
+#[test]
+fn dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once() {
+    let child = crate::Command::new()
+        .executable("/usr/bin/true")
+        .arg("true") // argv[0]; `executable` alone selects the loaded image, not argv
+        .contain_with(crate::ContainMode::Strongest)
+        .spawn()
+        .expect("spawn a contained macOS root");
+    // Keyed on this marker's own handle, not a bare process-global count: this crate's test
+    // binary runs every test in one shared process, routinely with several unrelated markers
+    // sweeping concurrently — see `fault::HARD_KILL_CALLS`'s own doc for why a bare count cannot
+    // tell this Child's sweeps apart from a concurrent, unrelated test's.
+    let handle = child
+        .test_marker_handle()
+        .expect("Strongest attaches FdMarker on macOS");
+
+    drop(child); // kill_on_drop defaults to true: this is the armed path under test.
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(handle),
+        1,
+        "Child::drop's own explicit hard_kill must be the ONLY sweep of this tree; a second \
+         (from an armed Drop for Marker still running after that sweep already tore the tree \
+         down) unconditionally re-fires killpg on a pgid that may since have been recycled"
+    );
+}

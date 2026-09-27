@@ -687,6 +687,18 @@ impl Child {
     }
 }
 
+impl Child {
+    /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree. Async
+    /// twin of the sync [`Child::test_marker_handle`](crate::Child::test_marker_handle).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_marker_handle(&self) -> Option<u64> {
+        match &self.os.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.handle()),
+            _ => None,
+        }
+    }
+}
+
 /// Fault seams for [`wait_and_reap`]. Take-semantics, matching `crate::wait::fault`.
 #[cfg(test)]
 pub(crate) mod fault {
@@ -856,6 +868,12 @@ impl Drop for Child {
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         let _ = tree;
+        // Disarm now that this handle's own sweep just ran: whatever eventually drops `os.attached`
+        // below (inline here, or later on a reaper thread once the root's reap is handed off) must
+        // not run a SECOND, redundant sweep of its own — see the sync twin's identical comment for
+        // why this matters concretely for `FdMarker`, whose `Drop` fires `hard_kill`'s pass 1
+        // unconditionally on every call, with no occupancy check.
+        self.os.attached.disarm();
 
         let pid = self.id.pid();
         // The WHOLE resource group moves, so a field added to `OsResources` is carried here
