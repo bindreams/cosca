@@ -1,4 +1,8 @@
 //! [`ResolveInput::cwd`]: which names need a base, and that `None` resolves those that do not.
+//!
+//! A test name ending `_unprivileged` needs a caller without `CAP_DAC_READ_SEARCH` (not root): run
+//! as root it fails loudly, naming the violated precondition, rather than silently passing on a
+//! precondition it never built. Opt out with `cargo nextest run -E 'not test(/_unprivileged$/)'`.
 
 use super::*;
 
@@ -278,37 +282,102 @@ fn a_candidate_is_accepted_when_fully_qualified() {
     }
 }
 
-/// One byte past `NAME_MAX` (255 on ext4, tmpfs, APFS and HFS+): a single path component this
-/// long is refused by the kernel's parse of the name itself, before any lookup or permission check
-/// runs.
+/// Reads the raw OS error [`crate::error::io_context`] wrapped: it keeps the original
+/// [`std::io::Error`] as `source()` precisely so the code survives being wrapped (several codes
+/// share one [`std::io::ErrorKind`]), and these fixtures rely on that to pin the exact errno
+/// rather than the coarser kind.
 #[cfg(unix)]
-const UNNAMEABLE_COMPONENT_LEN: usize = 256;
+fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
+    std::error::Error::source(e)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
 
 /// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
 ///
-/// The first entry is a directory that is never created, named one byte past `NAME_MAX`: `stat`
-/// rejects a component that long while parsing the name, before it asks whether anything exists
-/// there, so no on-disk fixture is needed to make the check fail.
+/// The first entry is a symlink to itself: resolving `<loop>/tool.exe` always yields `ELOOP`,
+/// the kernel's own loop-detection limit. That is not a DAC (discretionary access control)
+/// decision — no capability, root's `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` included, exempts a
+/// caller from it — so it fails identically for every uid. `ELOOP` is also already pinned as
+/// undeterminable, independently of this fixture, by
+/// [`only_a_denied_or_absent_execute_check_is_a_no`]; a too-long name would only be undeterminable
+/// by `is_absence` never having listed it, an omission a future change could close unnoticed.
 ///
-/// A chmod'd directory (the previous fixture here) does not survive contact with root: refusing a
-/// stat by permission bits is a DAC (discretionary access control) decision, and root carries
-/// `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, the capabilities that make root exempt from DAC —
-/// measured 2026-09-27 in `rust:1.90.0-bookworm`, root's `stat` on a `0o000` directory does not
-/// error, it just sees an empty directory and reports `ENOENT` for the file inside, which is a
-/// definite absence, not an undeterminable candidate. A component over `NAME_MAX` fails identically
-/// for root and any other caller: name-length is a syntactic limit on the request itself, checked
-/// before permissions are ever consulted, and no capability grants an exemption from it.
+/// The precondition this fixture means to build — a candidate `is_absence` cannot call absent —
+/// is asserted here rather than trusted, so a platform where it stops holding fails loudly instead
+/// of silently testing nothing.
 #[cfg(unix)]
-fn unnameable_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
+fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
     let root = tempfile::tempdir().unwrap();
-    let unnameable = root.path().join("a".repeat(UNNAMEABLE_COMPONENT_LEN));
+    let looping = root.path().join("loop");
+    std::os::unix::fs::symlink("loop", &looping).unwrap();
     let open = root.path().join("open");
     std::fs::create_dir(&open).unwrap();
     std::fs::write(open.join("tool.exe"), b"x").unwrap();
-    let mut path = unnameable.into_os_string();
+    let e = std::fs::metadata(looping.join("tool.exe")).unwrap_err();
+    assert!(
+        !is_absence(&e),
+        "precondition: {looping:?}/tool.exe must be undeterminable, not a definite absence: {e}"
+    );
+    let mut path = looping.into_os_string();
     path.push(";");
     path.push(&open);
     (root, open, path)
+}
+
+/// Restores a directory's permissions on drop, so the tempdir can be removed whatever the test's
+/// outcome.
+#[cfg(unix)]
+struct Locked(PathBuf);
+
+#[cfg(unix)]
+impl Locked {
+    fn new(dir: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Locked(dir)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)) {
+            log::warn!("could not unlock {:?}: {e}", self.0);
+        }
+    }
+}
+
+/// A `PATH` entry whose candidate cannot be checked because its directory is unreadable, followed
+/// by one that holds the name. Unlike [`loop_then_open`], this is a REAL `EACCES` — the case that
+/// production code actually meets on every unelevated host — not merely a uid-independent stand-in
+/// for one.
+///
+/// It only holds for a caller without `CAP_DAC_READ_SEARCH` (not root), which the precondition
+/// assert below checks: root's DAC override lets it stat through a `0o000` directory, so under
+/// root this fixture panics with that explanation rather than silently exercising nothing. See the
+/// module doc for the `_unprivileged` test-name convention this fixture is paired with.
+#[cfg(unix)]
+fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
+    let root = tempfile::tempdir().unwrap();
+    let locked = root.path().join("locked");
+    let open = root.path().join("open");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::create_dir(&open).unwrap();
+    std::fs::write(open.join("tool.exe"), b"x").unwrap();
+    let locked = Locked::new(locked);
+    let e = std::fs::metadata(locked.0.join("tool.exe")).unwrap_err();
+    assert_eq!(
+        e.raw_os_error(),
+        Some(libc::EACCES),
+        "precondition: this test needs a caller without CAP_DAC_READ_SEARCH (not root); opt out \
+         with `-E 'not test(/_unprivileged$/)'`: got {e}"
+    );
+    let mut path = locked.0.clone().into_os_string();
+    path.push(";");
+    path.push(&open);
+    (root, locked, open, path)
 }
 
 #[cfg(unix)]
@@ -325,24 +394,36 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
 }
 
 /// Under `loadable_only`, a candidate whose existence cannot be determined fails the search closed:
-/// the entry after it must not win because a check errored. `ENAMETOOLONG` decodes to
-/// [`std::io::ErrorKind::InvalidFilename`] (stable since Rust 1.83), the same for every caller.
+/// the entry after it must not win because a check errored. Uid-independent: passes as root and as
+/// any other caller alike.
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
-    let (_root, _open, path) = unnameable_then_open();
+    let (_root, _open, path) = loop_then_open();
     match search_tool(&path, true) {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidFilename, "{e}"),
+        Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::ELOOP), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }
 
-/// An ordinary spawn skips it and goes on, as before, so one unreadable `PATH` directory does not
-/// break every unelevated spawn.
+/// The same claim against a REAL permission-denied candidate, not just the uid-independent `ELOOP`
+/// stand-in above — see [`locked_then_open`] for why this one only runs unprivileged.
+#[cfg(unix)]
+#[test]
+fn an_undeterminable_candidate_fails_a_loadable_only_search_closed_unprivileged() {
+    let (_root, _locked, _open, path) = locked_then_open();
+    match search_tool(&path, true) {
+        Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::EACCES), "{e}"),
+        other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
+    }
+}
+
+/// An ordinary spawn skips it and goes on, as before, so one `PATH` entry whose candidate cannot be
+/// checked does not break every unelevated spawn.
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
-    let (_root, open, path) = unnameable_then_open();
+    let (_root, open, path) = loop_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
