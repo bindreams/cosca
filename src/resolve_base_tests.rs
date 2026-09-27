@@ -1,9 +1,10 @@
 //! [`ResolveInput::cwd`]: which names need a base, and that `None` resolves those that do not.
 //!
 //! A test name ending `_unprivileged` needs a caller DAC applies to: on Linux, one without
-//! `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH`; elsewhere, not root. Run as root (or with either
-//! capability) it fails loudly, naming the violated precondition, rather than silently passing on a
-//! precondition it never built. Opt out with `cargo nextest run -E 'not test(/_unprivileged$/)'`.
+//! `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH`; elsewhere, not root. Run by any other caller (on
+//! Linux, one holding either capability, as root usually does; elsewhere, root) it fails loudly,
+//! naming the violated precondition, rather than silently passing on a precondition it never
+//! built. Opt out with `cargo nextest run -E 'not test(/_unprivileged$/)'`.
 
 use super::*;
 
@@ -315,10 +316,11 @@ fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
     let open = root.path().join("open");
     std::fs::create_dir(&open).unwrap();
     std::fs::write(open.join("tool.exe"), b"x").unwrap();
-    let e = std::fs::metadata(looping.join("tool.exe")).unwrap_err();
+    let candidate = looping.join("tool.exe");
+    let e = std::fs::metadata(&candidate).unwrap_err();
     assert!(
         !is_absence(&e),
-        "precondition: {looping:?}/tool.exe must be undeterminable, not a definite absence: {e}"
+        "precondition: {candidate:?} must be undeterminable, not a definite absence: {e}"
     );
     let mut path = looping.into_os_string();
     path.push(";");
@@ -351,9 +353,9 @@ impl Drop for Locked {
 }
 
 /// A `PATH` entry whose candidate cannot be checked because its directory is unreadable, followed
-/// by one that holds the name. Unlike [`loop_then_open`], this is a REAL `EACCES` — the case that
-/// production code actually meets on every unelevated host — not merely a uid-independent stand-in
-/// for one.
+/// by one that holds the name. Unlike [`loop_then_open`], this is a real permission denial — the
+/// one failure whose kind is `PermissionDenied`, as an unreadable `PATH` directory yields — not a
+/// stand-in on another errno.
 ///
 /// It only holds for a caller DAC applies to (on Linux, one without `CAP_DAC_OVERRIDE` or
 /// `CAP_DAC_READ_SEARCH`; elsewhere, not root), which the precondition assert below checks: DAC
@@ -431,10 +433,10 @@ fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
-/// The same claim against a REAL permission-denied candidate, not just the uid-independent `ELOOP`
-/// stand-in above — this is the production case an ordinary (non-`loadable_only`) search actually
-/// meets on every unelevated host, so one `PATH` directory a caller cannot read must not break the
-/// whole search. See [`locked_then_open`] for why this one only runs unprivileged.
+/// The same claim against a real permission denial — the one failure whose kind is
+/// `PermissionDenied`, as an unreadable `PATH` directory yields — not a stand-in on another errno:
+/// one such directory must not break the whole search. See [`locked_then_open`] for why this one
+/// only runs unprivileged.
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search_unprivileged() {
