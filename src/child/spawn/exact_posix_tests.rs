@@ -112,7 +112,7 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
         return;
     };
-    drop_root();
+    crate::test_privilege::drop_dac_bypass();
     let mut gate = [0u8; 1];
     std::io::stdin().read_exact(&mut gate).expect("gate byte");
     if std::fs::metadata(&own_path).is_ok() {
@@ -148,34 +148,6 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     };
     std::process::exit(code);
 }
-
-/// Root reaches an unsearchable directory anyway (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`), so a
-/// root fixture becomes [`UNPRIVILEGED`] first: the test is then the same one it is for any other
-/// user, rather than one that cannot set up its own precondition.
-fn drop_root() {
-    // SAFETY: plain credential calls with valid arguments. libtest runs this on a thread of its
-    // own, not the main one, which is fine: glibc and musl broadcast a set*id to every thread
-    // (setxid), and Darwin's credentials are per-process, so the whole fixture process drops
-    // together — and the spawn that must run unprivileged happens on this same thread anyway.
-    unsafe {
-        if libc::geteuid() != 0 {
-            return;
-        }
-        if libc::setgroups(0, std::ptr::null()) != 0
-            || libc::setgid(UNPRIVILEGED) != 0
-            || libc::setuid(UNPRIVILEGED) != 0
-        {
-            report(&format!(
-                "precondition: dropping root: {}",
-                std::io::Error::last_os_error()
-            ));
-            std::process::exit(PRECONDITION_FAILED);
-        }
-    }
-}
-
-/// The uid and gid a root fixture drops to: `nobody` on Linux.
-const UNPRIVILEGED: libc::uid_t = 65534;
 
 /// The command `.elevate()` spawns from a process that is already root, on any host.
 fn already_elevated(c: &mut Command) -> Result<Command, Error> {

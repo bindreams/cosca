@@ -51,6 +51,9 @@ mod log_capture;
 #[cfg(test)]
 mod test_child;
 
+#[cfg(all(test, unix))]
+mod test_privilege;
+
 pub mod process;
 pub use process::{Process, Recursive};
 

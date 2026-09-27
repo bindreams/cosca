@@ -31,19 +31,60 @@
 /// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
 /// filter; this stdout check is the remaining backstop for whatever that still lets through.
 pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
-    // No `"cosca_unit_tests"` placeholder in slot 0 (that's [`fixture_argv`]'s convention for
-    // `cosca::Command`, see its doc): `std::process::Command` below already supplies its own
-    // argv[0] from `Command::new`'s program path.
+    let mut cmd = fixture_command(fixture);
+    cmd.env(marker_env, cwd).current_dir(cwd);
+    run_fixture_command(fixture, cmd);
+}
+
+/// Runs the libtest fixture at fully-qualified path `fixture` in a FRESH re-exec of this test
+/// binary, with `marker_env` set (to `"1"`, since unlike [`run_fixture_with_cwd`]'s this call
+/// carries no data the fixture needs back) — for a fixture whose body needs isolation for some
+/// OTHER process-wide, irreversible state, such as
+/// [`crate::test_privilege::drop_dac_bypass`]'s uid and capability sets, rather than for the cwd
+/// `run_fixture_with_cwd` exists to isolate.
+///
+/// `marker_env`'s presence is what lets the fixture tell this deliberate re-exec apart from being
+/// picked up by an ordinary, unfiltered suite run — where it must no-op rather than mutate this
+/// (shared, multithreaded) test binary's own irreversible process-wide state out from under every
+/// other concurrently running test. See [`run_fixture_with_cwd`]'s doc for the re-exec rationale,
+/// the panic conditions, and why `fixture` should come from [`fixture_path!`].
+pub(crate) fn run_fixture(fixture: &str, marker_env: &str) {
+    let mut cmd = fixture_command(fixture);
+    cmd.env(marker_env, "1");
+    run_fixture_command(fixture, cmd);
+}
+
+/// The `std::process::Command` common to every fixture re-exec: this binary, filtered to exactly
+/// one test, single-threaded, with both stdio streams captured for [`run_fixture_command`].
+///
+/// No `"cosca_unit_tests"` placeholder in argv slot 0 (that's [`fixture_argv`]'s convention for
+/// `cosca::Command`, see its doc): `std::process::Command` already supplies its own argv[0] from
+/// `Command::new`'s program path.
+fn fixture_command(fixture: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args(["--test-threads=1", "--exact", fixture])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd
+}
+
+/// Spawns `cmd` (built from [`fixture_command`], possibly with more set on it) under
+/// `spawn_lock()`, matching every other raw `std::process::Command` re-exec of this test binary
+/// (see [`spawn_a_process_that_exits`]'s doc for the macOS fd-marker hazard that convention
+/// guards against), and waits for it.
+///
+/// Panics with the child's captured stdout/stderr on a non-zero exit, i.e. whenever the fixture's
+/// own assertions failed — OR when the child's own libtest banner does not show that exactly the
+/// one intended fixture ran. `--exact <fixture>` naming a test that does not exist (a typo, or a
+/// rename on one side of the caller/fixture pair) makes libtest match ZERO tests and still exit
+/// 0, which a bare `status.success()` check cannot tell apart from "the fixture ran and passed" —
+/// build `fixture` with [`fixture_path!`] rather than a hand-typed string literal, so a mismatch
+/// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
+/// filter; this stdout check is the remaining backstop for whatever that still lets through.
+fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
     let child = {
         let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args(["--test-threads=1", "--exact", fixture])
-            .env(marker_env, cwd)
-            .current_dir(cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn fixture child")
+        cmd.spawn().expect("spawn fixture child")
     };
     let output = child.wait_with_output().expect("wait for fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
