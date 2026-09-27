@@ -76,8 +76,15 @@ pub(crate) fn childs_copy(
 ///
 /// For a test that closes the parent's end of a channel and needs the child to see that close: any
 /// process another test forks meanwhile holds a copy of that end until its own `exec`, and keeps
-/// the socket open past the close.
-#[cfg(target_os = "linux")]
+/// the socket open past the close. `child::spawn::fd_map_tests` also uses this, for the same
+/// reason but a plainer one: a test that closes this process's own fd 0/1/2 (process-wide, not
+/// per-thread) must not run alongside any other test in the same binary, on any Unix, not just
+/// Linux — hence `unix` rather than this file's otherwise Linux-only gate. Sets `COSCA_TEST_ALONE`
+/// in the copy so a precondition assert guarding the actual mutation (e.g.
+/// `tests/common::require_process_per_test`, a separate copy in a separate compilation unit that
+/// cannot name this one) can accept either this or nextest's own
+/// `NEXTEST_EXECUTION_MODE=process-per-test`.
+#[cfg(unix)]
 pub(crate) fn alone(name: &str) -> bool {
     const ALONE: &str = "COSCA_TEST_ALONE";
     if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
