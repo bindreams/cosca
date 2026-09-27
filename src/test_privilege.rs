@@ -74,9 +74,11 @@ pub(crate) fn drop_dac_bypass() -> std::io::Result<()> {
 pub(crate) const INJECT_FAILURE_ENV: &str = "COSCA_FIXTURE_INJECT_DAC_BYPASS_FAILURE";
 
 /// The uid and gid a root fixture drops to: `nobody` on Linux, and the conventional unallocated
-/// id elsewhere. Unused on Linux, which never changes uid — see [`drop_dac_bypass`].
+/// id elsewhere. Unused on Linux, which never changes uid — see [`drop_dac_bypass`]. `pub(crate)`:
+/// [`crate::test_child::run_fixture`] also needs it, to `chown` the scratch root it hands each
+/// fixture to the identity the fixture will actually be running as once it drops.
 #[cfg(not(target_os = "linux"))]
-const UNPRIVILEGED: libc::uid_t = 65534;
+pub(crate) const UNPRIVILEGED: libc::uid_t = 65534;
 
 /// The non-Linux half of [`drop_dac_bypass`]: root reaches an unsearchable directory anyway (it
 /// is the platform's only DAC bypass, with no separate capability system to strip), so a root
