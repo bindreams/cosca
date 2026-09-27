@@ -1512,9 +1512,16 @@ fn main() {
             std::fs::write(&args[2], std::process::id().to_string()).expect("write pid");
             std::thread::sleep(std::time::Duration::from_secs(600));
         }
-        // A long-lived elevated child for the Windows Unkillable/drop test.
+        // A long-lived elevated child for the Windows Unkillable/drop test. Blocks until this
+        // process is killed for real — never via a chosen sleep duration: the caller's `kill()`
+        // runs immediately after spawn, with no readiness wait (an elevated runas child gets its
+        // own console, so no pipe/handle can cross that boundary to prove readiness — see
+        // `tests/elevation.rs`'s callers), so an aliveness window bounded by ANY fixed duration,
+        // however large, is a race this fixture must not have at all.
         "sleep-marker" => {
-            std::thread::sleep(std::time::Duration::from_secs(600));
+            let (_tx, rx) = std::sync::mpsc::channel::<std::convert::Infallible>();
+            let _ = rx.recv(); // never returns: `_tx`, the lone sender, lives until this block
+                               // ends (never, since `recv` never returns) and is never sent on.
         }
         other => {
             eprintln!("cosca_testbin: unknown mode {other:?}");

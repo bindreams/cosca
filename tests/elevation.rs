@@ -392,7 +392,11 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
     }
     let exe = testbin();
     let mut c = cosca::Command::new();
-    // A long-lived elevated child (ping loops ~50s).
+    // A long-lived elevated child, blocked until killed for real (testbin's `sleep-marker`
+    // mode) — never via a chosen sleep duration: `kill()` below runs immediately, with no
+    // readiness wait (an elevated runas child gets its own console, so no pipe/handle can cross
+    // that boundary — see `spawn_elevated`'s `ElevatedStdio::OwnConsole`), so any fixed-duration
+    // fixture would race that immediate call.
     c.executable(&exe)
         .args([exe.clone().into_os_string(), "sleep-marker".into()])
         .elevate();
