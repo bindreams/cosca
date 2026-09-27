@@ -1004,6 +1004,50 @@ fn gate_rejects_a_non_alone_process() {
     );
 }
 
+/// The gate must reject a FORGED-BUT-MATCHING `COSCA_TEST_ALONE` too, not just a missing one: an
+/// implementation that only checked `var_os("COSCA_TEST_ALONE").is_some()` — never this process's
+/// own argv — would pass [`gate_rejects_a_non_alone_process`] above just as well as the real
+/// check does, since that prover never sets the env var at all. Spawns the same probe with
+/// `COSCA_TEST_ALONE` set to the probe's own name (exactly what a genuine `alone()` re-exec would
+/// set) but the SAME non-`ALONE_ARGS` argv shape as above, so only the argv half of
+/// `alone_marker_matches` can be what rejects it here.
+#[cfg(unix)]
+#[test]
+fn gate_rejects_a_matching_env_var_with_a_non_alone_argv() {
+    const PROBE: &str = "close_without_alone_probe";
+    let child = {
+        let _guard = cosca::test_spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_PROBE", "1")
+            .env("COSCA_TEST_ALONE", PROBE)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the probe")
+    };
+    let out = common::wait_bounded(child, std::time::Duration::from_secs(30));
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a matching COSCA_TEST_ALONE with the WRONG argv shape must still be rejected (exit 101) \
+         — an env-var-only gate would wrongly accept this. got {:?}\n--- stdout ---\n{}\n--- \
+         stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("call this from inside common::alone() — see cosca#196"),
+        "the gate's own panic message must reach stderr — got:\n{combined}"
+    );
+}
+
 /// Prove that fd 3 configured as a file is passed through to the child:
 /// the child reads fd 3 and echoes it to stdout; we compare the payload.
 #[cfg(unix)]

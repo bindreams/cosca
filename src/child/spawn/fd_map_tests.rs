@@ -1020,6 +1020,46 @@ fn gate_rejects_a_non_alone_process_via_restore_fd2() {
     );
 }
 
+/// The gate must reject a FORGED-BUT-MATCHING `COSCA_TEST_ALONE` too, not just a missing one — the
+/// lib's own copy of `tests/spawn_io.rs`'s `gate_rejects_a_matching_env_var_with_a_non_alone_argv`.
+/// See there for why [`gate_rejects_a_non_alone_process_via_restore_fd2`] above never exercises
+/// the argv half of `alone_marker_matches` on its own.
+#[test]
+fn gate_rejects_a_matching_env_var_with_a_non_alone_argv_via_restore_fd2() {
+    const PROBE: &str = "child::spawn::fd_map::fd_map_tests::close_without_alone_via_restore_fd2_probe";
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_VIA_RESTORE_FD2_PROBE", "1")
+            .env("COSCA_TEST_ALONE", PROBE)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the probe")
+    };
+    let out = wait_bounded(child, std::time::Duration::from_secs(30));
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a matching COSCA_TEST_ALONE with the WRONG argv shape must still be rejected (exit 101) \
+         — an env-var-only gate would wrongly accept this. got {:?}\n--- stdout ---\n{}\n--- \
+         stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("call this from inside crate::containment::cgroup::test_support::alone() — see cosca#196"),
+        "the gate's own panic message must reach stderr — got:\n{combined}"
+    );
+}
+
 /// A mapping whose parent-side source starts out sitting at fd 2 — because the current process
 /// just closed its own fd 2 and the source is the next thing opened — must not be silently
 /// repointed to whatever std's OWN `.stderr()` setup later `dup2`s onto fd 2 in the child. Std
