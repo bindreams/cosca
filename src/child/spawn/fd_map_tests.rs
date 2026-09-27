@@ -576,14 +576,24 @@ fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) ->
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read;
-        let mut stdout = Vec::new();
+        // Drain stdout and stderr CONCURRENTLY, each on its own thread — like std's own `read2`
+        // internals — not one after the other. A child that writes more than one pipe buffer
+        // (commonly 64 KiB) to stderr while producing little or no stdout would otherwise
+        // deadlock this function: reading stdout to EOF blocks until the child exits, but the
+        // child is itself blocked writing to a stderr pipe nobody is draining. Measured with 200
+        // KB of stderr.
+        let stdout_thread = std::thread::spawn(move || {
+            let mut stdout = Vec::new();
+            if let Some(mut p) = stdout_pipe.take() {
+                let _ = p.read_to_end(&mut stdout);
+            }
+            stdout
+        });
         let mut stderr = Vec::new();
-        if let Some(mut p) = stdout_pipe.take() {
-            let _ = p.read_to_end(&mut stdout);
-        }
         if let Some(mut p) = stderr_pipe.take() {
             let _ = p.read_to_end(&mut stderr);
         }
+        let stdout = stdout_thread.join().expect("join the stdout-draining thread");
         // Confirm the child has exited WITHOUT reaping it (`WNOWAIT`) — reaping stays on the
         // caller's thread below, the only place allowed to touch the `Child` it still owns.
         let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -644,6 +654,30 @@ fn run_probe_directly(probe_name: &str, extra_env: &[(&str, &str)]) -> std::proc
         cmd.spawn().expect("spawn the probe")
     };
     wait_bounded(child, std::time::Duration::from_secs(30))
+}
+
+/// `wait_bounded` must drain stdout and stderr CONCURRENTLY, not one after the other — the lib's
+/// own copy of `tests/spawn_io.rs`'s `wait_bounded_drains_stdout_and_stderr_concurrently`. See
+/// there for the deadlock this catches.
+#[test]
+fn wait_bounded_drains_stdout_and_stderr_concurrently() {
+    const STDERR_BYTES: usize = 200_000;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(format!("head -c {STDERR_BYTES} /dev/zero | tr '\\0' 'x' 1>&2"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        cmd.spawn().expect("spawn the child")
+    };
+    let out = wait_bounded(child, std::time::Duration::from_secs(30));
+    assert!(out.status.success(), "the child must exit cleanly: {:?}", out.status);
+    assert_eq!(
+        out.stderr.len(),
+        STDERR_BYTES,
+        "must drain all of stderr, not hang or truncate it while stdout sits empty"
+    );
 }
 
 /// A deliberate, always-panicking probe for `RestoreFd2`'s panic-hook fix — the lib's own copy

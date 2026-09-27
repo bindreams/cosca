@@ -68,14 +68,24 @@ pub fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read;
-        let mut stdout = Vec::new();
+        // Drain stdout and stderr CONCURRENTLY, each on its own thread — like std's own `read2`
+        // internals — not one after the other. A child that writes more than one pipe buffer
+        // (commonly 64 KiB) to stderr while producing little or no stdout would otherwise
+        // deadlock this function: reading stdout to EOF blocks until the child exits, but the
+        // child is itself blocked writing to a stderr pipe nobody is draining. Measured with 200
+        // KB of stderr.
+        let stdout_thread = std::thread::spawn(move || {
+            let mut stdout = Vec::new();
+            if let Some(mut p) = stdout_pipe.take() {
+                let _ = p.read_to_end(&mut stdout);
+            }
+            stdout
+        });
         let mut stderr = Vec::new();
-        if let Some(mut p) = stdout_pipe.take() {
-            let _ = p.read_to_end(&mut stdout);
-        }
         if let Some(mut p) = stderr_pipe.take() {
             let _ = p.read_to_end(&mut stderr);
         }
+        let stdout = stdout_thread.join().expect("join the stdout-draining thread");
         // Confirm the child has exited WITHOUT reaping it (`WNOWAIT`) — reaping stays on the
         // caller's thread below, the only place allowed to touch the `Child` it still owns.
         let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };

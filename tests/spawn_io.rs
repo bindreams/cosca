@@ -32,6 +32,38 @@ mod stderr_log {
     }
 }
 
+// Test harness self-tests =====
+
+/// `common::wait_bounded` must drain stdout and stderr CONCURRENTLY, not one after the other: a
+/// child that writes more than one pipe buffer (commonly 64 KiB) to stderr, while producing
+/// little or no stdout, would otherwise block this helper forever — reading stdout to EOF waits
+/// for the child to exit, but the child itself is stuck blocked writing to a stderr pipe nobody is
+/// draining. `wait_bounded`'s own timeout would eventually fail this test loudly rather than hang
+/// the whole suite, but that failure is exactly the bug this test exists to catch directly:
+/// draining 200 KB of stderr (well past any plausible pipe buffer size) must complete well within
+/// the bound, not need it.
+#[cfg(unix)]
+#[test]
+fn wait_bounded_drains_stdout_and_stderr_concurrently() {
+    const STDERR_BYTES: usize = 200_000;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(format!("head -c {STDERR_BYTES} /dev/zero | tr '\\0' 'x' 1>&2"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = {
+        let _guard = cosca::test_spawn_lock();
+        cmd.spawn().expect("spawn the child")
+    };
+    let out = common::wait_bounded(child, std::time::Duration::from_secs(30));
+    assert!(out.status.success(), "the child must exit cleanly: {:?}", out.status);
+    assert_eq!(
+        out.stderr.len(),
+        STDERR_BYTES,
+        "must drain all of stderr, not hang or truncate it while stdout sits empty"
+    );
+}
+
 // Basics =====
 
 #[test]
