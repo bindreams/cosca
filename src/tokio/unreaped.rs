@@ -485,6 +485,16 @@ impl Unreaped {
         Unreaped::with_retained(held, retained)
     }
 
+    /// Test-only: whether this `Unreaped` retained a containment mechanism to give up or await
+    /// (rather than nothing) — see [`with_retained`](Unreaped::with_retained)'s own doc for who
+    /// has one and who does not. Windows-only: its one caller is the async raw-spawn-teardown
+    /// regression test, and the raw async backend itself is Windows-only, so this is dead code on
+    /// every other target.
+    #[cfg(all(test, windows))]
+    pub(crate) fn has_retained(&self) -> bool {
+        self.retained.is_some()
+    }
+
     /// The child's process id. It stays this child's until the child is reaped.
     pub fn pid(&self) -> u32 {
         self.pid

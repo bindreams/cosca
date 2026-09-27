@@ -947,6 +947,58 @@ fn a_suspended_child_the_async_identity_arm_could_not_kill_is_terminated_through
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
+/// #165 regression, the async twin of `crate::child::spawn_tests`'s
+/// `a_raw_teardown_retains_the_attached_job_through_an_identity_failure` — see that test's own doc
+/// for the hazard: once `attach_or_fault` has succeeded and the resume has run, a failed post-attach
+/// identity read must not drop what was just attached before `Error::Unreaped` is even
+/// constructed — on Windows that drop would close the Job Object, and `KILL_ON_JOB_CLOSE` would
+/// kill the tree with no say from whoever is supposed to decide its fate through the returned
+/// `Unreaped`. `crate::tokio::spawn::windows_raw`'s teardown (its `resolve_identity` failure arm,
+/// which hands `Some(attachment.attached)` to `sync_raw::raw_spawn_teardown`) must retain that
+/// attachment in the SAME `tokio::Unreaped` the caller gets. `contain_with(Strongest)` on a root
+/// attaches a real Job Object, so this exercises the retained value itself, not the vacuous
+/// `Attached::None` case an uncontained command would give.
+#[cfg(windows)]
+#[test]
+fn an_async_raw_teardown_retains_the_attached_job_through_an_identity_failure() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = runtime.block_on(async {
+        let mut cmd = blocker();
+        cmd.executable("ping").contain_with(crate::ContainMode::Strongest);
+        fault::set_force_identity_vanished(true);
+        fault::set_force_kill_failure_leaving_child_alive("cosca-async-raw-identity-retains-job-52e1");
+        let err = cmd.spawn().err();
+        fault::set_force_identity_vanished(false);
+        err
+    });
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the kill failure must be consumed"
+    );
+    let Some(Error::Unreaped { mut child, .. }) = err else {
+        panic!("the unkillable, unidentified child must be handed back, got {err:?}");
+    };
+    assert!(
+        child.has_retained(),
+        "attach_or_fault succeeded (Strongest on a root attaches a real Job Object) before the \
+         identity read failed — the async raw backend's teardown must retain that attachment in \
+         the SAME tokio::Unreaped the caller gets, not drop it (and, via KILL_ON_JOB_CLOSE, tear \
+         the tree down) before Error::Unreaped is even constructed"
+    );
+
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    crate::wait::kill(id).expect("end the child");
+    runtime.block_on(child.wait()).expect("wait for the handed-back child");
+    fault::assert_child_reaped(captured);
+}
+
 /// The async twin of the sync elevated hand-back: a failed password write whose child refuses the
 /// kill hands it back in `Error::Unreaped`, whose `error` is the elevation's `AuthFailed`.
 #[cfg(unix)]
