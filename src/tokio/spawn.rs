@@ -516,6 +516,14 @@ fn abandoned(child: crate::containment::AbandonedChild, error: Error) -> Error {
 pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error {
     use crate::child::unreaped::{kill_error_to_io, Checked};
     let tree = crate::child::spawn::tree_note(child.containment().can_teardown().then(|| child.kill_tree_members()));
+    // The tree-kill above ran while the root was indisputably not yet reaped (it is the very
+    // first thing this function does), so it is already safe. Disarm the fd marker's own re-fire
+    // now, before anything downstream (the root's reap below, or `check`'s internal one past
+    // `into_unreaped_parts`) could make a SECOND, unconfirmed `killpg` through its field-wise
+    // `Drop` land on a recycled pgid — see `Attached::disarm_after_own_sweep`'s doc, and the sync
+    // twin's identical use of it here. Every other mechanism (notably `ProcessGroup`, whose own
+    // field-wise drop never kills at all) is untouched, matching `Child::drop`'s own use of it.
+    child.disarm_after_own_sweep();
     let auth_failed = |note: String| Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {note}{tree}"),
@@ -531,6 +539,12 @@ pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error
         // SIGKILL is uncatchable, so this wait — which never kills again — is bounded.
         Ok(()) => {
             child.wait_and_reap_blocking();
+            // The tree is already killed (above) and the root is already killed and reaped (just
+            // above) — an ordinary drop of `child` here would still run `Child::drop`'s OWN
+            // unconditional `hard_kill()` call, AFTER this reap, on a pgid that reap may already
+            // have freed for recycling. `detach()` opts out of that: there is nothing left for it
+            // to do.
+            child.detach();
             return auth_failed("the elevated child was terminated".into());
         }
         Err(e) => kill_error_to_io(e),
@@ -544,6 +558,11 @@ pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error
             kill,
             child: crate::Unreaped::with_retained(held, Some(retained)),
         },
+        // It had exited, which makes the kill's failure moot. The tree-kill note's own sweep,
+        // above, already ran before ANY reap — including this one, `check`'s own internal
+        // `try_wait` — so nothing here needs sweeping; `retained.attached`'s own field-wise drop,
+        // at the end of this arm, is a disarmed no-op for the fd marker, and was already a no-op
+        // for every other mechanism.
         Checked::Reaped => auth_failed("the elevated child had already exited".into()),
         Checked::Uncertain(e) => {
             // The pid may already name another process: what this spawn retained is given up
