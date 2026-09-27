@@ -100,7 +100,7 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
 /// [`Error::Unreaped`], whose `error` is that `AuthFailed`; one that had exited is reaped by the
 /// check; one of uncertain ownership is released without a wait.
 #[cfg(unix)]
-pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
+pub(crate) fn elevated_write_failed(mut child: Child, write_err: Error) -> Error {
     use crate::child::unreaped::{kill_error_to_io, Checked, Unreaped};
     // Its tree first, through its containment when that can tear one down, so a descendant forked
     // before the failure dies too. The root is then killed by its own handle.
@@ -127,6 +127,32 @@ pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
     let kill = match killed {
         // SIGKILL is uncatchable, so this wait is bounded.
         Ok(()) => {
+            // Unlike the async twin's `wait_and_reap_blocking` (WNOWAIT-only — see its own doc),
+            // `child.wait()` below (`SharedChild`) performs a REAL reap. So `Child::drop`'s own
+            // later, unconditional `hard_kill()` call — for a recyclable-pgid mechanism — WOULD
+            // land on a pgid this reap may already have freed for recycling (round-4 finding 6).
+            // Take `attached` out first and sweep it the pre-reap way, exactly as `teardown_unadopted`'s
+            // kill-succeeded branch does: confirm the root is still a zombie (bounded — SIGKILL is
+            // uncatchable), then kill through it while that is still true. Left behind as
+            // `Attached::None`, `Child::drop`'s own later `hard_kill()` call becomes a safe no-op
+            // regardless of when the reap below actually collects the root — no `detach()` needed
+            // (which would ALSO suppress a `CgroupLeaf`'s own occupied-leaf retry).
+            let pid = child.id().pid();
+            let attached = std::mem::take(&mut child.attached);
+            match crate::child::unreaped::sweep_recyclable_pgid_before_reap(
+                pid,
+                Box::new(crate::child::unreaped::Retained { attached }),
+            ) {
+                crate::child::unreaped::SweepOutcome::Swept => {}
+                // Not a recyclable-pgid mechanism: settle it exactly as if this sweep had never
+                // run — an ordinary drop (a `CgroupLeaf`'s own `Drop` retries `cgroup.kill` on an
+                // occupied leaf).
+                crate::child::unreaped::SweepOutcome::NotRecyclable(retained) => drop(retained),
+                // The confirmatory wait itself failed (in practice `ECHILD`) — never sweep on
+                // that; abandon instead, matching `Checked::Uncertain`'s own disposition below.
+                crate::child::unreaped::SweepOutcome::Unconfirmed(retained) => retained.attached.abandon(),
+            }
+
             #[cfg(test)]
             let waited = match fault::take_force_reap_failure() {
                 Some(marker) => child.wait().and(Err(Error::Io(std::io::Error::other(marker)))),
@@ -138,12 +164,6 @@ pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
                 log::warn!("failed to reap the killed elevated child {}: {e}", child.id().pid());
                 debug_assert!(false, "failed to reap a killed elevated child: {e}");
             }
-            // The tree is already killed (above) and the root is already killed and reaped
-            // (just above) — an ordinary drop of `child` here would still run `Child::drop`'s OWN
-            // unconditional `hard_kill()` call, AFTER this reap, on a pgid that reap may already
-            // have freed for recycling. `detach()` opts out of that (and of the redundant reap
-            // attempt): there is nothing left for either to do.
-            child.detach();
             return auth_failed("the elevated child was terminated".into());
         }
         Err(e) => kill_error_to_io(e),
@@ -453,13 +473,14 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 /// it: that is logged and asserted, whatever the kill's error.
 ///
 /// **Unix:** `attached`, if it carries a recyclable pgid (`ProcessGroup`, or macOS `FdMarker`
-/// with one — see `Attached::carries_recyclable_pgid`), is swept via
-/// [`sweep_recyclable_pgid_before_reap`](crate::child::unreaped::sweep_recyclable_pgid_before_reap)
-/// (kill succeeded: blocking, bounded by the uncatchable `SIGKILL`) or its
-/// [`_nonblocking`](crate::child::unreaped::sweep_recyclable_pgid_before_reap_nonblocking) twin
-/// (kill failed: `pid` may still be running) BEFORE the reap that follows — never after, which
-/// would let the sweep's `killpg` land on a pgid `pid`'s own reap may already have freed for
-/// recycling.
+/// with one — see `Attached::carries_recyclable_pgid`), is swept BEFORE the reap that follows —
+/// never after, which would let the sweep's `killpg` land on a pgid `pid`'s own reap may already
+/// have freed for recycling. Kill succeeded: via
+/// [`sweep_recyclable_pgid_before_reap`](crate::child::unreaped::sweep_recyclable_pgid_before_reap),
+/// blocking, bounded by the uncatchable `SIGKILL`. Kill failed: `pid` may still be running, so
+/// this classifies via [`poll_reapable`](crate::child::unreaped::poll_reapable) itself, in place
+/// of — not alongside — `Held::check`'s own reaping `try_wait`; the two would otherwise race
+/// (round-4 finding 2).
 #[must_use]
 fn teardown_unadopted(
     mut child: std::process::Child,
@@ -470,17 +491,62 @@ fn teardown_unadopted(
     let pid = child.id();
     if let Err(kill) = kill_unadopted(&mut child) {
         drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
-        // The kill FAILED: `pid` may still be genuinely running, so this confirmatory sweep must
-        // not block. Sweeps now only if `pid` happens to already be a confirmed zombie (it can
-        // exit on its own regardless of why the kill failed); otherwise hands `attached` back
-        // unchanged for `check` below — and, past `Checked::Running`, `Unreaped`'s own machinery
-        // — to settle. See `sweep_recyclable_pgid_before_reap`'s doc for why sweeping before any
-        // reap is load-bearing.
+
+        // For a RECYCLABLE-pgid mechanism, classify via `poll_reapable` itself and return —
+        // `Held::check()` below never runs for this case, so it cannot race this poll's own
+        // zombie confirmation. `attached` falls through unchanged for every OTHER case (not
+        // recyclable, or `None`), which the ordinary `check()`-based path below already handles
+        // correctly on its own (drop normally on `Reaped`, carry forward on `Running`, disarm on
+        // `Uncertain`) — nothing here needs to special-case those.
         #[cfg(unix)]
-        let attached = attached.and_then(|attached| {
-            crate::child::unreaped::sweep_recyclable_pgid_before_reap_nonblocking(pid, Box::new(Retained { attached }))
-                .map(|retained| retained.attached)
-        });
+        let attached = match attached {
+            Some(attached) if attached.carries_recyclable_pgid() => {
+                return match crate::child::unreaped::poll_reapable(pid) {
+                    // Still running: hand back ARMED. `Unreaped`'s own `wait`/`Drop` sweeps
+                    // before it reaps (see `sweep_recyclable_pgid_before_reap`'s own callers).
+                    Ok(false) => {
+                        // Round-4 finding 2 regression pin: a test can stage the root exiting
+                        // (and becoming a confirmed zombie) in THIS exact window, right after the
+                        // poll above answered `Ok(false)` — proving no reaping call runs on it
+                        // before this branch hands it back, unlike the pre-fix code, which went
+                        // on to call `Held::check()` next and could race this exact window.
+                        #[cfg(test)]
+                        if let Some(h) = fault::take_before_block_until_reapable_hook() {
+                            h();
+                        }
+                        Some((
+                            kill,
+                            Unreaped::with_retained(Held::Std(child), Some(Retained { attached })),
+                        ))
+                    }
+                    // Confirmed a zombie: sweep now, then reap.
+                    Ok(true) => {
+                        let retained = Retained { attached };
+                        crate::child::unreaped::sweep_confirmed_zombie(pid, &retained);
+                        drop(retained);
+                        if let Err(reap) = reap_unadopted(&mut child) {
+                            log::warn!("spawn teardown failed to reap pid {pid}: {reap}");
+                            debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
+                        }
+                        None
+                    }
+                    // The confirmatory poll itself failed (in practice `ECHILD`: something else
+                    // already reaped `pid`) — never sweep on that; abandon instead, matching
+                    // `Checked::Uncertain`'s own disposition below.
+                    Err(e) => {
+                        attached.abandon();
+                        log::warn!(
+                            "spawn teardown could not confirm pid {pid} was still a zombie before \
+                             sweeping what it retained ({e}); its ownership is likely uncertain — \
+                             abandoned without a sweep (the kill itself had already failed: {kill})"
+                        );
+                        None
+                    }
+                };
+            }
+            other => other,
+        };
+
         return match Held::Std(child).check() {
             Checked::Running(held) => {
                 #[cfg(windows)]
@@ -500,8 +566,9 @@ fn teardown_unadopted(
                     Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
                 ))
             }
-            // It had exited, which makes the kill's failure moot. Whatever `attached` carried was
-            // already swept above, while `check` here had not yet reaped it — nothing left to do.
+            // It had exited, which makes the kill's failure moot. `attached` here is never a
+            // recyclable-pgid mechanism (that case already returned above), so its own field-wise
+            // drop, at the end of this arm, is exactly as safe as it always was.
             Checked::Reaped => None,
             Checked::Uncertain(e) => {
                 // The pid may already name another process: what this spawn retained is given up
@@ -524,13 +591,16 @@ fn teardown_unadopted(
     // macOS's `FdMarker`, unconditionally re-fires `killpg` on whatever pgid `pid` now names).
     #[cfg(unix)]
     if let Some(attached) = attached {
-        if let Some(retained) =
-            crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, Box::new(Retained { attached }))
-        {
+        match crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, Box::new(Retained { attached })) {
+            crate::child::unreaped::SweepOutcome::Swept => {}
+            // Not a recyclable-pgid mechanism at all: settle it exactly as if this sweep had
+            // never run — an ordinary drop (a `CgroupLeaf`'s own `Drop` retries `cgroup.kill` on
+            // an occupied leaf; this is what round-4 finding 1's regression restores).
+            crate::child::unreaped::SweepOutcome::NotRecyclable(retained) => drop(retained),
             // The confirmatory wait itself failed (in practice `ECHILD`: something else already
             // reaped `pid`) — never sweep on that; abandon instead, matching `Checked::Uncertain`'s
             // own disposition above.
-            retained.attached.abandon();
+            crate::child::unreaped::SweepOutcome::Unconfirmed(retained) => retained.attached.abandon(),
         }
     }
     if let Err(reap) = reap_unadopted(&mut child) {
