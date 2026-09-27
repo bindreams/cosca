@@ -200,31 +200,40 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
 }
 
 /// cosca does not deduplicate its own log lines — that is a log handler's job. The warning is
-/// reported at `warn` every time, including on a repeat of the same errno.
+/// reported at `warn` every time, including on a repeat of the same errno, and through the real
+/// entry point (`warn_for_abandoned_child`) rather than an inner seam a dedup could sneak in
+/// behind.
 #[test]
 fn the_unreachable_child_warning_is_every_time() {
+    use crate::containment::AbandonedChild;
+
     crate::log_capture::install();
-    let error = || Error::Io(std::io::Error::from_raw_os_error(libc::EMFILE));
+    let error = || Error::Io(std::io::Error::other("cosca-abandoned-warn-probe-6f21"));
     let marker = "cosca-abandoned-warn-probe-6f21";
 
-    let mark = crate::log_capture::mark();
-    super::warn_after_fork(&error(), marker);
-    super::warn_after_fork(&error(), marker);
+    for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
+        let mark = crate::log_capture::mark();
+        super::warn_for_abandoned_child(child, &error());
+        super::warn_for_abandoned_child(child, &error());
 
-    assert_eq!(
-        crate::log_capture::levels_since(mark, marker),
-        [log::Level::Warn, log::Level::Warn]
-    );
+        assert_eq!(
+            crate::log_capture::levels_since(mark, marker),
+            [log::Level::Warn, log::Level::Warn]
+        );
+    }
 }
 
-/// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` — the seam's
-/// error names it — and so of this test's spawn, whatever other tests log meanwhile.
+/// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` at `warn` —
+/// the seam's error names it — and so of this test's spawn, whatever other tests log meanwhile.
+/// Checking the level, not just the text, is what would catch a dedup reintroduced at the
+/// production call site: a demoted repeat still carries its own full text.
 #[cfg(target_os = "linux")]
 fn warned_for(mark: usize, pid: u32, marker: &str) -> bool {
     let spawn = format!("for child {pid})");
     crate::log_capture::records_since(mark, marker)
         .iter()
-        .any(|record| record.contains(&spawn))
+        .zip(crate::log_capture::levels_since(mark, marker))
+        .any(|(record, level)| record.contains(&spawn) && level == log::Level::Warn)
 }
 
 /// Whether the child `pidfd` names has been reaped — which a pidfd, unlike a pid, can answer after

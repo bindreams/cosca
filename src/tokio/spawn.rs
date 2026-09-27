@@ -483,10 +483,5 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
              without the child's pid"
         }
     };
-    warn_after_fork(error, consequence);
-}
-
-/// Say that if the failed spawn forked, `consequence`.
-fn warn_after_fork(error: &Error, consequence: &str) {
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");
 }

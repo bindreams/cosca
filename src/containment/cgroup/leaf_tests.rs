@@ -1878,15 +1878,19 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
 // instead could block forever, so the verdict closes the leaf or learns the child is in it.
 
 /// A leaf with no report and no member is removed, so the child can never enter it, and the
-/// spawn degrades — reported at `warn` every time, including on the second occurrence.
+/// spawn degrades.
+///
+/// Not asserted here: that the degrade logs at `warn` on both iterations.
+/// `degrade_tests::a_repeated_degrade_reason_warns_every_time` already covers that with its own
+/// unique marker — this scenario's forced EMFILE and `std::process::id()` match
+/// `dispatch_tests::a_leaf_without_a_pidfd_degrades_without_a_kill`'s exactly, so the two tests'
+/// `log_degrade` calls are indistinguishable in the shared capture buffer and race when both
+/// run concurrently.
 #[cfg(target_os = "linux")]
 #[test]
 fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
     use crate::containment::cgroup::log_degrade;
 
-    crate::log_capture::install();
-    let marker = "placement report cannot be waited for";
-    let mark = crate::log_capture::mark();
     for _ in 0..2 {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-unwaitable");
@@ -1913,10 +1917,6 @@ fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
         assert!(!leaf_path.exists(), "the leaf must be closed to the child");
         log_degrade(&reason);
     }
-    assert_eq!(
-        crate::log_capture::levels_since(mark, marker),
-        [log::Level::Warn, log::Level::Warn]
-    );
 }
 
 /// A report already sent is final, pidfd or not, and the leaf is left alone.
