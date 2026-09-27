@@ -48,6 +48,7 @@ sudo chown "$(id -u):$(id -g)" target/debug/.skuld.db* 2>/dev/null || true
 ```
 
 A few things this works around:
+
 - Plain `sudo cargo ...` doesn't find `cargo` at all on a stock Debian/Ubuntu install — `sudo`'s
   `secure_path` doesn't include `~/.cargo/bin` (rustup's install location) regardless of your own
   `PATH`. Resolving `cargo-nextest`'s own path first, then invoking that directly, sidesteps it.
@@ -56,7 +57,7 @@ A few things this works around:
   other test picks up that label later.
 - Running the plain suite once first, unprivileged, creates skuld's own coordination database
   (`target/debug/.skuld.db`) under your own uid. If root creates it instead (e.g. by running the
-  `sudo` command first, on a fresh checkout), every later *unprivileged* run in that `target/`
+  `sudo` command first, on a fresh checkout), every later _unprivileged_ run in that `target/`
   fails outright with "attempt to write a readonly database" — reproduced. The final `chown` is a
   safety net for whatever WAL/SHM side files root's run may still have touched.
 
