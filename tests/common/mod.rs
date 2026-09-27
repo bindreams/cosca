@@ -37,6 +37,80 @@ pub fn status_locked(cmd: &mut std::process::Command) -> std::io::Result<std::pr
     cmd.status()
 }
 
+/// Wait for `child` to exit, bounded by `timeout` — killing it and failing loudly if it does
+/// not, rather than blocking forever.
+///
+/// This bound is a FAILURE SURFACE, not a synchronization mechanism: a regression under test in
+/// a probe-and-prover pair here can be a genuine, otherwise-unbounded hang (e.g. a self-deadlock
+/// on a process-wide mutex), and the only way to fail the PROVER on "the probe hung" — rather
+/// than hang the whole suite right along with it — is to give the wait an upper bound and treat
+/// crossing it as the prover's own failure. This is the documented exception for awaiting an
+/// external event that genuinely might never happen (a child process's exit), not a `sleep`-based
+/// poll: the wait below is a real blocking read on another thread, woken the instant the child
+/// actually exits, never a fixed delay.
+///
+/// `child`'s stdout/stderr must be piped: reading them happens on a background thread via
+/// `wait_with_output`, so a child that fills a pipe buffer without exiting cannot deadlock this
+/// function the way a plain `wait()` racing a full pipe could.
+#[cfg(unix)]
+pub fn wait_bounded(child: std::process::Child, timeout: std::time::Duration) -> std::process::Output {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => out.expect("wait for the child"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // SAFETY: `pid` is our own child's pid, read before handing the `Child` to the
+            // waiter thread; killing it here is best-effort cleanup for a child that hung
+            // exactly the way this function exists to catch, not a normal-path operation.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            panic!(
+                "child pid {pid} did not exit within {timeout:?} — it hung instead of exiting \
+                 (cleanly or otherwise), which is itself the regression under test"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("child pid {pid}'s wait thread died without sending a result")
+        }
+    }
+}
+
+/// Run `probe_name` — a `#[test]` in THIS SAME test binary — directly with the exact
+/// `alone()`-isolated shape (`COSCA_TEST_ALONE` set to `probe_name`, plus the full
+/// [`ALONE_ARGS`]), with `extra_env` also set, and return its captured output.
+///
+/// "Directly" is load bearing, not cosmetic: this is what makes `probe_name`'s OWN `alone()` call
+/// (if it makes one) match immediately and skip re-execing a SECOND time — one process runs the
+/// probe, not two. An extra `alone()` layer in between would convert a genuine process ABORT (no
+/// defined exit code, commonly reported as 134/`SIGABRT`) into that MIDDLE process's own,
+/// entirely ordinary panic (a clean exit 101, from `alone()`'s own `assert!` on the grandchild's
+/// non-success exit status) — masking the abort completely behind what still looks like an
+/// ordinary failed `wait_with_output` (which itself returns `Ok` either way; only the exit
+/// status inside it differs).
+///
+/// Spawns under `cosca::test_spawn_lock()` (see [`output_locked`]'s doc for why), then waits via
+/// [`wait_bounded`] — a probe that regresses into a hang, not just a wrong exit code, must still
+/// fail its prover rather than hang the whole suite.
+#[cfg(unix)]
+pub fn run_probe_directly(probe_name: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.arg(probe_name)
+        .args(ALONE_ARGS)
+        .env("COSCA_TEST_ALONE", probe_name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for &(k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = {
+        let _guard = cosca::test_spawn_lock();
+        cmd.spawn().expect("spawn the probe")
+    };
+    wait_bounded(child, std::time::Duration::from_secs(30))
+}
+
 /// Block until `pid` — which MUST be an unreaped child of this process — has exited AND become
 /// a zombie, leaving it unreaped for the caller to assert on and then reap. The canonical
 /// zombie edge for this suite: the ONLY sync point that a liveness assertion about a zombie may
@@ -656,7 +730,35 @@ impl RestoreStdio {
             "closes process-wide fd{} {listed}",
             if fds.len() == 1 { "" } else { "s" }
         ));
-        let mut saved = Vec::with_capacity(fds.len());
+        // A repeated fd (e.g. `&[2, 2]`) makes the second pass's `fcntl`/`close` operate on a
+        // number this same call already closed on the first pass — `F_DUPFD_CLOEXEC` on an
+        // already-closed fd fails with `EBADF`, which used to panic straight into a fd 2 this
+        // function had ALREADY closed but not yet armed the restoring hook for (see the
+        // in-loop `SAVED_STDERR` publish below, which fixes that half), and, worse, used to
+        // build the whole `saved: Vec<_>` first and wrap it in `RestoreStdio` only at the very
+        // end — so a mid-loop panic dropped a bare `Vec` (closing only the dup, not restoring
+        // the original) instead of a `RestoreStdio` whose `Drop` would have. Both are fixed
+        // below; this debug_assert rejects the malformed input outright, in a debug build,
+        // before either failure mode can even start.
+        debug_assert!(
+            {
+                let mut sorted: Vec<libc::c_int> = fds.to_vec();
+                sorted.sort_unstable();
+                sorted.dedup();
+                sorted.len() == fds.len()
+            },
+            "RestoreStdio::close: fds must be distinct, got {fds:?}"
+        );
+        // Built incrementally, and returned as this same `RestoreStdio` all the way through —
+        // never as a bare `Vec` wrapped only at the end — so a panic partway through the loop
+        // below still drops a `RestoreStdio` whose `saved` holds exactly the fds successfully
+        // closed so far, and `Drop` restores those (a bare `Vec`'s `Drop` would instead just
+        // close the dups, restoring nothing). Measured: without this, `close(&[2, 2])`'s second
+        // pass panicked with `saved` still a local `Vec`, and fd 2 stayed closed for the rest of
+        // the process.
+        let mut guard = RestoreStdio {
+            saved: Vec::with_capacity(fds.len()),
+        };
         for &fd in fds {
             // SAFETY: F_DUPFD_CLOEXEC(fd, 3) duplicates fd to a fresh number >= 3, checked below.
             let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
@@ -664,28 +766,36 @@ impl RestoreStdio {
             // SAFETY: `dup` was just returned by a successful F_DUPFD_CLOEXEC.
             let dup = unsafe { OwnedFd::from_raw_fd(dup) };
             assert_eq!(unsafe { libc::close(fd) }, 0, "close the test process' fd {fd}");
-            saved.push((fd, dup));
+            let dup_fd = dup.as_raw_fd();
+            guard.saved.push((fd, dup));
+            // Publish fd 2's dup to the panic-message slot RIGHT HERE, inside the loop — not
+            // after the whole loop finishes — so a LATER panic in this same loop (e.g. from a
+            // still-malformed `fds` in a release build, where the debug_assert above is a
+            // no-op) still has its message preserved, instead of only fd 2 itself among
+            // several closed fds getting that protection.
+            if fd == 2 {
+                ensure_stderr_panic_hook();
+                // NOT held across the debug_assert below, deliberately: `Mutex::lock()`'s
+                // temporary guard from `.replace(..)` drops at the end of ITS OWN statement,
+                // before the assert below can panic. Measured: holding the guard across the
+                // assert deadlocks — the panic hook this function just armed
+                // (`ensure_stderr_panic_hook`) tries to lock this SAME mutex, on this SAME
+                // thread, as the FIRST thing that happens when the assert panics (a hook runs
+                // before any unwinding, so the guard from `let mut slot = saved_stderr();`
+                // would still be alive) — a plain `std::sync::Mutex` is not reentrant, so that
+                // second `.lock()` call blocks forever on a lock its own thread already holds.
+                let prev = saved_stderr().replace(dup_fd);
+                debug_assert!(
+                    prev.is_none(),
+                    "RestoreStdio: SAVED_STDERR already occupied (by fd {prev:?}) when this \
+                     guard set it to {dup_fd} — a previous guard's fd 2 was never cleared, or \
+                     two guards overlap. Reachable even from a single alone()-isolated test: \
+                     e.g. opening a second RestoreStdio (or RestoreFd2) on fd 2 before the \
+                     first one drops."
+                );
+            }
         }
-        // Only relevant when fd 2 (stderr, where the panic hook writes) is actually among the
-        // closed fds — see `SAVED_STDERR`'s doc for the mechanism.
-        if fds.contains(&2) {
-            ensure_stderr_panic_hook();
-            let real_stderr = saved
-                .iter()
-                .find(|(fd, _)| *fd == 2)
-                .map(|(_, dup)| dup.as_raw_fd())
-                .expect("fd 2 is in `fds`, so its dup is in `saved`");
-            let mut slot = saved_stderr();
-            debug_assert!(
-                slot.is_none(),
-                "RestoreStdio: SAVED_STDERR already occupied (by fd {:?}) — a previous guard's fd \
-                 2 was never cleared, or two guards overlap. Only reachable if a caller uses \
-                 RestoreStdio outside alone()'s single-test isolation.",
-                *slot
-            );
-            *slot = Some(real_stderr);
-        }
-        RestoreStdio { saved }
+        guard
     }
 }
 
