@@ -12,18 +12,26 @@
 //! `std::fs::metadata` on Windows (`library/std/src/sys/fs/windows.rs`'s `fn metadata`, checked
 //! against rustc 1.98.1's own source) opens the target via `CreateFileW`, which ends up
 //! requesting `SYNCHRONIZE | FILE_READ_ATTRIBUTES` on the handle. A file-level `FILE_GENERIC_READ`
-//! deny (which includes `SYNCHRONIZE`), as measured in 0d4fe0b2, is not enough: `metadata` still
-//! returned `Ok`. `FILE_READ_ATTRIBUTES` specifically is not settled by the file's own security
-//! descriptor alone — MS-FSA §2.1.5.1.2.1 ("Algorithm to Check Access to an Existing File") has
-//! the object store grant it if EITHER the file's own descriptor allows it OR the caller holds
-//! `FILE_LIST_DIRECTORY` on the PARENT directory, so denying only the file does not close that
-//! route. Separately, `metadata`'s own fallback — taken on exactly `ERROR_ACCESS_DENIED` or
-//! `ERROR_SHARING_VIOLATION` — retries via `FindFirstFileExW` on the same path, itself gated on
-//! `FILE_LIST_DIRECTORY` (`0x1`) on the PARENT directory too, which a deny ACE on the file cannot
-//! reach at all. So the deny ACE below sits on the DIRECTORY instead, denying both
-//! `FILE_LIST_DIRECTORY` (closing the parent-directory route to `FILE_READ_ATTRIBUTES` and the
-//! `FindFirstFileExW` fallback alike) and `FILE_TRAVERSE` (`0x20`, the same bit as `FILE_EXECUTE`
-//! — closing the primary open's own route to a file under it).
+//! deny (which includes `SYNCHRONIZE`) is not enough on its own — measured on this crate's own
+//! Windows CI runners: `metadata` still returned `Ok`. `SYNCHRONIZE` has no fallback route: per
+//! MS-FSA §2.1.5.1.2.1 ("Algorithm to Check Access to an Existing File"), it is checked exactly
+//! once, against the FILE's own security descriptor, and nothing else can grant it — so that deny
+//! ACE DOES deny the primary `CreateFileW` open, either way. The `Ok` came entirely from
+//! `metadata`'s own fallback — taken on exactly `ERROR_ACCESS_DENIED` or `ERROR_SHARING_VIOLATION`
+//! — which retries via `FindFirstFileExW` on the same path, a directory-listing operation gated on
+//! `FILE_LIST_DIRECTORY` (`0x1`) on the PARENT directory, which a deny ACE on the file cannot
+//! reach at all.
+//!
+//! So the deny ACE below sits on the DIRECTORY instead: `FILE_LIST_DIRECTORY` there closes that
+//! `FindFirstFileExW` fallback. It does NOT close a "parent route to `FILE_READ_ATTRIBUTES`" —
+//! MS-FSA's algorithm checks `FILE_READ_ATTRIBUTES` against the FILE's own security descriptor
+//! FIRST, same as `SYNCHRONIZE`; the parent's `FILE_LIST_DIRECTORY` is consulted only as a
+//! fallback if THAT check denies it, and the file's DACL is left untouched here and grants it
+//! regardless, so that fallback is never even reached — denying `FILE_LIST_DIRECTORY` on the
+//! parent does nothing for `FILE_READ_ATTRIBUTES` in THIS design. What blocks the primary
+//! `CreateFileW` open here instead is `FILE_TRAVERSE` (`0x20`, the same bit as `FILE_EXECUTE`):
+//! reaching `tool.exe` at all requires traversing `locked` first, a check made before MS-FSA's
+//! per-file access algorithm ever runs on the file itself.
 //!
 //! `FILE_TRAVERSE` alone is not sufficient either: every ordinary token holds
 //! `SeChangeNotifyPrivilege` ("bypass traverse checking") by default — an interactive session
@@ -97,54 +105,76 @@ fn open_process_token(access: windows::Win32::Security::TOKEN_ACCESS_MASK) -> wi
     Ok(token)
 }
 
-/// This process's own user SID, from its own token — the trustee for the deny ACE. `Everyone`
-/// would do too, but the current user's SID needs no elevated or domain-joined runner to be
-/// meaningful, and it is what actually issues the `std::fs::metadata` call below.
-///
-/// Owns the raw `TOKEN_USER` buffer the SID in [`Self::sid`] borrows from: a bare `fn(&[u64]) ->
-/// PSID` free function (this type's previous shape) could not stop safe code calling it with a
-/// slice too short to hold a `TOKEN_USER`, which would read out of bounds. Bundling the buffer
-/// and the one function that reads it into a single type whose only constructor is
-/// [`Self::query`] closes that: nothing outside this type can hand [`Self::sid`] a mismatched
-/// buffer.
-struct CurrentUserSid(Vec<u64>);
+/// [`CurrentUserSid`] in its own module so its one field is private to more than just the type:
+/// `resolve_windows_tests` at large — the module this file otherwise is — cannot name `.0`, so it
+/// cannot construct a `CurrentUserSid` around an arbitrary buffer and call [`CurrentUserSid::sid`]
+/// on it. A bare `#[allow]`-free private field on a type defined directly in
+/// `resolve_windows_tests` would NOT have achieved that: Rust field privacy is scoped to the
+/// DEFINING MODULE, and every function in this whole file lives in that same module, so
+/// `CurrentUserSid(vec![]).sid()` compiled there regardless of the field lacking a `pub`.
+mod current_user_sid {
+    use super::*;
 
-impl CurrentUserSid {
-    fn query() -> Self {
-        let raw_token = open_process_token(TOKEN_QUERY).expect("OpenProcessToken(TOKEN_QUERY)");
-        // SAFETY: `raw_token` was just opened above and is owned by this function from here on.
-        let token = unsafe { Owned::new(raw_token) };
-        let mut needed = 0u32;
-        // SAFETY: a null buffer with length 0 is the documented size query; it fails with
-        // ERROR_INSUFFICIENT_BUFFER and writes the required size.
-        let _ = unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut needed) };
-        // u64-backed so the `TOKEN_USER` cast in `Self::sid` is 8-aligned, as `TOKEN_USER`
-        // requires.
-        let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
-        // SAFETY: `buf` is at least `needed` bytes.
-        unsafe {
-            GetTokenInformation(
-                *token,
-                TokenUser,
-                Some(buf.as_mut_ptr().cast()),
-                (buf.len() * 8) as u32,
-                &mut needed,
-            )
+    /// This process's own user SID, from its own token — the trustee for the deny ACE.
+    /// `Everyone` would do too, but the current user's SID needs no elevated or domain-joined
+    /// runner to be meaningful, and it is what actually issues the `std::fs::metadata` call in
+    /// the parent module.
+    ///
+    /// Owns the raw `TOKEN_USER` buffer the SID in [`Self::sid`] borrows from, and — see the
+    /// module doc — the field is reachable only from code inside THIS module, [`Self::query`]
+    /// included, so nothing else can construct one around a buffer [`Self::sid`] was not written
+    /// for. [`Self::sid`] itself still asserts the buffer is large enough before reading it: a
+    /// belt-and-suspenders check against a bug in [`Self::query`] itself, not against outside
+    /// code, which the module boundary already rules out.
+    pub(super) struct CurrentUserSid(Vec<u64>);
+
+    impl CurrentUserSid {
+        pub(super) fn query() -> Self {
+            let raw_token = open_process_token(TOKEN_QUERY).expect("OpenProcessToken(TOKEN_QUERY)");
+            // SAFETY: `raw_token` was just opened above and is owned by this function from here
+            // on.
+            let token = unsafe { Owned::new(raw_token) };
+            let mut needed = 0u32;
+            // SAFETY: a null buffer with length 0 is the documented size query; it fails with
+            // ERROR_INSUFFICIENT_BUFFER and writes the required size.
+            let _ = unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut needed) };
+            // u64-backed so the `TOKEN_USER` cast in `Self::sid` is 8-aligned, as `TOKEN_USER`
+            // requires.
+            let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+            // SAFETY: `buf` is at least `needed` bytes.
+            unsafe {
+                GetTokenInformation(
+                    *token,
+                    TokenUser,
+                    Some(buf.as_mut_ptr().cast()),
+                    (buf.len() * 8) as u32,
+                    &mut needed,
+                )
+            }
+            .expect("GetTokenInformation(TokenUser)");
+            CurrentUserSid(buf)
         }
-        .expect("GetTokenInformation(TokenUser)");
-        CurrentUserSid(buf)
-    }
 
-    /// The `PSID` inside the buffer this owns. Borrows from `self` — a raw pointer, so nothing
-    /// in the type system stops it outliving `self`, but every caller in this file uses it and
-    /// drops it well within `self`'s own scope.
-    fn sid(&self) -> PSID {
-        // SAFETY: `Self::query` is the only constructor, and it always writes a full
-        // `TOKEN_USER` (checked by the `.expect()` there) at the head of an 8-aligned buffer at
-        // least 8 bytes long — this type cannot exist without that having happened.
-        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        /// The `PSID` inside the buffer this owns. Borrows from `self` — a raw pointer, so
+        /// nothing in the type system stops it outliving `self`, but every caller in this file
+        /// uses it and drops it well within `self`'s own scope.
+        pub(super) fn sid(&self) -> PSID {
+            // A hard `assert!`, not `debug_assert!`: reading past `self.0` below is undefined
+            // behaviour, not merely a wrong answer, if this does not hold.
+            assert!(
+                self.0.len() * std::mem::size_of::<u64>() >= std::mem::size_of::<TOKEN_USER>(),
+                "CurrentUserSid holds only {} bytes, too few for a TOKEN_USER",
+                self.0.len() * std::mem::size_of::<u64>()
+            );
+            // SAFETY: the assertion above just confirmed `self.0` is at least
+            // `size_of::<TOKEN_USER>()` bytes; `Self::query` is the only constructor, and it
+            // always writes a full `TOKEN_USER` (checked by its own `.expect()`) at the head of
+            // an 8-aligned buffer.
+            unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        }
     }
 }
+use current_user_sid::CurrentUserSid;
 
 /// Report a `Drop` failure without risking a double panic during an unwind: real failures panic
 /// (loud, since nothing else would report this), an unwind-time failure — this `Drop` running
@@ -453,33 +483,40 @@ impl Drop for DenyAclGuard {
     }
 }
 
-/// Everything [`locked_then_open`] builds, torn down in one call to [`Self::close`] rather than
-/// left to each field's own `Drop`.
+/// Everything [`locked_then_open`] builds. Its own `Drop` — not an explicit method a caller could
+/// skip — reverts impersonation, restores the ACL, then removes the tree, each step checked and
+/// reported (panic, or `eprintln!` if already panicking — see [`panic_or_eprint`]) on failure.
+/// `Drop` runs unconditionally at the end of every scope this is bound in, `#[test]` functions
+/// included, so nothing here depends on a caller remembering to call anything.
 ///
-/// Field DECLARATION order doubles as a backstop drop order (struct fields drop in declaration
-/// order — the opposite of local variables) should some future caller skip `close()`:
-/// `impersonation` first (reverted), then `guard` (the ACL restored), then `root` (the tree
-/// removed) — see [`Self::close`] for why calling it explicitly, rather than relying on that, is
-/// still what every caller here does.
+/// Reverting impersonation before the ACL is restored is not merely cosmetic: with
+/// `SeChangeNotifyPrivilege` still stripped, `SetNamedSecurityInfoW`'s own path resolution down
+/// to `locked` would need real `FILE_TRAVERSE` on every ancestor of `locked` (`root` included) —
+/// nothing denies any of those today, so restoring the ACL while still impersonating would in
+/// fact still work, but reverting first removes the dependency on that staying true. Restoring
+/// the ACL before the tree is removed IS unconditionally load-bearing — see [`DenyAclGuard`]'s
+/// own doc — since deleting `locked` while it is still denied would fail.
 struct LockedThenOpen {
-    impersonation: ImpersonationGuard,
-    guard: DenyAclGuard,
-    root: tempfile::TempDir,
+    impersonation: Option<ImpersonationGuard>,
+    guard: Option<DenyAclGuard>,
+    root: Option<tempfile::TempDir>,
     open: PathBuf,
     path: std::ffi::OsString,
 }
 
-impl LockedThenOpen {
-    /// Reverts impersonation, restores the ACL, then removes the tree — in that order (see the
-    /// module doc's "Where the deny ACE has to sit" and [`DenyAclGuard`]'s own doc for why) — and,
-    /// unlike leaving `root` to `TempDir`'s own `Drop`, asserts the tree was actually removed
-    /// rather than silently swallowing a failure to do so. Both tests below call this, so a
-    /// future test added between `locked_then_open()` and its teardown cannot lose that check by
-    /// forgetting to call it.
-    fn close(self) {
-        drop(self.impersonation);
-        drop(self.guard);
-        self.root.close().expect("remove the tempdir");
+impl Drop for LockedThenOpen {
+    fn drop(&mut self) {
+        // `Option::take` so each piece can be dropped BY VALUE here: `ImpersonationGuard`'s and
+        // `DenyAclGuard`'s own `Drop` impls do the actual reverting/restoring, and
+        // `TempDir::close` (unlike its own `Drop`) reports removal failure instead of swallowing
+        // it — neither of which `&mut self` alone would allow.
+        drop(self.impersonation.take());
+        drop(self.guard.take());
+        if let Some(root) = self.root.take() {
+            if let Err(e) = root.close() {
+                panic_or_eprint(format!("could not remove the tempdir: {e}"));
+            }
+        }
     }
 }
 
@@ -513,9 +550,9 @@ fn locked_then_open() -> LockedThenOpen {
     assert_eq!(probe.raw_os_error(), Some(5), "precondition: {probe}");
 
     LockedThenOpen {
-        impersonation,
-        guard,
-        root,
+        impersonation: Some(impersonation),
+        guard: Some(guard),
+        root: Some(root),
         open,
         path,
     }
@@ -540,8 +577,6 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
         }
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
-
-    fixture.close();
 }
 
 /// An ordinary spawn skips the denied candidate and goes on, as before, so one ACL-denied `PATH`
@@ -553,5 +588,4 @@ fn an_undeterminable_windows_acl_is_skipped_by_an_ordinary_search() {
         search_tool(&fixture.path, false).unwrap(),
         fixture.open.join("tool.exe")
     );
-    fixture.close();
 }
