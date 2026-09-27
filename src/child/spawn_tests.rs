@@ -52,6 +52,68 @@ fn attach_failure_reaps_the_spawned_child() {
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
+/// The adopt step's own pre-`SharedChild::new` check must reap a child whose kill still succeeds,
+/// the same as the attach and identity-failure arms above. This check exists so a failure surfaces
+/// while this crate still owns `child`: `SharedChild::new`'s own internal `try_wait` would
+/// otherwise drop `child` inside its own call before an error ever reaches here (its `mut child:
+/// Child` parameter is consumed by value, and std `Child::drop` neither kills nor reaps), leaking
+/// a live process with no chance for this crate's teardown to run at all.
+#[test]
+fn an_adopt_check_failure_reaps_the_spawned_child_once_killed() {
+    fault::set_force_adopt_try_wait_error("cosca-adopt-try-wait-fail-51ae");
+    let mut cmd = blocker();
+    let err = cmd.spawn().err();
+    assert_eq!(
+        fault::take_force_adopt_try_wait_error(),
+        None,
+        "the forced adopt check failure must be consumed"
+    );
+
+    let err = err.expect("a forced adopt-check failure must make spawn return Err");
+    assert!(
+        matches!(err, Error::Io(_)),
+        "an adopt-check failure that a kill then resolves surfaces as Io, got {err:?}"
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// The same failure, when the kill it triggers also fails, must hand the child back rather than
+/// drop it — exactly the bug `SharedChild::new`'s own internal `try_wait` has no way to avoid on
+/// its own, since a failure inside its call drops `child` before ever returning control to this
+/// crate's teardown.
+#[test]
+fn an_adopt_check_failure_hands_back_the_child_when_its_kill_also_fails() {
+    fault::set_force_adopt_try_wait_error("cosca-adopt-try-wait-fail-alive-caa2");
+    fault::set_force_kill_failure_leaving_child_alive("cosca-adopt-kill-fail-alive-caa2");
+    let mut cmd = blocker();
+    let err = cmd.spawn().err();
+    assert_eq!(
+        fault::take_force_adopt_try_wait_error(),
+        None,
+        "the forced adopt check failure must be consumed"
+    );
+    assert_eq!(
+        fault::take_force_kill_failure(),
+        None,
+        "the forced kill failure must be consumed"
+    );
+
+    let Some(Error::Unreaped { error, kill: _, child }) = err else {
+        panic!("an unkillable child after a failed adopt check must be handed back, got {err:?}");
+    };
+    assert!(
+        matches!(*error, Error::Io(_)),
+        "the wrapped error must be the adopt check's own Io error, got {error:?}"
+    );
+    let captured = fault::take_captured().expect("seam captured the child's identity");
+    let crate::identity::Resolved::Found(id) = captured else {
+        panic!("the seam must capture a resolved identity, got {captured:?}");
+    };
+    crate::wait::kill(id).expect("end the child");
+    child.wait().expect("wait for the handed-back child");
+    fault::assert_child_reaped(captured);
+}
+
 /// A reap that FAILS during teardown must leave a trace in a release build, where the
 /// `debug_assert` beside it is compiled out: a `log::warn!` naming the error. Both teardown arms —
 /// attach failure and unresolved identity — share the one teardown, and each is driven here.
