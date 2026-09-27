@@ -274,46 +274,23 @@ async fn async_drop_tears_down_a_contained_tree() {
 
 #[tokio::test]
 async fn async_drop_after_wait_still_tears_down_the_tree() {
-    // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all. For a
-    // NON-recyclable-pgid mechanism (Cgroup v2, Job Object, tree-walk) `attached.hard_kill()` is
-    // still safe there and tears the tree down — proven by the grandchild's EOF, as before. For a
-    // RECYCLABLE-pgid mechanism (ProcessGroup/Session/FdMarker), `Drop` must instead SKIP the
-    // kill — a reaped root's pgid may already be recycled onto an unrelated, live process group —
-    // leaving the grandchild running; proven POSITIVELY alive via a real echo round trip, since
-    // an EOF/no-EOF check alone cannot tell "still alive" apart from "hasn't been reaped yet" (see
-    // `spawn-grandchild-echo`'s own doc in testbin/main.rs).
-    use std::io::Read as _;
-    let common::AsyncEchoTree {
-        mut child,
-        root,
-        mut grand,
-        grand_pid: _,
-    } = common::spawn_echo_tree_async(true);
+    // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
+    // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
+    use std::io::{Read as _, Write as _};
+    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true);
     let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
-    let recyclable_pgid = matches!(
-        child.containment(),
-        cosca::Containment::ProcessGroup | cosca::Containment::Session | cosca::Containment::FdMarker
-    );
-    drop(root); // EOF releases the root: `control-echo-pid` exits on a read of 0
+    root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
-    drop(child); // root already reaped → nothing submitted
-
-    if recyclable_pgid {
-        common::assert_echoes(&mut grand, "grandchild");
-    } else {
-        let mut buf = [0u8; 1];
-        match grand.read(&mut buf) {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
-        }
+    drop(child); // root already reaped → nothing submitted; attached.hard_kill must still kill the grandchild
+    let mut buf = [0u8; 1];
+    match grand.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
-    drop(grand); // release the grandchild either way: EOF ends it if it is still running
-
-    // This `Drop` ran on this thread, and waits for the leaf to drain before removing it. Only
-    // ever reached for CgroupV2, which is never `recyclable_pgid`.
+    // This `Drop` ran on this thread, and waits for the leaf to drain before removing it.
     if let Some(leaf) = leaf {
         assert!(
             !leaf.exists(),
