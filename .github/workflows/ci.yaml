@@ -127,19 +127,6 @@ jobs:
           --test windows_process_cwd --run-ignored all
           -E 'test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does)'
 
-      # `a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed` and
-      # `relocating_a_low_parent_fd_keeps_spawn_errors_reported` close this process's own real fd
-      # 1/2 via `RestoreStdio` — process-wide, not per-thread — so they are `#[ignore]`d in the
-      # default run (unsafe under `cargo test`'s shared-process parallelism). nextest's
-      # one-process-per-test model has no such shared process, so it is safe to opt them in here.
-      - name: Run the fd 0-2 relocation tests (Unix)
-        if: matrix.os != 'windows'
-        run: >-
-          cargo nextest run --locked --target ${{ matrix.target }} --profile ci
-          --test spawn_io --run-ignored all
-          -E 'test(=a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed) |
-              test(=relocating_a_low_parent_fd_keeps_spawn_errors_reported)'
-
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Run tests (pty feature)
         run: cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci
