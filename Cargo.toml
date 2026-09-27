@@ -46,9 +46,8 @@ tempfile = "3"
 serde_json = "1"
 # `test-util`: `start_paused` virtual clock for the deadline tests. Dev-only.
 tokio = { version = "1", features = ["test-util"] }
-# tests/process.rs's harness (issue #151 migrates the rest of the suite): `requires = [...]`
-# reports an unmet runtime precondition (e.g. root) as `ignored` with a reason, instead of a
-# silent skip or a hard failure on every other environment.
+# `requires = [...]` marks a runtime precondition (e.g. root); an unmet one is reported as
+# ignored — with its reason under `cargo test`, as a bare skip under nextest.
 skuld = "0.3.1"
 
 [target.'cfg(windows)'.dev-dependencies]
