@@ -700,6 +700,180 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     );
 }
 
+/// Build a `Child` over a real, already-spawned process-group leader with `Attached::ProcessGroup`
+/// containment, for driving `elevated_write_failed` directly (`Child::from_parts`, mirroring
+/// `containment::cgroup::leaf_tests`' own `contained_child` helper — the only way to get a REAL
+/// `Child::drop` under test, not a hand-called `hard_kill`, per that helper's own doc).
+#[cfg(unix)]
+fn process_group_child(leader: std::process::Child, pgid: i32) -> crate::Child {
+    let pid = leader.id();
+    let proc = shared_child::SharedChild::new(leader).expect("adopt the already-spawned leader");
+    let attachment = crate::containment::Attachment {
+        containment: crate::containment::Containment::ProcessGroup,
+        attached: crate::containment::Attached::ProcessGroup(pgid),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    };
+    crate::Child::from_parts(
+        crate::child::proc_handle::ProcHandle::Std(proc),
+        crate::identity::ProcessId::from_parts_for_test(pid, 0),
+        Default::default(),
+        true,
+        attachment,
+    )
+}
+
+/// Regression test for the recycle hazard in `Child::drop` ITSELF — not a spawn-teardown error
+/// path, but the ordinary case any caller can reach: `child.wait()` reaps the root, entirely
+/// outside `Child::drop`'s knowledge, and only later does `child` actually drop. Before the fix,
+/// `Child::drop`'s own tree-level `hard_kill` ran unconditionally, with no way to know the root
+/// was already gone — risking `killpg` on a pgid that reap may already have freed for recycling.
+/// The fix must skip the kill entirely (there is no safe way to reach the tree once the root's own
+/// pid is gone) — proven here by BOTH a zero call count and the second member being left
+/// genuinely untouched (still alive, not merely unreaped).
+#[cfg(unix)]
+#[test]
+fn child_drop_does_not_kill_a_recyclable_pgid_the_caller_already_reaped() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id();
+    let child = process_group_child(leader, pgid);
+    // The caller reaps the root itself — entirely outside `Child::drop`'s knowledge, the exact
+    // scenario its own unconditional `hard_kill` call, before this fix, could not see.
+    child.kill().expect("kill the root");
+    child.wait().expect("reap the root");
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    drop(child);
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        0,
+        "an already-reaped root's pgid may already be recycled: Drop must skip the kill \
+         entirely, never risk `killpg` on it"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "skipping the contained-tree kill"),
+        "the skip must be logged"
+    );
+
+    // A liveness probe is exactly right here (unlike the sibling tests' `wait()`-based proof):
+    // the member must be genuinely UNTOUCHED, not merely unreaped — an incorrect kill would have
+    // reached it for real, leaving it a signalled zombie, not a live process.
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(member.id() as i32), None),
+        Ok(()),
+        "the second member must be left alive: Drop must not have reached the group at all"
+    );
+    drop(member_stdin);
+    member.kill().expect("end the member");
+    member.wait().expect("reap the member");
+}
+
+/// Regression test for the recycle hazard at `elevated_write_failed`'s `Ok(kill)` arm: before the
+/// fix, this function's own reap (`child.wait()`, following the root's own successful `kill()`)
+/// was followed by an ordinary drop of `child` — and `Child::drop` unconditionally re-fires
+/// `Attached::hard_kill` BEFORE checking whether the root is already reaped, risking a SECOND
+/// `killpg` on a pgid this function's own reap may already have freed for recycling. Proven by a
+/// call count: the tree is correctly killed ONCE, by this function's own tree-kill note, at its
+/// top; a second call is the bug.
+#[cfg(unix)]
+#[test]
+fn elevated_write_failed_does_not_rekill_a_recyclable_pgid_after_its_own_reap() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id();
+    let child = process_group_child(leader, pgid);
+
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-elevated-ok-kill-no-rekill-6f21")),
+    );
+    assert!(err.to_string().contains("was terminated"), "got {err}");
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        1,
+        "Child::drop must not re-kill the tree after this function's own reap: a second call \
+         would risk `killpg` on a pgid that reap may already have freed for recycling"
+    );
+
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the ONE correct kill must still reach the second member, not only the root: got {member_status:?}"
+    );
+}
+
+/// Regression test for the recycle hazard at `elevated_write_failed`'s `Checked::Reaped` arm,
+/// against the ONE mechanism whose own field-wise `Drop` actually re-kills on every call
+/// (`ProcessGroup`'s is a no-op — see `child::unreaped::Retained`'s doc — so only `FdMarker`
+/// exercises this specific defect). Before the fix, nothing disarmed the retained marker after
+/// this function's own (correctly pre-reap) tree-kill note, so `retained.attached`'s field-wise
+/// drop, once `check` had already reaped the root, re-fired `killpg` — the exact hazard this PR
+/// closes. The leader here exits ON ITS OWN, confirmed a zombie (`block_until_reapable`,
+/// deterministic — no race) before this function ever runs, so its `killpg` at the top and
+/// `check`'s own reap are both against a still-valid, unrecycled pgid throughout — the mutant this
+/// test is meant to catch is the missing disarm, not an unsafe kill.
+#[cfg(target_os = "macos")]
+#[test]
+fn elevated_write_failed_does_not_rekill_a_retained_fd_marker_whose_check_already_reaped_it() {
+    use std::os::unix::process::CommandExt;
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("true");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .process_group(0);
+    let prepared = crate::containment::fdmarker::install(&mut cmd, &[]).expect("install");
+    let leader = cmd.spawn().expect("spawn a child that exits on its own");
+    drop(cmd);
+    let pid = leader.id();
+    // Confirm the leader is ALREADY a zombie — exited on its own — before this function's own
+    // tree-kill note ever runs: `killpg` on a zombie's still-valid (not yet recycled) pgid is
+    // exactly the safe window `sweep_recyclable_pgid_before_reap`'s doc describes.
+    crate::child::unreaped::block_until_reapable(pid).expect("the leader exits and becomes a zombie");
+
+    let marker = crate::containment::fdmarker::Marker::new(prepared, None, Some(pid as i32), false);
+    let key = marker.hard_kill_test_key();
+
+    let proc = shared_child::SharedChild::new(leader).expect("adopt the already-exited leader");
+    let attachment = crate::containment::Attachment {
+        containment: crate::containment::Containment::FdMarker,
+        attached: crate::containment::Attached::FdMarker(marker),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    };
+    let child = crate::Child::from_parts(
+        crate::child::proc_handle::ProcHandle::Std(proc),
+        crate::identity::ProcessId::from_parts_for_test(pid, 0),
+        Default::default(),
+        true,
+        attachment,
+    );
+
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-elevated-fdmarker-checked-reaped-9d31",
+        std::io::ErrorKind::PermissionDenied,
+    );
+
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-fdmarker-write-fail-9d31")),
+    );
+    assert!(err.to_string().contains("already exited"), "got {err}");
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(key),
+        1,
+        "the marker must be swept exactly once — by this function's own tree-kill note, at its \
+         top, before ANY reap. Its retained value's field-wise drop, once `check` (which finds \
+         the already-exited root and reaps it) returns, must be a disarmed no-op, not a second \
+         sweep on a pid `check`'s own reap has already freed for recycling"
+    );
+}
+
 /// A child the teardown could not kill is handed back in the error, on both teardown arms, and the
 /// teardown does NOT go on to a blocking reap: a child it could not kill may still be running
 /// (EPERM from a setuid child), and `wait()` would hang the spawn for as long as it runs. The reap
@@ -1100,6 +1274,133 @@ fn a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf() {
     let mut status = 0;
     // SAFETY: as above; a blocking reap of this process's own child.
     unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+}
+
+/// Spawn a real process-group leader, blocked on stdin, and a second member of the SAME group,
+/// also blocked on stdin — a live process standing in for what a recycled pgid would put at risk
+/// (per this crate's own convention: see `child::unreaped_tests`'s identical pattern). Returns the
+/// leader (owned by the caller, to hand to `teardown_unadopted`), its pgid (== its own pid), and
+/// the member (kept alive by its own held-open stdin, to prove the sweep's `killpg` reaches a
+/// SECOND process, not only the root).
+#[cfg(unix)]
+fn pgid_leader_and_member() -> (std::process::Child, i32, std::process::Child, std::process::ChildStdin) {
+    use std::os::unix::process::CommandExt;
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut leader_cmd = std::process::Command::new("cat");
+    leader_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid
+    let leader = leader_cmd.spawn().expect("spawn the group leader");
+    let pgid = leader.id() as i32;
+
+    let mut member_cmd = std::process::Command::new("cat");
+    member_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(pgid); // joins the leader's group, not a leader itself
+    let mut member = member_cmd.spawn().expect("spawn a second member of the same group");
+    let member_stdin = member.stdin.take().expect("piped stdin");
+    (leader, pgid, member, member_stdin)
+}
+
+/// Regression test for the recycle hazard at `teardown_unadopted`'s KILL-SUCCEEDED path: before
+/// the fix, `reap_unadopted` reaped the root FIRST, and only THEN was `attached` dropped —
+/// unswept, for `ProcessGroup` (whose field-wise drop never kills at all — see
+/// `child::unreaped::Retained`'s doc), meaning the whole group, including this test's second
+/// member, was simply never killed through this path AT ALL. Proves both defects the fix closes
+/// at once: the sweep reaches a live SECOND process (not only the root), and it does so while the
+/// root is still a confirmed zombie (watched live, via `Attached::hard_kill`'s own test hook —
+/// the `ProcessGroup` twin of `child::unreaped_tests`'s `FdMarker`-hook-based proof, since a bare
+/// pgid has no per-instance object of its own to hang a hook on).
+#[cfg(unix)]
+#[test]
+fn teardown_unadopted_sweeps_a_recyclable_pgid_before_reaping_a_successfully_killed_root() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id();
+
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    let handed_back = super::teardown_unadopted(leader, Some(crate::containment::Attached::ProcessGroup(pgid)));
+    assert!(handed_back.is_none(), "a successful kill hands nothing back");
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        1,
+        "the group must be swept exactly once"
+    );
+    assert_eq!(
+        crate::containment::dispatch::fault::take_zombie_at_each_hard_kill_call(),
+        vec![true],
+        "the sweep must run while the root pid is still a reapable zombie — before this \
+         teardown's own reap frees it for a new process group to take"
+    );
+
+    // A liveness probe (`kill(pid, 0)`) is not the right check for the member: a killed-but-
+    // unreaped process is still a ZOMBIE, which that probe reports as alive. Reaping it and
+    // checking ITS signal is the real proof the group's `killpg` reached it, not only the root.
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep must kill through the group, reaching the second member too, not only the root: \
+         got {member_status:?}"
+    );
+}
+
+/// Regression test for the recycle hazard at `teardown_unadopted`'s `Checked::Reaped` arm: a
+/// failed kill whose child had, regardless, already exited (here, killed and reaped by this test
+/// itself, standing in for "exited independently of the kill"). Before the fix, `attached` was
+/// dropped AFTER `check`'s own internal reap — unswept for `ProcessGroup`. The pre-check
+/// non-blocking sweep must run, and must do so while the root is CONFIRMED a zombie (this test
+/// reaps it for real, deterministically, before `teardown_unadopted` is ever called, ruling out
+/// the "not yet a zombie" race a natural EOF-triggered exit would risk) — proving both that the
+/// sweep is non-blocking (a failed kill must never park a spawn on a child that could still be
+/// running) and that it still runs strictly before any reap.
+#[cfg(unix)]
+#[test]
+fn teardown_unadopted_sweeps_a_recyclable_pgid_before_the_checked_reaped_arms_own_reap() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id();
+    // Kill and reap the leader for REAL, out of band, so it is a CONFIRMED zombie by the time
+    // `teardown_unadopted` runs — deterministic, unlike racing a `cat` process's own EOF exit
+    // against a non-blocking poll.
+    // SAFETY: `leader_pid` is this process's own unreaped child.
+    unsafe { libc::kill(leader_pid as i32, libc::SIGKILL) };
+    crate::child::unreaped::block_until_reapable(leader_pid).expect("the leader becomes a zombie");
+
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-teardown-checked-reaped-sweep-kill-eperm-7b21",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    let handed_back = super::teardown_unadopted(leader, Some(crate::containment::Attached::ProcessGroup(pgid)));
+    assert!(
+        handed_back.is_none(),
+        "the child had already exited, which makes the kill's failure moot: got {handed_back:?}"
+    );
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        1,
+        "the group must be swept exactly once, by the pre-check non-blocking sweep"
+    );
+    assert_eq!(
+        crate::containment::dispatch::fault::take_zombie_at_each_hard_kill_call(),
+        vec![true],
+        "the sweep must run while the root pid is still a reapable zombie — before `check`'s own \
+         internal reap frees it for a new process group to take"
+    );
+
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep must kill through the group, reaching the second member too: got {member_status:?}"
+    );
 }
 
 /// A `try_wait` error after a failed kill that is NOT `ECHILD` — a too-old kernel's `EINVAL` from
