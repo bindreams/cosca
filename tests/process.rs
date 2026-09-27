@@ -234,6 +234,17 @@ mod preconditions {
     }
 }
 
+/// Marks a test that needs an actual privileged (root) caller, so CI's root-precondition step
+/// can select every test that declares it (`SKULD_LABELS=ROOT`) instead of naming each one by
+/// hand — a future root-precondition test picks this label up automatically; a CI filter keyed
+/// on a single test's exact name silently would not. nextest itself has no notion of skuld's
+/// labels (its own filter DSL cannot express them; confirmed against `cargo-skuld nextest`,
+/// which only generates nextest `test-groups` for serial scheduling), so this label is read by
+/// skuld's OWN `SKULD_LABELS` filtering, before nextest ever lists or runs a single test.
+#[cfg(unix)]
+#[skuld::label]
+pub const ROOT: skuld::Label;
+
 /// The target's uid/gid: an ordinary unprivileged account, distinct from both root (0) and
 /// `READER_UID` below. No `/etc/passwd` entry is required for either — `setuid`/`execve` only
 /// need a number, and neither the target nor the reader ever looks itself up by name.
@@ -270,10 +281,11 @@ impl Drop for KillOnDrop {
 }
 
 /// Copies `src` into `dir` (a directory the caller has already chmod'd world-traversable) and
-/// chmods the copy `0o755` — explicitly, regardless of `src`'s own permissions or the ambient
-/// umask. `fs::copy` preserves the SOURCE's mode on the destination, which is not good enough on
-/// its own: see [`foreign_kill_surfaces_permission_denied`]'s doc for why `src` itself may
-/// already be missing "other" exec.
+/// chmods the copy `0o755` — explicitly, regardless of `src`'s own permissions. `fs::copy`
+/// preserves the SOURCE's mode on the destination, which is not good enough on its own: whatever
+/// built `src` may have used a stricter umask than this copy needs. The bigger problem — an
+/// untraversable ANCESTOR directory `src` happens to live under — is `dir`'s job to route around,
+/// not this function's: see [`foreign_kill_surfaces_permission_denied`]'s doc.
 #[cfg(unix)]
 fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -302,32 +314,49 @@ fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> std::p
 /// instant the reader actually uses it — the same safety property a passed-down pidfd would give,
 /// obtained here for free from the pid simply staying valid throughout.
 #[cfg(unix)]
-#[skuld::test(requires = [preconditions::root])]
+#[skuld::test(requires = [preconditions::root], labels = [ROOT])]
 fn foreign_kill_surfaces_permission_denied() {
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
+    // `requires` above already gates the whole test on this, but ONLY when skuld's own harness
+    // runs it. `--run-ignored all` (or a filter that names this test directly, bypassing skuld's
+    // precondition check some other way) can still reach this body directly on a non-root
+    // caller — assert it here too, so that path fails with a message that says what's actually
+    // wrong instead of a misleading `EPERM` from the first privileged syscall below.
+    // SAFETY: geteuid() takes no arguments and has no preconditions.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "foreign_kill_surfaces_permission_denied requires root"
+    );
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
 
     // Both binaries below get spawned under an uid that is neither their file's owner (root, the
-    // uid that built or archive-extracted them) nor its group — ordinary "other" access, gated on
-    // the "other" bits alone. Measured: those bits are NOT reliably set. `cargo build`'s own
-    // linker output honors the ambient umask like any created file (confirmed: `umask 027` alone
-    // yields mode 0750, no "other" exec, on a plain unprivileged-then-root build/run split — the
-    // exact shape `sudo` produces in CI); nextest's own archive-extraction temp directory is
-    // subject to the very same umask. A copy into a directory THIS process explicitly chmods,
-    // right before use, is the only way to stop depending on whatever umask happens to be
-    // ambient in whatever environment (CI's `sudo`, or a human's own shell) runs this test.
+    // uid this test runs as) nor its group — ordinary "other" access, which is not just the
+    // file's own bits: every directory ABOVE it needs "other" search (x) permission too, or
+    // `execve` fails closed with EACCES regardless of the file's own mode. Both `common::testbin()`
+    // (`env!("CARGO_BIN_EXE_cosca_testbin")`) and `std::env::current_exe()` are baked-in/resolved
+    // paths back into wherever this crate was originally checked out and built — and at least one
+    // ANCESTOR of that checkout is commonly untraversable by an unrelated uid:
+    // - On Linux: measured on a stock Ubuntu 24.04 root+`sudo` setup — `useradd -m`'s home
+    //   directory gets `/etc/login.defs`' `HOME_MODE` (`0750` there), so a checkout under
+    //   `$HOME` (as CI's is) blocks every uid but the checkout's own owner and group, even though
+    //   the binary itself, built unprivileged, is otherwise perfectly world-executable (`0775`)
+    //   and even after `sudo`'s own archive-extraction directory is confirmed fully traversable.
+    // - On macOS: `tempfile::tempdir()` honors `$TMPDIR`, a PER-USER directory
+    //   (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, under `/var/folders`) whose ANCESTORS are owned by
+    //   whichever user is running this process and are not traversable by another uid (measured:
+    //   root's own `$TMPDIR` under `sudo` reproduces the exact same "Permission denied" spawning
+    //   the target, even after chmod'ing this test's own leaf directory).
     //
-    // `tempdir_in("/tmp")`, not plain `tempfile::tempdir()`: the latter honors `$TMPDIR`, which
-    // on macOS is a PER-USER directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, under `/var/folders`)
-    // whose ANCESTORS — not just the leaf this creates — are owned by whichever user is running
-    // this process and are not traversable by another uid, no matter what this leaf itself is
-    // chmod'd to (measured: root's own `$TMPDIR` under `sudo` reproduces the exact same
-    // "Permission denied" spawning the target, even after the chmod below). `/tmp` itself
-    // (`/private/tmp` on macOS) is the one path both platforms guarantee world-traversable.
+    // Copying both binaries into a directory THIS process creates and chmods itself, directly
+    // under `/tmp` (`/private/tmp` on macOS) — the one path both platforms guarantee
+    // world-traversable — sidesteps the untraversable ancestor entirely, on both platforms, without
+    // having to name (or trust) every directory in either original path.
     let scratch = tempfile::Builder::new()
         .tempdir_in("/tmp")
         .expect("scratch directory for world-executable copies");
