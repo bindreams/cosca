@@ -596,6 +596,60 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     );
 }
 
+/// A deliberate, always-panicking probe for `RestoreStdio::close`'s panic-hook fix. NEVER runs on
+/// its own: without `COSCA_TEST_TRIGGER_MUTANT_C` set it no-ops, so an ordinary suite pass (which
+/// never sets that var) never sees it fail. Only
+/// [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below invokes it, deliberately, to prove
+/// the fix: before that fix, a panic while `RestoreStdio` held fd 2 closed had its message
+/// silently swallowed (the default panic hook's write to a closed fd 2 fails, and the hook drops
+/// that failure rather than panicking again), so this probe's own message would never reach
+/// anywhere the prover below could see it.
+#[cfg(unix)]
+#[test]
+fn cosca_test_mutant_c_deliberate_panic_while_fd2_closed() {
+    if std::env::var_os("COSCA_TEST_TRIGGER_MUTANT_C").is_none() {
+        return;
+    }
+    if !common::alone("cosca_test_mutant_c_deliberate_panic_while_fd2_closed") {
+        return;
+    }
+    let _restore = common::RestoreStdio::close(&[2]);
+    panic!("COSCA_TEST_MUTANT_C_MARKER: this message must survive fd 2 being closed");
+}
+
+/// Proves `RestoreStdio::close`'s panic-hook fix (see its own doc for the mechanism): re-execs
+/// the deliberately-panicking probe above (opted in via its own env-var gate, so the probe never
+/// runs as part of an ordinary pass) and asserts the probe's own marker message actually reached
+/// somewhere readable — not silently lost to a closed fd 2. Before the fix, this assertion fails:
+/// the probe's process exits non-zero with no trace of its own panic message anywhere in its
+/// captured output.
+#[cfg(unix)]
+#[test]
+fn a_panic_while_fd_2_is_closed_still_reaches_stderr() {
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([
+        "cosca_test_mutant_c_deliberate_panic_while_fd2_closed",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+    ])
+    .env("COSCA_TEST_TRIGGER_MUTANT_C", "1");
+    let out = common::output_locked(&mut cmd).expect("run the probe");
+    assert!(
+        !out.status.success(),
+        "the probe is designed to always panic; a success means it silently no-oped instead"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("COSCA_TEST_MUTANT_C_MARKER"),
+        "the probe's own panic message must survive fd 2 being closed while it panicked — got:\n{combined}"
+    );
+}
+
 /// Prove that fd 3 configured as a file is passed through to the child:
 /// the child reads fd 3 and echoes it to stdout; we compare the payload.
 #[cfg(unix)]
