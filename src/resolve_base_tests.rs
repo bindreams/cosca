@@ -1,7 +1,8 @@
 //! [`ResolveInput::cwd`]: which names need a base, and that `None` resolves those that do not.
 //!
-//! A test name ending `_unprivileged` needs a caller without `CAP_DAC_READ_SEARCH` (not root): run
-//! as root it fails loudly, naming the violated precondition, rather than silently passing on a
+//! A test name ending `_unprivileged` needs a caller DAC applies to: on Linux, one without
+//! `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH`; elsewhere, not root. Run as root (or with either
+//! capability) it fails loudly, naming the violated precondition, rather than silently passing on a
 //! precondition it never built. Opt out with `cargo nextest run -E 'not test(/_unprivileged$/)'`.
 
 use super::*;
@@ -354,10 +355,12 @@ impl Drop for Locked {
 /// production code actually meets on every unelevated host — not merely a uid-independent stand-in
 /// for one.
 ///
-/// It only holds for a caller without `CAP_DAC_READ_SEARCH` (not root), which the precondition
-/// assert below checks: root's DAC override lets it stat through a `0o000` directory, so under
-/// root this fixture panics with that explanation rather than silently exercising nothing. See the
-/// module doc for the `_unprivileged` test-name convention this fixture is paired with.
+/// It only holds for a caller DAC applies to (on Linux, one without `CAP_DAC_OVERRIDE` or
+/// `CAP_DAC_READ_SEARCH`; elsewhere, not root), which the precondition assert below checks: DAC
+/// override lets a stat through a `0o000` directory regardless of which of the two capabilities
+/// grants it — default Docker root, for one, carries only `CAP_DAC_OVERRIDE` — so under such a
+/// caller this fixture panics with that explanation rather than silently exercising nothing. See
+/// the module doc for the `_unprivileged` test-name convention this fixture is paired with.
 #[cfg(unix)]
 fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
     let root = tempfile::tempdir().unwrap();
@@ -371,8 +374,9 @@ fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString
     assert_eq!(
         e.raw_os_error(),
         Some(libc::EACCES),
-        "precondition: this test needs a caller without CAP_DAC_READ_SEARCH (not root); opt out \
-         with `-E 'not test(/_unprivileged$/)'`: got {e}"
+        "precondition: this test needs a caller DAC applies to (on Linux, one without \
+         CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH; elsewhere, not root); opt out with \
+         `-E 'not test(/_unprivileged$/)'`: got {e}"
     );
     let mut path = locked.0.clone().into_os_string();
     path.push(";");
@@ -424,6 +428,17 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed_unprivileged(
 #[test]
 fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
     let (_root, open, path) = loop_then_open();
+    assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
+}
+
+/// The same claim against a REAL permission-denied candidate, not just the uid-independent `ELOOP`
+/// stand-in above — this is the production case an ordinary (non-`loadable_only`) search actually
+/// meets on every unelevated host, so one `PATH` directory a caller cannot read must not break the
+/// whole search. See [`locked_then_open`] for why this one only runs unprivileged.
+#[cfg(unix)]
+#[test]
+fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search_unprivileged() {
+    let (_root, _locked, open, path) = locked_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
