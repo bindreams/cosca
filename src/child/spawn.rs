@@ -105,6 +105,14 @@ pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
     // Its tree first, through its containment when that can tear one down, so a descendant forked
     // before the failure dies too. The root is then killed by its own handle.
     let tree = tree_note(child.containment().can_teardown().then(|| child.attached.hard_kill()));
+    // The tree-kill above ran while the root was indisputably not yet reaped (it is the very
+    // first thing this function does), so it is already safe. Disarm the fd marker's own re-fire
+    // now, before anything downstream (the root's reap below, or `check`'s internal one past
+    // `into_unreaped_parts`) could make a SECOND, unconfirmed `killpg` through its field-wise
+    // `Drop` land on a recycled pgid — see `Attached::disarm_after_own_sweep`'s doc. Every other
+    // mechanism (notably `ProcessGroup`, whose own field-wise drop never kills at all) is
+    // untouched here, matching `Child::drop`'s own identical use of this call.
+    child.attached.disarm_after_own_sweep();
     let auth_failed = |note: String| Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {note}{tree}"),
@@ -130,6 +138,12 @@ pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
                 log::warn!("failed to reap the killed elevated child {}: {e}", child.id().pid());
                 debug_assert!(false, "failed to reap a killed elevated child: {e}");
             }
+            // The tree is already killed (above) and the root is already killed and reaped
+            // (just above) — an ordinary drop of `child` here would still run `Child::drop`'s OWN
+            // unconditional `hard_kill()` call, AFTER this reap, on a pgid that reap may already
+            // have freed for recycling. `detach()` opts out of that (and of the redundant reap
+            // attempt): there is nothing left for either to do.
+            child.detach();
             return auth_failed("the elevated child was terminated".into());
         }
         Err(e) => kill_error_to_io(e),
@@ -143,6 +157,11 @@ pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
             kill,
             child: Unreaped::with_retained(held, Some(retained)),
         },
+        // It had exited, which makes the kill's failure moot. The tree-kill note's own
+        // `hard_kill`, above, already ran before ANY reap — including this one, `check`'s own
+        // internal `try_wait` — so nothing here needs sweeping; `retained.attached`'s own
+        // field-wise drop, at the end of this arm, is a disarmed no-op for the fd marker, and was
+        // already a no-op for every other mechanism.
         Checked::Reaped => auth_failed("the elevated child had already exited".into()),
         Checked::Uncertain(e) => {
             // The pid may already name another process: what this spawn retained is given up
@@ -432,6 +451,15 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 /// retried through the process handle this teardown holds, and a child that retry terminates is
 /// reaped. If the retry fails too, the child is leaked, suspended, until something else terminates
 /// it: that is logged and asserted, whatever the kill's error.
+///
+/// **Unix:** `attached`, if it carries a recyclable pgid (`ProcessGroup`, or macOS `FdMarker`
+/// with one — see `Attached::carries_recyclable_pgid`), is swept via
+/// [`sweep_recyclable_pgid_before_reap`](crate::child::unreaped::sweep_recyclable_pgid_before_reap)
+/// (kill succeeded: blocking, bounded by the uncatchable `SIGKILL`) or its
+/// [`_nonblocking`](crate::child::unreaped::sweep_recyclable_pgid_before_reap_nonblocking) twin
+/// (kill failed: `pid` may still be running) BEFORE the reap that follows — never after, which
+/// would let the sweep's `killpg` land on a pgid `pid`'s own reap may already have freed for
+/// recycling.
 #[must_use]
 fn teardown_unadopted(
     mut child: std::process::Child,
@@ -439,9 +467,20 @@ fn teardown_unadopted(
     attached: Option<crate::containment::Attached>,
 ) -> Option<(std::io::Error, crate::child::unreaped::Unreaped)> {
     use crate::child::unreaped::{Checked, Held, Retained, Unreaped};
+    let pid = child.id();
     if let Err(kill) = kill_unadopted(&mut child) {
-        let pid = child.id();
         drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+        // The kill FAILED: `pid` may still be genuinely running, so this confirmatory sweep must
+        // not block. Sweeps now only if `pid` happens to already be a confirmed zombie (it can
+        // exit on its own regardless of why the kill failed); otherwise hands `attached` back
+        // unchanged for `check` below — and, past `Checked::Running`, `Unreaped`'s own machinery
+        // — to settle. See `sweep_recyclable_pgid_before_reap`'s doc for why sweeping before any
+        // reap is load-bearing.
+        #[cfg(unix)]
+        let attached = attached.and_then(|attached| {
+            crate::child::unreaped::sweep_recyclable_pgid_before_reap_nonblocking(pid, Box::new(Retained { attached }))
+                .map(|retained| retained.attached)
+        });
         return match Held::Std(child).check() {
             Checked::Running(held) => {
                 #[cfg(windows)]
@@ -461,7 +500,8 @@ fn teardown_unadopted(
                     Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
                 ))
             }
-            // It had exited, which makes the kill's failure moot.
+            // It had exited, which makes the kill's failure moot. Whatever `attached` carried was
+            // already swept above, while `check` here had not yet reaped it — nothing left to do.
             Checked::Reaped => None,
             Checked::Uncertain(e) => {
                 // The pid may already name another process: what this spawn retained is given up
@@ -477,8 +517,24 @@ fn teardown_unadopted(
             }
         };
     }
+    // The kill SUCCEEDED (`SIGKILL`, uncatchable): `pid` will become a zombie, so this
+    // confirmatory sweep is bounded. Sweep whatever `attached` carries BEFORE the reap below —
+    // see `sweep_recyclable_pgid_before_reap`'s doc for why the order is load-bearing; doing this
+    // after the reap is the exact bug this fixes (an armed retention's own field-wise `Drop`, on
+    // macOS's `FdMarker`, unconditionally re-fires `killpg` on whatever pgid `pid` now names).
+    #[cfg(unix)]
+    if let Some(attached) = attached {
+        if let Some(retained) =
+            crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, Box::new(Retained { attached }))
+        {
+            // The confirmatory wait itself failed (in practice `ECHILD`: something else already
+            // reaped `pid`) — never sweep on that; abandon instead, matching `Checked::Uncertain`'s
+            // own disposition above.
+            retained.attached.abandon();
+        }
+    }
     if let Err(reap) = reap_unadopted(&mut child) {
-        log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
+        log::warn!("spawn teardown failed to reap pid {pid}: {reap}");
         debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
     }
     None
@@ -1129,6 +1185,8 @@ pub(crate) mod fault {
         static BEFORE_BLOCK_UNTIL_REAPABLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
             const { std::cell::RefCell::new(None) };
         #[cfg(unix)]
+        static FORCE_POLL_REAPABLE_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(unix)]
         static FORCE_TEARDOWN_TRY_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(unix, feature = "tokio"))]
         static FORCE_TOKIO_WAIT_BLOCKING_MISS: Cell<bool> = const { Cell::new(false) };
@@ -1274,6 +1332,20 @@ pub(crate) mod fault {
     #[cfg(unix)]
     pub(crate) fn take_before_block_until_reapable_hook() -> Option<Box<dyn FnOnce() + Send>> {
         BEFORE_BLOCK_UNTIL_REAPABLE_HOOK.with(|h| h.borrow_mut().take())
+    }
+
+    /// Make the next non-blocking confirmatory `poll_reapable` on this thread fail with `marker`,
+    /// without actually polling: the child stays running, unreaped, for the test to clean up. The
+    /// non-blocking twin of [`set_force_block_until_reapable_error`] — see its doc for why this
+    /// forces the failure deterministically rather than relying on a real, unstageable recycle
+    /// race.
+    #[cfg(unix)]
+    pub(crate) fn set_force_poll_reapable_error(marker: &'static str) {
+        FORCE_POLL_REAPABLE_ERROR.with(|f| f.set(Some(marker)));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_force_poll_reapable_error() -> Option<&'static str> {
+        FORCE_POLL_REAPABLE_ERROR.with(|f| f.take())
     }
 
     /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread find the child
