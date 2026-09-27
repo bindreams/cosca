@@ -596,51 +596,44 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     );
 }
 
-/// A deliberate, always-panicking probe for `RestoreStdio::close`'s panic-hook fix. `#[ignore]`d
-/// so it never runs as part of an ordinary suite pass, even swept up by a bare `--include-ignored`
-/// (its own `COSCA_TEST_TRIGGER_MUTANT_C` env-var gate is a second, independent no-op guard for
-/// exactly that case). Only [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below invokes
-/// it, deliberately, to prove the fix: before it, a panic while `RestoreStdio` held fd 2 closed
-/// had its message silently swallowed (the default panic hook's write to a closed fd 2 fails, and
-/// the hook drops that failure rather than panicking again), so this probe's own message would
-/// never reach anywhere the prover below could see it.
+/// A deliberate, always-panicking probe for `RestoreStdio::close`'s panic-hook fix. `#[ignore]`d,
+/// so an ordinary suite pass never even selects it; a bare `--include-ignored` sweep (one that
+/// does not target it specifically) DOES still run it — libtest executes an ignored test under
+/// that flag — but its own `COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE` env-var gate makes
+/// that a no-op: it returns immediately, touching nothing. Only
+/// [`a_panic_while_fd_2_is_closed_still_reaches_stderr`] below sets that var and invokes it,
+/// deliberately, to prove the fix: before it, a panic while `RestoreStdio` held fd 2 closed had
+/// its message silently swallowed (the default panic hook's write to a closed fd 2 fails, and the
+/// hook drops that failure rather than panicking again), so this probe's own message would never
+/// reach anywhere the prover below could see it.
 #[cfg(unix)]
 #[test]
 #[ignore = "probe"]
-fn cosca_test_mutant_c_deliberate_panic_while_fd2_closed() {
-    if std::env::var_os("COSCA_TEST_TRIGGER_MUTANT_C").is_none() {
+fn panic_while_fd2_closed_probe() {
+    if std::env::var_os("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE").is_none() {
         return;
     }
-    if !common::alone("cosca_test_mutant_c_deliberate_panic_while_fd2_closed") {
+    if !common::alone("panic_while_fd2_closed_probe") {
         return;
     }
     let _restore = common::RestoreStdio::close(&[2]);
-    panic!("COSCA_TEST_MUTANT_C_MARKER: this message must survive fd 2 being closed");
+    panic!("PANIC_WHILE_FD2_CLOSED_PROBE_MARKER: this message must survive fd 2 being closed");
 }
 
 /// Proves `RestoreStdio::close`'s panic-hook fix (see its own doc for the mechanism).
 ///
-/// Invokes the probe above DIRECTLY with the exact `alone()`-isolated shape — `COSCA_TEST_ALONE`
-/// set to the probe's own name, plus the full `ALONE_ARGS` — so the probe's OWN `alone()` call
-/// matches immediately and does NOT re-exec a second time: one process runs the probe, not two.
-/// This is load bearing, not cosmetic: an extra `alone()` layer in between would convert a
-/// genuine process ABORT (this guard's `Drop` wrongly calling `std::panic::set_hook` during
-/// unwind — which itself panics, uncaught, so the process aborts with no defined exit code,
-/// commonly reported as 134/SIGABRT) into that MIDDLE process's own, entirely ordinary panic (a
-/// clean exit 101, from `alone()`'s own `assert!` on the grandchild's failed
-/// `wait_with_output`) — masking the abort completely behind a passing-looking `!success()`
-/// check. Asserting the probe's own exit code is EXACTLY `101` (libtest's ordinary
-/// panic-in-test exit, not merely "nonzero") is what makes an abort fail this test.
+/// Invokes the probe above via [`common::run_probe_directly`] — see its doc for why "directly"
+/// (skipping a second `alone()` re-exec layer) is load bearing here, not cosmetic: that second
+/// layer would mask a genuine process ABORT (this guard's `Drop` wrongly calling
+/// `std::panic::set_hook` during unwind — which itself panics, uncaught, so the process aborts
+/// with no defined exit code, commonly reported as 134/SIGABRT) as an entirely ordinary panic (a
+/// clean exit 101) one level up. Asserting the probe's own exit code is EXACTLY `101` (libtest's
+/// ordinary panic-in-test exit, not merely "nonzero") is what makes an abort fail this test.
 #[cfg(unix)]
 #[test]
 fn a_panic_while_fd_2_is_closed_still_reaches_stderr() {
-    const PROBE: &str = "cosca_test_mutant_c_deliberate_panic_while_fd2_closed";
-    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-    cmd.arg(PROBE)
-        .args(common::ALONE_ARGS)
-        .env("COSCA_TEST_ALONE", PROBE)
-        .env("COSCA_TEST_TRIGGER_MUTANT_C", "1");
-    let out = common::output_locked(&mut cmd).expect("run the probe");
+    const PROBE: &str = "panic_while_fd2_closed_probe";
+    let out = common::run_probe_directly(PROBE, &[("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE", "1")]);
     assert_eq!(
         out.status.code(),
         Some(101),
@@ -657,8 +650,57 @@ fn a_panic_while_fd_2_is_closed_still_reaches_stderr() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        combined.contains("COSCA_TEST_MUTANT_C_MARKER"),
+        combined.contains("PANIC_WHILE_FD2_CLOSED_PROBE_MARKER"),
         "the probe's own panic message must survive fd 2 being closed while it panicked — got:\n{combined}"
+    );
+}
+
+/// A deliberate probe for the `SAVED_STDERR` self-deadlock fix: opens two OVERLAPPING
+/// `RestoreStdio` guards on fd 2 without dropping the first, which — before the fix — deadlocked
+/// this thread instead of panicking. `#[ignore]`d and env-gated exactly like
+/// [`panic_while_fd2_closed_probe`] above; see there for why a bare `--include-ignored` sweep
+/// still executes but no-ops it.
+///
+/// The intervening `tempfile::tempfile()` matters: without it, the second `close(&[2])` would
+/// try to dup an ALREADY-CLOSED fd 2 (closed by the first guard) and panic on THAT `fcntl`
+/// failure instead — a different failure than the one this probe exists to trigger. Opening a
+/// throwaway file first lands something valid back at the freed fd 2 (the lowest free number, in
+/// a fresh `alone()`-isolated process with nothing else open), so the second `close(&[2])`
+/// succeeds through its own dup+close and reaches the `SAVED_STDERR`-occupied check.
+#[cfg(unix)]
+#[test]
+#[ignore = "probe"]
+fn two_overlapping_fd2_closes_probe() {
+    if std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_PROBE").is_none() {
+        return;
+    }
+    if !common::alone("two_overlapping_fd2_closes_probe") {
+        return;
+    }
+    let _first = common::RestoreStdio::close(&[2]);
+    let _file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
+    let _second = common::RestoreStdio::close(&[2]); // must panic cleanly, not deadlock
+}
+
+/// Proves the `SAVED_STDERR` self-deadlock fix (see `tests/common/mod.rs`'s `SAVED_STDERR` doc
+/// for the mechanism): invokes the probe above via [`common::run_probe_directly`], which bounds
+/// the wait (see its own and [`common::wait_bounded`]'s docs for why a bound is the right tool
+/// for exactly this regression) so a hang fails this test loudly instead of hanging the whole
+/// suite. Asserts the probe's own exit code is EXACTLY `101` — an ordinary libtest panic, proving
+/// the second, overlapping `RestoreStdio::close(&[2])` panicked instead of deadlocking.
+#[cfg(unix)]
+#[test]
+fn two_overlapping_fd2_closes_do_not_deadlock() {
+    const PROBE: &str = "two_overlapping_fd2_closes_probe";
+    let out = common::run_probe_directly(PROBE, &[("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_PROBE", "1")]);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the second, overlapping RestoreStdio::close(&[2]) must panic cleanly (exit 101), not \
+         hang or abort. got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
