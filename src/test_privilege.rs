@@ -4,10 +4,12 @@
 
 /// Makes DAC apply to the calling thread, and the threads and children it creates afterwards, for
 /// the rest of its life. On Linux this strips `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` from
-/// the effective, permitted, inheritable and ambient capability sets, and — when this thread
-/// holds `CAP_SETPCAP` — the bounding set too, so a uid-0 caller cannot regain either capability
-/// at a later `execve` either. Elsewhere it drops root (if root) to an unprivileged uid/gid, the
-/// only DAC bypass a non-Linux caller can hold.
+/// the effective, permitted and inheritable capability sets (the ambient set follows for free —
+/// see below), sets `no_new_privs` so a uid-0 caller's later `execve` cannot regain either
+/// capability from the bounding set (see below for why that is otherwise live), and — when this
+/// thread holds `CAP_SETPCAP` — drops both from the bounding set too, so even a caller that does
+/// not set `no_new_privs` on its own children loses them for good. Elsewhere it drops root (if
+/// root) to an unprivileged uid/gid, the only DAC bypass a non-Linux caller can hold.
 ///
 /// **Linux does not change uid.** Root's own `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` are
 /// themselves droppable capabilities, distinct from `CAP_SETUID`/`CAP_SETGID` — measured: root
@@ -83,23 +85,26 @@ fn drop_dac_capabilities() -> std::io::Result<()> {
     // Effective, permitted, inheritable: one call reads, one writes back all three at once. A
     // thread may always shed its own capabilities from these three sets — no privilege needed,
     // so dropping bits this thread never held (the common, non-root case) is a harmless no-op.
+    //
+    // No separate ambient step: the kernel enforces "a capability is never ambient unless it is
+    // also permitted AND inheritable" as an invariant of capset itself, so dropping a bit from
+    // either of those two here already clears it from ambient too (measured: `CapAmb` reads `0`
+    // afterwards with no `prctl(PR_CAP_AMBIENT, …)` call at all). An earlier version of this
+    // function called `PR_CAP_AMBIENT_LOWER` explicitly, redundantly — and on a kernel without
+    // ambient support (Linux < 4.3), or under a seccomp filter that blocks `prctl`, that call is
+    // the only step that fails: `main`, which never touches ambient, passes there; this function,
+    // for no reason once capset's own invariant already does the job, did not.
     let mut sets = rustix::thread::capabilities(None)?;
     sets.effective.remove(dac);
     sets.permitted.remove(dac);
     sets.inheritable.remove(dac);
     rustix::thread::set_capabilities(None, sets)?;
 
-    // Ambient: not part of the struct above, cleared per-capability via `prctl`. Issued
-    // unconditionally for both capabilities regardless of whether either is actually ambient —
-    // lowering an absent ambient capability is a harmless no-op (`PR_CAP_AMBIENT_LOWER` on a bit
-    // that was never set still returns success), so no `capability_is_in_ambient_set` check first.
-    rustix::thread::configure_capability_in_ambient_set(CapabilitySet::DAC_OVERRIDE, false)?;
-    rustix::thread::configure_capability_in_ambient_set(CapabilitySet::DAC_READ_SEARCH, false)?;
-
-    // Bounding: prevents a uid-0 caller from regaining either capability at a LATER `execve`
-    // (bounding only ever shrinks over a process's life). Needs `CAP_SETPCAP`, which this thread
-    // may not have — that is not a precondition failure, since bounding membership was never what
-    // let a `stat` through; only the effective set was. Best-effort, silently skipped otherwise.
+    // Bounding: prevents a uid-0 caller from regaining either capability at a LATER `execve` via
+    // the ordinary route — bounding only ever shrinks over a process's life. Needs `CAP_SETPCAP`,
+    // which this thread may not have — that is not a precondition failure, since bounding
+    // membership was never what let a `stat` through; only the effective set was. Best-effort,
+    // silently skipped otherwise (`no_new_privs` below is what covers that case instead).
     if rustix::thread::capabilities(None)?
         .effective
         .contains(CapabilitySet::SETPCAP)
@@ -107,6 +112,18 @@ fn drop_dac_capabilities() -> std::io::Result<()> {
         rustix::thread::remove_capability_from_bounding_set(CapabilitySet::DAC_OVERRIDE)?;
         rustix::thread::remove_capability_from_bounding_set(CapabilitySet::DAC_READ_SEARCH)?;
     }
+
+    // Without CAP_SETPCAP, the bounding set above is untouched, and a uid-0 thread's `execve` of
+    // an ordinary binary still regains everything in it: measured, a child this thread execs
+    // afterward has `CapEff` restored to the FULL bounding set, via the kernel's legacy
+    // set-user-ID-root compatibility grant (`capabilities(7)`) — "if the caller is uid 0, the
+    // exec'd program's permitted set becomes the bounding set" — which applies regardless of
+    // what this thread's OWN effective/permitted sets were reduced to. `no_new_privs` disables
+    // exactly that grant (same reference, "Effect of no_new_privs"), so the exec'd child inherits
+    // this thread's ALREADY-reduced set instead of the raw bounding set. It needs no privilege of
+    // its own and cannot be unset once set, which is exactly the "for the rest of its life"
+    // guarantee this function promises.
+    rustix::thread::set_no_new_privs(true)?;
 
     // The precondition every caller of this function relies on, checked here rather than trusted:
     // a caller three functions away that hits an unexpected `Ok(stat)` should not have to work out
@@ -117,6 +134,9 @@ fn drop_dac_capabilities() -> std::io::Result<()> {
             "still holds {:?} in the effective set after dropping it",
             effective & dac
         )));
+    }
+    if !rustix::thread::no_new_privs()? {
+        return Err(std::io::Error::other("no_new_privs did not take"));
     }
     Ok(())
 }
