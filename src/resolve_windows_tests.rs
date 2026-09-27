@@ -50,9 +50,9 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW, SecurityImpersonation,
-    TokenImpersonation, TokenUser, ACL, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, NO_INHERITANCE,
-    PSECURITY_DESCRIPTOR, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE,
-    TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+    TokenImpersonation, TokenPrivileges, TokenUser, ACL, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
+    NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, FILE_TRAVERSE};
 use windows::Win32::System::Threading::{
@@ -196,16 +196,22 @@ impl ImpersonationGuard {
                 Attributes: SE_PRIVILEGE_REMOVED,
             }],
         };
-        // Succeeds with `ERROR_NOT_ALL_ASSIGNED` even when the token never held the privilege to
-        // remove, so a successful call here does NOT by itself prove `SeChangeNotifyPrivilege`
-        // was actually stripped from `dup`. `locked_then_open`'s raw-5 precondition is what
-        // would catch a silently-missed strip: if this quietly did nothing, the primary
-        // `CreateFileW` traversal would succeed regardless of the deny ACE below, and that
-        // precondition would fail loudly instead of this call.
+        // `AdjustTokenPrivileges` reports success via its `BOOL` return (`Ok(())` here) even when
+        // the token never held the privilege to remove — `GetLastError() == ERROR_NOT_ALL_ASSIGNED`
+        // is the only signal of THAT, and it is not itself a failure (a token that never held the
+        // privilege is a valid state, so this deliberately does not inspect `GetLastError()` at
+        // all). Neither outcome proves `SeChangeNotifyPrivilege` is actually absent from `dup`
+        // afterward, which is the one thing that matters here — so the assertion right below
+        // reads the privilege list back via `GetTokenInformation` and checks that directly.
         // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches; `*dup` is this
         // function's own fresh, owned duplicate.
         unsafe { AdjustTokenPrivileges(*dup, false, Some(&privileges), 0, None, None) }
             .expect("AdjustTokenPrivileges(SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED)");
+        assert!(
+            !token_has_privilege(*dup, luid),
+            "AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED) reported success, but \
+             SeChangeNotifyPrivilege is still present on the duplicate token"
+        );
 
         // Build the guard from `SetThreadToken`'s own result BEFORE dropping `dup` below: if
         // `SetThreadToken` succeeded, this thread is now impersonating, and `guard` — once
@@ -244,6 +250,37 @@ impl ImpersonationGuard {
     }
 }
 
+/// Whether `token` currently holds the privilege named by `luid`, read back via
+/// `GetTokenInformation(TokenPrivileges)` — see [`ImpersonationGuard::without_change_notify`]'s
+/// call site for why this is checked directly rather than inferred from `AdjustTokenPrivileges`'s
+/// own return value.
+fn token_has_privilege(token: HANDLE, luid: LUID) -> bool {
+    let mut needed = 0u32;
+    // SAFETY: a null buffer with length 0 is the documented size query; it fails with
+    // ERROR_INSUFFICIENT_BUFFER and writes the required size.
+    let _ = unsafe { GetTokenInformation(token, TokenPrivileges, None, 0, &mut needed) };
+    // u32-backed so the `TOKEN_PRIVILEGES` cast below is 4-aligned, as it requires.
+    let mut buf = vec![0u32; (needed as usize).div_ceil(4).max(1)];
+    // SAFETY: `buf` is at least `needed` bytes.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenPrivileges,
+            Some(buf.as_mut_ptr().cast()),
+            (buf.len() * 4) as u32,
+            &mut needed,
+        )
+    }
+    .expect("GetTokenInformation(TokenPrivileges)");
+    // SAFETY: the kernel wrote a `TOKEN_PRIVILEGES` — a `u32` count followed by that many
+    // `LUID_AND_ATTRIBUTES`, both 4-byte types — at the head of a 4-aligned buffer.
+    let count = unsafe { *buf.as_ptr().cast::<u32>() } as usize;
+    // SAFETY: `count` is exactly how many `LUID_AND_ATTRIBUTES` the same call just wrote
+    // immediately after the leading `u32` count, in the same buffer.
+    let privileges = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(1).cast::<LUID_AND_ATTRIBUTES>(), count) };
+    privileges.iter().any(|p| p.Luid == luid)
+}
+
 /// [`OpenProcessToken`] wrapped to return the handle by value instead of through an out-param,
 /// so its caller can hand the result straight to [`Owned::new`] without an intermediate
 /// `HANDLE::default()` binding of its own.
@@ -277,10 +314,18 @@ struct DenyAclGuard {
     /// formatting `Vec<u16>` with `{:?}` prints raw UTF-16 code units, not a readable path.
     path: PathBuf,
     wide: Vec<u16>,
-    // The whole security descriptor `GetNamedSecurityInfoW` allocated, freed with `LocalFree` on
-    // drop — AFTER the DACL it holds has been reapplied, since `original_dacl` points INTO this
-    // buffer and is invalid once it is freed.
-    original_sd: PSECURITY_DESCRIPTOR,
+    /// The whole security descriptor `GetNamedSecurityInfoW` allocated, as an `Owned<HLOCAL>`
+    /// FIELD rather than a bare `PSECURITY_DESCRIPTOR` freed by hand: a struct's fields drop in
+    /// DECLARATION order, but only after its own `Drop::drop` body has already returned — so
+    /// this frees itself automatically, and always AFTER [`DenyAclGuard`]'s `Drop::drop` below
+    /// has reapplied the DACL `original_dacl` (which points INTO this buffer) — with no manual
+    /// `LocalFree` call needed on any path, `Drop::drop` included, and none of construction's own
+    /// early-return panics able to leak it either, since it becomes an owned `Owned` value the
+    /// moment `GetNamedSecurityInfoW` returns.
+    // Never read after construction — kept alive purely for this `Drop`, which `-D warnings`
+    // cannot tell from an accidentally-unused field.
+    #[allow(dead_code)]
+    original_sd: Owned<HLOCAL>,
     original_dacl: *mut ACL,
 }
 
@@ -292,8 +337,8 @@ impl DenyAclGuard {
         let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
 
         let mut original_dacl: *mut ACL = std::ptr::null_mut();
-        let mut original_sd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: `wide` is NUL-terminated; `original_dacl` and `original_sd` are valid `&mut`
+        let mut raw_sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `wide` is NUL-terminated; `original_dacl` and `raw_sd` are valid `&mut`
         // out-params that outlive the call.
         unsafe {
             GetNamedSecurityInfoW(
@@ -304,14 +349,16 @@ impl DenyAclGuard {
                 None,
                 Some(&mut original_dacl),
                 None,
-                &mut original_sd,
+                &mut raw_sd,
             )
         }
         .ok()
         .expect("GetNamedSecurityInfoW");
-        // From here on `original_sd` holds a `LocalAlloc`-backed allocation that must be freed
-        // on every exit path — including the two panics below, which free it explicitly before
-        // firing, since no `DenyAclGuard` will exist yet to do it in `Drop`.
+        // SAFETY: `raw_sd` was just allocated by `GetNamedSecurityInfoW` above and is owned by
+        // this function from here on — wrapping it immediately means every exit path below,
+        // including the two panics further down, frees it automatically (see the field's own
+        // doc on `DenyAclGuard` for why that is also true of `DenyAclGuard`'s own `Drop`).
+        let original_sd = unsafe { Owned::new(HLOCAL(raw_sd.0)) };
 
         let sid_buf = current_user_sid_buf();
         let sid = sid_from_buf(&sid_buf);
@@ -330,12 +377,10 @@ impl DenyAclGuard {
         // SAFETY: `entry` is fully initialized and borrows only from `sid_buf`, alive for this
         // call; `original_dacl` is the live ACL `GetNamedSecurityInfoW` just returned.
         let entries_set = unsafe { SetEntriesInAclW(Some(&[entry]), Some(original_dacl.cast_const()), &mut new_dacl) };
-        if let Err(e) = entries_set.ok() {
-            // SAFETY: `original_sd` was allocated by `GetNamedSecurityInfoW` above; this
-            // function panics right after with no guard constructed to free it otherwise.
-            unsafe { LocalFree(Some(HLOCAL(original_sd.0))) };
-            panic!("SetEntriesInAclW: {e}");
-        }
+        // `original_sd` (an `Owned<HLOCAL>` local by now) frees itself when this function
+        // unwinds past it, so this — unlike `new_dacl`'s own freeing just below — needs no
+        // explicit cleanup before panicking.
+        entries_set.ok().expect("SetEntriesInAclW");
 
         // SAFETY: `wide` is NUL-terminated; `new_dacl` is the ACL `SetEntriesInAclW` just built.
         let set = unsafe {
@@ -354,11 +399,8 @@ impl DenyAclGuard {
         // than retaining the pointer, whether that call succeeded or failed, so it is safe to
         // free here either way.
         unsafe { LocalFree(Some(HLOCAL(new_dacl.cast()))) };
-        if let Err(e) = set.ok() {
-            // SAFETY: same as the `SetEntriesInAclW` failure branch above.
-            unsafe { LocalFree(Some(HLOCAL(original_sd.0))) };
-            panic!("SetNamedSecurityInfoW: {e}");
-        }
+        // `original_sd` again frees itself on unwind if this panics — see above.
+        set.ok().expect("SetNamedSecurityInfoW");
 
         DenyAclGuard {
             path,
@@ -372,7 +414,9 @@ impl DenyAclGuard {
 impl Drop for DenyAclGuard {
     fn drop(&mut self) {
         // SAFETY: `self.wide` is still NUL-terminated; `self.original_dacl` still points into
-        // `self.original_sd`'s buffer, not yet freed below.
+        // `self.original_sd`'s buffer — `original_sd`'s own `Drop` (a struct FIELD, freed only
+        // after this function body returns; see its doc) has not run yet, so the buffer is
+        // still valid here regardless of which arm below this call takes.
         let restored = unsafe {
             SetNamedSecurityInfoW(
                 PCWSTR(self.wide.as_ptr()),
@@ -384,11 +428,6 @@ impl Drop for DenyAclGuard {
                 None,
             )
         };
-        // SAFETY: `self.original_sd` was allocated by `GetNamedSecurityInfoW`; the DACL it holds
-        // has just been reapplied above (or the attempt is about to be reported as failed) —
-        // either way nothing still borrows from it, and every other field of this guard is done
-        // with it too, this being the guard's own `Drop`.
-        unsafe { LocalFree(Some(HLOCAL(self.original_sd.0))) };
         if let Err(e) = restored.ok() {
             panic_or_eprint(format!(
                 "could not restore the original ACL on {:?}: {e} — it may be left locked in %TEMP%",
@@ -401,7 +440,7 @@ impl Drop for DenyAclGuard {
 /// A `PATH` entry whose directory is denied at the Win32 ACL level, followed by one that holds
 /// the name.
 ///
-/// The returned [`DenyAclGuard`] and [`ImpersonationGuard`] must be dropped, in that order
+/// The returned [`ImpersonationGuard`] and [`DenyAclGuard`] must be dropped, in that order
 /// (impersonation reverted first), before the returned [`tempfile::TempDir`] is closed — each
 /// caller below does so explicitly, rather than relying on the tuple's own drop order, so it can
 /// also call `TempDir::close` and assert the tree actually got removed. Reverting impersonation
