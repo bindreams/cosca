@@ -124,7 +124,7 @@ getrandom = "0.4"
 rustix = { version = "1", features = ["process", "event", "net", "fs"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-caps = "0.5.6"
+rustix = { version = "1", default-features = false, features = ["thread"] }
 
 [[bin]]
 name = "cosca_testbin"

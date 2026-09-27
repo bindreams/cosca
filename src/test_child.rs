@@ -206,29 +206,34 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
 }
 
 /// Runs the libtest fixture at fully-qualified path `fixture` in a FRESH re-exec of this test
-/// binary, with `marker_env` set (to `"1"`, since unlike [`run_fixture_with_cwd`]'s this call
-/// carries no data the fixture needs back) — for a fixture whose body needs isolation for some
-/// OTHER process-wide, irreversible state, such as
-/// [`crate::test_privilege::drop_dac_bypass`]'s uid and capability sets, rather than for the cwd
-/// `run_fixture_with_cwd` exists to isolate.
+/// binary, with no cwd or other data of its own to carry — for a fixture whose body needs
+/// isolation for some OTHER process-wide, irreversible state, such as
+/// [`crate::test_privilege::drop_dac_bypass`]'s credentials and capability sets, rather than for
+/// the cwd `run_fixture_with_cwd` exists to isolate. [`is_fixture_reexec`] is what the fixture
+/// checks, since there is no per-fixture marker here to carry it instead.
 ///
-/// `marker_env`'s presence is what lets the fixture tell this deliberate re-exec apart from being
-/// picked up by an ordinary, unfiltered suite run — where it must no-op rather than mutate this
-/// (shared, multithreaded) test binary's own irreversible process-wide state out from under every
-/// other concurrently running test. See [`run_fixture_with_cwd`]'s doc for the re-exec rationale,
-/// the panic conditions, and why `fixture` should come from [`fixture_path!`].
+/// See [`run_fixture_with_cwd`]'s doc for the re-exec rationale, the panic conditions, and why
+/// `fixture` should come from [`fixture_path!`].
 ///
 /// `#[cfg(unix)]`: every current caller drops DAC-bypassing privilege, a unix-only concept: gate
 /// this the same way rather than carry a cross-platform no-caller-on-Windows dead-code warning.
 #[cfg(unix)]
-pub(crate) fn run_fixture(fixture: &str, marker_env: &str) {
-    let mut cmd = fixture_command(fixture);
-    cmd.env(marker_env, "1");
-    run_fixture_command(fixture, cmd);
+pub(crate) fn run_fixture(fixture: &str) {
+    run_fixture_command(fixture, fixture_command(fixture));
 }
 
 /// The `std::process::Command` common to every fixture re-exec: this binary, filtered to exactly
-/// one test, single-threaded, with both stdio streams captured for [`run_fixture_command`].
+/// one test, single-threaded, with both stdio streams captured for [`run_fixture_command`],
+/// [`FIXTURE_PARENT_PID_ENV`] set (see [`is_fixture_reexec`]), and — on unix — `TMPDIR` forced to
+/// `/tmp`.
+///
+/// A fixture that builds its own tempdir cannot assume its ambient `TMPDIR`/`$TMPDIR` is writable
+/// by whatever uid or capability set it ends up with after dropping privilege: root's own per-uid
+/// temp directory can be `0700` (measured, Linux, `TMPDIR=/root/t`; the same is true of macOS's
+/// per-user `/var/folders/.../T`, by the same reasoning applied to Darwin's superuser). `/tmp`
+/// itself is the one POSIX convention every one of this crate's target platforms ships
+/// world-writable (`1777`) regardless of caller, so forcing it here — once, for every fixture —
+/// is a structural fix rather than a per-fixture one to remember.
 ///
 /// No `"cosca_unit_tests"` placeholder in argv slot 0 (that's [`fixture_argv`]'s convention for
 /// `cosca::Command`, see its doc): `std::process::Command` already supplies its own argv[0] from
@@ -236,9 +241,38 @@ pub(crate) fn run_fixture(fixture: &str, marker_env: &str) {
 fn fixture_command(fixture: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
     cmd.args(["--test-threads=1", "--exact", fixture])
+        .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if cfg!(unix) {
+        cmd.env("TMPDIR", "/tmp");
+    }
     cmd
+}
+
+/// The env var every fixture re-exec ([`run_fixture`], [`run_fixture_with_cwd`]) sets, to its own
+/// pid — see [`is_fixture_reexec`].
+const FIXTURE_PARENT_PID_ENV: &str = "COSCA_FIXTURE_PARENT_PID";
+
+/// Whether this process's real parent is the one that (deliberately) re-exec'd it via
+/// [`run_fixture`]/[`run_fixture_with_cwd`] — not merely that [`FIXTURE_PARENT_PID_ENV`], or a
+/// fixture-specific marker such as `run_fixture_with_cwd`'s `marker_env`, happens to be present
+/// in whatever environment picked this process up.
+///
+/// Presence alone does not prove a deliberate re-exec: a marker env var can be inherited by the
+/// shared, unfiltered suite process too — a stray shell `export`, a copy-pasted CI `env:` block —
+/// which would then run a fixture's body, [`crate::test_privilege::drop_dac_bypass`] for one,
+/// inside the process every other concurrently running test depends on. Measured under
+/// `cargo nextest run`, which runs every test as its own process: a presence-only check on
+/// [`crate::resolve::resolve_base_tests`]'s fixtures flaked, since nextest's own process
+/// launching for OTHER tests can set env vars this binary does not control. A real parent-pid
+/// match is not spoofable by an inherited or coincidentally-named var.
+#[cfg(unix)]
+pub(crate) fn is_fixture_reexec() -> bool {
+    std::env::var(FIXTURE_PARENT_PID_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|pid| pid == std::os::unix::process::parent_id())
 }
 
 /// Spawns `cmd` (built from [`fixture_command`], possibly with more set on it) under
@@ -277,9 +311,10 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
 }
 
 /// Reads `marker_env`'s value as the directory [`run_fixture_with_cwd`]'s caller prepared, and
-/// returns `None` when it is unset — a fixture is picked up by an ordinary, unfiltered suite run
-/// too, where it must no-op rather than assert against whatever the suite's own ambient cwd
-/// happens to be.
+/// returns `None` when it is unset, or (on unix) when [`is_fixture_reexec`] says this is not
+/// really a deliberate re-exec — either way, a fixture is picked up by an ordinary, unfiltered
+/// suite run too, where it must no-op rather than assert against whatever the suite's own ambient
+/// cwd happens to be, or against a `marker_env` some unrelated process happened to leave behind.
 ///
 /// When set, also asserts this fixture's OWN `std::env::current_dir()` actually IS that
 /// directory: `run_fixture_with_cwd`'s `.current_dir(cwd)` call is what is supposed to guarantee
@@ -289,6 +324,10 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
 /// test. Every fixture in this file that takes a `marker_env` argument calls this instead of
 /// reading `std::env::current_dir()` directly, so that check is never skippable by omission.
 pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    if !is_fixture_reexec() {
+        return None;
+    }
     let expected = std::path::PathBuf::from(std::env::var_os(marker_env)?);
     let actual = std::env::current_dir().expect("current_dir");
     assert_eq!(
