@@ -1124,6 +1124,8 @@ pub(crate) mod fault {
         static FORCE_TEARDOWN_TRY_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
         static FORCE_TEARDOWN_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
         #[cfg(unix)]
+        static FORCE_BLOCK_UNTIL_REAPABLE_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(unix)]
         static FORCE_TEARDOWN_TRY_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(unix, feature = "tokio"))]
         static FORCE_TOKIO_WAIT_BLOCKING_MISS: Cell<bool> = const { Cell::new(false) };
@@ -1231,6 +1233,25 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_force_teardown_wait_error() -> Option<&'static str> {
         FORCE_TEARDOWN_WAIT_ERROR.with(|f| f.take())
+    }
+
+    /// Make the next confirmatory `block_until_reapable` on this thread fail with `marker`,
+    /// without actually waiting: the child stays running, unreaped, for the test to clean up.
+    /// Unlike a real failure (in practice always `ECHILD`, from something else already having
+    /// reaped and possibly recycled the pid), this forces the failure deterministically, so a
+    /// test can drive `sweep_recyclable_pgid_before_reap`'s failure branch against a real, still
+    /// LIVE child without relying on an actual pid/pgid recycle race — which cannot be staged
+    /// safely or deterministically at all (see the module doc's `PGID-reuse caveat` in
+    /// `containment/unix.rs`). A test that also wants a genuine `ECHILD` textually should still
+    /// prefer a real reaped-elsewhere child; this seam is for proving the SKIP behavior itself,
+    /// against a child whose liveness after the call is the very thing being asserted.
+    #[cfg(unix)]
+    pub(crate) fn set_force_block_until_reapable_error(marker: &'static str) {
+        FORCE_BLOCK_UNTIL_REAPABLE_ERROR.with(|f| f.set(Some(marker)));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_force_block_until_reapable_error() -> Option<&'static str> {
+        FORCE_BLOCK_UNTIL_REAPABLE_ERROR.with(|f| f.take())
     }
 
     /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread find the child

@@ -194,9 +194,12 @@ impl ReapTask {
         let reaped = crate::child::unreaped::block_until_reapable(pid).and_then(|()| {
             // Sweep a recyclable-pgid retention now, while `pid` is still a zombie — see
             // `sweep_recyclable_pgid_before_reap`'s doc — before the reap a few lines below frees
-            // it. A no-op, leaving `self.retained` unchanged, for every other kind of retention.
+            // it. A no-op, leaving `self.retained` unchanged, for every other kind of retention. A
+            // successfully swept one is consumed here (`None`), so it is never handed on to
+            // `reaped`/`spawn_drain` at all — round-3 finding 2's fix relies on that: nothing left
+            // to re-sweep later.
             if let Some(retained) = self.retained.take() {
-                self.retained = Some(crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, retained));
+                self.retained = crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, retained);
             }
             self.held.as_mut().expect("claimed above").try_reap()
         });
@@ -1160,12 +1163,21 @@ impl Drop for Unreaped {
         let mut failed = false;
         // Sweep BEFORE the reap below, exactly as the sync twin's `Drop` does (and for the same
         // reason) — see `sweep_recyclable_pgid_before_reap`'s doc. Taken before `self.held`, on
-        // purpose: the pid must not be reaped between this and the wait a few lines down.
+        // purpose: the pid must not be reaped between this and the wait a few lines down. Gated on
+        // `self.held.is_some()`: once it is `None` the root is already reaped (see `reaped`'s
+        // doc), so any retained value still reaching here (round-3 finding 2 — `await_draining`
+        // reclaiming one back after its drain task never ran) is one whose pid/pgid may already
+        // have been recycled onto a live, unrelated process group. Sweeping THAT would be the
+        // exact hazard this function exists to prevent, so it is left unswept for the caller's own
+        // success/failure branch below to settle, same as any other unswept retention.
         #[cfg(unix)]
-        let retained = self
-            .retained
-            .take()
-            .map(|retained| crate::child::unreaped::sweep_recyclable_pgid_before_reap(self.pid, retained));
+        let retained = self.retained.take().and_then(|retained| {
+            if self.held.is_some() {
+                crate::child::unreaped::sweep_recyclable_pgid_before_reap(self.pid, retained)
+            } else {
+                Some(retained)
+            }
+        });
         #[cfg(windows)]
         let retained = self.retained.take();
         if let Some(held) = self.held.take() {

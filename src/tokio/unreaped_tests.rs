@@ -3,7 +3,7 @@
 
 use super::Unreaped;
 use crate::child::unreaped::Held;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use crate::child::unreaped::Retained;
 use crate::identity::{ProcessId, Resolved};
 
@@ -142,6 +142,63 @@ async fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_
          the reap frees it for a new process group to take. Got the pid already reaped \
          (Some(false)), or the sweep never ran at all (None)."
     );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child exited normally on EOF ({status:?}); a sweep that reached the root itself \
+         (rather than only what it retained) would show up here as a signal, not a normal exit"
+    );
+}
+
+/// Regression test for adversarial round-3 finding 2: a drain that never ran (a runtime shutdown
+/// before its `DrainTask` claimed anything) hands an unswept recyclable retention back into
+/// `self.retained` via `await_draining`, with `self.held` already `None` and `self.status`
+/// already `Some` — the root already reaped (see `reaped`'s doc). Before the fix, `Drop`'s own
+/// fallback swept it anyway, against a pid that may already have been recycled onto a live,
+/// unrelated process group. This constructs that exact state directly — the state
+/// `await_draining` produces, without needing a saturated blocking pool to reproduce it — against
+/// a REAL, still-running child in its own process group, so an incorrect sweep would kill it for
+/// real.
+#[cfg(unix)]
+#[test]
+fn drop_does_not_resweep_a_retention_whose_root_is_already_reaped() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid, with no other members
+    let mut child = cmd.spawn().expect("spawn a child blocked on stdin");
+    let pid = child.id();
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    let retained = Box::new(Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    });
+    let unreaped = Unreaped {
+        held: None,
+        retained: Some(retained),
+        pid,
+        status: Some(std::process::ExitStatus::from_raw(0)),
+        released: None,
+        blocking: None,
+        draining: None,
+        #[cfg(all(test, unix))]
+        before_blocking_drop: None,
+    };
+    drop(unreaped);
+
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Ok(()),
+        "the child must still be alive: `Drop`'s fallback must not sweep a retention once \
+         `held` is already `None` — the root reap already happened, so its pgid may already \
+         have been recycled onto a live, unrelated process group"
+    );
+
+    drop(stdin); // let the child exit on EOF; this test's own doing, not `Drop`'s
+    child.wait().expect("the child exits once stdin closes");
 }
 
 /// Poll `wait` once, assert it is pending — so it really started waiting — and drop it, as the

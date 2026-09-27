@@ -1,7 +1,7 @@
 //! `Unreaped`'s contract, on a child held as a spawn teardown holds it: `wait` reaps and returns
 //! the status, `leak` gives the child up unreaped, and `Drop` blocks until the child exits.
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use super::Retained;
 use super::{Held, Unreaped};
 use crate::identity::{ProcessId, Resolved};
@@ -216,6 +216,120 @@ fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie
          wait's own reap frees it for a new process group to take. Got the pid already reaped \
          (Some(false)), or the sweep never ran at all (None)."
     );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child exited normally on EOF ({status:?}); a sweep that reached the root itself \
+         (rather than only what it retained) would show up here as a signal, not a normal exit"
+    );
+}
+
+/// Regression test for adversarial round-3 finding 1: before the fix,
+/// `sweep_recyclable_pgid_before_reap` swept "regardless" even when its own confirmatory
+/// `block_until_reapable` failed — sending a real `killpg` to a pgid it could no longer confirm
+/// was still an unrecycled zombie's. Forces that confirmatory check to fail deterministically
+/// (see `fault::set_force_block_until_reapable_error`'s doc for why a real recycle race cannot be
+/// staged safely at all) against a REAL, still-running child in its own process group, so an
+/// incorrect sweep would kill it for real.
+#[cfg(unix)]
+#[test]
+fn sweep_skips_hard_kill_when_it_cannot_confirm_the_root_is_still_a_zombie() {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid, with no other members
+    let mut child = cmd.spawn().expect("spawn a child blocked on stdin");
+    let pid = child.id();
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    crate::child::spawn::fault::set_force_block_until_reapable_error("forced: cannot confirm zombie");
+    let retained = Box::new(Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    });
+    let result = super::sweep_recyclable_pgid_before_reap(pid, retained);
+
+    assert!(
+        matches!(
+            result.as_deref(),
+            Some(Retained {
+                attached: crate::containment::Attached::ProcessGroup(g)
+            }) if *g == pid as i32
+        ),
+        "a confirmatory failure must hand the retention back unswept, for the caller's own \
+         failed-wait branch to abandon: got {result:?}"
+    );
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Ok(()),
+        "the child must still be alive: an incorrect sweep would have sent it a real SIGKILL \
+         through killpg despite the confirmatory check having failed"
+    );
+
+    drop(stdin); // let the child exit on EOF
+    child.wait().expect("the child exits once stdin closes");
+}
+
+/// Positive twin of the skip test above, and of `wait_sweeps_a_retained_recyclable_marker_...`
+/// (macOS's `FdMarker`): a `ProcessGroup` retention is the one Unix mechanism whose own `Drop`
+/// never kills anything on its own (a bare pgid, no kernel resource) — the pre-reap sweep is its
+/// ONLY kill-through path, not merely a safety net over some other backstop. This proves the
+/// sweep actually reaches a SECOND process sharing the swept pgid, not only the root: a `hard_kill`
+/// that only signalled the (already-dying) root and returned `None` regardless would pass every
+/// other test here without ever killing anything through the group.
+#[cfg(unix)]
+#[test]
+fn sweep_kills_through_a_live_process_group_when_it_confirms_the_root_is_still_a_zombie() {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut leader_cmd = std::process::Command::new("cat");
+    leader_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid
+    let mut leader = leader_cmd.spawn().expect("spawn the group leader");
+    let pgid = leader.id();
+    let leader_stdin = leader.stdin.take().expect("piped stdin");
+
+    let mut member_cmd = std::process::Command::new("cat");
+    member_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(pgid as i32); // joins the leader's group, not a leader itself
+    let mut member = member_cmd.spawn().expect("spawn a second member of the same group");
+    let _member_stdin = member.stdin.take().expect("piped stdin"); // held open: member stays alive
+
+    drop(leader_stdin); // let the leader exit on EOF, becoming a reapable zombie
+    crate::child::unreaped::block_until_reapable(pgid).expect("wait for the leader's own exit");
+
+    let retained = Box::new(Retained {
+        attached: crate::containment::Attached::ProcessGroup(pgid as i32),
+    });
+    let result = super::sweep_recyclable_pgid_before_reap(pgid, retained);
+
+    assert!(
+        result.is_none(),
+        "a confirmed sweep must fully consume the retention (nothing left to sweep again): got \
+         {result:?}"
+    );
+
+    // A liveness probe (`kill(pid, 0)`) is not the right check here: a killed-but-unreaped
+    // process is still a ZOMBIE, which `kill(pid, 0)` reports as alive (`Ok(())`) until
+    // something actually reaps it — not `ESRCH`. Reaping it and checking ITS signal is the real
+    // proof the group's `killpg` reached it, not only the root.
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the second member of the swept group must have been killed: the sweep's killpg must \
+         reach the whole group, not only the root; got {member_status:?}"
+    );
+
+    leader.wait().expect("reap the already-signalled zombie leader");
 }
 
 /// A tokio child that exits promptly, needing no external binary: this same test binary, re-run
