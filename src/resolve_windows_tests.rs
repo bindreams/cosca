@@ -9,8 +9,8 @@
 //!
 //! # Where the deny ACE has to sit
 //!
-//! `std::fs::metadata` on Windows (`library/std/src/sys/fs/windows.rs`'s `fn metadata`, checked
-//! against rustc 1.98.1's own source) opens the target via `CreateFileW`, which ends up
+//! `std::fs::metadata` on Windows (`library/std/src/sys/fs/windows.rs`'s `fn metadata`) opens
+//! the target via `CreateFileW`, which ends up
 //! requesting `SYNCHRONIZE | FILE_READ_ATTRIBUTES` on the handle. A file-level `FILE_GENERIC_READ`
 //! deny (which includes `SYNCHRONIZE`) is not enough on its own — measured on this crate's own
 //! Windows CI runners: `metadata` still returned `Ok`. `SYNCHRONIZE` has no route around a deny on
@@ -209,8 +209,8 @@ fn panic_or_eprint(msg: String) {
 /// function applies to a DUPLICATE below, which is irreversible for whichever token it lands on
 /// — re-enabling after THAT is not an option at all). That disable-then-re-enable alternative has
 /// its own race: `cargo test` runs every test as a separate thread within ONE process (nextest,
-/// which this repo's CI uses, instead gives each test its own process — see `d2b1c7bd`), so
-/// under plain `cargo test` a concurrently running test on another thread of that same process
+/// which this repo's CI uses, instead gives each test its own process), so under plain
+/// `cargo test` a concurrently running test on another thread of that same process
 /// would observe the process token with the privilege missing too, for the whole disabled
 /// window — a data race on shared, mutable process state. A thread's impersonation token is not
 /// shared with any other thread, so touching only it, for only the calling thread's own
@@ -456,15 +456,21 @@ impl DenyAclGuard {
         // than retaining the pointer, whether that call succeeded or failed, so it is safe to
         // free here either way.
         unsafe { LocalFree(Some(HLOCAL(new_dacl.cast()))) };
-        // `original_sd` again frees itself on unwind if this panics — see above.
-        set.ok().expect("SetNamedSecurityInfoW");
 
-        DenyAclGuard {
+        // Build the guard BEFORE checking `set`: `SetNamedSecurityInfoW` can write the new DACL
+        // to `dir` and then still fail (e.g. while propagating it to children), so a bare
+        // `set.ok().expect(...)` here would panic with no `DenyAclGuard` yet existing to restore
+        // the ACE it may have already written — leaving `dir` permanently denied and unremovable.
+        // The restore `Drop` performs is idempotent, so building the guard unconditionally costs
+        // nothing on the ordinary, successful path.
+        let guard = DenyAclGuard {
             path,
             wide,
             original_sd,
             original_dacl,
-        }
+        };
+        set.ok().expect("SetNamedSecurityInfoW");
+        guard
     }
 }
 
@@ -543,9 +549,11 @@ fn locked_then_open() -> LockedThenOpen {
     let locked_tool = locked.join("tool.exe");
     std::fs::write(&locked_tool, b"x").unwrap();
 
-    let mut path = locked.clone().into_os_string();
-    path.push(";");
-    path.push(&open);
+    // `std::env::join_paths`, not a bare `";"` join: NTFS permits `;` in a directory name, and
+    // `split_path_var_windows` splits on any unquoted one, so a literal join could tear a
+    // directory whose own name contains `;` into two elements. `join_paths` quotes an entry that
+    // needs it, matching how this crate's own splitter reads a quoted entry back.
+    let path = std::env::join_paths([&locked, &open]).unwrap();
 
     // Denies the DIRECTORY, not `locked_tool` — see the module doc.
     let guard = DenyAclGuard::deny_traversal_and_listing(&locked);
