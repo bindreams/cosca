@@ -558,15 +558,21 @@ impl Drop for Child {
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
-            // A live member refused, or couldn't be confirmed — visible, not silently
-            // discarded, on the RAII teardown path most callers actually hit. A genuine
-            // mechanism failure (is_teardown_mechanism_failure) is a debug_assert instead,
-            // matching the async twin's disposition for the identical condition.
-            debug_assert!(
-                !is_teardown_mechanism_failure(e),
-                "contained-tree teardown failed on sync Drop: {e:?}"
-            );
-            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            // Visible, not silently discarded, on the RAII teardown path most callers actually
+            // hit. Never a `debug_assert` (round-4): a genuine mechanism failure —
+            // `CgroupLeaf::hard_kill`'s own doc lists EACCES from a privilege drop, and a
+            // read-only remount, among real outcomes, not a broken contract — is a real errno a
+            // destructor can do nothing about but log; asserting on it risks leaving the root
+            // unreaped (skipping `teardown_on_drop` below) and aborts outright if it fires during
+            // an unwind already in progress. `is_teardown_mechanism_failure` still separates the
+            // two, now only for log severity: `error` for the mechanism's own plumbing failing,
+            // `warn` for an ordinary per-member refusal (a live member that resisted, or one this
+            // pass could not confirm).
+            if is_teardown_mechanism_failure(e) {
+                log::error!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            } else {
+                log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            }
         }
         // Disarm ONLY the fd marker now that this handle's own sweep just ran: whatever falls out
         // of scope below (the field-wise drop of `self.attached` at the end of this function)

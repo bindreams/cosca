@@ -486,6 +486,126 @@ async fn an_already_reaped_root_still_routes_an_armed_leafs_release_through_the_
     );
 }
 
+/// Async twin of `leaf_tests::an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt` —
+/// round-4's "add an async F2 test" finding: mutant M14 (reverting `child.rs:876`'s
+/// `disarm_after_own_sweep()` back to a blanket `disarm()`) survived in both lanes because no
+/// async test drove this specific path. `Child::drop`'s own tree-level `hard_kill`, fired
+/// unconditionally near its top, is forced to fail for real (`EACCES`) — since round-4 also
+/// removed the `debug_assert` that used to make this panic in debug builds, this now runs in
+/// every build. If `disarm_after_own_sweep` regresses to `disarm()`, the leaf lands disarmed and
+/// never-killed instead of staying armed, and its own `Drop` never retries the write at all.
+///
+/// Unlike the sync twin, this leaf's own `Drop` runs on a reaper-pool thread, not this test's own
+/// — so the sync twin's `rmdir`/drain-block hooks (thread-local, per `cgroup/fault.rs`) cannot be
+/// reused here as written; they would simply never fire on that other thread and this test would
+/// hang or silently no-op. Two things sidestep that instead, both already thread-independent by
+/// design: no `rmdir` hook is installed at all, so the leaf's `rmdir_leaf()` falls through to a
+/// REAL `rmdir` on the real (non-empty) fake leaf directory, which fails with a real, unrecognized
+/// errno on ANY thread — read by the Drop logic the same as a genuinely occupied leaf, forcing the
+/// kill-it branch regardless of who calls it; and `set_next_kill_thread_hook` (already a global,
+/// path-keyed registry — see its own doc — built for exactly this async, cross-thread case) reports
+/// the real retried write, whichever thread performs it, and is used here to flip the fake leaf's
+/// `populated` bit so the drain that follows completes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_armed_async_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
+    use std::sync::mpsc;
+
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::Attached;
+    use crate::identity::ProcessId;
+
+    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
+    use super::{Child, OsResources, ProcSource};
+
+    let fake = FakeLeaf::new("cosca-async-armed-kill-retry-leaf", true);
+    let events = fake.events.clone();
+    let (retried_tx, retried) = mpsc::channel();
+    fault::set_next_kill_thread_hook(
+        &fake.leaf,
+        Box::new(move |_thread| {
+            FakeLeaf::set_populated(&events, false);
+            let _ = retried_tx.send(());
+        }),
+    );
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    assert!(
+        leaf.drop_may_block(),
+        "test setup: a freshly entered, still-armed leaf must be one Drop routes off the \
+         calling thread"
+    );
+
+    let proc = {
+        let _guard = crate::child::spawn::spawn_lock();
+        ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child that exits")
+    };
+    let pid = proc.id().expect("a freshly spawned child has a pid");
+
+    let child = Child {
+        os: OsResources {
+            proc: Some(ProcSource::Tokio(proc)),
+            attached: Attached::Cgroup(leaf),
+            pipes: Default::default(),
+            owned_std: Default::default(),
+        },
+        id: ProcessId::from_parts_for_test(pid, 0),
+        kill_on_drop: true,
+        containment: crate::containment::Containment::CgroupV2,
+        graceful: crate::graceful::GracefulMechanism::Process,
+        elevation: None,
+    };
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (outcome_tx, outcome) = mpsc::channel();
+    arm(DropProbe {
+        entered: entered_tx,
+        started: started_tx,
+        gate: gate_rx,
+        outcome: outcome_tx,
+    });
+    drop(gate_tx);
+
+    fault::set_force_kill_write_failure(true);
+    drop(child);
+
+    let _dropping = entered.recv().expect("the armed path must reach the reaper handoff");
+    let _executing = started.recv().expect("a worker must take the job");
+    // Bounded, not a bare `recv()`: a bug in this test's own retry-detection (rather than the
+    // production code under test) must fail loudly instead of hanging the suite.
+    let result = outcome.recv_timeout(std::time::Duration::from_secs(20));
+    assert!(
+        matches!(result, Ok(ReapOutcome::Reaped(_))),
+        "the job must complete via the reaper pool, got {result:?}"
+    );
+
+    assert!(
+        !fault::take_force_kill_write_failure(),
+        "one-shot: the forced failure must already have been consumed by Child::drop's own \
+         hard_kill call"
+    );
+    assert!(
+        retried.try_recv().is_ok(),
+        "an armed leaf's own Drop must retry cgroup.kill after its own earlier attempt \
+         (Child::drop's own sweep) failed — no retried write was ever observed"
+    );
+    // Not asserted further: with no `rmdir` hook installed (thread-local, and so unusable here —
+    // see the doc above), the retried rmdir this leaf's own Drop makes after the drain ALSO hits
+    // the real, non-empty fake directory and fails the same way the first one did, so the leaf is
+    // left behind (logged, not asserted) rather than actually removed. That is a limitation of
+    // this fixture reused across a thread hop, not a claim about production behavior: the retry
+    // write itself — this test's actual subject, and M14's actual effect — is what `retried`
+    // proves, unconditionally of whether the directory removal that follows can succeed here.
+}
+
 /// Sibling of the routing test above: a disarmed leaf that was NEVER killed has nothing to wait
 /// for, so its drop must NOT engage the reaper handoff at all — an armed probe must be left
 /// untouched for whatever later drop it was meant for.

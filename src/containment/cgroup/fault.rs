@@ -58,10 +58,9 @@ pub(crate) fn take_force_kill_check_errno() -> Option<i32> {
 /// Make the NEXT `hard_kill()`'s `cgroup.kill` write on this thread fail with `EACCES`, as a
 /// delegated subtree whose `cgroup.kill` stopped being writable after a privilege drop would —
 /// without touching the real file, so a retried `hard_kill()` after this one-shot is consumed
-/// succeeds normally. Take semantics. Release-only, like its one caller
-/// (`an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt`): debug builds assert the
-/// precondition this breaks (`Child::drop`'s own `debug_assert!(!is_teardown_mechanism_failure`).
-#[cfg(not(debug_assertions))]
+/// succeeds normally. Take semantics. `Child::drop` (both sync and async) no longer
+/// `debug_assert`s on this outcome (round-4: it treated a real environmental errno — exactly
+/// this one — as a broken contract), so this seam's callers run in every build now.
 pub(crate) fn set_force_kill_write_failure(on: bool) {
     FORCE_KILL_WRITE_FAILURE.with(|f| f.set(on));
 }

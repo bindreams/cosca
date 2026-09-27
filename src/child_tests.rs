@@ -76,8 +76,11 @@ fn recycled_root_pid_a_different_live_identity_is_recycled() {
 /// Regression test: the group-signal step's ordinary refusal outcomes (`Error::Containment` /
 /// `Error::Unassessable { source: None, .. }`, distinguished from a genuine teardown-mechanism
 /// failure since #61) were being stringified into an opaque `Error::Io` on the way out of
-/// `Marker::sweep`, which made `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
-/// ...)` fire on an entirely ordinary outcome — reintroducing the bug #61 fixed.
+/// `Marker::sweep`, which made `Child::drop` misclassify an entirely ordinary outcome as a
+/// mechanism failure — reintroducing the bug #61 fixed. (Round-4 downgraded that classification's
+/// only consequence from a `debug_assert!` to a log-severity choice — `error` vs `warn` — so a
+/// misclassification here is now a wrong log level, not a panic; still worth catching, since the
+/// severity is the one thing a consumer's `Log` impl can act on.)
 ///
 /// `fdmarker_tests.rs` calls `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
 /// `dispatch.rs`'s `Attached::FdMarker` arm where the laundering sat, so none of those tests
@@ -116,9 +119,9 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
          failure — got {err:?}"
     );
 
-    // The forced pgid persists into `Drop` (`kill_on_drop` defaults to true) — this is the
-    // literal reported bug: `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
-    // ...)` must not fire here. If the laundering regresses, this line panics.
+    // The forced pgid persists into `Drop` (`kill_on_drop` defaults to true), which classifies
+    // the identical refusal again on its own path — exercised here for coverage, though a
+    // misclassification no longer panics (round-4): it would only log this at the wrong level.
     drop(child);
 }
 

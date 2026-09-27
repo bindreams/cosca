@@ -842,8 +842,7 @@ impl Drop for Child {
             let _ = p.entered.send(std::thread::current().id());
         }
         // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
-        // only the root), so surface a real mechanism failure in debug. A no-op for an
-        // uncontained child.
+        // only the root). A no-op for an uncontained child.
         //
         // MUST stay on the dropping thread, before the handle is dismembered: on Windows a job
         // object's kill is the only signal reaching a nested descendant that leads its own console
@@ -852,11 +851,15 @@ impl Drop for Child {
         // returns.
         let tree = self.os.attached.hard_kill();
         if let Err(e) = &tree {
-            debug_assert!(
-                !crate::child::is_teardown_mechanism_failure(e),
-                "contained-tree teardown failed on async Drop: {e:?}"
-            );
-            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            // Visible, not silently discarded. Never a `debug_assert` (round-4): a genuine
+            // mechanism failure is a real errno this destructor can do nothing about but log, not
+            // a broken contract — see the sync twin's identical fix for why. Log severity still
+            // separates the two, via `is_teardown_mechanism_failure`.
+            if crate::child::is_teardown_mechanism_failure(e) {
+                log::error!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            } else {
+                log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            }
         }
         let _ = tree;
         // Disarm ONLY the fd marker now that this handle's own sweep just ran: whatever eventually

@@ -769,14 +769,13 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
 /// its top, is what this test forces to fail — the earlier version's hand-called one, done
 /// before `Child` even existed, is gone.
 ///
-/// Release only: `Child::drop`'s own `debug_assert!(!is_teardown_mechanism_failure(e), ...)`
-/// exists precisely to catch a genuine `Error::Io` reaching that tree-level `hard_kill` call
-/// silently (see `child_tests.rs`'s own regression test for that assert) — which is exactly what
-/// this test forces, on purpose, to drive the leaf into the state it needs. Debug builds assert
-/// the precondition instead of reaching the code this test is actually about, the same tradeoff
-/// `a_child_reaped_elsewhere_is_decided_without_signalling_its_pid` makes for the identical
-/// reason; the release-only CI lane exists to cover it.
-#[cfg(all(target_os = "linux", not(debug_assertions)))]
+/// Forces a genuine `Error::Io` (EACCES) out of that tree-level `hard_kill` call, on purpose, to
+/// drive the leaf into the state it needs. `Child::drop` used to `debug_assert!` that this could
+/// never happen, which made this test release-only (debug builds asserted the precondition
+/// instead of reaching the code this test is actually about); round-4 removed that assert —
+/// `CgroupLeaf::hard_kill`'s own doc lists EACCES from a privilege drop as a real outcome, not a
+/// broken contract — so this now runs in every build.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
     use crate::containment::cgroup::fault;
