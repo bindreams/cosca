@@ -104,6 +104,10 @@ windows = { version = "0.62", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
+# `poll_reapable`'s non-blocking `waitid(WNOHANG)`: rustix's `Option`-typed return tells "not yet
+# exited" apart from "confirmed a zombie" without the raw `siginfo_t` `si_pid`-zeroing idiom
+# `block_until_reapable` (which needs no such distinction) uses instead.
+rustix = { version = "1", features = ["process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
