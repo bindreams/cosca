@@ -7,24 +7,38 @@
 //! ACL, since no test here runs on a Windows host. This file is that: it builds an actual deny
 //! ACE with the Win32 Authorization APIs and checks the same two dispositions against it.
 //!
-//! The deny ACE sits on a FILE (`locked\tool.exe`), not the `locked` directory itself: Windows
-//! grants `SeChangeNotifyPrivilege` ("bypass traverse checking") to every ordinary token by
-//! default, which skips the ACL check for `FILE_TRAVERSE`/`FILE_LIST_DIRECTORY` on an
-//! intermediate directory entirely — so a deny ACE on `locked` alone would not reproduce
-//! `ERROR_ACCESS_DENIED` for a query on a file under it; `GetFileAttributesExW`'s access check
-//! on the FINAL target object is not subject to that bypass. Denying `FILE_GENERIC_READ` on the
-//! file itself is what the precondition check below exists to confirm — on THIS host, not by
-//! reasoning about the platform in the abstract.
+//! # Where the deny ACE has to sit, and why two earlier attempts here did not work
 //!
-//! [`drop_bypass_privileges`] strips `SeBackupPrivilege`/`SeRestorePrivilege` from this
-//! process before the first deny ACE is built, for the same reason
-//! `identity::windows_fixture::drop_se_debug_privilege` strips `SeDebugPrivilege`: measured on
-//! GitHub's Windows runners (both `windows-latest` and `windows-11-arm`), the deny ACE below
-//! had NO effect on `std::fs::metadata` at all — it opens with `FILE_FLAG_BACKUP_SEMANTICS`
-//! (so it can also open a directory), and that flag combined with `SeBackupPrivilege`
-//! **enabled** makes Windows grant the read regardless of the DACL. An interactive session does
-//! not hold it enabled, which is why this would not have shown up locally; GitHub's Windows
-//! runners do.
+//! `std::fs::metadata` on Windows (`library/std/src/sys/fs/windows.rs`, `fn metadata`) opens the
+//! target with `access_mode(0)` — "No read or write permissions are necessary", per its own
+//! comment — plus `FILE_FLAG_BACKUP_SEMANTICS`. A zero-access open has nothing for a DACL on the
+//! FILE ITSELF to deny, so a deny ACE placed on `locked\tool.exe` (this file's first version,
+//! denying `FILE_GENERIC_READ`) has no effect at all — measured on GitHub's Windows runners: the
+//! probe returned `Ok` with real metadata every time, ACE or no ACE.
+//!
+//! What that zero-access open still needs is to REACH the file: NT requires `FILE_TRAVERSE`
+//! (`0x20`, the same bit as `FILE_EXECUTE`) on every intermediate directory in the path. By
+//! default every token holds `SeChangeNotifyPrivilege` ("bypass traverse checking"), which skips
+//! that check entirely — so a deny ACE on `locked` for `FILE_TRAVERSE` alone is ALSO not enough
+//! while the privilege is held (this file's second version, which still failed on CI).
+//! [`drop_bypass_privileges`] removes it from this process first, the same way
+//! `identity::windows_fixture::drop_se_debug_privilege` removes `SeDebugPrivilege` for its own
+//! DACL to be authoritative: an interactive session does not hold it enabled, which is why
+//! neither gap would have shown up locally.
+//!
+//! Denying `FILE_TRAVERSE` still is not sufficient alone: on `ERROR_ACCESS_DENIED` (or
+//! `ERROR_SHARING_VIOLATION`), `metadata`'s own fallback retries via `FindFirstFileExW` on the
+//! same path — a directory-listing operation gated on `FILE_LIST_DIRECTORY` (`0x1`), a SEPARATE
+//! bit from `FILE_TRAVERSE` despite the similar name, and one `SeChangeNotifyPrivilege` explicitly
+//! does not cover ("This user right doesn't allow the user to list the contents of a folder.",
+//! per Microsoft's own doc for it). So the deny ACE below denies both bits on `locked`, and
+//! [`drop_bypass_privileges`] strips the one privilege that would otherwise blunt one of them —
+//! between the two, neither of `metadata`'s two internal paths can complete.
+//!
+//! The precondition assertion in `an_undeterminable_windows_acl_fails_a_loadable_only_search_closed`
+//! is what actually proves all of the above holds on THIS host, rather than resting on the
+//! reasoning above: it calls `std::fs::metadata` directly and checks for raw code 5 BEFORE
+//! asserting anything about [`resolve`]'s own behaviour.
 
 use super::*;
 use std::os::windows::ffi::OsStrExt;
@@ -37,10 +51,10 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-    LUID_AND_ATTRIBUTES, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME, SE_PRIVILEGE_REMOVED,
-    SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+    LUID_AND_ATTRIBUTES, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME, SE_CHANGE_NOTIFY_NAME,
+    SE_PRIVILEGE_REMOVED, SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
-use windows::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+use windows::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, FILE_TRAVERSE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> {
@@ -99,19 +113,19 @@ fn sid_from_buf(buf: &[u64]) -> PSID {
 /// `identity::windows_fixture`'s `SE_DEBUG_DROPPED` idiom.
 static BYPASS_PRIVILEGES_DROPPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-/// Remove `SeBackupPrivilege` and its write-side twin `SeRestorePrivilege` from THIS process's
-/// token — see the module doc for why. `SE_PRIVILEGE_REMOVED` is irreversible for the token, so
-/// this runs ONCE, before the first deny ACE exists, exactly like
-/// `identity::windows_fixture::drop_se_debug_privilege`.
+/// Remove `SeChangeNotifyPrivilege` (see the module doc for why it matters here),
+/// `SeBackupPrivilege` and their respective, less relevant twins from THIS process's token.
+/// `SE_PRIVILEGE_REMOVED` is irreversible for the token, so this runs ONCE, before the first
+/// deny ACE exists, exactly like `identity::windows_fixture::drop_se_debug_privilege`.
 fn drop_bypass_privileges() {
     BYPASS_PRIVILEGES_DROPPED.get_or_init(|| {
         let mut token = HANDLE::default();
         // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close.
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
             .expect("OpenProcessToken(TOKEN_ADJUST_PRIVILEGES)");
-        for name in [SE_BACKUP_NAME, SE_RESTORE_NAME] {
+        for name in [SE_CHANGE_NOTIFY_NAME, SE_BACKUP_NAME, SE_RESTORE_NAME] {
             let mut luid = LUID::default();
-            // SAFETY: `name` is one of the two static NUL-terminated wide strings named above.
+            // SAFETY: `name` is one of the three static NUL-terminated wide strings named above.
             unsafe { LookupPrivilegeValueW(None, name, &mut luid) }.expect("LookupPrivilegeValueW");
             let privileges = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
@@ -131,10 +145,10 @@ fn drop_bypass_privileges() {
     });
 }
 
-/// Denies `FILE_GENERIC_READ` on a single Windows file object for the current user, via
-/// `SetNamedSecurityInfoW`, and restores the ORIGINAL DACL on drop (not a guessed default) so
-/// `tempfile::TempDir`'s own `Drop` can subsequently delete the tree without an access-denied
-/// error of its own.
+/// Denies `FILE_TRAVERSE`/`FILE_LIST_DIRECTORY` on a single Windows DIRECTORY object for the
+/// current user, via `SetNamedSecurityInfoW`, and restores the ORIGINAL DACL on drop (not a
+/// guessed default) so `tempfile::TempDir`'s own `Drop` can subsequently delete the tree without
+/// an access-denied error of its own.
 struct DenyAclGuard {
     path: Vec<u16>,
     // The whole security descriptor `GetNamedSecurityInfoW` allocated, freed with `LocalFree` on
@@ -145,9 +159,11 @@ struct DenyAclGuard {
 }
 
 impl DenyAclGuard {
-    fn deny_read(path: &Path) -> Self {
+    /// `dir` is the directory object to deny — see the module doc for why this must be a
+    /// directory in the path, not a file under it.
+    fn deny_traversal_and_listing(dir: &Path) -> Self {
         drop_bypass_privileges();
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
 
         let mut original_dacl: *mut ACL = std::ptr::null_mut();
         let mut original_sd = PSECURITY_DESCRIPTOR::default();
@@ -175,7 +191,7 @@ impl DenyAclGuard {
         // `sid_buf`, which outlives this call.
         unsafe { BuildTrusteeWithSidW(&mut trustee, Some(sid)) };
         let entry = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: FILE_GENERIC_READ.0,
+            grfAccessPermissions: FILE_TRAVERSE.0 | FILE_LIST_DIRECTORY.0,
             grfAccessMode: DENY_ACCESS,
             grfInheritance: NO_INHERITANCE,
             Trustee: trustee,
@@ -241,10 +257,10 @@ impl Drop for DenyAclGuard {
     }
 }
 
-/// A `PATH` entry whose only candidate is denied at the Win32 ACL level, followed by one that
-/// holds the name. `_guard` must outlive `_open`/`path`/`locked_tool` (it does: tuple bindings
-/// from one `let` drop right-to-left) and, crucially, must drop before `root`'s own `TempDir`
-/// `Drop` runs — true here for the same reason, since `root` is named first.
+/// A `PATH` entry whose directory is denied at the Win32 ACL level, followed by one that holds
+/// the name. `_guard` must outlive `_open`/`path`/`locked_tool` (it does: tuple bindings from
+/// one `let` drop right-to-left) and, crucially, must drop before `root`'s own `TempDir` `Drop`
+/// runs — true here for the same reason, since `root` is named first.
 fn locked_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString, PathBuf, DenyAclGuard) {
     let root = tempfile::tempdir().unwrap();
     let locked = root.path().join("locked");
@@ -259,7 +275,8 @@ fn locked_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString, PathBu
     path.push(";");
     path.push(&open);
 
-    let guard = DenyAclGuard::deny_read(&locked_tool);
+    // Denies the DIRECTORY, not `locked_tool` — see the module doc.
+    let guard = DenyAclGuard::deny_traversal_and_listing(&locked);
     (root, open, path, locked_tool, guard)
 }
 
@@ -268,7 +285,8 @@ fn locked_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString, PathBu
 ///
 /// The precondition assertion is the point of this test over [`resolve_base_tests`]'s simulated
 /// equivalent: it proves the ACL built above really does yield raw Windows code 5 on THIS host,
-/// not merely a failure that happens to also map to `PermissionDenied`.
+/// not merely a failure that happens to also map to `PermissionDenied` — see the module doc for
+/// how easy that is to get wrong on Windows specifically.
 #[test]
 fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
     let (_root, _open, path, locked_tool, _guard) = locked_then_open();
