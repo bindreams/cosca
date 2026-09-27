@@ -15,19 +15,30 @@
 //! on the FINAL target object is not subject to that bypass. Denying `FILE_GENERIC_READ` on the
 //! file itself is what the precondition check below exists to confirm — on THIS host, not by
 //! reasoning about the platform in the abstract.
+//!
+//! [`drop_bypass_privileges`] strips `SeBackupPrivilege`/`SeRestorePrivilege` from this
+//! process before the first deny ACE is built, for the same reason
+//! `identity::windows_fixture::drop_se_debug_privilege` strips `SeDebugPrivilege`: measured on
+//! GitHub's Windows runners (both `windows-latest` and `windows-11-arm`), the deny ACE below
+//! had NO effect on `std::fs::metadata` at all — it opens with `FILE_FLAG_BACKUP_SEMANTICS`
+//! (so it can also open a directory), and that flag combined with `SeBackupPrivilege`
+//! **enabled** makes Windows grant the read regardless of the DACL. An interactive session does
+//! not hold it enabled, which is why this would not have shown up locally; GitHub's Windows
+//! runners do.
 
 use super::*;
 use std::os::windows::ffi::OsStrExt;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, LUID};
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS,
     EXPLICIT_ACCESS_W, SE_FILE_OBJECT, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
-    TOKEN_QUERY, TOKEN_USER,
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+    LUID_AND_ATTRIBUTES, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SE_BACKUP_NAME, SE_PRIVILEGE_REMOVED,
+    SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -84,6 +95,42 @@ fn sid_from_buf(buf: &[u64]) -> PSID {
     unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
 }
 
+/// Runs [`drop_bypass_privileges`] exactly once per test binary. Mirrors
+/// `identity::windows_fixture`'s `SE_DEBUG_DROPPED` idiom.
+static BYPASS_PRIVILEGES_DROPPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Remove `SeBackupPrivilege` and its write-side twin `SeRestorePrivilege` from THIS process's
+/// token — see the module doc for why. `SE_PRIVILEGE_REMOVED` is irreversible for the token, so
+/// this runs ONCE, before the first deny ACE exists, exactly like
+/// `identity::windows_fixture::drop_se_debug_privilege`.
+fn drop_bypass_privileges() {
+    BYPASS_PRIVILEGES_DROPPED.get_or_init(|| {
+        let mut token = HANDLE::default();
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
+            .expect("OpenProcessToken(TOKEN_ADJUST_PRIVILEGES)");
+        for name in [SE_BACKUP_NAME, SE_RESTORE_NAME] {
+            let mut luid = LUID::default();
+            // SAFETY: `name` is one of the two static NUL-terminated wide strings named above.
+            unsafe { LookupPrivilegeValueW(None, name, &mut luid) }.expect("LookupPrivilegeValueW");
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_REMOVED,
+                }],
+            };
+            // Succeeds with ERROR_NOT_ALL_ASSIGNED when the token never held the privilege —
+            // the normal local case, and exactly the state wanted either way.
+            // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches.
+            unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) }
+                .expect("AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)");
+        }
+        // SAFETY: `token` is an owned handle this function is done with.
+        unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
+    });
+}
+
 /// Denies `FILE_GENERIC_READ` on a single Windows file object for the current user, via
 /// `SetNamedSecurityInfoW`, and restores the ORIGINAL DACL on drop (not a guessed default) so
 /// `tempfile::TempDir`'s own `Drop` can subsequently delete the tree without an access-denied
@@ -99,6 +146,7 @@ struct DenyAclGuard {
 
 impl DenyAclGuard {
     fn deny_read(path: &Path) -> Self {
+        drop_bypass_privileges();
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
 
         let mut original_dacl: *mut ACL = std::ptr::null_mut();
