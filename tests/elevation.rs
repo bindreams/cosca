@@ -180,8 +180,18 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
     child.kill().expect("kill run0 client");
     child.wait().expect("wait run0 client");
     // The transient-unit payload must be gone — waitpid/kill(0) on its pid fails (ESRCH).
-    // Poll on the real teardown event; if propagation is broken this loop exposes it.
+    // Poll on the real teardown event; if propagation is broken this loop exposes it. The
+    // payload itself now has no natural timer of its own (see testbin's `write-pid-then-sleep`),
+    // so this loop cannot exit just because that timer ran out — only a real teardown, or this
+    // failure bound, ends it. The bound is on systemd actually tearing down the transient unit —
+    // a genuinely external event this test does not control — not a substitute for one.
+    let started = std::time::Instant::now();
     while pid_is_alive(payload_pid) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the transient unit's payload (pid {payload_pid}) is still alive 30s after the run0 \
+             client was killed — run0's kill propagation to the transient unit appears broken"
+        );
         std::thread::yield_now();
     }
     let _ = std::fs::remove_file(&pidfile);
@@ -387,20 +397,28 @@ async fn async_posix_elevated_child_runs_as_root() {
 #[cfg(windows)]
 #[test]
 fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
+    use std::io::Read;
+
     if !gated() {
         return;
     }
+    // A loopback TCP address, not a pipe or any other inherited handle: an elevated `runas`
+    // child gets its own console and inherits nothing from its caller (`spawn_elevated`'s
+    // `ElevatedStdio::OwnConsole`), but it CAN still dial back out over loopback. This gives a
+    // real readiness edge (the accepted connection + tag, proving the child is genuinely
+    // running before `kill()` is attempted — never a chosen sleep duration) and, at the end, a
+    // real way to end the child regardless of whether `kill()` itself succeeded.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
     let exe = testbin();
     let mut c = cosca::Command::new();
-    // A long-lived elevated child, blocked until killed for real (testbin's `sleep-marker`
-    // mode) — never via a chosen sleep duration: `kill()` below runs immediately, with no
-    // readiness wait (an elevated runas child gets its own console, so no pipe/handle can cross
-    // that boundary — see `spawn_elevated`'s `ElevatedStdio::OwnConsole`), so any fixed-duration
-    // fixture would race that immediate call.
     c.executable(&exe)
-        .args([exe.clone().into_os_string(), "sleep-marker".into()])
+        .args([exe.clone().into_os_string(), "sleep-marker".into(), addr.into()])
         .elevate();
     let child = c.spawn().expect("runas spawn");
+    let (mut sock, _) = listener.accept().expect("accept readiness connection");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("readiness tag");
     match child.kill() {
         Err(cosca::error::Error::Elevation { kind, .. }) => {
             assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
@@ -410,6 +428,10 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
     drop(child); // must return promptly (non-blocking teardown)
+                 // Only now: on the (typical) Unkillable path the child is still running (that IS the
+                 // property under test), so ending it for real is this test's own responsibility, not
+                 // `kill()`'s — dropping the socket delivers EOF, which the child exits on.
+    drop(sock);
 }
 
 // MANUAL-TIER async Windows elevation (4c785f26): mirrors the sync marker test. Runs only
@@ -452,15 +474,24 @@ async fn async_windows_elevated_child_writes_admin_marker() {
 #[cfg(all(windows, feature = "tokio"))]
 #[tokio::test]
 async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
+    use std::io::Read;
+
     if !gated() {
         return;
     }
+    // See the sync twin's doc for why a loopback TCP address, not a pipe, is what crosses the
+    // elevation boundary here.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
     let exe = testbin();
     let mut c = cosca::tokio::Command::new();
     c.executable(&exe)
-        .args([exe.clone().into_os_string(), "sleep-marker".into()])
+        .args([exe.clone().into_os_string(), "sleep-marker".into(), addr.into()])
         .elevate();
     let mut child = c.spawn().expect("async runas spawn");
+    let (mut sock, _) = listener.accept().expect("accept readiness connection");
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("readiness tag");
     match child.kill() {
         Err(cosca::error::Error::Elevation { kind, .. }) => {
             assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
@@ -470,6 +501,9 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
     drop(child); // must return promptly (non-blocking async teardown)
+                 // Only now: see the sync twin's doc for why ending the child is this test's own
+                 // responsibility on the (typical) Unkillable path.
+    drop(sock);
 }
 
 // GATED behind COSCA_TEST_ELEVATION_GUI: a TRUE no-op without it, and loud when set.

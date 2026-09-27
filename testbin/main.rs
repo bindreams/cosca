@@ -1507,21 +1507,30 @@ fn main() {
             let path = &args[2];
             std::fs::write(path, b"1").expect("write marker");
         }
-        // Publish our own pid, then block long enough for the run0 propagation test to kill us.
+        // Publish our own pid, then block until the run0 propagation test's kill reaches us —
+        // never via a chosen sleep duration: a payload with its own natural timer would let
+        // that test's final "is it actually dead yet" loop pass once the timer alone ends the
+        // payload, whether or not run0's kill propagation ever worked.
         "write-pid-then-sleep" => {
             std::fs::write(&args[2], std::process::id().to_string()).expect("write pid");
-            std::thread::sleep(std::time::Duration::from_secs(600));
-        }
-        // A long-lived elevated child for the Windows Unkillable/drop test. Blocks until this
-        // process is killed for real — never via a chosen sleep duration: the caller's `kill()`
-        // runs immediately after spawn, with no readiness wait (an elevated runas child gets its
-        // own console, so no pipe/handle can cross that boundary to prove readiness — see
-        // `tests/elevation.rs`'s callers), so an aliveness window bounded by ANY fixed duration,
-        // however large, is a race this fixture must not have at all.
-        "sleep-marker" => {
             let (_tx, rx) = std::sync::mpsc::channel::<std::convert::Infallible>();
-            let _ = rx.recv(); // never returns: `_tx`, the lone sender, lives until this block
-                               // ends (never, since `recv` never returns) and is never sent on.
+            let _ = rx.recv(); // never returns: `_tx`, the lone sender, is never sent on.
+        }
+        // A long-lived elevated child for the Windows Unkillable/drop test. Connects to the
+        // loopback address in `args[2]`, sends a one-byte readiness tag, then blocks on a read
+        // of that same socket and exits on EOF. A TCP address — unlike a pipe or any other
+        // inherited handle — DOES cross the elevation boundary (an elevated `runas` child gets
+        // its own console and inherits no handles from its caller, but it can still dial back
+        // out over loopback), so this gives the caller BOTH a real readiness edge (proving the
+        // child is actually running before `kill()` is attempted) and a real way to end the
+        // child afterward regardless of whether `kill()` itself succeeded (the caller drops its
+        // end of the socket once done) — never a chosen sleep duration either way.
+        "sleep-marker" => {
+            let addr = &args[2];
+            let mut sock = std::net::TcpStream::connect(addr).expect("connect readiness socket");
+            sock.write_all(b"R").expect("write readiness tag");
+            let mut sink = [0u8; 1];
+            let _ = sock.read(&mut sink); // blocks until the caller writes back or drops its end
         }
         other => {
             eprintln!("cosca_testbin: unknown mode {other:?}");
