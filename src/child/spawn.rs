@@ -273,7 +273,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // (a spawn racing this one via a path outside cosca's own spawn functions) that no local
     // code can close.
     #[cfg(target_os = "macos")]
-    let (prepared, child) = {
+    let (prepared, mut child) = {
         let _guard = spawn_lock();
         let prepared = crate::containment::prepare(
             &mut std_cmd,
@@ -305,7 +305,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (prepared, child) = {
+    let (prepared, mut child) = {
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
@@ -404,6 +404,37 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     };
     // Adopt AFTER the identity read (and after the containment resume) so
     // SharedChild's internal try_wait can reap-or-track without losing the identity.
+    //
+    // Check ourselves first, rather than call `SharedChild::new(child)` directly: its own
+    // internal `try_wait` reaps-or-tracks the exact same way, but `child` is its own by-value
+    // parameter, so a failure there drops it — inside that call, unkilled and unreaped, since std
+    // `Child::drop` does neither — before the error ever reaches this crate to tear down. The
+    // check below never conflicts with the one `SharedChild::new` makes right after: std caches an
+    // obtained exit status on `Child` itself, so a second `try_wait` on the same child never
+    // re-syscalls, it just returns the same answer.
+    #[cfg(test)]
+    let precheck = match fault::take_force_adopt_try_wait_error() {
+        Some(marker) => {
+            fault::capture(crate::identity::Resolved::Found(id));
+            Err(std::io::Error::other(marker))
+        }
+        None => child.try_wait(),
+    };
+    #[cfg(not(test))]
+    let precheck = child.try_wait();
+    if let Err(e) = precheck {
+        // Same teardown as the attach-failure and identity-failure arms above: a check that
+        // cannot say whether this child already exited is kept as though it is still running, so
+        // it goes through the same kill-then-check cycle they do rather than being adopted in an
+        // unknown state.
+        let handed_back = teardown_unadopted(
+            child,
+            #[cfg(windows)]
+            false,
+            Some(attachment.attached),
+        );
+        return Err(unkillable(Error::Io(e), handed_back));
+    }
     let shared = SharedChild::new(child).map_err(Error::Io)?;
 
     Ok(Child::from_parts(
@@ -1122,6 +1153,7 @@ pub(crate) mod fault {
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
         static FORCE_TEARDOWN_TRY_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static FORCE_ADOPT_TRY_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
         static FORCE_TEARDOWN_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
         #[cfg(unix)]
         static FORCE_BLOCK_UNTIL_REAPABLE_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
@@ -1202,6 +1234,18 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_force_teardown_try_wait_error() -> Option<&'static str> {
         FORCE_TEARDOWN_TRY_WAIT_ERROR.with(|f| f.take())
+    }
+
+    /// Make the adopt step's own pre-`SharedChild::new` check (`spawn_unelevated`, right before it
+    /// hands `child` into `SharedChild::new`) fail with `marker`, as a real `try_wait` error there
+    /// would. Captures the child's real identity first, mirroring `resolve_identity`'s and
+    /// `attach_or_fault`'s own seams, so a test can prove the child was reaped — or handed back —
+    /// despite `SharedChild::new`'s own internal `try_wait` never running to say so itself.
+    pub(crate) fn set_force_adopt_try_wait_error(marker: &'static str) {
+        FORCE_ADOPT_TRY_WAIT_ERROR.with(|f| f.set(Some(marker)));
+    }
+    pub(crate) fn take_force_adopt_try_wait_error() -> Option<&'static str> {
+        FORCE_ADOPT_TRY_WAIT_ERROR.with(|f| f.take())
     }
 
     /// Make the next ownership check (`Held::check`) on this thread fail with a genuine `ECHILD`,
