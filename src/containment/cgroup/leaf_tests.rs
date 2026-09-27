@@ -759,6 +759,15 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
 /// retry `cgroup.kill` itself and remove the leaf once it drains — exactly as
 /// `an_armed_drop_removes_its_leaf_only_after_it_drains` does for a leaf nothing tried to kill
 /// yet, proving the retry survives a real prior failed attempt too.
+///
+/// Drives a REAL `Child::drop` (`Child::from_parts`, not a hand-called `hard_kill` +
+/// `disarm_after_own_sweep`, as an earlier version of this test did): that version proved only
+/// that `disarm_after_own_sweep` itself is a cgroup no-op, not that `Child::drop` actually calls
+/// it — reverting `child.rs`'s `self.attached.disarm_after_own_sweep()` back to a blanket
+/// `disarm()` left that version GREEN, since it never exercised `Child::drop` at all (round-3's
+/// test-quality finding). `Child::drop`'s own tree-level `hard_kill`, fired unconditionally near
+/// its top, is what this test forces to fail — the earlier version's hand-called one, done
+/// before `Child` even existed, is gone.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
@@ -772,30 +781,49 @@ fn an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
     let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
 
     let leaf = entered_leaf_at(fake.leaf.clone());
-    fault::set_force_kill_write_failure(true);
-    leaf.hard_kill()
-        .expect_err("the forced write failure must surface as a real error");
-    assert!(
-        !fault::take_force_kill_write_failure(),
-        "one-shot: the forced failure must already be consumed by the call above"
+
+    // A real, short-lived child `Child::drop` owns outright — mirroring the async twin's own
+    // `a_failed_start_kill_still_routes_an_armed_leafs_release_through_the_reaper_pool` fixture.
+    let proc = shared_child::SharedChild::spawn(
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn a child that exits");
+    let pid = proc.id();
+
+    let attachment = crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(leaf),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    };
+    let child = crate::Child::from_parts(
+        crate::child::proc_handle::ProcHandle::Std(proc),
+        crate::identity::ProcessId::from_parts_for_test(pid, 0),
+        Default::default(),
+        true,
+        attachment,
     );
 
-    // `Child::drop`'s own post-sweep step, exactly as it runs in production: a no-op for a
-    // cgroup leaf (see `disarm_after_own_sweep`'s doc) — unlike the blanket `disarm()` it
-    // replaced, which would have armed==false here instead.
-    let attached = crate::containment::Attached::Cgroup(leaf);
-    attached.disarm_after_own_sweep();
-
+    // One-shot: consumed by `Child::drop`'s own tree-level `hard_kill` call below, not by
+    // anything this test calls directly.
+    fault::set_force_kill_write_failure(true);
     fault::record_leaf_steps();
-    drop(attached);
+    drop(child);
     let steps = fault::take_leaf_steps();
     drop(actor);
     fault::take_rmdir_hook();
+    assert!(
+        !fault::take_force_kill_write_failure(),
+        "one-shot: the forced failure must already have been consumed by Child::drop's own \
+         hard_kill call"
+    );
 
     assert!(
         !fake.leaf.exists(),
-        "an armed Drop must retry cgroup.kill after its own earlier attempt failed, and remove \
-         the leaf once the retried kill drains, got {steps:?}"
+        "an armed Drop must retry cgroup.kill after its own earlier attempt (Child::drop's own \
+         sweep) failed, and remove the leaf once the retried kill drains, got {steps:?}"
     );
     assert_eq!(
         steps,
