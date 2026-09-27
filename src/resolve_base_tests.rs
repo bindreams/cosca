@@ -289,43 +289,71 @@ fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
         .and_then(std::io::Error::raw_os_error)
 }
 
-/// Joins two directories into the `;`-separated `PATH` value [`search_tool`]'s `windows: true`
-/// expects to parse — deliberately not `std::env::join_paths`, which would use THIS HOST's own
-/// separator (`:` on Unix) rather than the Windows one every caller here means to test, splitting
-/// nothing at all once handed to [`split_path_var_windows`]. Panics if either directory's own path
-/// contains a literal `;`: `join_paths` refuses exactly that case, for the same reason — a
-/// component holding the separator would silently merge two entries into one instead of raising
-/// an error — and an ambient `TMPDIR` (every caller's tempdir is built under one) is not this
-/// crate's own to control, so this is a real precondition to assert, not a theoretical one.
+/// Joins two directories into the `PATH` value [`search_tool`]'s `windows: true` expects to
+/// parse — deliberately not `std::env::join_paths`, which would use THIS HOST's own separator
+/// (`:` on Unix) rather than the Windows one every caller here means to test, splitting nothing
+/// at all once handed to [`split_path_var_windows`]. Not a bare `;`-joined string either: an
+/// ambient `TMPDIR` (every caller's tempdir is built under one) is not this crate's own to
+/// control, and a `;` inside one directory's own path would otherwise be misread as a THIRD
+/// entry's boundary. [`split_path_var_windows`] already has a rule for exactly this — a `"..."`
+/// quoted span is copied through literally, `;` included, with the quotes themselves stripped —
+/// so quoting BOTH entries here, unconditionally, means neither can ever be split on its own
+/// content, whether or not it happens to contain one.
+///
+/// Panics if either directory's own path contains a literal `"`: unlike `;`, this grammar has no
+/// way to quote a `"` (there is no escape rule — `split_path_var_windows` toggles `in_quotes` on
+/// every one, unconditionally), so a component holding one genuinely cannot be expressed. Also
+/// not a real-world concern to guard for its own sake: NTFS forbids `"` in a file name outright,
+/// so a directory whose OWN name holds one can never exist to be joined in the first place. This
+/// assert exists for the same reason `locked_then_open`'s callers assert `drop_dac_bypass` ran —
+/// failing loudly on a precondition that should be unreachable is cheaper than a fixture that
+/// quietly tests the wrong thing if it somehow is.
 #[cfg(unix)]
 fn windows_path_var(first: &Path, second: &Path) -> std::ffi::OsString {
     use std::os::unix::ffi::OsStrExt;
     for dir in [first, second] {
         assert!(
-            !dir.as_os_str().as_bytes().contains(&b';'),
-            "precondition: {dir:?} must not itself contain the Windows PATH separator"
+            !dir.as_os_str().as_bytes().contains(&b'"'),
+            "precondition: {dir:?} must not contain a `\"` — NTFS forbids it, and the Windows \
+             PATH grammar cannot express one"
         );
     }
-    let mut path = first.as_os_str().to_os_string();
-    path.push(";");
+    let mut path = std::ffi::OsString::from("\"");
+    path.push(first);
+    path.push("\";\"");
     path.push(second);
+    path.push("\"");
     path
 }
 
 #[cfg(unix)]
 #[test]
-fn windows_path_var_joins_two_ordinary_directories() {
-    let path = windows_path_var(Path::new("/tmp/a"), Path::new("/tmp/b"));
-    assert_eq!(path, OsStr::new("/tmp/a;/tmp/b"));
+fn windows_path_var_resolves_two_ordinary_directories() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(second.path().join("tool.exe"), b"x").unwrap();
+    let path = windows_path_var(first.path(), second.path());
+    assert_eq!(search_tool(&path, false).unwrap(), second.path().join("tool.exe"));
 }
 
 /// The precondition this crate cannot control — an ambient `TMPDIR` containing the Windows `PATH`
-/// separator — must fail loudly, not silently merge two entries into one.
+/// separator — must still resolve correctly, not silently merge two entries into one: quoting is
+/// what makes that so, proven here against the real parser rather than trusted from its doc.
 #[cfg(unix)]
 #[test]
-#[should_panic(expected = "must not itself contain the Windows PATH separator")]
-fn windows_path_var_refuses_a_component_holding_the_separator() {
-    windows_path_var(Path::new("/tmp/a;evil"), Path::new("/tmp/b"));
+fn windows_path_var_resolves_a_directory_whose_name_contains_the_separator() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::Builder::new().prefix("has;semicolon").tempdir().unwrap();
+    std::fs::write(second.path().join("tool.exe"), b"x").unwrap();
+    let path = windows_path_var(first.path(), second.path());
+    assert_eq!(search_tool(&path, false).unwrap(), second.path().join("tool.exe"));
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "must not contain a `\"`")]
+fn windows_path_var_refuses_a_component_holding_a_quote() {
+    windows_path_var(Path::new("/tmp/has\"quote"), Path::new("/tmp/b"));
 }
 
 /// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
