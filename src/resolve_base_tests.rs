@@ -1,10 +1,4 @@
 //! [`ResolveInput::cwd`]: which names need a base, and that `None` resolves those that do not.
-//!
-//! A test name ending `_unprivileged` needs a caller DAC applies to: on Linux, one without
-//! `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH`; elsewhere, not root. Run by any other caller (on
-//! Linux, one holding either capability, as root usually does; elsewhere, root) it fails loudly,
-//! naming the violated precondition, rather than silently passing on a precondition it never
-//! built. Opt out with `cargo nextest run -E 'not test(/_unprivileged$/)'`.
 
 use super::*;
 
@@ -357,12 +351,14 @@ impl Drop for Locked {
 /// one failure whose kind is `PermissionDenied`, as an unreadable `PATH` directory yields — not a
 /// stand-in on another errno.
 ///
-/// It only holds for a caller DAC applies to (on Linux, one without `CAP_DAC_OVERRIDE` or
-/// `CAP_DAC_READ_SEARCH`; elsewhere, not root), which the precondition assert below checks: DAC
-/// override lets a stat through a `0o000` directory regardless of which of the two capabilities
-/// grants it — default Docker root, for one, carries only `CAP_DAC_OVERRIDE` — so under such a
-/// caller this fixture panics with that explanation rather than silently exercising nothing. See
-/// the module doc for the `_unprivileged` test-name convention this fixture is paired with.
+/// DAC (discretionary access control) is what refuses the `stat` this builds towards, and DAC has
+/// bypasses: root's `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, or either capability carried ambient
+/// by an otherwise ordinary caller (`capabilities(7)`; ambient survives a bare `setuid`, unlike
+/// root's own capabilities — see [`crate::test_privilege::drop_dac_bypass`]'s doc). Every caller
+/// of this function must have already called that in a freshly re-exec'd, single-test process —
+/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`] is why. The precondition is
+/// asserted below regardless, so a caller that skipped the drop, or a bypass the drop does not yet
+/// cover, fails loudly instead of silently testing nothing.
 #[cfg(unix)]
 fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
     let root = tempfile::tempdir().unwrap();
@@ -372,13 +368,13 @@ fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString
     std::fs::create_dir(&open).unwrap();
     std::fs::write(open.join("tool.exe"), b"x").unwrap();
     let locked = Locked::new(locked);
-    let e = std::fs::metadata(locked.0.join("tool.exe")).unwrap_err();
+    let candidate = locked.0.join("tool.exe");
+    let e = std::fs::metadata(&candidate).unwrap_err();
     assert_eq!(
         e.raw_os_error(),
         Some(libc::EACCES),
-        "precondition: this test needs a caller DAC applies to (on Linux, one without \
-         CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH; elsewhere, not root); opt out with \
-         `-E 'not test(/_unprivileged$/)'`: got {e}"
+        "precondition: {candidate:?} must be denied to this caller, not {e} — did the caller \
+         forget to drop_dac_bypass() first?"
     );
     let mut path = locked.0.clone().into_os_string();
     path.push(";");
@@ -412,11 +408,34 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
     }
 }
 
-/// The same claim against a REAL permission-denied candidate, not just the uid-independent `ELOOP`
-/// stand-in above — see [`locked_then_open`] for why this one only runs unprivileged.
+/// The real-`EACCES` twin of [`an_undeterminable_candidate_fails_a_loadable_only_search_closed`]:
+/// [`locked_then_open`]'s denial is the production case (`resolve.rs`'s `Err(e) if
+/// input.loadable_only` arm), worth its own test rather than trusting the uid-independent `ELOOP`
+/// stand-in to speak for every errno a real deployment meets. Runs in a re-exec — see
+/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`].
 #[cfg(unix)]
 #[test]
-fn an_undeterminable_candidate_fails_a_loadable_only_search_closed_unprivileged() {
+fn a_denied_candidate_fails_a_loadable_only_search_closed() {
+    crate::test_child::run_fixture(
+        crate::test_child::fixture_path!(fixture_a_denied_candidate_fails_a_loadable_only_search_closed),
+        FIXTURE_DENIED_CLOSED_ENV,
+    );
+}
+
+const FIXTURE_DENIED_CLOSED_ENV: &str = "COSCA_FIXTURE_DENIED_CLOSED";
+
+/// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]: a no-op when
+/// picked up by an ordinary, unfiltered suite run ([`FIXTURE_DENIED_CLOSED_ENV`] is unset there).
+/// Re-executed via `run_fixture`, it first drops any way this process could bypass DAC
+/// ([`crate::test_privilege::drop_dac_bypass`]), so [`locked_then_open`]'s `EACCES` precondition
+/// genuinely holds no matter which caller ran the suite.
+#[cfg(unix)]
+#[test]
+fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
+    if std::env::var_os(FIXTURE_DENIED_CLOSED_ENV).is_none() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    crate::test_privilege::drop_dac_bypass();
     let (_root, _locked, _open, path) = locked_then_open();
     match search_tool(&path, true) {
         Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::EACCES), "{e}"),
@@ -433,13 +452,31 @@ fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
-/// The same claim against a real permission denial — the one failure whose kind is
-/// `PermissionDenied`, as an unreadable `PATH` directory yields — not a stand-in on another errno:
-/// one such directory must not break the whole search. See [`locked_then_open`] for why this one
-/// only runs unprivileged.
+/// The real-`EACCES` twin of [`an_undeterminable_candidate_is_skipped_by_an_ordinary_search`]: the
+/// production case an ordinary (non-`loadable_only`) search meets (`resolve.rs`'s `Err(e) =>
+/// log::warn!(...)` skip arm), so one `PATH` directory a caller cannot read must not break the
+/// whole search. Runs in a re-exec — see
+/// [`fixture_a_denied_candidate_is_skipped_by_an_ordinary_search`].
 #[cfg(unix)]
 #[test]
-fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search_unprivileged() {
+fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
+    crate::test_child::run_fixture(
+        crate::test_child::fixture_path!(fixture_a_denied_candidate_is_skipped_by_an_ordinary_search),
+        FIXTURE_DENIED_SKIPPED_ENV,
+    );
+}
+
+const FIXTURE_DENIED_SKIPPED_ENV: &str = "COSCA_FIXTURE_DENIED_SKIPPED";
+
+/// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`] — see
+/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s doc, which this mirrors.
+#[cfg(unix)]
+#[test]
+fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
+    if std::env::var_os(FIXTURE_DENIED_SKIPPED_ENV).is_none() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    crate::test_privilege::drop_dac_bypass();
     let (_root, _locked, open, path) = locked_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
