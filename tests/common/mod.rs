@@ -464,24 +464,73 @@ pub fn assert_echoes(sock: &mut std::net::TcpStream, who: &str) {
     assert_eq!(&b, b"p", "{who} echoed {b:?} instead of the byte it was sent");
 }
 
-/// Require that this test is running under `cargo nextest`'s one-process-per-test model before
-/// any caller touches a process-wide resource (here: closing this process's own low-numbered
-/// fds). A plain `cargo test` run shares one process across every test thread in the binary, so
-/// closing a real fd 0/1/2 there races with, and can corrupt, whatever unrelated test's thread
-/// next opens something and gets handed the freed number.
+/// Run the test `name` (its full path, as libtest reports it — this crate's integration test
+/// binaries are flat, so just the fn name) alone, in a fresh copy of this test binary, and assert
+/// it passed. `true` in the copy, which must then run the test's real body; `false` in the
+/// original caller, which must return immediately — the real work already ran, in isolation, in
+/// the copy.
 ///
-/// `NEXTEST_EXECUTION_MODE` is nextest's own documented marker
-/// (<https://nexte.st/book/env-vars.html>, currently always `"process-per-test"` — nextest notes
-/// more values may exist once it can run multiple tests in one process, so this checks equality,
-/// not just presence). Fails loudly and immediately, before touching anything, rather than
-/// silently skipping: see cosca#196 for the long-term structural fix (a Skuld-style `io` serial
-/// group, so this stops depending on nextest specifically).
+/// This is how a test that mutates process-wide state (closes fd 0/1/2, lowers `RLIMIT_NOFILE`,
+/// ...) stays safe, and passes, under BOTH plain `cargo test` (many test threads sharing one
+/// process) and `cargo nextest run` (one process per test), instead of depending on nextest
+/// specifically and failing loudly under plain `cargo test`: it puts itself alone in a process no
+/// matter which harness launched it. Sets `COSCA_TEST_ALONE` in the copy, so
+/// [`require_process_per_test`]'s precondition (guarding the actual mutation) accepts either that
+/// or nextest's own `NEXTEST_EXECUTION_MODE=process-per-test`.
+///
+/// A copy of `src/containment/cgroup/test_support.rs`'s identical helper — that one is a separate
+/// compilation unit (this crate's own lib) and cannot name this `pub` one, or vice versa —
+/// deliberately one copy per compilation unit rather than a shared dependency between them.
+#[cfg(unix)]
+pub fn alone(name: &str) -> bool {
+    const ALONE: &str = "COSCA_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+        .env(ALONE, name)
+        .output()
+        .expect("run the test alone");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
+/// Require that this test is running alone in its own process — either via [`alone`] or under
+/// `cargo nextest`'s one-process-per-test model — before any caller touches a process-wide
+/// resource (here: closing this process's own low-numbered fds, or lowering its `RLIMIT_NOFILE`).
+/// A plain `cargo test` run shares one process across every test thread in the binary, so
+/// mutating either there races with, and can corrupt, whatever unrelated test's thread runs
+/// concurrently.
+///
+/// Accepts either of two proofs of isolation, both env vars so a `#[test]` fn needs no extra
+/// argument:
+/// - `COSCA_TEST_ALONE`, set by [`alone`] on the fresh, single-test copy of this binary it
+///   re-execs — the normal case, and what makes a test using this guard pass under plain
+///   `cargo test` too, not just nextest.
+/// - `NEXTEST_EXECUTION_MODE=process-per-test`, nextest's own documented marker
+///   (<https://nexte.st/book/env-vars.html> — checked for equality, not just presence, since
+///   nextest notes more values may exist once it can run multiple tests in one process), for a
+///   caller that reaches this without going through `alone` but still happens to run under
+///   nextest.
+///
+/// Fails loudly and immediately, before touching anything, rather than silently skipping: see
+/// cosca#196 for the long-term structural fix (serializing every process-wide-fd test into one
+/// group, so this stops depending on `alone` or nextest specifically).
 #[cfg(unix)]
 fn require_process_per_test(what: &str) {
-    assert_eq!(
-        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
-        Ok("process-per-test"),
-        "{what}; run under cargo nextest (one process per test) — see cosca#196"
+    let alone = std::env::var_os("COSCA_TEST_ALONE").is_some();
+    let nextest = std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test");
+    assert!(
+        alone || nextest,
+        "{what}; call this from inside common::alone(), or run under cargo nextest (one process \
+         per test) — see cosca#196"
     );
 }
 
@@ -538,7 +587,7 @@ impl Drop for RestoreStdio {
                     break ret;
                 }
             };
-            debug_assert_eq!(
+            assert_eq!(
                 ret,
                 *fd,
                 "dup2({}, {fd}) while restoring a guarded fd failed: {}",
@@ -559,8 +608,9 @@ impl Drop for RestoreStdio {
 /// Linux, a soft limit raised past `1_000_000` is entirely ordinary, so a test that assumes a
 /// large but fixed child fd is always out of range is otherwise runner-dependent).
 ///
-/// Safe only because this workspace's test runner (`cargo nextest`) puts every test function in
-/// its own OS process — see `RestoreStdio`'s doc for why a plain `cargo test` run would not be.
+/// `lower_to` asserts [`require_process_per_test`] before touching anything: see there for why —
+/// this is exactly as process-wide, and exactly as unsafe outside a call wrapped in [`alone`], as
+/// `RestoreStdio::close`.
 #[cfg(unix)]
 pub struct RestoreRlimitNofile {
     original: libc::rlimit,
@@ -569,6 +619,7 @@ pub struct RestoreRlimitNofile {
 #[cfg(unix)]
 impl RestoreRlimitNofile {
     pub fn lower_to(to: libc::rlim_t) -> RestoreRlimitNofile {
+        require_process_per_test("lowers this process's own RLIMIT_NOFILE, process-wide");
         let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
         // SAFETY: `original` is a valid, correctly-sized out-param.
         assert_eq!(
