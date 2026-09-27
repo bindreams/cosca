@@ -173,17 +173,27 @@ async fn leak_drops_a_tokio_child_releasing_its_handles() {
 /// rather than set directly on a `ReapTask` this test built by hand.
 ///
 /// The `after_claim` hook runs inside the task's real `run`, right after its real `claim`
-/// succeeds and before it waits for the exit, and blocks there until this test releases it. That
-/// makes the state deterministically `Running` when this test releases the gate and calls `leak`
-/// — `claim` updates it strictly before the hook that unblocks the `recv` runs — rather than
-/// racing the task's own progress toward `Finished`. Releasing the gate before calling `leak`
-/// (rather than after, as the pre-blocking version of this test did) is required now: `leak`
-/// itself blocks until the gated task proceeds, so releasing it afterward would deadlock both.
+/// succeeds and before it waits for the exit, and blocks there until released — pinning the state
+/// at `Running` for as long as the test wants, since nothing else can move it while the task is
+/// parked there.
+///
+/// The release itself happens from INSIDE `take_blocking`'s own wait loop, via
+/// `fault::set_before_reap_take_blocking_wait` — not before `leak` is even scheduled onto the
+/// blocking pool, as an earlier version of this test did. Releasing early only proves the gated
+/// task will EVENTUALLY finish; it races that finish against `leak`'s own task being scheduled at
+/// all, and on a fast schedule the gated task usually reaches `Finished` first — a `leak` that
+/// returned immediately for a `Running` task would still pass this test, undetected, because by
+/// the time it ran the state was never observed `Running` to begin with. Gating the release behind
+/// the seam instead means the task CANNOT reach `Finished` until `leak`'s own `take_blocking` call
+/// has already found `Running` and entered its wait loop for real — proven by `seam_rx` below,
+/// without which the test fails rather than passing on an unproven premise.
 ///
 /// `leak` is itself a blocking call once it reaches this path, so it runs on the blocking pool
 /// here too — matching how this crate's own docs tell a caller to run it, and leaving this test's
 /// own worker thread free for the runtime machinery `cancel_after_one_pending_poll` (and, before
-/// it, the real `spawn_blocking_reap`) already depends on.
+/// it, the real `spawn_blocking_reap`) already depends on. The seam is set from inside that same
+/// `spawn_blocking` closure, immediately before calling `leak`: `take_blocking` runs synchronously
+/// on whichever thread calls it, and the seam's thread-local must be set on that same thread.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_then_disarms() {
@@ -202,6 +212,7 @@ async fn leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_the
 
     let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (seam_tx, seam_rx) = std::sync::mpsc::channel::<()>();
     // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it (an
     // `Unreaped` carrying one must stay `Send + Sync` for `Error<Unreaped>`); the `Mutex` costs
     // nothing here, since the hook only ever touches them once, from the one thread that runs it.
@@ -217,7 +228,7 @@ async fn leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_the
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv()
-            .expect("the test thread releases the gate");
+            .expect("leak's own take_blocking releases the gate from inside its wait loop");
     }));
     super::fault::set_force_not_yet_reapable();
     cancel_after_one_pending_poll(&mut unreaped);
@@ -229,14 +240,25 @@ async fn leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_the
     claimed_rx
         .recv()
         .expect("the task reaches the gate once it has claimed the child");
-    release_tx.send(()).expect("let the gated task proceed");
 
     // `leak` now blocks until the gated task's own `report` has run: by the time this returns,
     // the disarm under test has already happened, with no further synchronization needed.
-    ::tokio::task::spawn_blocking(move || unreaped.leak())
-        .await
-        .expect("leak on the blocking pool");
+    ::tokio::task::spawn_blocking(move || {
+        super::fault::set_before_reap_take_blocking_wait(Box::new(move || {
+            seam_tx.send(()).expect("the test thread is waiting for the seam");
+            release_tx.send(()).expect("let the gated task proceed");
+        }));
+        unreaped.leak()
+    })
+    .await
+    .expect("leak on the blocking pool");
 
+    assert!(
+        matches!(seam_rx.try_recv(), Ok(())),
+        "leak must reach take_blocking's own wait loop before returning; a leak that returns \
+         immediately on a Running task would never trigger this seam, and nothing below would \
+         tell that mutant apart from the correct implementation"
+    );
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
         b"",

@@ -130,6 +130,13 @@ impl BlockingReap {
             "take_blocking on a task that has not claimed the child would wait on pool scheduling"
         );
         while matches!(*state, ReapState::Running) {
+            // Fires once per iteration actually reached, for a test — see
+            // `fault::before_reap_take_blocking_wait`'s own doc: reaching this at all already
+            // proves the wait loop runs, not just that `leak`/`Drop` took this branch.
+            #[cfg(test)]
+            if let Some(hook) = fault::take_before_reap_take_blocking_wait() {
+                hook();
+            }
             state = self
                 .finished
                 .wait(state)
@@ -1165,6 +1172,8 @@ pub(crate) mod fault {
         static AFTER_DRAIN_CLAIM: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
         static AFTER_DRAIN_DROP: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
         static BEFORE_TAKE_BLOCKING_WAIT: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
+        #[cfg(unix)]
+        static BEFORE_REAP_TAKE_BLOCKING_WAIT: RefCell<Option<Box<dyn FnOnce() + Send + Sync>>> = const { RefCell::new(None) };
     }
     /// Run `hook` once a `ReapTask` spawned next — by `spawn_blocking_reap`, sampled here on the
     /// submitting thread, before the task moves to the blocking pool — has claimed the child
@@ -1215,6 +1224,22 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_before_take_blocking_wait() -> Option<Box<dyn FnOnce() + Send + Sync>> {
         BEFORE_TAKE_BLOCKING_WAIT.with(|f| f.borrow_mut().take())
+    }
+    /// Run `hook` from inside `BlockingReap::take_blocking`'s wait loop, right before it parks on
+    /// the condvar — reached only once the loop condition has itself observed `Running`, so
+    /// reaching this at all already proves the wait loop runs (the reap-side twin of
+    /// `before_take_blocking_wait`, which does the same for `RetainedDrain`). `take_blocking` runs
+    /// synchronously on whichever thread calls it (typically `leak` or `Drop for Unreaped`, moved
+    /// onto the blocking pool): set this hook on that same thread, immediately before triggering
+    /// the call that reaches `take_blocking`.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // its one caller is a Linux-only test
+    pub(crate) fn set_before_reap_take_blocking_wait(hook: Box<dyn FnOnce() + Send + Sync>) {
+        BEFORE_REAP_TAKE_BLOCKING_WAIT.with(|f| *f.borrow_mut() = Some(hook));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_before_reap_take_blocking_wait() -> Option<Box<dyn FnOnce() + Send + Sync>> {
+        BEFORE_REAP_TAKE_BLOCKING_WAIT.with(|f| f.borrow_mut().take())
     }
     /// Make the next wait on this thread find the child's ownership uncertain, as `ECHILD` does.
     #[cfg_attr(windows, allow(dead_code))] // its one caller is a Unix test
