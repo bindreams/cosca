@@ -71,8 +71,94 @@ fn blocked_child() -> (::tokio::process::Child, ::tokio::process::ChildStdin, Pr
     (child, stdin, id)
 }
 
-/// The async twin of `crate::child::unreaped_tests`'s
-/// `wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie` — see that
+/// The async twin of `crate::child::unreaped_tests`'s `leader_and_member_in_one_process_group`:
+/// a tokio-spawned leader (so it can be held as `Held::Tokio`) and a plain std-spawned member
+/// sharing its pgid, the member's own stdin left untaken (and so open) so it stays alive with no
+/// EOF to exit on until something actually kills it. See that sync twin's own doc for why the
+/// member's `SIGKILL` status, not a `kill(pid, 0)` probe, is the only real proof a specific
+/// call site's sweep ran.
+#[cfg(unix)]
+fn tokio_leader_and_member_in_one_process_group() -> (
+    ::tokio::process::Child,
+    ::tokio::process::ChildStdin,
+    std::process::Child,
+) {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut leader = ::tokio::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn the group leader");
+    let pgid = leader.id().expect("a freshly spawned child has a pid");
+    let leader_stdin = leader.stdin.take().expect("piped stdin");
+
+    let member = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(pgid as i32)
+        .spawn()
+        .expect("spawn a second member of the same group");
+
+    (leader, leader_stdin, member)
+}
+
+/// The async twin of `crate::child::unreaped_tests`'s `assert_member_was_sigkilled`.
+#[cfg(unix)]
+fn assert_member_was_sigkilled(mut member: std::process::Child) {
+    use std::os::unix::process::ExitStatusExt;
+    let status = member.wait().expect("reap the (hopefully killed) second member");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the second member of the swept group must have been killed by the sweep's killpg, not \
+         merely the root — got {status:?}"
+    );
+}
+
+/// Round-4 finding (mutants M4 and M13): the pre-reap `ProcessGroup` sweep removed from
+/// `ReapTask::run`, or the `recyclable` routing check in `wait` that sends this retention there
+/// in the first place (bypassing it would let `wait_on` reap the root directly, through tokio's
+/// own `child.wait()`, with no sweep at all) — either mutation leaves the member alive.
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_sweeps_a_retained_process_group_while_its_root_pid_is_still_a_zombie() {
+    let (leader, leader_stdin, member) = tokio_leader_and_member_in_one_process_group();
+    let pid = leader.id().expect("a freshly spawned child has a pid");
+    let retained = Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    };
+    let mut unreaped = Unreaped::with_retained(Held::Tokio(Box::new(leader)), Some(retained));
+    drop(leader_stdin); // let the leader exit on EOF
+    unreaped.wait().await.expect("wait for the leader");
+    assert_member_was_sigkilled(member);
+}
+
+/// Round-4 finding (mutant M3): the pre-reap `ProcessGroup` sweep removed from the async `Drop`
+/// fallback call site specifically — driven with `held` still `Some` (never awaited), the branch
+/// gated on `self.held.is_some()` (round-3 finding 2's own fix), not the "already reaped" one.
+#[cfg(unix)]
+#[tokio::test]
+async fn drop_sweeps_a_retained_process_group_while_its_root_pid_is_still_a_zombie() {
+    let (leader, leader_stdin, member) = tokio_leader_and_member_in_one_process_group();
+    let pid = leader.id().expect("a freshly spawned child has a pid");
+    let retained = Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    };
+    let unreaped = Unreaped::with_retained(Held::Tokio(Box::new(leader)), Some(retained));
+    drop(leader_stdin); // let the leader exit on EOF
+                        // `Drop` blocks until the child exits, then reaps it — here on the blocking pool, as the
+                        // type's own doc tells a caller to.
+    ::tokio::task::spawn_blocking(move || drop(unreaped))
+        .await
+        .expect("drop on the blocking pool");
+    assert_member_was_sigkilled(member);
+}
+
+/// The async twin of
+/// `crate::child::unreaped_tests::wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie` — see that
 /// test's doc for the hazard this guards against. Here the sweep runs off the tokio blocking pool
 /// (see `ReapTask::run`'s doc), not inline on the caller's own thread, which is exactly why
 /// `fault::set_hard_kill_hook`'s registry is process-global rather than thread-local.
@@ -178,21 +264,47 @@ fn drop_does_not_resweep_a_retention_whose_root_is_already_reaped() {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     let _guard = crate::child::spawn::spawn_lock();
-    let mut cmd = std::process::Command::new("cat");
-    cmd.stdin(std::process::Stdio::piped())
+    // Models the actual recycled-onto-our-child hazard this guards against: a leader that has
+    // EXITED but is not yet reaped by anyone (`block_until_reapable` below confirms it is a real,
+    // still-confirmable zombie — round-3 finding 1's own confirmatory check would NOT by itself
+    // refuse a resweep here, unlike a fully-gone pid) — while `Unreaped`'s own bookkeeping already
+    // says `held: None` (as `await_draining` reclaiming a retention back after its drain task
+    // never ran leaves it — see the doc above). Only round-3 finding 2's `held.is_some()` gate
+    // stands between that mismatch and an incorrect resweep; a SEPARATE, genuinely alive member
+    // sharing the SAME pgid stands in for whatever the kernel may go on to recycle it onto, once
+    // this zombie is finally reaped elsewhere.
+    let mut leader_cmd = std::process::Command::new("cat");
+    leader_cmd
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .process_group(0); // a fresh pgid == this child's own pid, with no other members
-    let mut child = cmd.spawn().expect("spawn a child blocked on stdin");
-    let pid = child.id();
-    let stdin = child.stdin.take().expect("piped stdin");
+        .process_group(0);
+    let mut leader = leader_cmd.spawn().expect("spawn the group leader");
+    let pgid = leader.id();
+    let leader_stdin = leader.stdin.take().expect("piped stdin");
+
+    // Joins the leader's group WHILE the leader is still alive: `setpgid` needs an existing
+    // target group.
+    let mut member_cmd = std::process::Command::new("cat");
+    member_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(pgid as i32);
+    let mut member = member_cmd.spawn().expect("spawn a second member of the same group");
+
+    drop(leader_stdin); // let the leader exit on EOF
+                        // Confirm it is a real, still-reapable zombie — not blocking (it has already exited) and not
+                        // reaping it (`WNOWAIT`): this is what makes `block_until_reapable` inside a resweep SUCCEED
+                        // if the outer `held.is_some()` gate is the one that regresses, rather than fail closed on its
+                        // own via finding 1's confirmatory check — so this test isolates finding 2's own gate.
+    crate::child::unreaped::block_until_reapable(pgid).expect("the leader is a confirmable zombie");
 
     let retained = Box::new(Retained {
-        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+        attached: crate::containment::Attached::ProcessGroup(pgid as i32),
     });
     let unreaped = Unreaped {
         held: None,
         retained: Some(retained),
-        pid,
+        pid: pgid,
         status: Some(std::process::ExitStatus::from_raw(0)),
         released: None,
         blocking: None,
@@ -202,16 +314,43 @@ fn drop_does_not_resweep_a_retention_whose_root_is_already_reaped() {
     };
     drop(unreaped);
 
+    // A liveness probe on the member would be vacuous the same way a `kill(pid, 0)` on the root
+    // was (round-4's own test-quality finding): reaping it and checking ITS signal is the real
+    // proof an incorrect resweep did not `killpg` it.
+    drop(member.stdin.take().expect("piped stdin")); // let it exit on EOF, this test's own doing
+    let status = member.wait().expect("reap the member");
+    leader
+        .wait()
+        .expect("reap the leader here: nothing else in this test has, by design");
     assert_eq!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
-        Ok(()),
-        "the child must still be alive: `Drop`'s fallback must not sweep a retention once \
-         `held` is already `None` — the root reap already happened, so its pgid may already \
-         have been recycled onto a live, unrelated process group"
+        status.signal(),
+        None,
+        "`Drop`'s fallback must not sweep a retention once `held` is already `None` — the root \
+         reap already happened, so its pgid may already have been recycled onto this live, \
+         unrelated group; got {status:?}"
     );
+}
 
-    drop(stdin); // let the child exit on EOF; this test's own doing, not `Drop`'s
-    child.wait().expect("the child exits once stdin closes");
+/// Regression test for round-4 finding D1(a): a recyclable retention on a `Held::Tokio` child
+/// routed its non-reaping watch through `ProcessId::of(pid)`, which reads `/proc/<pid>/stat` — a
+/// read `hidepid=2`, or a setuid child's restricted `/proc` entry, refuses. The PR body claims
+/// this path "never reads /proc", matching `Held::Bare`'s own pidfd-only watch (see
+/// `a_bare_child_is_waited_on_through_its_pidfd_without_an_identity_read`); this proves the same
+/// for `Held::Tokio`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_tokio_child_with_a_recyclable_retention_is_waited_on_through_its_pidfd_without_an_identity_read() {
+    let (child, stdin, id) = blocked_child();
+    let retained = Retained {
+        attached: crate::containment::Attached::ProcessGroup(id.pid() as i32),
+    };
+    let mut unreaped = Unreaped::with_retained(Held::Tokio(Box::new(child)), Some(retained));
+    crate::identity::unreadable::set(true);
+    drop(stdin);
+    let waited = unreaped.wait().await;
+    crate::identity::unreadable::set(false);
+    waited.expect("the wait must not depend on an identity read");
+    crate::child::spawn::fault::assert_child_reaped(Resolved::Found(id));
 }
 
 /// Poll `wait` once, assert it is pending — so it really started waiting — and drop it, as the

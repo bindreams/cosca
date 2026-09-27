@@ -214,7 +214,13 @@ fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_zombie
         attached: crate::containment::Attached::FdMarker(marker),
     };
     let unreaped = Unreaped::with_retained(Held::Std(child), Some(retained));
-    drop(stdin); // let the child exit on EOF
+    // Closing stdin BEFORE calling `wait()` (an earlier version of this test did) leaves the
+    // window between that and `block_until_reapable`'s own `waitid` call unaccounted for: the
+    // child becoming a zombie in time for the sweep below is then really an assertion on the OS
+    // scheduler, not on this crate's own ordering (round-4 test-quality finding). Closing it from
+    // a hook fired exactly as `block_until_reapable` is entered — not merely before `wait()` is
+    // called — ties it to this crate's own ordering instead.
+    crate::child::spawn::fault::set_before_block_until_reapable_hook(move || drop(stdin));
     let status = unreaped.wait().expect("wait for the child");
 
     assert_eq!(
@@ -274,15 +280,23 @@ fn sweep_skips_hard_kill_when_it_cannot_confirm_the_root_is_still_a_zombie() {
         "a confirmatory failure must hand the retention back unswept, for the caller's own \
          failed-wait branch to abandon: got {result:?}"
     );
-    assert_eq!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
-        Ok(()),
-        "the child must still be alive: an incorrect sweep would have sent it a real SIGKILL \
-         through killpg despite the confirmatory check having failed"
-    );
-
+    // A liveness probe (`kill(pid, 0)`) would be vacuous here: a `SIGKILL`ed-but-unreaped zombie
+    // still answers `Ok(())`, same as a genuinely running process — round-4's own test-quality
+    // finding. Reaping it and checking ITS signal is the only real proof an incorrect sweep did
+    // not send it a real `SIGKILL` through `killpg` despite the confirmatory check having failed.
     drop(stdin); // let the child exit on EOF
-    child.wait().expect("the child exits once stdin closes");
+    use std::os::unix::process::ExitStatusExt;
+    let status = child.wait().expect("the child exits once stdin closes");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child must have exited normally, not been killed: got {status:?}"
+    );
+    assert_eq!(
+        status.signal(),
+        None,
+        "the child must not have been signalled: got {status:?}"
+    );
 }
 
 /// Positive twin of the skip test above, and of `wait_sweeps_a_retained_recyclable_marker_...`
@@ -343,6 +357,87 @@ fn sweep_kills_through_a_live_process_group_when_it_confirms_the_root_is_still_a
     );
 
     leader.wait().expect("reap the already-signalled zombie leader");
+}
+
+/// A group leader and a second member sharing its pgid, the leader's stdin piped (closing it lets
+/// the leader exit on EOF while the member — blocked on its own, separately piped stdin — stays
+/// alive) — the fixture round-4's per-call-site `ProcessGroup` sweep tests share: each drives a
+/// REAL `Unreaped`/`Drop`/`wait` path (not `sweep_recyclable_pgid_before_reap` directly, as
+/// `sweep_kills_through_a_live_process_group_when_it_confirms_the_root_is_still_a_zombie` above
+/// does) and then asserts the MEMBER died by `SIGKILL` — the only proof a mutant that removes a
+/// specific call site's sweep actually fails: a `kill(pid, 0)` liveness probe cannot tell a killed
+/// zombie from a running one, so it is never used here.
+#[cfg(unix)]
+fn leader_and_member_in_one_process_group() -> (std::process::Child, std::process::ChildStdin, std::process::Child) {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut leader_cmd = std::process::Command::new("cat");
+    leader_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0);
+    let mut leader = leader_cmd.spawn().expect("spawn the group leader");
+    let pgid = leader.id();
+    let leader_stdin = leader.stdin.take().expect("piped stdin");
+
+    let mut member_cmd = std::process::Command::new("cat");
+    member_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(pgid as i32);
+    // Its own stdin is left `Some(..)` inside `member`, deliberately never taken or dropped: an
+    // untaken piped stdin stays open, so the member has no EOF to exit on and stays genuinely
+    // alive until something actually kills it.
+    let member = member_cmd.spawn().expect("spawn a second member of the same group");
+    (leader, leader_stdin, member)
+}
+
+/// Assert `member` was killed by `SIGKILL` (reaping it), the one proof a pre-reap `ProcessGroup`
+/// sweep actually reached the whole group and not only the root.
+#[cfg(unix)]
+fn assert_member_was_sigkilled(mut member: std::process::Child) {
+    use std::os::unix::process::ExitStatusExt;
+    let status = member.wait().expect("reap the (hopefully killed) second member");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the second member of the swept group must have been killed by the sweep's killpg, not \
+         merely the root — got {status:?}"
+    );
+}
+
+/// Round-4 finding (mutant M1): the pre-reap `ProcessGroup` sweep removed from the sync `wait`
+/// call site specifically — see `leader_and_member_in_one_process_group`'s own doc for why a
+/// `kill(pid, 0)` probe cannot catch this, only reaping the member and checking its signal can.
+#[cfg(unix)]
+#[test]
+fn wait_sweeps_a_retained_process_group_while_its_root_pid_is_still_a_zombie() {
+    let (leader, leader_stdin, member) = leader_and_member_in_one_process_group();
+    let pid = leader.id();
+    let retained = Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    };
+    let unreaped = Unreaped::with_retained(Held::Std(leader), Some(retained));
+    drop(leader_stdin); // let the leader exit on EOF
+    unreaped.wait().expect("wait for the leader");
+    assert_member_was_sigkilled(member);
+}
+
+/// Round-4 finding (mutant M2): the pre-reap `ProcessGroup` sweep removed from the sync `Drop`
+/// fallback call site specifically.
+#[cfg(unix)]
+#[test]
+fn drop_sweeps_a_retained_process_group_while_its_root_pid_is_still_a_zombie() {
+    let (leader, leader_stdin, member) = leader_and_member_in_one_process_group();
+    let pid = leader.id();
+    let retained = Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    };
+    let unreaped = Unreaped::with_retained(Held::Std(leader), Some(retained));
+    drop(leader_stdin); // let the leader exit on EOF
+    drop(unreaped); // blocks until the leader exits, then reaps it — sweeping first
+    assert_member_was_sigkilled(member);
 }
 
 /// A tokio child that exits promptly, needing no external binary: this same test binary, re-run

@@ -316,6 +316,10 @@ pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
     if let Some(marker) = crate::child::spawn::fault::take_force_block_until_reapable_error() {
         return Err(std::io::Error::other(marker));
     }
+    #[cfg(test)]
+    if let Some(hook) = crate::child::spawn::fault::take_before_block_until_reapable_hook() {
+        hook();
+    }
     // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {

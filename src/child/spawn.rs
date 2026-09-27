@@ -1126,6 +1126,9 @@ pub(crate) mod fault {
         #[cfg(unix)]
         static FORCE_BLOCK_UNTIL_REAPABLE_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
         #[cfg(unix)]
+        static BEFORE_BLOCK_UNTIL_REAPABLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+            const { std::cell::RefCell::new(None) };
+        #[cfg(unix)]
         static FORCE_TEARDOWN_TRY_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(unix, feature = "tokio"))]
         static FORCE_TOKIO_WAIT_BLOCKING_MISS: Cell<bool> = const { Cell::new(false) };
