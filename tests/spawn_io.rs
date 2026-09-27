@@ -686,18 +686,30 @@ fn two_overlapping_fd2_closes_probe() {
 /// for the mechanism): invokes the probe above via [`common::run_probe_directly`], which bounds
 /// the wait (see its own and [`common::wait_bounded`]'s docs for why a bound is the right tool
 /// for exactly this regression) so a hang fails this test loudly instead of hanging the whole
-/// suite. Asserts the probe's own exit code is EXACTLY `101` — an ordinary libtest panic, proving
-/// the second, overlapping `RestoreStdio::close(&[2])` panicked instead of deadlocking.
+/// suite — the ONE assertion that holds in every build profile.
+///
+/// The overlap itself is only DIAGNOSED by a `debug_assert!` (a test-only, "two guards should
+/// never overlap" internal invariant, not a release-mode API contract), so it only panics in a
+/// build with debug assertions on. Measured: CI's own release lane (`--release`, debug
+/// assertions off) runs the lib's identical probe and it completes normally instead — the
+/// second guard's `.replace(..)` just silently overwrites the slot, which stays correct
+/// regardless (fd 2 currently IS whatever that second guard just put there).
 #[cfg(unix)]
 #[test]
 fn two_overlapping_fd2_closes_do_not_deadlock() {
     const PROBE: &str = "two_overlapping_fd2_closes_probe";
     let out = common::run_probe_directly(PROBE, &[("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_PROBE", "1")]);
+    let expected = if cfg!(debug_assertions) { Some(101) } else { Some(0) };
     assert_eq!(
         out.status.code(),
-        Some(101),
-        "the second, overlapping RestoreStdio::close(&[2]) must panic cleanly (exit 101), not \
-         hang or abort. got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        expected,
+        "the second, overlapping RestoreStdio::close(&[2]) must{} — got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        if cfg!(debug_assertions) {
+            " panic cleanly (exit 101), not hang or abort"
+        } else {
+            " complete normally (exit 0): this build has debug assertions off, so the \
+             SAVED_STDERR-occupied debug_assert is a no-op"
+        },
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)

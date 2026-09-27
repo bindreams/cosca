@@ -650,7 +650,16 @@ fn two_overlapping_fd2_closes_via_restore_fd2_probe() {
 }
 
 /// Proves the `SAVED_STDERR` self-deadlock fix on `RestoreFd2`. Bounded via [`wait_bounded`], so
-/// a hang fails this test loudly instead of hanging the whole suite.
+/// a hang fails this test loudly instead of hanging the whole suite — the ONE assertion that
+/// holds in every build profile, checked below regardless of debug assertions.
+///
+/// The overlap itself is only DIAGNOSED by a `debug_assert!` (a test-only, "two guards should
+/// never overlap" internal invariant — not a release-mode API contract the way
+/// `fd_map::install`'s duplicate-child-fd rejection is), so it only panics in a build with debug
+/// assertions on. Measured: CI's own release lane (`--release`, debug assertions off) runs this
+/// same probe and it completes normally instead — the second guard's `.replace(..)` just
+/// silently overwrites the slot, which stays correct regardless (fd 2 currently IS whatever that
+/// second guard just put there).
 #[test]
 fn two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock() {
     const PROBE: &str = "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_probe";
@@ -661,11 +670,17 @@ fn two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock() {
             "1",
         )],
     );
+    let expected = if cfg!(debug_assertions) { Some(101) } else { Some(0) };
     assert_eq!(
         out.status.code(),
-        Some(101),
-        "the second, overlapping RestoreFd2::take() must panic cleanly (exit 101), not hang or \
-         abort. got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        expected,
+        "the second, overlapping RestoreFd2::take() must{} — got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        if cfg!(debug_assertions) {
+            " panic cleanly (exit 101), not hang or abort"
+        } else {
+            " complete normally (exit 0): this build has debug assertions off, so the \
+             SAVED_STDERR-occupied debug_assert is a no-op"
+        },
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
