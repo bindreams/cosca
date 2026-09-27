@@ -43,8 +43,8 @@ fn an_events_write_and_the_leafs_removal_are_changes() {
 /// `IN_DELETE`s takes that many events, but not that many *directories*: only two sibling names are
 /// ever reused, so disk/inode use stays flat regardless of the sysctl's size. Alternating the name
 /// on each round matters — inotify coalesces adjacent identical events, so reusing one name would
-/// collapse the whole run into a handful of queued events and never overflow. Only wall-clock time
-/// scales with the sysctl.
+/// collapse the whole run into a handful of queued events and never overflow. Wall-clock time, and
+/// the kernel memory the queued events hold (~38 MB at 1048576), still scale with it.
 #[test]
 fn an_overflowed_queue_is_a_change() {
     let max: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
