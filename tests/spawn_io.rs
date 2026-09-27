@@ -511,6 +511,14 @@ fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
 /// instead. `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the stderr file must stay empty.
 #[cfg(unix)]
 #[test]
+// `RestoreStdio::close` closes THIS PROCESS'S real fd 2, process-wide — not a per-thread or
+// per-child fd. Under `cargo test`'s default shared-process, many-threads model, any other
+// test's thread can have the kernel hand it that freed number for its own unrelated pipe/file
+// (lowest-fd-first allocation), and this test's own `RestoreStdio::drop` then silently `dup2`s
+// over it, destroying that unrelated test's descriptor. Safe only with no other test running
+// concurrently in this process: nextest's one-process-per-test model (`cargo nextest run
+// --run-ignored all`, see ci.yaml), or `cargo test -- --ignored --test-threads=1`.
+#[ignore = "closes this process's real fd 2; unsafe under cargo test's shared-process parallelism — see RestoreStdio's doc comment"]
 fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     use std::io::{Seek, SeekFrom};
 
@@ -551,6 +559,10 @@ fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
 /// leaked exec-error-pipe bytes).
 #[cfg(unix)]
 #[test]
+// Same hazard as `a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed` above, closing
+// TWO real process-wide fds (1 and 2) instead of one — see that test's `#[ignore]` reason and
+// `RestoreStdio`'s doc comment.
+#[ignore = "closes this process's real fd 1 and fd 2; unsafe under cargo test's shared-process parallelism — see RestoreStdio's doc comment"]
 fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     use std::io::{Seek, SeekFrom};
 
