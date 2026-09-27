@@ -32,10 +32,14 @@ file write. It never waits for a process exit or a cgroup drain. Completion is e
 behind and logs a warning naming it. A dropped, still-running async root goes to tokio's own orphan
 queue, which is tokio's state, not cosca's. Sync code may block, as sync Rust normally does.
 
-**Why:** a kill is not an exit (a process in D state or on a hung NFS mount outlives `SIGKILL`), so
-any wait in `Drop` is unbounded. tokio's predecessor removed blocking from `Drop` for this reason,
-tokio itself panics rather than block inside a runtime, and embeddable libraries (sd-event,
-libcontainer, GLib) refuse global reapers, which only process-owning daemons use.
+**Why:** a kill is not an exit (a process stuck in I/O on a hung NFS mount outlives `SIGKILL`), so
+any wait in `Drop` is unbounded. tokio's predecessor, tokio-process, removed its blocking wait from
+`Drop` for this reason ([tokio-process#51]), and tokio panics rather than block when a `Runtime` is
+dropped in async context ([tokio `Runtime`]). Global reapers (`waitpid(-1)`, a subreaper) belong to
+programs that own the whole process, such as tini and the containerd shim. Embeddable libraries
+decline the role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), runc's Go `libcontainer` requires
+its embedder to supply the reaper ([runc CHANGELOG]), and GLib never calls `waitpid(-1)` and prefers
+a pidfd to installing a global `SIGCHLD` handler ([gmain.c]).
 
 **Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns, and
 every async spawn and teardown path under [`src/tokio/`](../src/tokio/). The sync
@@ -163,10 +167,11 @@ documented-only contract breaks silently when a future caller violates it.
 
 ## 7. Synchronise on events, not time
 
-No sleep-then-check, and no timeout chosen by cosca on code cosca controls. A timeout is allowed
-only as a failure bound on something outside our control, and its expiry is never evidence of a
-state. A nextest `terminate-after` ([`.config/nextest.toml`](../.config/nextest.toml)) counts as
-such a bound. A backoff that re-checks a real condition is fine. No arbitrary retry or loop caps.
+No sleep-then-check, and a timeout's expiry is never taken as proof of a state. A timeout is allowed
+only as a failure bound, whose expiry fails the test or reports an error, like a nextest
+`terminate-after` ([`.config/nextest.toml`](../.config/nextest.toml)); library code sets none on
+work cosca controls. A backoff that re-checks a deterministic condition, with no cap, is fine. No
+arbitrary retry or loop caps.
 
 **Why:** a sleep is a bet that something has happened by then, and loses on a slow or loaded
 machine.
@@ -227,14 +232,20 @@ whichever tests share the process.
 
 ## 9. System-affecting tests run in a sandbox
 
-Cgroup, process-group signal and elevation tests run in a container, VM or CI, never against a
-developer's host services.
+Tests that touch real system state run in a container, VM or CI, never on a developer's host:
+cgroups, Job Objects, elevation, signals to processes the test didn't spawn, and anything under
+`sudo`. Ordinary tests that spawn only this repo's own short-lived children run normally on a host,
+including process-group `kill_tree` tests on those children.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it.
 
-**Applies to:** local runs, which use [devvm](../scripts/README.md), and CI, whose cgroup lane runs
-in a fresh cgroup on a throwaway runner ([`ci.yaml`](../.github/workflows/ci.yaml)).
+**Applies to:** all tests. A default run skips the cgroup, elevation, setuid and registry tests,
+which are `#[ignore]`d or gated on an environment variable. Contained tests still create system
+state on two platforms: a cgroup leaf on Linux, whenever the test process's cgroup is writable, and
+a Job Object on Windows. So the suite runs directly on a macOS host, and on Linux and Windows in
+[devvm](../scripts/README.md), a container or CI. CI's cgroup lane runs in a fresh cgroup on a
+throwaway runner ([`ci.yaml`](../.github/workflows/ci.yaml)).
 
 ## 10. Prefer a dependency over hand-rolled code
 
@@ -270,3 +281,8 @@ step consistent with these principles.
 [#196]: https://github.com/bindreams/cosca/issues/196
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#205]: https://github.com/bindreams/cosca/pull/205
+[tokio-process#51]: https://github.com/alexcrichton/tokio-process/issues/51
+[tokio `Runtime`]: https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html
+[sd-event.c]: https://github.com/systemd/systemd/blob/885fe07ee37cff7316680b5088d11081e01813b1/src/libsystemd/sd-event/sd-event.c#L3753-L3765
+[runc CHANGELOG]: https://github.com/opencontainers/runc/blob/41b74772b651b3b42a1f04a43a803db16f0e7e9b/CHANGELOG.md#L1219-L1222
+[gmain.c]: https://gitlab.gnome.org/GNOME/glib/-/blob/36c60f069c6f3776dafc7f6ce18c8c0b606cd8b5/glib/gmain.c#L6052-L6526

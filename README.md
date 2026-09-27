@@ -15,6 +15,10 @@ run`. It's what CI runs, and it's the recommended way to run cosca's suite local
 isolates each test in its own process, rather than sharing one process across the whole run the
 way plain `cargo test` does.
 
+Run it directly on macOS. On Linux and Windows, contained tests create cgroup leaves and Job
+Objects, so run the suite in a VM ([`scripts/devvm`](scripts/README.md)), a container or CI; see
+[principle 9](docs/principles.md#9-system-affecting-tests-run-in-a-sandbox).
+
 nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
 today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an
 agent can't run that step locally either — it only runs in CI.
