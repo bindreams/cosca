@@ -468,58 +468,96 @@ impl RestoreFd2 {
         assert!(saved >= 0, "dup fd 2 aside before closing it");
         // SAFETY: `saved` was just returned by a successful F_DUPFD_CLOEXEC.
         let saved = unsafe { OwnedFd::from_raw_fd(saved) };
-        assert_eq!(unsafe { libc::close(2) }, 0, "close the test process' fd 2");
+        let saved_fd = saved.as_raw_fd();
         // See `SAVED_STDERR`'s doc for the mechanism.
         ensure_stderr_panic_hook();
-        // NOT held across the debug_assert below, deliberately: `Mutex::lock()`'s temporary
-        // guard from `.replace(..)` drops at the end of ITS OWN statement, before the assert
-        // below can panic. Measured: holding the guard across the assert deadlocks — the panic
-        // hook this function just armed (`ensure_stderr_panic_hook`) tries to lock this SAME
-        // mutex, on this SAME thread, as the FIRST thing that happens when the assert panics (a
-        // hook runs before any unwinding, so a guard from `let mut slot = saved_stderr();`
-        // would still be alive) — a plain `std::sync::Mutex` is not reentrant, so that second
-        // `.lock()` call blocks forever on a lock its own thread already holds.
-        let prev = saved_stderr().replace(saved.as_raw_fd());
+        // Set the slot ONLY if it is currently unoccupied — an overlapping second guard must NOT
+        // steal it from a still-live first one. Measured: overwriting here routed a later panic's
+        // message into whatever the SECOND guard's own dup pointed at instead of real stderr —
+        // silently worse than not fixing the message-loss bug at all. And this all happens BEFORE
+        // `close(2)` below — not after: Linux frees a fd from the table even when `close` itself
+        // reports failure (EINTR, EIO, ...), so if the `close` assert below panics, the slot must
+        // ALREADY be armed, or the panic message is lost exactly as if `close` had silently
+        // "succeeded" while this function never found out.
+        //
+        // NOT held across the debug_assert below, deliberately: `Mutex::lock()`'s temporary guard
+        // drops at the end of ITS OWN statement, before the assert below can panic. Measured:
+        // holding the guard across the assert deadlocks — the panic hook this function just armed
+        // (`ensure_stderr_panic_hook`) tries to lock this SAME mutex, on this SAME thread, as the
+        // FIRST thing that happens when the assert panics (a hook runs before any unwinding, so a
+        // guard from `let mut slot = saved_stderr();` would still be alive) — a plain
+        // `std::sync::Mutex` is not reentrant, so that second `.lock()` call blocks forever on a
+        // lock its own thread already holds.
+        let prev = {
+            let mut slot = saved_stderr();
+            let prev = *slot;
+            if prev.is_none() {
+                *slot = Some(saved_fd);
+            }
+            prev
+        };
         debug_assert!(
             prev.is_none(),
-            "RestoreFd2: SAVED_STDERR already occupied (by fd {prev:?}) when this guard set it \
-             to {} — a previous guard's fd 2 was never cleared, or two guards overlap. Reachable \
-             even from a single alone()-isolated test: e.g. opening a second RestoreFd2 (or \
-             RestoreStdio) on fd 2 before the first one drops.",
-            saved.as_raw_fd()
+            "RestoreFd2: SAVED_STDERR already occupied (by fd {prev:?}) when this guard tried to \
+             set it to {saved_fd} — a previous guard's fd 2 was never cleared, or two guards \
+             overlap. Reachable even from a single alone()-isolated test: e.g. opening a second \
+             RestoreFd2 (or RestoreStdio) on fd 2 before the first one drops."
         );
+        assert_eq!(unsafe { libc::close(2) }, 0, "close the test process' fd 2");
         RestoreFd2 { saved }
     }
 }
 
 impl Drop for RestoreFd2 {
     fn drop(&mut self) {
-        // Clear the process-wide slot BEFORE the restore below closes `self.saved` (the fd
-        // `SAVED_STDERR` currently points at), so the ONE process-wide panic hook (installed
-        // once by `take`, never touched here) can never read a stale fd. This NEVER calls
-        // `std::panic::set_hook`: see `SAVED_STDERR`'s doc for why that would turn an ordinary
-        // panic into a process abort.
-        *saved_stderr() = None;
+        // Restore fd 2 WITHOUT panicking here directly — record the failure instead — so this
+        // function never panics TWICE: once here (if the `dup2` below failed) and, if this `Drop`
+        // itself is already running as part of unwinding an EARLIER panic, a SECOND panic during
+        // unwind is not caught — the process aborts. Reported once, below.
+        //
         // SAFETY: dup2 back onto 2; `self.saved` stays valid (and is closed normally by its own
         // Drop) regardless of this call's outcome.
         //
         // Retries EINTR the same way `fd_map::dup2_onto` does, so a signal landing mid-restore
-        // cannot leave fd 2 unrestored, and asserts the final result: a restore failure here would
-        // silently leave this test process' own fd 2 in the wrong state for every test that runs
-        // after it.
+        // cannot leave fd 2 unrestored.
         let ret = loop {
             let ret = unsafe { libc::dup2(self.saved.as_raw_fd(), 2) };
             if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 break ret;
             }
         };
-        assert_eq!(
-            ret,
-            2,
-            "dup2({}, 2) while restoring fd 2 failed: {}",
-            self.saved.as_raw_fd(),
-            std::io::Error::last_os_error()
-        );
+        let failure = if ret != 2 {
+            Some(format!(
+                "dup2({}, 2) while restoring fd 2 failed: {}",
+                self.saved.as_raw_fd(),
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            None
+        };
+        // Clear the process-wide slot only AFTER the restore above has been attempted, and only
+        // if it STILL holds THIS guard's own dup — not some other, still-live guard's (one whose
+        // own registration was REJECTED in `take` because a prior guard already occupied the
+        // slot must NOT clear that prior guard's still-valid registration when IT drops). This
+        // NEVER calls `std::panic::set_hook`: see `SAVED_STDERR`'s doc for why that would turn an
+        // ordinary panic into a process abort.
+        let my_fd = self.saved.as_raw_fd();
+        let mut slot = saved_stderr();
+        if *slot == Some(my_fd) {
+            *slot = None;
+        }
+        drop(slot);
+        if let Some(msg) = failure {
+            // A NEW panic here, while this `Drop` is ALREADY running as part of unwinding an
+            // earlier panic, would abort the process — worse than the failure it would be
+            // reporting. Report loudly without panicking in that case; panic normally otherwise,
+            // so an ordinary (non-unwind) restore failure still fails its test.
+            if std::thread::panicking() {
+                eprintln!("RestoreFd2::drop: {msg} (not panicking: already unwinding)");
+            } else {
+                panic!("RestoreFd2::drop: {msg}");
+            }
+        }
     }
 }
 
@@ -527,23 +565,55 @@ impl Drop for RestoreFd2 {
 /// not, rather than blocking forever. A copy of `tests/common/mod.rs`'s identical helper: this
 /// file is a separate compilation unit and cannot name that one. See there for the full
 /// rationale (the bound is a FAILURE SURFACE for a genuine, otherwise-unbounded hang, not a
-/// synchronization mechanism).
-fn wait_bounded(child: std::process::Child, timeout: std::time::Duration) -> std::process::Output {
+/// synchronization mechanism) and for why `child` stays owned by THIS thread for its whole life
+/// (reaped only here, never on the background thread) — an earlier version raced a background
+/// thread's `wait_with_output` reap against this thread killing the bare pid number on timeout,
+/// a genuine pid-reuse hazard once the child was reaped elsewhere.
+fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) -> std::process::Output {
     let pid = child.id();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        use std::io::Read;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut p) = stdout_pipe.take() {
+            let _ = p.read_to_end(&mut stdout);
+        }
+        if let Some(mut p) = stderr_pipe.take() {
+            let _ = p.read_to_end(&mut stderr);
+        }
+        // Confirm the child has exited WITHOUT reaping it (`WNOWAIT`) — reaping stays on the
+        // caller's thread below, the only place allowed to touch the `Child` it still owns.
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: `si` is a valid, correctly-sized out-param; `pid` is our own unreaped child.
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut si, libc::WEXITED | libc::WNOWAIT) };
+            if rc == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        let _ = tx.send((stdout, stderr));
     });
     match rx.recv_timeout(timeout) {
-        Ok(out) => out.expect("wait for the child"),
+        Ok((stdout, stderr)) => {
+            let status = child.wait().expect("reap the child, already confirmed exited");
+            std::process::Output { status, stdout, stderr }
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // SAFETY: `pid` is our own child's pid, read before handing the `Child` to the
-            // waiter thread; killing it here is best-effort cleanup for a child that hung
-            // exactly the way this function exists to catch, not a normal-path operation.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            // `child` is still ours, unreaped: `kill`/`wait` target the exact process the OS
+            // handed us, never a recycled pid — see the doc above.
+            let _ = child.kill();
+            let status = child.wait().expect("reap the child after killing it");
             panic!(
                 "child pid {pid} did not exit within {timeout:?} — it hung instead of exiting \
-                 (cleanly or otherwise), which is itself the regression under test"
+                 (cleanly or otherwise), which is itself the regression under test. Killed it \
+                 and reaped exit status {status:?}."
             );
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
