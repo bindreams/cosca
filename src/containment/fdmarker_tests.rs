@@ -1052,3 +1052,32 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     // as a "holder". Disarm: this test is only about the blind-pass Err path, not teardown.
     marker.disarm();
 }
+
+/// Regression test for the flake in `dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once`
+/// (sync and tokio): that test reads `fault::HARD_KILL_CALLS` only AFTER its own marker (and the
+/// read end that was the only thing standing between its real OS pipe `handle` and reissue) has
+/// already been dropped, so `handle` itself was never safe to key that map on — a concurrent,
+/// unrelated test's brand-new marker can receive that exact `handle` value before the read runs.
+/// Measured 2026-09-27 at #165@aa922c72: `--test-threads=16` over a marker-heavy subset hit
+/// `left: 3` against an expected `1`, entirely from unrelated concurrent markers (a
+/// `--test-threads=1`, no-other-tests rerun of the SAME test showed 0 failures across 2000
+/// iterations — the disarm fix itself has no race).
+///
+/// `hard_kill_test_key` fixes this by never being a real, kernel-recycled identity in the first
+/// place: it is this process's own counter, assigned once per `Marker` and never reused for the
+/// process's whole life, so no two markers — however their real fds/handles overlap in time —
+/// can ever collide on it. This test proves that guarantee directly: a value that repeats even
+/// once would silently reintroduce exactly the conflation the flake above suffered from.
+#[test]
+fn hard_kill_test_keys_are_never_reused_within_the_process() {
+    let mut seen = std::collections::HashSet::new();
+    // Large enough to be a meaningful guarantee, small enough to run in well under a second;
+    // this is checking a monotonic counter's arithmetic, not timing anything.
+    for _ in 0..100_000 {
+        let key = super::fault::next_hard_kill_test_key();
+        assert!(
+            seen.insert(key),
+            "key {key} was already issued to an earlier marker in this process"
+        );
+    }
+}

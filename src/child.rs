@@ -470,11 +470,12 @@ impl Child {
         crate::containment::windows::job_contains_pid(&self.attached, self.proc().id())
     }
 
-    /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
+    /// Test-only: this marker's own `fault::HARD_KILL_CALLS` key (never `Marker::handle` itself
+    /// — see that map's doc for why a real, kernel-recycled pipe identity is unsafe here).
     #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn test_marker_handle(&self) -> Option<u64> {
+    pub(crate) fn test_marker_hard_kill_key(&self) -> Option<u64> {
         match &self.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.handle()),
+            crate::containment::Attached::FdMarker(m) => Some(m.hard_kill_test_key()),
             _ => None,
         }
     }

@@ -147,18 +147,18 @@ fn dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once() {
         .contain_with(crate::ContainMode::Strongest)
         .spawn()
         .expect("spawn a contained macOS root");
-    // Keyed on this marker's own handle, not a bare process-global count: this crate's test
-    // binary runs every test in one shared process, routinely with several unrelated markers
-    // sweeping concurrently — see `fault::HARD_KILL_CALLS`'s own doc for why a bare count cannot
-    // tell this Child's sweeps apart from a concurrent, unrelated test's.
-    let handle = child
-        .test_marker_handle()
+    // Keyed on this marker's own dedicated, never-reused hard-kill-count key — NOT its real OS
+    // pipe handle, which this process's own kernel can reissue to an unrelated, concurrently
+    // spawned marker once this one's read end is dropped, before this assertion even runs. See
+    // `fault::HARD_KILL_CALLS`'s own doc for the false failure that caused, measured.
+    let key = child
+        .test_marker_hard_kill_key()
         .expect("Strongest attaches FdMarker on macOS");
 
     drop(child); // kill_on_drop defaults to true: this is the armed path under test.
 
     assert_eq!(
-        crate::containment::fdmarker::fault::take_hard_kill_calls(handle),
+        crate::containment::fdmarker::fault::take_hard_kill_calls(key),
         1,
         "Child::drop's own explicit hard_kill must be the ONLY sweep of this tree; a second \
          (from an armed Drop for Marker still running after that sweep already tore the tree \

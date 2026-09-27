@@ -688,12 +688,13 @@ impl Child {
 }
 
 impl Child {
-    /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree. Async
-    /// twin of the sync [`Child::test_marker_handle`](crate::Child::test_marker_handle).
+    /// Test-only: this marker's own `fault::HARD_KILL_CALLS` key. Async twin of the sync
+    /// [`Child::test_marker_hard_kill_key`](crate::Child::test_marker_hard_kill_key) — see its
+    /// doc for why this is never `Marker::handle` itself.
     #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn test_marker_handle(&self) -> Option<u64> {
+    pub(crate) fn test_marker_hard_kill_key(&self) -> Option<u64> {
         match &self.os.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.handle()),
+            crate::containment::Attached::FdMarker(m) => Some(m.hard_kill_test_key()),
             _ => None,
         }
     }
