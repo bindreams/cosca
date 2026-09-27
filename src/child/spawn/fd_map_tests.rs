@@ -48,10 +48,10 @@ fn empty_mappings_installs_nothing_and_spawns_normally() {
     assert_eq!(run_sh("echo ok", vec![]).trim(), "ok");
 }
 
-// The "already on the right number" branch (fcntl F_SETFD only, no dup2) =====
+// The "already on the right number" branch: CLOEXEC cleared in place, fd survives exec =====
 
 #[test]
-fn a_mapping_onto_its_own_current_number_clears_cloexec_without_dup2() {
+fn a_mapping_onto_its_own_current_number_clears_cloexec_so_the_fd_survives_exec() {
     let f = file_with("self-mapped");
     let owned: OwnedFd = f.into();
     let raw = owned.as_raw_fd();
@@ -65,12 +65,15 @@ fn a_mapping_onto_its_own_current_number_clears_cloexec_without_dup2() {
     assert_eq!(out, "self-mapped");
 }
 
-// Colliding mappings: command-fds' temporary-fd shuffle =====
+// Colliding mappings deliver each file's own content =====
 
-/// Map file A onto file B's current number and file B onto file A's — the swap that forces the
-/// collision-avoiding temporary-fd shuffle (mirrors command-fds' own `swap_mappings` test).
+/// Map file A onto file B's current number and file B onto file A's — the swap that, internally,
+/// forces a collision-avoiding temporary-fd shuffle (mirrors command-fds' own `swap_mappings`
+/// test). This only checks the externally visible outcome (each file's own content, uncorrupted);
+/// it does not observe the shuffle itself, since any mechanism that resolves the collision without
+/// corrupting either file's content would pass it too.
 #[test]
-fn colliding_mappings_are_resolved_via_a_temporary_fd() {
+fn colliding_mappings_deliver_each_files_own_content() {
     let a = file_with("AAA");
     let b = file_with("BBB");
     let a_owned: OwnedFd = a.into();
@@ -390,7 +393,7 @@ impl Drop for RestoreFd2 {
                 break ret;
             }
         };
-        debug_assert_eq!(
+        assert_eq!(
             ret,
             2,
             "dup2({}, 2) while restoring fd 2 failed: {}",
