@@ -48,25 +48,28 @@ serde_json = "1"
 regex = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
-# Every feature below except `Wdk_System_SystemServices` is already enabled on the main `windows`
-# dependency further down this file — integration tests reach that dependency directly, they are
-# not walled off from it. `Wdk_System_SystemServices` is the one genuine addition: only
-# `windows_path_resolution`'s `provenance.rs` needs it, for `RtlGetVersion` (stamps each
-# measurement with its OS build). Declaring it here, in dev-dependencies, keeps it out of the
-# published crate's own dependency footprint for downstream consumers who only pull in
-# `[dependencies]`. The `windows_*` probes call GetFullPathNameW, GetFileInformationByHandleEx,
-# ShellExecuteExW, the token APIs, the CreateProcess* family, SetHandleInformation, RtlGetVersion,
-# RegGetValueW and CompareStringOrdinal directly (RtlGetVersion and RegGetValueW stamp each
-# measurement with its OS build; CompareStringOrdinal orders an environment block's keys the same
-# case-insensitive way CreateProcess* itself does) to MEASURE the platform rather than to use
-# cosca; `windows_shell_execute` calls ShellExecuteExW from an STA and writes one volatile App
-# Paths key in HKLM and one in HKCU (see its module doc).
-# `Win32_Security_Authorization` is the one addition beyond the main `windows` dependency's own
-# feature list, below: only `resolve_windows_tests.rs` needs it, for `SetNamedSecurityInfoW`,
-# `GetNamedSecurityInfoW`, `SetEntriesInAclW`, `EXPLICIT_ACCESS_W` and `TRUSTEE_W`, to build a
-# real deny ACE on a real Windows host rather than simulate one. Test-only, so it stays out of
-# the published crate's dependency footprint for downstream consumers who only pull in
-# `[dependencies]`, same reasoning as `Wdk_System_SystemServices` above.
+# Every feature below except `Wdk_System_SystemServices` and `Win32_Security_Authorization` is
+# already enabled on the main `windows` dependency further down this file — integration tests
+# reach that dependency directly, they are not walled off from it. Those two are the genuine
+# additions:
+# - `Wdk_System_SystemServices`: only `windows_path_resolution`'s `provenance.rs` needs it, for
+#   `RtlGetVersion` (stamps each measurement with its OS build). The `windows_*` probes call
+#   GetFullPathNameW, GetFileInformationByHandleEx, ShellExecuteExW, the token APIs, the
+#   CreateProcess* family, SetHandleInformation, RtlGetVersion, RegGetValueW and
+#   CompareStringOrdinal directly (RtlGetVersion and RegGetValueW stamp each measurement with its
+#   OS build; CompareStringOrdinal orders an environment block's keys the same case-insensitive
+#   way CreateProcess* itself does) to MEASURE the platform rather than to use cosca;
+#   `windows_shell_execute` calls ShellExecuteExW from an STA and writes one volatile App Paths
+#   key in HKLM and one in HKCU (see its module doc).
+# - `Win32_Security_Authorization`: only `resolve_windows_tests.rs` needs it, for
+#   `SetNamedSecurityInfoW`, `GetNamedSecurityInfoW`, `SetEntriesInAclW`, `EXPLICIT_ACCESS_W` and
+#   `TRUSTEE_W`, to build a real deny ACE on a real Windows host rather than simulate one. (Its
+#   thread-impersonation guard needs no feature beyond `Win32_Security`/`Win32_System_Threading`,
+#   both already enabled: `DuplicateTokenEx`/`RevertToSelf` live in the former,
+#   `SetThreadToken` in the latter.)
+#
+# Declaring both here, in dev-dependencies, keeps them out of the published crate's own
+# dependency footprint for downstream consumers who only pull in `[dependencies]`.
 windows = { version = "0.62", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",
