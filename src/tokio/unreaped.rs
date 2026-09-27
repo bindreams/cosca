@@ -1315,8 +1315,9 @@ impl Drop for Unreaped {
             drop(held);
         }
         if let Some(retained) = retained {
-            // See `reaped`: a successful reap leaves what it retained armed (and a swept
-            // recyclable-pgid retention is already disarmed by then regardless).
+            // See `reaped`: a successful reap leaves what it retained armed. A swept
+            // recyclable-pgid retention never reaches this `if let Some(retained)` at all — it is
+            // fully consumed (`None`) by the sweep above, not merely disarmed.
             if failed {
                 // Abandoned, not merely disarmed: see `Attached::abandon`'s doc.
                 retained.attached.abandon();

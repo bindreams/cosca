@@ -1257,6 +1257,25 @@ pub(crate) mod fault {
         FORCE_BLOCK_UNTIL_REAPABLE_ERROR.with(|f| f.take())
     }
 
+    /// Run `hook`, once, right as the NEXT `block_until_reapable` on this thread is entered — its
+    /// forced-error check has already been consulted and found empty, and its own `waitid` has
+    /// not run yet. Round-4 test-quality finding: a test that must close a child's stdin so it
+    /// becomes reapable EXACTLY as `block_until_reapable` is about to wait for it — not merely
+    /// before calling `wait()`, which leaves the window between that and this call unaccounted
+    /// for, so a test asserting the sweep saw a zombie is really asserting on the OS scheduler
+    /// instead of this crate's own ordering — gets a deterministic edge to do it from instead.
+    /// Its one caller today is macOS-only (the `FdMarker` sweep-timing regression test), so this
+    /// is dead code on every other Unix target.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn set_before_block_until_reapable_hook(hook: impl FnOnce() + Send + 'static) {
+        BEFORE_BLOCK_UNTIL_REAPABLE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_before_block_until_reapable_hook() -> Option<Box<dyn FnOnce() + Send>> {
+        BEFORE_BLOCK_UNTIL_REAPABLE_HOOK.with(|h| h.borrow_mut().take())
+    }
+
     /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread find the child
     /// confirmed reapable, then find its own `try_wait` reporting no exit waiting for it — as
     /// tokio 1.53 can, though this is never a genuine foreign reap (see

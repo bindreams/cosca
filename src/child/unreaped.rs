@@ -337,14 +337,15 @@ pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
 /// If `retained` carries a pid/pgid the OS could recycle onto an unrelated live process group
 /// once `pid` is reaped (see [`Attached::carries_recyclable_pgid`](crate::containment::Attached::carries_recyclable_pgid)'s
 /// doc), sweep it now — while `pid` is still a zombie, so its group id cannot yet have been
-/// recycled — and consume it: `None` means it is fully and permanently resolved (hard-killed, or
-/// safely skipped below) and must never be looked at, stored, or swept again — carrying a swept
-/// recyclable retention forward, armed but invisible as such (`ProcessGroup` has no "disarmed"
-/// state to represent — see `Attached::disarm_after_own_sweep`'s doc), is what let a stale one
-/// resurface for a second, now-unsafe sweep (round-3 finding 2). `Some` means callers settle it on
-/// their own success/failure branch exactly as before: unchanged, for every other kind of
-/// retention, or handed back UNSWEPT when the confirmatory check below fails (round-3 finding 1;
-/// see below).
+/// recycled — and consume it: `None` means it was actually hard-killed and swept, and must never
+/// be looked at, stored, or swept again — carrying a swept recyclable retention forward, armed
+/// but invisible as such (`ProcessGroup` has no "disarmed" state to represent — see
+/// `Attached::disarm_after_own_sweep`'s doc), is what let a stale one resurface for a second,
+/// now-unsafe sweep (round-3 finding 2). `Some` means nothing here has been resolved at all —
+/// every OTHER case returns it: not recyclable to begin with (unchanged, for callers to settle on
+/// their own success/failure branch exactly as before), or handed back UNSWEPT when the
+/// confirmatory check below fails (round-3 finding 1; see below) — never a "safely skipped"
+/// variant of `None`, since a skip settles nothing.
 ///
 /// Callers MUST call this before reaping `pid` themselves: a zombie's pid (and, for `FdMarker`,
 /// its pgid — which a mode that creates one always sets equal to the root pid) stays allocated
@@ -545,8 +546,10 @@ impl Unreaped {
             // A successful reap leaves what it retained armed: its own teardown belongs after
             // the root's reap (see `Retained`'s doc), so it still kills through a failed spawn's
             // grandchildren left behind. Only a failed wait, which never confirmed the reap, gives
-            // it up disarmed. (A recyclable-pgid retention swept above is already disarmed by
-            // then, so `give_up`'s own disarm is a harmless no-op for it either way.)
+            // it up disarmed. (A recyclable-pgid retention successfully swept above is fully
+            // consumed by then — `None`, not merely disarmed — so this `if let Some(retained)`
+            // never even reaches `give_up()` for it at all; only an UNSWEPT one, still `Some`,
+            // can reach here.)
             if waited.is_err() {
                 retained.give_up();
             }
@@ -609,8 +612,9 @@ impl Drop for Unreaped {
             drop(held);
         }
         if let Some(retained) = retained {
-            // See `wait`: a successful reap leaves what it retained armed (and a swept
-            // recyclable-pgid retention is already disarmed by then regardless).
+            // See `wait`: a successful reap leaves what it retained armed. A swept recyclable-pgid
+            // retention never reaches this `if let Some(retained)` at all — it is fully consumed
+            // (`None`) by the sweep above, not merely disarmed.
             if failed {
                 retained.give_up();
             }
