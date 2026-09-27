@@ -967,14 +967,22 @@ fn close_without_alone_probe() {
 #[test]
 fn gate_rejects_a_non_alone_process() {
     const PROBE: &str = "close_without_alone_probe";
-    let child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
-        .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_PROBE", "1")
-        .env_remove("COSCA_TEST_ALONE")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the probe");
+    let child = {
+        // Every raw `std::process::Command` fork in this test surface must go through
+        // `cosca::test_spawn_lock()` — see `tests/common/mod.rs`'s `output_locked` doc for why an
+        // unguarded raw fork here can transiently inherit a live `FdMarker` a concurrent
+        // `tests/macos_fdmarker.rs` sweep is watching for. Held only around `spawn()`, not the
+        // wait, matching `common::alone`'s own pattern.
+        let _guard = cosca::test_spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_PROBE", "1")
+            .env_remove("COSCA_TEST_ALONE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the probe")
+    };
     let out = common::wait_bounded(child, std::time::Duration::from_secs(30));
     assert_eq!(
         out.status.code(),

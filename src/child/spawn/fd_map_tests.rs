@@ -985,14 +985,20 @@ fn close_without_alone_via_restore_fd2_probe() {
 #[test]
 fn gate_rejects_a_non_alone_process_via_restore_fd2() {
     const PROBE: &str = "child::spawn::fd_map::fd_map_tests::close_without_alone_via_restore_fd2_probe";
-    let child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
-        .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_VIA_RESTORE_FD2_PROBE", "1")
-        .env_remove("COSCA_TEST_ALONE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the probe");
+    let child = {
+        // Every raw spawn in this test surface takes `crate::child::spawn::spawn_lock()` —
+        // matching `run_probe_directly`'s own pattern above — held only around `spawn()`, not
+        // the wait.
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_VIA_RESTORE_FD2_PROBE", "1")
+            .env_remove("COSCA_TEST_ALONE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the probe")
+    };
     let out = wait_bounded(child, std::time::Duration::from_secs(30));
     assert_eq!(
         out.status.code(),
