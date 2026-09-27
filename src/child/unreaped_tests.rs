@@ -299,6 +299,93 @@ fn sweep_skips_hard_kill_when_it_cannot_confirm_the_root_is_still_a_zombie() {
     );
 }
 
+/// The non-blocking twin of the test above, for `sweep_recyclable_pgid_before_reap_nonblocking` —
+/// added for the spawn-teardown call sites (a failed kill there must never park on a poll of a
+/// child that may still be running): a forced confirmatory-poll FAILURE (in practice `ECHILD`)
+/// must hand the retention back unswept, identically to the blocking twin's one failure case.
+#[cfg(unix)]
+#[test]
+fn sweep_nonblocking_skips_hard_kill_when_it_cannot_confirm_the_root_is_still_a_zombie() {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0); // a fresh pgid == this child's own pid, with no other members
+    let mut child = cmd.spawn().expect("spawn a child blocked on stdin");
+    let pid = child.id();
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    crate::child::spawn::fault::set_force_poll_reapable_error("forced: cannot confirm zombie");
+    let retained = Box::new(Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    });
+    let result = super::sweep_recyclable_pgid_before_reap_nonblocking(pid, retained);
+
+    assert!(
+        matches!(
+            result.as_deref(),
+            Some(Retained {
+                attached: crate::containment::Attached::ProcessGroup(g)
+            }) if *g == pid as i32
+        ),
+        "a confirmatory failure must hand the retention back unswept, for the caller's own \
+         subsequent check to abandon: got {result:?}"
+    );
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Ok(()),
+        "the child must still be alive: an incorrect sweep would have sent it a real SIGKILL \
+         through killpg despite the confirmatory poll having failed"
+    );
+
+    drop(stdin); // let the child exit on EOF
+    child.wait().expect("the child exits once stdin closes");
+}
+
+/// The non-blocking twin's OTHER failure mode, which the blocking twin cannot have at all: the
+/// root simply has not exited YET. Unlike a confirmatory-poll failure, this is the ORDINARY case
+/// for a spawn teardown's failed kill — it must hand the retention back unswept too, without
+/// logging it as a confirmation failure, and without ever touching a REAL, still-running child.
+#[cfg(unix)]
+#[test]
+fn sweep_nonblocking_skips_hard_kill_while_the_root_is_still_running() {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0);
+    let mut child = cmd.spawn().expect("spawn a child blocked on stdin");
+    let pid = child.id();
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    let retained = Box::new(Retained {
+        attached: crate::containment::Attached::ProcessGroup(pid as i32),
+    });
+    let result = super::sweep_recyclable_pgid_before_reap_nonblocking(pid, retained);
+
+    assert!(
+        matches!(
+            result.as_deref(),
+            Some(Retained {
+                attached: crate::containment::Attached::ProcessGroup(g)
+            }) if *g == pid as i32
+        ),
+        "a still-running root must hand the retention back unswept, unchanged: got {result:?}"
+    );
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Ok(()),
+        "the child must still be alive: it was never a zombie, so nothing may have swept it"
+    );
+
+    drop(stdin); // let the child exit on EOF
+    child.wait().expect("the child exits once stdin closes");
+}
+
 /// Positive twin of the skip test above, and of `wait_sweeps_a_retained_recyclable_marker_...`
 /// (macOS's `FdMarker`): a `ProcessGroup` retention is the one Unix mechanism whose own `Drop`
 /// never kills anything on its own (a bare pgid, no kernel resource) — the pre-reap sweep is its
