@@ -476,6 +476,50 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
+/// The regain [`crate::test_privilege::drop_dac_bypass`]'s `no_new_privs` call exists to prevent,
+/// checked the only way it can be: by actually exec'ing a child. Every OTHER test here — including
+/// [`a_denied_candidate_fails_a_loadable_only_search_closed`], which checks THIS thread's own
+/// `stat` — only observes THIS thread's own capability sets; a uid-0 thread whose bounding set
+/// still holds `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` (because it lacked `CAP_SETPCAP` to drop
+/// them) regains both there at ITS OWN `execve`, via the kernel's legacy set-user-ID-root
+/// compatibility grant, wholly independently of what this thread's effective, permitted or
+/// inheritable sets were reduced to — no same-thread check, however thorough, can see that. Runs
+/// in a re-exec — see [`fixture_a_denied_candidate_is_denied_by_an_exec_child`].
+#[cfg(unix)]
+#[test]
+fn a_denied_candidate_is_denied_by_an_exec_child() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_candidate_is_denied_by_an_exec_child
+    ));
+}
+
+/// The child half of [`a_denied_candidate_is_denied_by_an_exec_child`] — see
+/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s doc, which this mirrors,
+/// except the assertion: instead of THIS thread's own `stat`, it spawns `ls` on the locked
+/// directory and requires that CHILD to be denied too.
+#[cfg(unix)]
+#[test]
+fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
+    if !crate::test_child::is_fixture_reexec() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
+    let (_root, locked, _open, _path) = locked_then_open();
+    let out = std::process::Command::new("ls")
+        .arg(&locked.0)
+        .output()
+        .expect("spawn ls");
+    assert!(
+        !out.status.success(),
+        "an exec'd child must not regain access to a directory this thread was just denied: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("permission denied"),
+        "expected the child's own refusal to be a permission denial, got: {stderr}"
+    );
+}
+
 /// Which metadata errors are a definite "not here": absence, a non-directory in the path, or no
 /// such drive. A denied or failed check is not.
 #[test]

@@ -38,12 +38,27 @@
 /// would corrupt every other concurrently running test if it ran inside the shared multi-test
 /// suite process instead.
 pub(crate) fn drop_dac_bypass() -> std::io::Result<()> {
+    if let Ok(msg) = std::env::var(INJECT_FAILURE_ENV) {
+        return Err(std::io::Error::other(msg));
+    }
     #[cfg(not(target_os = "linux"))]
     drop_root_uid()?;
     #[cfg(target_os = "linux")]
     drop_dac_capabilities()?;
     Ok(())
 }
+
+/// Test-only: when set, [`drop_dac_bypass`] returns `Err` immediately with this value as the
+/// message, skipping the real drop entirely. This is the seam
+/// `exact_posix_tests.rs::reports_and_exits_on_an_injected_dac_bypass_failure` uses to drive the
+/// REAL call site (`report_and_exit_on_dac_bypass_failure(drop_dac_bypass())`,
+/// `resolve_base_tests.rs`'s `.expect()`) through a genuine failure, rather than a stand-in that
+/// calls the downstream handler directly and so cannot catch a mutant at the call site itself
+/// (measured: an earlier version of that test called the handler directly, and a mutant that
+/// dropped the call to `drop_dac_bypass` at the real call site entirely went undetected). A real
+/// failure IS forceable without this seam — `strace -f -e trace=capset -e inject=capset:error=EPERM`,
+/// measured — just not portably enough to run as an ordinary `cargo test`.
+pub(crate) const INJECT_FAILURE_ENV: &str = "COSCA_FIXTURE_INJECT_DAC_BYPASS_FAILURE";
 
 /// The uid and gid a root fixture drops to: `nobody` on Linux, and the conventional unallocated
 /// id elsewhere. Unused on Linux, which never changes uid — see [`drop_dac_bypass`].
@@ -127,12 +142,17 @@ fn drop_dac_capabilities() -> std::io::Result<()> {
 
     // The precondition every caller of this function relies on, checked here rather than trusted:
     // a caller three functions away that hits an unexpected `Ok(stat)` should not have to work out
-    // for itself whether this dropped anything.
-    let effective = rustix::thread::capabilities(None)?.effective;
-    if effective.intersects(dac) {
+    // for itself whether this dropped anything. Checks permitted and inheritable too, not just
+    // effective: a `capset` that dropped effective but left a bit in permitted would still pass an
+    // effective-only check on THIS thread, yet a uid-0 `execve` recomputes the CHILD's permitted
+    // set from the parent's permitted (intersected with bounding) — measured, exactly that gap —
+    // so an effective-only postcondition would miss it even though the exec-time regain it exists
+    // to catch is real.
+    let sets = rustix::thread::capabilities(None)?;
+    if sets.effective.intersects(dac) || sets.permitted.intersects(dac) || sets.inheritable.intersects(dac) {
         return Err(std::io::Error::other(format!(
-            "still holds {:?} in the effective set after dropping it",
-            effective & dac
+            "still holds {:?} somewhere in effective {:?}, permitted {:?} or inheritable {:?}",
+            dac, sets.effective, sets.permitted, sets.inheritable
         )));
     }
     if !rustix::thread::no_new_privs()? {
