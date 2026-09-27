@@ -184,6 +184,8 @@ impl std::fmt::Debug for crate::containment::cgroup::CgroupLeaf {
 impl Attached {
     /// Hard-kill the contained tree (best-effort; already-gone is success).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
+        #[cfg(all(test, unix))]
+        fault::record_hard_kill_call();
         match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
@@ -933,6 +935,57 @@ fn attach_tree(
     // Uncontained (or unsupported platform).
     let _ = prepared;
     Ok((Containment::None, Attached::None))
+}
+
+/// Test-only fault injection for [`Attached::hard_kill`]: a per-thread call counter, and (when a
+/// pid is being watched) whether that pid was still a confirmed, un-reaped zombie at the exact
+/// moment each call happened. Generalizes macOS's `fdmarker::fault`'s own per-instance
+/// `HARD_KILL_CALLS`/`set_hard_kill_hook` (which only `Marker` has anything to key on) to every
+/// mechanism `Attached::hard_kill` dispatches to — notably `ProcessGroup`, a bare pgid with no
+/// object of its own to hang a hook on — so ONE seam proves both "how many times" (a stray extra
+/// call after a root's own reap, e.g. `Child::drop`'s unconditional one) and "while still a
+/// zombie, or too late" (the pre-reap sweep's own ordering) at every call site, not only
+/// `sweep_recyclable_pgid_before_reap`'s.
+#[cfg(all(test, unix))]
+pub(crate) mod fault {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static HARD_KILL_CALLS: Cell<u32> = const { Cell::new(0) };
+        static WATCHED_PID: Cell<Option<u32>> = const { Cell::new(None) };
+        static ZOMBIE_AT_EACH_CALL: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Reset this thread's counters and start watching `pid`: every subsequent
+    /// `Attached::hard_kill` call records whether `pid` was still a confirmed zombie (via
+    /// [`crate::child::unreaped::poll_reapable`]; a poll failure — in practice `ECHILD`, meaning
+    /// something, possibly this same process's own earlier reap, already reaped it — counts as
+    /// NOT a zombie) at that exact moment.
+    pub(crate) fn watch_pid_across_hard_kill(pid: u32) {
+        HARD_KILL_CALLS.with(|c| c.set(0));
+        ZOMBIE_AT_EACH_CALL.with(|v| v.borrow_mut().clear());
+        WATCHED_PID.with(|w| w.set(Some(pid)));
+    }
+
+    pub(crate) fn record_hard_kill_call() {
+        HARD_KILL_CALLS.with(|c| c.set(c.get() + 1));
+        if let Some(pid) = WATCHED_PID.with(Cell::get) {
+            let zombie = crate::child::unreaped::poll_reapable(pid).unwrap_or(false);
+            ZOMBIE_AT_EACH_CALL.with(|v| v.borrow_mut().push(zombie));
+        }
+    }
+
+    /// This thread's total `Attached::hard_kill` call count since the last
+    /// [`watch_pid_across_hard_kill`], consumed once.
+    pub(crate) fn take_hard_kill_call_count() -> u32 {
+        HARD_KILL_CALLS.with(|c| c.replace(0))
+    }
+
+    /// Whether the watched pid was a confirmed zombie at each `Attached::hard_kill` call since
+    /// [`watch_pid_across_hard_kill`], in call order, consumed once.
+    pub(crate) fn take_zombie_at_each_hard_kill_call() -> Vec<bool> {
+        ZOMBIE_AT_EACH_CALL.with(|v| v.take())
+    }
 }
 
 #[cfg(test)]

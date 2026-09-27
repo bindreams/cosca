@@ -740,6 +740,259 @@ async fn a_teardown_whose_check_is_uncertain_disarms_its_retained_leaf() {
     unsafe { libc::waitpid(pid as i32, &mut status, 0) };
 }
 
+/// Spawn a real process-group leader, blocked on stdin, and a second member of the SAME group,
+/// also blocked on stdin — the async twin of
+/// `child::spawn::spawn_tests::pgid_leader_and_member`.
+#[cfg(unix)]
+fn pgid_leader_and_member() -> (
+    ::tokio::process::Child,
+    i32,
+    ::tokio::process::Child,
+    ::tokio::process::ChildStdin,
+) {
+    let mut leader_cmd = ::tokio::process::Command::new("cat");
+    leader_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(false)
+        .process_group(0); // a fresh pgid == this child's own pid
+    let leader = leader_cmd.spawn().expect("spawn the group leader");
+    let pgid = leader.id().expect("a freshly spawned child has a pid") as i32;
+
+    let mut member_cmd = ::tokio::process::Command::new("cat");
+    member_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(false)
+        .process_group(pgid); // joins the leader's group, not a leader itself
+    let mut member = member_cmd.spawn().expect("spawn a second member of the same group");
+    let member_stdin = member.stdin.take().expect("piped stdin");
+    (leader, pgid, member, member_stdin)
+}
+
+/// The async twin of
+/// `child::spawn::spawn_tests::teardown_unadopted_sweeps_a_recyclable_pgid_before_reaping_a_successfully_killed_root`:
+/// `reap_now`'s KILL-SUCCEEDED path (`start_kill` succeeds, `wait_and_reap` follows) must sweep a
+/// recyclable-pgid `attached` BEFORE that reap, not after — proven, as the sync twin proves it, by
+/// watching `Attached::hard_kill`'s own test hook (`ProcessGroup` has no per-instance object of
+/// its own to hang a hook on) and by a live second group member actually being killed through.
+#[cfg(unix)]
+#[tokio::test]
+async fn reap_now_sweeps_a_recyclable_pgid_before_reaping_a_successfully_killed_root() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id().expect("a freshly spawned child has a pid");
+
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    let handed_back = crate::tokio::child::reap_now(
+        leader,
+        leader_pid,
+        false,
+        Some(crate::containment::Attached::ProcessGroup(pgid)),
+    );
+    assert!(handed_back.is_none(), "a successful kill hands nothing back");
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        1,
+        "the group must be swept exactly once"
+    );
+    assert_eq!(
+        crate::containment::dispatch::fault::take_zombie_at_each_hard_kill_call(),
+        vec![true],
+        "the sweep must run while the root pid is still a reapable zombie — before this \
+         teardown's own reap frees it for a new process group to take"
+    );
+
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().await.expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep must kill through the group, reaching the second member too, not only the root: \
+         got {member_status:?}"
+    );
+}
+
+/// The async twin of
+/// `child::spawn::spawn_tests::teardown_unadopted_sweeps_a_recyclable_pgid_before_the_checked_reaped_arms_own_reap`:
+/// a `start_kill` failure whose child had, regardless, already exited (here, killed and reaped by
+/// this test itself, for the identical determinism reason the sync twin documents). The pre-check
+/// non-blocking sweep must run, while the root is CONFIRMED a zombie, strictly before `Held::check`'s
+/// own internal reap.
+#[cfg(unix)]
+#[tokio::test]
+async fn reap_now_sweeps_a_recyclable_pgid_before_the_checked_reaped_arms_own_reap() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id().expect("a freshly spawned child has a pid");
+    // SAFETY: `leader_pid` is this process's own unreaped child.
+    unsafe { libc::kill(leader_pid as i32, libc::SIGKILL) };
+    crate::child::unreaped::block_until_reapable(leader_pid).expect("the leader becomes a zombie");
+
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-checked-reaped-sweep-kill-eperm-2c6e",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    let handed_back = crate::tokio::child::reap_now(
+        leader,
+        leader_pid,
+        false,
+        Some(crate::containment::Attached::ProcessGroup(pgid)),
+    );
+    assert!(
+        handed_back.is_none(),
+        "the child had already exited, which makes the kill's failure moot: got {handed_back:?}"
+    );
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        1,
+        "the group must be swept exactly once, by the pre-check non-blocking sweep"
+    );
+    assert_eq!(
+        crate::containment::dispatch::fault::take_zombie_at_each_hard_kill_call(),
+        vec![true],
+        "the sweep must run while the root pid is still a reapable zombie — before `check`'s own \
+         internal reap frees it for a new process group to take"
+    );
+
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().await.expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep must kill through the group, reaching the second member too: got {member_status:?}"
+    );
+}
+
+/// Build a `crate::tokio::Child` over a real, already-spawned process-group leader with
+/// `Attached::ProcessGroup` containment, for driving `elevated_write_failed` directly — the async
+/// twin of `child::spawn::spawn_tests::process_group_child`.
+#[cfg(unix)]
+fn process_group_child(leader: ::tokio::process::Child, pgid: i32) -> crate::tokio::Child {
+    let pid = leader.id().expect("a freshly spawned child has a pid");
+    let attachment = crate::containment::Attachment {
+        containment: crate::containment::Containment::ProcessGroup,
+        attached: crate::containment::Attached::ProcessGroup(pgid),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    };
+    crate::tokio::child::Child::from_parts(
+        crate::tokio::child::ProcSource::Tokio(leader),
+        crate::identity::ProcessId::from_parts_for_test(pid, 0),
+        true,
+        attachment,
+        Default::default(),
+        Default::default(),
+    )
+}
+
+/// Regression test (round-4 finding 5) for WHY `elevated_write_failed`'s `Ok(kill)` arm needs no
+/// `detach()`, or any other special handling, before its ordinary drop of `child`:
+/// `wait_and_reap_blocking` confirms the root's exit via WNOWAIT WITHOUT reaping it — the actual
+/// reap happens later, folded into whatever eventually drops the tokio child. So by the time async
+/// `Child::drop` makes its own unconditional `hard_kill` call, the root is STILL an unreaped
+/// zombie: that call is safe, not a second, dangerous sweep of an already-freed pgid. Proven
+/// directly against `wait_and_reap_blocking` itself (not through `elevated_write_failed`, which
+/// also fires an EARLIER tree-kill of its own), so this also guards the invariant on its own, for
+/// any other caller that leans on it the same way.
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_and_reap_blocking_leaves_a_zombie_for_drop() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id().expect("a freshly spawned child has a pid");
+    let mut child = process_group_child(leader, pgid);
+    child.kill().expect("kill the root");
+    child.wait_and_reap_blocking();
+
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    drop(child); // armed Drop: its one hard_kill call is what this test is about
+
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        1,
+        "Drop's own hard_kill must still run exactly once"
+    );
+    assert_eq!(
+        crate::containment::dispatch::fault::take_zombie_at_each_hard_kill_call(),
+        vec![true],
+        "Drop's hard_kill, after wait_and_reap_blocking, must land on a STILL-unreaped zombie"
+    );
+
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().await.expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the kill must still reach the second member, not only the root: got {member_status:?}"
+    );
+}
+
+/// The async twin of
+/// `child::spawn::spawn_tests::elevated_write_failed_does_not_rekill_a_retained_fd_marker_whose_check_already_reaped_it`:
+/// same defect (a retained `FdMarker`'s field-wise `Drop`, once `check` has already reaped the
+/// root, re-firing `killpg`), same deterministic setup (a leader that exits on its own, confirmed
+/// a zombie via `block_until_reapable` before this function ever runs — no race).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn elevated_write_failed_does_not_rekill_a_retained_fd_marker_whose_check_already_reaped_it() {
+    use std::os::unix::process::CommandExt;
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new("true");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .process_group(0);
+    let prepared = crate::containment::fdmarker::install(&mut cmd, &[]).expect("install");
+    let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
+    *tcmd.as_std_mut() = cmd;
+    let leader = tcmd.spawn().expect("spawn a child that exits on its own");
+    drop(tcmd);
+    let pid = leader.id().expect("a freshly spawned child has a pid");
+    // Confirm the leader is ALREADY a zombie — exited on its own — before this function's own
+    // tree-kill note ever runs: `killpg` on a zombie's still-valid (not yet recycled) pgid is
+    // exactly the safe window `sweep_recyclable_pgid_before_reap`'s doc describes.
+    crate::child::unreaped::block_until_reapable(pid).expect("the leader exits and becomes a zombie");
+
+    let marker = crate::containment::fdmarker::Marker::new(prepared, None, Some(pid as i32), false);
+    let key = marker.hard_kill_test_key();
+
+    let attachment = crate::containment::Attachment {
+        containment: crate::containment::Containment::FdMarker,
+        attached: crate::containment::Attached::FdMarker(marker),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    };
+    let child = crate::tokio::child::Child::from_parts(
+        crate::tokio::child::ProcSource::Tokio(leader),
+        crate::identity::ProcessId::from_parts_for_test(pid, 0),
+        true,
+        attachment,
+        Default::default(),
+        Default::default(),
+    );
+
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-elevated-fdmarker-checked-reaped-3f7a",
+        std::io::ErrorKind::PermissionDenied,
+    );
+
+    let err = super::elevated_write_failed(
+        child,
+        Error::Io(std::io::Error::other("cosca-async-fdmarker-write-fail-3f7a")),
+    );
+    assert!(err.to_string().contains("already exited"), "got {err}");
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(key),
+        1,
+        "the marker must be swept exactly once — by this function's own tree-kill note, at its \
+         top, before ANY reap. Its retained value's field-wise drop, once `check` (which finds \
+         the already-exited root and reaps it) returns, must be a disarmed no-op, not a second \
+         sweep on a pid `check`'s own reap has already freed for recycling"
+    );
+}
+
 /// The async counterpart of the sync teardown's suspended-child test. A contained root is created
 /// `CREATE_SUSPENDED` and resumed only by a successful attach, so after a failed attach it cannot
 /// exit on its own. When `start_kill` fails, `reap_now` terminates it again through the handle it
@@ -1080,4 +1333,73 @@ fn a_suspended_child_whose_check_fails_in_the_async_teardown_is_still_terminated
         "the retry terminated it, so the spawn's own error comes back, got {err:?}"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// Round-4 finding 1 regression: `reap_now`'s kill-succeeded branch must still kill through an
+/// OCCUPIED cgroup leaf — the async twin of `child::spawn::spawn_tests::teardown_unadopted_kill_succeeded_still_kills_an_occupied_leaf`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reap_now_kill_succeeded_still_kills_an_occupied_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-round4-async-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
+    let leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
+    let child = ::tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(false)
+        .spawn()
+        .expect("spawn");
+    let pid = child.id().expect("pid");
+    let handed_back =
+        crate::tokio::child::reap_now(child, pid, false, Some(crate::containment::Attached::Cgroup(leaf)));
+    assert!(handed_back.is_none(), "a successful kill hands nothing back");
+    assert_eq!(
+        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+        b"1",
+        "a kill-succeeded async spawn teardown must still kill through an occupied cgroup leaf"
+    );
+}
+
+/// Round-4 finding 2 regression, the async twin of
+/// `child::spawn::spawn_tests::teardown_unadopted_nonblocking_does_not_race_check_when_the_root_exits_right_after_the_poll`.
+#[cfg(unix)]
+#[tokio::test]
+async fn reap_now_nonblocking_does_not_race_check_when_the_root_exits_right_after_the_poll() {
+    let (leader, pgid, mut member, member_stdin) = pgid_leader_and_member();
+    let leader_pid = leader.id().expect("a freshly spawned child has a pid");
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-async-round4-race-kill-eperm",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_before_block_until_reapable_hook(move || {
+        unsafe { libc::kill(leader_pid as i32, libc::SIGKILL) };
+        crate::child::unreaped::block_until_reapable(leader_pid).expect("the leader becomes a zombie");
+    });
+    crate::containment::dispatch::fault::watch_pid_across_hard_kill(leader_pid);
+    let handed_back = crate::tokio::child::reap_now(
+        leader,
+        leader_pid,
+        false,
+        Some(crate::containment::Attached::ProcessGroup(pgid)),
+    );
+
+    let (kill_err, unreaped) = handed_back.expect("the root was still running when polled");
+    assert_eq!(kill_err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        crate::containment::dispatch::fault::take_hard_kill_call_count(),
+        0,
+        "reap_now itself must not have swept anything: Unreaped's own wait does, below"
+    );
+
+    unreaped.wait().expect("reap the leader");
+    drop(member_stdin);
+    use std::os::unix::process::ExitStatusExt;
+    let member_status = member.wait().await.expect("reap the killed second member");
+    assert_eq!(
+        member_status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep, run by Unreaped's own wait, must still reach the second member: got {member_status:?}"
+    );
 }

@@ -334,18 +334,52 @@ pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
     }
 }
 
+/// The three, mutually exclusive outcomes of a pre-reap sweep attempt
+/// ([`sweep_recyclable_pgid_before_reap`]). Deliberately NOT an `Option`: round-2 of this
+/// hazard's own fix conflated `NotRecyclable` and `Unconfirmed` into a single `Some`, and callers
+/// that then `abandon()`ed every `Some` alike silently stopped killing through an occupied
+/// `CgroupLeaf` (or a pgid-less macOS `FdMarker`) on the kill-succeeded path — neither of those
+/// was ever a recyclable-pgid mechanism, so there was nothing to "abandon" instead of its own
+/// ordinary field-wise drop.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum SweepOutcome {
+    /// Confirmed a zombie, hard-killed (or tried to — see [`sweep_confirmed_zombie`]'s own log)
+    /// and disarmed for the fd marker's own re-fire. Fully resolved: never look at it again.
+    Swept,
+    /// Not a recyclable-pgid mechanism at all (`Cgroup`, `JobObject`, `TreeWalk`, `None`,
+    /// `Delegated` — see `Attached::carries_recyclable_pgid`) — untouched. Settle it exactly as
+    /// if this sweep had never run: let it drop normally (a `CgroupLeaf`'s own `Drop` retries
+    /// `cgroup.kill` on an occupied leaf; every other listed mechanism's own drop is a no-op), or
+    /// hand it back armed for a `Checked::Running` caller to carry forward.
+    NotRecyclable(Box<Retained>),
+    /// A recyclable-pgid mechanism, but the confirmatory check failed to positively establish a
+    /// zombie (blocking: `block_until_reapable` errored, in practice `ECHILD` — something else
+    /// already reaped `pid`) — never swept. The caller's own subsequent path decides: abandon on
+    /// confirmed-uncertain ownership, or carry it forward armed if `pid` turns out to still be
+    /// running.
+    Unconfirmed(Box<Retained>),
+}
+
+#[cfg(unix)]
+impl SweepOutcome {
+    /// Collapse `NotRecyclable`/`Unconfirmed` into a single "still unswept, settle it yourself"
+    /// `Some` — for a caller that already treats both alike (give it up on a failed wait,
+    /// otherwise let it drop normally), same as `sweep_recyclable_pgid_before_reap`'s own
+    /// pre-`SweepOutcome` contract. `Swept` becomes `None`: fully resolved, nothing left to give
+    /// up or drop.
+    pub(crate) fn into_unswept(self) -> Option<Box<Retained>> {
+        match self {
+            SweepOutcome::Swept => None,
+            SweepOutcome::NotRecyclable(retained) | SweepOutcome::Unconfirmed(retained) => Some(retained),
+        }
+    }
+}
+
 /// If `retained` carries a pid/pgid the OS could recycle onto an unrelated live process group
 /// once `pid` is reaped (see [`Attached::carries_recyclable_pgid`](crate::containment::Attached::carries_recyclable_pgid)'s
 /// doc), sweep it now — while `pid` is still a zombie, so its group id cannot yet have been
-/// recycled — and consume it: `None` means it was actually hard-killed and swept, and must never
-/// be looked at, stored, or swept again — carrying a swept recyclable retention forward, armed
-/// but invisible as such (`ProcessGroup` has no "disarmed" state to represent — see
-/// `Attached::disarm_after_own_sweep`'s doc), is what let a stale one resurface for a second,
-/// now-unsafe sweep (round-3 finding 2). `Some` means nothing here has been resolved at all —
-/// every OTHER case returns it: not recyclable to begin with (unchanged, for callers to settle on
-/// their own success/failure branch exactly as before), or handed back UNSWEPT when the
-/// confirmatory check below fails (round-3 finding 1; see below) — never a "safely skipped"
-/// variant of `None`, since a skip settles nothing.
+/// recycled.
 ///
 /// Callers MUST call this before reaping `pid` themselves: a zombie's pid (and, for `FdMarker`,
 /// its pgid — which a mode that creates one always sets equal to the root pid) stays allocated
@@ -356,27 +390,62 @@ pub(crate) fn block_until_reapable(pid: u32) -> std::io::Result<()> {
 /// If the confirmatory `block_until_reapable` below fails — in practice always `ECHILD`, meaning
 /// something else already reaped `pid`, so its pgid may already be live again under an unrelated
 /// process — this does NOT sweep "regardless": that would risk `killpg` on a recycled pgid (the
-/// exact hazard this function exists to prevent). It hands `retained` back unswept instead
-/// (`Some`), so the caller's own subsequent reap of `pid` — which fails for the identical reason —
-/// takes the normal failed-wait path and abandons it there without ever signalling anything.
+/// exact hazard this function exists to prevent). It hands `retained` back UNCONFIRMED instead,
+/// so the caller's own subsequent reap of `pid` — which fails for the identical reason — takes
+/// the normal failed-wait path and abandons it there without ever signalling anything.
 #[cfg(unix)]
-pub(crate) fn sweep_recyclable_pgid_before_reap(pid: u32, retained: Box<Retained>) -> Option<Box<Retained>> {
+pub(crate) fn sweep_recyclable_pgid_before_reap(pid: u32, retained: Box<Retained>) -> SweepOutcome {
     if !retained.attached.carries_recyclable_pgid() {
-        return Some(retained);
+        return SweepOutcome::NotRecyclable(retained);
     }
     if let Err(e) = block_until_reapable(pid) {
         log::warn!(
             "could not confirm unreaped child {pid} was still a zombie before sweeping what it \
              retained ({e}); skipping the sweep, since its pgid may already be recycled — the \
-             caller's own failed wait will abandon it instead"
+             caller settles it unswept instead"
         );
-        return Some(retained);
+        return SweepOutcome::Unconfirmed(retained);
     }
+    sweep_confirmed_zombie(pid, &retained);
+    SweepOutcome::Swept
+}
+
+/// The one place that actually sweeps: `pid` is a CONFIRMED zombie (by whichever caller
+/// established that — [`sweep_recyclable_pgid_before_reap`], or a call site that classified via
+/// [`poll_reapable`] itself, per its own doc), so `retained`'s `hard_kill` is provably safe — its
+/// pgid cannot yet have been recycled.
+#[cfg(unix)]
+pub(crate) fn sweep_confirmed_zombie(pid: u32, retained: &Retained) {
     if let Err(e) = retained.attached.hard_kill() {
         log::warn!("pre-reap sweep of what unreaped child {pid} retained did not fully succeed: {e}");
     }
     retained.attached.disarm_after_own_sweep();
-    None
+}
+
+/// Non-blocking poll of whether this process's unreaped child `pid` is already a zombie —
+/// `waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)` — WITHOUT reaping it. `Ok(true)`: confirmed a
+/// zombie (safe to sweep, via [`sweep_confirmed_zombie`]). `Ok(false)`: not yet exited — treat as
+/// still running; a caller with a recyclable-pgid retention hands it back ARMED rather than
+/// calling a reaping `try_wait` next, which would race this poll (round-4 finding 2: the root can
+/// exit between the two, landing the SAME reaping call in a `Reaped` outcome that never went
+/// through this poll's own zombie confirmation at all). `Err`: the poll itself failed, in
+/// practice `ECHILD` (something else already reaped `pid`) — treat as ownership-uncertain,
+/// matching `releases_ownership`. Unlike [`block_until_reapable`], this never blocks: for a
+/// caller whose own kill just failed, `pid` may still be genuinely running for as long as the
+/// process it names runs.
+#[cfg(unix)]
+pub(crate) fn poll_reapable(pid: u32) -> std::io::Result<bool> {
+    #[cfg(test)]
+    if let Some(marker) = crate::child::spawn::fault::take_force_poll_reapable_error() {
+        return Err(std::io::Error::other(marker));
+    }
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+    let rpid = Pid::from_raw(pid as i32).ok_or_else(|| std::io::Error::other("pid 0"))?;
+    Ok(waitid(
+        WaitId::Pid(rpid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+    )?
+    .is_some())
 }
 
 /// `waitid` for a [`Held::Bare`] child, through its pidfd if it has one, else by its pid.
@@ -534,7 +603,7 @@ impl Unreaped {
         let retained = self
             .retained
             .take()
-            .and_then(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
+            .and_then(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained).into_unswept());
         #[cfg(windows)]
         let retained = self.retained.take();
         let waited = held.wait();
@@ -589,7 +658,7 @@ impl Drop for Unreaped {
         let retained = self
             .retained
             .take()
-            .and_then(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained));
+            .and_then(|retained| sweep_recyclable_pgid_before_reap(self.pid, retained).into_unswept());
         #[cfg(windows)]
         let retained = self.retained.take();
         if let Some(held) = self.held.take() {

@@ -199,7 +199,7 @@ impl ReapTask {
             // `reaped`/`spawn_drain` at all — round-3 finding 2's fix relies on that: nothing left
             // to re-sweep later.
             if let Some(retained) = self.retained.take() {
-                self.retained = crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, retained);
+                self.retained = crate::child::unreaped::sweep_recyclable_pgid_before_reap(pid, retained).into_unswept();
             }
             self.held.as_mut().expect("claimed above").try_reap()
         });
@@ -1292,7 +1292,7 @@ impl Drop for Unreaped {
         #[cfg(unix)]
         let retained = self.retained.take().and_then(|retained| {
             if self.held.is_some() {
-                crate::child::unreaped::sweep_recyclable_pgid_before_reap(self.pid, retained)
+                crate::child::unreaped::sweep_recyclable_pgid_before_reap(self.pid, retained).into_unswept()
             } else {
                 Some(retained)
             }

@@ -272,10 +272,11 @@ fn sweep_skips_hard_kill_when_it_cannot_confirm_the_root_is_still_a_zombie() {
 
     assert!(
         matches!(
-            result.as_deref(),
-            Some(Retained {
-                attached: crate::containment::Attached::ProcessGroup(g)
-            }) if *g == pid as i32
+            &result,
+            super::SweepOutcome::Unconfirmed(retained) if matches!(
+                retained.attached,
+                crate::containment::Attached::ProcessGroup(g) if g == pid as i32
+            )
         ),
         "a confirmatory failure must hand the retention back unswept, for the caller's own \
          failed-wait branch to abandon: got {result:?}"
@@ -338,7 +339,7 @@ fn sweep_kills_through_a_live_process_group_when_it_confirms_the_root_is_still_a
     let result = super::sweep_recyclable_pgid_before_reap(pgid, retained);
 
     assert!(
-        result.is_none(),
+        matches!(result, super::SweepOutcome::Swept),
         "a confirmed sweep must fully consume the retention (nothing left to sweep again): got \
          {result:?}"
     );
