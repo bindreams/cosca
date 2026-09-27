@@ -1066,18 +1066,53 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
 /// `hard_kill_test_key` fixes this by never being a real, kernel-recycled identity in the first
 /// place: it is this process's own counter, assigned once per `Marker` and never reused for the
 /// process's whole life, so no two markers — however their real fds/handles overlap in time —
-/// can ever collide on it. This test proves that guarantee directly: a value that repeats even
-/// once would silently reintroduce exactly the conflation the flake above suffered from.
+/// can ever collide on it. This test proves that guarantee end to end, on two REAL markers alive
+/// at the same time: each `hard_kill()` call must be recorded under that marker's OWN
+/// `hard_kill_test_key()`, not under any other value — in particular not under `Marker::handle`,
+/// the very field `HARD_KILL_CALLS`'s doc explains this replaced. A mutant that reverts
+/// `hard_kill`'s bookkeeping call site back to `fault::record_hard_kill_call(self.handle)` fails
+/// this test: `hard_kill_test_key()` is a process-wide monotonic counter already well past
+/// `handle`'s small, OS-assigned fd-derived range by the time this test runs (every earlier
+/// test's markers already advanced it), so recording under `handle` never lands on either
+/// marker's own key, and `take_hard_kill_calls` on it reads back 0, not 1.
 #[test]
-fn hard_kill_test_keys_are_never_reused_within_the_process() {
-    let mut seen = std::collections::HashSet::new();
-    // Large enough to be a meaningful guarantee, small enough to run in well under a second;
-    // this is checking a monotonic counter's arithmetic, not timing anything.
-    for _ in 0..100_000 {
-        let key = super::fault::next_hard_kill_test_key();
-        assert!(
-            seen.insert(key),
-            "key {key} was already issued to an earlier marker in this process"
-        );
-    }
+fn two_live_markers_record_hard_kill_under_their_own_test_key() {
+    let _serialize = test_spawn_lock();
+    let mut cmd_a = std::process::Command::new("/usr/bin/true");
+    let prepared_a = super::install(&mut cmd_a, &[]).expect("install");
+    let marker_a = super::Marker::new(prepared_a, None, None, false);
+
+    let mut cmd_b = std::process::Command::new("/usr/bin/true");
+    let prepared_b = super::install(&mut cmd_b, &[]).expect("install");
+    let marker_b = super::Marker::new(prepared_b, None, None, false);
+
+    assert_ne!(
+        marker_a.hard_kill_test_key(),
+        marker_b.hard_kill_test_key(),
+        "two markers alive at the same time must never share a test key"
+    );
+
+    // Blind passes (root: None, pgid: None keeps every channel inert — see
+    // `hard_kill_reports_err_on_a_genuinely_blind_pass`'s own doc), so this exercises only
+    // `hard_kill`'s own accounting, not any real process's teardown.
+    crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+    let _ = marker_a.hard_kill();
+    crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+    let _ = marker_b.hard_kill();
+
+    assert_eq!(
+        super::fault::take_hard_kill_calls(marker_a.hard_kill_test_key()),
+        1,
+        "marker_a's hard_kill must be recorded under marker_a's own hard_kill_test_key"
+    );
+    assert_eq!(
+        super::fault::take_hard_kill_calls(marker_b.hard_kill_test_key()),
+        1,
+        "marker_b's hard_kill must be recorded under marker_b's own hard_kill_test_key"
+    );
+
+    // This test is only about `hard_kill`'s call-accounting, not teardown: disarm both so their
+    // own `Drop` does not attempt a second, real kill-through sweep.
+    marker_a.disarm();
+    marker_b.disarm();
 }
