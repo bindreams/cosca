@@ -48,6 +48,10 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
 /// (shared, multithreaded) test binary's own irreversible process-wide state out from under every
 /// other concurrently running test. See [`run_fixture_with_cwd`]'s doc for the re-exec rationale,
 /// the panic conditions, and why `fixture` should come from [`fixture_path!`].
+///
+/// `#[cfg(unix)]`: every current caller drops DAC-bypassing privilege, a unix-only concept: gate
+/// this the same way rather than carry a cross-platform no-caller-on-Windows dead-code warning.
+#[cfg(unix)]
 pub(crate) fn run_fixture(fixture: &str, marker_env: &str) {
     let mut cmd = fixture_command(fixture);
     cmd.env(marker_env, "1");

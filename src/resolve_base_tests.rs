@@ -422,6 +422,7 @@ fn a_denied_candidate_fails_a_loadable_only_search_closed() {
     );
 }
 
+#[cfg(unix)]
 const FIXTURE_DENIED_CLOSED_ENV: &str = "COSCA_FIXTURE_DENIED_CLOSED";
 
 /// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]: a no-op when
@@ -466,6 +467,7 @@ fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
     );
 }
 
+#[cfg(unix)]
 const FIXTURE_DENIED_SKIPPED_ENV: &str = "COSCA_FIXTURE_DENIED_SKIPPED";
 
 /// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`] — see
