@@ -269,6 +269,20 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Copies `src` into `dir` (a directory the caller has already chmod'd world-traversable) and
+/// chmods the copy `0o755` — explicitly, regardless of `src`'s own permissions or the ambient
+/// umask. `fs::copy` preserves the SOURCE's mode on the destination, which is not good enough on
+/// its own: see [`foreign_kill_surfaces_permission_denied`]'s doc for why `src` itself may
+/// already be missing "other" exec.
+#[cfg(unix)]
+fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dest = dir.join(src.file_name().expect("src has a file name"));
+    std::fs::copy(src, &dest).expect("copy into the scratch directory");
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).expect("chmod the copy world-executable");
+    dest
+}
+
 /// A genuinely foreign, unprivileged caller's `kill` on a genuinely foreign, unprivileged target
 /// must surface `EPERM` as `Err`, never swallow it into `Ok`. Runs only as root
 /// (`preconditions::root`): the test needs `CAP_SETUID`/`CAP_SETGID` to drop into two DIFFERENT
@@ -291,15 +305,30 @@ impl Drop for KillOnDrop {
 #[skuld::test(requires = [preconditions::root])]
 fn foreign_kill_surfaces_permission_denied() {
     use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
 
+    // Both binaries below get spawned under an uid that is neither their file's owner (root, the
+    // uid that built or archive-extracted them) nor its group — ordinary "other" access, gated on
+    // the "other" bits alone. Measured: those bits are NOT reliably set. `cargo build`'s own
+    // linker output honors the ambient umask like any created file (confirmed: `umask 027` alone
+    // yields mode 0750, no "other" exec, on a plain unprivileged-then-root build/run split — the
+    // exact shape `sudo` produces in CI); nextest's own archive-extraction temp directory is
+    // subject to the very same umask. A copy into a directory THIS process explicitly chmods,
+    // right before use, is the only way to stop depending on whatever umask happens to be
+    // ambient in whatever environment (CI's `sudo`, or a human's own shell) runs this test.
+    let scratch = tempfile::tempdir().expect("scratch directory for world-executable copies");
+    std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod the scratch directory world-traversable");
+    let target_bin = world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
+
     // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
     // such concept), so this one spawn uses `std::process::Command` directly, replicating
     // `tests/common/mod.rs`'s `spawn_control` handshake by hand instead of reusing it.
-    let target = std::process::Command::new(common::testbin())
+    let target = std::process::Command::new(&target_bin)
         .args(["control-block", &addr, "R"])
         .uid(TARGET_UID)
         .gid(TARGET_UID)
@@ -314,11 +343,12 @@ fn foreign_kill_surfaces_permission_denied() {
     // reach this — see the struct doc for why this kill can never itself return EPERM.
     let _target_guard = KillOnDrop(Some(target));
 
-    // The actual caller under test: re-exec THIS SAME test binary as READER_UID. Its result
-    // crosses back as an exit code ONLY (never parsed text) — see `foreign_kill_helper_main`'s
-    // doc for the exact mapping.
+    // The actual caller under test: re-exec THIS SAME test binary (another world-executable
+    // copy — see above) as READER_UID. Its result crosses back as an exit code ONLY (never
+    // parsed text) — see `foreign_kill_helper_main`'s doc for the exact mapping.
     let exe = std::env::current_exe().expect("this test binary's own path");
-    let status = std::process::Command::new(&exe)
+    let reader_bin = world_executable_copy(&exe, scratch.path());
+    let status = std::process::Command::new(&reader_bin)
         .uid(READER_UID)
         .gid(READER_UID)
         .env(ENV_TARGET_PID, target_pid.to_string())
