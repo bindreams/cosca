@@ -278,43 +278,37 @@ fn a_candidate_is_accepted_when_fully_qualified() {
     }
 }
 
-/// Restores a directory's permissions on drop, so the tempdir can be removed whatever the test's
-/// outcome.
+/// One byte past `NAME_MAX` (255 on ext4, tmpfs, APFS and HFS+): a single path component this
+/// long is refused by the kernel's parse of the name itself, before any lookup or permission check
+/// runs.
 #[cfg(unix)]
-struct Locked(PathBuf);
-
-#[cfg(unix)]
-impl Locked {
-    fn new(dir: PathBuf) -> Self {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        Locked(dir)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Locked {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)) {
-            log::warn!("could not unlock {:?}: {e}", self.0);
-        }
-    }
-}
+const UNNAMEABLE_COMPONENT_LEN: usize = 256;
 
 /// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
+///
+/// The first entry is a directory that is never created, named one byte past `NAME_MAX`: `stat`
+/// rejects a component that long while parsing the name, before it asks whether anything exists
+/// there, so no on-disk fixture is needed to make the check fail.
+///
+/// A chmod'd directory (the previous fixture here) does not survive contact with root: refusing a
+/// stat by permission bits is a DAC (discretionary access control) decision, and root carries
+/// `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, the capabilities that make root exempt from DAC —
+/// measured 2026-09-27 in `rust:1.90.0-bookworm`, root's `stat` on a `0o000` directory does not
+/// error, it just sees an empty directory and reports `ENOENT` for the file inside, which is a
+/// definite absence, not an undeterminable candidate. A component over `NAME_MAX` fails identically
+/// for root and any other caller: name-length is a syntactic limit on the request itself, checked
+/// before permissions are ever consulted, and no capability grants an exemption from it.
 #[cfg(unix)]
-fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
+fn unnameable_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
     let root = tempfile::tempdir().unwrap();
-    let locked = root.path().join("locked");
+    let unnameable = root.path().join("a".repeat(UNNAMEABLE_COMPONENT_LEN));
     let open = root.path().join("open");
-    std::fs::create_dir(&locked).unwrap();
     std::fs::create_dir(&open).unwrap();
     std::fs::write(open.join("tool.exe"), b"x").unwrap();
-    let mut path = locked.clone().into_os_string();
+    let mut path = unnameable.into_os_string();
     path.push(";");
     path.push(&open);
-    (root, Locked::new(locked), open, path)
+    (root, open, path)
 }
 
 #[cfg(unix)]
@@ -331,14 +325,14 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
 }
 
 /// Under `loadable_only`, a candidate whose existence cannot be determined fails the search closed:
-/// the entry after it must not win because a check errored. Fails loudly under root, which can
-/// search the locked directory.
+/// the entry after it must not win because a check errored. `ENAMETOOLONG` decodes to
+/// [`std::io::ErrorKind::InvalidFilename`] (stable since Rust 1.83), the same for every caller.
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
-    let (_root, _locked, _open, path) = locked_then_open();
+    let (_root, _open, path) = unnameable_then_open();
     match search_tool(&path, true) {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidFilename, "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }
@@ -348,7 +342,7 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
-    let (_root, _locked, open, path) = locked_then_open();
+    let (_root, open, path) = unnameable_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
