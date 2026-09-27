@@ -817,15 +817,35 @@ impl Drop for Child {
                     let _ = p.entered.send(std::thread::current().id());
                 }
                 let pid = self.id.pid();
-                let os = std::mem::take(&mut self.os);
-                // Round-4 findings D2 and D3: this branch never signals the root itself (see the
-                // module doc a few lines up — "nothing is signalled here"), so there is never a
-                // confirmed-sent signal for `wait_and_reap` to bound a wait on, whether or not
-                // the root happens to be reaped already: `release_possibly_blocking` always
-                // releases with `skip_wait: true`, and routes off this thread whenever
-                // `os.attached`'s own drop (this leaf's drain wait) may still block — which
-                // `disarmed_kill_may_block_drop` above already established, regardless of the
-                // root's own reap state.
+                let mut os = std::mem::take(&mut self.os);
+                // Already reaped: nothing left to wait for regarding the ROOT's own reap — but
+                // `os.attached`'s own drop (this leaf's drain wait) can still block regardless
+                // (`disarmed_kill_may_block_drop` above already established that), and here that
+                // block is INTENTIONALLY left inline, synchronous, on this thread: a caller that
+                // has already reaped the root itself (an explicit `kill_tree()` + `wait()` before
+                // dropping, exactly like `detach()`'s own contract) gets synchronous cleanup, not
+                // a fire-and-forget hand-off whose completion nothing lets it observe.
+                // `linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
+                // (`tests/tokio_io.rs`) is a real-kernel regression check for exactly this: it
+                // explicitly forbids sleeps or polling in the test, so Drop returning only once
+                // the drain is done is the one contract that lets it assert anything at all.
+                // Round-4 finding D2 proposed routing this off-thread too (matching the ARMED
+                // path's own already-reaped early return, round-3 finding 5) — flagged here
+                // rather than applied, since it broke exactly this test in real CI: routing this
+                // async makes `drop(child)` return before cleanup finishes, with no public way
+                // for a caller to wait for it. Round-4 finding D3's fix (`skip_wait: true`, no
+                // signal-less `wait_and_reap`) still applies below, for the OTHER sub-case, where
+                // the root has not been reaped yet.
+                if os.proc_mut().is_reaped() {
+                    return;
+                }
+                // Round-4 finding D3: this branch never signals the root itself (see the module
+                // doc a few lines up — "nothing is signalled here"), so there is never a
+                // confirmed-sent signal for `wait_and_reap` to bound a wait on here — route
+                // through the reaper pool with `skip_wait: true` instead of the plain
+                // `skip_wait: false` submit this used to make, which could park a worker
+                // waiting on a root a `cgroup.kill` write may have missed entirely (one that
+                // migrated to a different session scope, say).
                 release_possibly_blocking(
                     os,
                     pid,

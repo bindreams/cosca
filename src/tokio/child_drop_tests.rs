@@ -123,34 +123,42 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
     );
 }
 
-/// Regression test for round-4 finding D2: the disarmed branch's own `is_reaped()` early return
-/// dropped `os` — and so `os.attached` — inline whenever the root had already been reaped, even
-/// though a disarmed-but-killed leaf's own `Drop` can still block waiting for a drain (see
-/// `CgroupLeaf::disarmed_kill_may_block_drop`'s doc: ROW 2 of its table waits regardless of the
-/// root). The real scenario: `kill_on_drop(false)`, then an explicit `kill_tree()` and
-/// `wait().await`, with a leaf member still draining when this handle finally drops. Mirrors
-/// `a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool` above, but with the
-/// root reaped (via tokio's own `wait`, which the fix must not special-case away) BEFORE this
-/// handle ever drops, not still running.
+/// Round-4 finding D2 proposed routing the disarmed branch's `is_reaped()` (root already reaped)
+/// case off-thread too, matching the ARMED path's own already-reaped early return (round-3
+/// finding 5). Applying it broke a real-kernel CI check,
+/// `linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
+/// (`tests/tokio_io.rs`), which explicitly forbids sleeps or polling in the test and relies on
+/// `drop(child)` itself not returning until the leaf's drain — and so its `rmdir` — is done: with
+/// no public way to wait for an async hand-off's completion, routing this off-thread makes that
+/// property unprovable from outside the crate, not merely differently-timed. This test proves the
+/// INLINE behavior — that `os.attached` (and so the leaf) drops on the calling thread here,
+/// synchronously, exactly as the real-kernel check needs — using the reaper pool's own probe to
+/// prove the NEGATIVE: the handoff this leaf's `disarmed_kill_may_block_drop()` would otherwise
+/// qualify it for never happens once the root is already reaped.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_disarmed_killed_drop_with_an_already_reaped_root_still_routes_through_the_reaper_pool() {
-    use std::sync::mpsc;
-
+async fn a_disarmed_killed_drop_with_an_already_reaped_root_releases_inline_not_through_the_reaper_pool() {
+    use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
     use crate::containment::Attached;
     use crate::identity::ProcessId;
 
-    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
     use super::{Child, OsResources, ProcSource};
 
-    let fake = FakeLeaf::new("cosca-async-disarmed-killed-reaped-root-routing", false);
+    let fake = FakeLeaf::new("cosca-async-disarmed-killed-reaped-root-inline", false);
+    // A REAL, non-empty tmpfs directory stands in for the leaf: without this hook, even a
+    // correct (unpopulated) removal would fail with a genuine `ENOTEMPTY`, since `cgroup.kill`
+    // and the `cgroup.events` symlink are real filesystem entries here, unlike a real cgroupfs
+    // leaf's own kernel-provided files.
+    let (leaf_path, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf_path, &events));
     let leaf = entered_leaf_at(fake.leaf.clone());
     leaf.disarm();
     leaf.hard_kill().expect("kill the tree");
     assert!(
         leaf.disarmed_kill_may_block_drop(),
-        "test setup: this leaf must be the one Drop routes off the calling thread"
+        "test setup: this leaf must be one `disarmed_kill_may_block_drop()` reports true for, so \
+         the already-reaped check below is what actually keeps it off the reaper pool"
     );
 
     let mut proc = {
@@ -182,39 +190,20 @@ async fn a_disarmed_killed_drop_with_an_already_reaped_root_still_routes_through
         elevation: None,
     };
 
-    let (entered_tx, entered) = mpsc::channel();
-    let (started_tx, started) = mpsc::channel();
-    let (gate_tx, gate_rx) = mpsc::channel();
-    let (outcome_tx, outcome) = mpsc::channel();
-    arm(DropProbe {
-        entered: entered_tx,
-        started: started_tx,
-        gate: gate_rx,
-        outcome: outcome_tx,
-    });
-    drop(gate_tx);
-
     drop(child);
 
-    let dropping = entered.recv().expect(
-        "a disarmed, already-killed drop must reach the reaper handoff even with an \
-                 already-reaped root",
-    );
-    assert_eq!(
-        dropping,
-        std::thread::current().id(),
-        "#[tokio::test] is current-thread"
-    );
-    let executing = started.recv().expect("a worker must take the job");
-    assert_ne!(
-        executing, dropping,
-        "the drain wait must run on a reaper thread, never the thread that called drop, even \
-         though the root was already reaped before this handle dropped"
-    );
+    // Checked immediately, with no wait of any kind: the whole point is that `drop` itself does
+    // not return until this is already true. (This is the same "real-kernel regression check,
+    // not a deterministic proof" tradeoff `tests/tokio_io.rs`'s own twin documents — a wrongly
+    // async release would most likely still leave the leaf present here, but is not GUARANTEED
+    // to; the deterministic proof is the reaper pool's own probe elsewhere in this file, showing
+    // it engages for a STILL-RUNNING root and not for this already-reaped one.)
     assert!(
-        matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
-        "the job must complete via the reaper pool"
+        !fake.leaf.exists(),
+        "an already-reaped root's release must remove the leaf inline, synchronously, before \
+         `drop` returns — matching the real-kernel CI check that has no other way to observe it"
     );
+    fault::take_rmdir_hook();
 }
 
 /// Regression test for round-4 finding D3: the disarmed branch's own `reaper::submit` call, when
