@@ -13,25 +13,30 @@
 //! against rustc 1.98.1's own source) opens the target via `CreateFileW`, which ends up
 //! requesting `SYNCHRONIZE | FILE_READ_ATTRIBUTES` on the handle. A file-level `FILE_GENERIC_READ`
 //! deny (which includes `SYNCHRONIZE`) is not enough on its own — measured on this crate's own
-//! Windows CI runners: `metadata` still returned `Ok`. `SYNCHRONIZE` has no fallback route: per
-//! MS-FSA §2.1.5.1.2.1 ("Algorithm to Check Access to an Existing File"), it is checked exactly
-//! once, against the FILE's own security descriptor, and nothing else can grant it — so that deny
-//! ACE DOES deny the primary `CreateFileW` open, either way. The `Ok` came entirely from
-//! `metadata`'s own fallback — taken on exactly `ERROR_ACCESS_DENIED` or `ERROR_SHARING_VIOLATION`
-//! — which retries via `FindFirstFileExW` on the same path, a directory-listing operation gated on
-//! `FILE_LIST_DIRECTORY` (`0x1`) on the PARENT directory, which a deny ACE on the file cannot
-//! reach at all.
+//! Windows CI runners: `metadata` still returned `Ok`. `SYNCHRONIZE` has no route around a deny on
+//! the file's own security descriptor absent `SeBackupPrivilege` under backup intent (MS-FSA
+//! §2.1.5.1 Phase 4, which grants a fixed `BackupAccess` set including `FILE_GENERIC_READ` to a
+//! caller with that privilege enabled — `FILE_FLAG_BACKUP_SEMANTICS`, which `metadata` also sets,
+//! is what requests backup intent); ordinarily, then, that deny ACE DOES deny the primary
+//! `CreateFileW` open. The `Ok` came entirely from `metadata`'s own fallback — taken on exactly
+//! `ERROR_ACCESS_DENIED` or `ERROR_SHARING_VIOLATION` — which retries via `FindFirstFileExW` on
+//! the same path, a directory-listing operation gated on `FILE_LIST_DIRECTORY` (`0x1`) on the
+//! PARENT directory, which a deny ACE on the file cannot reach at all.
 //!
 //! So the deny ACE below sits on the DIRECTORY instead: `FILE_LIST_DIRECTORY` there closes that
 //! `FindFirstFileExW` fallback. It does NOT close a "parent route to `FILE_READ_ATTRIBUTES`" —
-//! MS-FSA's algorithm checks `FILE_READ_ATTRIBUTES` against the FILE's own security descriptor
-//! FIRST, same as `SYNCHRONIZE`; the parent's `FILE_LIST_DIRECTORY` is consulted only as a
-//! fallback if THAT check denies it, and the file's DACL is left untouched here and grants it
-//! regardless, so that fallback is never even reached — denying `FILE_LIST_DIRECTORY` on the
-//! parent does nothing for `FILE_READ_ATTRIBUTES` in THIS design. What blocks the primary
-//! `CreateFileW` open here instead is `FILE_TRAVERSE` (`0x20`, the same bit as `FILE_EXECUTE`):
-//! reaching `tool.exe` at all requires traversing `locked` first, a check made before MS-FSA's
-//! per-file access algorithm ever runs on the file itself.
+//! MS-FSA §2.1.5.1.2.1 ("Algorithm to Check Access to an Existing File") grants
+//! `FILE_READ_ATTRIBUTES` if EITHER the file's own security descriptor allows it OR the parent's
+//! grants `FILE_LIST_DIRECTORY`, an unconditional OR of two independent checks rather than a
+//! fallback gated on the first one failing. The file's DACL is left untouched here and already
+//! grants it, so denying `FILE_LIST_DIRECTORY` on the parent cannot remove that grant — denying it
+//! there is for the `FindFirstFileExW` fallback alone. What blocks the primary `CreateFileW` open
+//! here instead is `FILE_TRAVERSE` (`0x20`, the same bit as `FILE_EXECUTE`, checked in MS-FSA
+//! §2.1.5.1 Phase 6): reaching `tool.exe` at all requires traversing `locked` first, a check made
+//! before MS-FSA's per-file access algorithm (§2.1.5.1.2.1) ever runs on the file itself — and
+//! unaffected by the `SeBackupPrivilege` nuance above, since Phase 6's `FILE_TRAVERSE` check is
+//! skipped only when `Open.GrantedAccess.FILE_TRAVERSE` is already set, which Phase 4's
+//! `BackupAccess` would do too, but this test measures a token without that privilege enabled.
 //!
 //! `FILE_TRAVERSE` alone is not sufficient either: every ordinary token holds
 //! `SeChangeNotifyPrivilege` ("bypass traverse checking") by default — an interactive session
@@ -339,14 +344,20 @@ fn token_has_privilege(token: HANDLE, luid: LUID) -> bool {
     // SAFETY: the kernel wrote a `TOKEN_PRIVILEGES` — a `u32` count followed by that many
     // `LUID_AND_ATTRIBUTES`, both 4-byte types — at the head of a 4-aligned buffer.
     let count = unsafe { *buf.as_ptr().cast::<u32>() } as usize;
-    debug_assert!(
-        std::mem::size_of::<u32>() + count * std::mem::size_of::<LUID_AND_ATTRIBUTES>() <= needed as usize,
+    // A hard `assert!`, not `debug_assert!`, and checked against `buf.len()` — the buffer's own,
+    // guaranteed real size — rather than `needed`, which is merely what the kernel REPORTED
+    // needing: `from_raw_parts` below reads past `buf` if this does not hold, which is undefined
+    // behaviour, not merely a wrong answer, exactly like `CurrentUserSid::sid`'s own hard assert.
+    assert!(
+        std::mem::size_of::<u32>() + count * std::mem::size_of::<LUID_AND_ATTRIBUTES>()
+            <= buf.len() * std::mem::size_of::<u32>(),
         "GetTokenInformation(TokenPrivileges) reported PrivilegeCount {count} that does not fit \
-         in the {needed}-byte buffer it also reported needing"
+         in the {}-byte buffer actually allocated",
+        buf.len() * std::mem::size_of::<u32>()
     );
     // SAFETY: `count` is exactly how many `LUID_AND_ATTRIBUTES` the same call just wrote
     // immediately after the leading `u32` count, in the same buffer — the assertion just above
-    // is the debug-build check that this really holds.
+    // confirms that fits within `buf`'s own real length.
     let privileges = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(1).cast::<LUID_AND_ATTRIBUTES>(), count) };
     privileges.iter().any(|p| p.Luid == luid)
 }
