@@ -589,16 +589,20 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
     let (ready_read, ready_write) = std::io::pipe().expect("pipe");
     let ready_write_fd = ready_write.as_raw_fd();
     let member = fork_running(move || {
-        // SAFETY (in the child): `signal`, `write` and `pause` are async-signal-safe.
+        // SAFETY (in the child): `signal`, `write`, `_exit` and `pause` are async-signal-safe.
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
-            libc::write(ready_write_fd, b"r".as_ptr().cast(), 1);
+            if libc::write(ready_write_fd, b"r".as_ptr().cast(), 1) != 1 {
+                // The parent's `block_on` below would otherwise hang forever on a write that
+                // never lands: exit so it sees EOF instead.
+                libc::_exit(1);
+            }
             libc::pause();
         }
     });
-    drop(ready_write); // the parent's copy of the write end, closed once
+    drop(ready_write);
     block_on(ready_read.as_raw_fd()); // the member ignores SIGTERM from here on
-    drop(ready_read); // the parent's copy of the read end, closed once
+    drop(ready_read);
     std::fs::write(leaf_path.join("cgroup.procs"), format!("{member}\n")).expect("list the member");
     // `populated 1`: the member is still alive, and Drop's never-killed branch reads this file
     // to tell a leaf still holding its tree from one that already drained on its own.

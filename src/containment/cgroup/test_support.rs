@@ -26,12 +26,30 @@ pub(crate) fn reap(pid: u32) {
     assert_eq!(reaped, pid as i32, "waitpid: {}", std::io::Error::last_os_error());
 }
 
-/// Block on `gate` until a byte arrives. Async-signal-safe.
+/// A forked child that fails inside [`block_on`] cannot say why — no formatted panic, no
+/// allocation — so this number is the only diagnostic a hang left blocked on that read gets.
+#[cfg(target_os = "linux")]
+const BLOCK_ON_READ_FAILED_EXIT: i32 = 111;
+
+/// Block on `gate` until a byte arrives. Async-signal-safe: may run in a forked, pre-exec child.
 #[cfg(target_os = "linux")]
 pub(crate) fn block_on(gate: std::os::fd::RawFd) {
     let mut byte = 0u8;
-    // SAFETY: `gate` is an open read end; `byte` is a valid one-byte buffer.
-    unsafe { libc::read(gate, (&raw mut byte).cast(), 1) };
+    let n = loop {
+        // SAFETY: `gate` is an open read end; `byte` is a valid one-byte buffer.
+        let n = unsafe { libc::read(gate, (&raw mut byte).cast(), 1) };
+        if n == -1 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // A real read failure leaves nothing to retry, and this may run pre-exec in a forked
+            // child: no formatted panic (allocates), a distinct exit instead.
+            // SAFETY: async-signal-safe.
+            unsafe { libc::_exit(BLOCK_ON_READ_FAILED_EXIT) };
+        }
+        break n;
+    };
+    debug_assert_eq!(n, 1, "read");
 }
 
 /// A copy of `channel`'s child end, standing in for the one a forked child inherits: the parent's
