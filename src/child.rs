@@ -89,17 +89,6 @@ pub struct Child {
     attached: crate::containment::Attached,
     graceful: crate::graceful::GracefulMechanism,
     elevation: Option<crate::elevation::ElevationReport>,
-    /// Whether THIS handle's own [`wait`](Child::wait)/[`try_wait`](Child::try_wait) has ever
-    /// observed the root already exited (which, on Unix, always means reaped too — neither
-    /// returns a status without reaping). Set ONLY by those two calls, NEVER inferred from a
-    /// fresh kernel poll in `Drop`: a fast-exiting root can already be reaped by `SharedChild::new`'s
-    /// own internal `try_wait` (see `child/spawn.rs`'s comment on it) before this handle even
-    /// exists, and `Drop`'s tree-kill must still run unconditionally THEN — that race is a
-    /// separate, accepted, unfixed gap (`kill_tree`'s precondition doc), not what this flag
-    /// guards. It guards the caller's own LATER, explicit observation, which the caller could
-    /// then hold onto indefinitely before dropping — the actual unbounded window `Drop`'s tree-kill
-    /// cannot safely walk into for a recyclable pgid.
-    reaped_via_public_wait: std::sync::atomic::AtomicBool,
 }
 
 impl Child {
@@ -119,7 +108,6 @@ impl Child {
             attached: attachment.attached,
             graceful: attachment.graceful,
             elevation: None,
-            reaped_via_public_wait: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -213,20 +201,12 @@ impl Child {
 
     /// Block until the child exits, returning its status.
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
-        let status = self.proc().wait().map_err(Error::Io)?;
-        self.reaped_via_public_wait
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(status)
+        self.proc().wait().map_err(Error::Io)
     }
 
     /// Return the exit status if the child has already exited.
     pub fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, Error> {
-        let status = self.proc().try_wait().map_err(Error::Io)?;
-        if status.is_some() {
-            self.reaped_via_public_wait
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(status)
+        self.proc().try_wait().map_err(Error::Io)
     }
 
     /// Is this a wrapper-elevated child a plain parent may be unable to signal?
@@ -573,33 +553,10 @@ impl Drop for Child {
         if !self.kill_on_drop {
             return; // detached / opted out
         }
-        // A recyclable-pgid mechanism's `hard_kill` below would `killpg` a possibly-RECYCLED
-        // pgid if the caller's own prior `wait()`/`try_wait()`/`wait_deadline()` already reaped
-        // the root, entirely outside this `Drop`'s control, before now. Gated on
-        // `reaped_via_public_wait` specifically — NOT a fresh kernel poll here — because a fresh
-        // poll cannot tell that apart from the ordinary, harmless case where `SharedChild::new`'s
-        // own internal `try_wait` reaped a fast-exiting root during spawn itself, before this
-        // handle (or its caller) ever existed: THAT race is accepted and unfixed elsewhere
-        // (`kill_tree`'s precondition doc), and this `Drop` must still hard-kill unconditionally
-        // then, exactly as before — see `reaped_via_public_wait`'s own doc.
-        #[cfg(unix)]
-        let already_reaped = self.attached.carries_recyclable_pgid()
-            && self.reaped_via_public_wait.load(std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(unix))]
-        let already_reaped = false;
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
-        let tree = if already_reaped {
-            log::warn!(
-                "Child::drop: skipping the contained-tree kill for already-reaped pid {}: its \
-                 pgid may already be recycled onto an unrelated, live process group",
-                self.id.pid()
-            );
-            Ok(())
-        } else {
-            self.attached.hard_kill()
-        };
+        let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             // Visible, not silently discarded, on the RAII teardown path most callers actually
             // hit. Never a `debug_assert` (round-4): a genuine mechanism failure —
