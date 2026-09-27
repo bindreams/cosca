@@ -44,7 +44,7 @@ Async `Drop` may send a bounded number of signals, and may write `cgroup.kill`, 
 file write. It never waits for a process exit or a cgroup drain. Completion is explicit and async:
 `wait().await` for the root, plus `wait_tree().await` for the tree where the mechanism has a drain
 edge (cgroup, Job Object, fd marker). A bare drop that leaves work unfinished leaves the resource
-behind and logs a warning naming it.
+behind and logs it as principle 7 says.
 
 A dropped, still-running async root is left to tokio's drop of its `Child`: an in-drop `try_wait`
 ([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
@@ -54,9 +54,9 @@ best-effort: it drains only while some tokio runtime parks ([tokio runtime/proce
 then the root stays a zombie.
 
 On evidence of a foreign reap at drop time, cosca instead takes the child's stdio out, forgets
-tokio's `Child`, and logs a warning naming what the forget leaks: on Linux the pidfd and its reactor
-registration ([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in [#174]
-and open with the owner.
+tokio's `Child`, and logs what the forget leaks as principle 7 says: on Linux the pidfd and its
+reactor registration ([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
+[#174] and open with the owner.
 
 tokio discards a PID that is already reaped: the queue drops it on `ECHILD` ([tokio orphan.rs]).
 Neither step can detect a foreign reap followed by the number's reuse for another child of ours,
@@ -98,7 +98,8 @@ unrelated process.
 
 The application or another library may reap cosca's children (`SIGCHLD` set to `SIG_IGN`, or
 `waitpid(-1)`), and init and supervisor programs must. cosca detects it where it can (`ECHILD`,
-`ESRCH`), releases the child without signalling it, and never debug-asserts on it.
+`ESRCH`), releases the child without signalling it, logs it as principle 7 says, and never
+debug-asserts on it.
 
 After a foreign reap:
 
@@ -128,9 +129,14 @@ guarantees at all.
 
 An outcome the OS can really produce, such as `EACCES` from a privilege drop, `ECHILD`, `ESRCH` or a
 failed `cgroup.kill` write, is handled, not `debug_assert!`ed. A contract violation that is
-genuinely unreachable is asserted in debug, not merely documented. In `Drop`, a failed kill or
-signal logs a warning naming the resource. A foreign reap itself logs at `debug`, and a resource it
-forces cosca to leak gets a warning (principle 3).
+genuinely unreachable is asserted in debug, not merely documented. Handled outcomes are logged by
+class:
+
+- A foreign reap, anywhere, logs at `debug`.
+- A failed kill or signal logs at least at `warn` and names the resource. A mechanism failure may
+  log at `error`.
+- A drop that leaves behind something the caller did not ask to keep logs at least at `warn` and
+  names it. A deliberate `detach()` or `kill_on_drop(false)` is not such a leftover.
 
 **Why:** an assert on a reachable outcome panics debug builds on correct behaviour, while a
 documented-only contract breaks silently when a future caller violates it.
