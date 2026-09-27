@@ -395,6 +395,53 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
     })
 }
 
+/// The env var [`stat_errno_via_grandchild`] sets `fixture_stat_errno_probe`'s target to.
+#[cfg(unix)]
+const FIXTURE_STAT_TARGET_ENV: &str = "COSCA_FIXTURE_STAT_TARGET";
+
+/// Inert in an ordinary suite run. `stat`s [`FIXTURE_STAT_TARGET_ENV`] and exits with the raw
+/// errno (`0` on success) — nothing is written to stdout or stderr, so the PARENT
+/// ([`stat_errno_via_grandchild`]) learns the result from the exit code alone. That is the whole
+/// reason this fixture exists rather than a plain `ls`/`stat` command: `strerror()`'s text (what
+/// `ls`'s own stderr, and `std::io::Error`'s `Display`, both go through) is localized by
+/// `LANG`/`LC_ALL` — measured, `ls`'s English "Permission denied" becomes German "keine
+/// Berechtigung" — and this crate does not parse human text. An exit code has no locale.
+#[cfg(unix)]
+#[test]
+fn fixture_stat_errno_probe() {
+    let Some(target) = std::env::var_os(FIXTURE_STAT_TARGET_ENV) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    std::process::exit(match std::fs::metadata(&target) {
+        Ok(_) => 0,
+        Err(e) => e.raw_os_error().unwrap_or(-1),
+    });
+}
+
+/// Re-execs this test binary's [`fixture_stat_errno_probe`] against `target` in a FRESH child
+/// process — a genuine `execve`, not this thread's own `stat` — and returns the raw errno it
+/// exited with (`None` on success). Used by
+/// [`fixture_a_denied_candidate_is_denied_by_an_exec_child`], which needs to know whether an
+/// EXEC'D child, not this thread, can reach `target`.
+#[cfg(unix)]
+fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
+    let mut child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        crate::test_child::fixture_command(crate::test_child::fixture_path!(fixture_stat_errno_probe))
+            .env(FIXTURE_STAT_TARGET_ENV, target)
+            .spawn()
+            .expect("spawn the stat probe")
+    };
+    match child.wait().expect("wait for the stat probe").code() {
+        Some(0) => None,
+        Some(code) => Some(code),
+        None => panic!("the stat probe was terminated by a signal, not an exit"),
+    }
+}
+
 /// Under `loadable_only`, a candidate whose existence cannot be determined fails the search closed:
 /// the entry after it must not win because a check errored. Uid-independent: passes as root and as
 /// any other caller alike.
@@ -441,6 +488,33 @@ fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
     }
 }
 
+/// Pins [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s `.expect("drop DAC
+/// bypass")` — `crate::test_privilege::drop_dac_bypass`'s injection seam (see its doc) is what
+/// forces the failure this drives through; the other two `.expect("drop DAC bypass")` sites in
+/// this file share the identical one-line pattern and are not separately driven. Asserts the
+/// child's own panic MESSAGE, not an OS-generated string: `Error::other`'s payload is whatever
+/// plain text this test supplied, never `strerror()`'s locale-dependent wording.
+#[cfg(unix)]
+#[test]
+fn a_denied_candidate_fails_a_loadable_only_search_closed_reports_an_injected_dac_bypass_failure() {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        crate::test_child::fixture_command(crate::test_child::fixture_path!(
+            fixture_a_denied_candidate_fails_a_loadable_only_search_closed
+        ))
+        .env(crate::test_privilege::INJECT_FAILURE_ENV, "injected boom")
+        .spawn()
+        .expect("spawn the fixture")
+    };
+    let output = child.wait_with_output().expect("wait for the fixture");
+    assert!(!output.status.success(), "{output:?}");
+    // A failing libtest test's panic is replayed into ITS OWN stdout, not stderr — this fixture
+    // never wrote anything to its real stderr the way `report()`-style fixtures do.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("drop DAC bypass"), "{stdout}");
+    assert!(stdout.contains("injected boom"), "{stdout}");
+}
+
 /// An ordinary spawn skips it and goes on, as before, so one `PATH` entry whose candidate cannot be
 /// checked does not break every unelevated spawn.
 #[cfg(unix)]
@@ -477,14 +551,18 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
 }
 
 /// The regain [`crate::test_privilege::drop_dac_bypass`]'s `no_new_privs` call exists to prevent,
-/// checked the only way it can be: by actually exec'ing a child. Every OTHER test here — including
-/// [`a_denied_candidate_fails_a_loadable_only_search_closed`], which checks THIS thread's own
-/// `stat` — only observes THIS thread's own capability sets; a uid-0 thread whose bounding set
-/// still holds `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` (because it lacked `CAP_SETPCAP` to drop
-/// them) regains both there at ITS OWN `execve`, via the kernel's legacy set-user-ID-root
-/// compatibility grant, wholly independently of what this thread's effective, permitted or
-/// inheritable sets were reduced to — no same-thread check, however thorough, can see that. Runs
-/// in a re-exec — see [`fixture_a_denied_candidate_is_denied_by_an_exec_child`].
+/// checked by observing the REAL consequence rather than trusting the kernel's own report of it.
+/// `drop_dac_bypass`'s postcondition already asks the kernel `no_new_privs()` and fails closed if
+/// that answer is `false` — which catches a mutant that deletes the `set_no_new_privs` CALL alone
+/// (measured: `--cap-drop SETPCAP`, deleting only the call fails this test, the other two real-
+/// `EACCES` tests, AND `exact_posix_tests`'s real spawn test, all via that same postcondition,
+/// with no exec needed). What that postcondition does NOT cover is a mutant that also removes ITS
+/// OWN check alongside the call: nothing then asks the kernel anything, so nothing here would
+/// notice — except this test, which does not ask the kernel's opinion on this thread's OWN state
+/// at all. It asks what a REAL uid-0 thread's `execve` of an ordinary binary actually grants a
+/// child, per the legacy set-user-ID-root compatibility rule, wholly independently of what this
+/// thread's own effective, permitted, inheritable, or self-reported `no_new_privs` state claims.
+/// Runs in a re-exec — see [`fixture_a_denied_candidate_is_denied_by_an_exec_child`].
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_is_denied_by_an_exec_child() {
@@ -495,8 +573,8 @@ fn a_denied_candidate_is_denied_by_an_exec_child() {
 
 /// The child half of [`a_denied_candidate_is_denied_by_an_exec_child`] — see
 /// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s doc, which this mirrors,
-/// except the assertion: instead of THIS thread's own `stat`, it spawns `ls` on the locked
-/// directory and requires that CHILD to be denied too.
+/// except the assertion: instead of THIS thread's own `stat`, it re-execs
+/// [`fixture_stat_errno_probe`] as a grandchild and requires THAT to be denied too.
 #[cfg(unix)]
 #[test]
 fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
@@ -505,18 +583,11 @@ fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
     }
     crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
     let (_root, locked, _open, _path) = locked_then_open();
-    let out = std::process::Command::new("ls")
-        .arg(&locked.0)
-        .output()
-        .expect("spawn ls");
-    assert!(
-        !out.status.success(),
-        "an exec'd child must not regain access to a directory this thread was just denied: {out:?}"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(
-        stderr.contains("permission denied"),
-        "expected the child's own refusal to be a permission denial, got: {stderr}"
+    let errno = stat_errno_via_grandchild(&locked.0.join("tool.exe"));
+    assert_eq!(
+        errno,
+        Some(libc::EACCES),
+        "an exec'd child must not regain access to a directory this thread was just denied, got {errno:?}"
     );
 }
 

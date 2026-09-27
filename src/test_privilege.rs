@@ -36,8 +36,16 @@
 /// Call this ONLY at the very start of a freshly re-exec'd, single-test fixture process (see
 /// [`crate::test_child::run_fixture`]): it changes this thread's credentials permanently, which
 /// would corrupt every other concurrently running test if it ran inside the shared multi-test
-/// suite process instead.
+/// suite process instead. Asserted in debug via
+/// [`crate::test_child::parent_pid_matches`] — the same real-parent-pid check `run_fixture`'s own
+/// callers gate on, so a caller that reaches this function without having gone through that gate
+/// panics here instead of corrupting the shared process silently.
 pub(crate) fn drop_dac_bypass() -> std::io::Result<()> {
+    debug_assert!(
+        crate::test_child::parent_pid_matches(),
+        "drop_dac_bypass must only run in a freshly re-exec'd, single-test fixture process — \
+         this process's real parent does not match the pid run_fixture recorded"
+    );
     if let Ok(msg) = std::env::var(INJECT_FAILURE_ENV) {
         return Err(std::io::Error::other(msg));
     }
@@ -49,15 +57,20 @@ pub(crate) fn drop_dac_bypass() -> std::io::Result<()> {
 }
 
 /// Test-only: when set, [`drop_dac_bypass`] returns `Err` immediately with this value as the
-/// message, skipping the real drop entirely. This is the seam
-/// `exact_posix_tests.rs::reports_and_exits_on_an_injected_dac_bypass_failure` uses to drive the
-/// REAL call site (`report_and_exit_on_dac_bypass_failure(drop_dac_bypass())`,
-/// `resolve_base_tests.rs`'s `.expect()`) through a genuine failure, rather than a stand-in that
-/// calls the downstream handler directly and so cannot catch a mutant at the call site itself
-/// (measured: an earlier version of that test called the handler directly, and a mutant that
-/// dropped the call to `drop_dac_bypass` at the real call site entirely went undetected). A real
-/// failure IS forceable without this seam — `strace -f -e trace=capset -e inject=capset:error=EPERM`,
-/// measured — just not portably enough to run as an ordinary `cargo test`.
+/// message, skipping the real drop entirely. This is the seam each of `drop_dac_bypass`'s two
+/// call sites drives on its OWN — a mutant at either site (discarding the `Result`, or otherwise
+/// not propagating the `Err`) is only caught by a driver that goes through that SAME site, not by
+/// one that calls its downstream handler directly (measured: an earlier version of
+/// `exact_posix_tests.rs::reports_and_exits_on_an_injected_dac_bypass_failure` called
+/// `report_and_exit_on_dac_bypass_failure` directly, and a mutant that dropped the call to
+/// `drop_dac_bypass` at the real call site entirely went undetected). Driven from
+/// `exact_posix_tests.rs::reports_and_exits_on_an_injected_dac_bypass_failure` (its
+/// `report_and_exit_on_dac_bypass_failure(drop_dac_bypass())` call site) and from
+/// `resolve_base_tests.rs::a_denied_candidate_fails_a_loadable_only_search_closed_reports_an_injected_dac_bypass_failure`
+/// (one of its three `.expect()` sites — the other two share the identical one-line pattern, so
+/// are not separately driven). A real failure IS forceable without this seam —
+/// `strace -f -e trace=capset -e inject=capset:error=EPERM`, measured — just not portably enough
+/// to run as an ordinary `cargo test`.
 pub(crate) const INJECT_FAILURE_ENV: &str = "COSCA_FIXTURE_INJECT_DAC_BYPASS_FAILURE";
 
 /// The uid and gid a root fixture drops to: `nobody` on Linux, and the conventional unallocated
@@ -71,9 +84,9 @@ const UNPRIVILEGED: libc::uid_t = 65534;
 #[cfg(not(target_os = "linux"))]
 fn drop_root_uid() -> std::io::Result<()> {
     // SAFETY: plain credential calls with valid arguments. libtest runs this on a thread of its
-    // own, not the main one, which is fine: glibc and musl broadcast a set*id to every thread
-    // (setxid), and Darwin's credentials are per-process, so the whole fixture process drops
-    // together — and the check that must run restricted happens on this same thread anyway.
+    // own, not the main one, which is fine: Darwin's credentials are per-process, so the whole
+    // fixture process drops together — and the check that must run restricted happens on this
+    // same thread anyway.
     unsafe {
         if libc::geteuid() != 0 {
             return Ok(());
@@ -106,9 +119,11 @@ fn drop_dac_capabilities() -> std::io::Result<()> {
     // either of those two here already clears it from ambient too (measured: `CapAmb` reads `0`
     // afterwards with no `prctl(PR_CAP_AMBIENT, …)` call at all). An earlier version of this
     // function called `PR_CAP_AMBIENT_LOWER` explicitly, redundantly — and on a kernel without
-    // ambient support (Linux < 4.3), or under a seccomp filter that blocks `prctl`, that call is
-    // the only step that fails: `main`, which never touches ambient, passes there; this function,
-    // for no reason once capset's own invariant already does the job, did not.
+    // ambient support (Linux < 4.3), or under a seccomp filter that refuses `PR_CAP_AMBIENT`
+    // specifically (the bounding-set and `no_new_privs` calls below are `prctl` too, and stay
+    // unaffected by such a filter), that call was the only step that failed: `main`, which never
+    // touches ambient, passes there; this function, for no reason once capset's own invariant
+    // already does the job, did not.
     let mut sets = rustix::thread::capabilities(None)?;
     sets.effective.remove(dac);
     sets.permitted.remove(dac);
