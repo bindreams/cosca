@@ -88,7 +88,6 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -189,7 +188,6 @@ async fn a_disarmed_killed_drop_with_an_already_reaped_root_releases_inline_not_
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     drop(child);
@@ -277,7 +275,6 @@ async fn a_disarmed_killed_drop_whose_kill_missed_the_root_does_not_park_a_reape
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -372,7 +369,6 @@ async fn a_failed_start_kill_still_routes_an_armed_leafs_release_through_the_rea
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -443,7 +439,6 @@ async fn an_already_reaped_root_still_routes_an_armed_leafs_release_through_the_
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -552,7 +547,6 @@ async fn an_armed_async_leaf_retries_cgroup_kill_after_its_own_failed_attempt() 
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
@@ -646,7 +640,6 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
         containment: crate::containment::Containment::CgroupV2,
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
-        reaped_via_public_wait: false,
     };
 
     let (entered_tx, entered) = mpsc::channel();
