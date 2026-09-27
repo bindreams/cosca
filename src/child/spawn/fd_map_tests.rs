@@ -654,9 +654,14 @@ fn run_probe_directly(probe_name: &str, extra_env: &[(&str, &str)]) -> std::proc
 #[test]
 #[ignore = "probe"]
 fn panic_while_fd2_closed_via_restore_fd2_probe() {
-    if std::env::var_os("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE").is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE").is_some(),
+        "this probe must only be invoked via \
+         a_panic_while_fd2_is_closed_via_restore_fd2_still_reaches_stderr (which sets \
+         COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE) — a bare \
+         --include-ignored sweep that reaches here without it is not exercising the probe, and \
+         must not pass vacuously"
+    );
     if !crate::containment::cgroup::test_support::alone(
         "child::spawn::fd_map::fd_map_tests::panic_while_fd2_closed_via_restore_fd2_probe",
     ) {
@@ -706,9 +711,14 @@ fn a_panic_while_fd2_is_closed_via_restore_fd2_still_reaches_stderr() {
 #[test]
 #[ignore = "probe"]
 fn two_overlapping_fd2_closes_via_restore_fd2_probe() {
-    if std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_PROBE").is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_PROBE").is_some(),
+        "this probe must only be invoked via \
+         two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock (which sets \
+         COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_PROBE) — a bare \
+         --include-ignored sweep that reaches here without it is not exercising the probe, and \
+         must not pass vacuously"
+    );
     if !crate::containment::cgroup::test_support::alone(
         "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_probe",
     ) {
@@ -727,9 +737,10 @@ fn two_overlapping_fd2_closes_via_restore_fd2_probe() {
 /// never overlap" internal invariant — not a release-mode API contract the way
 /// `fd_map::install`'s duplicate-child-fd rejection is), so it only panics in a build with debug
 /// assertions on. Measured: CI's own release lane (`--release`, debug assertions off) runs this
-/// same probe and it completes normally instead — the second guard's `.replace(..)` just
-/// silently overwrites the slot, which stays correct regardless (fd 2 currently IS whatever that
-/// second guard just put there).
+/// same probe and it completes normally instead — `take` never overwrites an occupied
+/// `SAVED_STDERR` slot (occupied or not), so the second, overlapping guard simply never gets
+/// registered there; its own `Drop` sees the slot does not hold its fd and leaves the first
+/// guard's registration alone, so the mechanism stays correct either way.
 #[test]
 fn two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock() {
     const PROBE: &str = "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_probe";
@@ -754,6 +765,76 @@ fn two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock() {
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    if cfg!(debug_assertions) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("SAVED_STDERR already occupied"),
+            "the overlap panic's own message must reach stderr (proving the fix routes it there \
+             instead of into whatever fd the second, rejected guard's own dup pointed at) — got:\n{combined}"
+        );
+    }
+}
+
+/// A deliberate probe for `require_process_per_test` itself — the lib's own copy of
+/// `tests/spawn_io.rs`'s `close_without_alone_probe`: calls `RestoreFd2::take()` directly,
+/// deliberately NOT wrapped in `crate::containment::cgroup::test_support::alone()` first.
+/// `#[ignore]`d and env-gated exactly like the other probes above so a bare `--include-ignored`
+/// sweep fails loudly instead of silently no-oping.
+///
+/// Its invoker, [`gate_rejects_a_non_alone_process_via_restore_fd2`] below, spawns this probe
+/// directly with neither `COSCA_TEST_ALONE` set nor the `ALONE_ARGS` shape as its argv.
+#[test]
+#[ignore = "probe"]
+fn close_without_alone_via_restore_fd2_probe() {
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_VIA_RESTORE_FD2_PROBE").is_some(),
+        "this probe must only be invoked via gate_rejects_a_non_alone_process_via_restore_fd2 \
+         (which sets COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_VIA_RESTORE_FD2_PROBE) — a bare \
+         --include-ignored sweep that reaches here without it is not exercising the probe, and \
+         must not pass vacuously"
+    );
+    let _restore = RestoreFd2::take();
+}
+
+/// Proves `require_process_per_test`'s own gate on `RestoreFd2::take` — the lib's own copy of
+/// `tests/spawn_io.rs`'s `gate_rejects_a_non_alone_process`. Spawns the probe above directly —
+/// not via [`run_probe_directly`], which always sets up the full `alone()` shape — with neither
+/// `COSCA_TEST_ALONE` set nor `ALONE_ARGS` as its argv, so the gate itself is what is under test.
+/// No cgroup needed: `require_process_per_test` is the very first thing `RestoreFd2::take` does.
+#[test]
+fn gate_rejects_a_non_alone_process_via_restore_fd2() {
+    const PROBE: &str = "child::spawn::fd_map::fd_map_tests::close_without_alone_via_restore_fd2_probe";
+    let child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_VIA_RESTORE_FD2_PROBE", "1")
+        .env_remove("COSCA_TEST_ALONE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the probe");
+    let out = wait_bounded(child, std::time::Duration::from_secs(30));
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a process not running under alone() must have RestoreFd2::take panic (exit 101), not \
+         succeed or hang — got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("call this from inside crate::containment::cgroup::test_support::alone() — see cosca#196"),
+        "the gate's own panic message must reach stderr — got:\n{combined}"
     );
 }
 

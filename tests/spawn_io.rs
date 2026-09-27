@@ -610,9 +610,13 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 #[test]
 #[ignore = "probe"]
 fn panic_while_fd2_closed_probe() {
-    if std::env::var_os("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE").is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE").is_some(),
+        "this probe must only be invoked via a_panic_while_fd_2_is_closed_still_reaches_stderr \
+         (which sets COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_PROBE) — a bare --include-ignored \
+         sweep that reaches here without it is not exercising the probe, and must not pass \
+         vacuously"
+    );
     if !common::alone("panic_while_fd2_closed_probe") {
         return;
     }
@@ -671,9 +675,13 @@ fn a_panic_while_fd_2_is_closed_still_reaches_stderr() {
 #[test]
 #[ignore = "probe"]
 fn two_overlapping_fd2_closes_probe() {
-    if std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_PROBE").is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_PROBE").is_some(),
+        "this probe must only be invoked via two_overlapping_fd2_closes_do_not_deadlock (which \
+         sets COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_PROBE) — a bare --include-ignored \
+         sweep that reaches here without it is not exercising the probe, and must not pass \
+         vacuously"
+    );
     if !common::alone("two_overlapping_fd2_closes_probe") {
         return;
     }
@@ -691,9 +699,10 @@ fn two_overlapping_fd2_closes_probe() {
 /// The overlap itself is only DIAGNOSED by a `debug_assert!` (a test-only, "two guards should
 /// never overlap" internal invariant, not a release-mode API contract), so it only panics in a
 /// build with debug assertions on. Measured: CI's own release lane (`--release`, debug
-/// assertions off) runs the lib's identical probe and it completes normally instead — the
-/// second guard's `.replace(..)` just silently overwrites the slot, which stays correct
-/// regardless (fd 2 currently IS whatever that second guard just put there).
+/// assertions off) runs the lib's identical probe and it completes normally instead — `close`
+/// never overwrites an occupied `SAVED_STDERR` slot, so the second, overlapping guard simply
+/// never gets registered there; its own `Drop` sees the slot does not hold its fd and leaves the
+/// first guard's registration alone, so the mechanism stays correct either way.
 #[cfg(unix)]
 #[test]
 fn two_overlapping_fd2_closes_do_not_deadlock() {
@@ -713,6 +722,79 @@ fn two_overlapping_fd2_closes_do_not_deadlock() {
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    if cfg!(debug_assertions) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("SAVED_STDERR already occupied"),
+            "the overlap panic's own message must reach stderr (proving the fix routes it there \
+             instead of into whatever fd the second, rejected guard's own dup pointed at) — got:\n{combined}"
+        );
+    }
+}
+
+/// A deliberate probe for `require_process_per_test` itself: calls `RestoreStdio::close(&[2])`
+/// directly, deliberately NOT wrapped in `common::alone()` first. `#[ignore]`d and env-gated
+/// exactly like the other probes above (see e.g. [`panic_while_fd2_closed_probe`]'s doc) so a bare
+/// `--include-ignored` sweep fails loudly instead of silently no-oping.
+///
+/// Its invoker, [`gate_rejects_a_non_alone_process`] below, spawns this probe directly with
+/// neither `COSCA_TEST_ALONE` nor the `common::ALONE_ARGS` shape — the gate under test here is
+/// `require_process_per_test` itself, not anything downstream of it.
+#[cfg(unix)]
+#[test]
+#[ignore = "probe"]
+fn close_without_alone_probe() {
+    assert!(
+        std::env::var_os("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_PROBE").is_some(),
+        "this probe must only be invoked via gate_rejects_a_non_alone_process (which sets \
+         COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_PROBE) — a bare --include-ignored sweep that \
+         reaches here without it is not exercising the probe, and must not pass vacuously"
+    );
+    let _restore = common::RestoreStdio::close(&[2]);
+}
+
+/// Proves `require_process_per_test`'s own gate: a process that calls `RestoreStdio::close`
+/// without first going through `common::alone()` must panic with the gate's own message, not
+/// silently proceed to touch process-wide fd state. Spawns the probe above directly — not via
+/// `common::run_probe_directly`, which always sets up the full `alone()` shape — with neither
+/// `COSCA_TEST_ALONE` set nor `common::ALONE_ARGS` as its argv (a different, non-alone shape is
+/// used instead), so the gate itself is what is under test. No cgroup needed:
+/// `require_process_per_test` is the very first thing `RestoreStdio::close` does.
+#[cfg(unix)]
+#[test]
+fn gate_rejects_a_non_alone_process() {
+    const PROBE: &str = "close_without_alone_probe";
+    let child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("COSCA_TEST_TRIGGER_CLOSE_WITHOUT_ALONE_PROBE", "1")
+        .env_remove("COSCA_TEST_ALONE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the probe");
+    let out = common::wait_bounded(child, std::time::Duration::from_secs(30));
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a process not running under alone() must have RestoreStdio::close panic (exit 101), not \
+         succeed or hang — got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("call this from inside common::alone() — see cosca#196"),
+        "the gate's own panic message must reach stderr — got:\n{combined}"
     );
 }
 
