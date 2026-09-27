@@ -499,10 +499,7 @@ fn a_cloexec_holder_is_reported_and_warned_about() {
 #[test]
 fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     let _serialize = test_spawn_lock();
-    // marker_fd is always >= 64 (see the module docs); a dash-family shell parses only a
-    // single digit after `>&` and fails the whole script with "not found" past fd 9, so this
-    // needs a shell without that limit.
-    let mut cmd = std::process::Command::new("/bin/bash");
+    let mut cmd = high_fd_shell();
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
@@ -510,7 +507,7 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     cmd.arg("-c").arg(format!(
         "echo $$; read _go; exec {marker_fd}>&-; echo closed; read _ignored"
     ));
-    let mut child = cmd.spawn().expect("spawn sh");
+    let mut child = cmd.spawn().expect("spawn bash");
     drop(cmd);
 
     let mut stdin = child.stdin.take().expect("piped stdin");
@@ -693,10 +690,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
 #[test]
 fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let _serialize = test_spawn_lock();
-    // marker_fd is always >= 64 (see the module docs); a dash-family shell parses only a
-    // single digit after `>&` and fails the whole script with "not found" past fd 9, so this
-    // needs a shell without that limit.
-    let mut cmd = std::process::Command::new("/bin/bash");
+    let mut cmd = high_fd_shell();
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
@@ -704,7 +698,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     cmd.arg("-c").arg(format!(
         r#"echo $$; exec {marker_fd}>&-; echo closed; while read x; do echo "$x"; done"#
     ));
-    let mut child = cmd.spawn().expect("spawn sh");
+    let mut child = cmd.spawn().expect("spawn bash");
     drop(cmd);
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
@@ -811,6 +805,15 @@ fn member_command(pgid: i32) -> std::process::Command {
         .stdout(std::process::Stdio::piped())
         .process_group(pgid);
     cmd
+}
+
+/// A shell for scripts that redirect or close `marker_fd`, which `safe_marker_fd`/`HIGH_FLOOR` in
+/// `fdmarker.rs` guarantee is always >= 64: the fd number sits BEFORE the operator, in the
+/// IO_NUMBER position, and a dash-family shell only recognizes a single-digit IO_NUMBER there —
+/// so `exec 64>&-` parses as plain `exec 64` with stdout closed, and fails with
+/// "exec: 64: not found" rather than closing fd 64.
+fn high_fd_shell() -> std::process::Command {
+    std::process::Command::new("/bin/bash")
 }
 
 /// Block until a [`member_command`] child has announced itself, and check that the announcement
