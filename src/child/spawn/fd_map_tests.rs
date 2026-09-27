@@ -367,24 +367,34 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 
 // A parent_fd below fd 3 must not be clobbered by std's own stdio dup2 =====
 
-/// Require that this test is running under `cargo nextest`'s one-process-per-test model before
-/// any caller closes a process-wide fd. A plain `cargo test`/`cargo test --lib` run shares one
-/// process across every test thread in the binary, so closing a real fd 0/1/2 there races with,
-/// and can corrupt, whatever unrelated test's thread next opens something and gets handed the
-/// freed number.
+/// Require that this test is running alone in its own process before any caller closes a
+/// process-wide fd. A plain `cargo test`/`cargo test --lib` run shares one process across every
+/// test thread in the binary, so closing a real fd 0/1/2 there races with, and can corrupt,
+/// whatever unrelated test's thread next opens something and gets handed the freed number.
+///
+/// Accepts either of two proofs of isolation, both env vars so a `#[test]` fn needs no extra
+/// argument:
+/// - `COSCA_TEST_ALONE`, set by [`crate::containment::cgroup::test_support::alone`] on the
+///   fresh, single-test copy of this binary it re-execs — the normal case, and what makes this
+///   test pass under plain `cargo test` too, not just nextest.
+/// - `NEXTEST_EXECUTION_MODE=process-per-test`, nextest's own documented marker
+///   (<https://nexte.st/book/env-vars.html> — checked for equality, not just presence, since
+///   nextest notes more values may exist once it can run multiple tests in one process), for a
+///   caller that reaches this without going through `alone` but still happens to run under
+///   nextest.
 ///
 /// A copy of `tests/common/mod.rs`'s identical helper — this file is a separate compilation unit
-/// (the lib's own unit tests) and cannot name that one. `NEXTEST_EXECUTION_MODE` is nextest's own
-/// documented marker (<https://nexte.st/book/env-vars.html>, currently always
-/// `"process-per-test"` — nextest notes more values may exist once it can run multiple tests in
-/// one process, so this checks equality, not just presence). Fails loudly and immediately, before
+/// (the lib's own unit tests) and cannot name that one. Fails loudly and immediately, before
 /// touching anything, rather than silently skipping: see cosca#196 for the long-term structural
-/// fix (a Skuld-style `io` serial group, so this stops depending on nextest specifically).
+/// fix (serializing every process-wide-fd test into one group, so this stops depending on `alone`
+/// or nextest specifically).
 fn require_process_per_test(what: &str) {
-    assert_eq!(
-        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
-        Ok("process-per-test"),
-        "{what}; run under cargo nextest (one process per test) — see cosca#196"
+    let alone = std::env::var_os("COSCA_TEST_ALONE").is_some();
+    let nextest = std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test");
+    assert!(
+        alone || nextest,
+        "{what}; call this from inside crate::test_support::alone(), or run under cargo nextest \
+         (one process per test) — see cosca#196"
     );
 }
 
@@ -444,6 +454,11 @@ impl Drop for RestoreFd2 {
 /// through fd 3 instead of the mapping's real source.
 #[test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
+    if !crate::containment::cgroup::test_support::alone(
+        "child::spawn::fd_map::fd_map_tests::a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it",
+    ) {
+        return;
+    }
     let _restore = RestoreFd2::take();
     // The next fd opened lands at 2 (just closed above by `RestoreFd2::take`) — this IS the
     // mapping's source, at the exact number the bug needs to reproduce.
@@ -491,6 +506,11 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 /// purposes across the fork, corrupting whichever one loses.
 #[test]
 fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
+    if !crate::containment::cgroup::test_support::alone(
+        "child::spawn::fd_map::fd_map_tests::a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops",
+    ) {
+        return;
+    }
     let _restore = RestoreFd2::take();
     // The next fd opened lands at 2 (just closed above by `RestoreFd2::take`).
     let owned: OwnedFd = file_with("kept-open").into();
