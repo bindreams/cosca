@@ -123,6 +123,214 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
     );
 }
 
+/// Regression test for round-4 finding D2: the disarmed branch's own `is_reaped()` early return
+/// dropped `os` — and so `os.attached` — inline whenever the root had already been reaped, even
+/// though a disarmed-but-killed leaf's own `Drop` can still block waiting for a drain (see
+/// `CgroupLeaf::disarmed_kill_may_block_drop`'s doc: ROW 2 of its table waits regardless of the
+/// root). The real scenario: `kill_on_drop(false)`, then an explicit `kill_tree()` and
+/// `wait().await`, with a leaf member still draining when this handle finally drops. Mirrors
+/// `a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool` above, but with the
+/// root reaped (via tokio's own `wait`, which the fix must not special-case away) BEFORE this
+/// handle ever drops, not still running.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_disarmed_killed_drop_with_an_already_reaped_root_still_routes_through_the_reaper_pool() {
+    use std::sync::mpsc;
+
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::Attached;
+    use crate::identity::ProcessId;
+
+    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
+    use super::{Child, OsResources, ProcSource};
+
+    let fake = FakeLeaf::new("cosca-async-disarmed-killed-reaped-root-routing", false);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+    leaf.hard_kill().expect("kill the tree");
+    assert!(
+        leaf.disarmed_kill_may_block_drop(),
+        "test setup: this leaf must be the one Drop routes off the calling thread"
+    );
+
+    let mut proc = {
+        let _guard = crate::child::spawn::spawn_lock();
+        ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child that exits")
+    };
+    let pid = proc.id().expect("a freshly spawned child has a pid");
+    // Reap it through tokio's own `wait` BEFORE it is ever handed to `Child` — this is what
+    // `ProcSource::is_reaped()` actually reads (`tokio::process::Child::id()` going `None`), the
+    // same state an explicit `kill_tree()` + `wait().await` leaves behind in the real scenario.
+    proc.wait().await.expect("reap the child through tokio's own wait");
+
+    let child = Child {
+        os: OsResources {
+            proc: Some(ProcSource::Tokio(proc)),
+            attached: Attached::Cgroup(leaf),
+            pipes: Default::default(),
+            owned_std: Default::default(),
+        },
+        id: ProcessId::from_parts_for_test(pid, 0),
+        kill_on_drop: false,
+        containment: crate::containment::Containment::CgroupV2,
+        graceful: crate::graceful::GracefulMechanism::Process,
+        elevation: None,
+    };
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (outcome_tx, outcome) = mpsc::channel();
+    arm(DropProbe {
+        entered: entered_tx,
+        started: started_tx,
+        gate: gate_rx,
+        outcome: outcome_tx,
+    });
+    drop(gate_tx);
+
+    drop(child);
+
+    let dropping = entered.recv().expect(
+        "a disarmed, already-killed drop must reach the reaper handoff even with an \
+                 already-reaped root",
+    );
+    assert_eq!(
+        dropping,
+        std::thread::current().id(),
+        "#[tokio::test] is current-thread"
+    );
+    let executing = started.recv().expect("a worker must take the job");
+    assert_ne!(
+        executing, dropping,
+        "the drain wait must run on a reaper thread, never the thread that called drop, even \
+         though the root was already reaped before this handle dropped"
+    );
+    assert!(
+        matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+        "the job must complete via the reaper pool"
+    );
+}
+
+/// Regression test for round-4 finding D3: the disarmed branch's own `reaper::submit` call, when
+/// it DID route (root not yet reaped), submitted `skip_wait: false` — asking the reaper pool to
+/// `wait_and_reap` the root — with no confirmed signal actually sent TO THE ROOT backing that
+/// wait: this branch's own leaf-level `killed` flag only proves a `cgroup.kill` WRITE succeeded,
+/// which misses a process that migrated out of the leaf (a `sudo -i` into a different session
+/// scope, say) before the kill fired. `ReapJob::skip_wait`'s own invariant is that its wait is
+/// only ever bounded by a signal the SENDER knows reached the root — violating it here parks a
+/// reaper-pool worker for the root's entire remaining lifetime, and with only 2 workers, two such
+/// drops wedge every kill-on-drop reap in the process.
+///
+/// A `FakeLeaf`'s `cgroup.kill` is a plain file, so writing to it (the same `leaf.hard_kill()`
+/// call the other tests here make) never touches the REAL child either — reproducing the "missed
+/// by the kill" case exactly, without needing a real session escape. The child is left genuinely
+/// RUNNING (blocked on its own stdin) through the drop and the probe: an already-exited child
+/// (this test's first version) cannot distinguish `skip_wait: false` actually reaping it from
+/// tokio's own background orphan-queue reaper picking it up once `os.proc` is simply dropped —
+/// both leave nothing for this test's own `waitpid` to find, for unrelated reasons, so that
+/// version passed and failed for the wrong reason either way.
+///
+/// Waiting on `outcome` is bounded by a generous, one-shot `recv_timeout` — not a synchronization
+/// mechanism this test's correctness depends on, but the failure bound CLAUDE.md's own timing
+/// rule carves out: an external event (the reaper-pool worker's own report) that, under exactly
+/// the regression this test exists to catch, genuinely never comes, because the child never
+/// exits. A timeout here IS the failure, surfaced loudly instead of hanging the suite; stdin is
+/// closed unconditionally afterward either way, so a real regression still unwedges its own
+/// worker for later tests rather than leaking it forever.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_disarmed_killed_drop_whose_kill_missed_the_root_does_not_park_a_reaper_worker_on_it() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::Attached;
+    use crate::identity::ProcessId;
+
+    use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
+    use super::{Child, OsResources, ProcSource};
+
+    let fake = FakeLeaf::new("cosca-async-disarmed-killed-missed-root-routing", false);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+    leaf.hard_kill()
+        .expect("kill the (fake) tree — never reaches the real child below");
+    assert!(
+        leaf.disarmed_kill_may_block_drop(),
+        "test setup: this leaf must be the one Drop routes off the calling thread"
+    );
+
+    let (proc, stdin) = {
+        let _guard = crate::child::spawn::spawn_lock();
+        let mut proc = ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child blocked on stdin");
+        let stdin = proc.stdin.take().expect("piped stdin");
+        (proc, stdin)
+    };
+    let pid = proc.id().expect("a freshly spawned child has a pid");
+
+    let child = Child {
+        os: OsResources {
+            proc: Some(ProcSource::Tokio(proc)),
+            attached: Attached::Cgroup(leaf),
+            pipes: Default::default(),
+            owned_std: Default::default(),
+        },
+        id: ProcessId::from_parts_for_test(pid, 0),
+        kill_on_drop: false,
+        containment: crate::containment::Containment::CgroupV2,
+        graceful: crate::graceful::GracefulMechanism::Process,
+        elevation: None,
+    };
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (started_tx, started) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (outcome_tx, outcome) = mpsc::channel();
+    arm(DropProbe {
+        entered: entered_tx,
+        started: started_tx,
+        gate: gate_rx,
+        outcome: outcome_tx,
+    });
+    drop(gate_tx);
+
+    drop(child);
+
+    let dropping = entered
+        .recv()
+        .expect("a disarmed, already-killed drop must reach the reaper handoff");
+    let executing = started.recv().expect("a worker must take the job");
+    assert_ne!(
+        executing, dropping,
+        "the release must run on a reaper thread, never the dropping one"
+    );
+    let result = outcome.recv_timeout(Duration::from_secs(20));
+
+    // Whatever `result` says, let the child exit now: a real regression parks the worker in
+    // `wait_and_reap` on it, and this unblocks that worker (and lets the child itself be cleaned
+    // up, one way or another) for the rest of this process's tests. Not asserted further: once
+    // `os.proc` is dropped it is tokio's own orphan queue that may reap it, racing harmlessly
+    // with whatever else in this shared test binary next triggers a `SIGCHLD` sweep — the same
+    // best-effort cleanup `Unreaped::leak` documents elsewhere, not this test's concern.
+    drop(stdin);
+
+    assert!(
+        matches!(result, Ok(ReapOutcome::Reaped(_))),
+        "the release must complete promptly, without parking a reaper-pool worker waiting for a \
+         root this leaf's kill never actually signalled (got {result:?} within the bound)"
+    );
+}
+
 /// Regression test for adversarial round-3 finding 5: the ARMED `kill_on_drop` path's own
 /// `start_kill`-failure early return used to drop `os` — and so `os.attached` — inline, on
 /// whichever thread called `drop`. The tree-level `hard_kill` a few lines above it runs

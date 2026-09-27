@@ -817,28 +817,21 @@ impl Drop for Child {
                     let _ = p.entered.send(std::thread::current().id());
                 }
                 let pid = self.id.pid();
-                let mut os = std::mem::take(&mut self.os);
-                // Already reaped: `wait_and_reap`'s precondition (a wait bounded by a signal this
-                // handle knows was sent) does not hold as cheaply here — nothing left to wait for,
-                // so release inline, exactly as the armed path does just below.
-                if os.proc_mut().is_reaped() {
-                    return;
-                }
-                reaper::submit(reaper::ReapJob {
+                let os = std::mem::take(&mut self.os);
+                // Round-4 findings D2 and D3: this branch never signals the root itself (see the
+                // module doc a few lines up — "nothing is signalled here"), so there is never a
+                // confirmed-sent signal for `wait_and_reap` to bound a wait on, whether or not
+                // the root happens to be reaped already: `release_possibly_blocking` always
+                // releases with `skip_wait: true`, and routes off this thread whenever
+                // `os.attached`'s own drop (this leaf's drain wait) may still block — which
+                // `disarmed_kill_may_block_drop` above already established, regardless of the
+                // root's own reap state.
+                release_possibly_blocking(
                     os,
                     pid,
-                    skip_wait: false,
-                    #[cfg(test)]
-                    origin: std::thread::current().id(),
                     #[cfg(test)]
                     probe,
-                    #[cfg(test)]
-                    force_panic: false,
-                    #[cfg(test)]
-                    force_release_panic: false,
-                    #[cfg(test)]
-                    force_glue_panic: false,
-                });
+                );
             }
             return;
         }

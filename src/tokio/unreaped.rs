@@ -555,6 +555,11 @@ impl Unreaped {
             let outcome = if recyclable {
                 match watch_exit(held).await {
                     Ok(()) => Err(Failed::NotYetReapable),
+                    // Round-4 finding D1: a `Held::Tokio`'s own ownership-probe can find the pid
+                    // no longer a child of ours (recycled onto an unrelated live process) — the
+                    // same `ECHILD` classification every other ownership check on this thread
+                    // uses, not merely a watch failure the caller should keep retrying.
+                    Err(e) if crate::child::unreaped::releases_ownership(&e) => Err(Failed::Uncertain(e)),
                     Err(e) => Err(Failed::Unawaitable(e)),
                 }
             } else {
@@ -1090,10 +1095,20 @@ fn classify_tokio_wait(e: std::io::Error) -> Failed {
 /// Await `held`'s exit without reaping it, on the handle it owns: a pidfd on Linux, a kqueue filter
 /// on its pid — its own unreaped child's, so the pid names it — on macOS, the process handle on
 /// Windows. A `Held::Tokio` (round-3 finding 3) has none of these ready-made — its pid is all it
-/// carries — so it resolves a fresh identity for it and watches that instead, on either platform;
-/// a stale/recycled identity is not possible for our own still-unreaped child (its pid stays
-/// pinned to it until we reap it), so treated as already exited rather than as a watch failure. A
-/// failure here is the watch's, not the child's: the caller keeps it.
+/// carries, and unlike `Held::Std`'s (never reaped except by an explicit wait on it), tokio's own
+/// runtime-driven `SIGCHLD` handling can reap THIS pid out from under this holder at any time (see
+/// `wait_on`'s `Held::Tokio` arm, whose own `child.wait()` can already fail with `ECHILD` for
+/// exactly this reason) — so a pidfd/pid opened directly on it (round-4 finding D1) is confirmed
+/// still a child of ours, via a non-reaping `WNOHANG|WNOWAIT` probe, before it is trusted: opening
+/// on a pid already reaped and recycled by someone else, with no confirmation, would otherwise
+/// watch a live stranger's exit and report it as this child's own. `ProcessId::of` (round-3's
+/// first attempt) does not catch this: a recycled pid can resolve to a genuinely live, distinct
+/// identity, which `wait_exit`'s own "stale reports exited" handling only covers for a pid that
+/// has gone away entirely, not one now legitimately re-issued to someone else — and it reads
+/// `/proc`, which a`hidepid`-restricted or setuid child's entry refuses. A failure here is the
+/// watch's, not the child's, UNLESS it is exactly the ownership-uncertain case above (`ECHILD`,
+/// classified the same way everywhere else — see `releases_ownership`): the caller tells the two
+/// apart.
 async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
     #[cfg(test)]
     if fault::take_force_watch_failure() {
@@ -1101,23 +1116,36 @@ async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
     }
     let watched = match held {
         #[cfg(target_os = "linux")]
-        Held::Bare { pidfd: Some(pidfd), .. } => crate::tokio::wait::pidfd_exit(pidfd).await,
+        Held::Bare { pidfd: Some(pidfd), .. } => crate::tokio::wait::pidfd_exit(pidfd)
+            .await
+            .map_err(crate::child::unreaped::error_to_io),
         #[cfg(target_os = "macos")]
-        Held::Std(child) => crate::tokio::wait::pid_exit(child.id()).await,
-        #[cfg(unix)]
+        Held::Std(child) => crate::tokio::wait::pid_exit(child.id())
+            .await
+            .map_err(crate::child::unreaped::error_to_io),
+        #[cfg(target_os = "linux")]
         Held::Tokio(child) => {
             let pid = child.id().expect("an unreaped tokio child has a pid");
-            match crate::identity::ProcessId::of(pid) {
-                crate::identity::Resolved::Found(id) => crate::tokio::wait::wait_exit(id).await,
-                crate::identity::Resolved::Gone => Ok(()),
-                crate::identity::Resolved::Unknown => Err(crate::error::Error::Unassessable {
-                    detail: format!("pid {pid} identity could not be confirmed"),
-                    source: None,
-                }),
-            }
+            let pidfd = tokio_pidfd(pid)?;
+            pidfd_ownership_probe(&pidfd)?;
+            crate::tokio::wait::pidfd_exit(&pidfd)
+                .await
+                .map_err(crate::child::unreaped::error_to_io)
+        }
+        #[cfg(target_os = "macos")]
+        Held::Tokio(child) => {
+            let pid = child.id().expect("an unreaped tokio child has a pid");
+            pid_ownership_probe(pid)?;
+            crate::tokio::wait::pid_exit(pid)
+                .await
+                .map_err(crate::child::unreaped::error_to_io)
         }
         #[cfg(windows)]
-        Held::RawAsync(child) => child.wait().await.map(drop),
+        Held::RawAsync(child) => child
+            .wait()
+            .await
+            .map(drop)
+            .map_err(crate::child::unreaped::error_to_io),
         // Unreachable on macOS: `Held` there has only `Std` and `Tokio`, both matched above.
         #[cfg(not(target_os = "macos"))]
         _ => {
@@ -1127,7 +1155,63 @@ async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
             ))
         }
     };
-    watched.map_err(crate::child::unreaped::error_to_io)
+    watched
+}
+
+/// Open a pidfd directly on `pid` — a `Held::Tokio` child's — the same way `awaitable`'s
+/// `Held::Std` conversion does, without any identity read.
+#[cfg(target_os = "linux")]
+fn tokio_pidfd(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    let p = rustix::process::Pid::from_raw(pid as i32).expect("a child's pid is never 0");
+    rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()).map_err(std::io::Error::from)
+}
+
+/// Confirm `pidfd` still names a child of this process, without reaping or blocking: `pid`'s
+/// having been recycled onto an unrelated, live process before `pidfd_open` ran is the one thing
+/// this catches (round-4 finding D1) — `waitid(P_PIDFD, WNOHANG)` on that stranger reports
+/// `ECHILD`. A still-running or already-exited-but-unreaped OWN child both report `Ok` here
+/// (`si_pid` is left `0` for the former; `WNOWAIT` never reaps either way).
+#[cfg(target_os = "linux")]
+fn pidfd_ownership_probe(pidfd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd.as_raw_fd() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The macOS twin of [`pidfd_ownership_probe`], on the bare pid `Held::Tokio` carries: confirms
+/// `pid` is still a child of this process, without reaping or blocking, before a kqueue filter is
+/// armed on it (round-4 finding D1) — the same recycled-pid hazard `pidfd_ownership_probe` guards
+/// against on Linux.
+#[cfg(target_os = "macos")]
+fn pid_ownership_probe(pid: u32) -> std::io::Result<()> {
+    // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 impl Drop for Unreaped {
