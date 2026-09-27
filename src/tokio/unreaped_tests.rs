@@ -116,10 +116,23 @@ async fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_
         key,
         Box::new(move || {
             // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`. `WNOWAIT`
-            // never reaps, so this can never disturb the reap that follows this sweep.
+            // never reaps, so this can never disturb the reap that follows this sweep. `WNOHANG`
+            // makes this a genuine PROBE rather than a second wait: without it, a mutant that
+            // deletes the confirmatory `block_until_reapable` this hook exists to catch would just
+            // have this call block until the same exit instead, still observing a zombie and
+            // passing regardless (round-3 finding 1's test-quality gap) — `si_pid` stays `0` on a
+            // `WNOHANG` call that found nothing yet, which is what actually distinguishes "already
+            // a zombie" from "not yet", not merely `rc == 0`.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-            *flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(rc == 0);
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            *flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(rc == 0 && info.si_pid == pid as libc::pid_t);
         }),
     );
 
@@ -128,7 +141,7 @@ async fn wait_sweeps_a_retained_recyclable_marker_while_its_root_pid_is_still_a_
     };
     let mut unreaped = Unreaped::with_retained(Held::Tokio(Box::new(child)), Some(retained));
     drop(stdin); // let the child exit on EOF
-    unreaped.wait().await.expect("wait for the child");
+    let status = unreaped.wait().await.expect("wait for the child");
 
     assert_eq!(
         crate::containment::fdmarker::fault::take_hard_kill_calls(key),
