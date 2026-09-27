@@ -32,17 +32,49 @@ fn await_zombie(pid: u32) {
     }
 }
 
+/// A process-group leader that announces its own pid on a piped stdout, then blocks on a piped
+/// stdin this function's caller holds open — never via a chosen sleep duration. `pgid` is the
+/// group to join (`0` mints a new one of the leader's own, matching this file's existing
+/// `process_group(0)` convention). The caller MUST call [`await_leader_ready`] before using the
+/// leader's identity, and must keep the returned `Child`'s own `stdin` field intact (never
+/// `.take()` it) for exactly as long as it needs the leader to stay running.
+fn leader_command(pgid: i32) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .process_group(pgid);
+    cmd
+}
+
+/// Block until a [`leader_command`] child has announced itself, and check that the announcement
+/// came from that child — the real happens-before edge `spawn()` returning alone does not
+/// establish (see `fdmarker_tests.rs::await_member_ready`'s identical rationale).
+fn await_leader_ready(child: &mut std::process::Child) {
+    use std::io::BufRead;
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read the leader's announcement");
+    let announced: u32 = line.trim().parse().expect("the announcement carries a pid");
+    assert_eq!(
+        announced,
+        child.id(),
+        "the announcement must come from the leader itself"
+    );
+    // Hand the pipe back rather than dropping it: the leader outlives this call, and closing
+    // the read end under a live child would make any later write to it a `SIGPIPE`.
+    child.stdout = Some(out.into_inner());
+}
+
 /// A group we lead lists the member we put in it, with a token that resolves to Alive.
 #[test]
 fn members_lists_a_live_owned_group() {
-    use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
+    let mut child = leader_command(0).spawn().expect("spawn leader");
+    await_leader_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(pgid).expect("list the group");
@@ -109,14 +141,10 @@ fn members_of_an_absent_group_is_empty() {
 /// `ProcessId::of`'s live read, on both platforms.)
 #[test]
 fn members_token_matches_a_live_read_of_the_same_pid() {
-    use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
+    let mut child = leader_command(0).spawn().expect("spawn leader");
+    await_leader_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(pgid).expect("list the group");
@@ -136,14 +164,10 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
 /// signal, not just classify: the leader is dead afterward.
 #[test]
 fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
-    use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
+    let mut child = leader_command(0).spawn().expect("spawn leader");
+    await_leader_ready(&mut child);
     let pgid = child.id() as i32;
     assert!(
         matches!(state(pgid, Signal::SIGKILL), GroupState::Cleared),

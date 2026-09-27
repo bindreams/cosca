@@ -29,15 +29,24 @@ fn quick_contained_child() -> crate::Child {
     cmd.spawn().expect("spawn")
 }
 
-/// A long-lived contained child, for the deadline-not-met case.
-fn long_lived_contained_child() -> crate::Child {
+/// A contained child that blocks reading from a piped stdin this function's caller holds open —
+/// never via a chosen sleep duration, for the deadline-not-met case. `cat`/`findstr x` unblock
+/// only on EOF (the pipe dropped) or a real kill, so `MembersRemain` cannot pass vacuously just
+/// because a fixed-duration sleep hadn't finished yet. Returns the child AND its stdin writer:
+/// the caller MUST keep the writer alive for exactly as long as it needs the child to stay
+/// running.
+fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    cmd.args(["cat"]);
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.args(["findstr", "x"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain();
-    cmd.spawn().expect("spawn")
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
 }
 
 /// Drained case: on a drain-observable mechanism, an unbounded `wait_tree()` against a tree
@@ -68,7 +77,7 @@ fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 /// non-drainable mechanism the same call must still fail `Unsupported`.
 #[test]
 fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    let child = long_lived_contained_child();
+    let (child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::from_millis(200));
     if drainable {
@@ -90,7 +99,7 @@ fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
 /// implementation checks `remaining == Duration::ZERO` before its first blocking syscall).
 #[test]
 fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    let child = long_lived_contained_child();
+    let (child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::ZERO);
     if drainable {

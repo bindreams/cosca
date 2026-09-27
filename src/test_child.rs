@@ -163,28 +163,33 @@ pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_S
 /// Windows-only fixture for the `root_exited`-on-`MembersRemain` regression (sync and async
 /// twins): a no-op when picked up by an ordinary, unfiltered suite run —
 /// [`FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV`] is unset there. Re-executed via `current_exe()
-/// --exact` [`FIXTURE_SURVIVES_GROUP_SIGNAL_TEST`] with that var set, it instead spawns a
-/// grandchild a group `CTRL_BREAK` can never reach — `CREATE_NEW_PROCESS_GROUP` puts it in its
-/// own process group, the same isolation `graceful_shutdown_tree`'s own doc describes for a
-/// nested contained descendant — then connects to the caller's listener at that address and
-/// writes a single tag byte, proving the grandchild already exists (and is already in its own
-/// group) before the caller proceeds to call `graceful_shutdown_tree`. The tag goes out over a
-/// real TCP socket, not `print!`/`io::stdout()`: libtest captures the latter per-test and
-/// discards it for a passing test, so a stdout-based readiness byte never reaches the caller's
-/// piped reader at all — this is the same control-channel shape `tests/common`'s
-/// `spawn_tree`/`spawn_tree_async` tag handshake already uses for exactly this reason, not a
-/// Windows-specific mechanism. The job object still tracks the grandchild as a tree member
-/// despite its own process group (job membership and process group are independent Win32
-/// concepts), so it shows up as a `MembersRemain` survivor even though the signal itself never
-/// reaches it. Mirrors [`spawn_a_process_that_exits`]'s filtered-re-exec idiom (see its own doc
-/// for why the filter is mandatory) put to a second use.
+/// --exact` [`FIXTURE_SURVIVES_GROUP_SIGNAL_TEST`] with that var set, it spawns a grandchild a
+/// group `CTRL_BREAK` can never reach — `CREATE_NEW_PROCESS_GROUP` puts it in its own process
+/// group, the same isolation `graceful_shutdown_tree`'s own doc describes for a nested
+/// contained descendant — then returns immediately, letting this intermediate process exit.
+///
+/// The grandchild is itself a re-exec'd [`fixture_registers_then_blocks`], given THIS fixture's
+/// OWN `addr` (forwarded via [`FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV`]) so it connects and
+/// blocks DIRECTLY against the caller's listener — never against a socket this short-lived
+/// intermediate process would itself own and then close on its own exit, which a
+/// caller-chosen `grace` can easily outlive. The grandchild's own connect-and-tag is thus the
+/// happens-before edge the caller blocks on: it cannot tag until its own code is running, in
+/// its own group. The tag goes out over a real TCP socket, not `print!`/`io::stdout()`: libtest
+/// captures the latter per-test and discards it for a passing test, so a stdout-based readiness
+/// byte never reaches the caller's piped reader at all — this is the same control-channel shape
+/// `tests/common`'s `spawn_tree`/`spawn_tree_async` tag handshake already uses for exactly this
+/// reason, not a Windows-specific mechanism. The job object still tracks the grandchild as a
+/// tree member despite its own process group (job membership and process group are independent
+/// Win32 concepts), so it shows up as a `MembersRemain` survivor even though the signal itself
+/// never reaches it, and it stays that way for as long as the caller holds its control socket
+/// open — never via a chosen sleep duration. Mirrors [`spawn_a_process_that_exits`]'s
+/// filtered-re-exec idiom (see its own doc for why the filter is mandatory) put to a second use.
 #[cfg(windows)]
 #[test]
 fn fixture_survives_group_signal() {
     let Some(addr) = std::env::var_os(FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    use std::io::Write;
     use std::os::windows::process::CommandExt;
 
     // CREATE_NEW_PROCESS_GROUP (winbase.h). A scalar flag, so a raw constant needs no
@@ -192,14 +197,13 @@ fn fixture_survives_group_signal() {
     // as a plain `u32`.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment kills it
-    let _survivor = std::process::Command::new("ping")
-        .args(["-n", "30", "127.0.0.1"])
+    let _survivor = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST))
+        .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn a grandchild the group signal cannot reach");
-    let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect readiness socket");
-    sock.write_all(b"R").expect("write readiness tag");
 }
 
 /// The fully-qualified libtest path of [`fixture_registers_then_blocks`], for callers that

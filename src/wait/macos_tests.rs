@@ -6,8 +6,12 @@ use crate::identity::ProcessId;
 fn drain_reports_none_when_no_event_pending() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
+    // `cat`, blocked reading a piped stdin this test holds open (never via a chosen sleep
+    // duration): the arm-then-drain checks below need the child genuinely alive throughout,
+    // not merely for as long as a `sleep 30` happens to outlast them.
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn blocker");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");

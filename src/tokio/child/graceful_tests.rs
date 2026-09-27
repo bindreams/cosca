@@ -5,6 +5,23 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::wait::fault;
 
+/// Async twin of `child::graceful_tests::blocker` — see there for the full rationale. A
+/// contained child that blocks reading from a piped stdin this function's caller holds open,
+/// never via a chosen sleep duration.
+fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    let mut cmd = crate::tokio::Command::new();
+    #[cfg(unix)]
+    cmd.args(["cat"]);
+    #[cfg(windows)]
+    cmd.args(["findstr", "x"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
+}
+
 #[tokio::test]
 async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
     let mut cmd = crate::tokio::Command::new();
@@ -187,13 +204,7 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 // Async twin of `graceful_tree_unassessable_mechanism_failure_fails_fast`.
 #[tokio::test]
 async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, _stdin) = blocker();
     let id = child.id();
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
     let err = child
@@ -307,10 +318,13 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     use tokio::io::AsyncReadExt;
 
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & echo r; exit 0"]);
+    cmd.args(["sh", "-c", "trap '' TERM; cat >/dev/null & echo r; exit 0"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
+    // Held for the test's whole body — see `child::graceful_tests`'s sync twin for why.
+    let _stdin = child.stdin().expect("piped stdin");
     let mut readiness = [0u8; 1];
     child
         .stdout()
@@ -591,13 +605,7 @@ async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_re
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.
 #[tokio::test]
 async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, _stdin) = blocker();
     let id = child.id();
     term_fault::set_force_terminate(term_fault::Forced::Unsupported);
     let err = child

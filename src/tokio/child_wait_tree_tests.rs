@@ -25,12 +25,18 @@ fn quick_contained_cmd() -> crate::tokio::Command {
     cmd
 }
 
+/// Async twin of `child::lifecycle_tests::long_lived_contained_child` — see there for the full
+/// rationale. Not yet configured with a piped stdin: callers must add that themselves (see call
+/// sites) so the returned `Command` stays a drop-in swap for the old `sleep 30`/`ping -n 30`
+/// shape at each of them.
 fn long_lived_contained_cmd() -> crate::tokio::Command {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    cmd.args(["cat"]);
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.args(["findstr", "x"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain();
     cmd
 }
@@ -58,6 +64,7 @@ async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
     let mut cmd = long_lived_contained_cmd();
     let mut child = cmd.spawn().expect("spawn");
+    let _stdin = child.stdin().expect("piped stdin");
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::from_millis(200)).await;
     if drainable {
@@ -79,6 +86,7 @@ async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
 async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
     let mut cmd = long_lived_contained_cmd();
     let mut child = cmd.spawn().expect("spawn");
+    let _stdin = child.stdin().expect("piped stdin");
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::ZERO).await;
     if drainable {

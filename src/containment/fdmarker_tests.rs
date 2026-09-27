@@ -767,11 +767,12 @@ fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_sign
 /// whole reason no separate liveness check is needed — see the function's doc).
 #[test]
 fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() {
-    use std::os::unix::process::CommandExt;
     let _serialize = test_spawn_lock();
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("600").process_group(0); // pgid == the child's own pid — `process_group` is safe.
-    let mut child = cmd.spawn().expect("spawn sleep");
+    // `member_command`/`await_member_ready` below: a real happens-before edge from the member's
+    // own announcement, not a `/bin/sleep 600` chosen to outlast the immediate liveness checks
+    // that follow.
+    let mut child = member_command(0).spawn().expect("spawn member"); // pgid == the child's own pid
+    await_member_ready(&mut child);
     let pid = child.id() as crate::identity::RawPid;
     let pgid = child.id() as i32;
 

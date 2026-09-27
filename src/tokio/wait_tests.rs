@@ -9,15 +9,21 @@ use std::time::Duration;
 use super::{grace_wait, wait_exit};
 use crate::identity::ProcessId;
 
-// A long-lived std child (leak-proof: killed + reaped by each test).
+// A long-lived std child (leak-proof: killed + reaped by each test), blocked reading its own
+// piped stdin — never via a chosen sleep duration. `cat`/`findstr x` unblock only on EOF (the
+// pipe dropped, which nothing here does before the child's own field is dropped) or a real
+// kill, so an `is_alive()`/exit-state check taken before either of those cannot pass vacuously
+// just because a fixed-duration sleep hadn't finished yet. The piped stdin handle lives inside
+// `Child::stdin` itself — no caller here ever calls `.take()` on it — so it stays open for
+// exactly as long as the returned `Child` does.
 fn std_blocker() -> std::process::Child {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut cmd = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" });
+    let mut cmd = std::process::Command::new(if cfg!(windows) { "findstr" } else { "cat" });
     #[cfg(windows)]
-    cmd.args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null());
-    #[cfg(unix)]
-    cmd.arg("30");
+    cmd.arg("x");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
     cmd.spawn().expect("spawn std blocker")
 }
 

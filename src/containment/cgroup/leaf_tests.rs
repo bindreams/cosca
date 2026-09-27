@@ -2716,11 +2716,16 @@ fn reaped(pidfd: &std::os::fd::OwnedFd) -> bool {
 /// Spawn `argv` as a child that leads its own group and places itself through `leaf`'s channel,
 /// reporting `Placed` (`/dev/null` stands in for `cgroup.procs`) or, with `fail`, the write's
 /// `EBADF`. `before` runs in the forked child first. Returns the child, never waited on here.
+/// Stdin is inherited unless a caller passes its own `stdin` (a caller whose assertions need the
+/// child to stay alive should pass `Stdio::piped()` and hold the returned `Child`'s own `stdin`
+/// field open — never via a chosen sleep duration; see the two `an_abandoned_child_*` callers
+/// that do this).
 #[cfg(target_os = "linux")]
 fn spawn_placing(
     leaf: &crate::containment::cgroup::CgroupLeaf,
     argv: &[&str],
     fail: bool,
+    stdin: std::process::Stdio,
     stdout: std::process::Stdio,
 ) -> std::process::Child {
     use std::os::unix::process::CommandExt;
@@ -2736,7 +2741,7 @@ fn spawn_placing(
     };
     let slot = leaf.placement_slot();
     let mut cmd = std::process::Command::new(argv[0]);
-    cmd.args(&argv[1..]).stdout(stdout).process_group(0);
+    cmd.args(&argv[1..]).stdin(stdin).stdout(stdout).process_group(0);
     // SAFETY: the closure runs between fork and exec, and makes only async-signal-safe calls on
     // descriptors this test and `leaf` keep open across the spawn.
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::placement_hook(procs_fd, slot)) };
@@ -2760,7 +2765,13 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_dire
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     // Inherited by the child forked from this thread, which takes it.
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
-    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], false, std::process::Stdio::null());
+    let child = spawn_placing(
+        &leaf,
+        &["/bin/sleep", "300"],
+        false,
+        std::process::Stdio::inherit(),
+        std::process::Stdio::null(),
+    );
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
     let pid = child.id();
     let pidfd = pidfd_of(pid);
@@ -2835,7 +2846,16 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
     // Inherited by the child forked from this thread, which takes them.
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(true);
-    let mut child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    // `cat`, blocked reading a piped stdin this test holds open (never via a chosen sleep
+    // duration): the `try_wait().is_none()` check below needs the child genuinely still alive,
+    // not merely for as long as a `sleep 300` happens to outlast it.
+    let mut child = spawn_placing(
+        &leaf,
+        &["cat"],
+        true,
+        std::process::Stdio::piped(),
+        std::process::Stdio::null(),
+    );
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(false);
 
@@ -2915,7 +2935,13 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
     let leaf_path = dir.path().join("cosca-abandoned-window");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let child = spawn_placing(&leaf, &["/bin/true"], false, std::process::Stdio::null());
+    let child = spawn_placing(
+        &leaf,
+        &["/bin/true"],
+        false,
+        std::process::Stdio::inherit(),
+        std::process::Stdio::null(),
+    );
     let pid = child.id();
     drop(child);
     crate::containment::cgroup::fault::set_between_check_and_kill(move || reap(pid));
@@ -2938,9 +2964,22 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     // Its placement write fails, so the leaf does not hold it either.
-    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    // `cat`, blocked reading a piped stdin held open below (never via a chosen sleep duration):
+    // the `!reaped(&pidfd)` check needs the child genuinely still alive, not merely for as long
+    // as a `sleep 300` happens to outlast it.
+    let mut child = spawn_placing(
+        &leaf,
+        &["cat"],
+        true,
+        std::process::Stdio::piped(),
+        std::process::Stdio::null(),
+    );
     let pid = child.id();
     let pidfd = pidfd_of(pid);
+    // Taken out and held independently of `child` (dropped next): `Child`'s own `Drop` does not
+    // kill the OS process, but it WOULD close this pipe's write end were it left inside — EOF
+    // would unblock `cat` immediately, defeating the fixture.
+    let _stdin = child.stdin.take().expect("piped stdin");
     drop(child);
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     crate::containment::cgroup::fault::set_force_child_kill_denied(true);
@@ -2975,6 +3014,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
         &leaf,
         &["/bin/sh", "-c", "sleep 300 & echo forked; wait"],
         false,
+        std::process::Stdio::inherit(),
         std::process::Stdio::piped(),
     );
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
