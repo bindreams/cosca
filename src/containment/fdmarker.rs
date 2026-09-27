@@ -1567,10 +1567,15 @@ impl Marker {
 /// Kill through an armed marker before it falls out of scope, exactly like `CgroupLeaf`/
 /// `JobHandle` — mirrored here so a `Marker` retained past its `Child` (e.g. handed out by
 /// `into_unreaped_parts` and then plain-dropped, as `Retained`'s field-wise drop does) still
-/// tears its tree down. `Child::drop` also calls `hard_kill` explicitly before its fields
-/// drop, in the ordinary `kill_on_drop(true)` path; this makes that call redundant but
-/// harmless there (a second sweep over an already-drained tree finds no holders), same as it
-/// already is for `Cgroup`/`JobObject`.
+/// tears its tree down. `Child::drop` also calls `hard_kill` explicitly before its fields drop,
+/// in the ordinary `kill_on_drop(true)` path — but, unlike `Cgroup`/`JobObject`, it then disarms
+/// THIS mechanism specifically (`Attached::disarm_after_own_sweep`, since a marker's own `Drop`
+/// fires `hard_kill`'s pass 1 unconditionally, with no occupancy check, and by the time this
+/// runs the pgid that pass swept may already be recycled onto an unrelated, live process group —
+/// see that method's own doc). So in that ordinary path this `Drop` finds `self.armed` already
+/// `false` and does nothing at all: not a redundant-but-harmless second sweep, no sweep runs
+/// here a second time. Only the retained-past-its-`Child` case above still reaches the kill
+/// below.
 impl Drop for Marker {
     fn drop(&mut self) {
         if !self.armed.load(Ordering::Relaxed) {
