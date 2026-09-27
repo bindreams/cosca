@@ -24,6 +24,8 @@ thread_local! {
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_LISTEN: std::cell::RefCell<Option<AfterListenHook>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
@@ -93,6 +95,44 @@ pub(crate) fn notify_drain_blocking() {
             let _ = notify.send(());
         }
     });
+}
+
+/// Send on `notify` each time a leaf's drain step on this thread takes its zero-remaining
+/// shortcut — answers `MembersRemain` from a step that arms no listener. Kept until
+/// [`take_drain_zero_remaining_notifier`].
+pub(crate) fn set_drain_zero_remaining_notifier(notify: std::sync::mpsc::Sender<()>) {
+    DRAIN_ZERO_REMAINING.with(|d| *d.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_drain_zero_remaining_notifier() {
+    DRAIN_ZERO_REMAINING.with(|d| d.borrow_mut().take());
+}
+pub(crate) fn notify_drain_zero_remaining() {
+    DRAIN_ZERO_REMAINING.with(|d| {
+        if let Some(notify) = d.borrow().as_ref() {
+            let _ = notify.send(());
+        }
+    });
+}
+
+/// A rendezvous for the NEXT `drain_step` call on this thread that reaches the point right after
+/// `Watcher::listen()` succeeds: `ready` and `release`, respectively sent and awaited by
+/// [`run_after_listen_hook`].
+type AfterListenHook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+/// Arm the rendezvous above. Take semantics: consumed by the next [`run_after_listen_hook`] call
+/// on this thread, so a second `drain_step` call on the same thread runs unhooked.
+pub(crate) fn set_after_listen_hook(ready: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) {
+    AFTER_LISTEN.with(|h| *h.borrow_mut() = Some((ready, release)));
+}
+/// Run the hook armed on this thread, if any: send on `ready`, proving `drain_step` reached this
+/// point, then block on `release` until the test lets it continue — a real wait, never a sleep.
+/// A no-op if unarmed.
+pub(crate) fn run_after_listen_hook() {
+    let Some((ready, release)) = AFTER_LISTEN.with(|h| h.borrow_mut().take()) else {
+        return;
+    };
+    let _ = ready.send(());
+    let _ = release.recv();
 }
 
 /// Record, on this thread, each `cgroup.kill` write (`"kill"`) and each `rmdir` of a leaf, the

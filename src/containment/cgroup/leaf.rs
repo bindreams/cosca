@@ -540,9 +540,12 @@ impl CgroupLeaf {
     }
 
     /// One step of a wait on the leaf's drain, shared by the sync and async waits: read the leaf,
-    /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump,
-    /// and read it again: a change after that read is always heard, so the caller may block on
-    /// the returned listener for the time left, then take another step.
+    /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump
+    /// (which can itself take real time — spawning its thread), and read it again: a change after
+    /// that read is always heard, so the caller may block on the returned listener for the time
+    /// left, then take another step. `left` is recomputed fresh at that point, not carried over
+    /// from before `listen()`: a `Block`'s caller times its wait against now, never against a
+    /// value `listen()`'s own setup time has already eaten into.
     pub(crate) fn drain_step(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -554,11 +557,26 @@ impl CgroupLeaf {
         }
         let left = crate::wait::remaining(deadline);
         if left == Some(std::time::Duration::ZERO) {
+            #[cfg(test)]
+            fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
         }
         let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
+        #[cfg(test)]
+        fault::run_after_listen_hook();
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
+        }
+        // `listen()` may have just started the pump thread, and the test-only hook above stands
+        // in for whatever else can take real time here: recompute `left` fresh rather than hand
+        // `Block`'s caller the value from this function's entry, which `wait_timeout`/`timeout`
+        // would then block on all over again, overrunning the caller's deadline by however long
+        // this step took.
+        let left = crate::wait::remaining(deadline);
+        if left == Some(std::time::Duration::ZERO) {
+            #[cfg(test)]
+            fault::notify_drain_zero_remaining();
+            return Ok(DrainStep::Done(TreeDrain::MembersRemain));
         }
         #[cfg(test)]
         fault::notify_drain_blocking();
