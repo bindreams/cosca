@@ -34,13 +34,7 @@ impl Child {
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        let status = self.proc().wait_deadline(deadline).map_err(Error::Io)?;
-        if status.is_some() {
-            // Mirrors `wait`/`try_wait`'s own instrumentation — see `reaped_via_public_wait`'s doc.
-            self.reaped_via_public_wait
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(status)
+        self.proc().wait_deadline(deadline).map_err(Error::Io)
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
