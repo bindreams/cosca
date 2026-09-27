@@ -164,7 +164,10 @@ whichever tests share the process.
 Tests that touch real system state run in a container, VM or CI, never on a developer's host:
 cgroups, Job Objects, elevation, process-group and session signals, `kqueue` or `waitpid` teardown
 of trees, signals to processes the test didn't spawn, and anything under `sudo`. The only exemption
-is a test that spawns this repo's own short-lived children and signals them by their own handle.
+is a test that spawns this repo's own short-lived children and signals them only through the `Child`
+or `Process` handle cosca returned for each, never by process group, session or a PID the test
+computed. On Unix that handle's kill still reaches `kill(2)` by number ([#219], [#222]), which is
+safe for the test's own short-lived, unreaped children.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A recycled process group is reachable on the ordinary
@@ -200,3 +203,5 @@ step consistent with these principles.
 [tokio reap.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/reap.rs#L122-L128
 [tokio pidfd_reaper.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/pidfd_reaper.rs#L203-L209
 [tokio orphan.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/orphan.rs#L118-L124
+[#219]: https://github.com/bindreams/cosca/issues/219
+[#222]: https://github.com/bindreams/cosca/issues/222

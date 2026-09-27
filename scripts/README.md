@@ -8,7 +8,8 @@ machine.** `scripts/devvm.py` provisions throwaway VMs for that purpose, so the 
 of a scratch script bug is a disposable VM, not your laptop.
 
 The only exemption is a test that spawns this repo's own short-lived children and signals them
-by their own handle; process-group signals and tree teardown are not exempt. macOS and Windows
+only through the `Child` or `Process` handle cosca returned for each; process-group and session
+signals, PIDs the test computed, and tree teardown are not exempt. macOS and Windows
 lanes run on CI. See
 [principle 10](../docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
 
