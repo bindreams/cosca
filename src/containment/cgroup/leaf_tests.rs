@@ -1349,14 +1349,26 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
     );
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
-    let mut cmd = std::process::Command::new("sleep");
-    cmd.arg("300");
+    // `cat`, blocked reading a piped stdin, not `sleep 300`: this member's only job is to keep
+    // the leaf populated until a real kill (through the leaf, under test in every caller) ends
+    // it. A `sleep`-based member has its own 300s timer completely independent of that kill, so
+    // a caller whose assertion is merely "the leaf is gone" (not "gone because it was signalled")
+    // would still pass once that timer alone drains the leaf — the same vacuous-pass shape
+    // measured directly (300.01s) in this file's other group-kill tests.
+    let mut cmd = std::process::Command::new("cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
     // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
     // closure runs between fork and exec, and `leaf` outlives the spawn.
     unsafe {
         cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
     }
     let member = cmd.spawn().expect("spawn a member");
+    // Deliberately NOT taken out of `member`: every caller either kills it for real before
+    // `wait()`-ing (which itself would also close this, but only after the real kill already
+    // ran) or checks something before ever touching `member` again, so leaving it inside is
+    // safe here — see `containment::unix::group_tests::leader_command`'s doc for the general
+    // hazard this would otherwise be.
     leaf.take_placement(member.id())
         .expect("decidable")
         .expect("the member entered the leaf");
@@ -2245,12 +2257,20 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     // The member reports through a channel of its own, so the leaf's has nothing queued.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the member's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("300");
+    // `cat`, blocked reading a piped stdin, not `/bin/sleep 300`: `hard_kill()` below is the
+    // mechanism under test, and a `sleep`-based member has its own 300s timer independent of it
+    // — a broken `hard_kill()` would still let the unbounded `wait_drained(None)` below resolve
+    // once that timer alone runs out, proving nothing about `hard_kill()` itself.
+    let mut cmd = std::process::Command::new("/bin/cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
     // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
     let mut member = cmd.spawn().expect("spawn the member");
+    // Held past `hard_kill()`/`wait_drained` below: only `hard_kill()`'s own real signal may end
+    // this member.
+    let _stdin = member.stdin.take().expect("piped stdin");
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
     let verdict = leaf.take_placement(member.id());
@@ -3000,7 +3020,15 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 /// An abandoned child is killed as the process group it leads: what it forked after `exec` is in
 /// that group, whether or not it is in the leaf. Here the leaf's own kill kills nothing (a
 /// directory, not a cgroup), so only the group kill can end the descendant, which holds the
-/// child's stdout: reading it to EOF proves both dead. A regression hangs this test on the read.
+/// child's stdout: reading it to EOF proves both dead. A regression hangs this test on the read
+/// (never a chosen wait duration): the descendant is a `cat` blocked reading a piped stdin this
+/// test holds (via `exec 3<&0; cat <&3 ... 3<&-`, not a bare `cat &` — see
+/// `child::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root`'s
+/// doc for why a backgrounded command needs its stdin explicitly redirected), NOT `sleep 300`:
+/// a `sleep`-based descendant has its own 300s timer completely independent of any real kill, so
+/// a broken group-kill still lets the shell's `wait` (and thus this read) unblock once that
+/// timer alone runs out — measured passing in exactly 300.01s with the group kill mutated away,
+/// proving nothing. `cat` has no such timer: it can only die from a real signal.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
@@ -3012,11 +3040,15 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     let mut child = spawn_placing(
         &leaf,
-        &["/bin/sh", "-c", "sleep 300 & echo forked; wait"],
+        &["/bin/sh", "-c", "exec 3<&0; cat <&3 3<&- & echo forked; wait"],
         false,
-        std::process::Stdio::inherit(),
+        std::process::Stdio::piped(),
         std::process::Stdio::piped(),
     );
+    // Taken out and held past the EOF read below: `child`'s own `drop` must not be what ends
+    // the descendant (that would prove nothing about the real group kill under test — see this
+    // test's own doc).
+    let _stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the child's line");
@@ -3037,7 +3069,11 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
 /// A child cosca gives up on is killed as a group: between the last look at its report and the
 /// kill it can report, exec, and fork, and what it forks is in its process group, not the leaf.
 /// Each process in the tree holds the child's stdout, so reading it to EOF proves all are dead.
-/// A regression hangs this test on the read.
+/// A regression hangs this test on the read (never a chosen wait duration) — the descendant is a
+/// `cat` blocked on a piped stdin this test holds, not `sleep 300`: see
+/// `an_abandoned_child_is_killed_with_the_group_it_leads`'s doc for why a `sleep`-based
+/// descendant's own timer lets this test pass — measured at exactly 300.01s — even with the
+/// group kill under test mutated away, proving nothing.
 #[cfg(target_os = "linux")]
 #[test]
 fn fail_closed_kills_the_childs_whole_process_group() {
@@ -3051,11 +3087,17 @@ fn fail_closed_kills_the_childs_whole_process_group() {
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     // The child leads its own group, as a contained child does, and forks a descendant into it.
     let mut child = std::process::Command::new("/bin/sh")
-        .args(["-c", "sleep 300 & echo forked; wait"])
+        .args(["-c", "exec 3<&0; cat <&3 3<&- & echo forked; wait"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
         .expect("spawn");
+    // Taken out and held past the EOF read below: `child`'s own `wait()` (which closes its
+    // piped stdin before it waits — see `containment::unix::group_tests::leader_command`'s doc
+    // for why that alone is enough to end a `cat` blocker with no real signal involved) must not
+    // be what ends the descendant.
+    let _stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the child's line");

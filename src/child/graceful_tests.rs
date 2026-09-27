@@ -363,6 +363,16 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // not a sleep or a bet that the runner is fast: the root's own `trap` installation has nothing
 // else synchronizing it against `spawn()` returning, and the byte cannot be written until both
 // the trap and the background job are already in place.
+//
+// `exec 3<&0` duplicates the shell's OWN stdin (our pipe) to fd 3 while it is still the
+// foreground command — POSIX has a non-interactive shell give an asynchronous (`&`) command
+// `/dev/null` on stdin UNLESS that command's own stdin is explicitly redirected, so a bare
+// `cat &` here would get `/dev/null`, see EOF immediately, and exit right away — not a
+// documentation nuance but a measured failure: `cat >/dev/null &` reaches this branch's
+// `MembersRemain` in 0.01s, i.e. never, in a real cgroup v2 environment (verified in the
+// `--nocapture` cgroup lane; see this crate's own no-timed-fixtures history). Redirecting the
+// backgrounded `cat`'s stdin explicitly to `<&3` (a dup of the real pipe) opts it out of that
+// rule; `3<&-` then closes the now-redundant fd 3 once `cat`'s own fd 0 already aliases it.
 // On a mechanism with no kernel drain edge, this same fixture still exercises the pre-existing
 // root-only watch, which already computes `root_exited` correctly — asserted separately below
 // rather than skipped, per this crate's "never silently skip" testing convention.
@@ -372,7 +382,11 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use std::io::Read;
 
     let mut cmd = crate::Command::new();
-    cmd.args(["sh", "-c", "trap '' TERM; cat >/dev/null & echo r; exit 0"]);
+    cmd.args([
+        "sh",
+        "-c",
+        "trap '' TERM; exec 3<&0; cat <&3 >/dev/null 3<&- & echo r; exit 0",
+    ]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain();

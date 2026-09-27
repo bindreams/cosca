@@ -622,17 +622,28 @@ fn the_kill_filter_excludes_this_process_and_pid_one() {
 /// `ProcessId::of` in the very next line races the kernel's own delivery-and-reap timing — a
 /// zombie orphan (signalled, not yet reaped by launchd) still resolves via `proc_pidinfo` with
 /// the SAME start token, so that check alone can pass before the kill has actually landed. `sh`
-/// backgrounds `sleep` without redirecting it, so `sleep` inherits `sh`'s piped stdout; once
-/// `sh` exits (`child.wait()`, above), the orphaned `sleep` is the pipe's ONLY remaining write
-/// end, so a blocking read on it returns EOF exactly when `sleep` dies — a real event, not a
+/// backgrounds `cat` without redirecting its stdout, so `cat` inherits `sh`'s piped stdout; once
+/// `sh` exits (`child.wait()`, above), the orphaned `cat` is the pipe's ONLY remaining write
+/// end, so a blocking read on it returns EOF exactly when `cat` dies — a real event, not a
 /// timer.
+///
+/// The orphan is `cat`, not `sleep 600`: `hard_kill()` below is the mechanism under test, and a
+/// `sleep`-based orphan has its own 600s timer completely independent of it — a broken
+/// `hard_kill()` would still let the EOF read resolve once that timer alone ends the orphan,
+/// proving nothing. `cat` needs its OWN stdin explicitly redirected (`exec 3<&0; cat <&3 ...
+/// 3<&-`), not a bare `cat &`: a non-interactive shell gives an asynchronous command with no
+/// explicit stdin redirect of its own `/dev/null`, not the shell's stdin, so a bare `cat &`
+/// would see EOF and exit right away instead of blocking (measured elsewhere in this crate's
+/// history: `cat >/dev/null &` reaches its own intended blocked state in 0.01s, i.e. never).
 #[test]
 fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
-    // `sleep` inherits the marker across sh's fork and its own exec; `echo $!` publishes it.
+    // `cat` inherits the marker across sh's fork and its own exec, same as `sleep` did;
+    // `echo $!` publishes it.
     cmd.arg("-c")
-        .arg("sleep 600 & echo $!")
+        .arg("exec 3<&0; cat <&3 3<&- & echo $!")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     // setsid: the orphan leaves this process's session AND process group, so killpg misses it.
     // SAFETY: pre_exec runs post-fork, pre-exec; `libc::setsid` is async-signal-safe.
@@ -649,6 +660,10 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
 
+    // Taken out and held past the EOF read below: `child.wait()` (which closes its OWN piped
+    // stdin before it waits — see `containment::unix::group_tests::leader_command`'s doc) must
+    // not be what ends the orphan; only `hard_kill()`'s own real signal may.
+    let _stdin = child.stdin.take().expect("piped stdin");
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
     out.read_line(&mut line).expect("read orphan pid");
@@ -663,9 +678,9 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let marker = super::Marker::new(prepared, None, None, false);
     marker.hard_kill().expect("hard_kill");
 
-    // The proof: `sleep` is the pipe's sole remaining writer, so EOF fires exactly on its
+    // The proof: `cat` is the pipe's sole remaining writer, so EOF fires exactly on its
     // death — a real event, not a timer. This DOES block until then, unlike `Member::assert_dead`
-    // in Task 7: there is no alive/dead round trip available on a plain, un-echoing `sleep`, so
+    // in Task 7: there is no alive/dead round trip available on a plain, un-echoing `cat`, so
     // there is no way to fail non-blockingly on the "still alive" branch here. Accepted
     // deliberately for this one unit test (the integration tests in Task 7 use control sockets
     // precisely to avoid this tradeoff at the suite's more expensive layer).

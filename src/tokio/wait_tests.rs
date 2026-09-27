@@ -10,12 +10,17 @@ use super::{grace_wait, wait_exit};
 use crate::identity::ProcessId;
 
 // A long-lived std child (leak-proof: killed + reaped by each test), blocked reading its own
-// piped stdin — never via a chosen sleep duration. `cat`/`findstr x` unblock only on EOF (the
-// pipe dropped, which nothing here does before the child's own field is dropped) or a real
-// kill, so an `is_alive()`/exit-state check taken before either of those cannot pass vacuously
-// just because a fixed-duration sleep hadn't finished yet. The piped stdin handle lives inside
-// `Child::stdin` itself — no caller here ever calls `.take()` on it — so it stays open for
-// exactly as long as the returned `Child` does.
+// piped stdin — never via a chosen sleep duration. `cat`/`findstr x` unblock only on EOF or a
+// real kill, so an `is_alive()`/exit-state check taken before either of those cannot pass
+// vacuously just because a fixed-duration sleep hadn't finished yet.
+//
+// **`std::process::Child::wait()` itself closes the piped stdin before it waits** — not just an
+// explicit `.take()`/`drop()` (verified: a bare `child.wait()` with nothing else touching stdin
+// ends a `cat`/`findstr` blocker via EOF). Every test below calls `wait()` only as its very last
+// step, after an explicit `kill()` has already ended the child for real — never while an
+// earlier assertion still needs it alive — so this is safe here, but is NOT a property of
+// holding the `Child` value itself; see `containment::unix::group_tests::leader_command`'s
+// identical note for a case where the ordering matters.
 fn std_blocker() -> std::process::Child {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();

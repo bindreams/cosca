@@ -33,11 +33,18 @@ fn await_zombie(pid: u32) {
 }
 
 /// A process-group leader that announces its own pid on a piped stdout, then blocks on a piped
-/// stdin this function's caller holds open — never via a chosen sleep duration. `pgid` is the
-/// group to join (`0` mints a new one of the leader's own, matching this file's existing
-/// `process_group(0)` convention). The caller MUST call [`await_leader_ready`] before using the
-/// leader's identity, and must keep the returned `Child`'s own `stdin` field intact (never
-/// `.take()` it) for exactly as long as it needs the leader to stay running.
+/// stdin — never via a chosen sleep duration. `pgid` is the group to join (`0` mints a new one
+/// of the leader's own, matching this file's existing `process_group(0)` convention). The
+/// caller MUST call [`await_leader_ready`] before using the leader's identity.
+///
+/// **`std::process::Child::wait()` itself closes the piped stdin before it waits** — not just
+/// an explicit `.take()`/`drop()` by the caller (verified: a bare `child.wait()`, with nothing
+/// else touching stdin, ends this leader by EOF on its trailing `read`, exiting non-zero from
+/// `read`'s own EOF failure, no signal involved). So `wait()` is itself a way to end the leader,
+/// and any assertion taken after it that depends on a REAL signal having been the cause (not a
+/// bare `!status.success()`, which an EOF-driven `read` failure also satisfies) must check the
+/// status's `.signal()` specifically, and must call whatever is meant to deliver that signal
+/// BEFORE calling `wait()` — see `state_of_an_owned_group_is_cleared_and_the_signal_was_real`.
 fn leader_command(pgid: i32) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("sh");
@@ -164,6 +171,8 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
 /// signal, not just classify: the leader is dead afterward.
 #[test]
 fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
+    use std::os::unix::process::ExitStatusExt;
+
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
     let mut child = leader_command(0).spawn().expect("spawn leader");
@@ -174,9 +183,16 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
         "a group we own must never report refusers"
     );
     let status = child.wait().expect("wait after state()'s own SIGKILL");
-    assert!(
-        !status.success(),
-        "state() must have actually delivered SIGKILL, not just probed, got {status:?}"
+    // NOT `!status.success()`: `std::process::Child::wait()` itself closes the piped stdin
+    // before it waits, so `leader_command`'s trailing `read _ignored` hits EOF and `sh` exits
+    // non-zero (`read`'s own EOF failure) EVEN IF `state()` never sent anything — a mutant that
+    // returns `Cleared` without actually converging would still pass a bare `!success()` check.
+    // Only a real delivered `SIGKILL` proves `state()` converged.
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "state() must have actually delivered SIGKILL, not just probed (or relied on `wait()`'s \
+         own stdin-close to end the leader by EOF instead), got {status:?}"
     );
 }
 

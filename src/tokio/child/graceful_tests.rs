@@ -311,14 +311,21 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
 
 // Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` — see there
 // for the full rationale, including the readiness handshake that closes the root's own
-// trap-installation race.
+// trap-installation race, and why the backgrounded `cat` needs `exec 3<&0; cat <&3 ... 3<&-`
+// rather than a bare `cat &`: a non-interactive shell gives an asynchronous command with no
+// explicit stdin redirection `/dev/null`, not the shell's own stdin, so a bare `cat &` exits on
+// EOF immediately instead of blocking.
 #[cfg(unix)]
 #[tokio::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use tokio::io::AsyncReadExt;
 
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sh", "-c", "trap '' TERM; cat >/dev/null & echo r; exit 0"]);
+    cmd.args([
+        "sh",
+        "-c",
+        "trap '' TERM; exec 3<&0; cat <&3 >/dev/null 3<&- & echo r; exit 0",
+    ]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain();

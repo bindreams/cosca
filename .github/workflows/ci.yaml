@@ -235,14 +235,20 @@ jobs:
       # cgroups under. We make a fresh leaf directly under the unified root cgroup:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
       # rule does not apply and a cgroup may hold BOTH the test process and a child
-      # leaf. We move our shell into it and run only the cgroup-named tests there
-      # (as root, single-threaded) — across the `spawn_io` integration binary, the
-      # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
+      # leaf. We move our shell into it and run the cgroup-named tests there (as root,
+      # single-threaded) — across the `spawn_io` integration binary, the `--lib`
+      # unit-test binary (which carries the white-box CgroupLeaf::wait_drained
       # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
       # post-fork failure path), and `tokio_io`; its cgroup tests that
       # cannot be a no-op are `#[ignore]`d, hence `--run-ignored all`. With the marker
       # set the tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable
       # — never a silent skip.
+      #
+      # `test(/members_remain/)` is also selected here, not just `test(/cgroup/)`:
+      # `*_members_remain_still_reaps_an_already_exited_root`'s own `MembersRemain` branch
+      # (vs. the non-drain-observable fallback) exists only under a drain-observable,
+      # non-authoritative mechanism — cgroup v2 is the only one this CI matrix can reach —
+      # so without this real cgroup lane those tests never exercise it at all, anywhere.
       #
       # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
       # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
@@ -257,7 +263,7 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
-            exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(binary(cosca) | binary(spawn_io) | binary(tokio_io)) & test(/cgroup/)"
+            exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(/members_remain/))"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default

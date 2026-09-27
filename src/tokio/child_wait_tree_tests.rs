@@ -26,9 +26,10 @@ fn quick_contained_cmd() -> crate::tokio::Command {
 }
 
 /// Async twin of `child::lifecycle_tests::long_lived_contained_child` — see there for the full
-/// rationale. Not yet configured with a piped stdin: callers must add that themselves (see call
-/// sites) so the returned `Command` stays a drop-in swap for the old `sleep 30`/`ping -n 30`
-/// shape at each of them.
+/// rationale. Already configured with a piped stdin (below); callers still must retrieve the
+/// writer themselves after `spawn()` (`child.stdin()`) and hold it for as long as they need the
+/// child to stay running — this function alone cannot do that, since it returns the unspawned
+/// `Command`.
 fn long_lived_contained_cmd() -> crate::tokio::Command {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]

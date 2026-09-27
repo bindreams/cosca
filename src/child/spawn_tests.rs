@@ -9,13 +9,28 @@ use crate::command::Command;
 use crate::error::Error;
 
 // A long-lived child, so a teardown leak would show as an alive process at the assert rather than
-// self-exiting.
+// self-exiting. On Windows, `fault::assert_child_reaped` can only check bare `is_alive() ==
+// Liveness::Dead` (unlike Unix, whose identity-resolution check is immune to a pid simply having
+// exited on its own — see that function's own doc), so `ping -n 30`'s own natural exit after 30s
+// would let a still-not-actually-reaped bug pass once the fixture's own timer ran out, rather
+// than hang or fail. The Windows leg instead pipes stdin from a pipe this function creates and
+// LEAKS the write end of (never closed, by us or by anything `Command`/`Child`'s own `Drop` does
+// to ITS OWN, separate copy of the stdio handle): the resulting child can only die from a real
+// kill by the code under test.
 fn blocker() -> Command {
     let mut cmd = Command::new();
     #[cfg(unix)]
     cmd.args(["sleep", "30"]);
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    {
+        cmd.args(["findstr", "x"]);
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        cmd.stdin(crate::stdio::Stdio::from_file(std::fs::File::from(
+            std::os::windows::io::OwnedHandle::from(reader),
+        )))
+        .expect("set stdin pipe");
+        std::mem::forget(writer); // never closed — see this function's own doc
+    }
     cmd
 }
 
