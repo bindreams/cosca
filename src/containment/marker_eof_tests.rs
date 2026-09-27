@@ -641,36 +641,85 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     };
     loop {
         // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only within
-        // its bounds, and the `1` count matches the slice length passed.
-        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-        assert!(rc >= 0, "poll failed: {}", std::io::Error::last_os_error());
-        if rc > 0 {
-            break; // the kernel confirms NOTE_LOWAT crossed: the writer is now past the clamp
+        // its bounds, and the `1` count matches the slice length passed. An infinite timeout
+        // blocks in the kernel until genuinely ready — no busy-spin, no chosen wait duration.
+        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if rc >= 0 {
+            break;
         }
-        std::thread::yield_now(); // not yet — re-check the same real condition, no sleep, no bound
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::EINTR), "poll failed: {err}");
     }
+    // `poll` readiness alone does not distinguish a genuinely crossed low-water mark from
+    // `EV_EOF` (the writer having already exited) — both make the kqueue's own fd pollable.
+    // Retrieve and interpret the actual event so a dead writer can never be mistaken for one
+    // still blocked past the clamp.
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut events = [nix::sys::event::KEvent::new(
+        0,
+        nix::sys::event::EventFilter::EVFILT_READ,
+        nix::sys::event::EvFlags::empty(),
+        nix::sys::event::FilterFlag::empty(),
+        0,
+        0,
+    )];
+    let n = loop {
+        match probe_kq.kevent(&[], &mut events, Some(zero)) {
+            Ok(n) => break n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("kevent failed: {e}"),
+        }
+    };
+    assert_eq!(n, 1, "poll(2) reported ready but kevent found nothing pending");
+    assert!(
+        !events[0].flags().contains(nix::sys::event::EvFlags::EV_EOF),
+        "the writer already exited before crossing the low-water mark — a dead writer must not \
+         be mistaken for one still genuinely blocked past the clamp"
+    );
     drop(probe_kq);
 
-    // With the precondition proven — the kernel has already confirmed the writer is past the
-    // clamp BEFORE this await even starts — a short bounded `timeout` here is a genuine failure
-    // bound, not the proof: a real writer genuinely blocked in its own `write()` can only be
-    // unblocked by draining or by this process's own later `kill()`, neither of which has
-    // happened yet, so a CORRECT `wait_tree_drained` blocks for as long as this test's whole
-    // remaining body takes to run; only a BUG resolves it at all, and a bug that resolves a
-    // future which is checked via reactor-driven `AsyncFd` readiness (which — unlike a bare
-    // synchronous `Future::poll`, see this crate's `wait_exit_cancel_leaves_child_untouched` for
-    // where that idiom IS appropriate — needs the runtime to actually drive at least one I/O
-    // cycle to observe real kqueue state) does so on the very first such cycle, not eventually:
-    // there is no legitimate slow path here for the timeout to race against, so 50ms is ample
-    // and not a tight bound chasing scheduler noise.
+    // How many bytes are sitting in the pipe right now — measured BEFORE the bounded wait below,
+    // so a comparison afterward catches PARTIAL draining too, not just full resolution: a
+    // "drains past the clamp on an unbounded wait" mutant that needs several drain-and-refill
+    // rounds to fully resolve (each round bounded by how fast the writer can refill, which takes
+    // genuine wall-clock time) can still leave an OBSERVABLE trace — some bytes gone — well
+    // before it finishes all of them, even on a run where the bound below expires before full
+    // resolution. This does not depend on freezing the writer: an earlier version of this test
+    // did (`SIGSTOP` on `yes`/`head`, racing `wait` against a second, always-ready probe
+    // `AsyncFd` via `select!`), but measured to occasionally hang the whole test task
+    // indefinitely instead of failing — a custom raw-kqueue `AsyncFd` registration that never
+    // sees fresh kernel readiness (because the frozen writer can produce none) apparently does
+    // not reliably yield back to the executor on every poll, so not even `tokio::time::timeout`
+    // could recover it. A frozen writer is not needed for this check to work: it only needs a
+    // faithful "before" snapshot.
+    let queued_before = fionread(marker.as_raw_fd());
+    assert!(
+        queued_before > 0,
+        "poll/kevent confirmed readiness but FIONREAD reports 0 bytes queued"
+    );
+
+    // With the precondition proven, a bounded `timeout` here is a failure bound, not the sole
+    // proof (see the byte-count check below, which the ORIGINAL version of this test lacked and
+    // which is what actually closes the gap a "several rounds" mutant could exploit): a real
+    // writer genuinely blocked in its own `write()` can only be unblocked by draining or by this
+    // process's own later `kill()`, neither of which has happened yet.
     let outcome = ::tokio::time::timeout(
-        Duration::from_millis(50),
+        Duration::from_millis(100),
         crate::tokio::wait::wait_tree_drained(marker.as_fd()),
     )
     .await;
     assert!(
         outcome.is_err(),
         "a writer proven past the low-water clamp resolved the wait anyway — it must never be drained"
+    );
+    // Catches a mutant that drained SOME bytes during the bound above but had not (yet) fully
+    // resolved when it expired — a bare `outcome.is_err()` cannot tell that apart from the
+    // correct, fully-unbounded, never-drains behavior.
+    let queued_after = fionread(marker.as_raw_fd());
+    assert_eq!(
+        queued_after, queued_before,
+        "the marker pipe's buffered byte count changed during the bounded wait — \
+         wait_tree_drained must never drain past the low-water clamp on an unbounded wait"
     );
     assert_eq!(
         child.is_alive(),
