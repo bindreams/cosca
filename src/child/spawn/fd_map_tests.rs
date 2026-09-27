@@ -367,23 +367,24 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 
 // A parent_fd below fd 3 must not be clobbered by std's own stdio dup2 =====
 
-/// Require that this test is running alone in its own process before any caller closes a
-/// process-wide fd. A plain `cargo test`/`cargo test --lib` run shares one process across every
-/// test thread in the binary, so closing a real fd 0/1/2 there races with, and can corrupt,
-/// whatever unrelated test's thread next opens something and gets handed the freed number.
+/// Require that this test is running alone in its own process, via
+/// [`crate::containment::cgroup::test_support::alone`], before any caller closes a process-wide
+/// fd. A plain `cargo test`/`cargo test --lib` run shares one process across every test thread in
+/// the binary, so closing a real fd 0/1/2 there races with, and can corrupt, whatever unrelated
+/// test's thread next opens something and gets handed the freed number.
 ///
-/// Accepts either of two proofs of isolation:
-/// - `COSCA_TEST_ALONE=<name>` where this process's own argv is exactly `[<name>, ALONE_ARGS...]`
-///   — [`crate::containment::cgroup::test_support::alone_marker_matches`] — set by
-///   [`crate::containment::cgroup::test_support::alone`] on the fresh, single-test copy of this
-///   binary it re-execs. The normal case, and what makes this test pass under plain `cargo test`
-///   too, not just nextest. Checking argv, not just the env var's presence, is load bearing: see
-///   `alone_marker_matches`'s doc for the inherited/forged-env-var corruption this closes.
-/// - `NEXTEST_EXECUTION_MODE=process-per-test`, nextest's own documented marker
-///   (<https://nexte.st/book/env-vars.html> — checked for equality, not just presence, since
-///   nextest notes more values may exist once it can run multiple tests in one process), for a
-///   caller that reaches this without going through `alone` but still happens to run under
-///   nextest.
+/// The one accepted proof of isolation is `COSCA_TEST_ALONE=<name>` where this process's own argv
+/// is exactly `[<name>, ALONE_ARGS...]` —
+/// [`crate::containment::cgroup::test_support::alone_marker_matches`] — set by `alone` on the
+/// fresh, single-test copy of this binary it re-execs. Checking argv, not just the env var's
+/// presence, is load bearing: see `alone_marker_matches`'s doc for the inherited/forged-env-var
+/// corruption this closes.
+///
+/// Deliberately does NOT also accept nextest's own `NEXTEST_EXECUTION_MODE=process-per-test`:
+/// every guarded caller goes through `alone` now (itself safe under nextest too — its own
+/// `alone_marker_matches` check simply never matches there, so it re-execs same as under plain
+/// `cargo test`), and `NEXTEST_EXECUTION_MODE` is just as forgeable as `COSCA_TEST_ALONE` ever
+/// was — accepting it would reopen a second, unnecessary escape hatch.
 ///
 /// A copy of `tests/common/mod.rs`'s identical helper — this file is a separate compilation unit
 /// (this crate's own integration tests) and cannot name that one, though it DOES share
@@ -391,38 +392,70 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 /// its OWN compilation unit's copy of the re-exec helper. Fails loudly and immediately, before
 /// touching anything, rather than silently skipping: see cosca#196 for the long-term structural
 /// fix (serializing every process-wide-fd test into one group, so this stops depending on `alone`
-/// or nextest specifically).
+/// specifically).
 fn require_process_per_test(what: &str) {
     use crate::containment::cgroup::test_support::alone_marker_matches;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let alone = alone_marker_matches(std::env::var("COSCA_TEST_ALONE").ok().as_deref(), &argv);
-    let nextest = std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test");
     assert!(
-        alone || nextest,
-        "{what}; call this from inside crate::containment::cgroup::test_support::alone(), or run \
-         under cargo nextest (one process per test) — see cosca#196"
+        alone,
+        "{what}; call this from inside crate::containment::cgroup::test_support::alone() — see \
+         cosca#196"
     );
 }
 
-/// A panic hook, boxed the way [`std::panic::set_hook`]/[`std::panic::take_hook`] want it.
-type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static;
+/// Real fd 2 to `dup2` back before the panic hook's chained write runs, if a [`RestoreFd2`] is
+/// currently holding fd 2 closed — `None` when no guard has fd 2 closed. Read only by the ONE
+/// process-wide hook [`ensure_stderr_panic_hook`] installs; written only by [`RestoreFd2::take`]
+/// (sets) and its `Drop` (clears).
+///
+/// **`Drop` ONLY EVER clears this slot — it never calls [`std::panic::set_hook`] itself.**
+/// Measured: calling `set_hook` from `Drop` panics ("cannot modify the panic hook from a
+/// panicking thread") whenever that `Drop` runs during unwinding — which it always might, since
+/// unwinding is the ordinary reason a guard drops — and a panic during unwind is not caught: the
+/// process aborts (`SIGABRT`, exit 134), turning an ordinary test failure into a hard crash. That
+/// is worse than the very bug this file's panic-hook mechanism exists to fix. Installing the hook
+/// exactly ONCE, process-wide, and having it read this slot at panic time — rather than being
+/// reinstalled and un-installed per guard — is what makes `Drop` never need to touch the hook at
+/// all. A copy of `tests/common/mod.rs`'s identical mechanism on `RestoreStdio`.
+static SAVED_STDERR: std::sync::Mutex<Option<libc::c_int>> = std::sync::Mutex::new(None);
+
+/// Lock [`SAVED_STDERR`], recovering from poison rather than panicking: this mutex is read from
+/// inside a panic hook and written from `Drop` during unwind, both places where panicking AGAIN
+/// (on a poisoned lock) is the one outcome that must never happen — see [`SAVED_STDERR`]'s doc.
+fn saved_stderr() -> std::sync::MutexGuard<'static, Option<libc::c_int>> {
+    SAVED_STDERR.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Install the ONE, process-wide panic hook that restores real fd 2 from [`SAVED_STDERR`] (if
+/// occupied) before chaining to whatever hook was previously installed. Idempotent via `Once`:
+/// safe to call from every [`RestoreFd2::take`].
+fn ensure_stderr_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(real_stderr) = *saved_stderr() {
+                // SAFETY: `real_stderr` is a live dup of the original fd 2, owned by whichever
+                // `RestoreFd2` currently occupies `SAVED_STDERR` — its `Drop` clears the slot
+                // before that dup closes, so a `Some` read here is always still valid.
+                unsafe { libc::dup2(real_stderr, 2) };
+            }
+            previous(info);
+        }));
+    });
+}
 
 /// Dup fd 2 aside and close the original, so the CURRENT test process's fd 2 is free for the
 /// test to reuse — restoring it on drop even if the test panics.
 ///
 /// `take` asserts [`require_process_per_test`] before touching anything: see there for why.
 ///
-/// **A panic while this guard is alive would otherwise lose its own message.** The default panic
-/// hook writes to fd 2; a write to a CLOSED fd 2 fails, and the hook swallows that failure rather
-/// than panicking again — so the test fails with no diagnostic anywhere, exactly the case this
-/// helper exists to make debuggable. `take` installs a hook, for the life of the guard, that
-/// restores real fd 2 from `saved` (this same guard's own dup) before chaining to whatever hook
-/// was previously installed — so by the time that hook's `eprintln!`-shaped write actually runs,
-/// fd 2 is valid again. `Drop` restores the previous hook. A copy of `tests/common/mod.rs`'s
-/// identical mechanism on `RestoreStdio`.
+/// **A panic while this guard is alive would otherwise lose its own message** — see
+/// [`SAVED_STDERR`]/[`ensure_stderr_panic_hook`] for the mechanism that fixes this and why `Drop`
+/// never touches the hook itself.
 struct RestoreFd2 {
     saved: OwnedFd,
-    previous_panic_hook: std::sync::Arc<PanicHook>,
 }
 
 impl RestoreFd2 {
@@ -434,27 +467,29 @@ impl RestoreFd2 {
         // SAFETY: `saved` was just returned by a successful F_DUPFD_CLOEXEC.
         let saved = unsafe { OwnedFd::from_raw_fd(saved) };
         assert_eq!(unsafe { libc::close(2) }, 0, "close the test process' fd 2");
-        // See the struct doc for why.
-        let real_stderr = saved.as_raw_fd();
-        let previous: std::sync::Arc<PanicHook> = std::sync::Arc::from(std::panic::take_hook());
-        let for_hook = std::sync::Arc::clone(&previous);
-        std::panic::set_hook(Box::new(move |info| {
-            // SAFETY: `real_stderr` is this guard's own dup of the ORIGINAL fd 2 — kept open
-            // (owned by `saved`, itself kept alive by the `RestoreFd2` this closure outlives)
-            // for exactly this: restoring fd 2 from it here is `Drop`'s own restore, just done
-            // early enough that the previous hook's write actually lands.
-            unsafe { libc::dup2(real_stderr, 2) };
-            for_hook(info);
-        }));
-        RestoreFd2 {
-            saved,
-            previous_panic_hook: previous,
-        }
+        // See `SAVED_STDERR`'s doc for the mechanism.
+        ensure_stderr_panic_hook();
+        let mut slot = saved_stderr();
+        debug_assert!(
+            slot.is_none(),
+            "RestoreFd2: SAVED_STDERR already occupied (by fd {:?}) — a previous guard's fd 2 was \
+             never cleared, or two guards overlap. Only reachable if a caller uses RestoreFd2 \
+             outside alone()'s single-test isolation.",
+            *slot
+        );
+        *slot = Some(saved.as_raw_fd());
+        RestoreFd2 { saved }
     }
 }
 
 impl Drop for RestoreFd2 {
     fn drop(&mut self) {
+        // Clear the process-wide slot BEFORE the restore below closes `self.saved` (the fd
+        // `SAVED_STDERR` currently points at), so the ONE process-wide panic hook (installed
+        // once by `take`, never touched here) can never read a stale fd. This NEVER calls
+        // `std::panic::set_hook`: see `SAVED_STDERR`'s doc for why that would turn an ordinary
+        // panic into a process abort.
+        *saved_stderr() = None;
         // SAFETY: dup2 back onto 2; `self.saved` stays valid (and is closed normally by its own
         // Drop) regardless of this call's outcome.
         //
@@ -475,10 +510,6 @@ impl Drop for RestoreFd2 {
             self.saved.as_raw_fd(),
             std::io::Error::last_os_error()
         );
-        // Undo `take`'s temporary hook, now that fd 2 is restored above anyway — chaining back
-        // to whatever this guard displaced.
-        let previous = std::sync::Arc::clone(&self.previous_panic_hook);
-        std::panic::set_hook(Box::new(move |info| previous(info)));
     }
 }
 

@@ -113,9 +113,12 @@ pub(crate) fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool
 /// Linux — hence `unix` rather than this file's otherwise Linux-only gate. Sets `COSCA_TEST_ALONE`
 /// in the copy so a precondition assert guarding the actual mutation (e.g.
 /// `tests/common::require_process_per_test`, a separate copy in a separate compilation unit that
-/// cannot name this one) can accept either this or nextest's own
-/// `NEXTEST_EXECUTION_MODE=process-per-test` — see [`alone_marker_matches`] for why the env var
-/// alone does not suffice.
+/// cannot name this one) can accept it.
+///
+/// Checks BOTH that the env var equals `name` AND that this process's own argv matches
+/// [`alone_marker_matches`]'s shape — the first alone is not enough (see that function's doc for
+/// the inherited/forged-env-var corruption checking only presence, or only the wrong one of these
+/// two, would let back in), and belt-and-suspenders costs nothing here.
 ///
 /// Spawns under `crate::child::spawn::spawn_lock()`, waits outside it: on macOS, a fork here that
 /// lands while another test's fd-marker write end happens to have its `CLOEXEC` cleared (a real,
@@ -129,7 +132,8 @@ pub(crate) fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool
 pub(crate) fn alone(name: &str) -> bool {
     const ALONE: &str = "COSCA_TEST_ALONE";
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if alone_marker_matches(std::env::var(ALONE).ok().as_deref(), &argv) {
+    let env_value = std::env::var(ALONE).ok();
+    if env_value.as_deref() == Some(name) && alone_marker_matches(env_value.as_deref(), &argv) {
         return true;
     }
     let child = {
