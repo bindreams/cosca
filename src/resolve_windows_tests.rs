@@ -1,12 +1,11 @@
 //! A REAL Windows ACL proof for [`resolve`]'s undeterminable-candidate disposition.
 //!
-//! `src/resolve_base_tests.rs` has Unix-side tests that simulate the Windows grammar
-//! (`windows: true`) on a Unix HOST — via a directory this process is denied read access to, or
-//! (once a separate, in-flight PR lands) a symlink loop that always yields `ELOOP` — useful for
-//! pinning the DISPOSITION (fail closed under `loadable_only`, skip and continue otherwise), but
-//! not a real Windows `ERROR_ACCESS_DENIED` (raw code 5) from a real Windows ACL, since none of
-//! those run on a Windows host. This file is that: it builds an actual deny ACE with the Win32
-//! Authorization APIs and checks the same two dispositions against it.
+//! `src/resolve_base_tests.rs` has a Unix-side test that simulates the Windows grammar
+//! (`windows: true`) on a Unix HOST, using a directory this process is denied read access to —
+//! useful for pinning the DISPOSITION (fail closed under `loadable_only`, skip and continue
+//! otherwise), but not a real Windows `ERROR_ACCESS_DENIED` (raw code 5) from a real Windows
+//! ACL, since it does not run on a Windows host. This file is that: it builds an actual deny ACE
+//! with the Win32 Authorization APIs and checks the same two dispositions against it.
 //!
 //! # Where the deny ACE has to sit
 //!
@@ -29,9 +28,9 @@
 //! DUPLICATE of this process's own token and impersonates the CURRENT THREAD with it, so the
 //! DACL becomes authoritative for `FILE_TRAVERSE` too, for the probe and the [`resolve`] call
 //! that follow — and nothing else: the strip lives on a thread-scoped impersonation token, never
-//! this process's own, so no other thread and no later test is affected. See
-//! [`ImpersonationGuard::without_change_notify`]'s doc for why a process-wide, irreversible strip
-//! is unsound here.
+//! this process's own, so no other thread is affected. See
+//! [`ImpersonationGuard::without_change_notify`]'s doc for why a process-wide strip is unsound
+//! here.
 //!
 //! Only the combination above — both bits denied on the directory, `SeChangeNotifyPrivilege`
 //! stripped for the probing thread — was actually measured to work, on GitHub's Windows CI
@@ -40,10 +39,11 @@
 //! host runs this test, rather than resting on the reasoning above.
 
 use super::*;
+use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt;
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, LUID};
+use windows::core::{Owned, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_NO_TOKEN, HANDLE, HLOCAL, LUID};
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS,
     EXPLICIT_ACCESS_W, SE_FILE_OBJECT, TRUSTEE_W,
@@ -55,7 +55,9 @@ use windows::Win32::Security::{
     TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, FILE_TRAVERSE};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+};
 
 fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> {
     resolve(ResolveInput {
@@ -72,8 +74,7 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
 /// Reads the raw OS error [`crate::error::io_context`] wrapped: it keeps the original
 /// [`std::io::Error`] as `source()` precisely so the code survives being wrapped (several codes
 /// share one [`std::io::ErrorKind`]), and this is what pins the exact code rather than the
-/// coarser kind. Mirrors `resolve_base_tests.rs`'s own `wrapped_raw_os_error` (that one is
-/// `#[cfg(unix)]`-gated in its file, this whole file already is).
+/// coarser kind.
 fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
     std::error::Error::source(e)
         .and_then(|s| s.downcast_ref::<std::io::Error>())
@@ -137,38 +138,53 @@ fn panic_or_eprint(msg: String) {
 /// thread opens while the guard is alive — see the module doc for why that privilege matters
 /// here. Reverted on drop.
 ///
-/// Scoped to one thread's impersonation token rather than stripping the privilege from this
-/// process's own token: `AdjustTokenPrivileges(..., SE_PRIVILEGE_REMOVED)` is irreversible for a
-/// token, so a process-wide strip can never be undone for the rest of this test binary's life —
-/// every OTHER test still to run in this same process (`cargo test`/`cargo nextest` reuse the
-/// process across tests) would lose the privilege too, and re-enabling it afterwards would still
-/// leave a window where a concurrently running test observes the stripped process token, a data
-/// race on shared, mutable process state. A thread's impersonation token is not shared: setting
-/// and reverting it here touches only the thread these two tests run on.
-struct ImpersonationGuard;
+/// `!Send` (via the `PhantomData<*const ()>` field): impersonation is a property of the OS
+/// thread that called [`Self::without_change_notify`], not of this Rust value, so the guard must
+/// not be movable to another thread, where `Drop` would revert impersonation nobody there set up
+/// and leave THIS thread — the one that actually called `SetThreadToken` — impersonating forever.
+///
+/// Scoped to one thread's impersonation token rather than touching this process's own: the
+/// alternative would be a process-wide, temporary DISABLE-then-RE-ENABLE of
+/// `SeChangeNotifyPrivilege` on the process token (distinct from the `SE_PRIVILEGE_REMOVED` this
+/// function applies to a DUPLICATE below, which is irreversible for whichever token it lands on
+/// — re-enabling after THAT is not an option at all). That disable-then-re-enable alternative has
+/// its own race: `cargo test` runs every test as a separate thread within ONE process (nextest,
+/// which this repo's CI uses, instead gives each test its own process — see `d2b1c7bd`), so
+/// under plain `cargo test` a concurrently running test on another thread of that same process
+/// would observe the process token with the privilege missing too, for the whole disabled
+/// window — a data race on shared, mutable process state. A thread's impersonation token is not
+/// shared with any other thread, so touching only it, for only the calling thread's own
+/// lifetime, has no such window.
+struct ImpersonationGuard(PhantomData<*const ()>);
 
 impl ImpersonationGuard {
     fn without_change_notify() -> Self {
-        let mut token = HANDLE::default();
-        // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close.
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut token) }
-            .expect("OpenProcessToken(TOKEN_DUPLICATE)");
-        let mut dup = HANDLE::default();
-        // SAFETY: `token` is a live, owned handle with `TOKEN_DUPLICATE` access; `dup` is a
+        Self::assert_not_already_impersonating();
+
+        // SAFETY: `TOKEN_DUPLICATE` is a real, valid `TOKEN_ACCESS_MASK` constant.
+        let raw_token = unsafe { open_process_token(TOKEN_DUPLICATE) }.expect("OpenProcessToken(TOKEN_DUPLICATE)");
+        // SAFETY: `raw_token` was just opened above and is owned by this function from here on —
+        // wrapping it immediately means every exit path below, including a panic, closes it.
+        let token = unsafe { Owned::new(raw_token) };
+
+        let mut raw_dup = HANDLE::default();
+        // SAFETY: `*token` is a live, owned handle with `TOKEN_DUPLICATE` access; `raw_dup` is a
         // valid `&mut` out-param.
-        let duplicated = unsafe {
+        unsafe {
             DuplicateTokenEx(
-                token,
+                *token,
                 TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE | TOKEN_QUERY,
                 None,
                 SecurityImpersonation,
                 TokenImpersonation,
-                &mut dup,
+                &mut raw_dup,
             )
-        };
-        // SAFETY: `token` is an owned handle this function is done with.
-        unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
-        duplicated.expect("DuplicateTokenEx");
+        }
+        .expect("DuplicateTokenEx");
+        // SAFETY: `raw_dup` was just created above and is owned by this function from here on —
+        // same reasoning as `token`.
+        let dup = unsafe { Owned::new(raw_dup) };
+        drop(token); // the source token is no longer needed once the duplicate exists
 
         let mut luid = LUID::default();
         // SAFETY: `SE_CHANGE_NOTIFY_NAME` is a static NUL-terminated wide string.
@@ -180,36 +196,72 @@ impl ImpersonationGuard {
                 Attributes: SE_PRIVILEGE_REMOVED,
             }],
         };
-        // Succeeds with `ERROR_NOT_ALL_ASSIGNED` when the token never held the privilege — not
-        // the case here (`SeChangeNotifyPrivilege` is assigned to everyone by default), but the
-        // call still succeeds either way, so nothing extra needs checking for that case.
-        // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches; `dup` is this
+        // Succeeds with `ERROR_NOT_ALL_ASSIGNED` even when the token never held the privilege to
+        // remove, so a successful call here does NOT by itself prove `SeChangeNotifyPrivilege`
+        // was actually stripped from `dup`. `locked_then_open`'s raw-5 precondition is what
+        // would catch a silently-missed strip: if this quietly did nothing, the primary
+        // `CreateFileW` traversal would succeed regardless of the deny ACE below, and that
+        // precondition would fail loudly instead of this call.
+        // SAFETY: `privileges` describes one LUID and `PrivilegeCount` matches; `*dup` is this
         // function's own fresh, owned duplicate.
-        let adjusted = unsafe { AdjustTokenPrivileges(dup, false, Some(&privileges), 0, None, None) };
-        if let Err(e) = adjusted {
-            // SAFETY: `dup` is an owned handle, and this branch panics without ever handing it
-            // to `SetThreadToken`, so nothing else will close it.
-            unsafe { CloseHandle(dup) }.expect("CloseHandle(duplicate token)");
-            panic!("AdjustTokenPrivileges(SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED): {e}");
-        }
+        unsafe { AdjustTokenPrivileges(*dup, false, Some(&privileges), 0, None, None) }
+            .expect("AdjustTokenPrivileges(SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED)");
 
-        // SAFETY: `dup` is a valid, owned impersonation-type token for this same process's own
+        // Build the guard from `SetThreadToken`'s own result BEFORE dropping `dup` below: if
+        // `SetThreadToken` succeeded, this thread is now impersonating, and `guard` — once
+        // unwrapped — is the only thing whose `Drop` reverts that. Dropping `dup` cannot itself
+        // fail (`Owned::drop` swallows `CloseHandle`'s own possible failure, matching every
+        // other `HANDLE`'s `Free` impl), so there is no panic window between "impersonating" and
+        // "guard exists" for it to open — but building `guard` first keeps that invariant true
+        // even if a future edit here made freeing `dup` fallible.
+        // SAFETY: `*dup` is a valid, owned impersonation-type token for this same process's own
         // identity, missing only the one privilege just removed.
-        let set = unsafe { SetThreadToken(None, Some(dup)) };
-        // SAFETY: `dup` is an owned handle; `SetThreadToken` references the underlying kernel
-        // object for the thread's impersonation slot rather than borrowing this specific handle
-        // value, so closing it here does not invalidate the thread's impersonation.
-        unsafe { CloseHandle(dup) }.expect("CloseHandle(duplicate token)");
-        set.expect("SetThreadToken");
-
-        ImpersonationGuard
+        let guard = unsafe { SetThreadToken(None, Some(*dup)) }.map(|()| ImpersonationGuard(PhantomData));
+        drop(dup);
+        guard.expect("SetThreadToken")
     }
+
+    /// `Drop` reverts to NO impersonation at all (`SetThreadToken(None, None)`), which would
+    /// discard whatever impersonation the calling thread already had if this were nested inside
+    /// it — a precondition worth asserting rather than silently violating.
+    fn assert_not_already_impersonating() {
+        let mut existing = HANDLE::default();
+        // SAFETY: `GetCurrentThread` returns a pseudo-handle needing no close; `existing` is a
+        // valid `&mut` out-param.
+        match unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, false, &mut existing) } {
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_NO_TOKEN.0) => {} // expected: none yet
+            Err(e) => panic!("OpenThreadToken: unexpected error probing for prior impersonation: {e}"),
+            Ok(()) => {
+                // SAFETY: `existing` is a handle this branch just opened, owned from here on —
+                // wrapped so the `panic!` below still closes it.
+                let _existing = unsafe { Owned::new(existing) };
+                panic!(
+                    "this thread is already impersonating — ImpersonationGuard::drop only knows \
+                     how to revert to NO impersonation, so nesting would discard the caller's own"
+                );
+            }
+        }
+    }
+}
+
+/// [`OpenProcessToken`] wrapped to return the handle by value instead of through an out-param,
+/// so its caller can hand the result straight to [`Owned::new`] without an intermediate
+/// `HANDLE::default()` binding of its own.
+///
+/// # Safety
+/// Same as [`OpenProcessToken`]: `access` must be a valid `TOKEN_ACCESS_MASK` for the call.
+unsafe fn open_process_token(access: windows::Win32::Security::TOKEN_ACCESS_MASK) -> windows::core::Result<HANDLE> {
+    let mut token = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close; `token` is a valid
+    // `&mut` out-param. The caller upholds `access`'s validity per this function's own contract.
+    unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) }?;
+    Ok(token)
 }
 
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
         // SAFETY: reverts THIS thread's impersonation token to none, the exact counterpart to
-        // `SetThreadToken(None, Some(dup))` above.
+        // `SetThreadToken(None, Some(*dup))` above.
         if let Err(e) = unsafe { SetThreadToken(None, None) } {
             panic_or_eprint(format!("could not revert thread impersonation: {e}"));
         }
@@ -349,13 +401,17 @@ impl Drop for DenyAclGuard {
 /// A `PATH` entry whose directory is denied at the Win32 ACL level, followed by one that holds
 /// the name.
 ///
-/// Binding order in each caller's `let` matters for correctness, not just tidiness: tuple
-/// bindings from one `let` drop right-to-left, so with `_impersonation` named last it reverts
-/// BEFORE `_guard` restores the ACL (irrelevant to correctness here, since the restore relies on
-/// owner rights `SeChangeNotifyPrivilege` does not touch, but keeping the two guards' drop order
-/// the mirror of their setup order is the less surprising default), which in turn restores the
-/// ACL BEFORE `root`'s own `TempDir::drop` tries to delete the tree — the one drop-order
-/// dependency that IS load-bearing, since deleting `locked` while it is still denied would fail.
+/// The returned [`DenyAclGuard`] and [`ImpersonationGuard`] must be dropped, in that order
+/// (impersonation reverted first), before the returned [`tempfile::TempDir`] is closed — each
+/// caller below does so explicitly, rather than relying on the tuple's own drop order, so it can
+/// also call `TempDir::close` and assert the tree actually got removed. Reverting impersonation
+/// first is not merely cosmetic: with `SeChangeNotifyPrivilege` still stripped,
+/// `SetNamedSecurityInfoW`'s own path resolution down to `locked` would need real
+/// `FILE_TRAVERSE` on every ancestor of `locked` (`root` included) — nothing denies any of those
+/// today, so restoring the ACL while still impersonating would in fact still work, but reverting
+/// first removes the dependency on that staying true. Restoring the ACL before `TempDir::close`
+/// tries to delete the tree IS unconditionally load-bearing, since deleting `locked` while it is
+/// still denied would fail.
 fn locked_then_open() -> (
     tempfile::TempDir,
     PathBuf,
@@ -402,7 +458,7 @@ fn locked_then_open() -> (
 /// [`resolve`]'s own returned error, via its wrapped `source()`.
 #[test]
 fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
-    let (_root, _open, path, _guard, _impersonation) = locked_then_open();
+    let (root, _open, path, guard, impersonation) = locked_then_open();
 
     match search_tool(&path, true) {
         Err(Error::Io(e)) => {
@@ -411,12 +467,24 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
         }
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
+
+    // Explicit, in the order `locked_then_open`'s doc requires, so `root.close()` below sees a
+    // `locked` that is actually deletable and a failure to remove it fails this test rather than
+    // being swallowed by `TempDir`'s own `Drop`.
+    drop(impersonation);
+    drop(guard);
+    root.close().expect("remove the tempdir");
 }
 
 /// An ordinary spawn skips the denied candidate and goes on, as before, so one ACL-denied `PATH`
 /// directory does not break every unelevated spawn.
 #[test]
 fn an_undeterminable_windows_acl_is_skipped_by_an_ordinary_search() {
-    let (_root, open, path, _guard, _impersonation) = locked_then_open();
+    let (root, open, path, guard, impersonation) = locked_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
+
+    // See the sibling test for why this order and the explicit `close()` matter.
+    drop(impersonation);
+    drop(guard);
+    root.close().expect("remove the tempdir");
 }

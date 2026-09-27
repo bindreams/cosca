@@ -65,8 +65,7 @@ regex = "1"
 #   `SetNamedSecurityInfoW`, `GetNamedSecurityInfoW`, `SetEntriesInAclW`, `EXPLICIT_ACCESS_W` and
 #   `TRUSTEE_W`, to build a real deny ACE on a real Windows host rather than simulate one. (Its
 #   thread-impersonation guard needs no feature beyond `Win32_Security`/`Win32_System_Threading`,
-#   both already enabled: `DuplicateTokenEx`/`RevertToSelf` live in the former,
-#   `SetThreadToken` in the latter.)
+#   both already enabled: `DuplicateTokenEx` lives in the former, `SetThreadToken` in the latter.)
 #
 # Declaring both here, in dev-dependencies, keeps them out of the published crate's own
 # dependency footprint for downstream consumers who only pull in `[dependencies]`.
