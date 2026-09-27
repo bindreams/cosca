@@ -213,6 +213,52 @@ fn cancel_after_one_pending_poll(unreaped: &mut Unreaped) {
     );
 }
 
+/// Regression test for adversarial round-3 finding 3: before the fix, a recyclable retention on a
+/// `Held::Tokio` child forced `wait`'s outcome straight to `Err(Failed::NotYetReapable)` — a
+/// synchronous value needing no `.await` to produce — so the very first poll already fell through
+/// to `spawn_blocking_reap` and committed to a blocking-pool `ReapTask` before there was any chance
+/// to cancel anything. That task's `block_until_reapable` then blocks its pool thread for the
+/// child's entire remaining lifetime: for an ordinary, still-running child (nothing tracing it),
+/// `leak` afterwards would find the task `Running` and block right there until the child exited —
+/// contradicting `leak`'s own doc, `NotYetReapable`'s doc, and the PR body, all of which reserve
+/// that blocking case for a tracer holding the child, not an ordinary live one.
+///
+/// After the fix, `wait` first awaits a non-reaping exit watch — cancel-safe, and pending for as
+/// long as the child is running — before ever routing to the blocking pool. So one poll on a still-
+/// running child must leave no blocking-pool task pinned at all, and `leak` afterwards must return
+/// promptly rather than block.
+#[cfg(unix)]
+#[tokio::test]
+async fn leak_after_a_cancelled_wait_on_a_live_recyclable_child_neither_blocks_nor_pins_a_pool_thread() {
+    let (child, stdin, id) = blocked_child();
+    let retained = Retained {
+        attached: crate::containment::Attached::ProcessGroup(id.pid() as i32),
+    };
+    let mut unreaped = Unreaped::with_retained(Held::Tokio(Box::new(child)), Some(retained));
+
+    // The child is still alive for this poll — that is the scenario under test. What
+    // `self.blocking` ends up holding is decided synchronously within it (a blocking-pool task,
+    // once spawned, is not un-spawned by anything that happens afterward), so it is safe — and
+    // does not weaken the test — to let the child exit right away, before checking it: this way,
+    // if a later assertion panics or `leak` turns out to still block (the very bug under test),
+    // the ensuing `Drop`/`leak` wait is bounded by the child's own real exit, not by nothing.
+    cancel_after_one_pending_poll(&mut unreaped);
+    drop(stdin);
+
+    assert!(
+        unreaped.blocking.is_none(),
+        "a cancelled wait on a still-running child must not have pinned a blocking-pool task \
+         waiting on its exit — the exit had not happened yet at the time of the poll, so nothing \
+         must have been parked waiting for it off this future"
+    );
+    assert!(unreaped.held.is_some(), "the child is still held after the cancelled wait");
+
+    // Safe to call directly, not merely inferred: `blocking` being `None` above means `leak`
+    // cannot take the branch that would otherwise block on that task's own report (see `leak`'s
+    // doc) — there is no such task.
+    unreaped.leak();
+}
+
 /// Cancel a `wait` after it has started, then wait again: the caller still holds the child, and
 /// the second wait reaps it. A later `wait` returns the same status.
 async fn a_cancelled_wait_leaves_the_caller_holding<S>(mut unreaped: Unreaped, stdin: S, id: ProcessId) {

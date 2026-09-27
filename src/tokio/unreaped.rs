@@ -530,16 +530,28 @@ impl Unreaped {
             };
             // `wait_on`'s own inline reap (`held.try_reap()`, past its `watch_exit`) has no sweep
             // of its own — unlike the blocking-pool `ReapTask`'s (see its `run`'s doc) — so a
-            // recyclable-pgid retention must never reach it: force the same `NotYetReapable`
-            // routing `wait_on` itself would take if the exit watch fired before the zombie
-            // existed, sending it to `spawn_blocking_reap` below instead, without ever calling
-            // `wait_on` (and therefore never reaping through it) at all.
+            // recyclable-pgid retention must never reach it: route it to `spawn_blocking_reap`
+            // below instead, without ever calling `wait_on` (and therefore never reaping through
+            // it) at all.
+            //
+            // Round-3 finding 3: that routing must not itself pin a blocking-pool thread in a wait
+            // for a child that has not exited yet — `block_until_reapable` there blocks until it
+            // does, unbounded, which is only meant for the rare case a tracer is holding an
+            // already-exited child past its zombie (see `leak`'s doc). So await the same
+            // non-reaping, cancel-safe exit watch `wait_on` would (`watch_exit`) FIRST: pending for
+            // as long as the child runs, same as `wait_on`'s own watch would be. Only once it
+            // resolves — the exit is certain — does this become `NotYetReapable` and fall through
+            // to `spawn_blocking_reap`, whose own `block_until_reapable` then finds a zombie
+            // already there rather than blocking on one.
             let recyclable = self
                 .retained
                 .as_ref()
                 .is_some_and(|retained| retained.attached.carries_recyclable_pgid());
             let outcome = if recyclable {
-                Err(Failed::NotYetReapable)
+                match watch_exit(held).await {
+                    Ok(()) => Err(Failed::NotYetReapable),
+                    Err(e) => Err(Failed::Unawaitable(e)),
+                }
             } else {
                 wait_on(held).await
             };
@@ -1072,7 +1084,11 @@ fn classify_tokio_wait(e: std::io::Error) -> Failed {
 
 /// Await `held`'s exit without reaping it, on the handle it owns: a pidfd on Linux, a kqueue filter
 /// on its pid — its own unreaped child's, so the pid names it — on macOS, the process handle on
-/// Windows. A failure here is the watch's, not the child's: the caller keeps it.
+/// Windows. A `Held::Tokio` (round-3 finding 3) has none of these ready-made — its pid is all it
+/// carries — so it resolves a fresh identity for it and watches that instead, on either platform;
+/// a stale/recycled identity is not possible for our own still-unreaped child (its pid stays
+/// pinned to it until we reap it), so treated as already exited rather than as a watch failure. A
+/// failure here is the watch's, not the child's: the caller keeps it.
 async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
     #[cfg(test)]
     if fault::take_force_watch_failure() {
@@ -1083,8 +1099,22 @@ async fn watch_exit(held: &mut Held) -> std::io::Result<()> {
         Held::Bare { pidfd: Some(pidfd), .. } => crate::tokio::wait::pidfd_exit(pidfd).await,
         #[cfg(target_os = "macos")]
         Held::Std(child) => crate::tokio::wait::pid_exit(child.id()).await,
+        #[cfg(unix)]
+        Held::Tokio(child) => {
+            let pid = child.id().expect("an unreaped tokio child has a pid");
+            match crate::identity::ProcessId::of(pid) {
+                crate::identity::Resolved::Found(id) => crate::tokio::wait::wait_exit(id).await,
+                crate::identity::Resolved::Gone => Ok(()),
+                crate::identity::Resolved::Unknown => Err(crate::error::Error::Unassessable {
+                    detail: format!("pid {pid} identity could not be confirmed"),
+                    source: None,
+                }),
+            }
+        }
         #[cfg(windows)]
         Held::RawAsync(child) => child.wait().await.map(drop),
+        // Unreachable on macOS: `Held` there has only `Std` and `Tokio`, both matched above.
+        #[cfg(not(target_os = "macos"))]
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
