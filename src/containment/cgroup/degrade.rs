@@ -1,11 +1,9 @@
 //! Degrade reasons: pure data — no OS calls — so these compile, and their formatting is
 //! unit-tested, on every host rather than only where the mechanism exists.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// Why a cgroup v2 leaf could not be created. Each variant names the step that failed, the
 /// path it touched, and the kernel's own reason: the caller degrades to a process group
@@ -217,123 +215,20 @@ impl fmt::Display for NotPlaced {
     }
 }
 
-/// The step a contained spawn degraded at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) enum DegradeKind {
-    ReadProcSelfCgroup,
-    NoUnifiedLine,
-    CreateLeafDir,
-    KillUnsupported,
-    CheckKill,
-    OpenProcs,
-    OpenReportChannel,
-    WatchDrain,
-    PidfdUnavailable,
-    PlacementNotReported,
-    PlacementWriteFailed,
-}
-
-/// One condition a contained spawn can degrade for: the step, and the errno it failed with
-/// where it has one.
-///
-/// A reason's TEXT varies per spawn (paths, the child's own state); its condition is what an
-/// embedder can act on, and is what [`log_degrade`] warns about once per process. The errno is
-/// part of it because one step fails for different reasons that need different fixes: a
-/// transient `ENOMEM` from `mkdir` is not the standing `EACCES` of an undelegated slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) struct DegradeCondition {
-    pub(crate) kind: DegradeKind,
-    pub(crate) errno: Option<i32>,
-}
-
-/// A reason a spawn degraded: its full text, plus which condition it is an instance of.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) trait DegradeReason: fmt::Display {
-    fn condition(&self) -> DegradeCondition;
-}
-
-impl DegradeReason for LeafError {
-    fn condition(&self) -> DegradeCondition {
-        let (kind, source) = match self {
-            LeafError::ReadProcSelfCgroup(e) => (DegradeKind::ReadProcSelfCgroup, Some(e)),
-            LeafError::NoUnifiedLine { .. } => (DegradeKind::NoUnifiedLine, None),
-            LeafError::CreateLeafDir { source, .. } => (DegradeKind::CreateLeafDir, Some(source)),
-            LeafError::KillUnsupported { .. } => (DegradeKind::KillUnsupported, None),
-            LeafError::CheckKill { source, .. } => (DegradeKind::CheckKill, Some(source)),
-            LeafError::OpenProcs { source, .. } => (DegradeKind::OpenProcs, Some(source)),
-            LeafError::OpenReportChannel(e) => (DegradeKind::OpenReportChannel, Some(e)),
-            LeafError::WatchDrain { source, .. } => (DegradeKind::WatchDrain, Some(source)),
-        };
-        DegradeCondition {
-            kind,
-            errno: source.and_then(io::Error::raw_os_error),
-        }
-    }
-}
-
-impl DegradeReason for NotPlaced {
-    /// The child's own report, never how `cgroup.procs` read: that is diagnosis, not cause.
-    fn condition(&self) -> DegradeCondition {
-        let (NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. }) = self else {
-            let NotPlaced::Unwaitable { source, .. } = self else {
-                unreachable!("every other variant carries a report")
-            };
-            return DegradeCondition {
-                kind: DegradeKind::PidfdUnavailable,
-                errno: source.raw_os_error(),
-            };
-        };
-        match *report {
-            NotEntered::NotReported => DegradeCondition {
-                kind: DegradeKind::PlacementNotReported,
-                errno: None,
-            },
-            NotEntered::WriteFailed(errno) => DegradeCondition {
-                kind: DegradeKind::PlacementWriteFailed,
-                errno: Some(errno),
-            },
-        }
-    }
-}
-
-/// The degrade conditions this process has already reported at `warn`.
-static WARNED: Mutex<BTreeSet<DegradeCondition>> = Mutex::new(BTreeSet::new());
-
 /// Record that this spawn is not getting the containment it asked for, and why.
 ///
 /// One function for every degrade site so the wording is composed once: whichever step failed,
 /// the log carries a single line naming the achieved mechanism and the reason the stronger one
 /// was unavailable.
 ///
-/// **Once per condition at `warn`, every time after that at `debug`.** Nearly every degrade
-/// condition is a standing property of the host — an unprivileged container's read-only
-/// `/sys/fs/cgroup`, an undelegated slice, a kernel older than 5.14 — so it holds for every
-/// `.contain()` spawn this process will ever make. The first report is a real reduction in the
-/// guarantee the caller asked for and warns; the ten-thousandth tells an embedder nothing new
-/// about something it cannot fix, and a log an embedder learns to filter out is worse than no
-/// log. A genuinely NEW condition — see [`DegradeCondition`] — warns whatever has degraded
-/// before it.
-///
-/// Repeats carry their own full text, so a process whose `log` max level admits `debug` keeps
-/// every degrading spawn on record. Below that they are gone, not merely hidden: `log!` tests
-/// `max_level()` before reaching any logger, so a `warn`-filtered process emits nothing for
-/// them and no amount of capturing downstream brings them back.
+/// **Reported at `warn` every time.** A degrade is a real reduction in the guarantee the caller
+/// asked for, on every spawn it happens to — collapsing repeats into a single first report is a
+/// log handler's job (it has the whole process's history to decide what is worth showing
+/// again), not this library's: cosca does not know what an embedder's sink does with a repeated
+/// line, and guessing wrongly costs a real diagnosis.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn log_degrade(reason: &dyn DegradeReason) {
-    log_degrade_into(&WARNED, reason);
-}
-
-/// [`log_degrade`] against an explicit "already warned" set, and reporting the level it chose.
-///
-/// The set is a parameter, not a hard-wired static, so a test drives the first-then-repeat
-/// transition against its own state instead of racing every other test in the binary for the
-/// process-wide one.
-pub(super) fn log_degrade_into(warned: &Mutex<BTreeSet<DegradeCondition>>, reason: &dyn DegradeReason) -> log::Level {
-    let level = crate::warn_once::report_level(warned, reason.condition());
-    log::log!(level, "cgroup v2 containment: degrading to a process group — {reason}");
-    level
+pub(crate) fn log_degrade(reason: &dyn fmt::Display) {
+    log::warn!("cgroup v2 containment: degrading to a process group — {reason}");
 }
 
 #[cfg(test)]

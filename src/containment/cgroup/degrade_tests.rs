@@ -168,25 +168,17 @@ fn placement_unreadable_names_the_io_error() {
 
 /// The degrade is logged at `warn` with the reason attached — the single line a human reading
 /// CI output needs to tell WHICH step failed from the bare fact that containment degraded.
-///
-/// Driven against this test's own "already warned" set: the process-wide one is shared with
-/// every other test in this binary, so a first-report assertion made through it would silently
-/// become an assertion about libtest's scheduling.
 #[test]
 fn degrade_logs_the_reason_at_warn() {
     crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
     let mark = crate::log_capture::mark();
-    crate::containment::cgroup::log_degrade_into(
-        &warned,
-        &LeafError::KillUnsupported {
-            path: PathBuf::from("/sys/fs/cgroup/slice/cosca-degrade-probe-a41f"),
-        },
-    );
+    log_degrade(&LeafError::KillUnsupported {
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-degrade-probe-a41f"),
+    });
     assert_eq!(
         crate::log_capture::levels_since(mark, "cosca-degrade-probe-a41f"),
         vec![log::Level::Warn],
-        "a spawn that did not get the containment it asked for is news the first time"
+        "a spawn that did not get the containment it asked for is worth a warning"
     );
     let records = crate::log_capture::records_since(mark, "cosca-degrade-probe-a41f");
     assert!(
@@ -195,211 +187,25 @@ fn degrade_logs_the_reason_at_warn() {
     );
 }
 
-/// The process-wide entry point reports against a set that is shared and STICKY: whatever has
-/// degraded before it in this binary, a reason reported twice is at `debug` the second time.
-///
-/// Asserting the second report rather than the first is what makes this independent of test
-/// order — the bit is set either way by the time it runs.
+/// cosca does not deduplicate its own log lines — that is a log handler's job. A condition
+/// reported once and hit again by a later spawn is still news to `warn`: nothing here remembers
+/// what this process has already reported.
 #[test]
-fn log_degrade_reports_through_a_sticky_process_wide_set() {
+fn a_repeated_degrade_reason_warns_every_time() {
     crate::log_capture::install();
-    let reason = || LeafError::OpenProcs {
-        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-process-wide-probe-d582/cgroup.procs"),
-        source: std::io::Error::from_raw_os_error(9),
-    };
-    log_degrade(&reason());
-
-    let mark = crate::log_capture::mark();
-    log_degrade(&reason());
-
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "cosca-process-wide-probe-d582"),
-        vec![log::Level::Debug],
-        "the second report of one reason is a repeat, and still carries its own full text"
-    );
-}
-
-// Degrade-report volume -----
-// A degrade's REASON is usually a permanent property of the host (an unprivileged container's
-// read-only /sys/fs/cgroup, a kernel older than 5.14): an embedder spawning thousands of
-// contained children can act on the first report and on nothing after it.
-
-/// The first spawn to hit a given condition is news and warns; every later spawn hitting the
-/// SAME condition still reports, at `debug`. Driven against the test's own "already warned"
-/// state rather than the process-wide one, so the assertion does not depend on what other
-/// tests in this binary degraded first.
-#[test]
-fn a_repeated_degrade_reason_warns_once_then_reports_at_debug() {
-    crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
     let reason = || LeafError::KillUnsupported {
-        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-once-probe-7c13"),
+        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-repeat-probe-7c13"),
     };
 
     let mark = crate::log_capture::mark();
     for _ in 0..3 {
-        crate::containment::cgroup::log_degrade_into(&warned, &reason());
+        log_degrade(&reason());
     }
 
     assert_eq!(
-        crate::log_capture::levels_since(mark, "cosca-once-probe-7c13"),
-        vec![log::Level::Warn, log::Level::Debug, log::Level::Debug],
-        "an embedder cannot act twice on one host property, and every repeat is still on \
-         record for a reader who turns the level up"
+        crate::log_capture::levels_since(mark, "cosca-repeat-probe-7c13"),
+        vec![log::Level::Warn, log::Level::Warn, log::Level::Warn],
     );
-}
-
-/// A condition nobody has been told about yet is news, whatever else has already degraded —
-/// the once-per-reason rule must not collapse distinct reasons into one report.
-#[test]
-fn a_newly_seen_degrade_reason_still_warns() {
-    crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
-    crate::containment::cgroup::log_degrade_into(
-        &warned,
-        &LeafError::KillUnsupported {
-            path: PathBuf::from("/sys/fs/cgroup/slice/cosca-distinct-probe-3b90"),
-        },
-    );
-
-    let mark = crate::log_capture::mark();
-    crate::containment::cgroup::log_degrade_into(
-        &warned,
-        &LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(libc::EMFILE)),
-    );
-
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "placement-report channel"),
-        vec![log::Level::Warn],
-        "a second, different reason is a second thing the embedder has not been told"
-    );
-}
-
-/// One step failing for two different reasons is two conditions: a transient `ENOMEM` warning
-/// first must not silence a standing `EACCES` behind it.
-#[test]
-fn the_same_step_failing_with_a_new_errno_still_warns() {
-    crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
-    let refused = |errno: i32, marker: &str| LeafError::CreateLeafDir {
-        path: PathBuf::from(format!("/sys/fs/cgroup/slice/{marker}")),
-        source: std::io::Error::from_raw_os_error(errno),
-    };
-
-    let mark = crate::log_capture::mark();
-    crate::containment::cgroup::log_degrade_into(&warned, &refused(libc::ENOMEM, "cosca-errno-probe-e1c4"));
-    crate::containment::cgroup::log_degrade_into(&warned, &refused(libc::EACCES, "cosca-errno-probe-e1c4"));
-    crate::containment::cgroup::log_degrade_into(&warned, &refused(libc::EACCES, "cosca-errno-probe-e1c4"));
-
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "cosca-errno-probe-e1c4"),
-        vec![log::Level::Warn, log::Level::Warn, log::Level::Debug],
-    );
-}
-
-/// A child that reported nothing and a child whose write failed are different conditions, and
-/// so are two write failures with different errnos.
-#[test]
-fn each_placement_report_is_its_own_condition() {
-    crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
-    let absent = |report: NotEntered| NotPlaced::Absent {
-        pid: 4242,
-        path: PathBuf::from("/sys/fs/cgroup/slice/cosca-report-probe-9d27/cgroup.procs"),
-        procs: String::new(),
-        report,
-        child_state: None,
-    };
-
-    let mark = crate::log_capture::mark();
-    crate::containment::cgroup::log_degrade_into(&warned, &absent(NotEntered::NotReported));
-    crate::containment::cgroup::log_degrade_into(&warned, &absent(NotEntered::WriteFailed(libc::EBUSY)));
-    crate::containment::cgroup::log_degrade_into(&warned, &absent(NotEntered::WriteFailed(libc::EINVAL)));
-    crate::containment::cgroup::log_degrade_into(&warned, &absent(NotEntered::WriteFailed(libc::EBUSY)));
-
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "cosca-report-probe-9d27"),
-        vec![log::Level::Warn, log::Level::Warn, log::Level::Warn, log::Level::Debug],
-    );
-}
-
-/// Every reason carries its OWN kind, and every kind has a reason here. Two reasons sharing one
-/// kind would make the second one ever seen silently arrive at `debug`.
-#[test]
-fn every_degrade_reason_has_its_own_kind() {
-    use crate::containment::cgroup::{DegradeKind, DegradeReason};
-
-    // Exhaustive, so a new kind does not compile until it is counted here and given a reason
-    // below.
-    let counted = |kind: DegradeKind| match kind {
-        DegradeKind::ReadProcSelfCgroup
-        | DegradeKind::NoUnifiedLine
-        | DegradeKind::CreateLeafDir
-        | DegradeKind::KillUnsupported
-        | DegradeKind::CheckKill
-        | DegradeKind::OpenProcs
-        | DegradeKind::OpenReportChannel
-        | DegradeKind::WatchDrain
-        | DegradeKind::PidfdUnavailable
-        | DegradeKind::PlacementNotReported
-        | DegradeKind::PlacementWriteFailed => (),
-    };
-    const KINDS: usize = 11;
-
-    let reasons: Vec<Box<dyn DegradeReason>> = vec![
-        Box::new(LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13))),
-        Box::new(LeafError::NoUnifiedLine {
-            line_count: 1,
-            controllers: "9:memory".into(),
-        }),
-        Box::new(LeafError::CreateLeafDir {
-            path: PathBuf::from("/cg/leaf"),
-            source: std::io::Error::from_raw_os_error(13),
-        }),
-        Box::new(LeafError::KillUnsupported {
-            path: PathBuf::from("/cg/leaf"),
-        }),
-        Box::new(LeafError::CheckKill {
-            path: PathBuf::from("/cg/leaf/cgroup.kill"),
-            source: std::io::Error::from_raw_os_error(13),
-        }),
-        Box::new(LeafError::OpenProcs {
-            path: PathBuf::from("/cg/leaf/cgroup.procs"),
-            source: std::io::Error::from_raw_os_error(13),
-        }),
-        Box::new(LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(
-            libc::EMFILE,
-        ))),
-        Box::new(LeafError::WatchDrain {
-            path: PathBuf::from("/cg/leaf/cgroup.events"),
-            source: std::io::Error::from_raw_os_error(libc::EMFILE),
-        }),
-        Box::new(NotPlaced::Absent {
-            pid: 1,
-            path: PathBuf::from("/cg/leaf/cgroup.procs"),
-            procs: String::new(),
-            report: NotEntered::NotReported,
-            child_state: None,
-        }),
-        Box::new(NotPlaced::Unreadable {
-            pid: 1,
-            path: PathBuf::from("/cg/leaf/cgroup.procs"),
-            source: std::io::Error::from_raw_os_error(13),
-            report: NotEntered::WriteFailed(16),
-        }),
-        Box::new(NotPlaced::Unwaitable {
-            pid: 1,
-            source: std::io::Error::from_raw_os_error(libc::EMFILE),
-        }),
-    ];
-    let mut seen = Vec::new();
-    for reason in &reasons {
-        let kind = reason.condition().kind;
-        counted(kind);
-        assert!(!seen.contains(&kind), "{kind:?} is claimed by two different reasons");
-        seen.push(kind);
-    }
-    assert_eq!(seen.len(), KINDS, "every kind needs a reason here: {seen:?}");
 }
 
 // /proc/self/cgroup summary -----

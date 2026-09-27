@@ -1877,16 +1877,16 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
 // `pidfd_open` can fail (a full fd table, a seccomp filter). Waiting on the report channel's EOF
 // instead could block forever, so the verdict closes the leaf or learns the child is in it.
 
-/// A leaf with no report and no member is removed, so the child can never enter it, and the spawn
-/// degrades once per errno — warned the first time, `debug` after.
+/// A leaf with no report and no member is removed, so the child can never enter it, and the
+/// spawn degrades — reported at `warn` every time, including on the second occurrence.
 #[cfg(target_os = "linux")]
 #[test]
 fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
-    use crate::containment::cgroup::{DegradeCondition, DegradeKind, DegradeReason};
+    use crate::containment::cgroup::log_degrade;
 
     crate::log_capture::install();
-    let warned = std::sync::Mutex::default();
-    let mut levels = Vec::new();
+    let marker = "placement report cannot be waited for";
+    let mark = crate::log_capture::mark();
     for _ in 0..2 {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-unwaitable");
@@ -1904,17 +1904,19 @@ fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
             Err(reason @ NotPlaced::Unwaitable { .. }) => reason,
             other => panic!("expected Unwaitable, got {other:?}"),
         };
-        assert_eq!(
-            reason.condition(),
-            DegradeCondition {
-                kind: DegradeKind::PidfdUnavailable,
-                errno: Some(libc::EMFILE),
+        match &reason {
+            NotPlaced::Unwaitable { source, .. } => {
+                assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
             }
-        );
+            other => panic!("expected Unwaitable, got {other:?}"),
+        }
         assert!(!leaf_path.exists(), "the leaf must be closed to the child");
-        levels.push(crate::containment::cgroup::log_degrade_into(&warned, &reason));
+        log_degrade(&reason);
     }
-    assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
+    assert_eq!(
+        crate::log_capture::levels_since(mark, marker),
+        [log::Level::Warn, log::Level::Warn]
+    );
 }
 
 /// A report already sent is final, pidfd or not, and the leaf is left alone.

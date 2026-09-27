@@ -199,19 +199,21 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
 }
 
-/// The warning is once per errno: the first failure at `warn`, every repeat at `debug`.
+/// cosca does not deduplicate its own log lines — that is a log handler's job. The warning is
+/// reported at `warn` every time, including on a repeat of the same errno.
 #[test]
-fn the_unreachable_child_warning_is_once_per_errno() {
-    let warned = std::sync::Mutex::default();
+fn the_unreachable_child_warning_is_every_time() {
+    crate::log_capture::install();
     let error = || Error::Io(std::io::Error::from_raw_os_error(libc::EMFILE));
-    let levels: Vec<_> = (0..2)
-        .map(|_| super::warn_after_fork_into(&warned, &error(), "it was left running"))
-        .collect();
-    assert_eq!(levels, [log::Level::Warn, log::Level::Debug]);
-    let other = Error::Io(std::io::Error::from_raw_os_error(libc::ENOMEM));
+    let marker = "cosca-abandoned-warn-probe-6f21";
+
+    let mark = crate::log_capture::mark();
+    super::warn_after_fork(&error(), marker);
+    super::warn_after_fork(&error(), marker);
+
     assert_eq!(
-        super::warn_after_fork_into(&warned, &other, "it was left running"),
-        log::Level::Warn
+        crate::log_capture::levels_since(mark, marker),
+        [log::Level::Warn, log::Level::Warn]
     );
 }
 
