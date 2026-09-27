@@ -30,16 +30,16 @@ Async `Drop` may send a bounded number of signals, and may write `cgroup.kill`, 
 file write. It never waits for a process exit or a cgroup drain. Completion is explicit and async:
 `wait().await`, `wait_tree().await`. A bare drop that leaves work unfinished leaves the resource
 behind and logs a warning naming it. A dropped, still-running async root goes to tokio's own orphan
-queue, which is tokio's state, not cosca's. Sync code may block, as sync Rust normally does.
+queue, which is tokio's state, not cosca's; that queue reaps by PID, the exception principle 3
+accepts. Sync code may block, as sync Rust normally does.
 
 **Why:** a kill is not an exit (a process stuck in I/O on a hung NFS mount outlives `SIGKILL`), so
 any wait in `Drop` is unbounded. tokio's predecessor, tokio-process, removed its blocking wait from
 `Drop` for this reason ([tokio-process#51]), and tokio panics rather than block when a `Runtime` is
-dropped in async context ([tokio `Runtime`]). Global reapers (`waitpid(-1)`, a subreaper) belong to
-programs that own the whole process, such as tini and the containerd shim. Embeddable libraries
-decline the role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), runc's Go `libcontainer` requires
-its embedder to supply the reaper ([runc CHANGELOG]), and GLib never calls `waitpid(-1)` and prefers
-a pidfd to installing a global `SIGCHLD` handler ([gmain.c]).
+dropped in async context ([tokio shutdown.rs]). Global reapers (`waitpid(-1)`, a subreaper) belong
+to programs that own the whole process, such as tini and the containerd shim. Embeddable libraries
+decline the role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), and runc's Go `libcontainer`
+requires its embedder to supply the reaper ([runc CHANGELOG]).
 
 **Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns, and
 every async spawn and teardown path under [`src/tokio/`](../src/tokio/). The sync
@@ -72,6 +72,12 @@ while a handle to the process is open. Signal and wait through a handle that nam
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
+One by-number reap is accepted: tokio's orphan queue reaps a dropped, still-running async root with
+`waitpid(pid)` (principle 2). It is tokio's state, and the only alternative is a reaper cosca would
+own (principle 1). On evidence of a foreign reap at drop time, cosca forgets tokio's child instead
+of handing it over. What remains is a foreign reap after the handoff, which the queue cannot
+detect.
+
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
 
@@ -92,13 +98,25 @@ unrelated process.
   - `fail_closed` in [`leaf.rs`](../src/containment/cgroup/leaf.rs), for the child and its group;
   - `end_child` in the same file, for the child's group, and for the child itself when
     `pidfd_send_signal` is refused.
-- These wait by number, so after a foreign reap they can wait on, and reap, another child of ours:
-  - sync `Child::wait` and `Drop` ([`proc_handle.rs`](../src/child/proc_handle.rs)), and
-    `reap_unadopted` and `reap_in_background` in [`src/child/spawn.rs`](../src/child/spawn.rs),
-    through `SharedChild::wait` or std's `Child::wait`;
-  - `fail_closed`, and `end_child` and `reap_in_background` without a pidfd, in
-    [`leaf.rs`](../src/containment/cgroup/leaf.rs);
-  - `wait_and_reap` in [`src/tokio/child.rs`](../src/tokio/child.rs).
+- These wait and reap by number, so after a foreign reap they can reap another child of ours. Units
+  named are from [#165]'s split plan.
+  - sync `Child::wait`, `try_wait` and the timed wait (`ProcHandle::wait_deadline`) in
+    [`proc_handle.rs`](../src/child/proc_handle.rs), through `SharedChild` to std's `waitpid(pid)`:
+    untracked;
+  - async `Child::wait` and `try_wait` in [`src/tokio/child.rs`](../src/tokio/child.rs), through
+    tokio to std's `try_wait`, on its pidfd path too: untracked;
+  - sync `Drop` (`ProcHandle::teardown_on_drop`): UA, and UM on macOS;
+  - tokio's in-drop `try_wait` and orphan-queue handoff when cosca's async `Drop` releases tokio's
+    child, with no foreign-reap check first: UA;
+  - `reap_unadopted` in [`src/child/spawn.rs`](../src/child/spawn.rs): UA, UM and U6;
+  - `reap_in_background` in [`src/child/spawn.rs`](../src/child/spawn.rs): removed in U6;
+  - `end_child` without a pidfd, and `reap_in_background` without a pidfd, in
+    [`leaf.rs`](../src/containment/cgroup/leaf.rs): UA and U7.
+- These wait by number without reaping (`WNOWAIT`), so they can wait on another child of ours:
+  `fail_closed` in [`leaf.rs`](../src/containment/cgroup/leaf.rs) (UA), and `wait_and_reap` in
+  [`src/tokio/child.rs`](../src/tokio/child.rs) (U1, UA, UM).
+- The async `Child::kill` rustdoc in [`src/tokio/child.rs`](../src/tokio/child.rs) says it is
+  handle-bound and cannot race a recycled PID, but it reaches `kill(2)` by number (UA).
 - `ReportChannel::wait` ([`channel.rs`](../src/containment/cgroup/channel.rs)) opens its pidfd from
   a bare PID, which names the child only if nothing else reaped it.
 
@@ -127,6 +145,9 @@ forbidden precondition. These debug-assert on it:
 - `teardown_unadopted` in [`src/child/spawn.rs`](../src/child/spawn.rs), which runs without
   `contain()` too;
 - `reap_now` and `wait_and_reap` in [`src/tokio/child.rs`](../src/tokio/child.rs).
+
+Principle 3's by-number waits and reaps check for a foreign reap nowhere; its note says what fixes
+each.
 
 ## 5. Good defaults, with escape hatches for advanced users
 
@@ -282,7 +303,6 @@ step consistent with these principles.
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#205]: https://github.com/bindreams/cosca/pull/205
 [tokio-process#51]: https://github.com/alexcrichton/tokio-process/issues/51
-[tokio `Runtime`]: https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html
+[tokio shutdown.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/blocking/shutdown.rs#L51-L54
 [sd-event.c]: https://github.com/systemd/systemd/blob/885fe07ee37cff7316680b5088d11081e01813b1/src/libsystemd/sd-event/sd-event.c#L3753-L3765
 [runc CHANGELOG]: https://github.com/opencontainers/runc/blob/41b74772b651b3b42a1f04a43a803db16f0e7e9b/CHANGELOG.md#L1219-L1222
-[gmain.c]: https://gitlab.gnome.org/GNOME/glib/-/blob/36c60f069c6f3776dafc7f6ce18c8c0b606cd8b5/glib/gmain.c#L6052-L6526
