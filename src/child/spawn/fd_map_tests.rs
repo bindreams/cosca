@@ -393,8 +393,8 @@ fn require_process_per_test(what: &str) {
     let nextest = std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test");
     assert!(
         alone || nextest,
-        "{what}; call this from inside crate::test_support::alone(), or run under cargo nextest \
-         (one process per test) — see cosca#196"
+        "{what}; call this from inside crate::containment::cgroup::test_support::alone(), or run \
+         under cargo nextest (one process per test) — see cosca#196"
     );
 }
 
