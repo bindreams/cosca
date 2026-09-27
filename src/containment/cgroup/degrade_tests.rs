@@ -187,9 +187,7 @@ fn degrade_logs_the_reason_at_warn() {
     );
 }
 
-/// cosca does not deduplicate its own log lines — that is a log handler's job. A condition
-/// reported once and hit again by a later spawn is still news to `warn`: nothing here remembers
-/// what this process has already reported.
+/// A repeated reason warns each time; nothing remembers earlier reports.
 #[test]
 fn a_repeated_degrade_reason_warns_every_time() {
     crate::log_capture::install();
@@ -205,6 +203,22 @@ fn a_repeated_degrade_reason_warns_every_time() {
     assert_eq!(
         crate::log_capture::levels_since(mark, "cosca-repeat-probe-7c13"),
         vec![log::Level::Warn, log::Level::Warn, log::Level::Warn],
+    );
+}
+
+/// `NotPlaced::Unwaitable` — a `pidfd_open` failure — is a degrade reason like any other, logged
+/// at `warn`. The pid is the marker: `Unwaitable`'s `Display` carries no path to embed one in.
+#[test]
+fn an_unwaitable_verdict_logs_at_warn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    log_degrade(&NotPlaced::Unwaitable {
+        pid: 918273645,
+        source: std::io::Error::from_raw_os_error(libc::EMFILE),
+    });
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "918273645's placement report"),
+        vec![log::Level::Warn],
     );
 }
 

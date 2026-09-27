@@ -199,10 +199,8 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
 }
 
-/// cosca does not deduplicate its own log lines — that is a log handler's job. The warning is
-/// reported at `warn` every time, including on a repeat of the same errno, and through the real
-/// entry point (`warn_for_abandoned_child`) rather than an inner seam a dedup could sneak in
-/// behind.
+/// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
+/// entry point.
 #[test]
 fn the_unreachable_child_warning_is_every_time() {
     use crate::containment::AbandonedChild;
@@ -223,10 +221,25 @@ fn the_unreachable_child_warning_is_every_time() {
     }
 }
 
+/// `AbandonedChild::Ended` means nothing of the child runs and it is reaped or will be — not a
+/// degraded guarantee, so it logs nothing at all.
+#[test]
+fn ended_abandoned_child_logs_nothing() {
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let error = Error::Io(std::io::Error::other("cosca-abandoned-ended-probe-3a17"));
+    let marker = "cosca-abandoned-ended-probe-3a17";
+
+    let mark = crate::log_capture::mark();
+    super::warn_for_abandoned_child(AbandonedChild::Ended, &error);
+
+    assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
+}
+
 /// Whether a record since `mark` says `marker` of the seam's failed spawn of `pid` at `warn` —
 /// the seam's error names it — and so of this test's spawn, whatever other tests log meanwhile.
-/// Checking the level, not just the text, is what would catch a dedup reintroduced at the
-/// production call site: a demoted repeat still carries its own full text.
+/// Checks the level too: a demoted repeat still carries the same text.
 #[cfg(target_os = "linux")]
 fn warned_for(mark: usize, pid: u32, marker: &str) -> bool {
     let spawn = format!("for child {pid})");

@@ -101,9 +101,8 @@ mod log_capture {
         fn flush(&self) {}
     }
 
-    /// `Trace`, the full set: this crate emits no `trace` records at all, so this removes any
-    /// need to pick a narrower level and re-litigate the choice as the library's `debug`
-    /// logging grows. Costs nothing beyond `Debug`.
+    /// `Trace`, the full set: no narrower filter can drop a record before it reaches this
+    /// logger (`log!` checks `max_level()` first).
     pub fn install() {
         INSTALLED.get_or_init(|| {
             log::set_logger(&CaptureLog).expect("first logger in this test process");

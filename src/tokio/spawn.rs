@@ -467,8 +467,7 @@ mod spawn_tests;
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
 /// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
-/// "may". Reported at `warn` every time: collapsing repeats is a log handler's job, not this
-/// library's.
+/// "may". Reported at `warn` every time.
 fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &Error) {
     use crate::containment::AbandonedChild;
 

@@ -221,11 +221,7 @@ impl fmt::Display for NotPlaced {
 /// the log carries a single line naming the achieved mechanism and the reason the stronger one
 /// was unavailable.
 ///
-/// **Reported at `warn` every time.** A degrade is a real reduction in the guarantee the caller
-/// asked for, on every spawn it happens to — collapsing repeats into a single first report is a
-/// log handler's job (it has the whole process's history to decide what is worth showing
-/// again), not this library's: cosca does not know what an embedder's sink does with a repeated
-/// line, and guessing wrongly costs a real diagnosis.
+/// Logged at `warn` on every call; deduplication is the log handler's job.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn log_degrade(reason: &dyn fmt::Display) {
     log::warn!("cgroup v2 containment: degrading to a process group — {reason}");
