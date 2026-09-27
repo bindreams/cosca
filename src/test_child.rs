@@ -59,17 +59,28 @@ pub(crate) fn run_fixture(fixture: &str) {
 /// `/tmp`.
 ///
 /// A fixture that builds its own tempdir cannot assume its ambient `TMPDIR`/`$TMPDIR` is writable
-/// by whatever uid or capability set it ends up with after dropping privilege: root's own per-uid
-/// temp directory can be `0700` (measured, Linux, `TMPDIR=/root/t`; the same is true of macOS's
-/// per-user `/var/folders/.../T`, by the same reasoning applied to Darwin's superuser). `/tmp`
-/// itself is the one POSIX convention every one of this crate's target platforms ships
-/// world-writable (`1777`) regardless of caller, so forcing it here — once, for every fixture —
-/// is a structural fix rather than a per-fixture one to remember.
+/// by whatever uid or capability set it ends up with after dropping privilege. On Linux, [`drop_dac_bypass`]
+/// leaves this thread at uid 0 and drops the capabilities that would otherwise let it write
+/// anywhere regardless of ownership — so a `TMPDIR` naming a directory some OTHER uid owns,
+/// `0700`, genuinely refuses root once that drop has happened (measured: `TMPDIR` pointing at a
+/// directory `chown`'d to a non-root uid, `chmod 0700`'d — the shape `pam_tmpdir` leaves behind
+/// for a `sudo -E` invocation that preserved a non-root caller's own `TMPDIR` — fails a `tempdir()`
+/// call made after the drop). `/tmp` itself is the one POSIX convention every one of this crate's
+/// target platforms ships world-writable (`1777`) regardless of caller, so forcing it here — once,
+/// for every fixture — is a structural fix rather than a per-fixture one to remember.
+///
+/// [`drop_dac_bypass`]: crate::test_privilege::drop_dac_bypass
 ///
 /// No `"cosca_unit_tests"` placeholder in argv slot 0 (that's [`fixture_argv`]'s convention for
 /// `cosca::Command`, see its doc): `std::process::Command` already supplies its own argv[0] from
 /// `Command::new`'s program path.
-fn fixture_command(fixture: &str) -> std::process::Command {
+///
+/// `pub(crate)`, not just `run_fixture`/`run_fixture_with_cwd`'s private building block: a
+/// bespoke launcher with its own stdio needs (`exact_posix_tests.rs`'s
+/// `spawn_exact_tool_in_an_unreachable_cwd`, which pipes stdin for its own gate-byte protocol and
+/// nulls stdout rather than piping it) can start from this and override just the stdio it needs
+/// changed, rather than hand-rolling the argv/env/TMPDIR setup a third time.
+pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
     cmd.args(["--test-threads=1", "--exact", fixture])
         .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
@@ -93,17 +104,37 @@ const FIXTURE_PARENT_PID_ENV: &str = "COSCA_FIXTURE_PARENT_PID";
 /// Presence alone does not prove a deliberate re-exec: a marker env var can be inherited by the
 /// shared, unfiltered suite process too — a stray shell `export`, a copy-pasted CI `env:` block —
 /// which would then run a fixture's body, [`crate::test_privilege::drop_dac_bypass`] for one,
-/// inside the process every other concurrently running test depends on. Measured under
-/// `cargo nextest run`, which runs every test as its own process: a presence-only check on
-/// [`crate::resolve::resolve_base_tests`]'s fixtures flaked, since nextest's own process
-/// launching for OTHER tests can set env vars this binary does not control. A real parent-pid
-/// match is not spoofable by an inherited or coincidentally-named var.
+/// inside the process every other concurrently running test depends on. A real parent-pid match
+/// is not spoofable by an inherited or coincidentally-named var.
+///
+/// On `true`, also writes [`FIXTURE_GATE_PASSED_LINE`] to this process's real stderr (see that
+/// constant's doc for why): a mutant that makes this function always return `false` would
+/// otherwise make every fixture silently no-op and every driver test still pass, since "the
+/// fixture did nothing" and "the fixture ran and asserted nothing false" look identical from the
+/// outside.
 #[cfg(unix)]
 pub(crate) fn is_fixture_reexec() -> bool {
-    std::env::var(FIXTURE_PARENT_PID_ENV)
+    let reexec = std::env::var(FIXTURE_PARENT_PID_ENV)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .is_some_and(|pid| pid == std::os::unix::process::parent_id())
+        .is_some_and(|pid| pid == std::os::unix::process::parent_id());
+    if reexec {
+        write_gate_passed();
+    }
+    reexec
+}
+
+/// The line a fixture's own re-exec gate ([`is_fixture_reexec`], or [`expected_cwd`] for a
+/// `run_fixture_with_cwd` fixture) writes to this process's REAL stderr once it passes — bypassing
+/// libtest's capture the same way `exact_posix_tests.rs`'s `report()` does, since a fixture that
+/// gates out via an early `return` exits 0 with nothing further to distinguish it from one that
+/// genuinely ran and passed. [`run_fixture_command`] asserts this line is present, so a mutant
+/// that makes the gate always refuse is caught there instead of looking like a passing suite.
+pub(crate) const FIXTURE_GATE_PASSED_LINE: &str = "COSCA_FIXTURE_GATE_PASSED";
+
+fn write_gate_passed() {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{FIXTURE_GATE_PASSED_LINE}");
 }
 
 /// Spawns `cmd` (built from [`fixture_command`], possibly with more set on it) under
@@ -139,6 +170,14 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
          name on one side of a caller/fixture pair), which libtest also exits 0 for:\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
     );
+    assert!(
+        stderr.contains(FIXTURE_GATE_PASSED_LINE),
+        "fixture {fixture} exited 0 and reported 1 test passed, but never wrote \
+         {FIXTURE_GATE_PASSED_LINE:?} to its real stderr — its re-exec gate let it return early \
+         without running its own body at all, which a passing libtest banner alone cannot tell \
+         apart from a fixture that ran and found nothing wrong:\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+    );
 }
 
 /// Reads `marker_env`'s value as the directory [`run_fixture_with_cwd`]'s caller prepared, and
@@ -166,6 +205,9 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
         expected.canonicalize().expect("canonicalize expected cwd"),
         "this fixture's OS-level cwd must be the directory run_fixture_with_cwd's caller prepared",
     );
+    // Windows has no `is_fixture_reexec` to have written this already (no `parent_id()` there);
+    // unix already did, via that call above, so this second write is a harmless duplicate.
+    write_gate_passed();
     Some(expected)
 }
 

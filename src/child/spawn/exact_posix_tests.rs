@@ -92,8 +92,9 @@ fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
 
 const FIXTURE_UNREACHABLE_CWD_TEST: &str =
     "child::spawn::exact_posix_tests::fixture_spawn_exact_tool_in_an_unreachable_cwd";
-/// The fixture's own directory as a path, which it must fail to reach. Its presence also marks a
-/// deliberate re-exec rather than an ordinary suite run.
+/// The fixture's own directory as a path, which it must fail to reach. Its presence alone does
+/// NOT mark a deliberate re-exec — see [`crate::test_child::is_fixture_reexec`], which the
+/// fixture also requires, for why a marker env var's bare presence is not enough on its own.
 const FIXTURE_UNREACHABLE_CWD_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD";
 /// The `current_dir()` the fixture sets, if any.
 const FIXTURE_CURRENT_DIR_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_CURRENT_DIR";
@@ -112,11 +113,10 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
         return;
     };
-    if let Err(e) = crate::test_privilege::drop_dac_bypass() {
-        let (msg, code) = dac_bypass_failure(&e);
-        report(&msg);
-        std::process::exit(code);
+    if !crate::test_child::is_fixture_reexec() {
+        return;
     }
+    report_and_exit_on_dac_bypass_failure(crate::test_privilege::drop_dac_bypass());
     let mut gate = [0u8; 1];
     std::io::stdin().read_exact(&mut gate).expect("gate byte");
     if std::fs::metadata(&own_path).is_ok() {
@@ -158,8 +158,10 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
 /// (below) without forcing that failure for real. It used to be forceable with root started under
 /// `--cap-drop SETUID,SETGID`, back when dropping DAC bypass meant `setuid()`; now that it means
 /// dropping two specific capabilities instead (see that function's doc for why), no `--cap-drop`
-/// combination this suite's own CI lanes exercise still makes it fail — which is the point of
-/// that change, not a gap in this one.
+/// combination this suite's own CI lanes exercise still makes it fail this way. A real failure IS
+/// still forceable — a seccomp filter that makes `capset` itself return `EPERM` reproduces it —
+/// just not portably enough to run as an ordinary `cargo test`; [`reports_and_exits_on_an_injected_dac_bypass_failure`]
+/// below exercises the reporting end-to-end without needing one.
 fn dac_bypass_failure(e: &std::io::Error) -> (String, i32) {
     (format!("precondition: dropping DAC bypass: {e}"), PRECONDITION_FAILED)
 }
@@ -171,6 +173,64 @@ fn dac_bypass_failure_names_the_precondition_and_keeps_the_error() {
     assert_eq!(code, PRECONDITION_FAILED);
     assert!(msg.contains("dropping DAC bypass"), "{msg}");
     assert!(msg.contains("boom"), "{msg}");
+}
+
+/// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`]'s own `drop_dac_bypass`-failure handling,
+/// factored out so [`fixture_reports_and_exits_on_an_injected_dac_bypass_failure`] can drive it
+/// with a manufactured error via the `cfg(test)` seam below, rather than needing an environment
+/// that can force `drop_dac_bypass` itself to fail for real (see [`dac_bypass_failure`]'s doc for
+/// why that is not portable enough to be this test).
+fn report_and_exit_on_dac_bypass_failure(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        let (msg, code) = dac_bypass_failure(&e);
+        report(&msg);
+        std::process::exit(code);
+    }
+}
+
+/// The value carried by [`crate::test_child::fixture_command`]'s env var of the same purpose is
+/// only "a deliberate re-exec happened"; this one additionally carries the message the injected
+/// error must display, since [`fixture_reports_and_exits_on_an_injected_dac_bypass_failure`]
+/// needs one piece of fixture-specific data `is_fixture_reexec` alone does not carry.
+const FIXTURE_INJECT_DAC_BYPASS_FAILURE_ENV: &str = "COSCA_FIXTURE_INJECT_DAC_BYPASS_FAILURE";
+
+/// Inert in an ordinary suite run. Re-executed by
+/// [`reports_and_exits_on_an_injected_dac_bypass_failure`], it calls
+/// [`report_and_exit_on_dac_bypass_failure`] with a manufactured `Err` — the one seam that proves
+/// the reporting path (real stderr, exit `90`) actually works, without needing an environment
+/// that can make [`crate::test_privilege::drop_dac_bypass`] itself fail.
+#[test]
+fn fixture_reports_and_exits_on_an_injected_dac_bypass_failure() {
+    let Some(injected) = std::env::var_os(FIXTURE_INJECT_DAC_BYPASS_FAILURE_ENV) else {
+        return;
+    };
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    report_and_exit_on_dac_bypass_failure(Err(std::io::Error::other(injected.to_string_lossy().into_owned())));
+    panic!("report_and_exit_on_dac_bypass_failure must not return on Err");
+}
+
+/// Pins the wiring [`dac_bypass_failure_names_the_precondition_and_keeps_the_error`] cannot: that
+/// a real `drop_dac_bypass` failure is reported to this process's REAL stderr (not swallowed by
+/// libtest's capture, which the child's `Stdio::null()` stdout would otherwise hide — see
+/// [`report`]'s doc) and exits `90`, not merely that the message text would be right if something
+/// downstream ever looked at it.
+#[test]
+fn reports_and_exits_on_an_injected_dac_bypass_failure() {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        let mut cmd = crate::test_child::fixture_command(crate::test_child::fixture_path!(
+            fixture_reports_and_exits_on_an_injected_dac_bypass_failure
+        ));
+        cmd.env(FIXTURE_INJECT_DAC_BYPASS_FAILURE_ENV, "injected boom")
+            .output()
+            .expect("spawn the fixture")
+    };
+    assert_eq!(child.status.code(), Some(PRECONDITION_FAILED), "{child:?}");
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(stderr.contains("dropping DAC bypass"), "{stderr}");
+    assert!(stderr.contains("injected boom"), "{stderr}");
 }
 
 /// The command `.elevate()` spawns from a process that is already root, on any host.
@@ -228,14 +288,12 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
-    let mut fixture = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    let mut fixture = crate::test_child::fixture_command(FIXTURE_UNREACHABLE_CWD_TEST);
     fixture
-        .args(["--test-threads=1", "--exact", FIXTURE_UNREACHABLE_CWD_TEST])
         .env(FIXTURE_UNREACHABLE_CWD_ENV, &d)
         .current_dir(&d)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::null());
     if let Some(dir) = current_dir {
         fixture.env(FIXTURE_CURRENT_DIR_ENV, dir);
     }
