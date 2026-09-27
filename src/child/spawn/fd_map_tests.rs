@@ -393,7 +393,7 @@ impl Drop for RestoreFd2 {
                 break ret;
             }
         };
-        debug_assert_eq!(
+        assert_eq!(
             ret,
             2,
             "dup2({}, 2) while restoring fd 2 failed: {}",
