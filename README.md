@@ -6,6 +6,8 @@ Unified cross-platform subprocess management: spawning, stdio, process trees, st
 
 The API is not stable; expect breaking changes in any 0.x release.
 
+The design rules every change follows are in [docs/principles.md](docs/principles.md).
+
 ## Running tests
 
 Use [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`), run as `cargo nextest
