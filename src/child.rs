@@ -553,10 +553,31 @@ impl Drop for Child {
         if !self.kill_on_drop {
             return; // detached / opted out
         }
+        // A recyclable-pgid mechanism's `hard_kill` below would `killpg` a possibly-RECYCLED
+        // pgid if the root was already reaped before this `Drop` ran — e.g. by the caller's own
+        // prior `wait()`, entirely outside this handle's knowledge (this `Drop` has no
+        // WNOWAIT-confirmed reap of its own to order against, unlike `sweep_recyclable_pgid_before_reap`'s
+        // callers). Confirm it non-blockingly first: `Err` (in practice `ECHILD`) means already
+        // reaped, so the kill below is skipped, not risked. A confirmed-not-yet-reaped root, and
+        // every non-recyclable mechanism, proceed exactly as before.
+        #[cfg(unix)]
+        let already_reaped =
+            self.attached.carries_recyclable_pgid() && crate::child::unreaped::poll_reapable(self.id.pid()).is_err();
+        #[cfg(not(unix))]
+        let already_reaped = false;
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
-        let tree = self.attached.hard_kill();
+        let tree = if already_reaped {
+            log::warn!(
+                "Child::drop: skipping the contained-tree kill for already-reaped pid {}: its \
+                 pgid may already be recycled onto an unrelated, live process group",
+                self.id.pid()
+            );
+            Ok(())
+        } else {
+            self.attached.hard_kill()
+        };
         if let Err(e) = &tree {
             // Visible, not silently discarded, on the RAII teardown path most callers actually
             // hit. Never a `debug_assert` (round-4): a genuine mechanism failure —
