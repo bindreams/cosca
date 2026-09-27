@@ -11,15 +11,19 @@
 //!
 //! `std::fs::metadata` on Windows (`library/std/src/sys/fs/windows.rs`'s `fn metadata`, checked
 //! against rustc 1.98.1's own source) opens the target via `CreateFileW`, which ends up
-//! requesting `SYNCHRONIZE | FILE_READ_ATTRIBUTES` on the handle. Denying only the candidate
-//! FILE is not enough on its own: that primary open does fail, but `metadata`'s own fallback —
-//! taken on exactly `ERROR_ACCESS_DENIED` or `ERROR_SHARING_VIOLATION` — retries via
-//! `FindFirstFileExW` on the same path, a directory-listing operation gated on
-//! `FILE_LIST_DIRECTORY` (`0x1`) on the PARENT directory, which a deny ACE on the file cannot
-//! reach at all; `FindFirstFileExW` then succeeds and `metadata` returns `Ok`. So the deny ACE
-//! below sits on the DIRECTORY instead, denying both `FILE_LIST_DIRECTORY` (closing that
-//! fallback) and `FILE_TRAVERSE` (`0x20`, the same bit as `FILE_EXECUTE` — closing the primary
-//! open's own route to a file under it).
+//! requesting `SYNCHRONIZE | FILE_READ_ATTRIBUTES` on the handle. A file-level `FILE_GENERIC_READ`
+//! deny (which includes `SYNCHRONIZE`), as measured in 0d4fe0b2, is not enough: `metadata` still
+//! returned `Ok`. `FILE_READ_ATTRIBUTES` specifically is not settled by the file's own security
+//! descriptor alone — MS-FSA §2.1.5.1.2.1 ("Algorithm to Check Access to an Existing File") has
+//! the object store grant it if EITHER the file's own descriptor allows it OR the caller holds
+//! `FILE_LIST_DIRECTORY` on the PARENT directory, so denying only the file does not close that
+//! route. Separately, `metadata`'s own fallback — taken on exactly `ERROR_ACCESS_DENIED` or
+//! `ERROR_SHARING_VIOLATION` — retries via `FindFirstFileExW` on the same path, itself gated on
+//! `FILE_LIST_DIRECTORY` (`0x1`) on the PARENT directory too, which a deny ACE on the file cannot
+//! reach at all. So the deny ACE below sits on the DIRECTORY instead, denying both
+//! `FILE_LIST_DIRECTORY` (closing the parent-directory route to `FILE_READ_ATTRIBUTES` and the
+//! `FindFirstFileExW` fallback alike) and `FILE_TRAVERSE` (`0x20`, the same bit as `FILE_EXECUTE`
+//! — closing the primary open's own route to a file under it).
 //!
 //! `FILE_TRAVERSE` alone is not sufficient either: every ordinary token holds
 //! `SeChangeNotifyPrivilege` ("bypass traverse checking") by default — an interactive session
@@ -28,22 +32,20 @@
 //! DUPLICATE of this process's own token and impersonates the CURRENT THREAD with it, so the
 //! DACL becomes authoritative for `FILE_TRAVERSE` too, for the probe and the [`resolve`] call
 //! that follow — and nothing else: the strip lives on a thread-scoped impersonation token, never
-//! this process's own, so no other thread is affected. See
-//! [`ImpersonationGuard::without_change_notify`]'s doc for why a process-wide strip is unsound
-//! here.
+//! this process's own, so no other thread is affected. See [`ImpersonationGuard`]'s own doc for
+//! why a process-wide strip is unsound here.
 //!
 //! Only the combination above — both bits denied on the directory, `SeChangeNotifyPrivilege`
 //! stripped for the probing thread — was actually measured to work, on GitHub's Windows CI
-//! runners; there is no Windows host to develop this against directly.
-//! [`locked_then_open`]'s own precondition assertion is what still proves it holds on whichever
-//! host runs this test, rather than resting on the reasoning above.
+//! runners. [`locked_then_open`]'s own precondition assertion is what still proves it holds on
+//! whichever host runs this test, rather than resting on the reasoning above.
 
 use super::*;
 use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt;
 
 use windows::core::{Owned, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_NO_TOKEN, HANDLE, HLOCAL, LUID};
+use windows::Win32::Foundation::{LocalFree, ERROR_NO_TOKEN, HANDLE, HLOCAL, LUID};
 use windows::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS,
     EXPLICIT_ACCESS_W, SE_FILE_OBJECT, TRUSTEE_W,
@@ -81,44 +83,67 @@ fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
         .and_then(std::io::Error::raw_os_error)
 }
 
+/// [`OpenProcessToken`] wrapped to return the handle by value instead of through an out-param,
+/// so its caller can hand the result straight to [`Owned::new`] without an intermediate
+/// `HANDLE::default()` binding of its own.
+///
+/// Safe: an invalid `TOKEN_ACCESS_MASK` is rejected by the kernel (surfaced as `Err`, not
+/// undefined behaviour) — there is no precondition on `access` for a caller to uphold.
+fn open_process_token(access: windows::Win32::Security::TOKEN_ACCESS_MASK) -> windows::core::Result<HANDLE> {
+    let mut token = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close; `token` is a valid
+    // `&mut` out-param.
+    unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) }?;
+    Ok(token)
+}
+
 /// This process's own user SID, from its own token — the trustee for the deny ACE. `Everyone`
 /// would do too, but the current user's SID needs no elevated or domain-joined runner to be
 /// meaningful, and it is what actually issues the `std::fs::metadata` call below.
 ///
-/// Returned as the raw `TOKEN_USER` buffer rather than the `PSID` alone: the SID borrows from
-/// it, so a caller that dropped the buffer first would hold a dangling `PSID`.
-fn current_user_sid_buf() -> Vec<u64> {
-    let mut token = HANDLE::default();
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.expect("OpenProcessToken");
-    let mut needed = 0u32;
-    // SAFETY: a null buffer with length 0 is the documented size query; it fails with
-    // ERROR_INSUFFICIENT_BUFFER and writes the required size.
-    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
-    // u64-backed so the `TOKEN_USER` cast below is 8-aligned, as `TOKEN_USER` requires.
-    let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
-    // SAFETY: `buf` is at least `needed` bytes.
-    let info = unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr().cast()),
-            (buf.len() * 8) as u32,
-            &mut needed,
-        )
-    };
-    // SAFETY: `token` is an owned handle this function is done with.
-    unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
-    info.expect("GetTokenInformation(TokenUser)");
-    buf
-}
+/// Owns the raw `TOKEN_USER` buffer the SID in [`Self::sid`] borrows from: a bare `fn(&[u64]) ->
+/// PSID` free function (this type's previous shape) could not stop safe code calling it with a
+/// slice too short to hold a `TOKEN_USER`, which would read out of bounds. Bundling the buffer
+/// and the one function that reads it into a single type whose only constructor is
+/// [`Self::query`] closes that: nothing outside this type can hand [`Self::sid`] a mismatched
+/// buffer.
+struct CurrentUserSid(Vec<u64>);
 
-/// The `PSID` inside a buffer [`current_user_sid_buf`] returned. Borrows from `buf`, so it must
-/// not outlive it.
-fn sid_from_buf(buf: &[u64]) -> PSID {
-    // SAFETY: the kernel wrote a `TOKEN_USER` at the head of an 8-aligned buffer, and every
-    // caller keeps `buf` alive for at least as long as the returned `PSID` is used.
-    unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+impl CurrentUserSid {
+    fn query() -> Self {
+        let raw_token = open_process_token(TOKEN_QUERY).expect("OpenProcessToken(TOKEN_QUERY)");
+        // SAFETY: `raw_token` was just opened above and is owned by this function from here on.
+        let token = unsafe { Owned::new(raw_token) };
+        let mut needed = 0u32;
+        // SAFETY: a null buffer with length 0 is the documented size query; it fails with
+        // ERROR_INSUFFICIENT_BUFFER and writes the required size.
+        let _ = unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut needed) };
+        // u64-backed so the `TOKEN_USER` cast in `Self::sid` is 8-aligned, as `TOKEN_USER`
+        // requires.
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        // SAFETY: `buf` is at least `needed` bytes.
+        unsafe {
+            GetTokenInformation(
+                *token,
+                TokenUser,
+                Some(buf.as_mut_ptr().cast()),
+                (buf.len() * 8) as u32,
+                &mut needed,
+            )
+        }
+        .expect("GetTokenInformation(TokenUser)");
+        CurrentUserSid(buf)
+    }
+
+    /// The `PSID` inside the buffer this owns. Borrows from `self` — a raw pointer, so nothing
+    /// in the type system stops it outliving `self`, but every caller in this file uses it and
+    /// drops it well within `self`'s own scope.
+    fn sid(&self) -> PSID {
+        // SAFETY: `Self::query` is the only constructor, and it always writes a full
+        // `TOKEN_USER` (checked by the `.expect()` there) at the head of an 8-aligned buffer at
+        // least 8 bytes long — this type cannot exist without that having happened.
+        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
 }
 
 /// Report a `Drop` failure without risking a double panic during an unwind: real failures panic
@@ -161,8 +186,7 @@ impl ImpersonationGuard {
     fn without_change_notify() -> Self {
         Self::assert_not_already_impersonating();
 
-        // SAFETY: `TOKEN_DUPLICATE` is a real, valid `TOKEN_ACCESS_MASK` constant.
-        let raw_token = unsafe { open_process_token(TOKEN_DUPLICATE) }.expect("OpenProcessToken(TOKEN_DUPLICATE)");
+        let raw_token = open_process_token(TOKEN_DUPLICATE).expect("OpenProcessToken(TOKEN_DUPLICATE)");
         // SAFETY: `raw_token` was just opened above and is owned by this function from here on —
         // wrapping it immediately means every exit path below, including a panic, closes it.
         let token = unsafe { Owned::new(raw_token) };
@@ -250,6 +274,16 @@ impl ImpersonationGuard {
     }
 }
 
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        // SAFETY: reverts THIS thread's impersonation token to none, the exact counterpart to
+        // `SetThreadToken(None, Some(*dup))` above.
+        if let Err(e) = unsafe { SetThreadToken(None, None) } {
+            panic_or_eprint(format!("could not revert thread impersonation: {e}"));
+        }
+    }
+}
+
 /// Whether `token` currently holds the privilege named by `luid`, read back via
 /// `GetTokenInformation(TokenPrivileges)` — see [`ImpersonationGuard::without_change_notify`]'s
 /// call site for why this is checked directly rather than inferred from `AdjustTokenPrivileges`'s
@@ -275,34 +309,16 @@ fn token_has_privilege(token: HANDLE, luid: LUID) -> bool {
     // SAFETY: the kernel wrote a `TOKEN_PRIVILEGES` — a `u32` count followed by that many
     // `LUID_AND_ATTRIBUTES`, both 4-byte types — at the head of a 4-aligned buffer.
     let count = unsafe { *buf.as_ptr().cast::<u32>() } as usize;
+    debug_assert!(
+        std::mem::size_of::<u32>() + count * std::mem::size_of::<LUID_AND_ATTRIBUTES>() <= needed as usize,
+        "GetTokenInformation(TokenPrivileges) reported PrivilegeCount {count} that does not fit \
+         in the {needed}-byte buffer it also reported needing"
+    );
     // SAFETY: `count` is exactly how many `LUID_AND_ATTRIBUTES` the same call just wrote
-    // immediately after the leading `u32` count, in the same buffer.
+    // immediately after the leading `u32` count, in the same buffer — the assertion just above
+    // is the debug-build check that this really holds.
     let privileges = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(1).cast::<LUID_AND_ATTRIBUTES>(), count) };
     privileges.iter().any(|p| p.Luid == luid)
-}
-
-/// [`OpenProcessToken`] wrapped to return the handle by value instead of through an out-param,
-/// so its caller can hand the result straight to [`Owned::new`] without an intermediate
-/// `HANDLE::default()` binding of its own.
-///
-/// # Safety
-/// Same as [`OpenProcessToken`]: `access` must be a valid `TOKEN_ACCESS_MASK` for the call.
-unsafe fn open_process_token(access: windows::Win32::Security::TOKEN_ACCESS_MASK) -> windows::core::Result<HANDLE> {
-    let mut token = HANDLE::default();
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close; `token` is a valid
-    // `&mut` out-param. The caller upholds `access`'s validity per this function's own contract.
-    unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) }?;
-    Ok(token)
-}
-
-impl Drop for ImpersonationGuard {
-    fn drop(&mut self) {
-        // SAFETY: reverts THIS thread's impersonation token to none, the exact counterpart to
-        // `SetThreadToken(None, Some(*dup))` above.
-        if let Err(e) = unsafe { SetThreadToken(None, None) } {
-            panic_or_eprint(format!("could not revert thread impersonation: {e}"));
-        }
-    }
 }
 
 /// Denies `FILE_TRAVERSE`/`FILE_LIST_DIRECTORY` on a single Windows DIRECTORY object for the
@@ -360,11 +376,11 @@ impl DenyAclGuard {
         // doc on `DenyAclGuard` for why that is also true of `DenyAclGuard`'s own `Drop`).
         let original_sd = unsafe { Owned::new(HLOCAL(raw_sd.0)) };
 
-        let sid_buf = current_user_sid_buf();
-        let sid = sid_from_buf(&sid_buf);
+        let current_sid = CurrentUserSid::query();
+        let sid = current_sid.sid();
         let mut trustee = TRUSTEE_W::default();
         // SAFETY: `trustee` is a freshly zeroed, correctly sized `TRUSTEE_W`; `sid` borrows from
-        // `sid_buf`, which outlives this call.
+        // `current_sid`, which outlives this call.
         unsafe { BuildTrusteeWithSidW(&mut trustee, Some(sid)) };
         let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_TRAVERSE.0 | FILE_LIST_DIRECTORY.0,
@@ -374,8 +390,8 @@ impl DenyAclGuard {
         };
 
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: `entry` is fully initialized and borrows only from `sid_buf`, alive for this
-        // call; `original_dacl` is the live ACL `GetNamedSecurityInfoW` just returned.
+        // SAFETY: `entry` is fully initialized and borrows only from `current_sid`, alive for
+        // this call; `original_dacl` is the live ACL `GetNamedSecurityInfoW` just returned.
         let entries_set = unsafe { SetEntriesInAclW(Some(&[entry]), Some(original_dacl.cast_const()), &mut new_dacl) };
         // `original_sd` (an `Owned<HLOCAL>` local by now) frees itself when this function
         // unwinds past it, so this — unlike `new_dacl`'s own freeing just below — needs no
@@ -437,27 +453,39 @@ impl Drop for DenyAclGuard {
     }
 }
 
+/// Everything [`locked_then_open`] builds, torn down in one call to [`Self::close`] rather than
+/// left to each field's own `Drop`.
+///
+/// Field DECLARATION order doubles as a backstop drop order (struct fields drop in declaration
+/// order — the opposite of local variables) should some future caller skip `close()`:
+/// `impersonation` first (reverted), then `guard` (the ACL restored), then `root` (the tree
+/// removed) — see [`Self::close`] for why calling it explicitly, rather than relying on that, is
+/// still what every caller here does.
+struct LockedThenOpen {
+    impersonation: ImpersonationGuard,
+    guard: DenyAclGuard,
+    root: tempfile::TempDir,
+    open: PathBuf,
+    path: std::ffi::OsString,
+}
+
+impl LockedThenOpen {
+    /// Reverts impersonation, restores the ACL, then removes the tree — in that order (see the
+    /// module doc's "Where the deny ACE has to sit" and [`DenyAclGuard`]'s own doc for why) — and,
+    /// unlike leaving `root` to `TempDir`'s own `Drop`, asserts the tree was actually removed
+    /// rather than silently swallowing a failure to do so. Both tests below call this, so a
+    /// future test added between `locked_then_open()` and its teardown cannot lose that check by
+    /// forgetting to call it.
+    fn close(self) {
+        drop(self.impersonation);
+        drop(self.guard);
+        self.root.close().expect("remove the tempdir");
+    }
+}
+
 /// A `PATH` entry whose directory is denied at the Win32 ACL level, followed by one that holds
 /// the name.
-///
-/// The returned [`ImpersonationGuard`] and [`DenyAclGuard`] must be dropped, in that order
-/// (impersonation reverted first), before the returned [`tempfile::TempDir`] is closed — each
-/// caller below does so explicitly, rather than relying on the tuple's own drop order, so it can
-/// also call `TempDir::close` and assert the tree actually got removed. Reverting impersonation
-/// first is not merely cosmetic: with `SeChangeNotifyPrivilege` still stripped,
-/// `SetNamedSecurityInfoW`'s own path resolution down to `locked` would need real
-/// `FILE_TRAVERSE` on every ancestor of `locked` (`root` included) — nothing denies any of those
-/// today, so restoring the ACL while still impersonating would in fact still work, but reverting
-/// first removes the dependency on that staying true. Restoring the ACL before `TempDir::close`
-/// tries to delete the tree IS unconditionally load-bearing, since deleting `locked` while it is
-/// still denied would fail.
-fn locked_then_open() -> (
-    tempfile::TempDir,
-    PathBuf,
-    std::ffi::OsString,
-    DenyAclGuard,
-    ImpersonationGuard,
-) {
+fn locked_then_open() -> LockedThenOpen {
     let root = tempfile::tempdir().unwrap();
     let locked = root.path().join("locked");
     let open = root.path().join("open");
@@ -484,7 +512,13 @@ fn locked_then_open() -> (
     let probe = std::fs::metadata(&locked_tool).unwrap_err();
     assert_eq!(probe.raw_os_error(), Some(5), "precondition: {probe}");
 
-    (root, open, path, guard, impersonation)
+    LockedThenOpen {
+        impersonation,
+        guard,
+        root,
+        open,
+        path,
+    }
 }
 
 /// Under `loadable_only`, a candidate a real Windows ACL denies fails the search closed: the
@@ -497,9 +531,9 @@ fn locked_then_open() -> (
 /// [`resolve`]'s own returned error, via its wrapped `source()`.
 #[test]
 fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
-    let (root, _open, path, guard, impersonation) = locked_then_open();
+    let fixture = locked_then_open();
 
-    match search_tool(&path, true) {
+    match search_tool(&fixture.path, true) {
         Err(Error::Io(e)) => {
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
             assert_eq!(wrapped_raw_os_error(&e), Some(5), "{e}");
@@ -507,23 +541,17 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 
-    // Explicit, in the order `locked_then_open`'s doc requires, so `root.close()` below sees a
-    // `locked` that is actually deletable and a failure to remove it fails this test rather than
-    // being swallowed by `TempDir`'s own `Drop`.
-    drop(impersonation);
-    drop(guard);
-    root.close().expect("remove the tempdir");
+    fixture.close();
 }
 
 /// An ordinary spawn skips the denied candidate and goes on, as before, so one ACL-denied `PATH`
 /// directory does not break every unelevated spawn.
 #[test]
 fn an_undeterminable_windows_acl_is_skipped_by_an_ordinary_search() {
-    let (root, open, path, guard, impersonation) = locked_then_open();
-    assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
-
-    // See the sibling test for why this order and the explicit `close()` matter.
-    drop(impersonation);
-    drop(guard);
-    root.close().expect("remove the tempdir");
+    let fixture = locked_then_open();
+    assert_eq!(
+        search_tool(&fixture.path, false).unwrap(),
+        fixture.open.join("tool.exe")
+    );
+    fixture.close();
 }
