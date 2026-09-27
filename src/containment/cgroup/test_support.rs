@@ -92,8 +92,10 @@ pub(crate) const ALONE_ARGS: [&str; 4] = ["--exact", "--include-ignored", "--noc
 /// without this check, an inherited `COSCA_TEST_ALONE=<a real test's name>` made that one test's
 /// guard accept a plain, many-threads `cargo test` run as "isolated" and corrupt others.
 ///
-/// A copy of `tests/common/mod.rs`'s identical function — see `alone`'s own doc for why this
-/// crate keeps one copy per compilation unit rather than a shared dependency.
+/// A copy of `tests/common/mod.rs`'s identical function — see `tests/common::alone`'s own doc
+/// (not this file's `alone`, which only states the same fact in passing) for why this crate
+/// keeps one copy of this whole mechanism per compilation unit rather than a shared dependency:
+/// `tests/common/mod.rs` (the integration tests) and this lib cannot name each other's items.
 #[cfg(unix)]
 pub(crate) fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool {
     let Some(value) = value else { return false };

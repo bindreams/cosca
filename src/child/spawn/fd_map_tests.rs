@@ -386,8 +386,10 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 /// `cargo test`), and `NEXTEST_EXECUTION_MODE` is just as forgeable as `COSCA_TEST_ALONE` ever
 /// was — accepting it would reopen a second, unnecessary escape hatch.
 ///
-/// A copy of `tests/common/mod.rs`'s identical helper — this file is a separate compilation unit
-/// (this crate's own integration tests) and cannot name that one, though it DOES share
+/// A copy of `tests/common/mod.rs`'s identical helper — this file is part of the lib's OWN
+/// unit-test build (`#[cfg(test)]`, compiled only for `cargo test --lib`/`cargo nextest run`
+/// against the lib target), a separate compilation unit from `tests/common/mod.rs` (compiled
+/// once per integration-test binary in `tests/*.rs`), and cannot name that one. It DOES share
 /// `alone_marker_matches`/`ALONE_ARGS` with `crate::containment::cgroup::test_support::alone`,
 /// its OWN compilation unit's copy of the re-exec helper. Fails loudly and immediately, before
 /// touching anything, rather than silently skipping: see cosca#196 for the long-term structural
@@ -469,15 +471,23 @@ impl RestoreFd2 {
         assert_eq!(unsafe { libc::close(2) }, 0, "close the test process' fd 2");
         // See `SAVED_STDERR`'s doc for the mechanism.
         ensure_stderr_panic_hook();
-        let mut slot = saved_stderr();
+        // NOT held across the debug_assert below, deliberately: `Mutex::lock()`'s temporary
+        // guard from `.replace(..)` drops at the end of ITS OWN statement, before the assert
+        // below can panic. Measured: holding the guard across the assert deadlocks — the panic
+        // hook this function just armed (`ensure_stderr_panic_hook`) tries to lock this SAME
+        // mutex, on this SAME thread, as the FIRST thing that happens when the assert panics (a
+        // hook runs before any unwinding, so a guard from `let mut slot = saved_stderr();`
+        // would still be alive) — a plain `std::sync::Mutex` is not reentrant, so that second
+        // `.lock()` call blocks forever on a lock its own thread already holds.
+        let prev = saved_stderr().replace(saved.as_raw_fd());
         debug_assert!(
-            slot.is_none(),
-            "RestoreFd2: SAVED_STDERR already occupied (by fd {:?}) — a previous guard's fd 2 was \
-             never cleared, or two guards overlap. Only reachable if a caller uses RestoreFd2 \
-             outside alone()'s single-test isolation.",
-            *slot
+            prev.is_none(),
+            "RestoreFd2: SAVED_STDERR already occupied (by fd {prev:?}) when this guard set it \
+             to {} — a previous guard's fd 2 was never cleared, or two guards overlap. Reachable \
+             even from a single alone()-isolated test: e.g. opening a second RestoreFd2 (or \
+             RestoreStdio) on fd 2 before the first one drops.",
+            saved.as_raw_fd()
         );
-        *slot = Some(saved.as_raw_fd());
         RestoreFd2 { saved }
     }
 }
@@ -511,6 +521,155 @@ impl Drop for RestoreFd2 {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Wait for `child` to exit, bounded by `timeout` — killing it and failing loudly if it does
+/// not, rather than blocking forever. A copy of `tests/common/mod.rs`'s identical helper: this
+/// file is a separate compilation unit and cannot name that one. See there for the full
+/// rationale (the bound is a FAILURE SURFACE for a genuine, otherwise-unbounded hang, not a
+/// synchronization mechanism).
+fn wait_bounded(child: std::process::Child, timeout: std::time::Duration) -> std::process::Output {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => out.expect("wait for the child"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // SAFETY: `pid` is our own child's pid, read before handing the `Child` to the
+            // waiter thread; killing it here is best-effort cleanup for a child that hung
+            // exactly the way this function exists to catch, not a normal-path operation.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            panic!(
+                "child pid {pid} did not exit within {timeout:?} — it hung instead of exiting \
+                 (cleanly or otherwise), which is itself the regression under test"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("child pid {pid}'s wait thread died without sending a result")
+        }
+    }
+}
+
+/// Run `probe_name` — a `#[test]` in THIS SAME test binary — directly with the exact
+/// `alone()`-isolated shape (`COSCA_TEST_ALONE` set to `probe_name`, plus the full
+/// `crate::containment::cgroup::test_support::ALONE_ARGS`), with `extra_env` also set, and
+/// return its captured output. A copy of `tests/common/mod.rs`'s identical helper — see there
+/// for why "directly" (skipping a second `alone()` re-exec layer) is load bearing, and why the
+/// wait is bounded via [`wait_bounded`].
+fn run_probe_directly(probe_name: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
+    use crate::containment::cgroup::test_support::ALONE_ARGS;
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.arg(probe_name)
+        .args(ALONE_ARGS)
+        .env("COSCA_TEST_ALONE", probe_name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for &(k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        cmd.spawn().expect("spawn the probe")
+    };
+    wait_bounded(child, std::time::Duration::from_secs(30))
+}
+
+/// A deliberate, always-panicking probe for `RestoreFd2`'s panic-hook fix — the lib's own copy
+/// of `tests/spawn_io.rs`'s `panic_while_fd2_closed_probe`, proving the SAME mechanism
+/// (`SAVED_STDERR`/`ensure_stderr_panic_hook`) on `RestoreFd2`, not just `RestoreStdio`.
+/// `#[ignore]`d; see that sibling's doc for why a bare `--include-ignored` sweep still executes
+/// but no-ops it (its own env-var gate below).
+#[test]
+#[ignore = "probe"]
+fn panic_while_fd2_closed_via_restore_fd2_probe() {
+    if std::env::var_os("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE").is_none() {
+        return;
+    }
+    if !crate::containment::cgroup::test_support::alone(
+        "child::spawn::fd_map::fd_map_tests::panic_while_fd2_closed_via_restore_fd2_probe",
+    ) {
+        return;
+    }
+    let _restore = RestoreFd2::take();
+    panic!("PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE_MARKER: this message must survive fd 2 being closed");
+}
+
+/// Proves `RestoreFd2`'s panic-hook fix. Without a dedicated lib prover, reverting the lib half
+/// of that fix left every lib test passing — nothing exercised it. Asserts the probe's own exit
+/// code is EXACTLY `101` (see `tests/spawn_io.rs`'s sibling prover's doc for why: an abort has no
+/// defined exit code, commonly reported as 134/SIGABRT, and `run_probe_directly`'s "directly"
+/// invocation is what stops a second `alone()` layer from masking that as an ordinary 101 one
+/// level up) and that the marker reached stderr.
+#[test]
+fn a_panic_while_fd2_is_closed_via_restore_fd2_still_reaches_stderr() {
+    const PROBE: &str = "child::spawn::fd_map::fd_map_tests::panic_while_fd2_closed_via_restore_fd2_probe";
+    let out = run_probe_directly(
+        PROBE,
+        &[("COSCA_TEST_TRIGGER_PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE", "1")],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the probe must fail with an ordinary libtest panic exit (101) — anything else, \
+         including an abort with no exit code at all, means its own panic was not a clean test \
+         failure. got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("PANIC_WHILE_FD2_CLOSED_VIA_RESTORE_FD2_PROBE_MARKER"),
+        "the probe's own panic message must survive fd 2 being closed while it panicked — got:\n{combined}"
+    );
+}
+
+/// A deliberate probe for the `SAVED_STDERR` self-deadlock fix on `RestoreFd2` — the lib's own
+/// copy of `tests/spawn_io.rs`'s `two_overlapping_fd2_closes_probe`. See that sibling's doc for
+/// why the intervening `tempfile::tempfile()` matters.
+#[test]
+#[ignore = "probe"]
+fn two_overlapping_fd2_closes_via_restore_fd2_probe() {
+    if std::env::var_os("COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_PROBE").is_none() {
+        return;
+    }
+    if !crate::containment::cgroup::test_support::alone(
+        "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_probe",
+    ) {
+        return;
+    }
+    let _first = RestoreFd2::take();
+    let _file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
+    let _second = RestoreFd2::take(); // must panic cleanly, not deadlock
+}
+
+/// Proves the `SAVED_STDERR` self-deadlock fix on `RestoreFd2`. Bounded via [`wait_bounded`], so
+/// a hang fails this test loudly instead of hanging the whole suite.
+#[test]
+fn two_overlapping_fd2_closes_via_restore_fd2_do_not_deadlock() {
+    const PROBE: &str = "child::spawn::fd_map::fd_map_tests::two_overlapping_fd2_closes_via_restore_fd2_probe";
+    let out = run_probe_directly(
+        PROBE,
+        &[(
+            "COSCA_TEST_TRIGGER_TWO_OVERLAPPING_FD2_CLOSES_VIA_RESTORE_FD2_PROBE",
+            "1",
+        )],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "the second, overlapping RestoreFd2::take() must panic cleanly (exit 101), not hang or \
+         abort. got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// A mapping whose parent-side source starts out sitting at fd 2 — because the current process
