@@ -1071,10 +1071,14 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
 /// `hard_kill_test_key()`, not under any other value — in particular not under `Marker::handle`,
 /// the very field `HARD_KILL_CALLS`'s doc explains this replaced. A mutant that reverts
 /// `hard_kill`'s bookkeeping call site back to `fault::record_hard_kill_call(self.handle)` fails
-/// this test: `hard_kill_test_key()` is a process-wide monotonic counter already well past
-/// `handle`'s small, OS-assigned fd-derived range by the time this test runs (every earlier
-/// test's markers already advanced it), so recording under `handle` never lands on either
-/// marker's own key, and `take_hard_kill_calls` on it reads back 0, not 1.
+/// this test: `hard_kill_test_key()` is a small, sequential, process-local counter starting at 1
+/// (`next_hard_kill_test_key`) — fresh in THIS process regardless of what ran before it: under
+/// nextest's default per-test process isolation, no earlier test's markers share this process at
+/// all, so there is no accumulated count to be "already past". `handle` is the field's own doc's
+/// `VM_KERNEL_ADDRHASH` — a kernel-assigned hash of the real pipe object, not small and not
+/// fd-derived — so it lands nowhere near either marker's small counter value either way, and
+/// recording under it never lands on either marker's own key: `take_hard_kill_calls` on that key
+/// reads back 0, not 1.
 #[test]
 fn two_live_markers_record_hard_kill_under_their_own_test_key() {
     let _serialize = test_spawn_lock();
