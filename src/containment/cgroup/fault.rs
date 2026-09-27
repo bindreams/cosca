@@ -30,6 +30,7 @@ thread_local! {
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_END_CHILD_WAIT_EINVAL: Cell<bool> = const { Cell::new(false) };
+    static FORCE_KILL_WRITE_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -52,6 +53,17 @@ pub(crate) fn set_force_kill_check_errno(errno: i32) {
 }
 pub(crate) fn take_force_kill_check_errno() -> Option<i32> {
     FORCE_KILL_CHECK_ERRNO.with(|f| f.take())
+}
+
+/// Make the NEXT `hard_kill()`'s `cgroup.kill` write on this thread fail with `EACCES`, as a
+/// delegated subtree whose `cgroup.kill` stopped being writable after a privilege drop would —
+/// without touching the real file, so a retried `hard_kill()` after this one-shot is consumed
+/// succeeds normally. Take semantics.
+pub(crate) fn set_force_kill_write_failure(on: bool) {
+    FORCE_KILL_WRITE_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_kill_write_failure() -> bool {
+    FORCE_KILL_WRITE_FAILURE.with(|f| f.replace(false))
 }
 
 /// Make the NEXT drain watch on this thread fail to create its inotify instance, as

@@ -568,17 +568,23 @@ impl Drop for Child {
             );
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
-        // Disarm now that this handle's own sweep just ran: whatever falls out of scope below
-        // (the field-wise drop of `self.attached` at the end of this function) must not run a
-        // SECOND, redundant sweep of its own. That would matter little for a mechanism gated on
-        // real occupancy (`Cgroup`'s `Drop` only re-kills if `rmdir` still finds the leaf
-        // occupied — a fact, not a stale identifier), but `FdMarker`'s `Drop` (see its own doc)
-        // fires `hard_kill`'s pass 1 unconditionally on EVERY call, with no occupancy check —
-        // and by the time `teardown_on_drop` below has reaped the root, the pgid this handle just
-        // swept may already have been recycled onto an unrelated, live process group. `disarm`
-        // does not opt out of AWAITING a kill this same handle already sent (see its own doc) —
-        // only out of sending a new one nothing here asked for.
-        self.attached.disarm();
+        // Disarm ONLY the fd marker now that this handle's own sweep just ran: whatever falls out
+        // of scope below (the field-wise drop of `self.attached` at the end of this function)
+        // must not run a SECOND, redundant sweep of its own. `FdMarker`'s `Drop` (see its own doc)
+        // fires `hard_kill`'s pass 1 unconditionally on EVERY call, with no occupancy check — and
+        // by the time `teardown_on_drop` below has reaped the root, the pgid this handle just
+        // swept may already have been recycled onto an unrelated, live process group.
+        //
+        // Every other mechanism is left exactly as it was: `Cgroup`'s `Drop` is gated on real
+        // occupancy, not a stale identifier, and — unlike `FdMarker` — its retry depends on
+        // whether the sweep above actually succeeded (`killed`, set only on a successful
+        // `cgroup.kill` write). Disarming it here regardless of that outcome used to suppress its
+        // own retry on a failed write, silently giving up on an occupied leaf instead. A pgroup/
+        // `TreeWalk`/Job Object's own resource-drop never re-kills at all, so leaving them armed
+        // changes nothing for them either. `disarm_after_own_sweep` does not opt out of AWAITING a
+        // kill this same handle already sent (see its own doc) — only out of sending a new one
+        // nothing here asked for, and only for the one mechanism that needs it.
+        self.attached.disarm_after_own_sweep();
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
         // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals, handing

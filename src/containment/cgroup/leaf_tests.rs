@@ -749,6 +749,62 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     );
 }
 
+/// #165 F2 regression: `Child::drop`'s own explicit sweep disarms only the fd-marker mechanism
+/// afterwards (`Attached::disarm_after_own_sweep`), never a cgroup leaf — unlike the blanket
+/// `disarm()` call it replaced, which would have handed a `hard_kill()` attempt that genuinely
+/// FAILED (`kill_attempt_failed=true`, `killed=false`) straight to the disarmed "never killed"
+/// branch below, which never retries a real mechanism failure (see
+/// `a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn`, whose leaf is left behind).
+/// Left armed instead, as `disarm_after_own_sweep` now leaves it, this leaf's own `Drop` must
+/// retry `cgroup.kill` itself and remove the leaf once it drains — exactly as
+/// `an_armed_drop_removes_its_leaf_only_after_it_drains` does for a leaf nothing tried to kill
+/// yet, proving the retry survives a real prior failed attempt too.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-armed-kill-retry-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    fault::set_force_kill_write_failure(true);
+    leaf.hard_kill()
+        .expect_err("the forced write failure must surface as a real error");
+    assert!(
+        !fault::take_force_kill_write_failure(),
+        "one-shot: the forced failure must already be consumed by the call above"
+    );
+
+    // `Child::drop`'s own post-sweep step, exactly as it runs in production: a no-op for a
+    // cgroup leaf (see `disarm_after_own_sweep`'s doc) — unlike the blanket `disarm()` it
+    // replaced, which would have armed==false here instead.
+    let attached = crate::containment::Attached::Cgroup(leaf);
+    attached.disarm_after_own_sweep();
+
+    fault::record_leaf_steps();
+    drop(attached);
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    assert!(
+        !fake.leaf.exists(),
+        "an armed Drop must retry cgroup.kill after its own earlier attempt failed, and remove \
+         the leaf once the retried kill drains, got {steps:?}"
+    );
+    assert_eq!(
+        steps,
+        vec!["rmdir populated 1", "kill", "rmdir populated 0"],
+        "Drop must re-fire cgroup.kill (the forced failure above wrote nothing and left no step) \
+         and retry the rmdir only once that retried kill drains, got {steps:?}"
+    );
+}
+
 /// Disarmed twin of `an_armed_drop_removes_its_leaf_only_after_it_drains`: a
 /// leaf whose caller explicitly killed the tree (`hard_kill`, mirroring `Child::kill_tree()`)
 /// and THEN disarmed `Drop`'s own teardown (`kill_on_drop(false)`) must still have its `Drop`

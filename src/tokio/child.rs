@@ -869,12 +869,14 @@ impl Drop for Child {
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         let _ = tree;
-        // Disarm now that this handle's own sweep just ran: whatever eventually drops `os.attached`
-        // below (inline here, or later on a reaper thread once the root's reap is handed off) must
-        // not run a SECOND, redundant sweep of its own — see the sync twin's identical comment for
-        // why this matters concretely for `FdMarker`, whose `Drop` fires `hard_kill`'s pass 1
-        // unconditionally on every call, with no occupancy check.
-        self.os.attached.disarm();
+        // Disarm ONLY the fd marker now that this handle's own sweep just ran: whatever eventually
+        // drops `os.attached` below (inline here, or later on a reaper thread once the root's
+        // reap is handed off) must not run a SECOND, redundant sweep of its own — see the sync
+        // twin's identical comment for why this matters concretely for `FdMarker`, whose `Drop`
+        // fires `hard_kill`'s pass 1 unconditionally on every call, with no occupancy check, and
+        // for why every OTHER mechanism (notably `Cgroup`, whose own retry depends on whether the
+        // sweep above actually succeeded) must be left untouched here instead.
+        self.os.attached.disarm_after_own_sweep();
 
         let pid = self.id.pid();
         // The WHOLE resource group moves, so a field added to `OsResources` is carried here
