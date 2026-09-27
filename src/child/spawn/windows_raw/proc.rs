@@ -24,6 +24,33 @@ use crate::error::Error;
 /// `WaitForSingleObject`/`WaitForMultipleObjects` "no timeout" sentinel.
 const INFINITE: u32 = 0xFFFF_FFFF;
 
+/// What `TerminateProcess` reported for a process this process holds a handle to.
+#[derive(Debug)]
+pub(crate) enum Terminated {
+    Yes,
+    /// `ERROR_ACCESS_DENIED`. With terminate rights on the handle — which a child this process
+    /// created always grants — it means the process is already exiting, and a wait on the handle
+    /// confirms it. Only a higher-integrity `runas` child can deny terminate rights, which
+    /// [`RawChild::kill`] tells apart.
+    ExitUnderway,
+    Failed(io::Error),
+}
+
+/// `TerminateProcess(handle, 1)`, classified. The one reading of its result, shared by
+/// [`RawChild::kill`] and the spawn teardowns' retry for a suspended child.
+pub(crate) fn terminate(handle: HANDLE) -> Terminated {
+    // SAFETY: the caller keeps `handle` open for the call; exit code 1 is the forced-kill code.
+    classify_terminate(unsafe { TerminateProcess(handle, 1) })
+}
+
+pub(crate) fn classify_terminate(result: windows::core::Result<()>) -> Terminated {
+    match result {
+        Ok(()) => Terminated::Yes,
+        Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => Terminated::ExitUnderway,
+        Err(e) => Terminated::Failed(e.into()),
+    }
+}
+
 /// A child spawned via raw `CreateProcessW`, owning its process handle directly.
 #[derive(Debug)]
 pub(crate) struct RawChild {
@@ -63,6 +90,17 @@ impl RawChild {
         // SAFETY: our live owned handle pins the process object, so `self.pid` still names
         // THIS process; OpenProcess tolerates failure (returns Err).
         super::can_terminate(self.pid)
+    }
+
+    /// The process handle, for a teardown's `TerminateProcess` classified by [`terminate`].
+    pub(crate) fn handle_for_teardown(&self) -> HANDLE {
+        self.handle()
+    }
+
+    /// The owned handle and pid, for the async backend to await.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn into_parts(self) -> (OwnedHandle, u32) {
+        (self.proc, self.pid)
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -115,16 +153,15 @@ impl RawChild {
 
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
-        // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
-            Ok(()) => Ok(()),
+        match terminate(self.handle()) {
+            Terminated::Yes => Ok(()),
             // TerminateProcess reports ERROR_ACCESS_DENIED in two distinct situations: (a) the
             // target is already exiting/exited (the OS teardown window signals the denial before
             // the process object is signaled — a spurious kill error), or (b) a runas child is
             // genuinely higher-integrity than us. A static `can_terminate` probe (a second
             // OpenProcess for PROCESS_TERMINATE, pid-reuse-safe because we still hold the handle)
             // separates the two WITHOUT racing a `try_wait`.
-            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+            Terminated::ExitUnderway => {
                 if self.runas && !self.can_terminate() {
                     // (b) A genuinely higher-integrity runas child we cannot terminate. Do NOT
                     // block in wait(): surface the denial.
@@ -137,7 +174,7 @@ impl RawChild {
                     Ok(())
                 }
             }
-            Err(e) => Err(e.into()),
+            Terminated::Failed(e) => Err(e),
         }
     }
 

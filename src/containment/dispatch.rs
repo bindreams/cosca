@@ -40,16 +40,42 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed while the caller still holds its child
     /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
-    /// never for the child the caller will reap. A no-op without a leaf, or once taken.
+    /// never for the child the caller will reap.
+    ///
+    /// Returns the leaf as `Attached::Cgroup`, for the caller to retain (exactly as `attach_tree`
+    /// itself would construct it on a successful placement), if — and only if — the verdict says
+    /// the child was actually placed in it. A `None`-placed or undecidable verdict is discarded:
+    /// `take_placement` has already dealt with the child in every branch that is not
+    /// `Ok(Ok(()))` (an undecidable verdict has already killed it; a negative one never put
+    /// anything of the child's in the leaf), so there is nothing left worth retaining. Also
+    /// `None` without a leaf, once its verdict is already taken, or on any other platform.
     #[cfg_attr(not(any(test, feature = "tokio")), allow(dead_code))]
-    pub(crate) fn settle_verdict(&mut self, pid: u32) {
+    #[must_use]
+    pub(crate) fn settle_verdict(&mut self, pid: u32) -> Option<Attached> {
         #[cfg(target_os = "linux")]
-        if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            // The spawn fails either way; an undecidable verdict has already killed the child.
-            let _ = leaf.take_placement(pid);
+        {
+            match self.cgroup_leaf.take() {
+                Some(mut leaf) if leaf.holds_verdict_to_take() => {
+                    // The spawn fails either way; an undecidable verdict has already killed the
+                    // child.
+                    match leaf.take_placement(pid) {
+                        Ok(Ok(())) => Some(Attached::Cgroup(leaf)),
+                        _ => None,
+                    }
+                }
+                // No verdict to take (already resolved, or never had one): put it back untouched.
+                Some(leaf) => {
+                    self.cgroup_leaf = Some(leaf);
+                    None
+                }
+                None => None,
+            }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = pid;
+        {
+            let _ = pid;
+            None
+        }
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
@@ -63,6 +89,7 @@ impl Prepared {
             return match leaf.abandon_before_verdict() {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
+                Abandoned::HandedBack { kill, child } => AbandonedChild::HandedBack { kill, child },
                 Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
             };
         }
@@ -73,10 +100,15 @@ impl Prepared {
 /// What became of the child of a spawn that failed with no handle left on it (see
 /// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
 #[cfg_attr(not(all(target_os = "linux", feature = "tokio")), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum AbandonedChild {
     /// Nothing of it runs, and it is reaped or will be.
     Ended,
+    /// It refused the kill and may run on, held by its handle: for the caller to hand back.
+    HandedBack {
+        kill: std::io::Error,
+        child: crate::child::unreaped::Unreaped,
+    },
     /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
@@ -220,9 +252,9 @@ impl Attached {
 
     /// Neutralize teardown so `detach()` leaves the tree running. For Job Objects,
     /// clears `KILL_ON_JOB_CLOSE` so the handle close does not kill the tree; for a cgroup
-    /// leaf, stops `Drop` firing `cgroup.kill`. No-op only for mechanisms whose resource-drop
-    /// genuinely does not kill (pgroup/treewalk/fd marker/none), which `Child::drop`'s
-    /// `kill_on_drop` opt-out already covers.
+    /// leaf or an fd marker, stops `Drop` firing its kill-through sweep. No-op only for
+    /// mechanisms whose resource-drop genuinely does not kill (pgroup/treewalk/none), which
+    /// `Child::drop`'s `kill_on_drop` opt-out already covers.
     pub(crate) fn disarm(&self) {
         match self {
             Attached::None | Attached::Delegated => {}
@@ -232,10 +264,47 @@ impl Attached {
             Attached::Cgroup(leaf) => leaf.disarm(), // CgroupLeaf::drop kills an occupied leaf
             #[cfg(windows)]
             Attached::JobObject(job) => job.disarm(), // clear KILL_ON_JOB_CLOSE before handle drops
-            // dropping the read end does not kill; detach opts out via kill_on_drop
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(_) => {}
+            Attached::FdMarker(m) => m.disarm(), // Marker::drop kills through an armed marker
             Attached::TreeWalk(_) => {} // no kernel resource whose drop kills; detach opts out via kill_on_drop
+        }
+    }
+
+    /// Give this attachment up for a caller that never gets to kill through it and never made any
+    /// kill this handle's own `killed`-style bookkeeping might already record: `Unreaped`'s
+    /// `leak()`, `release()`, and a failed `wait`/`Drop`'s own give-up of what it retained.
+    ///
+    /// Unlike [`disarm`](Self::disarm), which still waits for a kill the SAME handle already fired
+    /// through `kill_tree()`/`hard_kill()`, `abandon` clears that record too, so a later `Drop`
+    /// never re-fires a kill or blocks on one this give-up never asked for — see
+    /// [`CgroupLeaf::abandon`](crate::containment::cgroup::CgroupLeaf::abandon)'s own doc for why a
+    /// cgroup leaf is the one variant where this distinction is observable: only it has a `killed`
+    /// flag a kill made before hand-back can leave set. Every other variant's drop either never
+    /// kills or has nothing equivalent to wait on, so `abandon` is exactly `disarm` for them.
+    pub(crate) fn abandon(&self) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(leaf) => leaf.abandon(),
+            _ => self.disarm(),
+        }
+    }
+
+    /// Neutralize ONLY the fd-marker mechanism's own re-fire, after this handle's own explicit
+    /// `hard_kill()` call already swept the tree once (see `Child::drop`). Every other mechanism
+    /// is left untouched, unlike the blanket [`disarm`](Self::disarm) this replaced at that call
+    /// site: a `CgroupLeaf`'s `killed` flag already tracks whether ITS write from that same sweep
+    /// actually succeeded, and its own `Drop` needs to retry the write if it did not (see
+    /// `CgroupLeaf::hard_kill`'s doc) — disarming it unconditionally right after the sweep
+    /// suppressed that retry regardless of whether the sweep had succeeded, silently giving up on
+    /// an occupied leaf. A pgroup/`TreeWalk`/Job Object's own resource-drop never re-kills at all
+    /// (see `disarm`'s own per-variant notes), so leaving them untouched here changes nothing for
+    /// them either — only the fd marker's `Drop` (which unconditionally re-fires `killpg`, see its
+    /// own doc) needs this.
+    pub(crate) fn disarm_after_own_sweep(&self) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.disarm(),
+            _ => {}
         }
     }
 
@@ -290,6 +359,26 @@ impl Attached {
         }
     }
 
+    /// Whether this attachment's `Drop` may block the thread that runs it, in ANY state —
+    /// broader than [`disarmed_kill_may_block_drop`](Self::disarmed_kill_may_block_drop), which
+    /// covers only the disarmed-and-killed `Cgroup` case (round-3 finding 5). The async
+    /// `Child::drop`'s two early-return releases (the root already reaped, or its own
+    /// `start_kill` failed) read this to decide whether releasing `self` needs routing off the
+    /// dropping thread and onto the reaper pool — WITHOUT waiting for the root's own exit there
+    /// (see `reaper::ReapJob::skip_wait`'s doc for why that wait is never bounded in either of
+    /// those two cases) — rather than falling, unconditionally, into whichever of `Drop`'s
+    /// branches its current armed/killed state happens to take. `false` for every other
+    /// mechanism: a pgroup/`TreeWalk`/fd-marker drop never itself blocks, and a Job Object's
+    /// handle close is a fast, non-blocking `CloseHandle`.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn drop_may_block(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(leaf) => leaf.drop_may_block(),
+            _ => false,
+        }
+    }
+
     /// Whether this handle owns a mechanism with a kernel drain edge — mirrors
     /// [`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain),
     /// checked against the concrete resource rather than the reported enum so the two can
@@ -321,7 +410,7 @@ impl Attached {
             #[cfg(windows)]
             Attached::JobObject(job) => job.wait_drained(deadline, None),
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.wait_drained(deadline),
+            Attached::FdMarker(m) => m.wait_drained(deadline, None),
             _ => Err(Error::Unsupported {
                 op: "wait for the contained tree to drain".into(),
                 platform: std::env::consts::OS,
@@ -408,7 +497,7 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
             marker_env: false,
         };
     };
-    let creation_flags = if is_root && !matches!(mode, ContainMode::TreeWalk) {
+    let creation_flags = if suspends(mode, is_root) {
         // Strongest root: suspend + new process group (job assigned in attach).
         crate::containment::windows::root_flags()
     } else {
@@ -419,6 +508,22 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     WindowsContain {
         creation_flags,
         marker_env: is_root && req.nesting == Nesting::Mark,
+    }
+}
+
+/// Whether a contained spawn in `mode` creates its child `CREATE_SUSPENDED`, for `attach` to
+/// resume once it is in its job: a root that is not `TreeWalk`.
+#[cfg(windows)]
+fn suspends(mode: ContainMode, is_root: bool) -> bool {
+    is_root && !matches!(mode, ContainMode::TreeWalk)
+}
+
+#[cfg(windows)]
+impl Prepared {
+    /// Whether this spawn created its child `CREATE_SUSPENDED`. Until `attach` succeeds, such a
+    /// child may still be suspended — `attach` alone resumes it — and so cannot exit on its own.
+    pub(crate) fn created_suspended(&self) -> bool {
+        self.mode.is_some_and(|mode| suspends(mode, self.is_root))
     }
 }
 

@@ -24,7 +24,7 @@ pub(crate) mod resolve;
 #[path = "windows_raw/proc.rs"]
 mod proc;
 
-pub(crate) use proc::RawChild;
+pub(crate) use proc::{terminate, RawChild, Terminated};
 // Additional seams the async raw backend reuses: the cancellable handle wait + its
 // outcome, and the exit-status reader. The sync path uses these only inside `proc`, so the
 // re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
@@ -170,18 +170,33 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         graceful: crate::containment::windows::mechanism_from_flags(flags),
     };
     let raw_handle = proc.as_raw_handle();
+    // Read before `attach_or_fault` consumes `prepared`: a failed attach may leave it suspended.
+    let suspended = prepared.created_suspended();
     let attachment = match attach_or_fault(pid, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            raw_spawn_teardown(proc, pid);
-            return Err(e);
+            // A real attach FAILURE retains nothing (mirrors `attach_or_fault`'s own fault seam
+            // doc): there is no attachment here to retain, unlike the identity-failure arm below.
+            return Err(crate::child::spawn::unkillable(
+                e,
+                raw_spawn_teardown(proc, pid, suspended, None),
+            ));
         }
     };
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            raw_spawn_teardown(proc, pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            // The attach succeeded, and with it the resume. Retain `attachment.attached` in the
+            // teardown rather than letting it drop here: on Windows that would close the Job
+            // Object BEFORE the caller ever sees the `Unreaped` this constructs, and a Job
+            // Object's `Drop` fires `KILL_ON_JOB_CLOSE` — silently tearing the tree down before
+            // `Error::Unreaped` gives the caller any say. `raw_spawn_teardown` decides the
+            // attachment's actual fate (retain for the caller, or disarm on uncertain ownership).
+            let handed_back = raw_spawn_teardown(proc, pid, false, Some(attachment.attached));
+            return Err(crate::child::spawn::unkillable(
+                crate::child::spawn::spawn_identity_error(other),
+                handed_back,
+            ));
         }
     };
 
@@ -413,30 +428,95 @@ pub(crate) fn app_name_wide(image: Option<&Path>) -> Result<Vec<u16>, Error> {
     Ok(to_wide_nul(image.as_os_str()))
 }
 
-/// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn
-/// never leaks a running/zombie process (mirrors the std path's teardown). `pub(crate)`: the async
-/// raw backend shares the identical error-teardown.
-pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
+/// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, as the std path's
+/// teardown does: a child the kill cannot end is returned with the kill's error, for the caller to
+/// hand back — never waited on here, where the wait would park for as long as it runs. `pub(crate)`:
+/// the async raw backend shares the identical error-teardown.
+///
+/// `suspended`: the child was created `CREATE_SUSPENDED` and its attach, the only thing that
+/// resumes it, failed. Such a child cannot exit on its own, so it is never handed back: a failed
+/// kill is retried through `proc`, as
+/// [`retry_terminate_suspended`](crate::child::spawn::retry_terminate_suspended) describes.
+///
+/// `attached`: the mechanism `attach_or_fault` attached before the failure this teardown is
+/// unwinding, if any — `None` from the attach-failure arm (nothing was ever attached there), and
+/// the identity-failure arm's own `attachment.attached` otherwise. Retained in the SAME `Unreaped`
+/// a still-running child is handed back in (mirrors `teardown_unadopted`'s identical parameter):
+/// dropping it here instead, unretained, would run its `Drop` — on Windows a Job Object's own
+/// `KILL_ON_JOB_CLOSE` — before `Error::Unreaped` ever reaches the caller, tearing the tree down
+/// with no say from whoever is supposed to decide its fate through `Unreaped::wait`/`leak`.
+#[must_use]
+pub(crate) fn raw_spawn_teardown(
+    proc: OwnedHandle,
+    pid: u32,
+    suspended: bool,
+    attached: Option<crate::containment::Attached>,
+) -> Option<(std::io::Error, crate::child::unreaped::Unreaped)> {
+    use crate::child::unreaped::{Checked, Held, Retained, Unreaped};
+    let raw = proc.as_raw_handle();
     let rc = RawChild::new(proc, pid);
-    // Windows only, so the std path-s invariant does NOT carry: there is no zombie to reap
-    // and `rc.wait()` is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed,
-    // nothing asked the child to exit and that wait would park forever - a logged, leaked
-    // child is strictly better.
-    if let Err(e) = rc.kill() {
-        log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
-        return;
+    if let Err(kill) = kill_for_teardown(&rc) {
+        return match Held::Raw(rc).check() {
+            Checked::Running(mut held) => {
+                if !suspended {
+                    return Some((
+                        kill,
+                        Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
+                    ));
+                }
+                // `held` keeps the handle open for the retry.
+                if crate::child::spawn::retry_terminate_suspended(raw, pid) {
+                    if let Err(e) = held.wait() {
+                        log::warn!("raw spawn teardown failed to reap terminated pid {pid}: {e}");
+                        debug_assert!(false, "raw spawn teardown failed to reap a terminated child: {e}");
+                    }
+                    log::warn!(
+                        "raw spawn teardown: kill of pid {pid} failed: {kill}; terminated it through its handle"
+                    );
+                } else {
+                    held.release();
+                }
+                None
+            }
+            // It had exited, which makes the kill's failure moot.
+            Checked::Reaped => None,
+            Checked::Uncertain(e) => {
+                // The pid may already name another process: what this spawn retained is given up
+                // disarmed, not left to kill (on Windows, via `KILL_ON_JOB_CLOSE`) through a tree
+                // that may no longer be its own — mirrors `teardown_unadopted`'s identical arm.
+                if let Some(attached) = attached {
+                    attached.disarm();
+                }
+                log::warn!(
+                    "raw spawn teardown could not kill pid {pid} ({kill}), and its ownership is \
+                     uncertain ({e}); released it without waiting"
+                );
+                None
+            }
+        };
     }
     if let Err(e) = rc.wait() {
         log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
         debug_assert!(false, "raw spawn teardown failed to reap child: {e}");
     }
+    None
+}
+
+/// `rc.kill()`, which a test can force to fail through the spawn teardown's kill seam, leaving the
+/// child running.
+fn kill_for_teardown(rc: &RawChild) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some((marker, kind)) = crate::child::spawn::fault::take_force_kill_failure() {
+        return Err(std::io::Error::new(kind, marker));
+    }
+    rc.kill()
 }
 
 /// Does the caller hold `PROCESS_TERMINATE` on `pid`? A STATIC permission answer (a second
 /// `OpenProcess`), used to separate a genuine higher-integrity runas denial from the OS
 /// teardown-window `ACCESS_DENIED` WITHOUT racing a `try_wait`. Pid-reuse-safe when the caller
 /// still holds a handle pinning the process object. Shared by the sync `RawChild` and the async
-/// `RawAsyncChild` runas kill paths so both surface the same typed `Unkillable`.
+/// `RawAsyncChild` runas kill paths so both surface the same typed `ElevationErrorKind::Unkillable`.
 pub(crate) fn can_terminate(pid: u32) -> bool {
     // SAFETY: the caller holds a live owned handle pinning the process object, so `pid` still
     // names THIS process; OpenProcess tolerates failure (returns Err).

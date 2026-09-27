@@ -613,7 +613,9 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
 
 /// The comparable shape of a cooperative-signal outcome: `Error` is `#[non_exhaustive]` and not
 /// `PartialEq`, and the detail strings legitimately differ between the two surfaces.
-fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
+fn refusal_shape<C: std::fmt::Debug + Send + Sync + 'static>(
+    result: &Result<(), cosca::error::Error<C>>,
+) -> &'static str {
     match result {
         Ok(()) => "ok",
         Err(cosca::error::Error::Unsupported { .. }) => "unsupported",

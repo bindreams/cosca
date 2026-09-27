@@ -20,7 +20,7 @@ pub use graceful::GracefulMechanism;
 pub use stdio::{Fd, Stdio};
 
 mod child;
-pub use child::Child;
+pub use child::{Child, Unreaped};
 
 /// Test-only: the same process-wide lock production spawns take internally
 /// (`child::spawn::spawn_lock`), exposed so this crate's OWN integration tests

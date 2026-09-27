@@ -89,6 +89,7 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
             ..Default::default()
         },
         pid,
+        skip_wait: false,
         origin,
         probe,
         force_panic: false,
@@ -404,6 +405,68 @@ async fn total_spawn_failure_releases_the_job_in_hand() {
         0,
         "the seam must have been consumed"
     );
+}
+
+/// Round-4 test-quality finding: `skip_wait` must be pinned directly, against a genuinely LIVE
+/// child, not inferred from a `Child::drop` scenario whose own `proc: None` panic (a broken
+/// `wait_and_reap` precondition — see its own doc — reached by a job built around a child ALREADY
+/// reaped some other way) can catch a mutant for the wrong reason. The child is held alive
+/// (blocked on its own stdin) until AFTER the job's own outcome is confirmed, not released first:
+/// `skip_wait: true` must mean `wait_and_reap` never ran, which is only provable by letting
+/// nothing else touch the child before checking whether it is still here, unreaped, for this test
+/// to reap itself.
+#[cfg(unix)]
+#[tokio::test]
+async fn skip_wait_releases_without_ever_reaping_a_live_child() {
+    let pool = private_pool(super::REAPER_POOL_THREADS);
+
+    let (proc, stdin) = {
+        let _guard = crate::child::spawn::spawn_lock();
+        let mut proc = ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child blocked on stdin");
+        let stdin = proc.stdin.take().expect("piped stdin");
+        (proc, stdin)
+    };
+    let pid = proc.id().expect("a freshly spawned child has a pid");
+
+    let (probe, ends) = probe_pair();
+    drop(ends.gate); // never held: nothing here needs the teardown parked open
+    let job = super::ReapJob {
+        os: super::super::OsResources {
+            proc: Some(super::super::ProcSource::Tokio(proc)),
+            ..Default::default()
+        },
+        pid,
+        skip_wait: true,
+        origin: std::thread::current().id(),
+        probe: Some(probe),
+        force_panic: false,
+        force_release_panic: false,
+        force_glue_panic: false,
+    };
+    super::submit_to(pool, job);
+
+    // No timeout here: syncing on our own code with a wall clock is forbidden. A regression that
+    // parks the worker on this still-live child hangs, which nextest's own `slow-timeout` for
+    // this test (`.config/nextest.toml`) bounds — a failure surfaced to a human, not a
+    // synchronization device.
+    let outcome = ends.outcome.recv();
+    assert!(
+        matches!(outcome, Ok(ReapOutcome::Reaped(_))),
+        "the job must complete even for a live child, got {outcome:?}"
+    );
+
+    // Only now, with the outcome already confirmed, is the child released: `skip_wait: true`
+    // means `wait_and_reap` never ran here — the prompt `outcome` above is that proof. Not
+    // re-proven by reaping it here too: once `os.proc` (a `ProcSource::Tokio`) drops, it is
+    // registered with tokio's OWN process-global orphan queue, which — running this in the full
+    // suite, alongside many other tests' children exiting and raising `SIGCHLD` — can win a race
+    // to reap it before this test gets to. Letting the child exit at all (`drop(stdin)`) is
+    // enough; who ends up reaping it afterward is not this test's concern.
+    drop(stdin);
 }
 
 #[tokio::test]

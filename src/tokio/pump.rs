@@ -10,7 +10,7 @@ use crate::Output;
 use super::child::Child;
 
 impl Child {
-    pub async fn communicate(&mut self, input: Option<Vec<u8>>) -> Result<Output, Error> {
+    pub async fn communicate(&mut self, input: Option<Vec<u8>>) -> Result<Output, crate::tokio::Error> {
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
         // `self.proc_mut()` (so the four-future join compiles), and the Tokio backend's `wait` internally
         // drops its own stdin, already taken here, so it cannot race the write future.

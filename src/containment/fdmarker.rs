@@ -754,11 +754,93 @@ pub(crate) mod fault {
     pub(crate) fn lock_for_log_assertion() -> std::sync::MutexGuard<'static, ()> {
         LOG_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// How many times [`Marker::hard_kill`](super::Marker::hard_kill) has run, per
+    /// [`hard_kill_test_key`](super::Marker::hard_kill_test_key) — not a single bare count:
+    /// this crate's test binary runs every test in one shared process, routinely with several
+    /// unrelated markers sweeping concurrently, and a process-global count would attribute
+    /// another test's sweep to this one (measured: a bare counter read 10 under the full suite,
+    /// not the 1-or-2 either scenario this seam exists to tell apart).
+    ///
+    /// Keyed on `hard_kill_test_key`, NOT `Marker::handle` — this map used to be keyed on
+    /// `handle` itself, on the theory that "a pipe object's handle cannot be reissued while this
+    /// process holds its read end, so no simultaneously-live marker can share one." That
+    /// argument only covers the window while the ORIGINAL marker is still alive. The two
+    /// `dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once` tests (sync and tokio)
+    /// read this map only AFTER their own marker (and the read end that was protecting its
+    /// `handle`) has already been dropped — at which point the OS is free to reissue that exact
+    /// `handle` value to a brand-new, unrelated, concurrently-running test's marker. If that
+    /// marker's own (legitimate, single) `hard_kill` fires before the first test's `take` reads
+    /// the entry, the two unrelated sweeps land on the same key and get summed — a false
+    /// positive that looks exactly like the double-kill bug this test exists to catch. Measured
+    /// 2026-09-27: under `--test-threads=16` load, `left: 3` against an expected `1`, entirely
+    /// from unrelated concurrent markers, not from any extra call this `Child`'s own tree made
+    /// (a `--test-threads=1`, no-other-tests run of the same test showed 0 failures in 2000
+    /// iterations). `hard_kill_test_key` is instead a fresh id this process alone assigns, once,
+    /// at `Marker::new` — see [`next_hard_kill_test_key`] for why it can never repeat.
+    static HARD_KILL_CALLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    fn hard_kill_calls() -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, usize>> {
+        HARD_KILL_CALLS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn record_hard_kill_call(key: u64) {
+        *hard_kill_calls().entry(key).or_insert(0) += 1;
+    }
+
+    /// Read-and-remove this key's count, so each test starts from a clean slate regardless of
+    /// what earlier or concurrent tests left behind for OTHER keys.
+    pub(crate) fn take_hard_kill_calls(key: u64) -> usize {
+        hard_kill_calls().remove(&key).unwrap_or(0)
+    }
+
+    /// The next [`Marker::hard_kill_test_key`](super::Marker::hard_kill_test_key), process-wide
+    /// and monotonically increasing — never reused for the life of the test binary, unlike the
+    /// real OS pipe `handle` a `Marker` also carries (see `HARD_KILL_CALLS`'s doc for the
+    /// collision that key allowed). Starts at 1: 0 stays reserved, matching `Marker::handle`'s
+    /// own "0 matches nothing" sentinel, so a default-initialized or forgotten key can never
+    /// silently alias a real one.
+    static NEXT_HARD_KILL_TEST_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    pub(crate) fn next_hard_kill_test_key() -> u64 {
+        NEXT_HARD_KILL_TEST_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One-shot hooks a regression test registers to observe `Marker::hard_kill`'s call site
+    /// from the inside, keyed on the same never-reused `hard_kill_test_key` as
+    /// [`HARD_KILL_CALLS`] (for the identical reason — see that map's doc). Process-global, not
+    /// thread-local: unlike this module's other fault seams, the sweep this hook observes can
+    /// run on a tokio blocking-pool thread the registering test never touches directly (see
+    /// `tokio::unreaped::ReapTask`), so a thread-local would silently never fire.
+    #[allow(clippy::type_complexity)]
+    static HARD_KILL_HOOKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<u64, Box<dyn FnOnce() + Send>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    /// Register a one-shot hook to run from inside the next `hard_kill` call keyed on `key`.
+    /// Consumed at most once — see [`run_hard_kill_hook`].
+    pub(crate) fn set_hard_kill_hook(key: u64, hook: Box<dyn FnOnce() + Send>) {
+        HARD_KILL_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, hook);
+    }
+
+    /// Run and consume `key`'s hook, if one is registered. A no-op for every ordinary (non-test)
+    /// sweep and for every key no test ever registered a hook for.
+    pub(crate) fn run_hard_kill_hook(key: u64) {
+        let hook = HARD_KILL_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 // The attached mechanism =====
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
@@ -789,6 +871,16 @@ pub(crate) struct Marker {
     /// `holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy`, and the CI failure that
     /// motivated it, #59).
     own_fd: RawFd,
+    /// This marker's own key into `fault::HARD_KILL_CALLS`, assigned once at construction —
+    /// see that map's doc for why it must NOT be `handle` (above). Never read outside `#[cfg(test)]`.
+    #[cfg(test)]
+    hard_kill_test_key: u64,
+    /// Whether the caller still wants cosca to kill through on drop. Cleared by
+    /// [`disarm`](Self::disarm), for `detach()`, `kill_on_drop(false)`, and a leaked
+    /// `Unreaped` — mirrors `CgroupLeaf::armed`. `Drop` kills only while this holds: a plain
+    /// drop of a `Marker` retained past its `Child` (e.g. `Retained`'s field-wise drop) does
+    /// no killing on its own, so this is the only thing that still does.
+    armed: AtomicBool,
 }
 
 impl std::fmt::Debug for Marker {
@@ -864,12 +956,28 @@ impl Marker {
             root_denied,
             pgid,
             own_fd: prepared.fd,
+            #[cfg(test)]
+            hard_kill_test_key: fault::next_hard_kill_test_key(),
+            armed: AtomicBool::new(true),
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Child::test_marker_handle (test-only)
-    pub(crate) fn handle(&self) -> u64 {
-        self.handle
+    /// Neutralize `Drop`'s kill-through, for `detach()`, `kill_on_drop(false)`, and a leaked
+    /// `Unreaped`. Mirrors `CgroupLeaf::disarm`: a disarmed `Marker` still closes its read end
+    /// on drop (that alone kills nothing), it just skips the `hard_kill` sweep.
+    pub(crate) fn disarm(&self) {
+        self.armed.store(false, Ordering::Relaxed);
+    }
+
+    /// This marker's own, never-reused `fault::HARD_KILL_CALLS` key. Consumed by
+    /// `Child::test_marker_hard_kill_key`: unlike `self.handle` (the real, kernel-recycled pipe
+    /// identity used for the mechanism's own correctness, e.g. `check_read_end_still_valid`),
+    /// this key is generated by this process alone and never reissued, so two markers can never
+    /// collide on it regardless of how their real fds/handles overlap in time. See
+    /// `fault::HARD_KILL_CALLS`'s doc for why `handle` itself is unsafe for this purpose.
+    #[cfg(test)]
+    pub(crate) fn hard_kill_test_key(&self) -> u64 {
+        self.hard_kill_test_key
     }
 
     /// The descriptor number the marker occupies in the child. Consumed by
@@ -919,6 +1027,7 @@ impl Marker {
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<Option<Instant>>,
+        cancel: Option<&crate::wait::backend::Cancel>,
     ) -> Result<crate::containment::TreeDrain, Error> {
         self.check_read_end_still_valid()?;
         // This process is the supervisor: it must have closed its own copy of the write end at
@@ -933,7 +1042,7 @@ impl Marker {
             crate::containment::marker_eof::WriteEndCheck::HeldByUs,
             "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
         );
-        crate::containment::marker_eof::block_until_drained(self.read_end(), deadline)
+        crate::containment::marker_eof::block_until_drained(self.read_end(), deadline, cancel)
     }
 
     /// `Err` distinguishes a genuine teardown-mechanism failure (`Error::Io`/`Unsupported`,
@@ -945,6 +1054,20 @@ impl Marker {
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
     pub(crate) fn hard_kill(&self) -> Result<(), Error> {
+        // Test-only bookkeeping: a regression test counts calls (keyed on this marker's own
+        // never-reused `hard_kill_test_key`, NOT `handle` — see `fault::HARD_KILL_CALLS`'s doc
+        // for why `handle` itself can be reissued to an unrelated marker before the count is
+        // read) across the whole lifetime of a `Child` to prove a redundant `Drop for Marker`
+        // kill (see that impl's doc) never runs after `Child::drop`'s own explicit sweep already
+        // tore the tree down. `fault` is `#[cfg(test)]`-only (unlike some sibling mechanisms'
+        // always-on fault modules), so the call site must be gated the same way.
+        #[cfg(test)]
+        fault::record_hard_kill_call(self.hard_kill_test_key);
+        // Test-only: lets a regression test observe, from the inside, exactly when this sweep
+        // runs relative to the caller's own reap (see `fault::HARD_KILL_HOOKS`'s doc). A no-op
+        // unless a test registered a hook for this marker's own key.
+        #[cfg(test)]
+        fault::run_hard_kill_hook(self.hard_kill_test_key);
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1437,6 +1560,32 @@ impl Marker {
                 crate::containment::treewalk::kill_by_identity(id, signal)
                     == crate::containment::treewalk::KillOutcome::NotAttempted
             }
+        }
+    }
+}
+
+/// Kill through an armed marker before it falls out of scope, exactly like `CgroupLeaf`/
+/// `JobHandle` — mirrored here so a `Marker` retained past its `Child` (e.g. handed out by
+/// `into_unreaped_parts` and then plain-dropped, as `Retained`'s field-wise drop does) still
+/// tears its tree down. `Child::drop` also calls `hard_kill` explicitly before its fields drop,
+/// in the ordinary `kill_on_drop(true)` path — but, unlike `Cgroup`/`JobObject`, it then disarms
+/// THIS mechanism specifically (`Attached::disarm_after_own_sweep`, since a marker's own `Drop`
+/// fires `hard_kill`'s pass 1 unconditionally, with no occupancy check, and by the time this
+/// runs the pgid that pass swept may already be recycled onto an unrelated, live process group —
+/// see that method's own doc). So in that ordinary path this `Drop` finds `self.armed` already
+/// `false` and does nothing at all: not a redundant-but-harmless second sweep, no sweep runs
+/// here a second time. Only the retained-past-its-`Child` case above still reaches the kill
+/// below.
+impl Drop for Marker {
+    fn drop(&mut self) {
+        if !self.armed.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = self.hard_kill() {
+            log::warn!(
+                "fd marker {:#x}: hard_kill on drop did not fully tear down its tree: {e}",
+                self.handle
+            );
         }
     }
 }

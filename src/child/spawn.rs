@@ -63,7 +63,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             };
             // Set the elevation report BEFORE handling the deferred password: a cleanup
             // kill() in the write-failure path must see the elevated state so an EPERM maps
-            // to the typed Unkillable rather than leaking a raw Io.
+            // to the typed `ElevationErrorKind::Unkillable` rather than leaking a raw Io.
             child.set_elevation(report);
             let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
             return finish_elevated(child, written);
@@ -80,36 +80,83 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     spawn_unelevated(cmd, kill_on_drop)
 }
 
-/// Finish a POSIX elevated spawn whose deferred password write returned `written`.
-///
-/// On a failed write, do NOT orphan the running elevated child: kill its tree through its
-/// containment when it has one, so a descendant forked before the failure dies too, then kill
-/// and reap the root by its own handle, folding both outcomes into the error.
-///
-/// The reap follows the ROOT's kill alone. A tree kill can fail (a setuid member refusing the
-/// signal) while the root dies, and a killed root must be waited for, or it stays a zombie. A
-/// failed root kill (e.g. `Unkillable`) cannot be waited for, so it gets a non-blocking
-/// `try_wait` and the note that it may still be running.
+/// Finish a POSIX elevated spawn whose deferred password write returned `written`: on a failed
+/// write, do NOT orphan the running elevated child (see [`elevated_write_failed`]).
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
-    let Err(write_err) = written else {
-        return Ok(child);
-    };
-    let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
-    let root_note = match child.kill() {
-        Ok(()) => {
-            let _ = child.wait();
-            "the elevated child was terminated".to_string()
-        }
-        Err(e) => {
-            let _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
-        }
-    };
-    Err(Error::Elevation {
+    match written {
+        Ok(()) => Ok(child),
+        Err(write_err) => Err(elevated_write_failed(child, write_err)),
+    }
+}
+
+/// The error for a POSIX elevated spawn whose deferred password write failed: its tree is killed
+/// through its containment when that can tear one down, so a descendant forked before the failure
+/// dies too; then its root is killed by its own handle and reaped, and both outcomes are folded
+/// into the `AuthFailed` detail. A tree kill can fail while the root dies, and a killed root is
+/// always reaped. A root the kill
+/// cannot end — a setuid backend refuses it with EPERM — gets its one ownership check (see
+/// [`unreaped`](crate::child::unreaped)): one still running is handed back in
+/// [`Error::Unreaped`], whose `error` is that `AuthFailed`; one that had exited is reaped by the
+/// check; one of uncertain ownership is released without a wait.
+#[cfg(unix)]
+pub(crate) fn elevated_write_failed(child: Child, write_err: Error) -> Error {
+    use crate::child::unreaped::{kill_error_to_io, Checked, Unreaped};
+    // Its tree first, through its containment when that can tear one down, so a descendant forked
+    // before the failure dies too. The root is then killed by its own handle.
+    let tree = tree_note(child.containment().can_teardown().then(|| child.attached.hard_kill()));
+    let auth_failed = |note: String| Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {root_note}{}", tree_note(tree)),
-    })
+        detail: format!("{write_err}; {note}{tree}"),
+    };
+    #[cfg(test)]
+    let killed = match fault::take_force_kill_failure() {
+        Some((marker, kind)) => Err(Error::Io(std::io::Error::new(kind, marker))),
+        None => child.kill(),
+    };
+    #[cfg(not(test))]
+    let killed = child.kill();
+    let kill = match killed {
+        // SIGKILL is uncatchable, so this wait is bounded.
+        Ok(()) => {
+            #[cfg(test)]
+            let waited = match fault::take_force_reap_failure() {
+                Some(marker) => child.wait().and(Err(Error::Io(std::io::Error::other(marker)))),
+                None => child.wait(),
+            };
+            #[cfg(not(test))]
+            let waited = child.wait();
+            if let Err(e) = waited {
+                log::warn!("failed to reap the killed elevated child {}: {e}", child.id().pid());
+                debug_assert!(false, "failed to reap a killed elevated child: {e}");
+            }
+            return auth_failed("the elevated child was terminated".into());
+        }
+        Err(e) => kill_error_to_io(e),
+    };
+    let (held, retained) = child.into_unreaped_parts();
+    match held.check() {
+        Checked::Running(held) => Error::Unreaped {
+            error: Box::new(auth_failed(
+                "the elevated child could not be terminated and is handed back".into(),
+            )),
+            kill,
+            child: Unreaped::with_retained(held, Some(retained)),
+        },
+        Checked::Reaped => auth_failed("the elevated child had already exited".into()),
+        Checked::Uncertain(e) => {
+            // The pid may already name another process: what this spawn retained is given up
+            // abandoned, not left to kill through a tree that may no longer be its own — and not
+            // merely disarmed: the tree-kill note above may already have fired `hard_kill` on this
+            // same leaf, and a bare `disarm` would let a still-occupied leaf's `Drop` re-fire
+            // `cgroup.kill` and block draining a kill this give-up never asked for.
+            retained.attached.abandon();
+            auth_failed(format!(
+                "the elevated child could not be terminated ({kill}), and its ownership is uncertain ({e}); \
+                 it was released"
+            ))
+        }
+    }
 }
 
 /// `None`: no tree kill was tried, as the containment cannot tear one down.
@@ -304,6 +351,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         use std::os::windows::io::AsRawHandle;
         child.as_raw_handle()
     };
+    // Read before `attach_or_fault` consumes `prepared`: a failed attach may leave it suspended.
+    #[cfg(windows)]
+    let suspended = prepared.created_suspended();
     let attachment = match attach_or_fault(
         child.id(),
         #[cfg(windows)]
@@ -314,8 +364,16 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // Mirror the async spawn's error teardown: kill + reap the just-spawned child so a failed
         // attach never leaks a running/zombie process (std `Child::drop` neither kills nor reaps).
         Err(e) => {
-            teardown_unadopted(child);
-            return Err(e);
+            return Err(unkillable(
+                e,
+                teardown_unadopted(
+                    child,
+                    #[cfg(windows)]
+                    suspended,
+                    // The attach itself failed: nothing was ever attached to retain.
+                    None,
+                ),
+            ));
         }
     };
     // Read identity BEFORE adopting into SharedChild. `SharedChild::new` calls
@@ -328,14 +386,20 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // handle so the pid cannot be reused — so this read is race-free.
     let id = match resolve_identity(child.id()) {
         crate::identity::Resolved::Found(id) => id,
-        // Same teardown for both arms (never leak the spawned child), different diagnosis:
-        // an OS refusal is not a vanish.
+        // Same teardown as the attach-failure arm above (see `teardown_unadopted`), different
+        // diagnosis: an OS refusal is not a vanish.
         other => {
-            teardown_unadopted(child);
+            // The attach succeeded, and with it the resume.
+            let handed_back = teardown_unadopted(
+                child,
+                #[cfg(windows)]
+                false,
+                Some(attachment.attached),
+            );
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure.
-            return Err(spawn_identity_error(other));
+            return Err(unkillable(spawn_identity_error(other), handed_back));
         }
     };
     // Adopt AFTER the identity read (and after the containment resume) so
@@ -349,6 +413,168 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         kill_on_drop,
         attachment,
     ))
+}
+
+/// Kill and reap a spawned child that an error path is abandoning before adoption.
+///
+/// A child that could not be killed is NOT waited for here: it may still be running — a setuid
+/// child such as `sudo` refuses our SIGKILL with EPERM — and a blocking `wait()` would hang the
+/// spawn for as long as it runs. Its one ownership check decides what becomes of it (see
+/// [`unreaped`](crate::child::unreaped)): one that had exited is reaped by the check; one whose
+/// check fails with `ECHILD` — its ownership now uncertain — is released without a wait, and
+/// logged; one still running, or whose check fails any other way, is returned with the kill's
+/// error, for the caller to hand back in [`Error::Unreaped`] — cosca keeps no thread to reap it
+/// with. Its own stdio handles are closed first: one the caller holds would keep a child waiting
+/// on it.
+///
+/// On Windows a `suspended` child — one created `CREATE_SUSPENDED` whose attach, the only thing
+/// that resumes it, failed — cannot exit on its own, so it is never handed back: a failed kill is
+/// retried through the process handle this teardown holds, and a child that retry terminates is
+/// reaped. If the retry fails too, the child is leaked, suspended, until something else terminates
+/// it: that is logged and asserted, whatever the kill's error.
+#[must_use]
+fn teardown_unadopted(
+    mut child: std::process::Child,
+    #[cfg(windows)] suspended: bool,
+    attached: Option<crate::containment::Attached>,
+) -> Option<(std::io::Error, crate::child::unreaped::Unreaped)> {
+    use crate::child::unreaped::{Checked, Held, Retained, Unreaped};
+    if let Err(kill) = kill_unadopted(&mut child) {
+        let pid = child.id();
+        drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+        return match Held::Std(child).check() {
+            Checked::Running(held) => {
+                #[cfg(windows)]
+                if suspended {
+                    if let Held::Std(child) = held {
+                        terminate_suspended(child);
+                    }
+                    log::warn!("spawn teardown failed to kill suspended pid {pid}: {kill}");
+                    return None;
+                }
+                // Retained, not dropped: matching `elevated_write_failed`'s handoff, the caller
+                // that gets this child back decides the containment's fate (via `Unreaped`'s own
+                // wait/leak/Drop) rather than having it torn down — cgroup.kill plus a drain wait
+                // — before the error even arrives.
+                Some((
+                    kill,
+                    Unreaped::with_retained(held, attached.map(|attached| Retained { attached })),
+                ))
+            }
+            // It had exited, which makes the kill's failure moot.
+            Checked::Reaped => None,
+            Checked::Uncertain(e) => {
+                // The pid may already name another process: what this spawn retained is given up
+                // disarmed, not left to kill through a tree that may no longer be its own.
+                if let Some(attached) = attached {
+                    attached.disarm();
+                }
+                log::warn!(
+                    "spawn teardown could not kill pid {pid} ({kill}), and its ownership is uncertain \
+                     ({e}); released it without waiting"
+                );
+                None
+            }
+        };
+    }
+    if let Err(reap) = reap_unadopted(&mut child) {
+        log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
+        debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
+    }
+    None
+}
+
+/// `error`, or — when its teardown handed a child back — [`Error::Unreaped`] carrying it.
+pub(crate) fn unkillable(
+    error: Error,
+    handed_back: Option<(std::io::Error, crate::child::unreaped::Unreaped)>,
+) -> Error {
+    match handed_back {
+        Some((kill, child)) => Error::Unreaped {
+            error: Box::new(error),
+            kill,
+            child,
+        },
+        None => error,
+    }
+}
+
+/// Terminate a suspended child whose kill failed, through the process handle `child` holds, and
+/// reap it; or report it leaked. See [`teardown_unadopted`].
+#[cfg(windows)]
+fn terminate_suspended(mut child: std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    let pid = child.id();
+    if retry_terminate_suspended(child.as_raw_handle(), pid) {
+        if let Err(e) = child.wait() {
+            log::warn!("spawn teardown failed to reap terminated pid {pid}: {e}");
+            debug_assert!(false, "sync spawn teardown failed to reap a terminated child: {e}");
+        }
+    }
+}
+
+/// Retry terminating a child created `CREATE_SUSPENDED` whose attach — the only thing that resumes
+/// it — failed, and whose kill failed too. Such a child cannot exit on its own, so nothing may
+/// wait for it unless this terminates it. Shared by the sync and async spawn teardowns.
+///
+/// `true`: terminated, or already exiting (`ERROR_ACCESS_DENIED` on our own handle, read as
+/// [`RawChild::kill`](windows_raw::RawChild::kill) reads it), so the caller's wait on it is
+/// bounded. `false`: it had already exited, or it is leaked, suspended, until something else
+/// terminates it — logged and asserted whatever the kill's error was. `handle` is the child's
+/// process handle, which the caller keeps open.
+#[cfg(windows)]
+pub(crate) fn retry_terminate_suspended(handle: std::os::windows::io::RawHandle, pid: u32) -> bool {
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows_raw::Terminated;
+    #[cfg(test)]
+    let terminated = if let Some(marker) = fault::take_force_suspended_terminate_failure() {
+        Terminated::Failed(std::io::Error::other(marker))
+    } else if fault::take_force_suspended_terminate_exit_underway() {
+        // Terminated for real, so the wait the outcome asks for is bounded.
+        let _ = windows_raw::terminate(HANDLE(handle));
+        Terminated::ExitUnderway
+    } else {
+        windows_raw::terminate(HANDLE(handle))
+    };
+    #[cfg(not(test))]
+    let terminated = windows_raw::terminate(HANDLE(handle));
+    let e = match terminated {
+        Terminated::Yes | Terminated::ExitUnderway => return true,
+        Terminated::Failed(e) => e,
+    };
+    // SAFETY: the caller keeps `handle` open; a zero timeout only polls.
+    if unsafe { WaitForSingleObject(HANDLE(handle), 0) } == WAIT_OBJECT_0 {
+        // Something else ended it after the kill failed.
+        return false;
+    }
+    log::warn!(
+        "spawn teardown could not terminate suspended pid {pid} either ({e}); it is leaked, \
+         suspended, until something else terminates it"
+    );
+    debug_assert!(false, "spawn teardown leaked suspended pid {pid}: {e}");
+    false
+}
+
+/// `child.kill()`, which a test can force to fail, leaving the child running. Only kills: whether
+/// a child whose kill failed has exited is the teardown's one check.
+fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some((marker, kind)) = fault::take_force_kill_failure() {
+        return Err(std::io::Error::new(kind, marker));
+    }
+    child.kill()
+}
+
+/// `child.wait()`, which a test can force to fail. The forced failure still REAPS first, so the
+/// test that asks for it leaks nothing.
+fn reap_unadopted(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if let Some(marker) = fault::take_force_reap_failure() {
+        child.wait()?;
+        return Err(std::io::Error::other(marker));
+    }
+    child.wait()
 }
 
 /// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
@@ -833,8 +1059,21 @@ pub(crate) fn attach_or_fault(
         // failure so `spawn` takes the attach-error teardown arm. The caller still holds the
         // child, so the verdict is taken before `prepared` drops, as a real attach takes it.
         fault::capture(ProcessId::of(pid));
+        if fault::take_attach_failure_awaits_exit() {
+            // Its own exit, an external event, awaited without reaping — until it is reapable: an
+            // exit watch can fire before the zombie exists.
+            #[cfg(unix)]
+            let _ = crate::child::unreaped::block_until_reapable(pid);
+            #[cfg(windows)]
+            if let crate::identity::Resolved::Found(id) = ProcessId::of(pid) {
+                let _ = crate::wait::block_until_exit(id, None);
+            }
+        }
         let mut prepared = prepared;
-        prepared.settle_verdict(pid);
+        // Discarded: this seam simulates a real attach FAILURE, which retains nothing (mirrors
+        // the attach-error teardown arm's own `None`), not the identity-failure arm this method
+        // also serves.
+        let _ = prepared.settle_verdict(pid);
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
         return Err(Error::Containment {
@@ -844,7 +1083,9 @@ pub(crate) fn attach_or_fault(
     #[cfg(all(test, target_os = "linux"))]
     if let Some(attachment) = fault::take_attachment_override() {
         let mut prepared = prepared;
-        prepared.settle_verdict(pid);
+        // Discarded: `attachment` (the injected override) is what the test wants retained, not
+        // whatever this real leaf's verdict happens to say.
+        let _ = prepared.settle_verdict(pid);
         return Ok(attachment);
     }
     crate::containment::attach(
@@ -853,97 +1094,6 @@ pub(crate) fn attach_or_fault(
         proc_handle,
         prepared,
     )
-}
-
-/// Kill and reap a spawned child that an error path is abandoning before adoption, logging a
-/// failure of either at `warn` and `debug_assert`ing it.
-///
-/// A child that could not be killed is NOT waited for here: it may still be running — a setuid
-/// child such as `sudo` refuses our SIGKILL with EPERM — and a blocking `wait()` would hang the
-/// spawn for as long as it runs. If it has not exited, it is handed to [`reap_in_background`],
-/// which reaps it whenever it does, so it never lingers as a zombie. EPERM is the one kill failure
-/// that is not asserted, because it is reachable without any bug.
-fn teardown_unadopted(mut child: std::process::Child) {
-    // warn before any assert: `debug_assert` is compiled out in release, and a swallowed failure
-    // would otherwise leave no trace at all there.
-    if let Err(kill) = kill_unadopted(&mut child) {
-        log::warn!(
-            "spawn teardown failed to kill pid {}: {kill}; reaping it in the background once it exits",
-            child.id()
-        );
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            reap_in_background(child);
-        }
-        // After the handoff, so a debug build's panic cannot strand the child.
-        debug_assert!(
-            kill.kind() == std::io::ErrorKind::PermissionDenied,
-            "sync spawn teardown failed to kill child: {kill}"
-        );
-        return;
-    }
-    if let Err(reap) = reap_unadopted(&mut child) {
-        log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
-        debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
-    }
-}
-
-/// Reap `child` on a detached thread once it exits on its own. The thread blocks on the child's
-/// exit, an event outside this process's control; nothing waits for the thread.
-fn reap_in_background(mut child: std::process::Child) {
-    #[cfg(test)]
-    let notify = fault::take_background_reap_notifier();
-    let pid = child.id();
-    let spawned = std::thread::Builder::new()
-        .name(format!("cosca-reap-{pid}"))
-        .spawn(move || {
-            let reaped = child.wait().map(drop);
-            if let Err(e) = &reaped {
-                log::warn!("background reap of pid {pid} failed: {e}");
-            }
-            #[cfg(test)]
-            if let Some(notify) = notify {
-                let _ = notify.send(reaped);
-            }
-        });
-    if let Err(e) = spawned {
-        log::warn!("could not start a thread to reap pid {pid}, which stays unreaped: {e}");
-    }
-}
-
-/// `child.kill()`, `Ok` for a child that has already exited on every platform, and forceable to
-/// fail by a test.
-///
-/// std returns `Ok` for an exited child on Windows (`TerminateProcess`'s `ACCESS_DENIED` is
-/// checked with `try_wait`) and, on Unix, for one it has already waited on. An exited child it has
-/// NOT waited on is left to `kill(2)`, whose answer for a zombie std does not promise — so an
-/// `Err` here is checked the same way Windows' is, and dropped if the child has exited.
-///
-/// The forced failure KILLS AND REAPS first, so the test that asks for it leaks nothing although
-/// the teardown then skips its own reap — unless it was set to leave the child alive.
-fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
-    #[cfg(test)]
-    if let Some((marker, kind, alive)) = fault::take_force_kill_failure() {
-        if !alive {
-            child.kill()?;
-            child.wait()?;
-        }
-        return Err(std::io::Error::new(kind, marker));
-    }
-    match child.kill() {
-        Err(_) if matches!(child.try_wait(), Ok(Some(_))) => Ok(()),
-        other => other,
-    }
-}
-
-/// `child.wait()`, which a test can force to fail. The forced failure still REAPS first, so the
-/// test that asks for it leaks nothing.
-fn reap_unadopted(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
-    #[cfg(test)]
-    if let Some(marker) = fault::take_force_reap_failure() {
-        child.wait()?;
-        return Err(std::io::Error::other(marker));
-    }
-    child.wait()
 }
 
 /// Test-only fault injection + assertions for the spawn error-teardown paths, shared by both spawns.
@@ -956,9 +1106,9 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
+        static ATTACH_FAILURE_AWAITS_EXIT: Cell<bool> = const { Cell::new(false) };
         static FORCE_REAP_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
-        static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
-        static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
+        static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind)>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
@@ -971,6 +1121,21 @@ pub(crate) mod fault {
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
+        static FORCE_TEARDOWN_TRY_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static FORCE_TEARDOWN_WAIT_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(unix)]
+        static FORCE_BLOCK_UNTIL_REAPABLE_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(unix)]
+        static BEFORE_BLOCK_UNTIL_REAPABLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+            const { std::cell::RefCell::new(None) };
+        #[cfg(unix)]
+        static FORCE_TEARDOWN_TRY_WAIT_ECHILD: Cell<bool> = const { Cell::new(false) };
+        #[cfg(all(unix, feature = "tokio"))]
+        static FORCE_TOKIO_WAIT_BLOCKING_MISS: Cell<bool> = const { Cell::new(false) };
+        #[cfg(windows)]
+        static FORCE_SUSPENDED_TERMINATE_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
+        #[cfg(windows)]
+        static FORCE_SUSPENDED_TERMINATE_UNDERWAY: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Fail the NEXT tokio spawn after its fork succeeded, the way tokio's own `build_child` can
@@ -1028,6 +1193,123 @@ pub(crate) mod fault {
         ))))
     }
 
+    /// Make the next ownership check (`Held::check`) on this thread fail with `marker`, as a
+    /// `try_wait` failing would. This is an `Other`-kind error, so on Unix it does NOT release the
+    /// child — only a genuine `ECHILD` does (see [`set_force_teardown_try_wait_echild`]) — the
+    /// child stays held, same as on Windows.
+    pub(crate) fn set_force_teardown_try_wait_error(marker: &'static str) {
+        FORCE_TEARDOWN_TRY_WAIT_ERROR.with(|f| f.set(Some(marker)));
+    }
+    pub(crate) fn take_force_teardown_try_wait_error() -> Option<&'static str> {
+        FORCE_TEARDOWN_TRY_WAIT_ERROR.with(|f| f.take())
+    }
+
+    /// Make the next ownership check (`Held::check`) on this thread fail with a genuine `ECHILD`,
+    /// as a `try_wait` on a child something else already reaped would. Unlike
+    /// [`set_force_teardown_try_wait_error`], whose `Other`-kind error cannot carry a raw OS error
+    /// code, this constructs a real `ECHILD`, so `Held::check`'s ownership classification — and
+    /// only that classification — releases the child.
+    #[cfg(unix)]
+    pub(crate) fn set_force_teardown_try_wait_echild() {
+        FORCE_TEARDOWN_TRY_WAIT_ECHILD.with(|f| f.set(true));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_force_teardown_try_wait_echild() -> bool {
+        FORCE_TEARDOWN_TRY_WAIT_ECHILD.with(|f| f.take())
+    }
+
+    /// Make the next blocking reap (`Held::wait`, the sync and async `Unreaped::wait`/`Drop`'s
+    /// shared call) on this thread fail with `marker`, without actually waiting on the child: it
+    /// stays running, unreaped, for the test to clean up. An `Other`-kind error, so on Unix it
+    /// does NOT release the child — only a genuine `ECHILD` does.
+    ///
+    /// Only called from Linux-gated cgroup-leaf regression tests (the retained-containment
+    /// disarm-on-failed-wait proof needs a real, observable armed/disarmed resource, which only a
+    /// cgroup leaf's occupancy check gives without a live Windows job object to query): unused, so
+    /// dead on a non-Linux test build. The seam it drives — `Held::wait`'s top-of-function check —
+    /// is itself platform-agnostic code with no `cfg`, so what it proves (a failed wait is
+    /// returned, not special-cased, and disarms `Retained` before it does) holds identically on
+    /// every platform the call site compiles for.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn set_force_teardown_wait_error(marker: &'static str) {
+        FORCE_TEARDOWN_WAIT_ERROR.with(|f| f.set(Some(marker)));
+    }
+    pub(crate) fn take_force_teardown_wait_error() -> Option<&'static str> {
+        FORCE_TEARDOWN_WAIT_ERROR.with(|f| f.take())
+    }
+
+    /// Make the next confirmatory `block_until_reapable` on this thread fail with `marker`,
+    /// without actually waiting: the child stays running, unreaped, for the test to clean up.
+    /// Unlike a real failure (in practice always `ECHILD`, from something else already having
+    /// reaped and possibly recycled the pid), this forces the failure deterministically, so a
+    /// test can drive `sweep_recyclable_pgid_before_reap`'s failure branch against a real, still
+    /// LIVE child without relying on an actual pid/pgid recycle race — which cannot be staged
+    /// safely or deterministically at all (see the module doc's `PGID-reuse caveat` in
+    /// `containment/unix.rs`). A test that also wants a genuine `ECHILD` textually should still
+    /// prefer a real reaped-elsewhere child; this seam is for proving the SKIP behavior itself,
+    /// against a child whose liveness after the call is the very thing being asserted.
+    #[cfg(unix)]
+    pub(crate) fn set_force_block_until_reapable_error(marker: &'static str) {
+        FORCE_BLOCK_UNTIL_REAPABLE_ERROR.with(|f| f.set(Some(marker)));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_force_block_until_reapable_error() -> Option<&'static str> {
+        FORCE_BLOCK_UNTIL_REAPABLE_ERROR.with(|f| f.take())
+    }
+
+    /// Run `hook`, once, right as the NEXT `block_until_reapable` on this thread is entered — its
+    /// forced-error check has already been consulted and found empty, and its own `waitid` has
+    /// not run yet. Round-4 test-quality finding: a test that must close a child's stdin so it
+    /// becomes reapable EXACTLY as `block_until_reapable` is about to wait for it — not merely
+    /// before calling `wait()`, which leaves the window between that and this call unaccounted
+    /// for, so a test asserting the sweep saw a zombie is really asserting on the OS scheduler
+    /// instead of this crate's own ordering — gets a deterministic edge to do it from instead.
+    /// Its one caller today is macOS-only (the `FdMarker` sweep-timing regression test), so this
+    /// is dead code on every other Unix target.
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn set_before_block_until_reapable_hook(hook: impl FnOnce() + Send + 'static) {
+        BEFORE_BLOCK_UNTIL_REAPABLE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    #[cfg(unix)]
+    pub(crate) fn take_before_block_until_reapable_hook() -> Option<Box<dyn FnOnce() + Send>> {
+        BEFORE_BLOCK_UNTIL_REAPABLE_HOOK.with(|h| h.borrow_mut().take())
+    }
+
+    /// Make the next blocking tokio wait (`tokio_wait_blocking`) on this thread find the child
+    /// confirmed reapable, then find its own `try_wait` reporting no exit waiting for it — as
+    /// tokio 1.53 can, though this is never a genuine foreign reap (see
+    /// `releases_ownership`'s doc): a real one reports `ECHILD`, not `Ok(None)`.
+    #[cfg(all(unix, feature = "tokio"))]
+    pub(crate) fn set_force_tokio_wait_blocking_miss() {
+        FORCE_TOKIO_WAIT_BLOCKING_MISS.with(|f| f.set(true));
+    }
+    #[cfg(all(unix, feature = "tokio"))]
+    pub(crate) fn take_force_tokio_wait_blocking_miss() -> bool {
+        FORCE_TOKIO_WAIT_BLOCKING_MISS.with(|f| f.take())
+    }
+
+    /// Make the teardown's next retried termination of a suspended child on this thread fail with
+    /// `marker`, without terminating it: the test that asks for it must terminate the child.
+    #[cfg(windows)]
+    pub(crate) fn set_force_suspended_terminate_failure(marker: &'static str) {
+        FORCE_SUSPENDED_TERMINATE_FAIL.with(|f| f.set(Some(marker)));
+    }
+    #[cfg(windows)]
+    pub(crate) fn take_force_suspended_terminate_failure() -> Option<&'static str> {
+        FORCE_SUSPENDED_TERMINATE_FAIL.with(|f| f.take())
+    }
+    /// Make the teardown's next retried termination of a suspended child on this thread report
+    /// `ERROR_ACCESS_DENIED`'s reading — an exit already underway — after terminating it for real.
+    #[cfg(windows)]
+    pub(crate) fn set_force_suspended_terminate_exit_underway() {
+        FORCE_SUSPENDED_TERMINATE_UNDERWAY.with(|f| f.set(true));
+    }
+    #[cfg(windows)]
+    pub(crate) fn take_force_suspended_terminate_exit_underway() -> bool {
+        FORCE_SUSPENDED_TERMINATE_UNDERWAY.with(|f| f.replace(false))
+    }
+
     pub(crate) fn set_force_identity_vanished(on: bool) {
         FORCE_VANISH.with(|f| f.set(on));
     }
@@ -1049,6 +1331,14 @@ pub(crate) mod fault {
         ATTACHMENT_OVERRIDE.with(|f| f.borrow_mut().take())
     }
 
+    /// Have the next forced attach failure on this thread wait, without reaping, for the child to
+    /// exit first: the teardown then meets a child already exited.
+    pub(crate) fn set_attach_failure_awaits_exit() {
+        ATTACH_FAILURE_AWAITS_EXIT.with(|f| f.set(true));
+    }
+    pub(crate) fn take_attach_failure_awaits_exit() -> bool {
+        ATTACH_FAILURE_AWAITS_EXIT.with(|f| f.replace(false))
+    }
     pub(crate) fn force_attach_failure() -> bool {
         FORCE_ATTACH_FAIL.with(|f| f.get())
     }
@@ -1061,29 +1351,18 @@ pub(crate) mod fault {
     pub(crate) fn take_force_reap_failure() -> Option<&'static str> {
         FORCE_REAP_FAIL.with(|f| f.take())
     }
-    /// Make the next teardown kill on this thread fail with an error of `kind` carrying `marker`,
-    /// with the same TAKE semantics as [`set_force_reap_failure`].
-    pub(crate) fn set_force_kill_failure(marker: &'static str, kind: std::io::ErrorKind) {
-        FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, false))));
-    }
-    /// As [`set_force_kill_failure`] with an `Other` error, but the child is NOT killed first: it
-    /// is left running, as a child that refused the kill would be.
+    /// Make the next teardown kill on this thread fail with an `Other` error carrying `marker`,
+    /// instead of killing: the child is left running, as a child that refused the kill would be.
+    /// TAKE semantics, as [`set_force_reap_failure`]'s.
     pub(crate) fn set_force_kill_failure_leaving_child_alive(marker: &'static str) {
         set_force_kill_failure_leaving_child_alive_as(marker, std::io::ErrorKind::Other);
     }
     /// As [`set_force_kill_failure_leaving_child_alive`], failing with `kind`. Also consumed by the
     /// async spawn's teardown (`crate::tokio::child::reap_now`).
     pub(crate) fn set_force_kill_failure_leaving_child_alive_as(marker: &'static str, kind: std::io::ErrorKind) {
-        FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, true))));
+        FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind))));
     }
-    /// Have the next background reap started on this thread report its outcome on `notify`.
-    pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<std::io::Result<()>>) {
-        BACKGROUND_REAP_NOTIFY.with(|f| f.set(Some(notify)));
-    }
-    pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<std::io::Result<()>>> {
-        BACKGROUND_REAP_NOTIFY.with(|f| f.take())
-    }
-    pub(crate) fn take_force_kill_failure() -> Option<(&'static str, std::io::ErrorKind, bool)> {
+    pub(crate) fn take_force_kill_failure() -> Option<(&'static str, std::io::ErrorKind)> {
         FORCE_KILL_FAIL.with(|f| f.take())
     }
     pub(crate) fn capture(id: crate::identity::Resolved<ProcessId>) {

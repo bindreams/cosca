@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use crate::error::Error;
 use crate::identity::{ProcessId, RawPid};
 use crate::process::Recursive;
 
@@ -80,40 +79,42 @@ impl Process {
     /// Needs a runtime with the IO driver enabled on Unix (the `#[tokio::main]` /
     /// `#[tokio::test]` defaults) — missing it, tokio panics rather than returning a typed
     /// error. On Windows the watch runs on the blocking pool (one thread per in-flight wait).
-    pub async fn wait(&self) -> Result<(), Error> {
-        crate::tokio::wait::wait_exit(self.inner.id()).await
+    pub async fn wait(&self) -> Result<(), crate::tokio::Error> {
+        crate::tokio::wait::wait_exit(self.inner.id()).await.map_err(Into::into)
     }
 
     /// Wait up to `timeout` for the process to exit. `Ok(true)` = exited; `Ok(false)` =
     /// still alive at expiry. `Duration::ZERO` polls once. Non-reaping; cancellation and
     /// runtime requirements as on [`wait`](Process::wait) (Unix additionally needs the time
     /// driver).
-    pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
-        crate::tokio::wait::grace_wait(self.inner.id(), timeout).await
+    pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool, crate::tokio::Error> {
+        crate::tokio::wait::grace_wait(self.inner.id(), timeout)
+            .await
+            .map_err(Into::into)
     }
 
     /// Hard-kill the process by identity (see [`Process::kill`](crate::Process::kill) for
     /// the per-OS race-freedom contract).
-    pub fn kill(&self) -> Result<(), Error> {
-        self.inner.kill()
+    pub fn kill(&self) -> Result<(), crate::tokio::Error> {
+        self.inner.kill().map_err(Into::into)
     }
 
     /// Send `SIGTERM` (signal-only, identity-bound). Unix only; Windows returns
     /// `Unsupported`.
-    pub fn terminate(&self) -> Result<(), Error> {
-        self.inner.terminate()
+    pub fn terminate(&self) -> Result<(), crate::tokio::Error> {
+        self.inner.terminate().map_err(Into::into)
     }
 
     /// Best-effort hard identity-walk sweep of the tree (all platforms; the `TreeWalk`
     /// contract — see [`Process::kill_tree`](crate::Process::kill_tree)).
-    pub fn kill_tree(&self) -> Result<(), Error> {
-        self.inner.kill_tree()
+    pub fn kill_tree(&self) -> Result<(), crate::tokio::Error> {
+        self.inner.kill_tree().map_err(Into::into)
     }
 
     /// Best-effort graceful (`SIGTERM`) identity-walk sweep. Unix only; Windows returns
     /// `Unsupported` (see [`Process::terminate_tree`](crate::Process::terminate_tree)).
-    pub fn terminate_tree(&self) -> Result<(), Error> {
-        self.inner.terminate_tree()
+    pub fn terminate_tree(&self) -> Result<(), crate::tokio::Error> {
+        self.inner.terminate_tree().map_err(Into::into)
     }
 }
 

@@ -2,7 +2,7 @@ use crate::error::{Error, QuoteError, QuoteErrorKind};
 
 #[test]
 fn containment_error_displays_detail() {
-    let e = Error::Containment {
+    let e: crate::error::Error = Error::Containment {
         detail: "cgroup leaf not writable".into(),
     };
     assert!(e.to_string().contains("cgroup leaf not writable"), "{e}");
@@ -10,7 +10,7 @@ fn containment_error_displays_detail() {
 
 #[test]
 fn no_console_error_names_the_cause() {
-    let e = Error::NoConsole {
+    let e: crate::error::Error = Error::NoConsole {
         detail: "CTRL_BREAK to group 1234".into(),
     };
     let s = e.to_string();
@@ -61,7 +61,7 @@ fn error_wraps_quote_error_via_from() {
 
 #[test]
 fn unsupported_displays_op_platform_and_detail() {
-    let e = Error::Unsupported {
+    let e: crate::error::Error = Error::Unsupported {
         op: "fd 3".into(),
         platform: "windows",
         detail: "arbitrary fds require the raw backend".into(),
@@ -75,7 +75,7 @@ fn unsupported_displays_op_platform_and_detail() {
 #[test]
 fn elevation_error_displays_kind_and_detail() {
     use crate::error::ElevationErrorKind;
-    let e = Error::Elevation {
+    let e: crate::error::Error = Error::Elevation {
         kind: ElevationErrorKind::NoTty,
         detail: "interactive auth requested with no controlling terminal".into(),
     };
@@ -145,7 +145,7 @@ fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
 
 #[test]
 fn unassessable_reads_as_a_refusal_not_a_failure() {
-    let e = crate::error::Error::Unassessable {
+    let e: crate::error::Error = crate::error::Error::Unassessable {
         detail: "pid 4 could not be opened".into(),
         source: Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
     };
@@ -161,7 +161,7 @@ fn unassessable_reads_as_a_refusal_not_a_failure() {
 
 #[test]
 fn unassessable_carries_no_source_when_there_is_no_os_error() {
-    let e = crate::error::Error::Unassessable {
+    let e: crate::error::Error = crate::error::Error::Unassessable {
         detail: "identity could not be confirmed".into(),
         source: None,
     };
@@ -181,4 +181,52 @@ fn io_context_keeps_the_os_error_as_its_source() {
         .and_then(|s| s.downcast_ref::<std::io::Error>())
         .expect("the OS error is the source");
     assert_eq!(source.raw_os_error(), Some(code));
+}
+
+/// The handed-back-child variants keep why the spawn failed out of their own `Display`: it is their
+/// `source`, and a report printing the chain would print it twice.
+#[test]
+fn unreaped_does_not_repeat_its_source_in_its_display() {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) { &["/C", "exit 0"][..] } else { &[][..] })
+            .spawn()
+            .expect("spawn a child")
+    };
+    let e: crate::error::Error = crate::error::Error::Unreaped {
+        error: Box::new(crate::error::Error::Io(std::io::Error::other("cosca-spawn-cause-6d2e"))),
+        kill: std::io::Error::other("cosca-kill-cause-1b9f"),
+        child: crate::Unreaped::new(crate::child::unreaped::Held::Std(child)),
+    };
+    let display = e.to_string();
+    assert!(
+        !display.contains("cosca-spawn-cause-6d2e"),
+        "the source is not in Display: {display}"
+    );
+    assert!(
+        display.contains("cosca-kill-cause-1b9f"),
+        "the kill's error is: {display}"
+    );
+    let source = std::error::Error::source(&e).expect("the spawn's error is the source");
+    assert!(source.to_string().contains("cosca-spawn-cause-6d2e"));
+}
+
+/// The error's shape, checked by the compiler: `Error` defaults its handed-back child to
+/// `cosca::Unreaped`, the sync spawn returns it, the async spawn returns `cosca::tokio::Error` —
+/// the same enum with `cosca::tokio::Unreaped` — and both are `Send + Sync + 'static`, as an error
+/// type a caller boxes must be.
+#[test]
+fn error_is_generic_over_the_handed_back_child() {
+    fn send_sync_static<T: Send + Sync + 'static>() {}
+    send_sync_static::<crate::error::Error>();
+    let _: fn(&mut crate::Command) -> Result<crate::Child, crate::error::Error<crate::Unreaped>> =
+        crate::Command::spawn;
+    #[cfg(feature = "tokio")]
+    {
+        send_sync_static::<crate::tokio::Error>();
+        let _: fn(
+            &mut crate::tokio::Command,
+        ) -> Result<crate::tokio::Child, crate::error::Error<crate::tokio::Unreaped>> = crate::tokio::Command::spawn;
+    }
 }

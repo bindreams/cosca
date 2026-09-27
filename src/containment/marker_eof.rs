@@ -110,20 +110,17 @@ fn drain_pending(read_end: BorrowedFd<'_>, mut n: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Create a kqueue with `EVFILT_READ` armed on the marker read end, `NOTE_LOWAT`-gated (see
-/// the module doc for what this does and does not guarantee) so ordinary writes never wake
-/// it — only `EV_EOF` does.
-///
-/// One kqueue PER WAITER, deliberately: a knote is keyed on `(kqueue, fd, filter)`, so private
-/// kqueues compose (two waiters both see the edge) where two registrations of the same
-/// descriptor on one shared queue would take each other's place.
+/// Arm `EVFILT_READ` on the marker read end on an EXISTING kqueue, `NOTE_LOWAT`-gated (see the
+/// module doc for what this does and does not guarantee) so ordinary writes never wake it —
+/// only `EV_EOF` does. The one definition shared by `arm` (a private, per-waiter kqueue) and
+/// `block_until_drained`'s cancellable path (a caller-supplied kqueue that also carries a
+/// `wait::backend::Cancel`'s `EVFILT_USER` filter).
 ///
 /// `unbounded_wait` says whether the caller intends to wait with no deadline — see
 /// `refuse_if_write_end_held` for why that matters.
-pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kqueue, Error> {
+fn arm_on(kq: &Kqueue, read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<(), Error> {
     ensure_nonblocking(read_end)?;
     refuse_if_write_end_held(read_end, unbounded_wait)?;
-    let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
     let change = KEvent::new(
         read_end.as_raw_fd() as usize,
         EventFilter::EVFILT_READ,
@@ -132,10 +129,23 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
         LOW_WATER_MARK,
         0,
     );
-    let add_result = crate::wait::backend::add_with_receipt(&kq, change)?;
+    let add_result = crate::wait::backend::add_with_receipt(kq, change)?;
     if add_result != 0 {
         return Err(Error::Io(std::io::Error::from_raw_os_error(add_result as i32)));
     }
+    Ok(())
+}
+
+/// Create a fresh, private kqueue with `EVFILT_READ` armed on the marker read end.
+///
+/// One kqueue PER WAITER, deliberately: a knote is keyed on `(kqueue, fd, filter)`, so private
+/// kqueues compose (two waiters both see the edge) where two registrations of the same
+/// descriptor on one shared queue would take each other's place. `block_until_drained`'s
+/// cancellable path deliberately does NOT go through this: it shares its cancel's own kqueue
+/// instead, since a cancel's usefulness depends on the real filter living alongside it.
+pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kqueue, Error> {
+    let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
+    arm_on(&kq, read_end, unbounded_wait)?;
     Ok(kq)
 }
 
@@ -267,15 +277,36 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// clamp on a sustained writer — see the module doc for why, and `interpret_read_event` for
 /// where that decision is made. A bounded wait (`Some(Some(_))`, including one already past)
 /// keeps draining as before.
+///
+/// `cancel`, when given, is armed on the SAME kqueue the `EVFILT_READ` filter uses — the shared
+/// kqueue a `wait::backend::Cancel` already owns (`Cancel` cannot wrap an externally-created
+/// kqueue, so this primitive arms onto the cancel's own instead of creating a private one) —
+/// rather than a private, per-waiter one. A cancellation reports `MembersRemain` (the tree's
+/// drain state is simply unknown at that point, same as a timeout), never an error, mirroring
+/// `JobHandle::wait_drained`'s own `cancel` parameter on Windows exactly.
 pub(crate) fn block_until_drained(
     read_end: BorrowedFd<'_>,
     deadline: Option<Option<Instant>>,
+    cancel: Option<&crate::wait::backend::Cancel>,
 ) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
-    let kq = arm(read_end, unbounded_wait)?;
-    crate::wait::backend::block_on_kqueue(&kq, deadline, TreeDrain::MembersRemain, |event| {
-        interpret_read_event(event, read_end, unbounded_wait)
-    })
+    match cancel {
+        None => {
+            let kq = arm(read_end, unbounded_wait)?;
+            crate::wait::backend::block_on_kqueue(&kq, deadline, TreeDrain::MembersRemain, |event| {
+                interpret_read_event(event, read_end, unbounded_wait)
+            })
+        }
+        Some(cancel) => {
+            arm_on(cancel.kqueue(), read_end, unbounded_wait)?;
+            crate::wait::backend::block_on_kqueue(cancel.kqueue(), deadline, TreeDrain::MembersRemain, |event| {
+                if crate::wait::backend::Cancel::is_signal(event) {
+                    return Ok(Some(TreeDrain::MembersRemain));
+                }
+                interpret_read_event(event, read_end, unbounded_wait)
+            })
+        }
+    }
 }
 
 // Detecting a supervisor-retained write-end copy =====

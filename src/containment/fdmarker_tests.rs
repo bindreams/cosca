@@ -1027,6 +1027,10 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
         "a Denied re-check on a supposedly-known holder must report incomplete (true), not \
          silently succeed"
     );
+    // `cmd` above is never spawned, so the write end this marker installed never left this
+    // process — a real kill-through sweep on drop would find this fixture itself as a
+    // "holder". Disarm: this test is only about `kill_holder`'s own logic, not teardown.
+    marker.disarm();
 }
 
 /// `Marker::sweep`'s top-level `incomplete`/`Err` return, end to end through the REAL public
@@ -1052,4 +1056,76 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
         result.is_err(),
         "a sweep whose only pass was blind must report Err, not silently converge as Ok(())"
     );
+    // `cmd` above is never spawned, so the write end this marker installed never left this
+    // process — a second, un-blinded kill-through sweep on drop would find this fixture itself
+    // as a "holder". Disarm: this test is only about the blind-pass Err path, not teardown.
+    marker.disarm();
+}
+
+/// Regression test for the flake in `dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once`
+/// (sync and tokio): that test reads `fault::HARD_KILL_CALLS` only AFTER its own marker (and the
+/// read end that was the only thing standing between its real OS pipe `handle` and reissue) has
+/// already been dropped, so `handle` itself was never safe to key that map on — a concurrent,
+/// unrelated test's brand-new marker can receive that exact `handle` value before the read runs.
+/// Measured 2026-09-27 at #165@aa922c72: `--test-threads=16` over a marker-heavy subset hit
+/// `left: 3` against an expected `1`, entirely from unrelated concurrent markers (a
+/// `--test-threads=1`, no-other-tests rerun of the SAME test showed 0 failures across 2000
+/// iterations — the disarm fix itself has no race).
+///
+/// `hard_kill_test_key` fixes this by never being a real, kernel-recycled identity in the first
+/// place: it is this process's own counter, assigned once per `Marker` and never reused for the
+/// process's whole life, so no two markers — however their real fds/handles overlap in time —
+/// can ever collide on it. This test proves that guarantee end to end, on two REAL markers alive
+/// at the same time: each `hard_kill()` call must be recorded under that marker's OWN
+/// `hard_kill_test_key()`, not under any other value — in particular not under `Marker::handle`,
+/// the very field `HARD_KILL_CALLS`'s doc explains this replaced. A mutant that reverts
+/// `hard_kill`'s bookkeeping call site back to `fault::record_hard_kill_call(self.handle)` fails
+/// this test: `hard_kill_test_key()` is a small, sequential, process-local counter starting at 1
+/// (`next_hard_kill_test_key`) — fresh in THIS process regardless of what ran before it: under
+/// nextest's default per-test process isolation, no earlier test's markers share this process at
+/// all, so there is no accumulated count to be "already past". `handle` is the field's own doc's
+/// `VM_KERNEL_ADDRHASH` — a kernel-assigned hash of the real pipe object, not small and not
+/// fd-derived — so it lands nowhere near either marker's small counter value either way, and
+/// recording under it never lands on either marker's own key: `take_hard_kill_calls` on that key
+/// reads back 0, not 1.
+#[test]
+fn two_live_markers_record_hard_kill_under_their_own_test_key() {
+    let _serialize = test_spawn_lock();
+    let mut cmd_a = std::process::Command::new("/usr/bin/true");
+    let prepared_a = super::install(&mut cmd_a, &[]).expect("install");
+    let marker_a = super::Marker::new(prepared_a, None, None, false);
+
+    let mut cmd_b = std::process::Command::new("/usr/bin/true");
+    let prepared_b = super::install(&mut cmd_b, &[]).expect("install");
+    let marker_b = super::Marker::new(prepared_b, None, None, false);
+
+    assert_ne!(
+        marker_a.hard_kill_test_key(),
+        marker_b.hard_kill_test_key(),
+        "two markers alive at the same time must never share a test key"
+    );
+
+    // Blind passes (root: None, pgid: None keeps every channel inert — see
+    // `hard_kill_reports_err_on_a_genuinely_blind_pass`'s own doc), so this exercises only
+    // `hard_kill`'s own accounting, not any real process's teardown.
+    crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+    let _ = marker_a.hard_kill();
+    crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+    let _ = marker_b.hard_kill();
+
+    assert_eq!(
+        super::fault::take_hard_kill_calls(marker_a.hard_kill_test_key()),
+        1,
+        "marker_a's hard_kill must be recorded under marker_a's own hard_kill_test_key"
+    );
+    assert_eq!(
+        super::fault::take_hard_kill_calls(marker_b.hard_kill_test_key()),
+        1,
+        "marker_b's hard_kill must be recorded under marker_b's own hard_kill_test_key"
+    );
+
+    // This test is only about `hard_kill`'s call-accounting, not teardown: disarm both so their
+    // own `Drop` does not attempt a second, real kill-through sweep.
+    marker_a.disarm();
+    marker_b.disarm();
 }

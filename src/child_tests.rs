@@ -76,8 +76,11 @@ fn recycled_root_pid_a_different_live_identity_is_recycled() {
 /// Regression test: the group-signal step's ordinary refusal outcomes (`Error::Containment` /
 /// `Error::Unassessable { source: None, .. }`, distinguished from a genuine teardown-mechanism
 /// failure since #61) were being stringified into an opaque `Error::Io` on the way out of
-/// `Marker::sweep`, which made `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
-/// ...)` fire on an entirely ordinary outcome — reintroducing the bug #61 fixed.
+/// `Marker::sweep`, which made `Child::drop` misclassify an entirely ordinary outcome as a
+/// mechanism failure — reintroducing the bug #61 fixed. (Round-4 downgraded that classification's
+/// only consequence from a `debug_assert!` to a log-severity choice — `error` vs `warn` — so a
+/// misclassification here is now a wrong log level, not a panic; still worth catching, since the
+/// severity is the one thing a consumer's `Log` impl can act on.)
 ///
 /// `fdmarker_tests.rs` calls `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
 /// `dispatch.rs`'s `Attached::FdMarker` arm where the laundering sat, so none of those tests
@@ -116,8 +119,52 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
          failure — got {err:?}"
     );
 
-    // The forced pgid persists into `Drop` (`kill_on_drop` defaults to true) — this is the
-    // literal reported bug: `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
-    // ...)` must not fire here. If the laundering regresses, this line panics.
+    // The forced pgid persists into `Drop` (`kill_on_drop` defaults to true), which classifies
+    // the identical refusal again on its own path — exercised here for coverage, though a
+    // misclassification no longer panics (round-4): it would only log this at the wrong level.
     drop(child);
+}
+
+/// Regression test: `Child::drop` (`kill_on_drop` true, the default) sweeps the contained tree
+/// itself via its own explicit `self.attached.hard_kill()` call, then reaps the root
+/// (`teardown_on_drop`). Once that has happened, `self.attached` (an `Attached::FdMarker` on
+/// macOS) falls out of scope and runs `Drop for Marker`, which — before this fix — was still
+/// armed and fired `hard_kill` a SECOND time, unconditionally re-sending `sweep_pass`'s pass-1
+/// group signal (`killpg` on the marker's `pgid`) over a process group `Child::drop`'s own sweep
+/// already tore down.
+///
+/// That second, unconditional `killpg` is not harmless: `sweep_pass`'s pass-1 fire has no
+/// liveness gate (see its own doc — only a LATER pass's re-fire is gated on a freshly confirmed
+/// live member), so it reaches whatever the OS may since have recycled that pgid number onto,
+/// entirely unrelated to this `Child`'s own tree. This test does not need to engineer an actual
+/// recycled pgid (a race against the kernel's own allocator, not something to synchronize on) —
+/// counting `Marker::hard_kill` invocations across one `Child::drop` proves the hazard directly:
+/// every invocation's OWN first pass fires the group signal unconditionally, so two invocations
+/// means two unconditional `killpg` calls, the second one blind to whatever now holds the pgid.
+#[cfg(target_os = "macos")]
+#[test]
+fn dropping_an_armed_fdmarker_child_calls_hard_kill_exactly_once() {
+    let child = crate::Command::new()
+        .executable("/usr/bin/true")
+        .arg("true") // argv[0]; `executable` alone selects the loaded image, not argv
+        .contain_with(crate::ContainMode::Strongest)
+        .spawn()
+        .expect("spawn a contained macOS root");
+    // Keyed on this marker's own dedicated, never-reused hard-kill-count key — NOT its real OS
+    // pipe handle, which this process's own kernel can reissue to an unrelated, concurrently
+    // spawned marker once this one's read end is dropped, before this assertion even runs. See
+    // `fault::HARD_KILL_CALLS`'s own doc for the false failure that caused, measured.
+    let key = child
+        .test_marker_hard_kill_key()
+        .expect("Strongest attaches FdMarker on macOS");
+
+    drop(child); // kill_on_drop defaults to true: this is the armed path under test.
+
+    assert_eq!(
+        crate::containment::fdmarker::fault::take_hard_kill_calls(key),
+        1,
+        "Child::drop's own explicit hard_kill must be the ONLY sweep of this tree; a second \
+         (from an armed Drop for Marker still running after that sweep already tore the tree \
+         down) unconditionally re-fires killpg on a pgid that may since have been recycled"
+    );
 }

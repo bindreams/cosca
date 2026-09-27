@@ -940,3 +940,134 @@ fn a_failed_token_close_is_logged() {
         "a failed token close must be logged"
     );
 }
+
+/// A failed wait for a runas child `untracked` terminated is not discarded: it is logged at `warn`,
+/// which a release build keeps, and asserted in debug builds.
+#[test]
+fn a_failed_wait_for_a_terminated_untracked_child_is_logged() {
+    crate::log_capture::install();
+    let marker = "cosca-runas-reap-fail-8d17";
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in for the runas child")
+    };
+    let pid = child.id();
+    let proc = std::os::windows::io::OwnedHandle::from(child);
+    let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(pid) else {
+        panic!("the stand-in is live, so its identity resolves");
+    };
+    let mark = crate::log_capture::mark();
+    crate::child::spawn::fault::set_force_reap_failure(marker);
+    let outcome = std::panic::catch_unwind(move || super::untracked(proc, pid));
+    assert_eq!(
+        crate::child::spawn::fault::take_force_reap_failure(),
+        None,
+        "the forced failure must be consumed"
+    );
+    assert_eq!(
+        outcome.is_err(),
+        cfg!(debug_assertions),
+        "the debug_assert fires in exactly the builds that keep it"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, marker),
+        "a failed wait must be logged"
+    );
+    crate::child::spawn::fault::assert_child_reaped(crate::identity::Resolved::Found(id));
+}
+
+/// A runas child whose identity cannot be resolved, and whose termination fails, is handed back in
+/// `Error::Unreaped` — its `error` the `Untracked` elevation error — so the caller holds a handle
+/// to wait on rather than none. A plain child stands in for the elevated one; the test ends it,
+/// and the handed-back child reaps it.
+#[test]
+fn an_untracked_runas_child_that_cannot_be_terminated_is_handed_back() {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in for the runas child")
+    };
+    let pid = child.id();
+    let proc = std::os::windows::io::OwnedHandle::from(child);
+    crate::child::spawn::fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-runas-terminate-denied-3f8b",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let err = super::untracked(proc, pid);
+    assert_eq!(
+        crate::child::spawn::fault::take_force_kill_failure(),
+        None,
+        "the forced failure must be consumed"
+    );
+    let crate::error::Error::Unreaped { error, kill, child } = err else {
+        panic!("the untracked child must be handed back, got {err:?}");
+    };
+    assert_eq!(kill.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        matches!(
+            &*error,
+            crate::error::Error::Elevation {
+                kind: crate::error::ElevationErrorKind::Untracked,
+                ..
+            }
+        ),
+        "why the spawn failed, got {error:?}"
+    );
+    assert_eq!(child.pid(), pid);
+    let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(pid) else {
+        panic!("the handed-back child is live, so its identity resolves");
+    };
+    crate::wait::kill(id).expect("end the child");
+    child.wait().expect("wait for the handed-back child");
+    assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
+}
+
+/// `TerminateProcess` answering `ERROR_ACCESS_DENIED` on a runas child this process may not
+/// terminate is a genuine higher-integrity denial, not an exit underway: the child is handed back,
+/// never waited on — a wait would last as long as the elevated child runs. The seam reports that
+/// denial for a live stand-in; a spawn that waited would block until the test ended it.
+#[test]
+fn an_untracked_runas_child_denying_termination_is_handed_back_not_waited_on() {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in for the runas child")
+    };
+    let pid = child.id();
+    let proc = std::os::windows::io::OwnedHandle::from(child);
+    super::fault::set_force_higher_integrity_denial();
+    let err = super::untracked(proc, pid);
+    assert!(
+        !super::fault::take_force_higher_integrity_denial(),
+        "the forced denial must be consumed"
+    );
+    let crate::error::Error::Unreaped { error, kill, child } = err else {
+        panic!("the higher-integrity child must be handed back, got {err:?}");
+    };
+    assert_eq!(kill.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        matches!(
+            &*error,
+            crate::error::Error::Elevation {
+                kind: crate::error::ElevationErrorKind::Untracked,
+                ..
+            }
+        ),
+        "why the spawn failed, got {error:?}"
+    );
+    let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(pid) else {
+        panic!("the handed-back child is live, so its identity resolves");
+    };
+    crate::wait::kill(id).expect("end the child");
+    child.wait().expect("wait for the handed-back child");
+}

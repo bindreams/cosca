@@ -749,6 +749,97 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     );
 }
 
+/// #165 F2 regression: `Child::drop`'s own explicit sweep disarms only the fd-marker mechanism
+/// afterwards (`Attached::disarm_after_own_sweep`), never a cgroup leaf — unlike the blanket
+/// `disarm()` call it replaced, which would have handed a `hard_kill()` attempt that genuinely
+/// FAILED (`kill_attempt_failed=true`, `killed=false`) straight to the disarmed "never killed"
+/// branch below, which never retries a real mechanism failure (see
+/// `a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn`, whose leaf is left behind).
+/// Left armed instead, as `disarm_after_own_sweep` now leaves it, this leaf's own `Drop` must
+/// retry `cgroup.kill` itself and remove the leaf once it drains — exactly as
+/// `an_armed_drop_removes_its_leaf_only_after_it_drains` does for a leaf nothing tried to kill
+/// yet, proving the retry survives a real prior failed attempt too.
+///
+/// Drives a REAL `Child::drop` (`Child::from_parts`, not a hand-called `hard_kill` +
+/// `disarm_after_own_sweep`, as an earlier version of this test did): that version proved only
+/// that `disarm_after_own_sweep` itself is a cgroup no-op, not that `Child::drop` actually calls
+/// it — reverting `child.rs`'s `self.attached.disarm_after_own_sweep()` back to a blanket
+/// `disarm()` left that version GREEN, since it never exercised `Child::drop` at all (round-3's
+/// test-quality finding). `Child::drop`'s own tree-level `hard_kill`, fired unconditionally near
+/// its top, is what this test forces to fail — the earlier version's hand-called one, done
+/// before `Child` even existed, is gone.
+///
+/// Forces a genuine `Error::Io` (EACCES) out of that tree-level `hard_kill` call, on purpose, to
+/// drive the leaf into the state it needs. `Child::drop` used to `debug_assert!` that this could
+/// never happen, which made this test release-only (debug builds asserted the precondition
+/// instead of reaching the code this test is actually about); round-4 removed that assert —
+/// `CgroupLeaf::hard_kill`'s own doc lists EACCES from a privilege drop as a real outcome, not a
+/// broken contract — so this now runs in every build.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_leaf_retries_cgroup_kill_after_its_own_failed_attempt() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-armed-kill-retry-leaf", true);
+    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+
+    // A real, short-lived child `Child::drop` owns outright — mirroring the async twin's own
+    // `a_failed_start_kill_still_routes_an_armed_leafs_release_through_the_reaper_pool` fixture.
+    let proc = shared_child::SharedChild::spawn(
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn a child that exits");
+    let pid = proc.id();
+
+    let attachment = crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(leaf),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    };
+    let child = crate::Child::from_parts(
+        crate::child::proc_handle::ProcHandle::Std(proc),
+        crate::identity::ProcessId::from_parts_for_test(pid, 0),
+        Default::default(),
+        true,
+        attachment,
+    );
+
+    // One-shot: consumed by `Child::drop`'s own tree-level `hard_kill` call below, not by
+    // anything this test calls directly.
+    fault::set_force_kill_write_failure(true);
+    fault::record_leaf_steps();
+    drop(child);
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+    assert!(
+        !fault::take_force_kill_write_failure(),
+        "one-shot: the forced failure must already have been consumed by Child::drop's own \
+         hard_kill call"
+    );
+
+    assert!(
+        !fake.leaf.exists(),
+        "an armed Drop must retry cgroup.kill after its own earlier attempt (Child::drop's own \
+         sweep) failed, and remove the leaf once the retried kill drains, got {steps:?}"
+    );
+    assert_eq!(
+        steps,
+        vec!["rmdir populated 1", "kill", "rmdir populated 0"],
+        "Drop must re-fire cgroup.kill (the forced failure above wrote nothing and left no step) \
+         and retry the rmdir only once that retried kill drains, got {steps:?}"
+    );
+}
+
 /// Disarmed twin of `an_armed_drop_removes_its_leaf_only_after_it_drains`: a
 /// leaf whose caller explicitly killed the tree (`hard_kill`, mirroring `Child::kill_tree()`)
 /// and THEN disarmed `Drop`'s own teardown (`kill_on_drop(false)`) must still have its `Drop`
@@ -2462,6 +2553,40 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
     assert!(reaped(&pidfd), "and reaped");
 }
 
+/// `end_child`'s final reap falls back to waiting by pid when its `waitid(P_PIDFD, ...)` fails with
+/// `EINVAL` — a too-old kernel's answer for a pidfd it could still open (see `bare_wait`'s doc, the
+/// analogous fallback on the `Unreaped` side). Without the fallback this leaves the child unreaped:
+/// this pins that it does not.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_reaped_by_pidfd_falls_back_to_its_pid_on_einval() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-einval-fallback");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], false, std::process::Stdio::null());
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
+    drop(child);
+
+    crate::containment::cgroup::fault::set_force_end_child_wait_einval(true);
+    drop(leaf);
+    assert!(
+        !crate::containment::cgroup::fault::take_force_end_child_wait_einval(),
+        "the forced EINVAL must be consumed by the wait it targets"
+    );
+
+    assert!(
+        crate::containment::cgroup::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
+        "the fallback wait by pid must still record the reap"
+    );
+    assert!(
+        reaped(&pidfd),
+        "and the child must actually be reaped, not left a zombie"
+    );
+}
+
 /// A pidfd for `pid`, this process's own unreaped child, taken while its pid is pinned.
 #[cfg(target_os = "linux")]
 fn pidfd_of(pid: u32) -> std::os::fd::OwnedFd {
@@ -2576,10 +2701,10 @@ fn an_abandoned_intent_without_a_handle_is_never_signalled() {
             .expect("send a forged intent");
     }
 
-    assert_eq!(
+    assert!(matches!(
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::OutOfReach
-    );
+    ));
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
 
     let mut echo = [0u8; 1];
@@ -2615,10 +2740,10 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(false);
 
-    assert_eq!(
+    assert!(matches!(
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::OutOfReach
-    );
+    ));
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
     assert!(
         child.try_wait().expect("try_wait").is_none(),
@@ -2655,10 +2780,10 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     // Reaped as `std` reaps it: before the exchange is abandoned.
     reap(pid);
 
-    assert_eq!(
+    assert!(matches!(
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::Ended
-    );
+    ));
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
     assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
 }
@@ -2673,10 +2798,10 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
-    assert_eq!(
+    assert!(matches!(
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::MaybeUnreaped
-    );
+    ));
     assert!(!leaf_path.exists(), "the empty leaf is removed");
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
 }
@@ -2696,19 +2821,20 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
     drop(child);
     crate::containment::cgroup::fault::set_between_check_and_kill(move || reap(pid));
 
-    assert_eq!(
+    assert!(matches!(
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::Ended
-    );
+    ));
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
     assert_eq!(crate::containment::cgroup::fault::take_reaped_orphans(), Vec::new());
 }
 
-/// An abandoned child cosca may not kill is out of reach, and still never left a zombie: a
-/// background reaper waits for its exit, however that comes — here, the test's own kill.
+/// An abandoned child cosca may not kill is handed back, held by its handle, and never left a
+/// zombie: whoever holds it reaps it on its exit, however that comes — here, the test's own kill.
+/// No thread of cosca's waits for it.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
+fn an_abandoned_child_that_refuses_the_kill_is_handed_back() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-refuses");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -2718,19 +2844,18 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     let pid = child.id();
     let pidfd = pidfd_of(pid);
     drop(child);
-    let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     crate::containment::cgroup::fault::set_force_child_kill_denied(true);
-    crate::containment::cgroup::fault::set_background_reap_notifier(reaped_tx);
 
-    assert_eq!(
-        leaf.abandon_before_verdict(),
-        crate::containment::cgroup::Abandoned::OutOfReach
-    );
+    let crate::containment::cgroup::Abandoned::HandedBack { kill, child } = leaf.abandon_before_verdict() else {
+        panic!("the child that refused the kill must be handed back");
+    };
+    assert_eq!(kill.raw_os_error(), Some(libc::EPERM));
+    assert_eq!(child.pid(), pid, "the handed-back child is the abandoned one");
     assert!(!reaped(&pidfd), "the child refused the kill and is still running");
 
     // Its pid is pinned while it is unreaped.
     rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
-    reaped_rx.recv().expect("the background reaper must reap it");
+    child.wait().expect("wait for the handed-back child");
     assert!(reaped(&pidfd), "the child must be reaped once it exits");
 }
 
@@ -3086,4 +3211,1390 @@ fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
     let a = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     let b = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     assert_ne!(a, b);
+}
+
+/// A failed kill of the process group an abandoned child leads is not silent: it is logged at
+/// `debug`. The child's own kill still ends it, and it is still reaped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_group_kill_of_an_abandoned_child_is_logged() {
+    crate::log_capture::install();
+    let marker = "cosca-group-kill-fail-5e3d";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-group-kill-fails");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // Its placement write fails, so the leaf does not hold it either.
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    let pidfd = pidfd_of(child.id());
+    drop(child);
+    let mark = crate::log_capture::mark();
+    crate::containment::cgroup::fault::set_force_group_kill_failure(marker);
+
+    let _ = leaf.abandon_before_verdict();
+    assert_eq!(
+        crate::containment::cgroup::fault::take_force_group_kill_failure(),
+        None,
+        "the group kill must be attempted"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, marker),
+        vec![log::Level::Debug],
+        "the failed group kill must be logged at debug"
+    );
+    assert!(reaped(&pidfd), "the child's own kill still ends it, and it is reaped");
+}
+
+/// A placed child that refuses its own kill is handed back even when the kill through its leaf
+/// succeeds: that kill reaches only what is still in the leaf, and a child moved out — as
+/// `pam_systemd` moves a `sudo -i` into its session scope — survives it, so a wait for it here
+/// would last as long as it runs. Here the leaf is a directory, not a cgroup, so its kill succeeds
+/// and kills nothing, as for a child that left.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_placed_child_that_refuses_the_kill_is_handed_back_though_its_leaf_was_killed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-moved-out");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], false, std::process::Stdio::null());
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    drop(child);
+    crate::containment::cgroup::fault::set_force_child_kill_denied(true);
+
+    let crate::containment::cgroup::Abandoned::HandedBack { child, .. } = leaf.abandon_before_verdict() else {
+        panic!("the child that refused the kill must be handed back, not waited on");
+    };
+    assert!(!reaped(&pidfd), "the child survived the leaf's kill");
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    child.wait().expect("wait for the handed-back child");
+    assert!(reaped(&pidfd), "the child must be reaped once it exits");
+}
+
+/// A leaf whose child entered it, still occupied, as its `Drop` finds it: the directory holds a
+/// file, so the removal fails and an armed `Drop` goes on to write `cgroup.kill`. Returns the leaf
+/// and the path of that `cgroup.kill`.
+#[cfg(target_os = "linux")]
+fn occupied_entered_leaf(dir: &std::path::Path) -> (crate::containment::cgroup::CgroupLeaf, std::path::PathBuf) {
+    let leaf_path = dir.join("cosca-occupied");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), b"").expect("occupy the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    leaf.report = None;
+    leaf.entered = true;
+    (leaf, leaf_path.join("cgroup.kill"))
+}
+
+/// The control: an armed leaf's `Drop` kills through an occupied leaf it cannot remove.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_armed_leaf_kills_through_itself_on_drop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    drop(leaf);
+    assert_eq!(std::fs::read(&kill).expect("cgroup.kill written"), b"1");
+}
+
+/// `Child::detach` disarms its leaf: the leaf's `Drop` neither kills nor waits, and the leaf is
+/// left for the delegated parent's owner to remove.
+#[cfg(target_os = "linux")]
+#[test]
+fn detach_leaves_a_contained_child_running() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let child = contained_child(child, leaf);
+    child.detach();
+    assert!(!kill.exists(), "a detached child's leaf must not be killed through");
+    drop(stdin);
+}
+
+/// `Unreaped::leak` disarms the leaf it retains the same way: nothing the leaked child leads is
+/// killed.
+#[cfg(target_os = "linux")]
+#[test]
+fn leaking_a_contained_child_leaves_it_running() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    )
+    .leak();
+    assert!(!kill.exists(), "a leaked child's leaf must not be killed through");
+    drop(stdin);
+    reap(pid);
+}
+
+/// `Unreaped::leak` must never re-fire `cgroup.kill`: a leaf whose `killed` flag was already set by
+/// a kill that reached it BEFORE the child was ever handed back (e.g. an elevated teardown's own
+/// `hard_kill` on a root that itself refused to die — see `elevated_write_failed`'s
+/// `Checked::Running` arm) is not the caller's own `kill_tree()`/`hard_kill()`, so `disarm`'s
+/// documented "wait for a kill already in flight" contract does not apply to it. `leak` promises
+/// neither a new kill nor a wait; a bare `disarm` (the regression this test guards against) still
+/// lets `Drop`'s disarmed-but-`killed` branch re-fire `cgroup.kill` and block on its drain.
+#[cfg(target_os = "linux")]
+#[test]
+fn leaking_a_child_whose_leaf_was_already_killed_before_handoff_is_not_rekilled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    )
+    .leak();
+    assert!(
+        !kill.exists(),
+        "leak must not re-fire cgroup.kill over a leaf a kill before hand-back already reached"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// The same regression as `leaking_a_child_whose_leaf_was_already_killed_before_handoff_is_not_rekilled`,
+/// through `Unreaped::wait`'s failed-wait give-up path.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_does_not_rekill_a_leaf_already_killed_before_handoff_even_when_the_wait_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    let err = unreaped.wait().expect_err("the forced failure must fail the wait");
+    assert!(err.to_string().contains("forced wait failure"), "{err}");
+    assert!(
+        !kill.exists(),
+        "a failed wait must give up a pre-killed leaf without re-firing cgroup.kill"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// The same regression as `leaking_a_child_whose_leaf_was_already_killed_before_handoff_is_not_rekilled`,
+/// through `Unreaped::drop`'s failed-wait give-up path.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_does_not_rekill_a_leaf_already_killed_before_handoff_even_when_the_wait_fails() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    let mark = crate::log_capture::mark();
+    drop(unreaped);
+    assert!(
+        crate::log_capture::contains_since(mark, "it stays unreaped"),
+        "a failed wait in Drop must be logged"
+    );
+    assert!(
+        !kill.exists(),
+        "a failed wait in Drop must give up a pre-killed leaf without re-firing cgroup.kill"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// A plain child blocked on stdin, and that stdin.
+#[cfg(target_os = "linux")]
+fn cat_child() -> (std::process::Child, std::process::ChildStdin) {
+    let mut child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat")
+    };
+    let stdin = child.stdin.take().expect("stdin");
+    (child, stdin)
+}
+
+/// `child` as a cosca `Child` contained by `leaf`.
+#[cfg(target_os = "linux")]
+fn contained_child(child: std::process::Child, leaf: crate::containment::cgroup::CgroupLeaf) -> crate::Child {
+    let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
+        panic!("an unreaped child resolves");
+    };
+    crate::Child::from_parts(
+        crate::child::proc_handle::ProcHandle::Std(shared_child::SharedChild::new(child).expect("adopt")),
+        id,
+        Default::default(),
+        true,
+        crate::containment::Attachment {
+            containment: crate::containment::Containment::CgroupV2,
+            attached: crate::containment::Attached::Cgroup(leaf),
+            graceful: crate::graceful::GracefulMechanism::Process,
+        },
+    )
+}
+
+/// A child that could send no pidfd on itself — only its `/proc` directory — and refuses the kill
+/// is still handed back with a pidfd, opened on the pid that directory proved its own, so an async
+/// holder can await it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_handed_back_child_that_sent_no_pidfd_is_given_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-no-pidfd");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // Inherited by the child forked from this thread, which takes it.
+    crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    drop(child);
+    crate::containment::cgroup::fault::set_force_child_kill_denied(true);
+
+    let crate::containment::cgroup::Abandoned::HandedBack { child, .. } = leaf.abandon_before_verdict() else {
+        panic!("the child that refused the kill must be handed back");
+    };
+    // Read before the child is ended, asserted after: a failure then does not leave the
+    // handed-back child's drop waiting out the sleep.
+    let holds_pidfd = child.holds_pidfd();
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    child.wait().expect("wait for the handed-back child");
+    assert!(reaped(&pidfd), "the child must be reaped once it exits");
+    assert!(
+        holds_pidfd,
+        "the handed-back child must hold a pidfd to be awaited through"
+    );
+}
+
+/// A child already exited when its kill is refused is reaped by its one check, not handed back:
+/// only a child that check finds running is. Here it is a zombie before the leaf is abandoned.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_child_already_exited_when_its_kill_is_refused_is_reaped_not_handed_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-zombie-refuses");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let child = spawn_placing(&leaf, &["/bin/true"], true, std::process::Stdio::null());
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    drop(child);
+    crate::child::unreaped::block_until_reapable(pid).expect("wait until it is a zombie");
+    crate::containment::cgroup::fault::set_force_child_kill_denied(true);
+
+    let abandoned = leaf.abandon_before_verdict();
+    assert!(
+        matches!(abandoned, crate::containment::cgroup::Abandoned::Ended),
+        "an exited child must be reaped, not handed back: {abandoned:?}"
+    );
+    assert!(reaped(&pidfd), "its one check reaped it");
+}
+
+/// A leaf dropped with its exchange still open never waits in `Drop` for a child that refused its
+/// kill: every spawn path abandons the exchange itself, and hands such a child back, so reaching
+/// one here breaks that contract. It is asserted in debug builds and leaked with a warning — never
+/// waited for, which could block a runtime worker for as long as the child runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_a_leaf_never_waits_for_a_child_that_refused_its_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-dropped-refuses");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let child = spawn_placing(&leaf, &["/bin/sleep", "300"], true, std::process::Stdio::null());
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    drop(child);
+    crate::containment::cgroup::fault::set_force_child_kill_denied(true);
+
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(leaf)));
+    assert_eq!(
+        dropped.is_err(),
+        cfg!(debug_assertions),
+        "asserted in exactly the builds that keep it"
+    );
+    assert!(!reaped(&pidfd), "the child was left running, not waited for");
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL).expect("kill the child");
+    reap(pid);
+}
+
+/// Leaking a `cosca::tokio::Unreaped` while a cancelled wait's blocking reap holds the child still
+/// disarms the leaf it retains, and says so: nothing the leaked child leads is killed. Dropping the
+/// runtime ends the blocking reap — run, or cancelled before it ran — so what it retained has been
+/// released, disarmed or not, by the time this test looks.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leaking_during_a_blocking_reap_disarms_the_retained_leaf() {
+    crate::log_capture::install();
+    // Before the child's stdin, so a failing assertion drops that first: the runtime's drop waits
+    // for a blocking reap that waits for the child to exit.
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    let mark = crate::log_capture::mark();
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut wait = std::pin::pin!(unreaped.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "the child is still running");
+        }
+        assert!(
+            unreaped.hands_child_to_blocking_task(),
+            "the blocking task owns the child now"
+        );
+        unreaped.leak();
+    });
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("leaking unkillable child {pid}")),
+        "a leak is logged"
+    );
+    drop(stdin);
+    drop(runtime);
+    assert!(!kill.exists(), "a leaked child's leaf must not be killed through");
+    if !reaped(&pidfd) {
+        reap(pid);
+    }
+}
+
+/// Leaking a `cosca::tokio::Unreaped` whose blocking reap has finished, unawaited, disarms the leaf
+/// it retains, and says the child was already reaped.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leaking_after_a_blocking_reap_finished_disarms_the_retained_leaf() {
+    crate::log_capture::install();
+    // Before the child's stdin, so a failing assertion drops that first: the runtime's drop waits
+    // for a blocking reap that waits for the child to exit.
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    let mark = crate::log_capture::mark();
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut wait = std::pin::pin!(unreaped.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "the child is still running");
+        }
+        drop(stdin);
+        unreaped.block_until_blocking_reap_finished();
+        unreaped.leak();
+    });
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("leaking unkillable child {pid}, already reaped")),
+        "the leak says the child was already reaped"
+    );
+    assert!(!kill.exists(), "a leaked child's leaf must not be killed through");
+    assert!(reaped(&pidfd), "its blocking reap reaped it");
+}
+
+/// `Unreaped::wait` disarms the leaf it retains even when the wait itself fails: a bare `drop`
+/// (the regression this test guards against) leaves the leaf armed, so its own `Drop` still fires
+/// `cgroup.kill` the next time something makes the leaf directory unremovable.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_disarms_the_retained_leaf_even_when_the_wait_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    let err = unreaped.wait().expect_err("the forced failure must fail the wait");
+    assert!(err.to_string().contains("forced wait failure"), "{err}");
+    assert!(!kill.exists(), "a failed wait must still disarm the leaf it retains");
+    drop(stdin);
+    reap(pid);
+}
+
+/// `Unreaped::drop` disarms the leaf it retains even when its synchronous wait fails, the same as
+/// `wait` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_disarms_the_retained_leaf_even_when_the_wait_fails() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    let mark = crate::log_capture::mark();
+    drop(unreaped);
+    assert!(
+        crate::log_capture::contains_since(mark, "it stays unreaped"),
+        "a failed wait in Drop must be logged"
+    );
+    assert!(
+        !kill.exists(),
+        "a failed wait in Drop must still disarm the leaf it retains"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// A `cosca::tokio::Unreaped::wait` that releases the child for uncertain ownership still disarms
+/// the leaf it retains, the same as a leaked or successfully reaped one does.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn wait_disarms_the_retained_leaf_when_ownership_becomes_uncertain() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_uncertain();
+        let err = unreaped
+            .wait()
+            .await
+            .expect_err("forced uncertain ownership must fail the wait");
+        assert!(err.to_string().contains("forced uncertain ownership"), "{err}");
+    });
+    assert!(
+        !kill.exists(),
+        "a wait that releases for uncertain ownership must still disarm the leaf it retains"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// A `cosca::tokio::Unreaped` dropped without ever being awaited falls to `Drop`'s own
+/// synchronous wait, which must disarm the leaf it retains even when that wait fails, the same as
+/// the sync `Unreaped`'s `Drop` does.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn drop_disarms_the_retained_leaf_even_when_the_synchronous_wait_fails() {
+    crate::log_capture::install();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let mark = crate::log_capture::mark();
+    runtime.block_on(async {
+        let unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        // Dropped without ever being awaited: `Drop` falls straight to its own synchronous wait.
+        drop(unreaped);
+    });
+    assert!(
+        crate::log_capture::contains_since(mark, "it stays unreaped"),
+        "a failed synchronous wait in Drop must be logged"
+    );
+    assert!(
+        !kill.exists(),
+        "Drop's synchronous wait failure must still disarm the leaf it retains"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// The same regression as the sync `leaking_a_child_whose_leaf_was_already_killed_before_handoff_
+/// is_not_rekilled`, through `cosca::tokio::Unreaped::wait`'s uncertain-ownership `release` path.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn wait_does_not_rekill_a_leaf_already_killed_before_handoff_when_ownership_becomes_uncertain() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_uncertain();
+        let err = unreaped
+            .wait()
+            .await
+            .expect_err("forced uncertain ownership must fail the wait");
+        assert!(err.to_string().contains("forced uncertain ownership"), "{err}");
+    });
+    assert!(
+        !kill.exists(),
+        "a wait that releases for uncertain ownership must not re-fire cgroup.kill over a leaf a \
+         kill before hand-back already reached"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// The same regression, through `cosca::tokio::Unreaped::leak` while a cancelled wait's blocking
+/// reap is still `Running` (already claimed by the blocking-pool task).
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leaking_a_leaf_already_killed_before_handoff_during_a_blocking_reap_does_not_rekill() {
+    crate::log_capture::install();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut wait = std::pin::pin!(unreaped.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "the child is still running");
+        }
+        assert!(
+            unreaped.hands_child_to_blocking_task(),
+            "the blocking task owns the child now"
+        );
+        unreaped.leak();
+    });
+    drop(stdin);
+    drop(runtime);
+    assert!(
+        !kill.exists(),
+        "leak must not re-fire cgroup.kill over a leaf a kill before hand-back already reached"
+    );
+    if !reaped(&pidfd) {
+        reap(pid);
+    }
+}
+
+/// The same regression, through `cosca::tokio::Unreaped::leak` after a cancelled wait's blocking
+/// reap has already finished, unawaited.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leaking_a_leaf_already_killed_before_handoff_after_a_blocking_reap_finished_does_not_rekill() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut wait = std::pin::pin!(unreaped.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "the child is still running");
+        }
+        drop(stdin);
+        unreaped.block_until_blocking_reap_finished();
+        unreaped.leak();
+    });
+    assert!(
+        !kill.exists(),
+        "leak must not re-fire cgroup.kill over a leaf a kill before hand-back already reached"
+    );
+    assert!(reaped(&pidfd), "its blocking reap reaped it");
+}
+
+/// The same regression as the sync `drop_does_not_rekill_a_leaf_already_killed_before_handoff_
+/// even_when_the_wait_fails`, through `cosca::tokio::Unreaped`'s `Drop` fallback (never awaited,
+/// falling straight to its own synchronous wait, which is forced to fail).
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn drop_does_not_rekill_a_leaf_already_killed_before_handoff_even_when_the_synchronous_wait_fails() {
+    crate::log_capture::install();
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    crate::child::spawn::fault::set_force_teardown_wait_error("forced wait failure (test seam)");
+    let mark = crate::log_capture::mark();
+    runtime.block_on(async {
+        let unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        // Dropped without ever being awaited: `Drop` falls straight to its own synchronous wait.
+        drop(unreaped);
+    });
+    assert!(
+        crate::log_capture::contains_since(mark, "it stays unreaped"),
+        "a failed synchronous wait in Drop must be logged"
+    );
+    assert!(
+        !kill.exists(),
+        "Drop's synchronous wait failure must not re-fire cgroup.kill over a leaf a kill before \
+         hand-back already reached"
+    );
+    drop(stdin);
+    reap(pid);
+}
+
+/// `Prepared::settle_verdict` — the tokio identity-failure teardown arm's own verdict-taking,
+/// which runs BEFORE the caller gets an `Unreaped` back — retains a successfully placed leaf as
+/// `Attached::Cgroup`, rather than leaving `Prepared` to drop it: a bare drop there would
+/// `cgroup.kill` and drain-wait the tree before the caller's error even returns, exactly the
+/// premature teardown `teardown_unadopted`'s own `attached` parameter (sync's twin) exists to
+/// avoid.
+#[cfg(target_os = "linux")]
+#[test]
+fn settle_verdict_retains_a_placed_leaf_as_attached_cgroup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-settle-verdict-retains");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    // SAFETY: the slot's channel lives as long as `leaf`.
+    unsafe { leaf.placement_slot().report_placed_for_test() };
+
+    let mut prepared = crate::containment::Prepared {
+        mode: Some(crate::containment::ContainMode::Strongest),
+        is_root: true,
+        cgroup_leaf: Some(leaf),
+        #[cfg(target_os = "macos")]
+        marker: None,
+        #[cfg(windows)]
+        graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
+    };
+    // This process's own pid stands in for a child's, exactly as `entered_leaf_at` does: the
+    // synthetic report already decided `Placed` before `take_placement` ever reads a pid.
+    let attached = prepared.settle_verdict(std::process::id());
+    let Some(crate::containment::Attached::Cgroup(leaf)) = attached else {
+        panic!("a placed verdict must retain the leaf as Attached::Cgroup, got {attached:?}");
+    };
+
+    // Occupy the leaf so its `Drop` cannot silently `rmdir` it away: this makes the retained
+    // leaf's continued liveness (armed, real, killable-through) observable.
+    std::fs::write(leaf_path.join("occupant"), b"").expect("occupy the leaf");
+    let kill = leaf_path.join("cgroup.kill");
+    assert!(
+        !kill.exists(),
+        "settle_verdict itself must not tear the leaf down: retaining it, not dropping it, is the point"
+    );
+    drop(leaf);
+    assert_eq!(
+        std::fs::read(&kill).expect("cgroup.kill written"),
+        b"1",
+        "the retained leaf must still be a normal, live one, killable through exactly as any other"
+    );
+}
+
+/// `Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains ARMED, not disarm it: tree
+/// teardown belongs after the root's reap (see `Retained`'s own doc), so a failed spawn's
+/// grandchildren still in the leaf must still be killed through by the leaf's own `Drop`.
+/// Disarming on success too (the regression this test guards against) would let them run on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_successful_wait_leaves_the_retained_leaf_armed_to_kill_through_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    drop(stdin);
+    unreaped.wait().expect("the child exits cleanly");
+    assert!(
+        kill.exists(),
+        "a successful reap must leave the retained leaf armed, so its own Drop kills through \
+         whatever else still occupies it"
+    );
+}
+
+/// `Unreaped::drop`'s SUCCESSFUL synchronous wait must leave the leaf it retains armed too, the
+/// same as `wait` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn drop_leaves_the_retained_leaf_armed_after_a_successful_synchronous_wait() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let unreaped = crate::Unreaped::with_retained(
+        crate::child::unreaped::Held::Std(child),
+        Some(crate::child::unreaped::Retained {
+            attached: crate::containment::Attached::Cgroup(leaf),
+        }),
+    );
+    drop(stdin);
+    drop(unreaped);
+    assert!(
+        kill.exists(),
+        "a successful synchronous wait in Drop must leave the retained leaf armed, so its own \
+         Drop kills through whatever else still occupies it"
+    );
+}
+
+/// A `cosca::tokio::Unreaped::wait`'s SUCCESSFUL reap must leave the leaf it retains armed too —
+/// and (H1) the kill that arming leads to, once the retained leaf is dropped, must not run inline
+/// on the thread that awaited the reap: a still-occupied leaf's kill is followed by an unbounded
+/// drain wait, which must never run on a runtime worker.
+///
+/// Deterministic, not a race against the drain task: `set_next_kill_thread_hook` parks the task
+/// inside its real `cgroup.kill` write itself — mid-teardown, past `finish`'s `drop(retained)` call
+/// but before the write returns — until this test releases it. A biased `select!` against `wait`
+/// then proves `wait` cannot resolve before that write is reached: were the notify to fire before
+/// the real kill-through ran (the ordering bug this once caught only by luck, via `kill.exists()`
+/// checked after the fact — see `git blame`), `wait`'s arm would be ready first and this would
+/// panic instead of hanging. Also proves the write runs on the blocking pool, not inline on the
+/// runtime thread that awaited the reap: the runtime here has exactly one thread.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_tokio_wait_returns_only_after_the_retained_drop_ran() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    drop(stdin);
+    let leaf_path = kill.parent().expect("cgroup.kill has a parent").to_path_buf();
+    let runtime_thread = std::thread::current().id();
+    // The drain thread parks in its own `cgroup.kill` (inside `drop(retained)`) until released.
+    let (at_kill_tx, at_kill_rx) = ::tokio::sync::oneshot::channel::<std::thread::ThreadId>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |tid| {
+        let _ = at_kill_tx.send(tid);
+        // Err once the test drops `release_tx` (on a failed assertion): never hangs.
+        let _ = release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+    });
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        let mut wait = std::pin::pin!(unreaped.wait());
+        let kill_thread = ::tokio::select! {
+            biased;
+            r = &mut wait => panic!("wait returned while the retained drop is parked mid-teardown: {r:?}"),
+            tid = at_kill_rx => tid.expect("the drain reached cgroup.kill"),
+        };
+        assert_ne!(
+            kill_thread, runtime_thread,
+            "the kill on a still-occupied retained leaf must run on the blocking pool, not inline \
+             on the runtime thread that awaited the reap"
+        );
+        release_tx.send(()).expect("the drain is parked on the gate");
+        wait.await.expect("the child exits cleanly");
+    });
+    assert!(
+        kill.exists(),
+        "a successful tokio reap must leave the retained leaf armed, so its own Drop kills \
+         through whatever else still occupies it"
+    );
+}
+
+/// The drain's own commit to kill-through, once claimed, cannot be recalled: `leak` racing in
+/// after the drain has already claimed what it must drop (M2) finds it parked mid `cgroup.kill`
+/// (via the same gate as the probe above) and now blocks on it, exactly as `Drop` would, rather
+/// than returning early while the kill-through it can no longer stop keeps running unowned — the
+/// kill goes ahead, and `leak` itself does not return until it has.
+///
+/// The gate holds the drain task strictly until `release_tx` is sent, so `leak` is spawned onto
+/// its own thread and joined only afterward: releasing before spawning `leak` (rather than after,
+/// as the pre-blocking version of this test did) is required now — sending the release first and
+/// calling a now-blocking `leak` after would still work here (the gate only opens once `release_tx`
+/// is sent, whichever thread calls `leak`), but joining the thread before that send would deadlock,
+/// the same way `leaking_while_the_blocking_reap_is_running_blocks_until_it_finishes_then_disarms`'s
+/// doc explains for the reap-side twin.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_leak_of_a_committed_drain_still_kills_through() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    drop(stdin);
+    let leaf_path = kill.parent().unwrap().to_path_buf();
+    let (at_kill_tx, at_kill_rx) = ::tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    crate::containment::cgroup::fault::set_next_kill_thread_hook(&leaf_path, move |_| {
+        let _ = at_kill_tx.send(());
+        let _ = release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        let _ = done_tx.send(());
+    });
+    let unreaped = runtime.block_on(async {
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained { attached: crate::containment::Attached::Cgroup(leaf) }),
+        );
+        ::tokio::select! { biased; r = u.wait() => panic!("wait completed while the drain is parked: {r:?}"), _ = at_kill_rx => {} }
+        u
+    });
+    assert!(
+        kill.exists(),
+        "the kill write already ran (the hook fires just after it)"
+    );
+    // The drain is parked inside cgroup.kill, committed; `leak` now blocks on it, so it runs on
+    // its own thread here, joined only once the gate below has released the drain and it has
+    // reported.
+    let leak_thread = std::thread::spawn(move || unreaped.leak());
+    release_tx.send(()).expect("the drain is parked on the gate");
+    done_rx.recv().expect("the drain finishes once released");
+    leak_thread.join().expect("leak must not panic");
+    assert!(kill.exists(), "kill-through went ahead despite leak()");
+}
+
+/// The converse of `probe_leak_of_a_committed_drain_still_kills_through`: `leak` racing in BEFORE
+/// the queued `DrainTask` has claimed what it must drop — still `NotStarted`, queued behind an
+/// occupied blocking pool — reclaims it directly and disarms it, the same as
+/// `leaking_a_contained_child_leaves_it_running` does for a leaf that never moved to a drain at
+/// all. Nothing kills through it (round-7 review, mutant E: a `leak` that forgets to disarm an
+/// unclaimed drain's retained leaf leaves it armed, so the leaf's own later `Drop` — once `retained`
+/// itself goes out of scope at the end of that match arm — kills through it instead, even though
+/// `leak` itself never wrote `cgroup.kill`).
+///
+/// Deterministic: `max_blocking_threads(1)` plus a blocker parked on a gate occupies the pool's
+/// only thread, so the `DrainTask` the reap below queues cannot be claimed until this test releases
+/// it — `leak` below is guaranteed to find the task still `NotStarted`, not racing to get there
+/// first.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_leak_of_an_unclaimed_drain_disarms() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    drop(stdin); // the child exits at once
+    crate::child::unreaped::block_until_reapable(pid).expect("zombie");
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    runtime.block_on(async {
+        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
+        // Occupies the pool's only blocking thread until this test releases `gate_tx`, so the
+        // `DrainTask` the reap below queues can never be claimed.
+        let _blocker = ::tokio::task::spawn_blocking(move || {
+            let _ = occ_tx.send(());
+            let _ = gate_rx.recv();
+        });
+        occ_rx.await.expect("the blocker parked");
+
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        let raw = pid as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = u.wait() => panic!("wait completed while the drain is queued behind the occupied pool: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+        assert!(
+            u.hands_retained_to_draining_task(),
+            "the drain must still be tracked (queued behind the occupied pool), not detached"
+        );
+
+        // The task cannot have claimed it yet: the pool's only thread is still occupied by
+        // `_blocker`. `leak` below reclaims it directly.
+        u.leak();
+        assert!(
+            !kill.exists(),
+            "leak() of an unclaimed drain must disarm what it retained, not leave it armed for \
+             its own later Drop to kill through"
+        );
+
+        // Release the blocker so the runtime can join the pool's thread when it drops below,
+        // instead of hanging on it.
+        gate_tx.send(()).expect("the blocker is still parked on this receiver");
+    });
+}
+
+/// The same regression as `leaking_a_child_whose_leaf_was_already_killed_before_handoff_is_not_
+/// rekilled`, through `probe_leak_of_an_unclaimed_drain_disarms`'s unclaimed-drain path: a leaf
+/// already killed before hand-back must not be re-killed when `leak` reclaims an unclaimed drain
+/// directly.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leak_of_an_unclaimed_drain_does_not_rekill_a_leaf_already_killed_before_handoff() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    drop(stdin); // the child exits at once
+    crate::child::unreaped::block_until_reapable(pid).expect("zombie");
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    runtime.block_on(async {
+        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
+        // Occupies the pool's only blocking thread until this test releases `gate_tx`, so the
+        // `DrainTask` the reap below queues can never be claimed.
+        let _blocker = ::tokio::task::spawn_blocking(move || {
+            let _ = occ_tx.send(());
+            let _ = gate_rx.recv();
+        });
+        occ_rx.await.expect("the blocker parked");
+
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        let raw = pid as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = u.wait() => panic!("wait completed while the drain is queued behind the occupied pool: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+        assert!(
+            u.hands_retained_to_draining_task(),
+            "the drain must still be tracked (queued behind the occupied pool), not detached"
+        );
+
+        // The task cannot have claimed it yet: the pool's only thread is still occupied by
+        // `_blocker`. `leak` below reclaims it directly.
+        u.leak();
+        assert!(
+            !kill.exists(),
+            "leak of an unclaimed drain must not re-fire cgroup.kill over a leaf a kill before \
+             hand-back already reached"
+        );
+
+        // Release the blocker so the runtime can join the pool's thread when it drops below,
+        // instead of hanging on it.
+        gate_tx.send(()).expect("the blocker is still parked on this receiver");
+    });
+}
+
+/// The same regression as `leaking_a_child_whose_leaf_was_already_killed_before_handoff_is_not_
+/// rekilled`, through `leak`'s reap-side twin of `probe_leak_of_an_unclaimed_drain_disarms`:
+/// `leak` racing in BEFORE the queued `ReapTask` has claimed the child — still `NotStarted`, queued
+/// behind an occupied blocking pool — reclaims it directly, at `tokio/unreaped.rs`'s
+/// `retained.attached.disarm()` inside `leak`'s `#[cfg(unix)] if let Some((shared, _)) =
+/// self.blocking.take()` arm (the one production site with no other dedicated test isolating it —
+/// every other `leak` path is exercised by a template above, mirrored with a pre-killed leaf; this
+/// is that template's own new sibling, since the un-pre-killed case had no dedicated test to mirror
+/// in the first place).
+///
+/// Deterministic for the same reason `probe_leak_of_an_unclaimed_drain_disarms` is:
+/// `max_blocking_threads(1)` plus a blocker parked on a gate occupies the pool's only thread, so the
+/// `ReapTask` the forced-not-yet-reapable wait below queues cannot be claimed until this test
+/// releases it.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leaking_an_unclaimed_blocking_reap_does_not_rekill_a_leaf_already_killed_before_handoff() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    runtime.block_on(async {
+        let (occ_tx, occ_rx) = ::tokio::sync::oneshot::channel::<()>();
+        // Occupies the pool's only blocking thread until this test releases `gate_tx`, so the
+        // `ReapTask` the wait below queues can never be claimed.
+        let _blocker = ::tokio::task::spawn_blocking(move || {
+            let _ = occ_tx.send(());
+            let _ = gate_rx.recv();
+        });
+        occ_rx.await.expect("the blocker parked");
+
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut wait = std::pin::pin!(unreaped.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "the child is still running");
+        }
+        assert!(
+            unreaped.hands_child_to_blocking_task(),
+            "the reap task must still be tracked (queued behind the occupied pool), not detached"
+        );
+
+        // The task cannot have claimed it yet: the pool's only thread is still occupied by
+        // `_blocker`. `leak` below reclaims it directly.
+        unreaped.leak();
+
+        // Release the blocker so the runtime can join the pool's thread when it drops below,
+        // instead of hanging on it.
+        gate_tx.send(()).expect("the blocker is still parked on this receiver");
+    });
+    drop(stdin);
+    drop(runtime);
+    assert!(
+        !kill.exists(),
+        "leak of an unclaimed blocking reap must not re-fire cgroup.kill over a leaf a kill \
+         before hand-back already reached"
+    );
+    if !reaped(&pidfd) {
+        reap(pid);
+    }
+}
+
+/// M1 regression: a `wait` that returns `Ok` because the child's exit status was already cached
+/// (a previous, cancelled wait already reaped it) re-awaits what that reap retained — but if the
+/// runtime shuts down before the queued `DrainTask` ever claims it, that re-await reclaims the
+/// retained leaf back into the handle unsettled, not "fully settled" the way `wait`'s own doc used
+/// to claim. A later `leak()` must still disarm it rather than let `Unreaped::drop`'s fallback kill
+/// through it.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn probe_leak_after_a_refused_drain_disarms() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.handle().clone();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    drop(stdin);
+    let mut u = runtime.block_on(async {
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut w = std::pin::pin!(u.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(w.as_mut().poll(&mut cx).is_pending());
+        }
+        u
+    });
+    // The blocking reap runs the real reap before the runtime shuts down, so `wait` below finds a
+    // cached status rather than racing the reap itself.
+    u.block_until_blocking_reap_finished();
+    runtime.shutdown_background();
+    let r = handle.block_on(u.wait());
+    assert!(r.is_ok(), "the cached status must still be returned: {r:?}");
+    assert!(!kill.exists(), "nothing killed through yet: the drain task never ran");
+    u.leak();
+    assert!(
+        !kill.exists(),
+        "leak() must disarm what the refused drain left behind, not kill through it"
+    );
+}
+
+/// The same regression as `leaking_a_child_whose_leaf_was_already_killed_before_handoff_is_not_
+/// rekilled`, through `probe_leak_after_a_refused_drain_disarms`'s fallback path — `leak`'s final
+/// `held`/`retained`-in-`self` arm (`tokio/unreaped.rs`'s last `retained.attached.disarm()` site).
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn leak_after_a_refused_drain_does_not_rekill_a_leaf_already_killed_before_handoff() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.handle().clone();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    leaf.hard_kill()
+        .expect("simulate a kill that reached the leaf before hand-back");
+    std::fs::remove_file(&kill).expect("clear the kill marker written above");
+    let (child, stdin) = cat_child();
+    drop(stdin);
+    let mut u = runtime.block_on(async {
+        let mut u = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        crate::tokio::unreaped::fault::set_force_not_yet_reapable();
+        {
+            use std::future::Future;
+            let mut w = std::pin::pin!(u.wait());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(w.as_mut().poll(&mut cx).is_pending());
+        }
+        u
+    });
+    // The blocking reap runs the real reap before the runtime shuts down, so `wait` below finds a
+    // cached status rather than racing the reap itself.
+    u.block_until_blocking_reap_finished();
+    runtime.shutdown_background();
+    let r = handle.block_on(u.wait());
+    assert!(r.is_ok(), "the cached status must still be returned: {r:?}");
+    u.leak();
+    assert!(
+        !kill.exists(),
+        "leak() must not re-fire cgroup.kill over a leaf a kill before hand-back already reached"
+    );
+}
+
+/// The same contract as `probe_tokio_wait_returns_only_after_the_retained_drop_ran`, but
+/// through `Unreaped::drop` after a cancelled `wait` already reaped the child and handed its
+/// retained leaf to a still-running `DrainTask`: `Drop`'s own claim-slot wait (`take_blocking`)
+/// reads the very same `RetainedDrain` state `wait`'s `await_draining` does, so the ordering bug
+/// that test catches (notifying before the real kill-through ran) would equally have hidden here.
+///
+/// Deterministic, not a race against `Drop`, the same way
+/// `dropping_during_a_blocking_reap_waits_for_it` is: an `after_drain_claim` gate holds the task
+/// claimed (state `Committed`, not yet `Finished`) until this test releases it, so `Drop`
+/// deterministically finds the task already claimed and must go through
+/// `take_blocking`, not `reclaim_before_start`'s direct-drop fast path. The `before_blocking_drop`
+/// hook then fires as `Drop` commits to blocking on the drain and releases the gate — from inside
+/// `Drop`'s own call frame, so the release cannot be observed to race `Drop`'s own transition to
+/// blocking. `take_blocking`'s return is therefore itself the proof the real drop already ran (see
+/// `RetainedDrain::take_blocking`'s wait loop): checking `kill.exists()` right after `drop(unreaped)`
+/// returns has nothing left to race.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn tokio_drop_leaves_the_retained_leaf_armed_after_a_successful_reap() {
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (leaf, kill) = occupied_entered_leaf(dir.path());
+    let (child, stdin) = cat_child();
+    let pid = child.id();
+    drop(stdin); // the child exits at once
+    crate::child::unreaped::block_until_reapable(pid).expect("zombie");
+
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // `Sender`/`Receiver` are not `Sync`, but the hook's trait object bound requires it; the
+    // `Mutex` costs nothing here, since each hook only ever touches its own once.
+    let claimed_tx = std::sync::Mutex::new(claimed_tx);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    crate::tokio::unreaped::fault::set_after_drain_claim(Box::new(move || {
+        claimed_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(())
+            .expect("the test thread is waiting for the claim");
+        release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("the test thread releases the gate");
+    }));
+
+    runtime.block_on(async {
+        let mut unreaped = crate::tokio::Unreaped::with_retained(
+            crate::child::unreaped::Held::Std(child),
+            Some(crate::child::unreaped::Retained {
+                attached: crate::containment::Attached::Cgroup(leaf),
+            }),
+        );
+        let raw = pid as libc::id_t;
+        let reaped_by_us = move || unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                raw,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        };
+        ::tokio::select! {
+            biased;
+            r = unreaped.wait() => panic!("wait completed instead of being cancelled: {r:?}"),
+            _ = async { loop { if reaped_by_us() { break } ::tokio::task::yield_now().await } } => {}
+        }
+        assert!(
+            unreaped.hands_retained_to_draining_task(),
+            "the drain must still be tracked after the cancelled wait"
+        );
+
+        // Deterministic: wait for the drain task's own claim signal before dropping, so `Drop`
+        // below exercises the "wait for a claimed drain" branch of `take_blocking`, not "drop an
+        // unclaimed one inline". The task is now parked in the gate, claimed — and so already
+        // committed to kill-through (see `DrainState`'s doc) — but not yet having run it.
+        claimed_rx
+            .recv()
+            .expect("the drain task reaches the gate once it has claimed what it must drop");
+        assert!(
+            !kill.exists(),
+            "the gated task has claimed what it must drop but not yet run it"
+        );
+
+        // `before_blocking_drop` releases the gate from inside `Drop`'s own call frame, right as it
+        // commits to `take_blocking` — no separate thread, no race about when the release happens
+        // relative to `Drop`'s own transition to blocking.
+        unreaped.before_blocking_drop(Box::new(move || {
+            release_tx
+                .send(())
+                .expect("let the gated task proceed to the real drop");
+        }));
+        drop(unreaped); // blocks until the task's own drop (the real kill-through) has actually run
+        assert!(
+            kill.exists(),
+            "a successful reap's Drop must not return before it has left the retained leaf armed, \
+             so its own drop kills through whatever else still occupies it — the same as `wait`"
+        );
+    });
 }

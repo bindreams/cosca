@@ -4,7 +4,6 @@
 use std::time::Duration;
 
 use super::Process;
-use crate::error::Error;
 
 impl Process {
     /// Cooperative-then-forced lone shutdown of the foreign process: `SIGTERM`, wait up to
@@ -19,7 +18,7 @@ impl Process {
     ///
     /// Needs the IO **and** time drivers on Unix (the `#[tokio::main]`/`#[tokio::test]`
     /// defaults) — missing either, tokio panics rather than returning a typed error.
-    pub async fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
+    pub async fn graceful_shutdown(&self, grace: Duration) -> Result<(), crate::tokio::Error> {
         crate::wait::terminate(self.id())?;
         // Watch failure escalates now (kill still runs); a kill Err wins — mirrors the
         // sync twin's subsumption.
@@ -46,7 +45,7 @@ impl Process {
     /// watch error is surfaced afterward; a sweep failure would win over it. Dropping this
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
     /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
-    pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
+    pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), crate::tokio::Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;
         // The sweep is unconditional — a gracefully-exited root does NOT mean the

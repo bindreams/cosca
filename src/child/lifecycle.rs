@@ -34,7 +34,7 @@ impl Child {
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        self.proc.wait_deadline(deadline).map_err(Error::Io)
+        self.proc().wait_deadline(deadline).map_err(Error::Io)
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is

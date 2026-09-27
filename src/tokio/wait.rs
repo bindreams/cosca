@@ -170,6 +170,30 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     }
 }
 
+/// Resolve when the process `pidfd` refers to exits — unbounded, non-reaping, signal-free, and
+/// read through the pidfd alone, so no `/proc` read (`hidepid`) can stand in its way.
+/// Cancellable: dropping the future deregisters the watch.
+#[cfg(target_os = "linux")]
+pub(crate) async fn pidfd_exit(pidfd: &std::os::fd::OwnedFd) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+    let afd = AsyncFd::with_interest(
+        pidfd.try_clone().map_err(Error::Io)?,
+        Interest::READABLE | Interest::ERROR,
+    )
+    .map_err(Error::Io)?;
+    loop {
+        let mut guard = afd
+            .ready(Interest::READABLE | Interest::ERROR)
+            .await
+            .map_err(Error::Io)?;
+        match classify_pidfd_ready(guard.ready()) {
+            Some(verdict) => return verdict,
+            None => guard.clear_ready(), // false-positive wake — re-await
+        }
+    }
+}
+
 /// Map a pidfd readiness to the watch verdict; `None` = unclassified readiness (tokio's
 /// documented `ready()` false positive) — re-await: never a false "exited" (which would skip
 /// escalation on a live child) and never a false watch failure (which would force-kill a
@@ -196,6 +220,21 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     let Some(kq) = crate::wait::backend::arm_proc_exit(id)? else {
         return Ok(());
     };
+    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
+    watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
+}
+
+/// Resolve when this process's unreaped child `pid` exits — unbounded, non-reaping, and read from
+/// a kqueue filter on the pid alone, which the child's being unreaped keeps its own: no identity
+/// read (`/proc`-style) stands in its way. Cancellable: dropping the future closes the kqueue.
+#[cfg(target_os = "macos")]
+pub(crate) async fn pid_exit(pid: u32) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+    let kq = nix::sys::event::Kqueue::new().map_err(|e| Error::Io(e.into()))?;
+    if crate::wait::backend::arm_note_exit_on(&kq, pid)?.is_none() {
+        return Ok(()); // past accepting the filter: exited
+    }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
 }
