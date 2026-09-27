@@ -621,18 +621,56 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     // spin this primitive must not have, so past the clamp it does not drain and the writer's
     // own `write()` blocks instead (the marker fd's documented misuse contract). >64 KiB exceeds
     // the pipe's own buffer capacity, so the writer never reaches its own `exec 3>&-` and the
-    // future never resolves; the external `tokio::time::timeout` here bounds the TEST's
-    // patience, not the primitive's — it is the caller-supplied bound the primitive's doc says a
-    // caller wanting one must supply itself.
+    // future never resolves.
     let (child, marker, stdin) = spawn_marker_holder("yes | head -c 200000 >&3; exec 3>&-; exec cat >/dev/null");
+
+    // Prove the precondition deterministically BEFORE trusting anything downstream: nothing
+    // here establishes that the writer has actually reached the clamp merely by having spawned
+    // it — a slow fork/exec or a slow `yes`/`head` pipeline could still be short of it. A direct,
+    // repeated, non-blocking kernel query (zero-timeout `poll(2)` of the kqueue's own fd — same
+    // idiom `note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp` above uses to check the
+    // OPPOSITE state, on a THROWAWAY kqueue this probe owns; private kqueues on the same fd never
+    // interfere with each other, see this module's own doc), looped until the kernel itself
+    // reports `NOTE_LOWAT` crossed — never a chosen wait duration, and never satisfied by a
+    // writer that simply hasn't started yet.
+    let probe_kq = super::arm(marker.as_fd(), false).expect("arm probe kqueue");
+    let mut pfd = libc::pollfd {
+        fd: probe_kq.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only within
+        // its bounds, and the `1` count matches the slice length passed.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        assert!(rc >= 0, "poll failed: {}", std::io::Error::last_os_error());
+        if rc > 0 {
+            break; // the kernel confirms NOTE_LOWAT crossed: the writer is now past the clamp
+        }
+        std::thread::yield_now(); // not yet — re-check the same real condition, no sleep, no bound
+    }
+    drop(probe_kq);
+
+    // With the precondition proven — the kernel has already confirmed the writer is past the
+    // clamp BEFORE this await even starts — a short bounded `timeout` here is a genuine failure
+    // bound, not the proof: a real writer genuinely blocked in its own `write()` can only be
+    // unblocked by draining or by this process's own later `kill()`, neither of which has
+    // happened yet, so a CORRECT `wait_tree_drained` blocks for as long as this test's whole
+    // remaining body takes to run; only a BUG resolves it at all, and a bug that resolves a
+    // future which is checked via reactor-driven `AsyncFd` readiness (which — unlike a bare
+    // synchronous `Future::poll`, see this crate's `wait_exit_cancel_leaves_child_untouched` for
+    // where that idiom IS appropriate — needs the runtime to actually drive at least one I/O
+    // cycle to observe real kqueue state) does so on the very first such cycle, not eventually:
+    // there is no legitimate slow path here for the timeout to race against, so 50ms is ample
+    // and not a tight bound chasing scheduler noise.
     let outcome = ::tokio::time::timeout(
-        Duration::from_millis(300),
+        Duration::from_millis(50),
         crate::tokio::wait::wait_tree_drained(marker.as_fd()),
     )
     .await;
     assert!(
         outcome.is_err(),
-        "a writer stuck past the low-water clamp must not resolve the wait — it should never be drained"
+        "a writer proven past the low-water clamp resolved the wait anyway — it must never be drained"
     );
     assert_eq!(
         child.is_alive(),
