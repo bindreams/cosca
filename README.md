@@ -17,7 +17,7 @@ way plain `cargo test` does.
 
 Run it directly on macOS. On Linux and Windows, contained tests create cgroup leaves and Job
 Objects, so run the suite in a VM ([`scripts/devvm`](scripts/README.md)), a container or CI; see
-[principle 9](docs/principles.md#9-system-affecting-tests-run-in-a-sandbox).
+[principle 10](docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
 
 nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
 today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an

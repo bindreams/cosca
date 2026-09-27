@@ -24,42 +24,61 @@ shape: the leaf's first blocking wait starts it, and the leaf's `Drop` stops and
   [`src/containment/cgroup/leaf.rs`](../src/containment/cgroup/leaf.rs) detaches a thread per child
   a failed spawn could not kill. [#165] (open) hands that child back to the caller instead.
 
-## 2. Never block a tokio runtime thread; async drop does only bounded work
+## 2. Never block a tokio runtime thread
 
-Async `Drop` may send a bounded number of signals, and may write `cgroup.kill`, which is one bounded
-file write. It never waits for a process exit or a cgroup drain. Completion is explicit and async:
-`wait().await`, `wait_tree().await`. A bare drop that leaves work unfinished leaves the resource
-behind and logs a warning naming it. A dropped, still-running async root goes to tokio's own orphan
-queue, which is tokio's state, not cosca's; that queue reaps by PID, the exception principle 3
-accepts. Sync code may block, as sync Rust normally does.
+cosca's async methods, and the sync methods of its async types, never block the runtime thread they
+run on: no wait for a process exit or a cgroup drain, and no sweep of unbounded length. Work that
+must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 
-**Why:** a kill is not an exit (a process stuck in I/O on a hung NFS mount outlives `SIGKILL`), so
-any wait in `Drop` is unbounded. tokio's predecessor, tokio-process, removed its blocking wait from
-`Drop` for this reason ([tokio-process#51]), and tokio panics rather than block when a `Runtime` is
-dropped in async context ([tokio shutdown.rs]). Global reapers (`waitpid(-1)`, a subreaper) belong
-to programs that own the whole process, such as tini and the containerd shim. Embeddable libraries
-decline the role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), and runc's Go `libcontainer`
-requires its embedder to supply the reaper ([runc CHANGELOG]).
+**Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
+stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async
+context ([tokio shutdown.rs]).
 
-**Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns, and
-every async spawn and teardown path under [`src/tokio/`](../src/tokio/). The sync
-[`Child`](../src/child.rs) kills and reaps in its `Drop`, which is allowed.
+**Applies to:** every spawn, control and teardown path under [`src/tokio/`](../src/tokio/).
 
 **Being brought into line:**
 
-- The async `Drop` hands the wait to the reaper pool (principle 1) rather than to tokio.
-- `Attached::hard_kill()` does unbounded work on the dropping thread ([#111]), and the same sweeps
-  run on the caller's runtime worker in the sync `kill_tree()`/`terminate_tree()` of
-  [`tokio::Child`](../src/tokio/child.rs) and [`tokio::Process`](../src/tokio/process.rs), including
-  from the async `graceful_shutdown_tree`.
+- The sync `kill_tree()`/`terminate_tree()` of [`tokio::Child`](../src/tokio/child.rs) and
+  [`tokio::Process`](../src/tokio/process.rs) run `Attached::hard_kill()`'s unbounded sweeps on the
+  caller's runtime worker, including from the async `graceful_shutdown_tree`.
+- Async spawn error paths reap on the caller's runtime worker ([#112]), and elevation's setup blocks
+  it ([#176]).
+- When a contained spawn's placement is undecidable, `fail_closed` in
+  [`leaf.rs`](../src/containment/cgroup/leaf.rs) waits for the child's exit and the leaf's drain on
+  that worker.
+
+## 3. Async `Drop` does only bounded work
+
+Async `Drop` may send a bounded number of signals, and may write `cgroup.kill`, which is one bounded
+file write. It never waits for a process exit or a cgroup drain. Completion is explicit and async:
+`wait_tree().await`, or `wait().await` for the root alone. A bare drop that leaves work unfinished
+leaves the resource behind and logs a warning naming it.
+
+A dropped, still-running async root goes to tokio's own orphan queue, which is tokio's state, not
+cosca's. That queue reaps with `waitpid(pid)`, the one by-number reap cosca accepts (principle 4):
+the only alternative is a reaper cosca would own (principle 1). On evidence of a foreign reap at
+drop time, cosca forgets tokio's child instead of handing it over. What remains is a foreign reap
+after the handoff, which the queue cannot detect.
+
+**Why:** a kill is not an exit (a process stuck in I/O on a hung NFS mount outlives `SIGKILL`), so
+any wait in `Drop` is unbounded. tokio's predecessor, tokio-process, removed its blocking wait from
+`Drop` for this reason ([tokio-process#51]). Global reapers (`waitpid(-1)`, a subreaper) belong to
+programs that own the whole process, such as tini and the containerd shim. Embeddable libraries
+decline the role: sd-event avoids `waitid(P_ALL)` ([sd-event.c]), and runc's Go `libcontainer`
+requires its embedder to supply the reaper ([runc CHANGELOG]).
+
+**Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns. The
+sync [`Child`](../src/child.rs) kills and reaps in its `Drop`, which is allowed.
+
+**Being brought into line:**
+
+- The async `Drop` hands the wait to the reaper pool (principle 1) rather than to tokio, and checks
+  for a foreign reap nowhere (principle 5).
+- `Attached::hard_kill()` does unbounded work on the dropping thread ([#111]).
 - The async `Drop` blocks on a cgroup leaf's drain when the root is already reaped, its kill fails,
   or the reaper pool cannot start (see [`Command::kill_on_drop`](../src/command.rs)'s rustdoc).
-- Async spawn error paths reap on the caller's runtime worker ([#112]), and elevation's setup blocks
-  it ([#176]). When a contained spawn's placement is undecidable, `fail_closed` in
-  [`leaf.rs`](../src/containment/cgroup/leaf.rs) waits for the child's exit and the leaf's drain on
-  that worker too.
 
-## 3. Don't act on a bare PID after it may be reused
+## 4. Don't act on a bare PID after it may be reused
 
 On Unix a PID is pinned only while its process is an unreaped child (a zombie at worst); on Windows,
 while a handle to the process is open. Signal and wait through a handle that names the process:
@@ -72,11 +91,7 @@ while a handle to the process is open. Signal and wait through a handle that nam
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
-One by-number reap is accepted: tokio's orphan queue reaps a dropped, still-running async root with
-`waitpid(pid)` (principle 2). It is tokio's state, and the only alternative is a reaper cosca would
-own (principle 1). On evidence of a foreign reap at drop time, cosca forgets tokio's child instead
-of handing it over. What remains is a foreign reap after the handoff, which the queue cannot
-detect.
+One by-number reap is accepted: tokio's orphan queue reaping a dropped async root (principle 3).
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
@@ -91,7 +106,7 @@ unrelated process.
 - The cgroup graceful signal goes to bare PIDs ([#106]).
 - Kill-by-identity re-verifies and then signals non-atomically ([#55], [#64]); macOS has an
   identity-bound signal cosca does not use yet ([#55]).
-- These signal by number, which is safe only if nothing else reaps the child (principle 4):
+- These signal by number, which is safe only if nothing else reaps the child (principle 5):
   - the single-process kill of an owned Unix child (`Child::kill()`, both `Drop` impls,
     `kill_unadopted` in [`src/child/spawn.rs`](../src/child/spawn.rs)), which goes through std's
     `Child::kill`, `SharedChild::kill` or tokio's `start_kill` to `kill(2)`;
@@ -120,7 +135,7 @@ unrelated process.
 - `ReportChannel::wait` ([`channel.rs`](../src/containment/cgroup/channel.rs)) opens its pidfd from
   a bare PID, which names the child only if nothing else reaped it.
 
-## 4. A foreign reap is a handled case, not a contract violation
+## 5. A foreign reap is a handled case, not a contract violation
 
 The application or another library may reap cosca's children (`SIGCHLD` set to `SIG_IGN`, or
 `waitpid(-1)`), and init and supervisor programs must. cosca detects it where it can (`ECHILD`,
@@ -129,7 +144,7 @@ The application or another library may reap cosca's children (`SIGCHLD` set to `
 After a foreign reap:
 
 - On Linux, cgroup plus pidfd stays exact; only the exit status is lost.
-- Process-group and fd-marker kills are unsafe (principle 3).
+- Process-group and fd-marker kills are unsafe (principle 4).
 - macOS has no pidfd, and cosca has no exact kill there.
 
 **Why:** a library cannot require the whole process to leave its children alone, and processes that
@@ -149,7 +164,7 @@ forbidden precondition. These debug-assert on it:
 Principle 3's by-number waits and reaps check for a foreign reap nowhere; its note says what fixes
 each.
 
-## 5. Good defaults, with escape hatches for advanced users
+## 6. Good defaults, with escape hatches for advanced users
 
 Defaults are safe: a child is killed on drop, and `contain()` picks the strongest mechanism by
 default. Don't forbid what advanced users legitimately need; document exactly what holds when they
@@ -162,7 +177,7 @@ guarantees at all.
 `nesting()`, `raw_executable()` and `creation_flags()` on [`Command`](../src/command.rs), and
 `detach()` on [`Child`](../src/child.rs).
 
-## 6. Assert contracts in debug; never assert on real OS outcomes
+## 7. Assert contracts in debug; never assert on real OS outcomes
 
 An outcome the OS can really produce, such as `EACCES` from a privilege drop, `ECHILD`, `ESRCH` or a
 failed `cgroup.kill` write, is handled, not `debug_assert!`ed. A contract violation that is
@@ -184,9 +199,9 @@ documented-only contract breaks silently when a future caller violates it.
 - `take_owned_out`, `take_owned_in`, `fd_read_end` and `fd_write_end` on Unix in
   [`src/tokio/child.rs`](../src/tokio/child.rs) debug-assert that registering a pipe with tokio's
   reactor succeeded, which the kernel can refuse (`ENOMEM`, `ENOSPC`).
-- The foreign-reap asserts in principle 4 are the same kind.
+- The foreign-reap asserts in principle 5 are the same kind.
 
-## 7. Synchronise on events, not time
+## 8. Synchronise on events, not time
 
 No sleep-then-check, and a timeout's expiry is never taken as proof of a state. A timeout is allowed
 only as a failure bound, whose expiry fails the test or reports an error, like a nextest
@@ -217,7 +232,7 @@ Elsewhere:
   ([`leaf_tests.rs`](../src/containment/cgroup/leaf_tests.rs)) describes its bounded wait as
   settling time for the membership checks that follow.
 
-## 8. Tests fail loudly and never silently skip
+## 9. Tests fail loudly and never silently skip
 
 A test that can't establish its precondition fails with a message that names the precondition and
 how to opt out explicitly. A test that mutates process-wide state (fds 0–2, rlimits, credentials,
@@ -251,7 +266,7 @@ whichever tests share the process.
     ([`leaf_tests.rs`](../src/containment/cgroup/leaf_tests.rs)), whose pipe lacks close-on-exec and
     so leaks into concurrently spawned children ([#205]).
 
-## 9. System-affecting tests run in a sandbox
+## 10. System-affecting tests run in a sandbox
 
 Tests that touch real system state run in a container, VM or CI, never on a developer's host:
 cgroups, Job Objects, elevation, signals to processes the test didn't spawn, and anything under
@@ -268,7 +283,7 @@ a Job Object on Windows. So the suite runs directly on a macOS host, and on Linu
 [devvm](../scripts/README.md), a container or CI. CI's cgroup lane runs in a fresh cgroup on a
 throwaway runner ([`ci.yaml`](../.github/workflows/ci.yaml)).
 
-## 10. Prefer a dependency over hand-rolled code
+## 11. Prefer a dependency over hand-rolled code
 
 A dependency's bugs that don't affect cosca are its to fix, not a reason to avoid it. A bug that
 does affect cosca can disqualify it.
@@ -278,7 +293,7 @@ hand.
 
 **Applies to:** all code.
 
-## 11. Small PRs, split along clean seams
+## 12. Small PRs, split along clean seams
 
 Split a plan or PR wherever it has a clean seam. Stack dependent pieces, and keep every intermediate
 step consistent with these principles.
