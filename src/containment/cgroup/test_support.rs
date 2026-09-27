@@ -54,10 +54,18 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
                         crate::containment::cgroup::fault::record_fork_running_pidfd_failure_probe(probe);
                     }
                     // SAFETY: `raw_pid` is this process's own child, forked immediately above.
-                    unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+                    let killed = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+                    debug_assert_eq!(killed, 0, "kill: {}", std::io::Error::last_os_error());
                     let mut status = 0;
-                    // SAFETY: as above.
-                    unsafe { libc::waitpid(raw_pid, &mut status, 0) };
+                    let reaped = loop {
+                        // SAFETY: as above.
+                        let reaped = unsafe { libc::waitpid(raw_pid, &mut status, 0) };
+                        if reaped == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break reaped;
+                    };
+                    debug_assert_eq!(reaped, raw_pid, "waitpid: {}", std::io::Error::last_os_error());
                     panic!("pidfd_open its own just-forked child: {e}");
                 }
             }
@@ -114,8 +122,14 @@ impl Drop for KillOnDrop {
         );
         if std::thread::panicking() {
             // Already unwinding a panic: asserting here would abort instead of completing that
-            // unwind, so this is surfaced, not asserted.
-            eprintln!("KillOnDrop: pidfd_send_signal: {killed:?}, waitid: {reaped:?}");
+            // unwind, so this is surfaced, not asserted. `eprintln!` itself panics on a broken
+            // stderr pipe (e.g. `--nocapture ... | head`), which would abort here instead of
+            // completing the unwind — write directly and ignore that failure instead.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "KillOnDrop: pidfd_send_signal: {killed:?}, waitid: {reaped:?}"
+            );
         } else {
             debug_assert!(killed.is_ok(), "pidfd_send_signal: {killed:?}");
             debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");

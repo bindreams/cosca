@@ -7,6 +7,10 @@ use super::fork_running;
 /// Probed by a pidfd this test opens independently of the guard's own: once the guard's `Drop`
 /// has reaped the child, querying the same process through that separate pidfd finds no child
 /// left to wait for (`ECHILD`) — proof the guard did the reaping, not a coincidence of timing.
+///
+/// A regression that drops the kill hangs this test rather than failing it: the guard's `Drop`
+/// would then block forever in its own blocking `waitid` on a child that never exits (`pause()`
+/// ignores everything but a kill). See `.config/nextest.toml`'s `terminate-after` for this module.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_panic_after_fork_running_still_reaps_the_child() {
@@ -46,6 +50,10 @@ fn a_panic_after_fork_running_still_reaps_the_child() {
 /// `fork_running`'s own failure path records (see `fault::record_fork_running_pidfd_failure_probe`),
 /// opened before it killed the child — this test cannot open its own, since it never gets the pid
 /// back (the call panics instead of returning).
+///
+/// A regression that drops the kill hangs this test rather than failing it: `fork_running`'s own
+/// blocking `waitpid` would then block forever on a child that never exits (`pause()` ignores
+/// everything but a kill). See `.config/nextest.toml`'s `terminate-after` for this module.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_pidfd_open_failure_still_reaps_the_child() {
