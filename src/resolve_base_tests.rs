@@ -416,27 +416,24 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_fails_a_loadable_only_search_closed() {
-    crate::test_child::run_fixture(
-        crate::test_child::fixture_path!(fixture_a_denied_candidate_fails_a_loadable_only_search_closed),
-        FIXTURE_DENIED_CLOSED_ENV,
-    );
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_candidate_fails_a_loadable_only_search_closed
+    ));
 }
 
-#[cfg(unix)]
-const FIXTURE_DENIED_CLOSED_ENV: &str = "COSCA_FIXTURE_DENIED_CLOSED";
-
 /// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]: a no-op when
-/// picked up by an ordinary, unfiltered suite run ([`FIXTURE_DENIED_CLOSED_ENV`] is unset there).
-/// Re-executed via `run_fixture`, it first drops any way this process could bypass DAC
-/// ([`crate::test_privilege::drop_dac_bypass`]), so [`locked_then_open`]'s `EACCES` precondition
-/// genuinely holds no matter which caller ran the suite.
+/// picked up by an ordinary, unfiltered suite run (see
+/// [`crate::test_child::is_fixture_reexec`]). Re-executed via `run_fixture`, it first drops any
+/// way this process could bypass DAC ([`crate::test_privilege::drop_dac_bypass`]), so
+/// [`locked_then_open`]'s `EACCES` precondition genuinely holds no matter which caller ran the
+/// suite.
 #[cfg(unix)]
 #[test]
 fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
-    if std::env::var_os(FIXTURE_DENIED_CLOSED_ENV).is_none() {
+    if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
     }
-    crate::test_privilege::drop_dac_bypass();
+    crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
     let (_root, _locked, _open, path) = locked_then_open();
     match search_tool(&path, true) {
         Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::EACCES), "{e}"),
@@ -461,24 +458,20 @@ fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
-    crate::test_child::run_fixture(
-        crate::test_child::fixture_path!(fixture_a_denied_candidate_is_skipped_by_an_ordinary_search),
-        FIXTURE_DENIED_SKIPPED_ENV,
-    );
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_candidate_is_skipped_by_an_ordinary_search
+    ));
 }
-
-#[cfg(unix)]
-const FIXTURE_DENIED_SKIPPED_ENV: &str = "COSCA_FIXTURE_DENIED_SKIPPED";
 
 /// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`] — see
 /// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s doc, which this mirrors.
 #[cfg(unix)]
 #[test]
 fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
-    if std::env::var_os(FIXTURE_DENIED_SKIPPED_ENV).is_none() {
+    if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
     }
-    crate::test_privilege::drop_dac_bypass();
+    crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
     let (_root, _locked, open, path) = locked_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }

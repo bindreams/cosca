@@ -112,7 +112,11 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
         return;
     };
-    crate::test_privilege::drop_dac_bypass();
+    if let Err(e) = crate::test_privilege::drop_dac_bypass() {
+        let (msg, code) = dac_bypass_failure(&e);
+        report(&msg);
+        std::process::exit(code);
+    }
     let mut gate = [0u8; 1];
     std::io::stdin().read_exact(&mut gate).expect("gate byte");
     if std::fs::metadata(&own_path).is_ok() {
@@ -147,6 +151,26 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
         }
     };
     std::process::exit(code);
+}
+
+/// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`]'s diagnostic and exit code for a
+/// [`crate::test_privilege::drop_dac_bypass`] failure, split out so the message text is checkable
+/// (below) without forcing that failure for real. It used to be forceable with root started under
+/// `--cap-drop SETUID,SETGID`, back when dropping DAC bypass meant `setuid()`; now that it means
+/// dropping two specific capabilities instead (see that function's doc for why), no `--cap-drop`
+/// combination this suite's own CI lanes exercise still makes it fail — which is the point of
+/// that change, not a gap in this one.
+fn dac_bypass_failure(e: &std::io::Error) -> (String, i32) {
+    (format!("precondition: dropping DAC bypass: {e}"), PRECONDITION_FAILED)
+}
+
+#[test]
+fn dac_bypass_failure_names_the_precondition_and_keeps_the_error() {
+    let e = std::io::Error::other("boom");
+    let (msg, code) = dac_bypass_failure(&e);
+    assert_eq!(code, PRECONDITION_FAILED);
+    assert!(msg.contains("dropping DAC bypass"), "{msg}");
+    assert!(msg.contains("boom"), "{msg}");
 }
 
 /// The command `.elevate()` spawns from a process that is already root, on any host.
