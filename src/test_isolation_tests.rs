@@ -270,10 +270,11 @@ fn a_ppid_mismatch_is_never_honored_even_with_a_real_pipe() {
 
     let (mut token_read, token_write) = std::io::pipe().expect("open a real completion-token pipe");
     let token_write_fd = token_write.as_raw_fd();
-    // Never a real pid of anything in this test's own process tree: this process's own pid is
-    // never 1 in the sandbox this test already requires (see docs/principles.md's own rule 10),
-    // and the forged child's REAL parent is this test process, never pid 1.
-    const DEFINITELY_WRONG_PARENT: &str = "1";
+    // Never a real pid, under any process: `getppid()` always returns a positive value, so `-1`
+    // can never match it regardless of what process this test happens to run as (a small pid,
+    // even 1, is a real possibility inside a container's own pid namespace, and would have made
+    // this forgery accidentally correct instead of wrong).
+    const DEFINITELY_WRONG_PARENT: &str = "-1";
     let child = {
         let _guard = super::test_spawn_lock();
         // SAFETY: clears FD_CLOEXEC on our own token pipe's write end so it survives into the
@@ -329,23 +330,28 @@ fn a_ppid_mismatch_is_never_honored_even_with_a_real_pipe() {
 /// with a MATCHING `TOKEN_PARENT_ENV` (this test's own pid — the forged child's real, immediate
 /// parent), a `TOKEN_FD_ENV` that names a REGULAR FILE instead of a pipe must still never be
 /// written to.
+///
+/// The marker file is read back by THE PARENT, after `wait_bounded` — never by the child itself.
+/// An earlier version of this test read it back inside the child, right after `alone(name)`
+/// returned — before the child's own body had even finished, let alone before `Completion::drop`
+/// (which is what would actually perform the write, per N1) had run. That version passed even
+/// with the `fstat` guard deleted outright (round 7 review, confirmed: `OBSERVED_MARKER_CONTENTS
+/// = Ok("1ntouched")` — the write DID land, the assertion just ran before it, every time). Reading
+/// the file back only after the WHOLE child process has exited — guaranteeing `Completion::drop`
+/// already ran, whichever way — is what actually exercises the guard.
 #[test]
 fn a_non_pipe_fd_is_never_touched_even_with_a_matching_ppid() {
     use std::os::fd::AsRawFd;
 
     let name = fixture_path!(a_non_pipe_fd_is_never_touched_even_with_a_matching_ppid);
-    const MARKER_PATH_ENV: &str = "COSCA_TEST_STALE_FD_MARKER_PATH";
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if alone_marker_matches(Some(name), &argv) {
         let Some(_completion) = alone(name) else {
             unreachable!("alone_marker_matches just confirmed this process is the child");
         };
-        let path = std::env::var(MARKER_PATH_ENV).expect("marker path env var");
-        let contents = std::fs::read_to_string(&path).expect("read the marker file back");
-        assert_eq!(
-            contents, "untouched",
-            "write_completion_token_if_child must never write into a fd that is not a pipe"
-        );
+        // No in-child check at all — see the doc above for why: the parent is the only place
+        // that can observe the outcome of this process's own `Completion::drop`, which runs
+        // AFTER this function returns, not before.
         return;
     }
 
@@ -382,7 +388,6 @@ fn a_non_pipe_fd_is_never_touched_even_with_a_matching_ppid() {
             .env("COSCA_TEST_ALONE", name)
             .env(TOKEN_FD_ENV, file_fd.to_string())
             .env(TOKEN_PARENT_ENV, &this_pid)
-            .env(MARKER_PATH_ENV, &path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -390,7 +395,10 @@ fn a_non_pipe_fd_is_never_touched_even_with_a_matching_ppid() {
         drop(file);
         child
     };
+    // The child has now fully exited — its own `Completion::drop` (whichever way it resolved)
+    // has already run. ONLY NOW is the marker file's content meaningful.
     let out = wait_bounded(child, PROBE_TIMEOUT, false);
+    let contents = std::fs::read_to_string(&path).expect("read the marker file back");
     let _ = std::fs::remove_file(&path);
     assert!(
         out.status.success(),
@@ -399,6 +407,10 @@ fn a_non_pipe_fd_is_never_touched_even_with_a_matching_ppid() {
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        contents, "untouched",
+        "write_completion_token_if_child must never write into a fd that is not a pipe — got {contents:?}"
     );
 }
 
@@ -409,102 +421,115 @@ const LIFELINE_TRIGGER_ENV: &str = "COSCA_TEST_TRIGGER_LIFELINE_SURROGATE_PARENT
 const LIFELINE_READY_ADDR_ENV: &str = "COSCA_TEST_LIFELINE_READY_ADDR";
 const LIFELINE_CHILD_CANARY_FD_ENV: &str = "COSCA_TEST_LIFELINE_CHILD_CANARY_FD";
 const LIFELINE_GRANDCHILD_CANARY_FD_ENV: &str = "COSCA_TEST_LIFELINE_GRANDCHILD_CANARY_FD";
+/// Bounds every wait this prover itself performs (the readiness accept, the two canary reads) —
+/// distinct from [`PROBE_TIMEOUT`] only so a regression here reads as "the lifeline tree never
+/// came up / never died", not conflated with `spawn_alone`'s own, unrelated bound.
+const LIFELINE_WAIT: std::time::Duration = PROBE_TIMEOUT;
 
-/// The prover's own SURROGATE PARENT: the ONE process the test kills directly, standing in for a
-/// nextest-managed single-test process the runner itself kills on a timeout. Spawned by the test
-/// as a raw, manually-argv'd re-exec (NOT through `spawn_alone`, which would itself wait for it to
-/// exit — defeating the point of killing it mid-flight). Its only job is to become a REAL,
-/// `spawn_alone` PARENT for [`the_lifeline_child_fixture`] via an ordinary `alone_with_env` call,
-/// so the child's lifeline is tied to THIS process for real, not simulated.
-#[test]
-fn the_lifeline_surrogate_parent_fixture() {
-    if std::env::var_os(LIFELINE_TRIGGER_ENV).is_none() {
-        return; // an ordinary suite run: not triggered by the prover below, no-op.
-    }
-    let addr = std::env::var(LIFELINE_READY_ADDR_ENV).expect("ready addr env var");
-    let child_canary_fd = std::env::var(LIFELINE_CHILD_CANARY_FD_ENV).expect("child canary fd env var");
-    let grandchild_canary_fd = std::env::var(LIFELINE_GRANDCHILD_CANARY_FD_ENV).expect("grandchild canary fd env var");
-    let child_name = fixture_path!(the_lifeline_child_fixture);
-    // Blocks until the child (and, transitively, its own grandchild) exits — which, in the
-    // scenario this proves, never happens through this call at all: the test kills THIS process
-    // first. `alone_with_env`'s own bounded wait is a safety net for anything else going wrong,
-    // not what this prover relies on.
-    let _ = alone_with_env(
-        child_name,
-        &[
-            (LIFELINE_READY_ADDR_ENV, addr.as_str()),
-            (LIFELINE_CHILD_CANARY_FD_ENV, child_canary_fd.as_str()),
-            (LIFELINE_GRANDCHILD_CANARY_FD_ENV, grandchild_canary_fd.as_str()),
-        ],
-    );
-}
-
-/// The re-exec'd child a real `spawn_alone` call (from [`the_lifeline_surrogate_parent_fixture`])
-/// launches: spawns its OWN grandchild (a plain, long-blocked process — inherits both canary fds
-/// automatically, non-`CLOEXEC`, the same way any child does), closes its own now-redundant copy
-/// of the grandchild's canary immediately (so that canary's EOF proves the GRANDCHILD's death
-/// specifically, not merely this process's own), signals the test that the whole tree is up, then
-/// blocks on the grandchild itself — never returning normally in the scenario this proves: the
-/// surrogate parent above is killed before either of these two processes get the chance to exit on
-/// their own.
+/// N2's own prover, in ONE `#[test] fn` playing all three roles by dispatching on env triggers —
+/// like every other prover in this file, NOT three separate `#[test] fn`s. An earlier version had
+/// the surrogate-parent and lifeline-child bodies as their own, separately-named `#[test] fn`s,
+/// each guarded by "return immediately if my own trigger env var is absent" — meaning both showed
+/// up in an ordinary `cargo test`/`nextest run` listing and reported PASS on every normal run,
+/// having tested nothing: exactly the silent-pass shape `docs/principles.md`'s principle 9
+/// ("tests fail loudly and never silently skip") forbids. Folding them here removes the two
+/// always-passing entries entirely.
 ///
-/// Only meaningful when spawned via [`the_lifeline_surrogate_parent_fixture`]'s own
-/// `alone_with_env` call, which is the only place `LIFELINE_READY_ADDR_ENV` is ever set — an
-/// ordinary top-level run of this same `#[test] fn` (cargo/nextest's own sweep, not the prover's
-/// deliberate spawn) has no way to supply it, and must not go on to call `alone()` at all: THAT
-/// call would re-exec a copy of this same test lacking it too, only to panic on the same missing
-/// env var one generation later, uselessly.
-#[test]
-fn the_lifeline_child_fixture() {
-    if std::env::var_os(LIFELINE_READY_ADDR_ENV).is_none() {
-        return;
-    }
-    let name = fixture_path!(the_lifeline_child_fixture);
-    let Some(_completion) = alone(name) else {
-        return;
-    };
-    let addr = std::env::var(LIFELINE_READY_ADDR_ENV).expect("ready addr env var");
-    let grandchild_canary_fd: i32 = std::env::var(LIFELINE_GRANDCHILD_CANARY_FD_ENV)
-        .expect("grandchild canary fd env var")
-        .parse()
-        .expect("valid fd number");
-
-    // The grandchild: `spawn_alone`'s own `setpgid(0, 0)` already made this process the leader of
-    // a fresh group, and an ordinary child inherits its parent's pgid at fork time — no further
-    // setpgid call is needed for it to land in the SAME group this fixture's own lifeline watcher
-    // (installed by `alone()` above) will `kill(0, SIGKILL)` on EOF.
-    let mut grandchild = std::process::Command::new("sleep")
-        .arg("1000")
-        .spawn()
-        .expect("spawn the grandchild");
-    // SAFETY: closes our own, now-redundant copy of the grandchild's canary fd — the grandchild's
-    // own inherited copy, made just above, is unaffected. Without this, the canary's EOF would
-    // require BOTH this process and the grandchild to exit, instead of proving the grandchild's
-    // death specifically.
-    unsafe {
-        libc::close(grandchild_canary_fd);
-    }
-
-    let mut sock = std::net::TcpStream::connect(&addr).expect("connect back to the test");
-    use std::io::Write;
-    sock.write_all(b"1").expect("signal readiness");
-
-    // Blocks until the grandchild exits — which, in the scenario this proves, happens only once
-    // the group-kill this process's own watcher thread issues (on its lifeline's EOF) reaches it
-    // too. If this ever returns normally instead, nothing here asserts on it: this whole process
-    // is expected to be SIGKILL'd well before reaching this point in the run this test drives.
-    let _ = grandchild.wait();
-}
-
-/// N2's own prover: killing the direct process a re-exec'd `alone()` child's lifeline is tied to
-/// must kill that child AND a grandchild it spawned into its own process group — not leave either
-/// running, orphaned under init, immune to the group-kill mechanism that already covers a hang
-/// THIS process notices (see `spawn_alone`'s own `setpgid(0, 0)`; measured without the lifeline:
-/// a real nextest TIMEOUT left the child alive with parent pid 1).
+/// Three real processes: this test (never killed) spawns the SURROGATE PARENT — the ONE process
+/// the test kills directly, standing in for a nextest-managed single-test process the runner
+/// itself kills on a timeout — as a raw, manually-argv'd re-exec (NOT through `spawn_alone`, which
+/// would itself wait for it to exit, defeating the point of killing it mid-flight). The surrogate
+/// parent's own job is to become a REAL `spawn_alone` PARENT for the LIFELINE CHILD via an
+/// ordinary `alone_with_env` call, so the child's lifeline is tied to it for real, not simulated.
+/// The lifeline child spawns its OWN grandchild (a plain, long-blocked process — inherits both
+/// canary fds automatically, non-`CLOEXEC`, the same way any child does), closes its own
+/// now-redundant copy of the grandchild's canary immediately (so that canary's EOF proves the
+/// GRANDCHILD's death specifically, not merely this process's own), signals the test that the
+/// whole tree is up, then blocks on the grandchild itself — never returning normally in the
+/// scenario this proves: the surrogate parent is killed before either of these two processes get
+/// the chance to exit on their own.
+///
+/// Killing the direct process a re-exec'd `alone()` child's lifeline is tied to must kill that
+/// child AND a grandchild it spawned into its own process group — not leave either running,
+/// orphaned under init, immune to the group-kill mechanism that already covers a hang THIS process
+/// notices (see `spawn_alone`'s own `setpgid(0, 0)`; measured without the lifeline: a real nextest
+/// TIMEOUT left the child alive with parent pid 1).
 #[test]
 fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
     use std::os::fd::AsRawFd;
 
+    let name = fixture_path!(a_dead_parent_kills_its_lifeline_child_and_grandchild);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // Level 2: the lifeline child — recognized by `alone()`'s own argv/env shape, since this
+    // process is what a REAL `spawn_alone` call (made below, by level 1) launches.
+    if alone_marker_matches(Some(name), &argv) {
+        let Some(_completion) = alone(name) else {
+            unreachable!("alone_marker_matches just confirmed this process is the child");
+        };
+        let addr = std::env::var(LIFELINE_READY_ADDR_ENV).expect("ready addr env var");
+        let grandchild_canary_fd: i32 = std::env::var(LIFELINE_GRANDCHILD_CANARY_FD_ENV)
+            .expect("grandchild canary fd env var")
+            .parse()
+            .expect("valid fd number");
+
+        // The grandchild: `spawn_alone`'s own `setpgid(0, 0)` already made this process the
+        // leader of a fresh group, and an ordinary child inherits its parent's pgid at fork time
+        // — no further setpgid call is needed for it to land in the SAME group this fixture's
+        // own lifeline watcher (installed by `alone()` above) will `kill(0, SIGKILL)` on EOF.
+        let mut grandchild = {
+            let _guard = super::test_spawn_lock();
+            std::process::Command::new("sleep")
+                .arg("1000")
+                .spawn()
+                .expect("spawn the grandchild")
+        };
+        // SAFETY: closes our own, now-redundant copy of the grandchild's canary fd — the
+        // grandchild's own inherited copy, made just above, is unaffected. Without this, the
+        // canary's EOF would require BOTH this process and the grandchild to exit, instead of
+        // proving the grandchild's death specifically.
+        unsafe {
+            libc::close(grandchild_canary_fd);
+        }
+
+        let mut sock = std::net::TcpStream::connect(&addr).expect("connect back to the test");
+        use std::io::Write;
+        sock.write_all(b"1").expect("signal readiness");
+
+        // Blocks until the grandchild exits — which, in the scenario this proves, happens only
+        // once the group-kill this process's own watcher thread issues (on its lifeline's EOF)
+        // reaches it too. If this ever returns normally instead, nothing here asserts on it:
+        // this whole process is expected to be SIGKILL'd well before reaching this point in the
+        // run this test drives.
+        let _ = grandchild.wait();
+        return;
+    }
+
+    // Level 1: the surrogate parent — recognized by its OWN trigger env var, never `alone()`'s
+    // shape (this process must stay under the TEST's manual `Child` control below, killable
+    // directly; going through `alone()`/`spawn_alone` here would hand that control to an
+    // internal, auto-waiting call instead).
+    if std::env::var_os(LIFELINE_TRIGGER_ENV).is_some() {
+        let addr = std::env::var(LIFELINE_READY_ADDR_ENV).expect("ready addr env var");
+        let child_canary_fd = std::env::var(LIFELINE_CHILD_CANARY_FD_ENV).expect("child canary fd env var");
+        let grandchild_canary_fd =
+            std::env::var(LIFELINE_GRANDCHILD_CANARY_FD_ENV).expect("grandchild canary fd env var");
+        // Blocks until the child (and, transitively, its own grandchild) exits — which, in the
+        // scenario this proves, never happens through this call at all: the test kills THIS
+        // process first. `alone_with_env`'s own bounded wait is a safety net for anything else
+        // going wrong, not what this prover relies on.
+        let _ = alone_with_env(
+            name,
+            &[
+                (LIFELINE_READY_ADDR_ENV, addr.as_str()),
+                (LIFELINE_CHILD_CANARY_FD_ENV, child_canary_fd.as_str()),
+                (LIFELINE_GRANDCHILD_CANARY_FD_ENV, grandchild_canary_fd.as_str()),
+            ],
+        );
+        return;
+    }
+
+    // Level 0: the test itself.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
     let addr = listener.local_addr().expect("listener local addr").to_string();
 
@@ -513,7 +538,6 @@ fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
     let child_canary_fd = child_canary_write.as_raw_fd();
     let grandchild_canary_fd = grandchild_canary_write.as_raw_fd();
 
-    let surrogate_name = fixture_path!(the_lifeline_surrogate_parent_fixture);
     let mut surrogate = {
         let _guard = super::test_spawn_lock();
         // SAFETY: clears FD_CLOEXEC on both canary write ends so they survive exec into the
@@ -538,7 +562,7 @@ fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
             }
         }
         let child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([surrogate_name, "--exact", "--nocapture", "--test-threads=1"])
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
             .env(LIFELINE_TRIGGER_ENV, "1")
             .env(LIFELINE_READY_ADDR_ENV, &addr)
             .env(LIFELINE_CHILD_CANARY_FD_ENV, child_canary_fd.to_string())
@@ -556,8 +580,22 @@ fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
     };
 
     // Blocks until the whole tree (surrogate parent -> child -> grandchild) is confirmed up —
-    // never a sleep-then-check: `accept()` blocks on the real event, the child's own connect-back.
-    let (mut sock, _) = listener.accept().expect("accept the readiness connection");
+    // never a sleep-then-check: accepting the real event, the child's own connect-back — but
+    // bounded: if the tree never comes up (a regression upstream of what this prover itself
+    // covers), this must read as "it hung", not hang the whole run indefinitely alongside it.
+    let (accept_tx, accept_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let accepted = listener.accept();
+        let _ = accept_tx.send(accepted);
+    });
+    let mut sock = match accept_rx.recv_timeout(LIFELINE_WAIT) {
+        Ok(Ok((sock, _))) => sock,
+        Ok(Err(e)) => panic!("accepting the readiness connection failed: {e}"),
+        Err(_) => panic!(
+            "the surrogate parent -> lifeline child -> grandchild tree never signalled \
+             readiness within {LIFELINE_WAIT:?}"
+        ),
+    };
     let mut tag = [0u8; 1];
     use std::io::Read;
     sock.read_exact(&mut tag).expect("read the readiness tag");
@@ -577,7 +615,7 @@ fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
             let _ = read_end.read_to_end(&mut buf);
             let _ = tx.send(());
         });
-        rx.recv_timeout(PROBE_TIMEOUT).unwrap_or_else(|_| {
+        rx.recv_timeout(LIFELINE_WAIT).unwrap_or_else(|_| {
             panic!(
                 "the {label} must die (its own canary pipe must EOF) once the surrogate parent \
                  that launched it is killed out from under it — the lifeline watcher thread must \
@@ -586,6 +624,120 @@ fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
             )
         });
     }
+}
+
+// spawn_alone's OWN whole-group timeout kill (N3/N4) =====
+
+const HANGING_CANARY_FD_ENV: &str = "COSCA_TEST_HANGING_CANARY_FD";
+
+/// `spawn_alone`'s own `wait_bounded(child, PROBE_TIMEOUT, true)` — the bounded wait EVERY
+/// `alone()`/`alone_capturing()`/`alone_with_env` call goes through — had no direct prover:
+/// changing that call's `true` to `false` (own_process_group) left every other test in this file
+/// passing (measured, round 7 review). This is that prover: a fixture whose body, once recognized
+/// as `alone()`'s own child, spawns a grandchild holding the only remaining copy of a canary
+/// pipe's write end and then hangs forever (blocks on that same grandchild, which itself never
+/// exits on its own) — never returning, so `spawn_alone`'s real, hardcoded `PROBE_TIMEOUT` (30s,
+/// not a shorter one this test picks) genuinely elapses and its real `wait_on_channel` `Timeout`
+/// arm fires `kill_and_reap(child, true)`, the exact call under test, before panicking (expected,
+/// caught below — `kill_and_reap` has already run by the time that panic unwinds out).
+///
+/// Same one-`#[test]`-fn, dispatch-on-recognition shape as every other prover here, not a
+/// separately-named, always-passing fixture fn (principle 9).
+#[test]
+fn spawn_alones_own_timeout_kill_reaches_a_grandchild() {
+    use std::os::fd::AsRawFd;
+
+    let name = fixture_path!(spawn_alones_own_timeout_kill_reaches_a_grandchild);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if alone_marker_matches(Some(name), &argv) {
+        let Some(_completion) = alone(name) else {
+            unreachable!("alone_marker_matches just confirmed this process is the child");
+        };
+        let canary_fd: i32 = std::env::var(HANGING_CANARY_FD_ENV)
+            .expect("canary fd env var")
+            .parse()
+            .expect("valid fd number");
+        // The grandchild: same reasoning as the lifeline prover above — this process is already
+        // the leader of its own fresh group (`spawn_alone`'s own `setpgid(0, 0)`), so an ordinary
+        // child inherits that group at fork time, with no further setpgid call needed.
+        let mut grandchild = {
+            let _guard = super::test_spawn_lock();
+            std::process::Command::new("sleep")
+                .arg("1000")
+                .spawn()
+                .expect("spawn the grandchild")
+        };
+        // SAFETY: closes our own, now-redundant copy — the grandchild's own inherited copy, made
+        // just above, is unaffected. Without this, the canary's EOF would require BOTH this
+        // process and the grandchild to exit, instead of proving the grandchild's death
+        // specifically (which is what the group kill under test must reach).
+        unsafe {
+            libc::close(canary_fd);
+        }
+        // Hangs forever — the point. `wait()` on the equally-hanging grandchild rather than an
+        // arbitrary blocking read: this process must never return normally, and the grandchild
+        // never exits on its own either, so this blocks for as long as this process itself
+        // survives — which, in the run this test drives, ends only when the group kill under
+        // test reaches it.
+        let _ = grandchild.wait();
+        return;
+    }
+
+    use std::io::Read;
+    let (mut canary_read, canary_write) = std::io::pipe().expect("open canary pipe");
+    let canary_fd = canary_write.as_raw_fd();
+    {
+        let _guard = super::test_spawn_lock();
+        // SAFETY: clears FD_CLOEXEC on the canary's write end so it survives exec into the
+        // fixture, and from there plain fork inheritance carries it into the grandchild — held
+        // under `test_spawn_lock()` for the same reason `spawn_alone` itself does this.
+        unsafe {
+            let flags = libc::fcntl(canary_fd, libc::F_GETFD);
+            assert_ne!(
+                flags,
+                -1,
+                "fcntl(F_GETFD) on the canary pipe: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                libc::fcntl(canary_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                0,
+                "fcntl(F_SETFD) to make the canary pipe inheritable: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    // `alone_with_env` panics when its own `spawn_alone` call's `wait_bounded` times out (an
+    // ordinary, expected outcome of THIS SPECIFIC scenario — every OTHER caller in this file
+    // treats that panic as a genuine failure, which is exactly why this one must be the only
+    // place that deliberately catches it): `kill_and_reap` has already run, synchronously,
+    // before that panic unwinds out to here, so the group kill under test has already happened
+    // by the time this returns.
+    let canary_write_fd_str = canary_fd.to_string();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        alone_with_env(name, &[(HANGING_CANARY_FD_ENV, canary_write_fd_str.as_str())])
+    }));
+    drop(canary_write);
+    assert!(
+        result.is_err(),
+        "a hanging alone body must make spawn_alone's own wait_bounded time out and panic — a \
+         silent return here would mean the real PROBE_TIMEOUT never elapsed, or elapsed without \
+         reaching the Timeout arm under test"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = canary_read.read_to_end(&mut buf);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(PROBE_TIMEOUT).unwrap_or_else(|_| {
+        panic!(
+            "spawn_alone's own timeout-triggered kill_and_reap(child, true) must reach the \
+             grandchild too, via the group kill — its own canary pipe must EOF, not stay open \
+             forever"
+        )
+    });
 }
 
 // RestoreStdio: duplicate fd, mid-loop restore, no double panic =====
@@ -865,6 +1017,29 @@ fn kill_and_reap_sends_sigkill() {
 /// `kill_and_reap`'s own `child.wait()` already confirms, trivially, for every call).
 #[test]
 fn kill_and_reap_with_own_process_group_reaches_a_grandchild() {
+    run_kill_and_reap_own_process_group_scenario();
+}
+
+/// The same scenario as [`kill_and_reap_with_own_process_group_reaches_a_grandchild`], but with
+/// fds 3 through 12 deliberately occupied first — a direct regression test for the exact bug
+/// round 7's review found and reported a deterministic repro for: this test's own pipes, and
+/// hence the fixed targets `dup2` moves them to inside the leader, are chosen independently of
+/// whatever else happens to be open in the CURRENT process — under a shared, long-running test
+/// binary (or, as measured, plain `cargo test` specifically, which shares one process across many
+/// tests, unlike nextest's one-process-per-test) they can land anywhere. Occupying a wide,
+/// contiguous low range first is what actually forces the pipes themselves above it, proving the
+/// fix holds regardless of this process's own ambient fd usage, not merely in whatever state this
+/// binary happens to start a test run in.
+#[test]
+fn kill_and_reap_with_own_process_group_reaches_a_grandchild_with_high_fds_occupied() {
+    let _occupied: Vec<std::fs::File> = (3..=12)
+        .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
+        .collect();
+    run_kill_and_reap_own_process_group_scenario();
+}
+
+fn run_kill_and_reap_own_process_group_scenario() {
+    use std::io::Read;
     use std::os::fd::AsRawFd;
 
     let (mut canary_read, canary_write) = std::io::pipe().expect("open canary pipe");
@@ -878,12 +1053,27 @@ fn kill_and_reap_with_own_process_group_reaches_a_grandchild() {
     // sleep guessing at how long that takes.
     let (mut ready_read, ready_write) = std::io::pipe().expect("open readiness pipe");
     let ready_fd = ready_write.as_raw_fd();
+    // Fixed, single-digit targets for the shell script below to reference — NOT `canary_fd`
+    // and `ready_fd`'s own, dynamically-allocated numbers. `dash` (Debian/Ubuntu's `/bin/sh`)
+    // only parses a SINGLE digit after `>&`/before `>&-` in these redirections; this test's own
+    // pipes can otherwise land at fd 10 or higher (measured, round 7 review: under a shared test
+    // process with enough already open, they routinely do), which `dash` then rejects with exit
+    // 127 — silently, well before the leader ever reaches the readiness write, leaving `sleep
+    // 1000` backgrounded and this test's own readiness read blocked for however long whatever
+    // else eventually bounds it (measured: 655s, then `UnexpectedEof`). `dup2`ing onto fixed,
+    // known-single-digit numbers in `pre_exec` sidesteps `dash`'s own parsing limit entirely,
+    // regardless of what this process's own pipe fds happen to number.
+    const FIXED_CANARY_FD: libc::c_int = 3;
+    const FIXED_READY_FD: libc::c_int = 4;
     let leader = {
         let _guard = super::test_spawn_lock();
         // SAFETY: clears FD_CLOEXEC on both pipes' write ends so they survive exec into the
         // leader, and from there plain fork inheritance carries the canary further down into
         // whatever the leader itself spawns — held under `test_spawn_lock()` for the same reason
-        // `spawn_alone` does.
+        // `spawn_alone` does. Belt-and-suspenders with the `pre_exec` `dup2` below: if `dup2`'s
+        // own source and target numbers ever happened to coincide (a same-fd `dup2` is a no-op
+        // per POSIX, including for `FD_CLOEXEC`), this is what would still guarantee the fd
+        // survives the exec.
         for fd in [canary_fd, ready_fd] {
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -902,22 +1092,38 @@ fn kill_and_reap_with_own_process_group_reaches_a_grandchild() {
             }
         }
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(format!(
-                // Backgrounds the grandchild (inherits the canary fd, still open at this
-                // point), closes THIS process's own copy of it (so only the grandchild is left
-                // holding it), THEN signals readiness and closes that fd too, before blocking in
-                // `wait` — the write can only happen after both prior steps completed.
-                "sleep 1000 & exec {canary_fd}>&- ; printf r >&{ready_fd} ; exec {ready_fd}>&- ; wait"
-            ))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // SAFETY: async-signal-safe; the exact same technique `spawn_alone` itself uses.
+        cmd.arg("-c").arg(
+            // Backgrounds the grandchild (inherits both fixed fds, still open at this point),
+            // closes THIS process's own copy of the canary (so only the grandchild is left
+            // holding it), THEN signals readiness and closes that fd too, before blocking in
+            // `wait` — the write can only happen after both prior steps completed.
+            format!("sleep 1000 & exec {FIXED_CANARY_FD}>&- ; printf r >&{FIXED_READY_FD} ; exec {FIXED_READY_FD}>&- ; wait"),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        // SAFETY: async-signal-safe; `setpgid` is the exact same technique `spawn_alone` itself
+        // uses. The two `dup2`s move the pipe ends to `FIXED_CANARY_FD`/`FIXED_READY_FD`
+        // regardless of their own original numbers, then close whichever original number is
+        // left over (a `dup2(fd, fd)` no-op leaves nothing to close, hence the guard) — this
+        // runs in the FORKED CHILD, after `fork` and before `exec`, so it can never affect this
+        // test's own fd table.
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(canary_fd, FIXED_CANARY_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(ready_fd, FIXED_READY_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if canary_fd != FIXED_CANARY_FD && canary_fd != FIXED_READY_FD {
+                    libc::close(canary_fd);
+                }
+                if ready_fd != FIXED_CANARY_FD && ready_fd != FIXED_READY_FD {
+                    libc::close(ready_fd);
                 }
                 Ok(())
             });
@@ -929,12 +1135,20 @@ fn kill_and_reap_with_own_process_group_reaches_a_grandchild() {
     };
 
     // Blocks until the leader confirms it has ALREADY backgrounded the grandchild and closed its
-    // own canary copy — never a sleep-then-check.
-    let mut ready = [0u8; 1];
-    use std::io::Read;
-    ready_read
-        .read_exact(&mut ready)
-        .expect("read the leader's readiness byte");
+    // own canary copy — but bounded: a leader that never reaches the readiness write (this
+    // exact test's own round-7 regression, before the `dup2`-onto-fixed-numbers fix above) must
+    // read as "it hung", not hang the whole run indefinitely alongside it.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ready = [0u8; 1];
+        let result = ready_read.read_exact(&mut ready);
+        let _ = ready_tx.send(result);
+    });
+    match ready_rx.recv_timeout(PROBE_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("reading the leader's readiness byte failed: {e}"),
+        Err(_) => panic!("the leader never signalled readiness within {PROBE_TIMEOUT:?}"),
+    }
 
     kill_and_reap(leader, true);
 

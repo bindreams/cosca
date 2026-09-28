@@ -80,7 +80,12 @@ pub(crate) fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool
 /// The write end's `CLOEXEC` flag is cleared so it survives into the child at the SAME fd number,
 /// which the child is told via [`TOKEN_FD_ENV`] — clearing it happens while this process holds
 /// `test_spawn_lock()`, the same lock that already serializes every raw fork here, so no
-/// concurrent, unrelated spawn can observe the momentarily-inheritable fd.
+/// concurrent, unrelated spawn can observe the momentarily-inheritable fd. "Momentarily" on the
+/// child's own side too: [`reclaim_cloexec_on_inherited_fds`] sets `CLOEXEC` back the instant the
+/// child recognizes itself, before its real body runs — this process's own later write
+/// ([`write_completion_token_if_child`]) happens directly, by fd number, never across a further
+/// exec, so nothing about that write needs the fd to stay inheritable one moment longer. Left
+/// cleared, it would leak into every further child the test body itself spawns instead.
 pub(crate) const TOKEN_FD_ENV: &str = "COSCA_TEST_ALONE_TOKEN_FD";
 
 /// The pid `spawn_alone` recorded as this child's own immediate parent, set alongside
@@ -162,6 +167,45 @@ fn write_completion_token_if_child() {
     let _ = file.write_all(b"1");
 }
 
+/// Set `FD_CLOEXEC` back on [`TOKEN_FD_ENV`]'s and [`LIFELINE_FD_ENV`]'s own fds, for the
+/// re-exec'd child itself. `spawn_alone` clears it on both so they survive ITS OWN exec into this
+/// process — nothing needs them inheritable beyond that: this process's own later completion-token
+/// write ([`write_completion_token_if_child`]) and lifeline read ([`install_lifeline_watcher`])
+/// both happen directly, by fd number, from THIS SAME process, never across a further exec.
+///
+/// Left cleared, both fds leak into EVERY further child the test body itself spawns (measured,
+/// round 7 review: a `sh -c "ls -l /proc/self/fd"` grandchild showed both open, at fd numbers
+/// named by `TOKEN_FD_ENV`/`LIFELINE_FD_ENV` themselves). Two concrete costs, not just a
+/// hygiene concern: `spawn_alone`'s own `token_read.read_to_end` (see there) blocks until EVERY
+/// copy of the write end closes, so a grandchild that outlives the test body's own return (e.g.
+/// `Stdio::null()`'d and detached, as a real cosca child under test often is) delays — measured: a
+/// `sleep 45` grandchild made the whole `alone()` call take 45s — or, if it never exits at all,
+/// hangs the outer call forever, not just this one test. A grandchild holding the lifeline read
+/// end open the same way would additionally defeat N2's own mechanism for it specifically.
+///
+/// Called once, by the child branch of both [`alone`] and [`alone_capturing`], right after this
+/// process recognizes itself — before either function returns control to the real test body, so
+/// nothing the body runs (including its own very first `Command::spawn`) can ever observe either
+/// fd as inheritable.
+fn reclaim_cloexec_on_inherited_fds() {
+    for env in [TOKEN_FD_ENV, LIFELINE_FD_ENV] {
+        let Some(fd) = std::env::var_os(env) else { continue };
+        let Some(fd) = fd.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        // SAFETY: `fd` was made inheritable by `spawn_alone` specifically for this child;
+        // restoring FD_CLOEXEC does not close it or otherwise affect this process's OWN direct
+        // use of it (write_completion_token_if_child, install_lifeline_watcher both read/write it
+        // by raw fd number, unaffected by CLOEXEC, which only ever applies across an exec).
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags != -1 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 /// Close this process's own inherited [`TOKEN_FD_ENV`] fd without writing to it — for a child
 /// spawned via [`alone_capturing`], whose caller inspects the re-exec'd child's raw `Output`
 /// directly and never reads the completion token. Unlike [`alone`]'s child (see [`Completion`]),
@@ -212,10 +256,19 @@ fn install_lifeline_watcher() {
     });
 }
 
-/// An RAII marker [`alone`]/[`alone_capturing`] return to the re-exec'd child — hold it (even as
-/// `_`) across the real test body. Its `Drop` is the ONLY place that calls
-/// [`write_completion_token_if_child`], and only when the current thread is not unwinding from a
-/// panic (`std::thread::panicking()`).
+/// An RAII marker [`alone`]/[`alone_capturing`] return to the re-exec'd child — bind it to a
+/// NAMED variable, such as `_completion`, and hold that across the real test body. Its `Drop` is
+/// the ONLY place that calls [`write_completion_token_if_child`], and only when the current
+/// thread is not unwinding from a panic (`std::thread::panicking()`).
+///
+/// NEVER bind it to the bare wildcard `_` (directly, as `let _ = alone(name);`, or nested, as
+/// `let Some(_) = alone(name) else { ... };`) — `_` is not a binding at all; the matched value is
+/// a temporary that drops at the end of THAT STATEMENT, immediately, before the real body runs.
+/// This reintroduces the exact bug this whole type exists to fix (see below), just one call site
+/// away from `alone()`'s own recognition instead of inside it — confirmed on `rustc` 1.90 (round 7
+/// review). `_completion` (a real, if underscore-PREFIXED, identifier) is a completely different,
+/// safe thing: it silences the "unused variable" lint the SAME way `_` appears to, but binds
+/// normally and drops at the END OF ITS ENCLOSING SCOPE, same as any other named variable.
 ///
 /// This is what makes "the token arrived" prove "the body ran to completion", not merely "the
 /// process exited zero": writing the token at the moment [`alone`] first recognizes the child
@@ -235,13 +288,31 @@ impl Drop for Completion {
     }
 }
 
+/// Read `reader` to EOF on a background thread, bounded by `timeout` — an empty `Vec` if nothing
+/// arrived in time, exactly like a genuine EOF-with-no-bytes would read. The background thread
+/// itself is not joined or otherwise waited on beyond `timeout`: on a timeout it is abandoned
+/// (still blocked in its own read, if whatever holds `reader`'s write end open never closes it),
+/// which is the deliberate trade this makes — a caller-visible bound instead of a caller-visible
+/// hang, at the cost of one outstanding thread for the rest of THIS process's own life in the
+/// timeout case specifically (never in the ordinary case, where the read completes and the thread
+/// exits normally well within the bound).
+fn read_bounded(mut reader: impl std::io::Read + Send + 'static, timeout: std::time::Duration) -> Vec<u8> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx.recv_timeout(timeout).unwrap_or_default()
+}
+
 /// Spawn a fresh copy of this test binary against `name` with the isolated `alone()` shape
 /// (`COSCA_TEST_ALONE=name`, argv [`ALONE_ARGS`]) plus `extra_env`, give it a token pipe (see
 /// [`TOKEN_FD_ENV`]) and a lifeline pipe (see [`LIFELINE_FD_ENV`]), and wait for it — the shared
 /// spawn machinery [`alone`], [`alone_capturing`] and [`alone_with_env`] all build on. Returns the
 /// captured `Output` plus whether the completion token arrived.
 fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output, bool) {
-    let (mut token_read, token_write) = std::io::pipe().expect("open completion-token pipe");
+    let (token_read, token_write) = std::io::pipe().expect("open completion-token pipe");
     let token_write_fd = token_write.as_raw_fd();
     let (lifeline_read, lifeline_write) = std::io::pipe().expect("open lifeline pipe");
     let lifeline_read_fd = lifeline_read.as_raw_fd();
@@ -309,9 +380,14 @@ fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output,
         child
     };
     let out = wait_bounded(child, PROBE_TIMEOUT, true);
-    let mut token = Vec::new();
-    use std::io::Read;
-    let _ = token_read.read_to_end(&mut token);
+    // Bounded the same way `wait_bounded` itself is, not a bare blocking read: by the time
+    // `wait_bounded` has returned, the CHILD has already exited, so ordinarily every copy of the
+    // token write end is already gone too — but `reclaim_cloexec_on_inherited_fds` is what makes
+    // that actually true (a leaked copy in a still-running grandchild would otherwise hold this
+    // open indefinitely, hanging this read forever regardless of the child's own exit). This bound
+    // is what turns "some future regression re-opens that leak" into "this read times out and
+    // reports no token", never "this call hangs forever".
+    let token = read_bounded(token_read, PROBE_TIMEOUT);
     // `lifeline_write` drops here, at the end of this function — deliberately kept alive across
     // the whole wait above. The child's own watcher thread self-destructs the instant it sees
     // THIS fd close, so closing it any earlier (even a "tidy" explicit drop right after spawning)
@@ -323,20 +399,23 @@ fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output,
 }
 
 /// Run the test `name` (its full path, as libtest reports it) alone, in a fresh copy of this test
-/// binary, and assert it passed. `Some(Completion)` in the copy — hold it (even as `_`) across the
-/// test's real body, whose normal return is what makes its `Drop` report completion (see
-/// [`Completion`]'s own doc for why that, not the moment of recognition, is when it must run);
-/// `None` in the original caller, which must return immediately — the real work already ran, in
-/// isolation, in the re-exec'd child.
+/// binary, and assert it passed. `Some(Completion)` in the copy — bind it to a NAMED variable
+/// (e.g. `_completion`, NEVER the bare `_` — see [`Completion`]'s own doc for why) and hold that
+/// across the test's real body, whose normal return is what makes its `Drop` report completion
+/// (see [`Completion`]'s own doc for why that, not the moment of recognition, is when it must
+/// run); `None` in the original caller, which must return immediately — the real work already
+/// ran, in isolation, in the re-exec'd child.
 ///
 /// Pass/fail is decided from the re-exec'd child's exit status AND its completion token, never by
 /// scanning its stdout for libtest's own banner text.
 #[must_use = "the caller must return immediately when this is None — the real work already ran, \
-              in isolation, in the re-exec'd child. Hold the Some(Completion) alive across the \
-              real body (even bound to `_`): its own Drop is what reports completion."]
+              in isolation, in the re-exec'd child. Bind the Some(Completion) to a NAMED variable \
+              and hold it alive across the real body — NEVER the bare `_`, which drops it \
+              immediately, before the real body runs; see Completion's own doc."]
 pub fn alone(name: &str) -> Option<Completion> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if alone_marker_matches(Some(name), &argv) {
+        reclaim_cloexec_on_inherited_fds();
         install_lifeline_watcher();
         return Some(Completion { _private: () });
     }
@@ -370,6 +449,7 @@ pub fn alone(name: &str) -> Option<Completion> {
 pub fn alone_capturing(name: &str) -> Option<std::process::Output> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if alone_marker_matches(Some(name), &argv) {
+        reclaim_cloexec_on_inherited_fds();
         install_lifeline_watcher();
         close_inherited_completion_token();
         return None;
