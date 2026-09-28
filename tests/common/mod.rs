@@ -274,7 +274,9 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     }
     #[cfg(unix)]
     cmd.stdout(cosca::Stdio::pipe()).expect("configure a piped stdout");
-    let mut child = cmd.spawn().expect("spawn control child");
+    let child = cmd.spawn().expect("spawn control child");
+    #[cfg(unix)]
+    let mut child = child; // only unix's `.stdout()` call below needs this mutable
     #[cfg(unix)]
     let mut sock = {
         let mut dead_watch = child.stdout().expect("child was spawned with a piped stdout");
@@ -351,7 +353,9 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     }
     #[cfg(unix)]
     cmd.stdout(cosca::Stdio::pipe()).expect("configure a piped stdout");
-    let mut child = cmd.spawn().expect("spawn tree");
+    let child = cmd.spawn().expect("spawn tree");
+    #[cfg(unix)]
+    let mut child = child; // only unix's `.stdout()` call below needs this mutable
     #[cfg(unix)]
     let mut dead_watch = child.stdout().expect("child was spawned with a piped stdout");
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
