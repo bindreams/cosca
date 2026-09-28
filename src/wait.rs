@@ -175,12 +175,12 @@ pub(crate) mod test_clock {
 }
 
 #[cfg(not(test))]
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     Instant::now()
 }
 
 #[cfg(test)]
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     test_clock::now()
 }
 
@@ -190,9 +190,17 @@ fn now() -> Instant {
 ///
 /// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
+    remaining_at(deadline, now())
+}
+
+/// [`remaining`], taking `now` as an explicit argument instead of reading the clock itself. A caller that also needs to PROVE (e.g. to a test observer) exactly which clock
+/// reading a `remaining` value came from can read `now` once and pass it to both — one read,
+/// shared — rather than trusting a second, independent `Instant::now()` call elsewhere to
+/// coincide with the one this function would otherwise take internally.
+pub(crate) fn remaining_at(deadline: Option<Option<Instant>>, now: Instant) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,
-        Some(Some(at)) => Some(at.saturating_duration_since(now())),
+        Some(Some(at)) => Some(at.saturating_duration_since(now)),
     }
 }
 
@@ -205,11 +213,63 @@ pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
 /// would panic there instead of waiting. Shared by every `_timeout`/`grace`-style call that
 /// starts a fresh relative wait from "now".
 pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
+    // Test-only, single-use override: lets a test force this call to return a MADE-UP instant
+    // instead of a real `Instant::now() + duration` — see `deadline_from_override_seam`'s own
+    // doc for why this makes a "was the deadline re-derived instead of threaded through"
+    // mutant provable by exact equality, not by betting two independent `Instant::now()` reads
+    // never happen to coincide at whatever resolution the host's clock actually has.
+    #[cfg(test)]
+    if let Some(at) = deadline_from_override_seam::take() {
+        return Some(Some(at));
+    }
     Some(
         now()
             .checked_add(duration)
             .filter(|at| at.checked_add(Duration::from_millis(1)).is_some()),
     )
+}
+
+/// Test-only, single-use, per-thread override for [`deadline_from`]'s NEXT call: returns a
+/// caller-chosen `Instant` instead of computing one from the real clock. Set on the ARMING
+/// thread (e.g. a `#[tokio::test]`'s own thread, before calling an async fn whose first,
+/// pre-`.await` action is `deadline_from`), it has no effect on any OTHER thread — in
+/// particular not on a `spawn_blocking` closure the armed value is later handed to. A test
+/// picks an instant already in the past (e.g. `start - 1s`, `start` read before arming) so
+/// that a CORRECT callee, which only ever THREADS the armed value through, reports that exact
+/// made-up instant back; a callee that instead RE-DERIVES its own deadline (e.g. by calling
+/// `deadline_from`/`Instant::now()` again on a different thread, where this override does not
+/// apply) reports a real, current instant — always later than the made-up past one, and so
+/// always unequal to it. No clock-resolution assumption either way.
+#[cfg(test)]
+pub(crate) mod deadline_from_override_seam {
+    use std::cell::Cell;
+    use std::time::Instant;
+    thread_local! {
+        static OVERRIDE: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    /// Force the next [`deadline_from`](super::deadline_from) call on THIS thread to return
+    /// `Some(Some(at))`.
+    // Only a Windows-`tokio`-feature test currently installs this (see `tokio::wait_tests`);
+    // dead on any build lacking either, where `deadline_from` still compiles the (never-armed)
+    // check.
+    /// The override is cleared when the returned guard drops, if `deadline_from` has not
+    /// already consumed it (RAII, even mid-panic).
+    #[cfg_attr(not(all(windows, feature = "tokio")), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn set(at: Instant) -> Guard {
+        OVERRIDE.with(|c| c.set(Some(at)));
+        Guard(())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(None));
+        }
+    }
+    /// Consume and return the forced value, if one is armed.
+    pub(crate) fn take() -> Option<Instant> {
+        OVERRIDE.with(|c| c.take())
+    }
 }
 
 /// The largest `Instant` reachable from `start`, found purely through `checked_add`'s own

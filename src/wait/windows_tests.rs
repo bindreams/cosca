@@ -214,7 +214,7 @@ fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
     let cancel = super::new_cancel_event().expect("create cancel event");
     wait_ms_probe::take();
     let _override = remaining_override_seam::set(Duration::from_micros(500));
-    let result = super::block_until_exit_or_cancel(id, Some(Duration::from_millis(5)), &cancel);
+    let result = super::block_until_exit_or_cancel(id, crate::wait::deadline_from(Duration::from_millis(5)), &cancel);
     let probed = wait_ms_probe::take();
     let_child_exit(child);
     result.expect("a live never-exiting child must not report a wait failure");
@@ -248,7 +248,7 @@ fn block_until_exit_or_cancel_never_reports_still_alive_before_the_deadline() {
     let _override = remaining_override_seam::set(Duration::from_micros(500));
     wait_ms_probe::on_second_arm(move || drop(stdin));
     let grace = Duration::from_secs(3600); // hours off: nowhere near expiry
-    let result = super::block_until_exit_or_cancel(id, Some(grace), &cancel);
+    let result = super::block_until_exit_or_cancel(id, crate::wait::deadline_from(grace), &cancel);
     let probed = wait_ms_probe::take();
     let exited = result.expect("a genuinely-terminated child must not report a wait failure");
     child.wait().expect("reap the child after it exits");
@@ -281,7 +281,7 @@ fn block_until_exit_or_cancel_re_arms_past_a_clamped_timeout() {
     let _clamp = wait_clamp_seam::set(5);
     wait_ms_probe::on_second_arm(move || drop(stdin));
     let grace = Duration::from_secs(3600); // hours off: always clamped
-    let result = super::block_until_exit_or_cancel(id, Some(grace), &cancel);
+    let result = super::block_until_exit_or_cancel(id, crate::wait::deadline_from(grace), &cancel);
     let probed = wait_ms_probe::take();
     let exited = result.expect("a genuinely-terminated child must not report a wait failure");
     child.wait().expect("reap the child after it exits");
