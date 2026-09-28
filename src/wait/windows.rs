@@ -74,6 +74,9 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     };
     // SAFETY: `handle` is a live process handle held for the wait's duration.
     let waited = unsafe { WaitForSingleObject(handle, ms) };
+    // A real wait call may legitimately reach here and still resolve at once: the
+    // identity-verified handle can name an already-exited-but-not-yet-destroyed process
+    // object, which is already signaled, so `WAIT_OBJECT_0` comes back promptly.
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
     close(handle);
@@ -184,9 +187,31 @@ pub(crate) fn block_until_exit_or_cancel(
             clamped
         }
     };
+    // Test-only seam: proves — immediately, never by elapsed time — that this wait is never
+    // genuinely entered on a still-alive target. See `armed_probe`'s own doc. Gated on
+    // `is_armed()`: EVERY caller of this function in the whole binary reaches this point
+    // (e.g. `grace_wait_true_when_child_dies_mid_wait` genuinely needs its wait to run to
+    // completion), so polling and force-cancelling unconditionally would silently break any
+    // other test whose target is still alive here — only the one test that installed the
+    // observer may have its wait diverted.
+    #[cfg(test)]
+    if armed_probe::is_armed() {
+        // SAFETY: `handle` is a live, identity-verified process handle; ms=0 is a
+        // non-blocking poll, never a wait.
+        let already = unsafe { WaitForSingleObject(handle, 0) };
+        if already != WAIT_OBJECT_0 {
+            armed_probe::notify_armed_unsignalled();
+            // Force the real wait below to return at once instead of genuinely spending
+            // `ms` — a bug this seam catches must fail fast, not hang out the grace.
+            signal_cancel(cancel);
+        }
+    }
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // SAFETY: both handles are live for the wait's duration.
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+    // A real wait call may legitimately reach here and still resolve at once: the
+    // identity-verified handle can name an already-exited-but-not-yet-destroyed process
+    // object, which is already signaled, so `WAIT_OBJECT_0` comes back promptly.
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
@@ -284,4 +309,102 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
                  child use graceful_shutdown_tree (CTRL_BREAK to the group)"
             .into(),
     })
+}
+
+/// Test-only seam proving `block_until_exit_or_cancel` never genuinely enters its real wait on
+/// a still-alive target — immediately, never by elapsed time (a `WAIT_TIMEOUT`-based counter
+/// could only ever be told apart from correct code by how long the call ran, which makes
+/// elapsed time the real assertion; see the PR that replaced it with this seam).
+///
+/// The call site (`block_until_exit_or_cancel`, just before the real wait) only polls and acts
+/// when [`is_armed`] is true. `block_until_exit_or_cancel` is the SAME function every other
+/// grace-wait test in the binary calls, several of them precisely to watch a genuinely
+/// still-alive target run its real wait to completion (e.g.
+/// `grace_wait_true_when_child_dies_mid_wait`); gating on `is_armed` is what keeps this seam
+/// from force-releasing THEIR waits too. Only once armed does it do a non-blocking
+/// `WaitForSingleObject(handle, 0)` on the TARGET — not `cancel` — the instant before the real
+/// wait would be entered. If that target is not ALREADY signaled (the process has not already
+/// exited), this is exactly the regression shape this test exists to catch: a real wait is
+/// about to be genuinely entered on a live target. [`notify_armed_unsignalled`] fires, and the
+/// call site immediately force-signals `cancel` so the real wait that follows returns at once
+/// instead of genuinely spending the grace — a caught bug fails fast, not slow.
+///
+/// `thread_local!`, NOT a process-global slot — a global (even one gated by `is_armed`) is
+/// still visible from every thread, so under plain `cargo test`'s shared-process, many-threads
+/// model (which cosca must pass — [#201]) a concurrent, unrelated test's
+/// `block_until_exit_or_cancel` call on ANOTHER thread would see `is_armed() == true` while
+/// this test's guard is installed, find ITS OWN target unsignalled, and get force-cancelled
+/// too — cross-test interference, the exact shape the old `ProcessId`-keyed map was trying
+/// (and, per its own doc, over-solving) to avoid.
+///
+/// `block_until_exit_or_cancel` runs inside `tokio::task::spawn_blocking`'s closure
+/// (`crate::tokio::wait::blocking_watch`), on a blocking-pool thread distinct from the one that
+/// called `grace_wait` (the "arming" thread) — so a thread-local written by the ARMING thread
+/// (where a test calls [`install`]) is not, by itself, visible to code running on the
+/// blocking-pool thread. `blocking_watch` bridges the two explicitly, the same way
+/// `crate::wait::fault`'s seam relies on running entirely on the arming thread, just one hop
+/// further: it reads [`current`] — the arming thread's installed sender, cloned — BEFORE
+/// calling `spawn_blocking` (still on the arming thread; nothing before that call yields), then
+/// `move`s the captured value into the closure and re-[`install`]s it there via another
+/// `Guard`, scoped to that one blocking-pool call. Two distinct OS threads, each briefly
+/// holding its OWN copy of the sender in its OWN thread-local slot — never a value shared
+/// (mutably or otherwise) across threads.
+///
+/// [#201]: https://github.com/bindreams/cosca/pull/201
+#[cfg(test)]
+pub(crate) mod armed_probe {
+    use std::cell::RefCell;
+    use std::sync::mpsc::Sender;
+
+    thread_local! {
+        static ARMED_TX: RefCell<Option<Sender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// Installs `tx` as the CURRENT thread's observer for the guard's lifetime, restoring
+    /// whatever was there before (always `None` in every real use — this repo never nests two
+    /// installs on one thread) on drop, even on unwind, so a panicking test or a reused
+    /// blocking-pool thread never carries a stale observer forward.
+    // The only consumer is the tokio TreeWalk fast-path test
+    // (`windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`), so this is
+    // dead code in a `--no-default-features` (no `tokio`) build — same shape as
+    // `block_until_exit_or_cancel`'s own `allow(dead_code)` just above.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) struct Guard(Option<Sender<()>>);
+
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn install(tx: Sender<()>) -> Guard {
+        let prev = ARMED_TX.with(|cell| cell.replace(Some(tx)));
+        Guard(prev)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED_TX.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// The CURRENT thread's installed observer, if any — read on the arming thread, before
+    /// `spawn_blocking`, so `blocking_watch` can `move` it into that closure. Cloned, not
+    /// taken: the arming thread's own installation must survive for its guard's whole
+    /// lifetime, which may span more than one `blocking_watch` call (e.g. `wait_exit`'s retry
+    /// loop).
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn current() -> Option<Sender<()>> {
+        ARMED_TX.with(|cell| cell.borrow().clone())
+    }
+
+    /// Whether the CURRENT thread has an observer installed — gates the call site's poll and
+    /// forced cancel so they run only for the one test that opted in, never for any other
+    /// caller of `block_until_exit_or_cancel` in the same binary or on another thread.
+    pub(crate) fn is_armed() -> bool {
+        ARMED_TX.with(|cell| cell.borrow().is_some())
+    }
+
+    pub(crate) fn notify_armed_unsignalled() {
+        ARMED_TX.with(|cell| {
+            if let Some(tx) = cell.borrow().as_ref() {
+                let _ = tx.send(());
+            }
+        });
+    }
 }

@@ -62,6 +62,19 @@ filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
 
 [[profile.default.overrides]]
+# `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`
+# (`src/tokio/child/graceful_tests.rs`) asserts deterministically, via `crate::wait::backend::
+# armed_probe` — not by elapsed time, and not tied to `GRACE`'s size (see the test's own doc).
+# This override is a pure backstop against an UNRELATED hang (e.g. the cancel event itself
+# failing to release the blocking watcher), never part of the test's own detection — the one
+# sanctioned use of a timeout (docs/principles.md §8). With correct code, and with the mutant
+# this test's own seam catches, the test resolves in well under a second either way, so this
+# bound is pure headroom. Under `profile.default` so `profile.ci` and local runs both inherit it
+# — same reasoning as `test_support_tests` below.
+filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # Bounds a hang (blocking reap of a `pause()` child) if the guard stops killing, so it fails
 # instead. Under `profile.default` so `profile.ci` and local runs both inherit it.
 filter = 'test(test_support_tests)'
