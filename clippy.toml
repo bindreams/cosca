@@ -1,13 +1,12 @@
-# Every function reachable in this crate's dependency graph that creates a pipe without
-# close-on-exec set. `nix::unistd::pipe` is ungated in nix 0.31.3 and calls `libc::pipe`
-# internally. `rustix::pipe::pipe` is marked `allow-invalid = true`: this crate does not enable
-# rustix's `pipe` feature today, so on the one target that links rustix (Linux) the path is
-# unreachable — confirmed a missing-feature gap, not a typo, by checking rustix's feature list.
-# `allow-invalid` suppresses clippy's "does not refer to a reachable function" warning for exactly
-# that case; a target that never links rustix at all (macOS, Windows) skips the path silently
-# regardless.
+# The flag-less pipe constructors in this crate's dependency graph: pipe(2)/pipe2 wrappers that
+# take no flags argument, so their fds always lack close-on-exec. Narrower than every
+# close-on-exec gap by design — pipe2 called with empty flags, openpty/forkpty and dup are out of
+# scope here. `nix::unistd::pipe` calls `libc::pipe` internally. `rustix::pipe::pipe` is marked
+# `allow-invalid = true`: rustix's `pipe` feature isn't enabled in this crate today, so on the one
+# target that links rustix (Linux) the path is unreachable — a missing-feature gap, not a typo. A
+# target that never links rustix at all (macOS, Windows) skips the path silently either way.
 disallowed-methods = [
-    { path = "libc::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently can inherit them and delay EOFs (#216). Use std::io::pipe() (close-on-exec on both ends; atomic via pipe2 on Linux/BSDs, pipe()+FD_CLOEXEC on macOS), or pipe2(O_CLOEXEC) where the platform has it and a raw pipe is required." },
-    { path = "nix::unistd::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently can inherit them and delay EOFs (#216). Use std::io::pipe() (close-on-exec on both ends; atomic via pipe2 on Linux/BSDs, pipe()+FD_CLOEXEC on macOS), or pipe2(O_CLOEXEC) where the platform has it and a raw pipe is required." },
-    { path = "rustix::pipe::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently can inherit them and delay EOFs (#216). Use std::io::pipe() (close-on-exec on both ends; atomic via pipe2 on Linux/BSDs, pipe()+FD_CLOEXEC on macOS), or pipe2(O_CLOEXEC) where the platform has it and a raw pipe is required.", allow-invalid = true },
+    { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which is an open question for the owner. Or use pipe2(O_CLOEXEC) where the platform has it." },
+    { path = "nix::unistd::pipe", reason = "nix::unistd::pipe wraps libc::pipe, so its fds lack close-on-exec the same way. Use nix::unistd::pipe2(OFlag::O_CLOEXEC) where available, or std::io::pipe()." },
+    { path = "rustix::pipe::pipe", reason = "rustix::pipe::pipe is a pipe/pipe2 call with no flags, so its fds lack close-on-exec. Use rustix::pipe::pipe_with(PipeFlags::CLOEXEC) or std::io::pipe().", allow-invalid = true },
 ]
