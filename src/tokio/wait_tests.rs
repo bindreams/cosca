@@ -302,3 +302,63 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
 
     assert_eq!(drained.expect("wait"), TreeDrain::AllMembersExited);
 }
+
+/// A deadline within tokio's own ~1ms round-up margin of `Instant`'s ceiling must not panic:
+/// `crate::wait::deadline_from` saturates it to unbounded before `drain_step` ever sees it, so
+/// this call takes the `listener.await` arm, never `timeout_at`.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-async-near-max-deadline", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+
+    let now = std::time::Instant::now();
+    // 500µs short of the true ceiling: comfortably more than the time this takes to reach
+    // `deadline_from`'s own `Instant::now()` call, landing within the 1ms margin this exercises.
+    let duration =
+        crate::wait::instant_near_ceiling(now).saturating_duration_since(now) - std::time::Duration::from_micros(500);
+    let deadline = crate::wait::deadline_from(duration);
+
+    let fut = super::cgroup_wait_tree_drained(&leaf, deadline);
+    ::tokio::pin!(fut);
+    // A single poll is enough: reaching here without panicking is the proof. The fake leaf never
+    // drains, so a correct call is Pending either way — nothing here needs it to resolve.
+    ::tokio::select! {
+        biased;
+        _ = &mut fut => {}
+        _ = std::future::ready(()) => {}
+    }
+}
+
+/// `cgroup_wait_tree_drained`'s bounded arm, driven end to end on a `FakeLeaf` (no cgroup
+/// needed): a populated leaf that never drains must answer `MembersRemain` no earlier than the
+/// caller's own deadline. No upper bound is asserted — only that it never answers early.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+    use std::time::{Duration, Instant};
+
+    let fake = FakeLeaf::new("cosca-async-wait-tree-fakeleaf-bounded", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+
+    const BOUND: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+    let result = super::cgroup_wait_tree_drained(&leaf, Some(Some(start + BOUND)))
+        .await
+        .expect("wait");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        result,
+        TreeDrain::MembersRemain,
+        "a populated leaf that never drains must report MembersRemain once its deadline passes"
+    );
+    assert!(
+        elapsed >= BOUND,
+        "cgroup_wait_tree_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
+    );
+}

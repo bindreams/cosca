@@ -1,0 +1,16 @@
+[package]
+name = "disallowed-pipes-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Regression fixture proving the root clippy.toml's pipe ban still fires; not part of the cosca package."
+
+[lib]
+doctest = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.31", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["pipe"] }

@@ -37,7 +37,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use rustix::fs::inotify;
 
 use super::{above_stdio, fd_path, read_populated, removed_after_drain, LeafDir};
-use crate::containment::TreeDrain;
 use crate::error::Error;
 
 /// A watch on one leaf's drain. See the module docs.
@@ -138,28 +137,18 @@ impl DrainWatch {
         }
     }
 
-    /// Block until the leaf drains or `deadline` passes (see [`crate::wait::remaining`]). No
-    /// interval: each round is one `poll` for the caller's own remaining time.
-    pub(crate) fn wait(&mut self, deadline: Option<Option<std::time::Instant>>) -> Result<TreeDrain, Error> {
+    /// Block until the leaf drains — `populated` reads 0, or the leaf is removed. Unbounded.
+    pub(crate) fn wait(&mut self) -> Result<(), Error> {
         use rustix::event::{poll, PollFd, PollFlags};
 
         loop {
             if !self.populated()? {
-                return Ok(TreeDrain::AllMembersExited);
+                return Ok(());
             }
-            let remaining = crate::wait::remaining(deadline);
-            if remaining == Some(std::time::Duration::ZERO) {
-                return Ok(TreeDrain::MembersRemain);
-            }
-            let ts = remaining.map(|d| rustix::event::Timespec {
-                tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
-                tv_nsec: d.subsec_nanos() as _,
-            });
             #[cfg(test)]
             super::fault::notify_drain_blocking();
             let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
-            match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => return Ok(TreeDrain::MembersRemain),
+            match poll(&mut fds, None) {
                 Ok(_) => drop(self.consume()?),
                 Err(rustix::io::Errno::INTR) => {}
                 Err(e) => return Err(Error::Io(e.into())),

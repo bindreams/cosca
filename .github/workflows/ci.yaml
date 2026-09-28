@@ -43,6 +43,17 @@ jobs:
         shell: bash
         run: bash .github/scripts/release-script-tests.sh
 
+      # Regression check for clippy.toml's disallowed-methods pipe ban (see that file): lints
+      # .github/fixtures/disallowed-pipes, a standalone crate that calls every banned path,
+      # against the real clippy.toml, and asserts the diagnostic actually fires for each —
+      # structured JSON, not scraped text. Catches a renamed disallowed-methods key, a typo'd
+      # path, or a dependency upgrade that silently moves a function out from under the ban.
+      # `!cancelled()`: same override-success() rationale as the step below.
+      - name: Check the disallowed-methods pipe ban still fires
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash .github/scripts/check-disallowed-pipes.sh
+
       # The prek `cargo-clippy` hook above calls .github/scripts/clippy.sh with
       # neither --target nor --feature-powerset (host, no features) — this crate
       # declares no `default` feature, so the host (Linux) side of the
