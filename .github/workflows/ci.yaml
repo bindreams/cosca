@@ -73,6 +73,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # THROWAWAY (never merge): darwin/windows lanes commented out — this probe only needs
+        # the Linux runners' kernel version and the mutant-A RED signal, and the account is
+        # under heavy macOS-runner contention right now.
         include:
           - os: linux
             arch: amd64
@@ -82,34 +85,36 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            target: aarch64-apple-darwin
-            # This is the one darwin lane that also runs the feature-powerset
-            # Clippy step below; see there for why one arch stands in for both.
-            lint: true
-          - os: darwin
-            arch: amd64
-            runner: macos-15
-            target: x86_64-apple-darwin
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            # This is the one Windows lane that also runs the feature-powerset
-            # Clippy step below; see there for why one arch stands in for both.
-            lint: true
-          - os: windows
-            arch: arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
+          # - os: darwin
+          #   arch: arm64
+          #   runner: macos-latest
+          #   target: aarch64-apple-darwin
+          #   lint: true
+          # - os: darwin
+          #   arch: amd64
+          #   runner: macos-15
+          #   target: x86_64-apple-darwin
+          # - os: windows
+          #   arch: amd64
+          #   runner: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   lint: true
+          # - os: windows
+          #   arch: arm64
+          #   runner: windows-11-arm
+          #   target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
+
+      # THROWAWAY (never merge): report this runner's kernel, for PR #258's reaped-leader
+      # mutant-RED check (pidfd_open's EINVAL/ENOENT split by kernel version).
+      - name: uname -r (THROWAWAY)
+        if: matrix.os == 'linux'
+        run: uname -r
 
       - uses: ./.github/actions/setup-rust
         with:

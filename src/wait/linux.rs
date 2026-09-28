@@ -21,28 +21,9 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
     let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
         Ok(fd) => fd,
         Err(rustix::io::Errno::SRCH) => return Ok(None),
-        // `pidfd_open` requires the pid number to resolve to a THREAD-GROUP LEADER task
-        // (`pid_has_task(pid, PIDTYPE_TGID)`, v6.15 kernel/fork.c:2114); a pid number that is
-        // live but not a leader fails this even though the process it names is not gone:
-        //   - A process-group leader that has exited and been REAPED, while another member
-        //     of its group is still alive, keeps its number's `struct pid` alive as that
-        //     group's PGID — resolvable, but with no TGID task attached. Before Linux 6.16
-        //     this is EINVAL; 6.16 (commit 8cf4b738) changes it to ESRCH, already handled
-        //     above.
-        //   - A LIVE thread that is not its process's group leader (a non-leader tid) fails
-        //     the same check for the opposite reason — the task exists but was never a
-        //     leader. Before 6.16 this is ALSO EINVAL (indistinguishable from the reaped-
-        //     leader case by errno alone); 6.16+ gives ENOENT.
-        // Since one errno can mean either "gone" or "live", re-verify identity instead of
-        // guessing: `Gone` confirms the reaped-leader case (report exited, matching the SRCH
-        // arm above); `Present`/`Unknown` means the pid still names a live, non-leader task,
-        // and reporting that as exited would be an early verdict — keep the original error.
-        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => {
-            return match id.exists() {
-                Existence::Gone => Ok(None),
-                Existence::Present | Existence::Unknown => Err(Error::Io(std::io::Error::from(e))),
-            };
-        }
+        // MUTANT A (THROWAWAY, for CI RED verification of PR #258 — never merge): "no exists()
+        // fallback". Reverts the INVAL/NOENT arm this PR adds; INVAL/NOENT now fall through to
+        // the catch-all `Err(e) => Err(Error::Io(...))` arm below, matching pre-fix `main`.
         Err(rustix::io::Errno::NOSYS) => {
             return Err(Error::Unsupported {
                 op: "foreign process wait/kill".into(),
