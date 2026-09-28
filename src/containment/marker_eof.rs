@@ -28,9 +28,7 @@
 //! - **Bounded** (a caller-supplied deadline): the excess is drained in bounded rounds, an
 //!   accommodation for a misbehaving-but-eventually-cooperative writer, paid for by the
 //!   caller's own deadline — CPU-proportional to the writer's throughput for the wait's
-//!   duration, same as the drain itself. No round starts once the deadline has passed (see
-//!   `docs/principles.md`'s deadline contract); the crate promises no upper bound on how much
-//!   later than the deadline the already-in-flight round finishes.
+//!   duration, same as the drain itself, but never longer than the deadline allows.
 //! - **Unbounded** (no deadline at all): nothing is drained. The effective low-water clamp
 //!   equals the pipe's full capacity, so the very edge that makes the knote ready is also the
 //!   instant the writer's own `write()` call blocks in the kernel — the original design
@@ -95,8 +93,8 @@ fn ensure_nonblocking(read_end: BorrowedFd<'_>) -> Result<(), Error> {
 /// KERNEL just reported via the triggering kevent's own `data` field, never "keep reading
 /// until it stops." Below the low-water clamp this branch never runs at all; at or above it —
 /// and only for a caller with an actual deadline, see `interpret_read_event` — this is what
-/// keeps a single round bounded — the OUTER loop (`block_until_drained`) is what keeps a new
-/// round from ever starting once the caller's deadline has passed, despite repeated rounds.
+/// keeps a single round bounded — the OUTER loop (`block_until_drained`) is what keeps the
+/// total wait bounded by the caller's deadline despite repeated rounds.
 fn drain_pending(read_end: BorrowedFd<'_>, mut n: usize) -> Result<(), Error> {
     let mut buf = [0u8; 4096];
     while n > 0 {
@@ -349,9 +347,9 @@ pub(crate) fn write_end_check(read_end: BorrowedFd<'_>) -> WriteEndCheck {
 
 /// Refuse to watch an edge that provably cannot fire. `Unassessable` proceeds UNLESS the
 /// caller intends to wait with no deadline: an inconclusive scan combined with a bounded wait
-/// still stops starting new rounds once the caller's own deadline passes regardless, but combined
-/// with an UNBOUNDED wait it is exactly the condition under which this primitive could hang
-/// forever with no elevated runtime signal at all — so only that combination is refused.
+/// is capped by the caller's own deadline regardless, but combined with an UNBOUNDED wait it is
+/// exactly the condition under which this primitive could hang forever with no elevated
+/// runtime signal at all — so only that combination is refused.
 fn refuse_if_write_end_held(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<(), Error> {
     match write_end_check(read_end) {
         WriteEndCheck::Clear => Ok(()),

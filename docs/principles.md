@@ -262,7 +262,9 @@ Every caller-supplied deadline cosca accepts (for example `wait_timeout`, `wait_
   reports what it finds, without starting further work contingent on the answer. This is proved
   structurally, not by timing: a `#[cfg(test)]` seam reports the deadline (or remaining time) a
   wait was actually armed with, or whether a blocking call happened at all, and a test clock
-  advanced past the deadline shows the next check returning without another round.
+  advanced past the deadline shows the next check returning without another round. That seam is
+  introduced by [#240] (the macOS kqueue wait) and [#207] (the cgroup drain waits); [#242] tracks
+  the gap until they land.
 
 cosca promises no upper bound on how late after the deadline it actually reports the outcome —
 scheduler, load, a suspended process, or a waiting primitive's own rounding below its API can delay
@@ -292,7 +294,9 @@ stacked fix PR that resolves it.
 [#151]: https://github.com/bindreams/cosca/issues/151
 [#174]: https://github.com/bindreams/cosca/issues/174
 [#201]: https://github.com/bindreams/cosca/pull/201
+[#207]: https://github.com/bindreams/cosca/pull/207
 [#210]: https://github.com/bindreams/cosca/pull/210
 [#223]: https://github.com/bindreams/cosca/issues/223
 [#234]: https://github.com/bindreams/cosca/issues/234
+[#240]: https://github.com/bindreams/cosca/pull/240
 [#242]: https://github.com/bindreams/cosca/issues/242
