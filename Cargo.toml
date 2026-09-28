@@ -84,6 +84,13 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# `test-util`, for `#[tokio::test(start_paused = true)]` — the deterministic, non-wall-clock
+# check that `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`'s
+# grace-wait never advances the virtual clock (i.e. never spends any of `GRACE`, not even via a
+# mechanism the `armed_probe` seam does not observe, like a hollowed-out `grace_wait` that just
+# slept). Dev-only: kept out of the published crate's dependency footprint, same reasoning as
+# this block's other additions.
+tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 # Unpredictable merge-target pipe names (std parity: std randomizes its anon-pipe names).

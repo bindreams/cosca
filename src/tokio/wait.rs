@@ -55,7 +55,15 @@ async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, 
     }
     let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
+    // Test-only: `armed_probe` is thread-local (see its own doc for why), and this closure
+    // runs on a blocking-pool thread distinct from this one (the "arming" thread) — so read
+    // whatever THIS thread has installed now, while still on it (nothing before this point
+    // yields), and move the captured value into the closure to re-install on ITS thread.
+    #[cfg(test)]
+    let armed_tx = crate::wait::backend::armed_probe::current();
     let joined = ::tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _armed_guard = armed_tx.map(crate::wait::backend::armed_probe::install);
         let result = crate::wait::backend::block_until_exit_or_cancel(id, grace, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
