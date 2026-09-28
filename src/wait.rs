@@ -106,6 +106,13 @@ pub(crate) mod test_clock {
     /// value — not real elapsed time — so a test's own setup latency can never change what a
     /// deadline computed from it means.
     fn freeze_now() -> Instant {
+        // Nesting is not supported: the INNER guard's `Drop` would unfreeze the clock out from
+        // under the OUTER guard, which is still alive and still expects it frozen.
+        debug_assert!(
+            FROZEN.with(Cell::get).is_none(),
+            "test_clock::freeze_now called while already frozen — nesting FrozenClockGuard is \
+             not supported"
+        );
         let at = Instant::now();
         FROZEN.with(|f| f.set(Some(at)));
         at

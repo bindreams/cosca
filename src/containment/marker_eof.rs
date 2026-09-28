@@ -28,7 +28,9 @@
 //! - **Bounded** (a caller-supplied deadline): the excess is drained in bounded rounds, an
 //!   accommodation for a misbehaving-but-eventually-cooperative writer, paid for by the
 //!   caller's own deadline — CPU-proportional to the writer's throughput for the wait's
-//!   duration, same as the drain itself, but never longer than the deadline allows.
+//!   duration, same as the drain itself. No round starts once the deadline has passed. The one
+//!   non-blocking check at expiry looks for EOF only and drains nothing. The in-flight round
+//!   may finish arbitrarily later (principle 13).
 //! - **Unbounded** (no deadline at all): nothing is drained. The effective low-water clamp
 //!   equals the pipe's full capacity, so the very edge that makes the knote ready is also the
 //!   instant the writer's own `write()` call blocks in the kernel — the original design
@@ -93,21 +95,58 @@ fn ensure_nonblocking(read_end: BorrowedFd<'_>) -> Result<(), Error> {
 /// KERNEL just reported via the triggering kevent's own `data` field, never "keep reading
 /// until it stops." Below the low-water clamp this branch never runs at all; at or above it —
 /// and only for a caller with an actual deadline, see `interpret_read_event` — this is what
-/// keeps a single round bounded — the OUTER loop (`block_until_drained`) is what keeps the
-/// total wait bounded by the caller's deadline despite repeated rounds.
-fn drain_pending(read_end: BorrowedFd<'_>, mut n: usize) -> Result<(), Error> {
+/// keeps a single round bounded — the OUTER loop (`wait::backend::block_on_kqueue`, reached via
+/// `block_until_drained`) is what keeps the total wait bounded by the caller's deadline despite
+/// repeated rounds.
+fn drain_pending(read_end: BorrowedFd<'_>, original_n: usize) -> Result<(), Error> {
+    let mut n = original_n;
     let mut buf = [0u8; 4096];
-    while n > 0 {
+    let result = loop {
+        if n == 0 {
+            break Ok(());
+        }
         let want = n.min(buf.len());
         match nix::unistd::read(read_end, &mut buf[..want]) {
-            Ok(0) => return Ok(()), // EOF raced ahead of us; nothing left to drain
-            Ok(got) => n -= got,
+            Ok(0) => break Ok(()), // EOF raced ahead of us; nothing left to drain
+            Ok(got) => n -= got,   // still nonzero next iteration if `got < want`
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::EAGAIN) => return Ok(()), // a concurrent reader won the race
-            Err(e) => return Err(Error::Io(e.into())),
+            Err(nix::errno::Errno::EAGAIN) => break Ok(()), // a concurrent reader won the race
+            Err(e) => break Err(Error::Io(e.into())),
         }
+    };
+    // Recorded regardless of outcome — even a partial drain (EOF/EAGAIN cut it short) really
+    // did consume `original_n - n` bytes. Test-only; see `drain_test_hooks`'s own doc for why
+    // this is a bytes-drained counter and not a wall-clock or call-count proxy.
+    #[cfg(test)]
+    drain_test_hooks::record_drained((original_n - n) as u64);
+    result
+}
+
+/// Test-only, and confined to macOS builds only by virtue of this whole module being macOS-only
+/// (`#[cfg(target_os = "macos")]` at the `containment::marker_eof` declaration in
+/// `containment.rs`) — no separate `cfg_attr` needed, unlike `wait::test_clock`'s helpers, which
+/// live in a cross-platform module.
+#[cfg(test)]
+pub(crate) mod drain_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DRAINED_BYTES: Cell<u64> = const { Cell::new(0) };
     }
-    Ok(())
+
+    /// Cumulative bytes `drain_pending` has actually discarded on THIS thread so far —
+    /// monotonically increasing, so a test proves "round N drained nothing" by comparing a
+    /// BASELINE taken right before round N to the total taken right after the whole wait
+    /// concludes, immune to a writer refilling the pipe in between and masking a
+    /// FIONREAD-only comparison (a sustained writer can restore the byte COUNT a round wrongly
+    /// drained, but it can never undo this counter having moved).
+    pub(crate) fn drained_bytes() -> u64 {
+        DRAINED_BYTES.with(Cell::get)
+    }
+
+    pub(crate) fn record_drained(n: u64) {
+        DRAINED_BYTES.with(|c| c.set(c.get() + n));
+    }
 }
 
 /// Create a kqueue with `EVFILT_READ` armed on the marker read end, `NOTE_LOWAT`-gated (see
@@ -154,7 +193,7 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 ///   reported — the crate's accommodation for a misbehaving-but-eventually-cooperative writer,
 ///   paid for by the caller's own deadline.
 /// - **`true`**: nothing is read. Two DISTINCT callers ask for this, unified under one flag by
-///   owner decision (#233): an unbounded wait (no deadline exists to fund a drain), and a
+///   principle 13: an unbounded wait (no deadline exists to fund a drain), and a
 ///   bounded wait whose deadline has ALREADY elapsed for this round (no deadline is left to
 ///   fund one, even though one existed a moment ago) — once elapsed, the final check looks for
 ///   `EV_EOF` only and never drains. The armed knote carries `EV_CLEAR` (see `arm`), so with no
@@ -203,15 +242,21 @@ fn interpret_read_event(
 }
 
 /// Take one pending event from an armed kqueue without blocking. `Ok(Some(_))` = the drain was
-/// observed; `Ok(None)` = nothing conclusive yet (nothing pending, or — only once the
-/// low-water clamp is reached, and only for a bounded wait — a member's bytes, discarded) —
-/// re-wait; `Err` = see `interpret_read_event`. `unbounded_wait` must match what the kqueue was
-/// armed with (`arm`'s own parameter of the same name) — see `interpret_read_event` for why it
-/// changes what a non-EOF event does.
+/// observed; `Ok(None)` = nothing conclusive yet (nothing pending, or — only when `!suppress_drain`
+/// and the low-water clamp is reached — a member's bytes, discarded) — re-wait; `Err` = see
+/// `interpret_read_event`. `suppress_drain` is `interpret_read_event`'s own parameter of the
+/// same name, passed straight through — it does NOT have to equal whatever `unbounded_wait`
+/// the kqueue was armed with (`arm`'s own, separate parameter, which governs
+/// `refuse_if_write_end_held`'s policy, not draining): `probe`'s caller arms bounded (an
+/// `Unassessable` write-end scan should still proceed, capped by the caller's own deadline) but
+/// always suppresses draining (a one-shot, zero-timeout check IS a check at expiry — see
+/// `probe`'s own doc), the same "no round starts once the deadline has passed, the one
+/// non-blocking check at expiry looks for `EV_EOF` only" rule `block_on_kqueue`/
+/// `interpret_read_event` apply to a bounded wait's own final round (principle 13).
 pub(crate) fn drain_kqueue(
     kq: &Kqueue,
     read_end: BorrowedFd<'_>,
-    unbounded_wait: bool,
+    suppress_drain: bool,
 ) -> Result<Option<TreeDrain>, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [KEvent::new(
@@ -225,7 +270,7 @@ pub(crate) fn drain_kqueue(
     loop {
         match kq.kevent(&[], &mut events, Some(zero)) {
             Ok(0) => return Ok(None), // nothing pending
-            Ok(_) => return interpret_read_event(&events[0], read_end, unbounded_wait),
+            Ok(_) => return interpret_read_event(&events[0], read_end, suppress_drain),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::Io(e.into())),
         }
@@ -239,16 +284,23 @@ pub(crate) fn drain_kqueue(
 /// `MembersRemain`, correctly, since `AllMarkersClosed` is only ever reported when the kernel
 /// itself said `EV_EOF`.
 ///
+/// A zero-timeout check IS a check at expiry — the same one a bounded `block_until_drained`
+/// wait performs on its own final round once the deadline has passed — so this never drains
+/// (`drain_kqueue`'s `suppress_drain = true`): it looks for `EV_EOF` only (principle 13). It
+/// still arms bounded (`false` for `arm`'s OWN, separate `unbounded_wait` parameter), so an
+/// `Unassessable` write-end scan proceeds rather than refuses — the two parameters govern
+/// different policies and do not have to agree; see `drain_kqueue`'s own doc.
+///
 /// Called from `wait_tree_deadline`'s zero-duration case (`crate::tokio::wait`) — a one-shot
-/// check never blocks, so it never risks a caller-invisible hang there: it always passes
-/// `false` for `arm`'s `unbounded_wait`. That caller lives behind the crate's `tokio` feature,
-/// so this (and its own callee `drain_kqueue`) really is unreachable without it —
-/// `#[allow(dead_code)]` reflects that honestly for a `tokio`-disabled build instead of leaving
-/// the lib target to fail `cargo clippy --all-targets -D warnings` there.
+/// check never blocks, so it never risks a caller-invisible hang there. That caller lives
+/// behind the crate's `tokio` feature, so this (and its own callee `drain_kqueue`) really is
+/// unreachable without it — `#[allow(dead_code)]` reflects that honestly for a `tokio`-disabled
+/// build instead of leaving the lib target to fail `cargo clippy --all-targets -D warnings`
+/// there.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
     let kq = arm(read_end, false)?;
-    match drain_kqueue(&kq, read_end, false)? {
+    match drain_kqueue(&kq, read_end, true)? {
         Some(verdict) => Ok(verdict),
         None => Ok(TreeDrain::MembersRemain),
     }
@@ -271,7 +323,7 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// clamp on a sustained writer — see the module doc for why, and `interpret_read_event` for
 /// where that decision is made. A bounded wait (`Some(Some(_))`, including one already past)
 /// keeps draining as long as its deadline has funding left; once a round starts with the
-/// deadline already elapsed, that round stops draining too (decision #233) — same
+/// deadline already elapsed, that round stops draining too (principle 13) — same
 /// `suppress_drain` flag, just also true for that reason.
 pub(crate) fn block_until_drained(
     read_end: BorrowedFd<'_>,
@@ -353,9 +405,9 @@ pub(crate) fn write_end_check(read_end: BorrowedFd<'_>) -> WriteEndCheck {
 
 /// Refuse to watch an edge that provably cannot fire. `Unassessable` proceeds UNLESS the
 /// caller intends to wait with no deadline: an inconclusive scan combined with a bounded wait
-/// is capped by the caller's own deadline regardless, but combined with an UNBOUNDED wait it is
-/// exactly the condition under which this primitive could hang forever with no elevated
-/// runtime signal at all — so only that combination is refused.
+/// is still bounded by the caller's own deadline (no new rounds after it), but combined with
+/// an UNBOUNDED wait it is exactly the condition under which this primitive could hang forever
+/// with no elevated runtime signal at all — so only that combination is refused.
 fn refuse_if_write_end_held(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<(), Error> {
     match write_end_check(read_end) {
         WriteEndCheck::Clear => Ok(()),
