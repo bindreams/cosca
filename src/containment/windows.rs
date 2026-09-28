@@ -934,7 +934,7 @@ pub(crate) fn wait_drained_raw(
             None => INFINITE,
             Some(d) => {
                 let clamp = wait_max_ms();
-                let ms = d.as_millis().min(clamp as u128) as u32;
+                let ms = crate::wait::ceil_millis(d).min(clamp as u128) as u32;
                 #[cfg(test)]
                 crate::wait::wait_ms_probe::record(ms, d);
                 ms
@@ -955,7 +955,16 @@ pub(crate) fn wait_drained_raw(
         }
 
         if waited == WAIT_TIMEOUT {
-            return Ok(TreeDrain::MembersRemain);
+            // A `WAIT_TIMEOUT` only proves the caller's real deadline passed if this round's
+            // wait was not capped short of it by `wait_max_ms()`'s clamp (production:
+            // `INFINITE - 1`, ~49.7 days; test: `wait_clamp_seam`). Recheck against the real
+            // deadline rather than trust the raw verdict: if it has not actually elapsed, loop
+            // back — the outer loop re-enumerates and this round's `ms` computation re-arms
+            // with the (now shorter) remaining time. See docs/principles.md #13.
+            if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+                return Ok(TreeDrain::MembersRemain);
+            }
+            continue;
         }
         if let Some(e) = wait_failed {
             return Err(Error::Io(e));

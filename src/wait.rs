@@ -129,7 +129,7 @@ pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
 /// Pure and portable (no OS dependency) so it is unit-testable on every host, including this
 /// one — the Windows wait sites are the only current callers, but the math itself is not
 /// Windows-specific.
-#[cfg_attr(not(test), allow(dead_code))] // wired into the Windows wait sites by the next commit
+#[cfg_attr(not(any(test, windows)), allow(dead_code))] // only wired into the Windows wait sites
 pub(crate) fn ceil_millis(d: Duration) -> u128 {
     let nanos = d.as_nanos();
     let ms = nanos.div_ceil(1_000_000);

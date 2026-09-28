@@ -81,18 +81,27 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             });
         }
     }
-    let ms: u32 = match crate::wait::remaining(deadline) {
-        None => INFINITE,
-        Some(d) => {
-            let clamp = wait_max_ms();
-            let ms = d.as_millis().min(clamp as u128) as u32;
-            #[cfg(test)]
-            crate::wait::wait_ms_probe::record(ms, d);
-            ms
+    // Armed in rounds: a `WAIT_TIMEOUT` only proves the caller's real deadline passed if the
+    // wait was not capped short of it by `wait_max_ms()`'s clamp (production: `INFINITE - 1`,
+    // ~49.7 days; test: `wait_clamp_seam`). A clamped timeout is rechecked against the real
+    // deadline and re-armed rather than trusted — see docs/principles.md #13.
+    let waited = loop {
+        let ms: u32 = match crate::wait::remaining(deadline) {
+            None => INFINITE,
+            Some(d) => {
+                let clamp = wait_max_ms();
+                let ms = crate::wait::ceil_millis(d).min(clamp as u128) as u32;
+                #[cfg(test)]
+                crate::wait::wait_ms_probe::record(ms, d);
+                ms
+            }
+        };
+        // SAFETY: `handle` is a live process handle held for the wait's duration.
+        let w = unsafe { WaitForSingleObject(handle, ms) };
+        if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
+            break w;
         }
     };
-    // SAFETY: `handle` is a live process handle held for the wait's duration.
-    let waited = unsafe { WaitForSingleObject(handle, ms) };
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
     close(handle);
@@ -189,29 +198,41 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
-    let ms = match grace {
-        None => INFINITE,
-        // Capped at INFINITE-1 (~49.7 days) — the cancel event releases large graces early;
-        // a debug_assert flags the rare clamp.
-        Some(d) => {
-            let clamp = wait_max_ms();
-            let clamped = d.as_millis().min(clamp as u128) as u32;
-            // Checked against the REAL production clamp (never the test-seam override above):
-            // this flags a caller's raw grace genuinely exceeding ~49.7 days, not a test's
-            // deliberately-tiny injected clamp.
-            debug_assert!(
-                d.as_millis() <= (INFINITE - 1) as u128,
-                "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
-                d.as_secs()
-            );
-            #[cfg(test)]
-            crate::wait::wait_ms_probe::record(clamped, d);
-            clamped
+    // Established once, at entry, from the relative `grace` — every re-arm below recomputes
+    // its remaining time against this SAME absolute instant, so a re-arm never resets the
+    // clock (mirrors `crate::wait::deadline_from`'s convention: `None` = unbounded).
+    let deadline: Option<Option<Instant>> = grace.map(|g| Instant::now().checked_add(g));
+    let handles = [handle, HANDLE(cancel.as_raw_handle())];
+    // Armed in rounds: a `WAIT_TIMEOUT` only proves `grace` genuinely elapsed if the wait was
+    // not capped short of it by `wait_max_ms()`'s clamp (production: `INFINITE - 1`, ~49.7
+    // days — the cancel event releases large graces early; test: `wait_clamp_seam`). A
+    // clamped timeout is rechecked against the real deadline and re-armed rather than
+    // trusted — see docs/principles.md #13.
+    let waited = loop {
+        let ms = match crate::wait::remaining(deadline) {
+            None => INFINITE,
+            Some(d) => {
+                let clamp = wait_max_ms();
+                let clamped = crate::wait::ceil_millis(d).min(clamp as u128) as u32;
+                // Checked against the REAL production clamp (never the test-seam override
+                // above): this flags a caller's raw grace genuinely exceeding ~49.7 days, not
+                // a test's deliberately-tiny injected clamp.
+                debug_assert!(
+                    d.as_millis() <= (INFINITE - 1) as u128,
+                    "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
+                    d.as_secs()
+                );
+                #[cfg(test)]
+                crate::wait::wait_ms_probe::record(clamped, d);
+                clamped
+            }
+        };
+        // SAFETY: both handles are live for the wait's duration.
+        let w = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+        if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
+            break w;
         }
     };
-    let handles = [handle, HANDLE(cancel.as_raw_handle())];
-    // SAFETY: both handles are live for the wait's duration.
-    let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
