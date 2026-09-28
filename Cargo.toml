@@ -46,8 +46,7 @@ tempfile = "3"
 serde_json = "1"
 # `test-util`: `start_paused` virtual clock for the deadline tests. Dev-only.
 tokio = { version = "1", features = ["test-util"] }
-# `requires = [...]` marks a runtime precondition (e.g. root); an unmet one is reported as
-# ignored — with its reason under `cargo test`, as a bare skip under nextest.
+# `requires = [...]` declares a runtime precondition; an unmet one skips the test.
 skuld = "0.3.1"
 
 [target.'cfg(windows)'.dev-dependencies]
