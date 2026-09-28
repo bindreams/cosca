@@ -278,6 +278,45 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     child.wait().expect("reap");
 }
 
+// `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on
+// when watching an already-reaped root — see
+// `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`'s own doc for why
+// that test alone cannot pin this ONE down: `Opened::Gone` returns before any handle exists, and
+// a live-but-already-signalled `Same` never reaches `armed_probe`'s poll either, so `Different`
+// is possible there only if the OS happens to recycle the pid in the window between the test
+// killing its root and this watch opening it. This test pins `Different` down directly and
+// deterministically instead: a genuinely LIVE child, watched under an identity naming the SAME
+// pid but a WRONG start token, is `Opened::Found` + `HandleIdentity::Different` on every run —
+// no dependence on OS pid-recycling timing.
+#[cfg(windows)]
+#[tokio::test]
+async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
+    let mut child = std_blocker();
+    let real = ProcessId::of(child.id()).found().expect("identity of live child");
+    let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let _armed_guard = crate::wait::backend::armed_probe::install(armed_tx);
+
+    let exited = grace_wait(stale, Duration::from_secs(30))
+        .await
+        .expect("an identity mismatch must resolve, not error");
+    assert!(
+        exited,
+        "HandleIdentity::Different must report exited — the original identity is gone"
+    );
+    assert!(
+        armed_rx.try_recv().is_err(),
+        "the identity-mismatch fast path must never reach the real wait — armed_probe must not fire"
+    );
+
+    // The child itself is still live throughout (the watch above resolved on the STALE
+    // identity, never touching this one) — kill-on-drop would also cover this, but clean up
+    // explicitly rather than leaving a live `ping` to the runtime's teardown.
+    child.kill().expect("cleanup");
+    child.wait().expect("reap");
+}
+
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
 /// `cgroup.events` — the removal can cancel the one notification a drain sends.
 #[cfg(target_os = "linux")]
