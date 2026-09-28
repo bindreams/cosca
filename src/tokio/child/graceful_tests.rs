@@ -467,15 +467,28 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 
 // The held refusal buys a shutdown window only where a tree drain can be observed. `TreeWalk`
 // has none, so the grace-wait watches the ROOT alone — and this refusal's precondition IS that
-// the root has already exited, so the watch resolves at once and the sweep follows immediately.
-// The assertion is on elapsed time because that is the entire claim: checking only for `Ok`
-// passes just as well in the world where the full grace is spent.
+// the root has already exited, so `block_until_exit_or_cancel`'s identity check must resolve
+// the wait without ever genuinely spending the grace. A real `WaitForMultipleObjects` call MAY
+// still be entered (the identity-verified handle can legitimately name an
+// already-exited-but-not-yet-destroyed process object — `HandleIdentity::Same` — and a wait on
+// that resolves near-instantly since it is already signaled), so the claim is not "no real wait
+// call happens" but "no real wait call ever genuinely blocks on a still-alive target."
+//
+// Proven by `crate::wait::backend::armed_probe`, installed below before the call: the call
+// site polls the target non-blockingly the instant before its real wait and notifies iff that
+// target is not already signaled — see the module's own doc for why a single global slot is
+// safe here (this repo's test runner is nextest, one process per test) and why this is
+// immediate, not elapsed-time-based (docs/principles.md §8 — a timeout is a failure bound, never
+// the proof of anything). The assertion below (`try_recv` is `Err`) is the whole check; it does
+// not depend on `GRACE`'s size at all, so `GRACE` here is just an ordinary, moderate value, not
+// Win32's near-unbounded cap. The nextest `terminate-after` override for this exact test
+// (`.config/nextest.toml`) is a pure backstop against an unrelated hang (e.g. `cancel` itself
+// failing to release the watcher) — the one sanctioned use of a timeout — never part of the
+// detection.
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
-    // Wide enough that the two worlds are three orders of magnitude apart, so the split below
-    // cannot be reached by jitter: this path is measured in milliseconds.
-    const GRACE: Duration = Duration::from_secs(10);
+    const GRACE: Duration = Duration::from_secs(30);
     let mut cmd = crate::tokio::Command::new();
     cmd.args(["ping", "-n", "30", "127.0.0.1"]);
     cmd.contain_with(crate::ContainMode::TreeWalk);
@@ -489,14 +502,15 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     child.kill().expect("kill");
     child.wait().await.expect("reap"); // tokio unpins the pid here
 
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    crate::wait::backend::armed_probe::install(armed_tx);
+
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let started = std::time::Instant::now();
     child
         .graceful_shutdown_tree(GRACE)
         .await
         .expect("a swept tree supersedes the held refusal");
-    let elapsed = started.elapsed();
 
     // Non-vacuity, first: a `terminate_tree` that returned `Ok` would produce the same fast,
     // green run, and this test would then be measuring a path it never entered.
@@ -508,9 +522,10 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
         "the refusal must have reached the hold-and-continue arm"
     );
     assert!(
-        elapsed < GRACE / 2,
-        "the root-only watch must resolve at once on an already-exited root rather than spend \
-         the grace: took {elapsed:?} of {GRACE:?}"
+        armed_rx.try_recv().is_err(),
+        "the root-only watch must never genuinely enter its real wait on a still-alive target — \
+         a real wait call may fire (an already-exited handle can still resolve and return \
+         instantly), but it must never be armed against a live one"
     );
 }
 

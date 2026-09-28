@@ -74,6 +74,9 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     };
     // SAFETY: `handle` is a live process handle held for the wait's duration.
     let waited = unsafe { WaitForSingleObject(handle, ms) };
+    // A real wait call may legitimately reach here and still resolve at once: the
+    // identity-verified handle can name an already-exited-but-not-yet-destroyed process
+    // object, which is already signaled, so `WAIT_OBJECT_0` comes back promptly.
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
     close(handle);
@@ -184,9 +187,31 @@ pub(crate) fn block_until_exit_or_cancel(
             clamped
         }
     };
+    // Test-only seam: proves — immediately, never by elapsed time — that this wait is never
+    // genuinely entered on a still-alive target. See `armed_probe`'s own doc. Gated on
+    // `is_armed()`: EVERY caller of this function in the whole binary reaches this point
+    // (e.g. `grace_wait_true_when_child_dies_mid_wait` genuinely needs its wait to run to
+    // completion), so polling and force-cancelling unconditionally would silently break any
+    // other test whose target is still alive here — only the one test that installed the
+    // observer may have its wait diverted.
+    #[cfg(test)]
+    if armed_probe::is_armed() {
+        // SAFETY: `handle` is a live, identity-verified process handle; ms=0 is a
+        // non-blocking poll, never a wait.
+        let already = unsafe { WaitForSingleObject(handle, 0) };
+        if already != WAIT_OBJECT_0 {
+            armed_probe::notify_armed_unsignalled();
+            // Force the real wait below to return at once instead of genuinely spending
+            // `ms` — a bug this seam catches must fail fast, not hang out the grace.
+            signal_cancel(cancel);
+        }
+    }
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // SAFETY: both handles are live for the wait's duration.
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+    // A real wait call may legitimately reach here and still resolve at once: the
+    // identity-verified handle can name an already-exited-but-not-yet-destroyed process
+    // object, which is already signaled, so `WAIT_OBJECT_0` comes back promptly.
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
@@ -284,4 +309,60 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
                  child use graceful_shutdown_tree (CTRL_BREAK to the group)"
             .into(),
     })
+}
+
+/// Test-only seam proving `block_until_exit_or_cancel` never genuinely enters its real wait on
+/// a still-alive target — immediately, never by elapsed time (a `WAIT_TIMEOUT`-based counter
+/// could only ever be told apart from correct code by how long the call ran, which makes
+/// elapsed time the real assertion; see the PR that replaced it with this seam).
+///
+/// The call site (`block_until_exit_or_cancel`, just before the real wait) only polls and acts
+/// when [`is_armed`] is true. `block_until_exit_or_cancel` is the SAME function every other
+/// grace-wait test in the binary calls, several of them precisely to watch a genuinely
+/// still-alive target run its real wait to completion (e.g.
+/// `grace_wait_true_when_child_dies_mid_wait`); gating on `is_armed` is what keeps this seam
+/// from force-releasing THEIR waits too. Only once armed does it do a non-blocking
+/// `WaitForSingleObject(handle, 0)` on the TARGET — not `cancel` — the instant before the real
+/// wait would be entered. If that target is not ALREADY signaled (the process has not already
+/// exited), this is exactly the regression shape this test exists to catch: a real wait is
+/// about to be genuinely entered on a live target. [`notify_armed_unsignalled`] fires, and the
+/// call site immediately force-signals `cancel` so the real wait that follows returns at once
+/// instead of genuinely spending the grace — a caught bug fails fast, not slow.
+///
+/// A single global slot, not one keyed by [`crate::identity::ProcessId`] — safe here for a
+/// reason `crate::tokio::wait::fault_observer` (the identical single-slot pattern this mirrors)
+/// already relies on: this repo's test runner is nextest, one process per test (principle 9,
+/// `docs/principles.md`), so no other test's call into this backend can ever be running in the
+/// same process while this one's slot is installed. `note_timeout`'s old per-`ProcessId` keying
+/// was solving a `cargo test` shared-process race this repo's CI does not have.
+#[cfg(test)]
+pub(crate) mod armed_probe {
+    use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
+
+    static ARMED_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
+
+    /// Install the observer for the current test. Not cleared between tests — each test gets
+    /// its own process (see the module doc), so there is nothing to leak into.
+    // The only consumer is the tokio TreeWalk fast-path test
+    // (`windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`), so this is
+    // dead code in a `--no-default-features` (no `tokio`) build — same shape as
+    // `block_until_exit_or_cancel`'s own `allow(dead_code)` just above.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn install(tx: Sender<()>) {
+        *ARMED_TX.lock().unwrap() = Some(tx);
+    }
+
+    /// Whether the current test has installed an observer — gates the call site's poll and
+    /// forced cancel so they run only for the one test that opted in, never for any other
+    /// caller of `block_until_exit_or_cancel` in the same binary.
+    pub(crate) fn is_armed() -> bool {
+        ARMED_TX.lock().unwrap().is_some()
+    }
+
+    pub(crate) fn notify_armed_unsignalled() {
+        if let Some(tx) = ARMED_TX.lock().unwrap().as_ref() {
+            let _ = tx.send(());
+        }
+    }
 }
