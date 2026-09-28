@@ -153,11 +153,10 @@ pub(crate) fn block_until_exit_or_cancel(
     // The handle already in hand answers the recycle question with no race; a second by-pid
     // lookup would not.
     match crate::identity::windows_handle_identity(handle, id) {
-        HandleIdentity::Same => {}
-        HandleIdentity::Different => {
-            close(handle);
-            return Ok(true); // recycled before open - the original is gone
-        }
+        // MUTANT (throwaway, induced for CI verification — see PR description): the
+        // Different arm no longer returns early, so a recycled/mismatched-pid identity
+        // falls through to the real wait on whatever now holds the pid.
+        HandleIdentity::Same | HandleIdentity::Different => {}
         HandleIdentity::Unreadable(e) => {
             log::warn!(
                 "wait: pid {} opened but its identity could not be verified ({e})",
