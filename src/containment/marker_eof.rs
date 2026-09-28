@@ -275,11 +275,7 @@ impl DrainOutcome {
 /// Take one pending event from an armed kqueue without blocking. `suppress_drain` is
 /// `interpret_read_event`'s own parameter of the same name, passed straight through — see that
 /// function's own doc for what it means and why it need not equal `arm`'s `unbounded_wait`.
-pub(crate) fn drain_kqueue(
-    kq: &Kqueue,
-    read_end: BorrowedFd<'_>,
-    suppress_drain: bool,
-) -> Result<DrainOutcome, Error> {
+pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain: bool) -> Result<DrainOutcome, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [KEvent::new(
         0,
