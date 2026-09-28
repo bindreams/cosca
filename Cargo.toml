@@ -135,6 +135,11 @@ name = "process"
 path = "tests/process.rs"
 harness = false
 
+[[test]]
+name = "process_root"
+path = "tests/process_root.rs"
+harness = false
+
 [[bin]]
 name = "cosca_testbin"
 path = "testbin/main.rs"

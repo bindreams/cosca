@@ -681,3 +681,163 @@ impl Drop for RestoreRlimitNofile {
         );
     }
 }
+
+// Root-precondition test infrastructure ==========================================================
+//
+// Shared by every skuld-harness binary with a test that needs an actual privileged caller (uid
+// switching, not merely a foreign same-uid one) — currently just `tests/process_root.rs`. Lives
+// here, not in that one binary, because the `ROOT` label and `preconditions::root` are what CI's
+// `SKULD_LABELS=ROOT` step selects on: a future root test in a different binary needs the same
+// two items, not a copy of them.
+
+/// The target's uid/gid: an ordinary unprivileged account, distinct from both root (0) and
+/// `READER_UID` below. No `/etc/passwd` entry is required for either — `setuid`/`execve` only
+/// need a number, and neither the target nor the reader ever looks itself up by name.
+#[cfg(unix)]
+pub const TARGET_UID: u32 = 65534;
+/// The uid/gid a root test re-execs itself as, to make the actual privileged call under test.
+/// Different from `TARGET_UID`: this proves a GENUINELY foreign, unprivileged caller, not merely
+/// "some non-root uid or other."
+#[cfg(unix)]
+pub const READER_UID: u32 = 65533;
+
+/// Runtime preconditions for `#[skuld::test(requires = [...])]`. Each one is `fn() -> Result<(),
+/// String>`; an unmet one reports the test as `ignored` with the `Err`'s text, instead of a
+/// silent skip or a hard failure on every environment that doesn't happen to run as root.
+#[cfg(unix)]
+pub mod preconditions {
+    use super::{READER_UID, TARGET_UID};
+
+    const HINT: &str = "requires root, see README.md's \"Tests that need root\"";
+
+    /// `geteuid() == 0`, plus — on Linux — the actual ability to spawn a child under each of
+    /// `TARGET_UID`/`READER_UID`: euid 0 alone is not sufficient inside a user namespace
+    /// (`unshare -r`, a rootless container) whose uid/gid map doesn't cover those ids, and
+    /// `setgid`/`setuid` there fails with `EINVAL` instead of `EPERM`. Probed by actually forking
+    /// and dropping to each id, not by parsing `/proc/self/{uid,gid}_map`: this is the exact pair
+    /// of syscalls the test itself relies on, so a "yes" here cannot disagree with what the test
+    /// does next. macOS has no equivalent namespace/capability split — root is sufficient there.
+    pub fn root() -> Result<(), String> {
+        // SAFETY: geteuid() takes no arguments and has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err(HINT.into());
+        }
+        #[cfg(target_os = "linux")]
+        for uid in [TARGET_UID, READER_UID] {
+            if !can_setuid_setgid_to(uid) {
+                return Err(format!(
+                    "{HINT} (root, but this namespace cannot setuid/setgid to {uid} — \
+                     CAP_SETUID/CAP_SETGID or the uid/gid map may not cover it)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Forks a throwaway child that attempts `setgid(uid)` then `setuid(uid)` and reports success
+    /// via its exit code. The child does no allocation and takes no lock between `fork` and
+    /// `_exit` — only the two syscalls under test — so the usual fork-in-a-multithreaded-process
+    /// hazards (a held libc lock, an allocator in an inconsistent state) do not apply here.
+    #[cfg(target_os = "linux")]
+    fn can_setuid_setgid_to(uid: u32) -> bool {
+        // SAFETY: fork() takes no arguments. The child below calls only async-signal-safe raw
+        // syscalls before exiting.
+        match unsafe { libc::fork() } {
+            0 => {
+                // SAFETY: `uid` fits both `gid_t` and `uid_t` (both are u32-width on Linux).
+                let ok = unsafe { libc::setgid(uid as libc::gid_t) } == 0
+                    && unsafe { libc::setuid(uid as libc::uid_t) } == 0;
+                // SAFETY: exits this forked child only; never returns.
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            }
+            pid if pid > 0 => {
+                let mut status: libc::c_int = 0;
+                loop {
+                    // SAFETY: `pid` is our own just-forked child; `status` is a valid out-param.
+                    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    if r >= 0 {
+                        break;
+                    }
+                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        return false;
+                    }
+                }
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+            }
+            _ => false, // fork() itself failed
+        }
+    }
+}
+
+/// Selects tests that need a root caller; CI's root step runs `SKULD_LABELS=ROOT`.
+#[cfg(unix)]
+#[skuld::label]
+pub const ROOT: skuld::Label;
+
+/// Kills and reaps a raw `std::process::Child` on drop, including mid-unwind. Construct it
+/// immediately after `spawn()` — before anything else has a chance to panic — so a panic anywhere
+/// afterward cannot orphan the wrapped child.
+#[cfg(unix)]
+pub struct KillOnDrop(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl KillOnDrop {
+    pub fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    pub fn id(&self) -> u32 {
+        self.0.as_ref().expect("KillOnDrop used after its child was taken").id()
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0
+            .as_mut()
+            .expect("KillOnDrop used after its child was taken")
+            .try_wait()
+    }
+
+    /// Takes the child's stdout pipe (only meaningful if it was spawned with
+    /// `Stdio::piped()`). Returns `None` on a second call.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.0
+            .as_mut()
+            .expect("KillOnDrop used after its child was taken")
+            .stdout
+            .take()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        let kill_result = child.kill();
+        let wait_result = child.wait();
+        // A failure here during an ordinary (non-unwinding) drop is a broken contract this guard
+        // exists to uphold — assert it. During unwind, a second panic would abort the process
+        // and hide the ORIGINAL panic's message, so this reports instead of asserting.
+        if std::thread::panicking() {
+            if let Err(e) = &kill_result {
+                eprintln!("KillOnDrop: kill failed during unwind: {e}");
+            }
+            if let Err(e) = &wait_result {
+                eprintln!("KillOnDrop: wait failed during unwind: {e}");
+            }
+        } else {
+            debug_assert!(kill_result.is_ok(), "KillOnDrop: kill failed: {kill_result:?}");
+            debug_assert!(wait_result.is_ok(), "KillOnDrop: wait failed: {wait_result:?}");
+        }
+    }
+}
+
+/// Copies `src` into `dir` (a directory the caller has already chmod'd world-traversable) and
+/// chmods the copy `0o755` regardless of `src`'s own mode.
+#[cfg(unix)]
+pub fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dest = dir.join(src.file_name().expect("src has a file name"));
+    std::fs::copy(src, &dest).expect("copy into the scratch directory");
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).expect("chmod the copy world-executable");
+    dest
+}
