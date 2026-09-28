@@ -198,7 +198,10 @@ fn fixture_survives_group_signal() {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment kills it
     let _survivor = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .args(fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST))
+        // `[1..]`: `fixture_argv`'s slot 0 is the placeholder libtest itself would drop as the
+        // binary name — `std::process::Command` supplies its own argv[0] from `new()` above, so
+        // passing the full array here would leave the placeholder as a real argv[1], not dropped.
+        .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
         .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(std::process::Stdio::null())
