@@ -651,6 +651,18 @@ fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
 /// The largest handle count a single `WaitForMultipleObjects` call accepts (`MAXIMUM_WAIT_OBJECTS`).
 const MAXIMUM_WAIT_OBJECTS: usize = 64;
 
+/// The clamp applied to a computed wait timeout (production: `INFINITE - 1`, ~49.7 days —
+/// `WaitForMultipleObjects` reserves `INFINITE` itself as the "no timeout" sentinel). A test
+/// can override it via `crate::wait::wait_clamp_seam` to exercise the "clamped wait elapsed
+/// before the real deadline, re-arm" path deterministically, without an actual 49.7-day wait.
+fn wait_max_ms() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = crate::wait::wait_clamp_seam::get() {
+        return v;
+    }
+    INFINITE - 1
+}
+
 impl JobHandle {
     /// Block until every process in this job has EXITED (not reaped), or until `deadline`.
     ///
@@ -920,7 +932,13 @@ pub(crate) fn wait_drained_raw(
         // real look before `WAIT_TIMEOUT` reports `MembersRemain` below.
         let ms: u32 = match remaining {
             None => INFINITE,
-            Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
+            Some(d) => {
+                let clamp = wait_max_ms();
+                let ms = d.as_millis().min(clamp as u128) as u32;
+                #[cfg(test)]
+                crate::wait::wait_ms_probe::record(ms, d);
+                ms
+            }
         };
 
         // SAFETY: every handle in `handles` was just opened above and stays open for the

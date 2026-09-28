@@ -120,6 +120,63 @@ pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
     }
 }
 
+/// `d` rounded UP to whole milliseconds, not truncated. `Duration::as_millis()` floors, which
+/// for a sub-millisecond remainder (e.g. 500µs) yields `0` — a Win32 wait armed with that `0`
+/// polls immediately and can report "timed out" up to a full millisecond before the caller's
+/// real deadline, violating cosca's never-early deadline contract. `Duration::ZERO` ceils to
+/// `0`, which is correct: a zero-remaining deadline is a poll, not a wait.
+///
+/// Pure and portable (no OS dependency) so it is unit-testable on every host, including this
+/// one — the Windows wait sites are the only current callers, but the math itself is not
+/// Windows-specific.
+#[cfg_attr(not(test), allow(dead_code))] // wired into the Windows wait sites by the next commit
+pub(crate) fn ceil_millis(d: Duration) -> u128 {
+    let nanos = d.as_nanos();
+    let ms = nanos.div_ceil(1_000_000);
+    debug_assert!(ms * 1_000_000 >= nanos, "ceil_millis must round UP, never down");
+    ms
+}
+
+/// Test-only seam: lets a test override the clamp the Windows wait sites apply to a computed
+/// millisecond timeout (production default: `INFINITE - 1`, ~49.7 days) so the "clamped wait
+/// elapsed before the real deadline, re-arm" path is exercised deterministically — without
+/// actually waiting 49.7 days for a real clamp to fire.
+#[cfg(all(test, windows))]
+pub(crate) mod wait_clamp_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE_MS: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+    /// Override the clamp for the current thread. `None` restores the production default.
+    pub(crate) fn set(ms: Option<u32>) {
+        OVERRIDE_MS.with(|c| c.set(ms));
+    }
+    pub(crate) fn get() -> Option<u32> {
+        OVERRIDE_MS.with(|c| c.get())
+    }
+}
+
+/// Test-only seam: records, for every Win32 wait a call site arms, the millisecond count it
+/// chose alongside the exact `remaining` duration it was computed from — so a test can assert
+/// the ceiling relationship (`armed_ms >= remaining`) structurally, without depending on
+/// wall-clock timing around the call (which real OS/syscall jitter makes unreliable to assert
+/// on directly).
+#[cfg(all(test, windows))]
+pub(crate) mod wait_ms_probe {
+    use std::cell::RefCell;
+    use std::time::Duration;
+    thread_local! {
+        static RECORDED: RefCell<Vec<(u32, Duration)>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(crate) fn record(ms: u32, remaining: Duration) {
+        RECORDED.with(|r| r.borrow_mut().push((ms, remaining)));
+    }
+    /// Drain and return everything recorded on the current thread since the last `take()`.
+    pub(crate) fn take() -> Vec<(u32, Duration)> {
+        RECORDED.with(|r| r.take())
+    }
+}
+
 #[cfg(test)]
 #[path = "wait_tests.rs"]
 mod wait_tests;

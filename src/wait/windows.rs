@@ -21,6 +21,19 @@ fn close(handle: HANDLE) {
     debug_assert!(closed.is_ok(), "CloseHandle of an owned process handle should not fail");
 }
 
+/// The clamp applied to a computed wait timeout (production: `INFINITE - 1`, ~49.7 days —
+/// `WaitForSingleObject`/`WaitForMultipleObjects` reserve `INFINITE` itself as the "no
+/// timeout" sentinel). A test can override it via `crate::wait::wait_clamp_seam` to exercise
+/// the "clamped wait elapsed before the real deadline, re-arm" path deterministically, without
+/// an actual 49.7-day wait.
+fn wait_max_ms() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = crate::wait::wait_clamp_seam::get() {
+        return v;
+    }
+    INFINITE - 1
+}
+
 pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
     let handle = match crate::identity::windows_open_classified(
         id.pid(),
@@ -70,7 +83,13 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     }
     let ms: u32 = match crate::wait::remaining(deadline) {
         None => INFINITE,
-        Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
+        Some(d) => {
+            let clamp = wait_max_ms();
+            let ms = d.as_millis().min(clamp as u128) as u32;
+            #[cfg(test)]
+            crate::wait::wait_ms_probe::record(ms, d);
+            ms
+        }
     };
     // SAFETY: `handle` is a live process handle held for the wait's duration.
     let waited = unsafe { WaitForSingleObject(handle, ms) };
@@ -175,12 +194,18 @@ pub(crate) fn block_until_exit_or_cancel(
         // Capped at INFINITE-1 (~49.7 days) — the cancel event releases large graces early;
         // a debug_assert flags the rare clamp.
         Some(d) => {
-            let clamped = d.as_millis().min((INFINITE - 1) as u128) as u32;
+            let clamp = wait_max_ms();
+            let clamped = d.as_millis().min(clamp as u128) as u32;
+            // Checked against the REAL production clamp (never the test-seam override above):
+            // this flags a caller's raw grace genuinely exceeding ~49.7 days, not a test's
+            // deliberately-tiny injected clamp.
             debug_assert!(
                 d.as_millis() <= (INFINITE - 1) as u128,
                 "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
                 d.as_secs()
             );
+            #[cfg(test)]
+            crate::wait::wait_ms_probe::record(clamped, d);
             clamped
         }
     };
@@ -285,3 +310,7 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
             .into(),
     })
 }
+
+#[cfg(test)]
+#[path = "windows_tests.rs"]
+mod windows_tests;
