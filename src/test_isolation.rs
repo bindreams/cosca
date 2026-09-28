@@ -29,9 +29,12 @@ pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// `unused_macros` is allowed here, not fixed by using it below: nothing in THIS file invokes it
 /// any more (its only caller, `isolation_tests`, moved out to the lib-only `src/
 /// test_isolation_tests.rs` — see that file's own doc for why it could not stay nested here). At
-/// the lib mount point that invocation is enough to mark it used; at every integration-test mount
-/// point (a SEPARATE compilation of this same file, which that lib-only caller never reaches) it
-/// genuinely is not, since no integration test currently calls `common::fixture_path!` either.
+/// the lib mount point that invocation is enough to mark it used. At each SEPARATE compilation of
+/// this same file for an integration-test mount point, it depends on that specific binary:
+/// `tests/spawn_io.rs` does call `common::fixture_path!` (its closed-std-slots provers), so this
+/// attribute is a genuine no-op THERE — but every other integration test binary that
+/// `#[path]`-includes this file still does not call it at all, and needs the attribute for real.
+/// One `#[allow]` covering every mount point uniformly is simpler than gating it per binary.
 #[allow(unused_macros)]
 macro_rules! fixture_path {
     ($name:ident) => {{

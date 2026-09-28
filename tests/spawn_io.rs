@@ -1656,8 +1656,9 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     let name = common::fixture_path!(linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child);
 
-    // Isolates the WHOLE test (this outer call, and every one of the 16 per-case re-execs below,
-    // which inherit `COSCA_TEST_ALONE` and already use this exact re-exec shape) from the rest of
+    // Isolates the WHOLE test (this outer call, and every one of the 16 per-case re-execs below —
+    // each one an `alone_with_env` call, which sets `COSCA_TEST_ALONE` explicitly on every spawn,
+    // not merely inherits it, and already uses this exact re-exec shape) from the rest of
     // the suite before any of them can reach `spawn_with_std_slots_closed`'s real fd 0/1/2 close —
     // gated there by `common::require_process_per_test`. Without this, `COSCA_TEST_CLOSED_SLOTS`
     // alone (a plain env var, no argv verification) was the only gate on that mutation — the same
@@ -1784,8 +1785,9 @@ fn parse_closed_slots(slots: &str) -> Vec<i32> {
 ///
 /// `RestoreStdio::close` asserts `common::require_process_per_test` before touching anything:
 /// this process-wide fd 0/1/2 close is exactly what that guard exists for. Reachable only via the
-/// outer test's own `common::alone` isolation (see there) — every path down to here inherits
-/// `COSCA_TEST_ALONE` and keeps the same re-exec shape.
+/// outer test's own `common::alone` isolation (see there) — every re-exec down to here has
+/// `COSCA_TEST_ALONE` set explicitly, by whichever `spawn_alone` call launched it, and keeps the
+/// same re-exec shape.
 #[cfg(target_os = "linux")]
 fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
     // Closed only across the spawn, and restored right after: checks every dup/close/restore

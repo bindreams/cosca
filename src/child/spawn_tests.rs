@@ -393,10 +393,13 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     cgroup_fault::set_hook_gate(gate_read.as_raw_fd());
     let spawned = cmd.spawn();
     let _ = cgroup_fault::take_hook_gate();
-    drop(restore_stdio);
-    // Released whatever happened, before any assert: a child held forever holds this process's
-    // stdout, and would hang the outer run.
+    // Released whatever happened, before any assert AND before `restore_stdio` drops: a child
+    // held forever holds this process's stdout, and would hang the outer run — including if
+    // `restore_stdio`'s own `Drop` panics (a real, documented outcome of a restore failure, not
+    // merely a theoretical one), which would otherwise skip this write entirely were it ordered
+    // after the drop instead.
     gate_write.write_all(b"x").expect("release the child");
+    drop(restore_stdio);
     let leftover = (
         cgroup_fault::take_force_leaf_busy(),
         cgroup_fault::take_force_signal_denied(),

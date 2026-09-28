@@ -449,10 +449,13 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
         fault::set_force_post_fork_failure(true);
         let spawned = cmd.spawn();
         let _ = crate::containment::cgroup::fault::take_hook_gate();
-        drop(restore_stdio);
-        // The spawn is abandoned: only now does the child's hook run. Released before any assert:
-        // the child holds this process's stdout, and a child held forever would hang the outer run.
+        // The spawn is abandoned: only now does the child's hook run. Released before any assert
+        // AND before `restore_stdio` drops: the child holds this process's stdout, and a child
+        // held forever would hang the outer run — including if `restore_stdio`'s own `Drop`
+        // panics (a real, documented outcome of a restore failure), which would otherwise skip
+        // this write entirely were it ordered after the drop instead.
         gate_write.write_all(b"x").expect("release the child");
+        drop(restore_stdio);
         assert!(spawned.is_err(), "the forced failure must fail the spawn");
         let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
         let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
