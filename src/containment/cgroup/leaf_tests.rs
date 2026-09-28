@@ -2249,7 +2249,6 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    // Not yet wired into the guard's protection across this test — a follow-up does that.
     let pid = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
@@ -2641,7 +2640,6 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
-    // Not yet wired into the guard's protection across this test — a follow-up does that.
     let pid = fork_running(move || {
         // SAFETY: this child's inherited copy of the channel's child end.
         let _ = unsafe { slot.send_intent() };
@@ -3005,7 +3003,6 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    // Not yet wired into the guard's protection across this test — a follow-up does that.
     let pid = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.

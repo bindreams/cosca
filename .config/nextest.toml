@@ -37,15 +37,6 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'binary(windows_elevation_routes)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
-[[profile.ci.overrides]]
-# `test_support_tests.rs`'s two regression tests fork a `pause()` child that ignores everything but
-# a kill, then rely on `fork_running`/`KillOnDrop` to actually kill it before reaping. A regression
-# that drops that kill has no other bound: the reap that follows (a blocking `waitid`/`waitpid`)
-# then waits forever on a child that can never exit on its own. This turns that hang into a named
-# failure instead of hanging the whole run — both tests normally finish in well under a second.
-filter = 'test(test_support_tests)'
-slow-timeout = { period = "20s", terminate-after = 1 }
-
 [test-groups]
 # `tests/windows_shell_execute.rs` serializes its tests with an in-process mutex, a holdover from
 # when `cargo test` ran them all in one shared process — there PATH and one env var were also
@@ -69,3 +60,11 @@ test-group = 'windows-shell-execute'
 [[profile.default.overrides]]
 filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
+
+[[profile.default.overrides]]
+# The kill-dropping regression hangs these tests (blocking reap of a `pause()` child); bound it so
+# it fails instead. Both normally finish in well under a second. Under `profile.default`, not
+# `profile.ci`, so it also bounds a local `cargo nextest run` — nextest falls back to the default
+# profile's overrides for settings a named profile's own overrides don't match.
+filter = 'test(test_support_tests)'
+slow-timeout = { period = "20s", terminate-after = 1 }

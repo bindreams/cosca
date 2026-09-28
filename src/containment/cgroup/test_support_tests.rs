@@ -1,16 +1,8 @@
-use super::fork_running;
+use super::{fork_running, reap};
 
-/// A panic between `fork_running`'s return and whatever cleanup the caller would otherwise do
-/// must not leave its child unreaped: the guard's `Drop` runs during unwind and reaps it there,
-/// even though nothing else on the caller's stack got a chance to.
-///
-/// Probed by a pidfd this test opens independently of the guard's own: once the guard's `Drop`
-/// has reaped the child, querying the same process through that separate pidfd finds no child
-/// left to wait for (`ECHILD`) — proof the guard did the reaping, not a coincidence of timing.
-///
-/// A regression that drops the kill hangs this test rather than failing it: the guard's `Drop`
-/// would then block forever in its own blocking `waitid` on a child that never exits (`pause()`
-/// ignores everything but a kill). See `.config/nextest.toml`'s `terminate-after` for this module.
+/// A panic after `fork_running` must not leave the child unreaped: the guard's `Drop` reaps it
+/// during unwind. Checked via an independent pidfd, which reports `ECHILD` once the child is
+/// reaped. If the kill regresses, this hangs (bounded by `nextest.toml`).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_panic_after_fork_running_still_reaps_the_child() {
@@ -42,18 +34,10 @@ fn a_panic_after_fork_running_still_reaps_the_child() {
     );
 }
 
-/// A `pidfd_open` failure right after the fork — as `RLIMIT_NOFILE` can cause — runs before any
-/// `KillOnDrop` exists to protect the child. `fork_running` must still not orphan it: it kills and
-/// reaps through the bare pid itself, in that one narrow window, before panicking.
-///
-/// Probed the same way as the sibling test above, but the probe pidfd here is the one
-/// `fork_running`'s own failure path records (see `fault::record_fork_running_pidfd_failure_probe`),
-/// opened before it killed the child — this test cannot open its own, since it never gets the pid
-/// back (the call panics instead of returning).
-///
-/// A regression that drops the kill hangs this test rather than failing it: `fork_running`'s own
-/// blocking `waitpid` would then block forever on a child that never exits (`pause()` ignores
-/// everything but a kill). See `.config/nextest.toml`'s `terminate-after` for this module.
+/// A `pidfd_open` failure (e.g. `RLIMIT_NOFILE`) happens before any guard exists; `fork_running`
+/// must still kill and reap the child before panicking. Probed via the pidfd its failure path
+/// records (see `fault::record_fork_running_pidfd_failure_probe`), since the pid is never
+/// returned. Hang-if-regressed as above.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_pidfd_open_failure_still_reaps_the_child() {
@@ -61,14 +45,19 @@ fn a_pidfd_open_failure_still_reaps_the_child() {
 
     crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
     let unwound = std::panic::catch_unwind(|| {
-        // `fork_running` panics before returning here (that's the point), so its `KillOnDrop`
-        // never comes into existence for this call.
         let _ = fork_running(|| {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
     });
-    assert!(unwound.is_err(), "the forced pidfd_open failure must panic");
+    let payload = unwound.expect_err("the forced pidfd_open failure must panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .expect("panic! with format args produces a String payload");
+    assert!(
+        message.contains("pidfd_open its own just-forked child"),
+        "the panic must name the failure it's about, got {message:?}"
+    );
     assert!(
         !crate::containment::cgroup::fault::take_force_fork_running_pidfd_failure(),
         "the fault must be consumed exactly once"
@@ -85,4 +74,33 @@ fn a_pidfd_open_failure_still_reaps_the_child() {
         rustix::io::Errno::CHILD,
         "the pidfd_open failure path must have reaped the child before panicking"
     );
+}
+
+/// A defused guard's `Drop` must neither kill nor reap: the caller took that over by taking the
+/// pid back. Checked via an independent pidfd — `waitid` `NOHANG` on a still-running child returns
+/// `Ok(None)`, which a live kill or reap would instead turn into a real exit status or `ECHILD`.
+#[cfg(target_os = "linux")]
+#[test]
+fn defuse_disarms_the_guard() {
+    use std::os::fd::AsFd;
+
+    let guard = fork_running(|| {
+        // SAFETY: `pause` is async-signal-safe.
+        unsafe { libc::pause() };
+    });
+    let child = rustix::process::Pid::from_raw(guard.pid() as i32).expect("a positive pid");
+    let probe = rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty()).expect("open a probe pidfd");
+
+    let pid = guard.defuse();
+    match rustix::process::waitid(
+        rustix::process::WaitId::PidFd(probe.as_fd()),
+        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOHANG,
+    ) {
+        Ok(None) => {}
+        other => panic!("a defused guard must not have killed or reaped the child, got {other:?}"),
+    }
+
+    // SAFETY: `pid` is this process's own child, still alive and unreaped.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    reap(pid);
 }

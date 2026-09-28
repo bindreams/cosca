@@ -401,8 +401,8 @@ pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
     }
 }
 
-/// Make the NEXT `fork_running` on this thread fail its `pidfd_open`, as `RLIMIT_NOFILE` would.
-/// Take semantics.
+/// Make the NEXT `fork_running` on this thread fail its `pidfd_open` (as `RLIMIT_NOFILE` would);
+/// consumed by that call.
 pub(crate) fn set_force_fork_running_pidfd_failure(on: bool) {
     FORCE_FORK_RUNNING_PIDFD_FAILURE.with(|f| f.set(on));
 }
@@ -412,7 +412,7 @@ pub(crate) fn take_force_fork_running_pidfd_failure() -> bool {
 
 /// A pidfd `fork_running`'s own `pidfd_open` failure path opened independently, on the same
 /// child, before it killed and reaped it — for a test to check that child is really gone
-/// afterward without racing its pid number's possible reuse. Take semantics.
+/// afterward without racing its pid number's possible reuse. Consumed by `take`.
 pub(crate) fn take_fork_running_pidfd_failure_probe() -> Option<std::os::fd::OwnedFd> {
     FORK_RUNNING_PIDFD_FAILURE_PROBE.with(|p| p.borrow_mut().take())
 }
