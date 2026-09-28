@@ -1,6 +1,6 @@
 use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
-use crate::test_isolation::alone;
 use crate::containment::cgroup::PlacementReport;
+use crate::test_isolation::alone;
 
 /// The child's self-placement errno crosses `fork` into the parent. Deterministic and
 /// cgroup-free: fd -1 is never writable, so the child's `write` always fails with `EBADF`,
