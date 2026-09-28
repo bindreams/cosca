@@ -241,6 +241,32 @@ step consistent with these principles.
 
 **Applies to:** plans and PRs.
 
+## 13. A deadline is never early, and never late by its own choice
+
+Every caller-supplied deadline cosca accepts (`wait_timeout`, `wait_tree_timeout`,
+`graceful_shutdown`'s grace) gets exactly two promises, both checked against a monotonic clock:
+
+- **Never early.** cosca never reports a timeout outcome (`wait_timeout`'s `Ok(None)`/`Ok(false)`,
+  `wait_tree_timeout`'s `MembersRemain`, a grace escalating to a kill) before `now >= deadline`.
+  Tests assert `elapsed >= deadline` exactly, with no slack: scheduling can only push a call later,
+  never earlier, so a passing test never needed a tolerance band.
+- **Never late by its own choice.** Every block that waits for the deadline is armed with the
+  deadline itself — not a duration computed earlier and reused — as its wake time, and no new round
+  of work starts once the deadline has passed. This is proved structurally: a `#[cfg(test)]` seam
+  reports the instant a wait actually blocked until, or whether a blocking call happened at all, and
+  a test clock advanced past the deadline shows the next check returning without another round —
+  not by timing a wall-clock run and checking it against a tolerance band.
+
+cosca promises no upper bound on how late after the deadline it actually reports the outcome: OS
+scheduling, load or a suspended process can delay that by any amount. No test may assert one.
+
+**Why:** a wall-clock assertion with a tolerance band (`elapsed <= deadline + slack`) is a bet that
+the test machine is fast enough that day — it passes by luck and fails under load, and the slack
+itself is exactly wide enough to hide the busy-poll and early-return bugs it exists to catch. A
+structural check proves the property regardless of machine speed.
+
+**Applies to:** every caller-supplied deadline and every wait that arms one.
+
 [tokio shutdown.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/blocking/shutdown.rs#L51-L54
 [sd-event.c]: https://github.com/systemd/systemd/blob/885fe07ee37cff7316680b5088d11081e01813b1/src/libsystemd/sd-event/sd-event.c#L3753-L3765
 [runc CHANGELOG]: https://github.com/opencontainers/runc/blob/41b74772b651b3b42a1f04a43a803db16f0e7e9b/CHANGELOG.md?plain=1#L1217-L1220
