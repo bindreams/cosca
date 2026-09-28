@@ -100,6 +100,10 @@ pub(crate) mod test_clock {
     }
 
     /// Advance this thread's offset by `by`, moving the mock "now" further into the future.
+    /// Exercised only by macOS's `marker_eof_tests` today (the only current caller across the
+    /// crate's platforms), so this is genuinely dead code everywhere else — same pattern as
+    /// `containment::cgroup::parse`'s Linux-only helpers.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn advance(by: Duration) {
         OFFSET.with(|o| o.set(o.get() + by));
     }
