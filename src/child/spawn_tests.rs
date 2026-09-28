@@ -636,9 +636,13 @@ fn a_failed_password_write_kills_the_contained_tree() {
 /// logged at `warn`, naming the failure — matching every other teardown-mechanism failure's own
 /// convention elsewhere in this crate (e.g. `warn_leaf_left_behind`). Before this, the returned
 /// `Error::Elevation`'s `detail` noted it, but nothing routed it through the log, so a real (e.g.
-/// transient) failure here left no diagnosable trace — exactly what made an earlier CI flake of
-/// the async twin of this test (`a_failed_password_write_kills_the_contained_tree`) unexplainable
-/// from its own output.
+/// transient) failure here left no diagnosable trace.
+///
+/// (This is a real, independent gap this crate's own principles call for — it is NOT what
+/// explained a since-fixed CI flake of the async twin of this test
+/// (`a_failed_password_write_kills_the_contained_tree`): that one was a genuine race between this
+/// thread's own kill and the async reaper pool's background re-fire of the same write, unrelated
+/// to logging. See that test's own doc.)
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_password_write_warns_when_the_tree_kill_fails() {
@@ -654,7 +658,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
 
     // Not ENOENT/ENODEV, so `hard_kill` cannot read this as "already gone" — it must take the
     // real teardown-mechanism-failure arm.
-    crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
+    let _errno_guard = crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
     assert!(

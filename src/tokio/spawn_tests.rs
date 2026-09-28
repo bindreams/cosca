@@ -557,6 +557,25 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
     }
 }
 
+/// A failed password write kills the contained tree through the leaf — checked on the
+/// thread-local step log, not by reading `cgroup.kill`'s raw bytes.
+///
+/// **Why not the file.** `child`'s own `Drop`, at the end of this call, hands its leaf to the
+/// async reaper pool's background thread — a SEPARATE thread from this test's own. If that
+/// thread's own teardown logic finds the leaf disarmed-but-killed (exactly this test's shape —
+/// `detach()`, then a kill through the leaf outside `Drop`'s own path), it deliberately re-fires
+/// `hard_kill` itself: a documented defense in `CgroupLeaf::drop`'s own truth table against a
+/// stale `killed` flag (an occupant that migrated in after the first kill, or — pre-Linux-6.14 —
+/// a fork racing the first `cgroup.kill`). That second write is real and correct, but it runs
+/// concurrently with whatever this thread does next, and `LeafDir::write` truncates before it
+/// writes the new byte: a read of the raw file from THIS thread can land in that window and see
+/// `[]`. Measured live in CI at a low but real rate before this test was changed (root-caused via
+/// `fault::record_leaf_step`, which showed the second writer's thread was the reaper pool's, not
+/// this test's own).
+///
+/// The thread-local step log sidesteps the race entirely: it only records what THIS thread's own
+/// `hard_kill` call did, so the reaper thread's later, independent re-fire — on a different
+/// thread, into a different thread-local — is invisible to it, by construction.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_kills_the_contained_tree() {
@@ -571,6 +590,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: "forced password-write failure".into(),
     });
+    crate::containment::cgroup::fault::record_leaf_steps();
     let err = super::finish_elevated(child, written).expect_err("a failed write fails the spawn");
 
     assert!(
@@ -584,8 +604,8 @@ async fn a_failed_password_write_kills_the_contained_tree() {
         "got {err:?}"
     );
     assert_eq!(
-        std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
-        b"1",
+        crate::containment::cgroup::fault::take_leaf_steps(),
+        vec!["kill".to_string()],
         "the failed spawn must kill its tree through the leaf"
     );
 }
@@ -593,7 +613,8 @@ async fn a_failed_password_write_kills_the_contained_tree() {
 /// Async twin of the sync `a_failed_password_write_warns_when_the_tree_kill_fails` (see there): a
 /// tree-teardown failure during a failed password write must be logged at `warn`, not only
 /// embedded in the returned error's `detail`. Before this, a real (e.g. transient) failure here
-/// left no trace to diagnose a flake from.
+/// left no diagnosable trace — a real, independent gap, not what explained the CI flake fixed
+/// just above in `a_failed_password_write_kills_the_contained_tree`'s own doc.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
@@ -607,7 +628,7 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
 
     // Not ENOENT/ENODEV, so `hard_kill` cannot read this as "already gone" — it must take the
     // real teardown-mechanism-failure arm.
-    crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
+    let _errno_guard = crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
     assert!(

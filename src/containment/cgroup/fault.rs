@@ -66,9 +66,21 @@ pub(crate) fn take_force_kill_check_errno() -> Option<i32> {
 /// Make the NEXT `hard_kill` write to `cgroup.kill` on this thread fail with `errno`, instead of
 /// the real write — a mechanism failure `removed_after_drain` does not recognize (not `ENOENT`/
 /// `ENODEV`), as a delegated subtree's `cgroup.kill` losing write access mid-teardown would give.
-/// Take semantics.
-pub(crate) fn set_force_hard_kill_write_errno(errno: i32) {
+/// RAII: the returned guard clears the fault on drop, so a test that panics before `hard_kill`
+/// ever consumes it (via [`take_force_hard_kill_write_errno`]) cannot leak it into whichever
+/// test next shares this thread.
+#[must_use = "dropping this immediately clears the forced errno; bind it for the scope that needs it"]
+pub(crate) struct ForceHardKillWriteErrnoGuard(());
+
+impl Drop for ForceHardKillWriteErrnoGuard {
+    fn drop(&mut self) {
+        FORCE_HARD_KILL_WRITE_ERRNO.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn set_force_hard_kill_write_errno(errno: i32) -> ForceHardKillWriteErrnoGuard {
     FORCE_HARD_KILL_WRITE_ERRNO.with(|f| f.set(Some(errno)));
+    ForceHardKillWriteErrnoGuard(())
 }
 pub(crate) fn take_force_hard_kill_write_errno() -> Option<i32> {
     FORCE_HARD_KILL_WRITE_ERRNO.with(|f| f.take())
