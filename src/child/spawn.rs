@@ -375,8 +375,23 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 /// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
 /// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
 pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
-    static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
     SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A non-blocking probe on the exact same mutex [`spawn_lock`] locks, for a test to prove the
+/// lock is genuinely held at a given point — a real contended `Mutex::try_lock` either refuses
+/// immediately (`WouldBlock`) or succeeds; it never spins or blocks waiting to find out, so this
+/// cannot pass by scheduling luck the way racing two threads against a shared flag can.
+///
+/// `cfg`'d to match its one caller's own reachability (`fork_running`'s test, Linux-only): a
+/// wider `#[cfg(test)]` alone would compile this on every OS while never being called on most of
+/// them, a real `dead_code` warning, not a false one.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn try_spawn_lock_for_test(
+) -> Result<std::sync::MutexGuard<'static, ()>, std::sync::TryLockError<std::sync::MutexGuard<'static, ()>>> {
+    SPAWN_MUTEX.try_lock()
 }
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {

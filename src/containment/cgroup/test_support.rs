@@ -5,27 +5,36 @@
 /// inherited fds (stdout) open. The returned [`KillOnDrop`] SIGKILLs and reaps it on drop unless
 /// [`defused`](KillOnDrop::defuse).
 ///
-/// Forks under [`spawn_lock`](crate::child::spawn::spawn_lock): a bare `fork()` here would race a
-/// concurrent cosca spawn elsewhere in this test binary that momentarily holds a non-`CLOEXEC` fd
-/// open across its own inheritable-fd window, and this fork would inherit it too (`#200`'s
-/// finding). Held only across the `fork()` call itself, not the pidfd/cleanup that follows.
+/// Forks under [`spawn_lock`](crate::child::spawn::spawn_lock). `#200`'s own fd is `O_CLOEXEC`,
+/// so this fork not `exec`ing does not, by itself, inherit it — but `fork_running`'s `exec`-less
+/// child inherits every fd its parent has open at all, `O_CLOEXEC` or not, exactly as `#200`'s own
+/// finding says. What `spawn_lock` actually excludes is narrower: an fd that exists ONLY inside
+/// another holder's own `spawn_lock` section — e.g. a fd a concurrent cosca spawn opened non-
+/// `CLOEXEC` for a window it means to close before releasing the lock. A bare fork here could land
+/// inside that window and inherit it too. Held across the `fork()` call itself, through to just
+/// after it returns in the parent, not the pidfd/cleanup that follows.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
-    let raw_pid = {
-        let _guard = crate::child::spawn::spawn_lock();
-        crate::containment::cgroup::fault::run_between_spawn_lock_and_fork();
-        // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
-        // `_exit`s without unwinding or running destructors.
-        unsafe { libc::fork() }
-    };
+    let guard = crate::child::spawn::spawn_lock();
+    // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
+    // `_exit`s without unwinding or running destructors.
+    let raw_pid = unsafe { libc::fork() };
     match raw_pid {
         -1 => panic!("fork: {}", std::io::Error::last_os_error()),
         0 => {
+            // Never dropped here: `MutexGuard::drop`'s unlock (an atomic swap, a `FUTEX_WAKE`
+            // when contended) is not async-signal-safe, and this process's own copy of the lock
+            // state dies with it regardless — only the parent's release is real.
+            std::mem::forget(guard);
             body();
             // SAFETY: async-signal-safe.
             unsafe { libc::_exit(0) }
         }
         raw_pid => {
+            // Observed here, not before the fork: this is the seam a test uses to prove the lock
+            // is still held across the fork itself, not just up to the moment before it.
+            crate::containment::cgroup::fault::run_between_spawn_lock_and_fork(raw_pid);
+            drop(guard);
             let pid = raw_pid as u32;
             // Opened right after the fork: only our still-unreaped child can hold this pid now,
             // so the pidfd names it exactly.

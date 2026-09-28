@@ -275,75 +275,78 @@ fn defuse_disarms_the_guard() {
 }
 
 /// `fork_running` must hold `spawn_lock()` across its `fork()`, not just release it before —
-/// otherwise a concurrent cosca spawn elsewhere in this test binary can inherit an fd
-/// `fork_running`'s caller holds open at that moment (`#200`'s finding).
+/// otherwise a concurrent cosca spawn elsewhere in this test binary can inherit an fd that
+/// exists only inside that spawn's own `spawn_lock` section (`#200`'s finding).
 ///
-/// Proved through a seam, not timing: a hook fires on `fork_running`'s own thread right after it
-/// acquires `spawn_lock` and blocks there until this test releases it. While blocked, another
-/// thread's own `spawn_lock()` call can only be a real, contended `Mutex::lock()` — it either
-/// waits for the release, or (if the guard were missing) races ahead of it. Which one happened is
-/// read back through a flag the hook sets, still holding the lock, immediately before releasing
-/// it: `Mutex`'s own unlock-then-lock happens-before edge (not this test) is what guarantees the
-/// probe thread cannot observe `written == false` once it has legitimately acquired the lock, so
-/// the assertion below cannot pass by scheduling luck.
+/// Proved through a seam, observed AFTER the fork, not before it: the hook fires on
+/// `fork_running`'s own thread right after its `fork()` returns in the parent, still holding
+/// `spawn_lock`, and blocks there until this test releases it. Two independent, deterministic
+/// checks while it is blocked, neither timing-dependent:
+/// - the hook is handed the child's real pid, which only exists once `fork()` has actually
+///   returned — this test confirms it independently of the hook's own honesty, via `kill(pid, 0)`
+///   asking the kernel directly whether that pid is a live process right now;
+/// - a `#[cfg(test)]` non-blocking `try_spawn_lock_for_test` on the very same mutex either
+///   refuses immediately (`WouldBlock`, the lock is genuinely held) or succeeds (it is not) — a
+///   real `Mutex::try_lock` never spins or blocks waiting to find out.
+///
+/// Together they rule out both a seam that fires before the fork (no real pid to hand it) and a
+/// `fork_running` that never takes the lock at all (`try_lock` would simply succeed).
 #[cfg(target_os = "linux")]
 #[test]
 fn fork_running_holds_spawn_lock_across_the_fork() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
 
-    let written = Arc::new(AtomicBool::new(false));
-    let (tx_started, rx_started) = mpsc::channel::<()>();
+    let (tx_started, rx_started) = mpsc::channel::<i32>();
     let (tx_release, rx_release) = mpsc::channel::<()>();
 
-    let fork_thread = {
-        let written = Arc::clone(&written);
-        std::thread::spawn(move || {
-            crate::containment::cgroup::fault::set_between_spawn_lock_and_fork(move || {
-                tx_started
-                    .send(())
-                    .expect("the test thread is still waiting to receive");
-                rx_release
-                    .recv()
-                    .expect("the test thread still holds the release sender");
-                written.store(true, Ordering::Release);
-            });
-            fork_running(|| {
-                // SAFETY: `pause` is async-signal-safe.
-                unsafe { libc::pause() };
-            })
+    let fork_thread = std::thread::spawn(move || {
+        crate::containment::cgroup::fault::set_between_spawn_lock_and_fork(move |child_pid| {
+            tx_started
+                .send(child_pid)
+                .expect("the test thread is still waiting to receive");
+            rx_release
+                .recv()
+                .expect("the test thread still holds the release sender");
+        });
+        fork_running(|| {
+            // SAFETY: `pause` is async-signal-safe.
+            unsafe { libc::pause() };
         })
-    };
+    });
 
-    // Blocks until fork_running's hook is running — i.e. spawn_lock is held on that thread — not
-    // a fixed duration.
-    rx_started
+    // Blocks until fork_running's hook is running — not a fixed duration.
+    let child_pid = rx_started
         .recv()
         .expect("fork_thread must reach the hook before this returns");
 
-    // A second, genuinely concurrent attempt on the SAME process-global lock. If fork_running
-    // still holds it, this call blocks in the kernel/libstd's own mutex until `tx_release` fires
-    // below; if fork_running does not hold it, this acquires immediately.
-    let probe_thread = {
-        let written = Arc::clone(&written);
-        std::thread::spawn(move || {
-            let _guard = crate::child::spawn::spawn_lock();
-            written.load(Ordering::Acquire)
-        })
-    };
+    // The hook can only be called with a real pid from the PARENT arm, after `fork()` has
+    // already returned — a hook moved to before the `fork()` this lock is meant to cover has no
+    // pid to pass. Confirmed independently of the hook's own honesty: `kill(pid, 0)` asks the
+    // kernel directly whether a process at that pid exists right now, sending nothing.
+    // SAFETY: signal 0 sends nothing; it only queries existence/permission.
+    assert_eq!(
+        unsafe { libc::kill(child_pid, 0) },
+        0,
+        "the child must already exist by the time the hook runs, proving fork() already happened: {}",
+        std::io::Error::last_os_error()
+    );
+
+    assert!(
+        matches!(
+            crate::child::spawn::try_spawn_lock_for_test(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ),
+        "spawn_lock must still be held on fork_running's own thread, after its fork, while the \
+         hook is blocked"
+    );
 
     tx_release
         .send(())
         .expect("fork_thread's hook is still waiting to receive");
 
+    // Not re-checked as free afterward: `spawn_lock` is process-global, shared with every other
+    // test in this binary that may spawn concurrently, so its state right after this thread's
+    // own release is not this test's to assert on.
     let guard = fork_thread.join().expect("fork_thread must not panic");
-    let probe_saw_written = probe_thread.join().expect("probe_thread must not panic");
-
-    assert!(
-        probe_saw_written,
-        "a concurrent spawn_lock() must not succeed until fork_running's own fork() is done"
-    );
-
     drop(guard);
 }
