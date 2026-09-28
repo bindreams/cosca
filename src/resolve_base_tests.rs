@@ -679,13 +679,60 @@ fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
         return; // picked up by an ordinary suite run — deliberately inert
     }
     crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
-    let (_root, locked, _open, _path) = locked_then_open();
-    let errno = stat_errno_via_grandchild(&locked.0.join("tool.exe"));
+    let (_root, locked, open, _path) = locked_then_open();
+    assert_eq!(
+        stat_errno_via_grandchild(&grandchild_reachable_path(&open.join("tool.exe"))),
+        None,
+        "positive control: an exec'd child must be able to reach an UNLOCKED directory the same \
+         way, or a denial below cannot be told apart from this path being unreachable outright"
+    );
+    let errno = stat_errno_via_grandchild(&grandchild_reachable_path(&locked.0.join("tool.exe")));
     assert_eq!(
         errno,
         Some(libc::EACCES),
         "an exec'd child must not regain access to a directory this thread was just denied, got {errno:?}"
     );
+}
+
+/// Rewrites a path built under [`crate::test_child::run_fixture`]'s scratch root so a GRANDCHILD
+/// (not this fixture) can resolve it. On Linux, `fixture_scratch_tempdir` builds paths under
+/// `/proc/<this fixture's own pid>/fd/<n>/...` — correct for THIS process's own use, but reading
+/// ANOTHER process's `/proc/<pid>/fd/<n>` entry is gated by `ptrace_may_access`
+/// (`PTRACE_MODE_READ_FSCREDS`), which requires the READER's capabilities to be a superset of the
+/// TARGET's. `capset` is per-thread: `drop_dac_bypass` only reduces the capabilities of the
+/// specific WORKER THREAD running this fixture's body, not the process's thread-group leader
+/// (whose credentials `/proc/<pid>/...` permission checks use) — so from the grandchild's
+/// perspective (itself reduced, having inherited the worker thread's capabilities via `fork`), the
+/// FIXTURE's own `/proc/<pid>` entry looks MORE privileged than the grandchild itself, and
+/// `ptrace_may_access` refuses it before ever reaching the locked directory's own permission bits.
+/// Measured: `stat`ing even the UNLOCKED `open/tool.exe` through the unrewritten path also failed
+/// with `EACCES` — a false positive the original assertion could not tell apart from the real one,
+/// which the positive control above now catches directly.
+///
+/// The grandchild inherits the SAME fd (see `run_fixture`'s doc on its `O_CLOEXEC` handling), so it
+/// can resolve the identical target through its OWN `/proc/self/fd/<n>` entry instead — reading
+/// one's OWN `/proc/self` needs no cross-process permission check at all. Rewriting the fixture's
+/// pid prefix to `self` in the path STRING (rather than re-deriving the path from scratch) keeps
+/// the rest of the path — the fd number, and every fixture-built subdirectory under it — identical,
+/// so it still names the exact same target the fixture itself built.
+///
+/// A no-op everywhere else: only Linux's `fixture_scratch_tempdir` builds a `/proc`-relative path
+/// in the first place, so elsewhere `locked_then_open`'s paths are already plain, real filesystem
+/// paths any process (grandchild included, since it inherits the SAME dropped identity via `fork`)
+/// can resolve directly.
+#[cfg(target_os = "linux")]
+fn grandchild_reachable_path(p: &Path) -> PathBuf {
+    let own_pid_prefix = format!("/proc/{}/", std::process::id());
+    let rewritten = p
+        .to_str()
+        .expect("fixture scratch paths are built from valid UTF-8 components")
+        .replacen(&own_pid_prefix, "/proc/self/", 1);
+    PathBuf::from(rewritten)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn grandchild_reachable_path(p: &Path) -> PathBuf {
+    p.to_path_buf()
 }
 
 /// Which metadata errors are a definite "not here": absence, a non-directory in the path, or no

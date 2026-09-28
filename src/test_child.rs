@@ -246,11 +246,38 @@ pub(crate) fn run_fixture(fixture: &str) {
     let mut cmd = fixture_command(fixture);
 
     #[cfg(target_os = "linux")]
-    let _fd_guard = {
-        let fd = open_scratch_fd(scratch.path());
-        cmd.env(FIXTURE_SCRATCH_FD_ENV, fd.0.to_string());
-        fd
-    };
+    {
+        // The whole open-to-spawn window is under `spawn_lock()`, not just the spawn: `fd` is
+        // opened `O_CLOEXEC` (so an ordinary `fork`+`exec` anywhere else in this process never
+        // inherits it), but a BARE `fork()` from another concurrently running test — this test
+        // binary does that elsewhere for process-group tests — copies the whole fd table
+        // regardless of `O_CLOEXEC`, which only takes effect at `exec`. Serializing against every
+        // other cosca-originated fork in this binary (the same lock they all use) closes that
+        // window too, not just the exec-time one `O_CLOEXEC` alone would cover.
+        let child = {
+            let _guard = crate::child::spawn::spawn_lock();
+            let fd = open_scratch_fd(scratch.path());
+            cmd.env(FIXTURE_SCRATCH_FD_ENV, fd.0.to_string());
+            // SAFETY: `fcntl(F_SETFD, 0)` is async-signal-safe, and runs in the CHILD after
+            // `fork` and before `execve` — clearing close-on-exec here, in the child's own copy
+            // of the fd, cannot race or interfere with the PARENT's copy (still `O_CLOEXEC`,
+            // closed when `fd` drops below) or with any other thread's own fork.
+            use std::os::unix::process::CommandExt as _;
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fcntl(fd.0, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.spawn().expect("spawn fixture child")
+            // `fd` (this PARENT's own, still-`O_CLOEXEC` copy) drops here, closing it — the
+            // CHILD's copy, duplicated by `fork` inside `spawn` above and un-`CLOEXEC`'d by the
+            // `pre_exec` hook, stays open independently and survives the child's own `execve`.
+        };
+        finish_fixture_command(fixture, child);
+    }
 
     #[cfg(not(target_os = "linux"))]
     {
@@ -258,6 +285,7 @@ pub(crate) fn run_fixture(fixture: &str) {
         // no-op otherwise, same check as that function's own) — an unprivileged driver's own
         // `tempfile::tempdir()` call just above already PROVES its ambient `TMPDIR` is usable
         // post-drop, since that identity does not change; only a root driver's does.
+        let mut exe_copy = None;
         if unsafe { libc::geteuid() } == 0 {
             assert_dropped_identity_can_traverse_tmpdir();
             use std::os::unix::ffi::OsStrExt as _;
@@ -279,11 +307,27 @@ pub(crate) fn run_fixture(fixture: &str) {
                     std::io::Error::last_os_error()
                 );
             }
+            // `current_exe()`'s own path is not necessarily reachable by the dropped identity
+            // either — measured under `sudo` on macOS CI, where it resolves under the invoking
+            // user's own `$HOME`, `chmod 0750`. Copying it to a directory this driver creates and
+            // chmods itself, directly under `/tmp`, is what #204's own root-precondition tests do
+            // for the identical reason; see `copy_exe_to_traversable_scratch`'s doc.
+            let (dir, exe) = copy_exe_to_traversable_scratch();
+            let mut root_cmd = std::process::Command::new(&exe);
+            configure_fixture_command(&mut root_cmd, fixture);
+            cmd = root_cmd;
+            exe_copy = Some(dir);
         }
         cmd.env(FIXTURE_SCRATCH_ROOT_ENV, scratch.path());
+        let child = {
+            let _guard = crate::child::spawn::spawn_lock();
+            cmd.spawn().expect("spawn fixture child")
+        };
+        // `exe_copy` (and the scratch dir it names) must outlive the fixture process actually
+        // running from it — dropped only after the fixture has exited, here, not any earlier.
+        finish_fixture_command(fixture, child);
+        drop(exe_copy);
     }
-
-    run_fixture_command(fixture, cmd);
 }
 
 /// A raw directory fd, closed on `Drop` — including during unwind (a fixture's own assertion
@@ -305,9 +349,10 @@ impl Drop for OwnedRawFd {
     }
 }
 
-/// Opens `dir` (the scratch root [`run_fixture`] just created) `O_DIRECTORY`, deliberately WITHOUT
-/// `O_CLOEXEC` — this fd must survive the fixture's own `execve`, unlike every other fd this
-/// process holds. `std::fs::File::open` cannot be used for this: it always sets close-on-exec.
+/// Opens `dir` (the scratch root [`run_fixture`] just created) `O_DIRECTORY`, WITH `O_CLOEXEC` —
+/// `std::fs::File::open` would do the same, but returning a raw fd rather than a `File` here
+/// keeps the caller in charge of exactly when it stops being close-on-exec (see [`run_fixture`]'s
+/// `pre_exec` hook, which clears it in the FIXTURE child specifically, not here).
 ///
 /// The fixture reads this fd's NUMBER (env-carried — see [`FIXTURE_SCRATCH_FD_ENV`]) and builds
 /// its own paths under `/proc/<its own pid>/fd/<that number>/...` rather than under `dir` itself.
@@ -320,20 +365,24 @@ impl Drop for OwnedRawFd {
 /// still answers `EACCES` for the dropped identity — the ancestor-skipping is scoped to what is
 /// ABOVE the fd's target, never to what a fixture builds under it for its own purposes.
 ///
-/// The PID form, not `/proc/self/fd/<n>`: a probe run as a GRANDCHILD of the fixture (see
-/// `resolve_base_tests.rs`'s `stat_errno_via_grandchild`) does not inherit this fd — a fresh
-/// re-exec starts its own fd table — so `self` there would resolve against the GRANDCHILD's own,
-/// unrelated fd `<n>` (or none at all). `/proc/<fixture's own pid>/fd/<n>` instead resolves
-/// against the FIXTURE's fd table by walking `/proc`, which needs no inheritance and works for ANY
-/// reader, related or not, for as long as the FIXTURE process (whose pid names the link) is still
-/// alive to hold the fd open — true for the whole time any grandchild it spawns is running, since
-/// the fixture blocks on that grandchild's exit before doing anything else.
+/// The fixture's OWN pid, not always `self`: this fd — un-`CLOEXEC`'d only in the fixture child,
+/// per `run_fixture`'s `pre_exec` hook — DOES survive into a grandchild the fixture itself spawns
+/// (ordinary fd inheritance, unless something re-sets `O_CLOEXEC`, which nothing here does). But
+/// `resolve_base_tests.rs`'s `stat_errno_via_grandchild` still cannot use `/proc/<fixture's
+/// pid>/fd/<n>` from the GRANDCHILD's side: reading ANOTHER process's `/proc/<pid>/fd/<n>` entry
+/// is `ptrace`-gated (`PTRACE_MODE_READ_FSCREDS`), not open to any reader merely because it holds
+/// the same fd — and `capset` being per-thread means the fixture's OWN `/proc/<pid>` identity (its
+/// thread-group leader, which never called `drop_dac_bypass`) still reports FULL capabilities,
+/// which a now-reduced grandchild fails the ptrace check against. The grandchild instead uses its
+/// OWN `/proc/self/fd/<n>` (see `grandchild_reachable_path` in `resolve_base_tests.rs`) — reading
+/// one's own `/proc/self` needs no cross-process permission check — which is exactly why the fd
+/// must stay inherited that far, not just into the fixture.
 #[cfg(target_os = "linux")]
 fn open_scratch_fd(dir: &std::path::Path) -> OwnedRawFd {
     use std::os::unix::ffi::OsStrExt as _;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("scratch root path has no interior NUL");
     // SAFETY: `path` is a valid, NUL-terminated C string for a directory this call just created.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_DIRECTORY | libc::O_RDONLY) };
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         panic!("open scratch root as O_DIRECTORY: {}", std::io::Error::last_os_error());
     }
@@ -363,32 +412,93 @@ pub(crate) const FIXTURE_SCRATCH_ROOT_ENV: &str = "COSCA_FIXTURE_SCRATCH_ROOT";
 /// one case an already-successful `tempfile::tempdir()` call does NOT already prove the ambient
 /// `TMPDIR` usable post-drop, since an unprivileged driver's own uid never changes, so ITS
 /// successful call already is that proof.
+///
+/// Checks EVERY ancestor of `TMPDIR`, not just `TMPDIR` itself: a path lookup needs search
+/// permission on each directory component it walks through, so a `TMPDIR` that is itself wide
+/// open but sits under, say, a `chmod 0750` home directory is just as unreachable as a `TMPDIR`
+/// that is `chmod 0700` directly. Measured under `sudo` on a real macOS runner: `TMPDIR` itself is
+/// usually fine, but `std::env::current_exe()`'s own path resolves under the invoking user's
+/// `$HOME` (also checked — see [`run_fixture`]'s `copy_exe_to_traversable_scratch` call), whose
+/// default mode denies every other uid outright.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn assert_dropped_identity_can_traverse_tmpdir() {
     let tmpdir = std::env::temp_dir();
-    if let Err(e) = check_traversable_by(&tmpdir, crate::test_privilege::UNPRIVILEGED) {
+    let uid = crate::test_privilege::UNPRIVILEGED;
+    if let Err(e) = check_path_traversable_by(&tmpdir, uid, uid) {
         panic!("{e}");
     }
 }
 
 /// The pure check [`assert_dropped_identity_can_traverse_tmpdir`] panics on — split out so the
-/// logic is checkable against an arbitrary directory and uid, not just this process's real
-/// `TMPDIR` and [`crate::test_privilege::UNPRIVILEGED`].
+/// logic is checkable against an arbitrary path and uid/gid, not just this process's real
+/// `TMPDIR` and [`crate::test_privilege::UNPRIVILEGED`]. Also used by
+/// [`copy_exe_to_traversable_scratch`] to confirm its OWN construction is actually reachable,
+/// rather than trusting that constructing it correctly is enough.
+///
+/// Walks every ancestor of `path`, root first, checking each one for SEARCH (execute) permission
+/// by `(uid, gid)` — owner bits if `uid` matches that ancestor's own owner, group bits if `gid`
+/// matches its group, else other bits. `path` itself is checked the same way if it is a directory
+/// (the final `TMPDIR` component itself must also grant entry), or for READ+EXECUTE if it is a
+/// regular file (an exec target's ancestors need search permission, but the file itself needs to
+/// be openable and executable, which search permission alone does not grant).
 #[cfg(all(unix, not(target_os = "linux")))]
-fn check_traversable_by(dir: &std::path::Path, uid: libc::uid_t) -> Result<(), String> {
+fn check_path_traversable_by(path: &std::path::Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let meta = std::fs::metadata(dir).expect("stat the ambient TMPDIR");
-    let owned_by_dropped_identity = meta.uid() == uid;
-    let other_can_search = meta.permissions().mode() & 0o001 != 0;
-    if owned_by_dropped_identity || other_can_search {
-        Ok(())
-    } else {
-        Err(format!(
-            "precondition: ambient TMPDIR {dir:?} is not traversable by the uid this fixture \
-             drops to ({uid}) — point TMPDIR at a directory that uid can search before running \
-             as root"
-        ))
+    let mut ancestors: Vec<&std::path::Path> = path.ancestors().collect();
+    ancestors.reverse(); // root first, `path` itself last
+    for (i, component) in ancestors.iter().enumerate() {
+        let meta = std::fs::symlink_metadata(component).map_err(|e| format!("stat {component:?}: {e}"))?;
+        let is_leaf_file = i + 1 == ancestors.len() && meta.is_file();
+        let required: u32 = if is_leaf_file { 0o5 } else { 0o1 }; // r+x for a final file, x (search) for a directory
+        let mode = meta.permissions().mode();
+        let granted = if meta.uid() == uid {
+            (mode >> 6) & required == required
+        } else if meta.gid() == gid {
+            (mode >> 3) & required == required
+        } else {
+            mode & required == required
+        };
+        if !granted {
+            let access = if is_leaf_file { "read+execute" } else { "search" };
+            return Err(format!(
+                "precondition: {component:?} (mode {mode:o}, owner uid {}, gid {}) does not \
+                 grant uid {uid}/gid {gid} the {access} access needed to reach {path:?}",
+                meta.uid(),
+                meta.gid(),
+            ));
+        }
     }
+    Ok(())
+}
+
+/// A directory this driver creates and `chmod`s itself, directly under `/tmp` — the one path
+/// every platform this crate targets guarantees world-traversable regardless of the invoking
+/// user's own `$HOME` or `$TMPDIR`, matching #204's own root-precondition tests, which hit the
+/// identical problem for the identical reason. Holds a COPY of this test binary, `chmod`'d
+/// world-readable+executable, for a root driver to re-exec the fixture from instead of
+/// `std::env::current_exe()`'s own (possibly unreachable post-drop) path.
+///
+/// Returns the containing [`tempfile::TempDir`] alongside the copy's path: the caller must keep it
+/// alive for exactly as long as the fixture might still be running from it — dropping it any
+/// earlier deletes the very binary the fixture is executing.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn copy_exe_to_traversable_scratch() -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::Builder::new()
+        .tempdir_in("/tmp")
+        .expect("tempdir directly under /tmp for a traversable fixture-exe copy");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod the exe-copy scratch dir world-traversable");
+    let src = std::env::current_exe().expect("current_exe");
+    let dest = dir.path().join("fixture-exe");
+    std::fs::copy(&src, &dest).expect("copy the test binary into the traversable scratch dir");
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod the exe copy world-readable+executable");
+    let uid = crate::test_privilege::UNPRIVILEGED;
+    if let Err(e) = check_path_traversable_by(&dest, uid, uid) {
+        panic!("copied fixture exe is still not traversable by the post-drop identity: {e}");
+    }
+    (dir, dest)
 }
 
 /// The `std::process::Command` common to every fixture re-exec: this binary, filtered to exactly
@@ -429,6 +539,16 @@ pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
     #[cfg(not(target_os = "linux"))]
     let program = std::env::current_exe().expect("current_exe");
     let mut cmd = std::process::Command::new(program);
+    configure_fixture_command(&mut cmd, fixture);
+    cmd
+}
+
+/// The argv/env/stdio setup common to every fixture re-exec, split out from [`fixture_command`]
+/// so a caller that needs a DIFFERENT program path — [`run_fixture`]'s non-Linux root branch,
+/// which re-execs a COPY of this binary rather than its original (possibly unreachable, post-drop)
+/// location — can build its own `Command::new(..)` and still get everything else this function
+/// sets up, without duplicating it.
+fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
     cmd.args(["--test-threads=1", "--exact", fixture])
         .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
         .stdout(std::process::Stdio::piped())
@@ -441,7 +561,6 @@ pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
         // a driver reading stdout. Explicitly removed, not merely left unset, so this holds
         // regardless of what the ambient environment carries.
         .env_remove("RUST_TEST_NOCAPTURE");
-    cmd
 }
 
 /// The env var every fixture re-exec ([`run_fixture`], [`run_fixture_with_cwd`]) sets, to its own
@@ -523,6 +642,15 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
         let _guard = crate::child::spawn::spawn_lock();
         cmd.spawn().expect("spawn fixture child")
     };
+    finish_fixture_command(fixture, child);
+}
+
+/// The post-spawn half of [`run_fixture_command`], split out so [`run_fixture`]'s Linux branch —
+/// which needs its OWN `spawn_lock()`-held region spanning both opening the scratch fd and
+/// spawning the fixture, not just the spawn alone — can provide the already-spawned `Child`
+/// itself rather than going through this function's own (separately locked, and therefore
+/// deadlocking if nested) spawn step.
+fn finish_fixture_command(fixture: &str, child: std::process::Child) {
     let output = child.wait_with_output().expect("wait for fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
