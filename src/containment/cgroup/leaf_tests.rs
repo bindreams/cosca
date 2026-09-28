@@ -156,11 +156,14 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
-/// full mechanism: a real park at `wait_drained`'s `Block` arm, and the real kernel `populated`
-/// 1→0 transition once both members are gone.
+/// full mechanism: the real kernel `populated` 1→0 transition once both members are gone, and a
+/// real park at `wait_drained`'s `Block` arm — proven by counting real pump broadcasts
+/// (`fault::set_pump_batch_notifier`) against every park that woke, not just that the wait call
+/// returned.
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
+    use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::{assert_bounded_conclusion, Member, WaitObserver};
     use crate::containment::TreeDrain;
     use std::os::unix::process::CommandExt;
@@ -179,6 +182,20 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
              cgroup.kill support (kernel >= 5.14)?"
         )
     });
+
+    // A park proves only that the wait call returned, not that a real broadcast woke it (a
+    // dropped listener returns too). Count real pump broadcasts independently: a mutant that
+    // fakes a park without ever really waiting cannot fake a matching broadcast, since the pump
+    // is a separate thread that only ever reports one for a real, observed leaf change.
+    let leaf_name = leaf
+        .leaf_path
+        .file_name()
+        .expect("a leaf has a name")
+        .to_str()
+        .expect("leaf names are UTF-8");
+    let (batches_tx, batches_rx) = mpsc::channel();
+    fault::set_pump_batch_notifier(leaf_name, batches_tx);
+    let mut total_woken = 0usize;
 
     // Each member reports through its OWN channel. The leaf's channel carries one report for the whole
     // leaf (see `ReportChannel`), so two members sharing it would read as whichever wrote first.
@@ -229,7 +246,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         );
     }
 
-    let bounded_wait_drained = || {
+    let mut bounded_wait_drained = || {
         const BOUND: Duration = Duration::from_millis(250);
         let start = Instant::now();
         let deadline = start + BOUND;
@@ -242,6 +259,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
             elapsed >= BOUND,
             "wait_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
         );
+        total_woken += parks.iter().filter(|p| p.woken).count();
         result
     };
 
@@ -296,18 +314,32 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     assert_eq!(
         blocks,
         parks.len(),
-        "drain_step announced blocking {blocks} times, but {} real parks were seen at the wait \
-         site — every announced block must be a real park",
+        "drain_step announced blocking {blocks} times, but the wait site's own wait call \
+         returned {} times — every announced block must show up as a wait-site return",
         parks.len()
     );
     assert!(
         !parks.is_empty(),
-        "the rendezvous above guarantees at least one real park before the kill; got none"
+        "the rendezvous above guarantees the wait call reached the wait site at least once \
+         before the kill; got none"
     );
     assert!(
         parks.iter().all(|p| p.deadline.is_none() && p.woken),
         "every park in an unbounded call is armed with no deadline and can only conclude by \
          being woken — it has no timeout to elapse, got {parks:?}"
+    );
+    total_woken += parks.iter().filter(|p| p.woken).count();
+
+    // The structural proof that a park is real, not merely a wait call returning (a dropped
+    // listener returns too, as if woken, with no broadcast behind it): the pump is a thread of
+    // its own that only ever reports a batch as "changed" when it observed a real leaf change
+    // and genuinely broadcast for it, so no more parks can wake than the pump genuinely woke.
+    let changed_batches = batches_rx.try_iter().filter(|&notified| notified).count();
+    assert!(
+        total_woken <= changed_batches,
+        "{total_woken} parks woke across this test, but the pump reported only \
+         {changed_batches} batches that actually broadcast — a woken park with no matching real \
+         broadcast behind it is not a real park"
     );
 }
 
@@ -1647,11 +1679,18 @@ fn a_wait_past_its_deadline_answers_from_the_leafs_state() {
     );
 }
 
-/// Block a wait on `leaf` on a thread of its own, returning once it blocks.
+/// Block a wait on `leaf` on a thread of its own, returning once it blocks. The caller must keep
+/// the returned `Receiver` alive until the handle is joined: `drain_step` can legally re-block
+/// (`populated` is re-read before the pump's own broadcast lands), sending on this notifier
+/// again, and a send with no live receiver is a contract violation `notify_drain_blocking`
+/// debug-asserts against.
 #[cfg(target_os = "linux")]
 fn blocked_wait(
     leaf: &std::sync::Arc<crate::containment::cgroup::CgroupLeaf>,
-) -> std::thread::JoinHandle<Result<crate::containment::TreeDrain, crate::error::Error>> {
+) -> (
+    std::thread::JoinHandle<Result<crate::containment::TreeDrain, crate::error::Error>>,
+    std::sync::mpsc::Receiver<()>,
+) {
     let (blocking, blocking_rx) = std::sync::mpsc::channel();
     let leaf = leaf.clone();
     let waiter = std::thread::spawn(move || {
@@ -1659,7 +1698,7 @@ fn blocked_wait(
         leaf.wait_drained(None)
     });
     blocking_rx.recv().expect("the wait blocks");
-    waiter
+    (waiter, blocking_rx)
 }
 
 /// The pump starts with the first wait that blocks, and dropping the leaf stops and joins it
@@ -1680,7 +1719,7 @@ fn dropping_the_leaf_stops_and_joins_its_pump() {
         "a wait that cannot block starts none"
     );
 
-    let waiter = blocked_wait(&leaf);
+    let (waiter, _blocking_rx) = blocked_wait(&leaf);
     assert_eq!(
         fault::pumps_of("cosca-pumped-leaf"),
         (1, 0),
@@ -1693,7 +1732,7 @@ fn dropping_the_leaf_stops_and_joins_its_pump() {
     );
 
     FakeLeaf::set_populated(&fake.events, true);
-    let waiter = blocked_wait(&leaf);
+    let (waiter, _blocking_rx) = blocked_wait(&leaf);
     FakeLeaf::set_populated(&fake.events, false);
     assert_eq!(
         waiter.join().expect("waiter").expect("wait"),
@@ -1754,7 +1793,7 @@ fn a_failed_pump_wakes_every_wait_with_its_error() {
     // Readable once more: the pump wakes, and fails.
     FakeLeaf::set_populated(&fake.events, true);
 
-    for waiter in waiters {
+    for (waiter, _blocking_rx) in waiters {
         let e = waiter.join().expect("waiter").expect_err("the pump failed");
         assert!(e.to_string().contains("can no longer be watched"), "{e}");
     }
@@ -1776,7 +1815,7 @@ fn a_siblings_removal_wakes_no_wait() {
     let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
     let (batches, batches_rx) = std::sync::mpsc::channel();
     fault::set_pump_batch_notifier("cosca-sibling-watcher", batches);
-    let waiter = blocked_wait(&leaf);
+    let (waiter, _blocking_rx) = blocked_wait(&leaf);
 
     let sibling = fake.leaf.with_file_name("cosca-sibling");
     std::fs::create_dir(&sibling).expect("make a sibling");

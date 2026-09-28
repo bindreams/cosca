@@ -116,18 +116,19 @@ pub(crate) mod test_clock {
     }
 
     /// Advance the frozen instant by `real_elapsed` — a no-op if the clock isn't frozen (an
-    /// unfrozen clock already tracks real time on its own). Called automatically by
-    /// `block_on_kqueue` around every completed round's real, blocking `kevent` call, so a
-    /// frozen clock a test forgot to (or a bug failed to) advance explicitly can never make a
-    /// GENUINELY elapsed real wait invisible to `remaining`: even with no test hook ever calling
-    /// [`advance`], `now` eventually catches up to whatever real time was actually spent
-    /// blocked in the kernel, turning what would otherwise be an unbounded spin under a
-    /// never-advancing mock clock into, at worst, a wait bounded by the real timeouts genuinely
-    /// requested — never a true infinite loop.
+    /// unfrozen clock already tracks real time on its own). Called automatically around every
+    /// completed round of a real, blocking wait keyed to a real `Instant` deadline — macOS's
+    /// `block_on_kqueue` after each `kevent` call, and the Linux cgroup drain loop's bounded arm
+    /// (`CgroupLeaf::wait_drained`) after each `wait_deadline` call — so a frozen clock a test
+    /// forgot to (or a bug failed to) advance explicitly can never make a GENUINELY elapsed real
+    /// wait invisible to `remaining`: even with no test hook ever calling [`advance`], `now`
+    /// eventually catches up to whatever real time was actually spent blocked in the kernel,
+    /// turning what would otherwise be an unbounded spin under a never-advancing mock clock
+    /// into, at worst, a wait bounded by the real timeouts genuinely requested — never a true
+    /// infinite loop.
     ///
-    /// Called only from `wait/macos.rs`'s `block_on_kqueue` today — genuinely dead code on other
-    /// platforms, same pattern as `containment::cgroup::parse`'s Linux-only helpers.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Genuinely dead code on Windows, which has neither caller.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
         FROZEN.with(|f| {
             if let Some(cur) = f.get() {

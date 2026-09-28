@@ -547,8 +547,18 @@ impl CgroupLeaf {
                     listener,
                     deadline: Some(at),
                 } => {
+                    #[cfg(test)]
+                    let call_start = std::time::Instant::now();
                     #[cfg_attr(not(test), allow(unused_variables))]
                     let woken = listener.wait_deadline(at).is_some();
+                    // Bounds what would otherwise be an unbounded spin under a mock clock a test
+                    // forgot to advance: `at` is a real `Instant`, so once real time passes it
+                    // this returns immediately every iteration, and only a frozen `remaining()`
+                    // that never catches up would keep re-arming the same, already-past
+                    // deadline forever. See `test_clock::advance_by_elapsed_if_frozen`'s own doc.
+                    // A no-op outside tests and whenever the clock isn't frozen.
+                    #[cfg(test)]
+                    crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
                     #[cfg(test)]
                     fault::notify_wait_site_park(fault::WaitSitePark {
                         deadline: Some(at),

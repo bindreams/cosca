@@ -342,13 +342,16 @@ pub(crate) struct Member(
 #[cfg(target_os = "linux")]
 impl Drop for Member {
     fn drop(&mut self) {
-        // Already killed and reaped by the test in the common case; a failure here should only
-        // ever be "already gone" — `kill`'s `InvalidInput` once exited, `wait`'s `ECHILD` once
-        // reaped — never a real signal/reap failure this guard exists to catch.
+        // Already killed and reaped by the test in the common case. If std's own `Child` already
+        // observed the exit (a prior `wait`/`try_wait`), `kill` checks its cached status first and
+        // returns `Ok` without a syscall — `InvalidInput` never happens on that path. If the child
+        // was reaped some other way instead (a foreign `waitpid`, principle 5), the syscall does
+        // run, and fails with `ESRCH`. Both are "already gone"; only something outside that set is
+        // the real signal/reap failure this guard exists to catch.
         if let Err(e) = self.0.kill() {
             debug_assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::InvalidInput,
+                e.raw_os_error(),
+                Some(libc::ESRCH),
                 "Member::drop's kill failed unexpectedly: {e}"
             );
         }
@@ -383,9 +386,10 @@ pub(crate) struct WaitObserver;
 
 #[cfg(target_os = "linux")]
 impl WaitObserver {
-    /// Run `f` with the seams installed, and return its own result alongside what they saw:
-    /// every real park, how many times `drain_step` announced it was about to block, and how
-    /// many times the zero-remaining shortcut fired.
+    /// Run `f` with the seams installed, and return its own result alongside what they saw: each
+    /// time the wait site's own wait call returned (see `WaitSitePark`'s own doc for what that
+    /// does and doesn't prove), how many times `drain_step` announced it was about to block, and
+    /// how many times the zero-remaining shortcut fired.
     pub(crate) fn run<T>(
         f: impl FnOnce() -> T,
     ) -> (T, Vec<crate::containment::cgroup::fault::WaitSitePark>, usize, usize) {
@@ -415,12 +419,43 @@ impl WaitObserver {
     }
 }
 
+/// Installs `set_tokio_wait_site_park_notifier` on construction, uninstalling it on drop —
+/// panic-safe, so a panic between install and take never leaves the seam installed for whatever
+/// runs on this thread next. Same pattern as `WaitObserverGuard`, for the one seam it doesn't
+/// cover.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[must_use]
+pub(crate) struct TokioWaitSiteParkGuard;
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+impl TokioWaitSiteParkGuard {
+    pub(crate) fn install() -> (
+        Self,
+        std::sync::mpsc::Receiver<crate::containment::cgroup::fault::TokioWaitSitePark>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::containment::cgroup::fault::set_tokio_wait_site_park_notifier(tx);
+        (Self, rx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+impl Drop for TokioWaitSiteParkGuard {
+    fn drop(&mut self) {
+        crate::containment::cgroup::fault::take_tokio_wait_site_park_notifier();
+    }
+}
+
 /// A bounded call concludes exactly once via the zero-remaining shortcut, and every announced
-/// block must be a real park (see `WaitSitePark`'s own doc for what "park" proves here). At most
-/// one park times out (event_listener reports "not woken" only at/after its deadline), and it
-/// must be last. Earlier parks may be `woken: true` (cgroup.events writes don't imply a
-/// membership change). Zero parks is legitimate: the first check may already find the deadline
-/// spent.
+/// block must show up as a wait-site return (see `WaitSitePark`'s own doc for what that does and
+/// doesn't prove — on its own, it does not prove a real park happened; pair this with a real
+/// pump-batch count for that). At most one wait-site return times out (event_listener reports
+/// "not woken" only at/after its deadline), and it must be last. Earlier ones may be
+/// `woken: true` (cgroup.events writes don't imply a membership change). Zero is legitimate: the
+/// first check may already find the deadline spent.
 #[cfg(target_os = "linux")]
 pub(crate) fn assert_bounded_conclusion(
     parks: &[crate::containment::cgroup::fault::WaitSitePark],
@@ -436,8 +471,8 @@ pub(crate) fn assert_bounded_conclusion(
     assert_eq!(
         blocks,
         parks.len(),
-        "drain_step announced blocking {blocks} times, but {} real parks were seen at the \
-         wait site — every announced block must be a real park",
+        "drain_step announced blocking {blocks} times, but the wait site's own wait call \
+         returned {} times — every announced block must show up as a wait-site return",
         parks.len()
     );
     // Structural: elapsed time proves only "not early", not "armed with the right instant".

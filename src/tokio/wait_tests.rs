@@ -289,9 +289,18 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
     let fake = FakeLeaf::new("cosca-async-removed-while-waited", true);
     let removed = fake.leaf.clone();
     let (blocking_tx, blocking_rx) = std::sync::mpsc::channel::<()>();
+    // Loops on `recv` rather than returning after the first, so its receiver stays alive for as
+    // long as the notifier is installed: `drain_step` can legally re-block (a spurious wake, or
+    // the removal notification racing a stale re-read) before this wait ever completes, and a
+    // send with no live receiver by then is a contract violation `notify_drain_blocking`
+    // debug-asserts against.
     let remover = std::thread::spawn(move || {
-        if blocking_rx.recv().is_ok() {
-            FakeLeaf::remove(&removed);
+        let mut removed_once = false;
+        while blocking_rx.recv().is_ok() {
+            if !removed_once {
+                FakeLeaf::remove(&removed);
+                removed_once = true;
+            }
         }
     });
     crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
@@ -368,15 +377,13 @@ async fn cgroup_wait_tree_drained_through_sleep_until_never_answers_early() {
 #[cfg(target_os = "linux")]
 #[::tokio::test]
 async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_instant() {
-    use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::cgroup::test_support::{FakeLeaf, TokioWaitSiteParkGuard};
     use std::time::{Duration, Instant};
 
     let fake = FakeLeaf::new("cosca-async-wait-site-deadline", true);
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
 
-    let (park_tx, park_rx) = std::sync::mpsc::channel();
-    fault::set_tokio_wait_site_park_notifier(park_tx);
+    let (_guard, park_rx) = TokioWaitSiteParkGuard::install();
 
     // Far enough out that a populated fake leaf never takes the zero-remaining shortcut; how far
     // is irrelevant, since the future below is polled only once.
@@ -394,7 +401,6 @@ async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_i
         _ = std::future::ready(()) => {}
     }
 
-    fault::take_tokio_wait_site_park_notifier();
     let park = park_rx
         .try_recv()
         .expect("the wait site must arm a park on its first poll");
@@ -410,14 +416,12 @@ async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_i
 #[cfg(target_os = "linux")]
 #[::tokio::test]
 async fn cgroup_wait_tree_drained_arms_the_wait_site_unbounded_with_no_deadline() {
-    use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::cgroup::test_support::{FakeLeaf, TokioWaitSiteParkGuard};
 
     let fake = FakeLeaf::new("cosca-async-wait-site-unbounded", true);
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
 
-    let (park_tx, park_rx) = std::sync::mpsc::channel();
-    fault::set_tokio_wait_site_park_notifier(park_tx);
+    let (_guard, park_rx) = TokioWaitSiteParkGuard::install();
 
     let fut = super::cgroup_wait_tree_drained(&leaf, None);
     ::tokio::pin!(fut);
@@ -427,7 +431,6 @@ async fn cgroup_wait_tree_drained_arms_the_wait_site_unbounded_with_no_deadline(
         _ = std::future::ready(()) => {}
     }
 
-    fault::take_tokio_wait_site_park_notifier();
     let park = park_rx
         .try_recv()
         .expect("the wait site must arm a park on its first poll");
