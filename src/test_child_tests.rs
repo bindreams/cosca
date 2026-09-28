@@ -61,6 +61,42 @@ mod check_path_traversable_by_tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Restores `0o700` on drop, so a `TempDir` (or ancestor `TempDir`) that owns a directory a
+    /// test locked down further (`0o101`, `0o000`) can still remove it afterward.
+    /// `TempDir::drop`'s own cleanup calls `remove_dir_all`, which needs to `read_dir` every
+    /// directory along the way — including one a test itself deliberately locked — and, as a
+    /// non-root caller, this process cannot `read_dir` a directory it cannot itself list, even
+    /// though it OWNS it and even though the directory is empty. `tempfile` swallows that
+    /// `remove_dir_all` error silently, leaking the directory into `/tmp` for good (measured: two
+    /// new leftovers per unprivileged test run, on top of whatever a prior run already left).
+    /// Declared AFTER the `TempDir` (or path) it restores, so Rust's LIFO drop order runs this
+    /// restore FIRST — matching `Locked` in `resolve_base_tests.rs` and `RestoreMode` in
+    /// `exact_posix_tests.rs`.
+    struct RestoreMode(std::path::PathBuf);
+
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Regression for the leak itself: a scratch directory a test locked down must actually be
+    /// GONE after drop, not merely have `TempDir::drop` return without panicking — that call can
+    /// silently swallow the `remove_dir_all` failure the lock causes and still leave the directory
+    /// behind. Mirrors the exact declaration order (`dir`, then `_restore`) the two tests below
+    /// rely on, so a regression in THAT ordering — not just in `RestoreMode` itself — fails here
+    /// too.
+    #[test]
+    fn a_locked_scratch_dir_is_still_removed_on_drop() {
+        let path = {
+            let dir = scratch_dir();
+            let _restore = RestoreMode(dir.path().to_path_buf());
+            chmod(dir.path(), 0o000);
+            dir.path().to_path_buf()
+        };
+        assert!(!path.exists(), "{path:?} was not removed on drop");
+    }
+
     /// Every test in this module builds directly under `/tmp`, never under
     /// `tempfile::tempdir()`'s own ambient `TMPDIR` — the ONE thing every platform this crate
     /// targets guarantees world-traversable end to end (see `copy_exe_to_traversable_scratch`'s
@@ -90,6 +126,7 @@ mod check_path_traversable_by_tests {
     #[test]
     fn search_only_for_owner_and_other_is_ok() {
         let dir = scratch_dir();
+        let _restore = RestoreMode(dir.path().to_path_buf());
         chmod(dir.path(), 0o101);
         let r = check(dir.path());
         assert!(r.is_ok(), "{r:?}");
@@ -136,8 +173,11 @@ mod check_path_traversable_by_tests {
         std::fs::create_dir(&inner).unwrap();
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        // Locked last: creating `inner` under `real` needs the OWNER's own write+execute first —
-        // mode bits bind the owner too, not just other callers.
+        // Declared after `base`, so it restores `real`'s mode BEFORE `base`'s own `TempDir::drop`
+        // tries to recursively remove it (see `RestoreMode`'s own doc). Locked last for the same
+        // reason `real` itself is: creating `inner` under it needs the OWNER's own write+execute
+        // first — mode bits bind the owner too, not just other callers.
+        let _restore = RestoreMode(real.clone());
         chmod(&real, 0o000);
 
         let r = check(&link.join("inner"));
