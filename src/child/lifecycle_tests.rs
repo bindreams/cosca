@@ -179,3 +179,57 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     }
     let _ = treewalk_child.wait();
 }
+
+// `Child::wait_deadline`'s own recheck loop (site 5 of the "deadline-windows-never-early" bug
+// family; see docs/principles.md #13 — PR #233, not yet merged, and this function's own doc):
+// a `None` ("still running") from the underlying backend must never be trusted as proof the
+// real `deadline` passed. Portable — this loop is cosca's own code, not Windows-specific — even
+// though the bug it defends against (`shared_child`'s Windows `wait_deadline_noreap` only
+// rechecking when ITS OWN per-call timeout was clamped) only manifests on Windows.
+
+/// A live, uncontained child that blocks reading its own piped stdin until EOF — it never
+/// exits on its own. `cat` (Unix) / `cmd /C more` (Windows, already used by this crate's
+/// Windows-only wait tests, e.g. `src/wait/windows_tests.rs`) — no new external dependency.
+fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
+    let mut cmd = crate::Command::new();
+    #[cfg(unix)]
+    cmd.args(["cat"]);
+    #[cfg(windows)]
+    cmd.args(["cmd", "/C", "more"]);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("configure piped stdin");
+    cmd.stdout(crate::Stdio::null()).expect("configure null stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin was just configured above");
+    (child, stdin)
+}
+
+/// `early_none_seam` fakes the OBSERVABLE effect of `shared_child`'s own early-`WAIT_TIMEOUT`
+/// bug deterministically — there is no seam into that third-party dependency's internals to
+/// force ITS bug directly (upstream tracking: cosca #237, not filed here). The loop's FIRST
+/// iteration receives a synthetic `None` without ever calling the real underlying wait; a hook
+/// fires the instant that's consumed, closing the fixture's piped stdin so it exits for real.
+/// The loop's SECOND (real) iteration must then correctly detect that genuine exit — the
+/// synthetic `None` must never be returned to the caller as "still running".
+///
+/// Mutant: revert `Child::wait_deadline` to a single `self.proc.wait_deadline(deadline)` call
+/// with no loop at all (this function's pre-fix shape) -> fails deterministically: the
+/// (possibly-forced) `None` is returned immediately, hours before the real deadline, and the
+/// fixture — per the hook, which never even got a chance to matter on this path since the
+/// forced value IS what gets returned directly — would leak running (`kill()`/`wait()` below
+/// still clean it up regardless, since they run unconditionally, not conditioned on the
+/// assertion having passed).
+#[test]
+fn wait_deadline_never_reports_still_running_before_the_deadline() {
+    let (child, stdin) = spawn_never_exiting();
+    crate::wait::early_none_seam::arm(move || drop(stdin)); // EOF -> the fixture exits for real
+    let deadline = std::time::Instant::now() + Duration::from_secs(3600); // hours off
+    let result = child.wait_deadline(deadline);
+    let status = result.expect("a genuinely-exiting child must not report a wait failure");
+    assert!(
+        status.is_some(),
+        "must report exited once the child genuinely exits, not falsely conclude still-running \
+         from an early, synthetic None"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
