@@ -7,6 +7,8 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(unix)]
+use common::consent_root;
 
 /// Set on this binary's own re-exec of itself, routing `fn main` (bottom of this file) to
 /// [`foreign_kill_helper_main`] instead of the skuld harness — checked before skuld ever parses
@@ -82,9 +84,13 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     let _ = child.wait();
 }
 
-/// See the module doc. Runs only as root (`common::preconditions::root`, label `ROOT`): the test
-/// needs `CAP_SETUID`/`CAP_SETGID` to drop into two DIFFERENT unprivileged identities of its own
-/// choosing, rather than depending on whatever uid CI happens to run tests as.
+/// See the module doc. Runs only once its `ROOT` group's switch AND consent both hold
+/// (`common::preconditions::root`, `#[fixture(consent_root)]`, label `ROOT`) — this test changes
+/// real system state (two uid switches), so it needs explicit consent, not just the switch being
+/// on. `common::assert_root_capable()` then asserts the ACTUAL requirement (root, and on Linux
+/// the ability to setuid/setgid to both `TARGET_UID` and `READER_UID`): a missing capability at
+/// that point FAILS the test — switch-on-plus-consent is a promise the environment can do this,
+/// and a broken promise is a failure, not "unavailable".
 ///
 /// Both the target and the actual caller under test run as ordinary child PROCESSES of this
 /// (root) one — never as this process itself — so root can always name and clean up the target
@@ -94,7 +100,7 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
 /// `std::process::Child`, so the kernel cannot recycle the pid before the reader reports back.
 #[cfg(unix)]
 #[skuld::test(requires = [common::preconditions::root], labels = [common::ROOT])]
-fn foreign_kill_surfaces_permission_denied() {
+fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &()) {
     use std::io::Read;
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
@@ -102,14 +108,7 @@ fn foreign_kill_surfaces_permission_denied() {
 
     use common::KillOnDrop;
 
-    // Guards direct invocation that bypasses skuld's `requires` (e.g. --run-ignored): fail
-    // clearly, not with a later EPERM.
-    // SAFETY: geteuid() takes no arguments and has no preconditions.
-    assert_eq!(
-        unsafe { libc::geteuid() },
-        0,
-        "foreign_kill_surfaces_permission_denied requires root"
-    );
+    common::assert_root_capable();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
@@ -134,7 +133,6 @@ fn foreign_kill_surfaces_permission_denied() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn the target under an unprivileged uid");
-    // Guard immediately, before anything below gets a chance to panic and orphan it.
     let mut target = KillOnDrop::new(target);
     let target_pid = target.id();
     let mut dead_watch = target.take_stdout().expect("target was spawned with a piped stdout");

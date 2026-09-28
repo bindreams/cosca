@@ -682,13 +682,51 @@ impl Drop for RestoreRlimitNofile {
     }
 }
 
-// Root-precondition test infrastructure ==========================================================
+// Conditional-test groups =========================================================================
 //
-// Shared by every skuld-harness binary with a test that needs an actual privileged caller (uid
-// switching, not merely a foreign same-uid one) — currently just `tests/process_root.rs`. Lives
-// here, not in that one binary, because the `ROOT` label and `preconditions::root` are what CI's
-// `SKULD_LABELS=ROOT` step selects on: a future root test in a different binary needs the same
-// two items, not a copy of them.
+// The owner's shape for a test that needs real privilege or mutates real system state (2026-09-28,
+// docs/principles.md): three separate things, not one runtime probe.
+//   - An on/off SWITCH, `COSCA_TEST_<GROUP>` — default ON, disabled only by an explicit `"0"`. A
+//     pure convention: it makes NO judgment about whether the environment can actually satisfy the
+//     test, only whether this run wants to attempt it at all. Read by `switch()`, used as a skuld
+//     `requires` precondition — an unmet one reports the test `ignored`, never a failure.
+//   - CONSENT, `COSCA_TEST_<GROUP>_CONSENT` — default OFF, granted only by exactly `"1"`. Required
+//     in addition to the switch because this class of test changes real system state (uid
+//     switches, delegated cgroups, ...); "the switch happened to be on" is not the same as "you
+//     meant to run this". Read by `consent()`, used as a skuld FIXTURE — an unmet one FAILS the
+//     test (a fixture `Err` panics, by skuld's own contract), never reports it unavailable.
+//   - Its own capability assertion, called from the test body once both of the above hold: a
+//     missing capability (not root, an unmapped uid under `unshare -r`, ...) is the environment
+//     breaking a promise "switch on + consent given" made — that FAILS the test, with a message
+//     naming the precondition and how to opt out, never reports it unavailable either.
+//
+// Shared here, not duplicated per binary, so a later group (CGROUP, ...) reuses `switch`/`consent`
+// with its own name instead of copying this file. `ROOT`'s own three pieces
+// (`preconditions::root`, the `consent_root` fixture, `assert_root_capable`) are the one instance
+// of this shape that exists today.
+
+/// `COSCA_TEST_<group>` as a skuld `requires` precondition: enabled unless explicitly `"0"`.
+pub fn switch(group: &str) -> Result<(), String> {
+    let var = format!("COSCA_TEST_{group}");
+    if std::env::var(&var).as_deref() == Ok("0") {
+        Err(format!("disabled via {var}=0"))
+    } else {
+        Ok(())
+    }
+}
+
+/// `COSCA_TEST_<group>_CONSENT` as a skuld fixture: FAILS the test unless exactly `"1"`.
+pub fn consent(group: &str) -> Result<(), String> {
+    let var = format!("COSCA_TEST_{group}_CONSENT");
+    if std::env::var(&var).as_deref() == Ok("1") {
+        Ok(())
+    } else {
+        Err(format!(
+            "{var} is not \"1\" — this test changes real system state and needs explicit \
+             consent, see README.md's \"Tests that need root\""
+        ))
+    }
+}
 
 /// The target's uid/gid: an ordinary unprivileged account, distinct from both root (0) and
 /// `READER_UID` below. No `/etc/passwd` entry is required for either — `setuid`/`execve` only
@@ -701,71 +739,82 @@ pub const TARGET_UID: u32 = 65534;
 #[cfg(unix)]
 pub const READER_UID: u32 = 65533;
 
-/// Runtime preconditions for `#[skuld::test(requires = [...])]`. Each one is `fn() -> Result<(),
-/// String>`; an unmet one reports the test as `ignored` with the `Err`'s text, instead of a
-/// silent skip or a hard failure on every environment that doesn't happen to run as root.
+/// The `ROOT` group's on/off switch, wired to `#[skuld::test(requires = [...])]`. Not a
+/// capability check — see the module doc and `assert_root_capable`.
 #[cfg(unix)]
 pub mod preconditions {
-    use super::{READER_UID, TARGET_UID};
-
-    const HINT: &str = "requires root, see README.md's \"Tests that need root\"";
-
-    /// `geteuid() == 0`, plus — on Linux — the actual ability to spawn a child under each of
-    /// `TARGET_UID`/`READER_UID`: euid 0 alone is not sufficient inside a user namespace
-    /// (`unshare -r`, a rootless container) whose uid/gid map doesn't cover those ids, and
-    /// `setgid`/`setuid` there fails with `EINVAL` instead of `EPERM`. Probed by actually forking
-    /// and dropping to each id, not by parsing `/proc/self/{uid,gid}_map`: this is the exact pair
-    /// of syscalls the test itself relies on, so a "yes" here cannot disagree with what the test
-    /// does next. macOS has no equivalent namespace/capability split — root is sufficient there.
     pub fn root() -> Result<(), String> {
-        // SAFETY: geteuid() takes no arguments and has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            return Err(HINT.into());
-        }
-        #[cfg(target_os = "linux")]
-        for uid in [TARGET_UID, READER_UID] {
-            if !can_setuid_setgid_to(uid) {
-                return Err(format!(
-                    "{HINT} (root, but this namespace cannot setuid/setgid to {uid} — \
-                     CAP_SETUID/CAP_SETGID or the uid/gid map may not cover it)"
-                ));
-            }
-        }
-        Ok(())
+        super::switch("ROOT")
     }
+}
 
-    /// Forks a throwaway child that attempts `setgid(uid)` then `setuid(uid)` and reports success
-    /// via its exit code. The child does no allocation and takes no lock between `fork` and
-    /// `_exit` — only the two syscalls under test — so the usual fork-in-a-multithreaded-process
-    /// hazards (a held libc lock, an allocator in an inconsistent state) do not apply here.
+/// The `ROOT` group's consent fixture. Its value is `()` — a test using it (`#[fixture
+/// (consent_root)] _consent: &()`) cares only that the dependency was satisfied, not any payload.
+#[cfg(unix)]
+#[skuld::fixture]
+pub fn consent_root() -> Result<(), String> {
+    consent("ROOT")
+}
+
+/// Asserts this process can actually do what a ROOT-group test needs: real root, and — on Linux —
+/// the ability to `setuid`/`setgid` to both `TARGET_UID` and `READER_UID` in this user namespace.
+/// Call this from the test body itself, once both `preconditions::root` (the switch) and
+/// `consent_root` (consent) have already passed: a failure here means the environment broke the
+/// promise "switch on + consent given" made, so it panics — a `requires` precondition would
+/// report the test merely unavailable, which is the wrong outcome once consent was given.
+///
+/// The capability probe forks a throwaway child that attempts `setgid(uid)` then `setuid(uid)`
+/// and reports success via its exit code, rather than parsing `/proc/self/{uid,gid}_map`: this is
+/// the exact pair of syscalls the test itself relies on next, so a "yes" here cannot disagree with
+/// what the test does. The child does no allocation and takes no lock between `fork` and `_exit`
+/// — only the two syscalls under test — so the usual fork-in-a-multithreaded-process hazards (a
+/// held libc lock, an allocator in an inconsistent state) do not apply. macOS has no equivalent
+/// namespace/capability split — root is sufficient there.
+#[cfg(unix)]
+pub fn assert_root_capable() {
+    // SAFETY: geteuid() takes no arguments and has no preconditions.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "not root — see README.md's \"Tests that need root\""
+    );
     #[cfg(target_os = "linux")]
-    fn can_setuid_setgid_to(uid: u32) -> bool {
-        // SAFETY: fork() takes no arguments. The child below calls only async-signal-safe raw
-        // syscalls before exiting.
-        match unsafe { libc::fork() } {
-            0 => {
-                // SAFETY: `uid` fits both `gid_t` and `uid_t` (both are u32-width on Linux).
-                let ok = unsafe { libc::setgid(uid as libc::gid_t) } == 0
-                    && unsafe { libc::setuid(uid as libc::uid_t) } == 0;
-                // SAFETY: exits this forked child only; never returns.
-                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-            }
-            pid if pid > 0 => {
-                let mut status: libc::c_int = 0;
-                loop {
-                    // SAFETY: `pid` is our own just-forked child; `status` is a valid out-param.
-                    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-                    if r >= 0 {
-                        break;
-                    }
-                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                        return false;
-                    }
-                }
-                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-            }
-            _ => false, // fork() itself failed
+    for uid in [TARGET_UID, READER_UID] {
+        assert!(
+            can_setuid_setgid_to(uid),
+            "root, but this namespace cannot setuid/setgid to {uid} — CAP_SETUID/CAP_SETGID or \
+             the uid/gid map may not cover it; see README.md's \"Tests that need root\""
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn can_setuid_setgid_to(uid: u32) -> bool {
+    // SAFETY: fork() takes no arguments. The child below calls only async-signal-safe raw
+    // syscalls before exiting.
+    match unsafe { libc::fork() } {
+        0 => {
+            // SAFETY: `uid` fits both `gid_t` and `uid_t` (both are u32-width on Linux).
+            let ok =
+                unsafe { libc::setgid(uid as libc::gid_t) } == 0 && unsafe { libc::setuid(uid as libc::uid_t) } == 0;
+            // SAFETY: exits this forked child only; never returns.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
+        pid if pid > 0 => {
+            let mut status: libc::c_int = 0;
+            loop {
+                // SAFETY: `pid` is our own just-forked child; `status` is a valid out-param.
+                let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if r >= 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return false;
+                }
+            }
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        }
+        _ => false, // fork() itself failed
     }
 }
 
