@@ -29,28 +29,51 @@ agent can't run that step locally either — it only runs in CI.
 
 ### Tests that need root
 
-A few tests (e.g. `foreign_kill_surfaces_permission_denied` in `tests/process_root.rs`) declare a
-runtime precondition and carry a `ROOT` label instead of assuming the environment happens to run
-as root — never a silent skip, never a false pass on every unprivileged machine. CI provisions
-root for exactly these tests (see `.github/workflows/ci.yaml`'s "Run root-precondition tests"
-step) on Linux and macOS.
+A few tests (e.g. `foreign_kill_surfaces_permission_denied` in `tests/process_root.rs`) belong to
+the `ROOT` group: an on/off switch, `COSCA_TEST_ROOT` (default on, `=0` disables the group —
+reported as `ignored`, never a failure), plus separate CONSENT, `COSCA_TEST_ROOT_CONSENT` (default
+off, `=1` consents — an unmet consent FAILS the test, since the switch being on is not the same as
+meaning to run it). "Switch on" alone never assumes the environment happens to run as root — never
+a silent skip, never a false pass on every unprivileged machine. CI provisions root for exactly
+these tests (see `.github/workflows/ci.yaml`'s "Run root-precondition tests" step) on Linux and
+macOS.
 
 These tests spawn real children under real, different unprivileged uids and re-exec as root to do
-it — never run them against this machine's own `sudo`. Run them in a throwaway container instead:
+it — never run them against this machine's own `sudo`. Run them in a throwaway container instead.
+Two steps, because `--network none` (below) cannot itself fetch anything: first a networked step
+populates a named `CARGO_HOME` volume with cosca's own dependencies and `cargo-nextest` itself,
+then the actual test run is fully offline and network-isolated:
 
 ```sh
 ( set -e
-docker run --rm --network none \
+docker volume create cosca-root-test-cargo-home >/dev/null
+docker volume create cosca-root-test-target >/dev/null
+
+# 1. Networked: fetch dependencies and install cargo-nextest into the shared CARGO_HOME.
+docker run --rm \
     -v "$PWD":/repo:ro \
+    -v cosca-root-test-cargo-home:/usr/local/cargo \
     -v cosca-root-test-target:/target \
     -e CARGO_TARGET_DIR=/target \
+    -w /repo \
+    rust:1 \
+    bash -c 'cargo fetch --locked && cargo install cargo-nextest --locked --quiet'
+
+# 2. Offline and network-isolated: the actual root-precondition run. COSCA_TEST_ROOT_CONSENT=1
+#    consents to the ROOT group's real uid-switching; COSCA_TEST_ROOT=0 would instead skip it.
+docker run --rm --network none \
+    -v "$PWD":/repo:ro \
+    -v cosca-root-test-cargo-home:/usr/local/cargo:ro \
+    -v cosca-root-test-target:/target \
+    -e CARGO_TARGET_DIR=/target \
+    -e CARGO_NET_OFFLINE=true \
     -e COSCA_TEST_ROOT_CONSENT=1 \
     -e SKULD_LABELS=ROOT \
     -w /repo \
     rust:1 \
-    bash -c 'cargo install cargo-nextest --locked --quiet && cargo nextest run -E "binary(process) | binary(process_root)"'
+    cargo nextest run --offline -E "binary(process) | binary(process_root)"
 )
-docker volume rm cosca-root-test-target
+docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 ```
 
 - The whole block is wrapped in `( set -e; … )` — a subshell, not the calling shell — so pasting
@@ -58,9 +81,9 @@ docker volume rm cosca-root-test-target
 - The container's default user is already root, so no `sudo` (and none of its `secure_path`/PATH
   surprises) is needed inside it; `COSCA_TEST_ROOT_CONSENT=1` is the only thing that unlocks the
   test's real uid-switching, and it stays inside the container's own environment. The repo is
-  bind-mounted read-only, and the build goes to a throwaway named volume — nothing under `target/`
-  on the host is ever touched, so there is no unprivileged/privileged ownership conflict to clean
-  up afterward.
+  bind-mounted read-only, and both the build and the fetched dependencies go to throwaway named
+  volumes — nothing under `target/` (or `~/.cargo`) on the host is ever touched, so there is no
+  unprivileged/privileged ownership conflict to clean up afterward.
 - Don't lift the inner `cargo nextest run` out of the container and run it with `sudo` on the
   host: `COSCA_TEST_ROOT_CONSENT=1` is real, standing consent to switch uids and spawn/kill
   processes, and this project's own rule is that system-affecting tests run in a container or VM,

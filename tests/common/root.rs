@@ -41,13 +41,15 @@ pub fn switch(group: &str) -> Result<(), String> {
 
 /// `COSCA_TEST_<group>_CONSENT` as a skuld fixture: FAILS the test unless exactly `"1"`.
 pub fn consent(group: &str) -> Result<(), String> {
-    let var = format!("COSCA_TEST_{group}_CONSENT");
-    if std::env::var(&var).as_deref() == Ok("1") {
+    let consent_var = format!("COSCA_TEST_{group}_CONSENT");
+    let switch_var = format!("COSCA_TEST_{group}");
+    if std::env::var(&consent_var).as_deref() == Ok("1") {
         Ok(())
     } else {
         Err(format!(
-            "{var} is not \"1\" — this test changes real system state and needs explicit \
-             consent, see README.md's \"Tests that need root\""
+            "{consent_var} is not \"1\" — this test changes real system state. Set \
+             {consent_var}=1 to consent and run it, or {switch_var}=0 to skip the whole \
+             {group} group instead; see README.md's \"Tests that need root\""
         ))
     }
 }
@@ -100,14 +102,19 @@ pub fn assert_root_capable() {
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
-        "not root — see README.md's \"Tests that need root\""
+        "not root, despite COSCA_TEST_ROOT_CONSENT=1 — this consented to a real root test, but \
+         this process is not actually root. Fix the environment and re-run with \
+         COSCA_TEST_ROOT_CONSENT=1, or set COSCA_TEST_ROOT=0 to skip the whole ROOT group \
+         instead; see README.md's \"Tests that need root\""
     );
     #[cfg(target_os = "linux")]
     for uid in [TARGET_UID, READER_UID] {
         assert!(
             can_setuid_setgid_to(uid),
             "root, but this namespace cannot setuid/setgid to {uid} — CAP_SETUID/CAP_SETGID or \
-             the uid/gid map may not cover it; see README.md's \"Tests that need root\""
+             the uid/gid map may not cover it. Fix the environment and re-run with \
+             COSCA_TEST_ROOT_CONSENT=1, or set COSCA_TEST_ROOT=0 to skip the whole ROOT group \
+             instead; see README.md's \"Tests that need root\""
         );
     }
 }
@@ -226,9 +233,15 @@ pub fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> st
 /// measured to be unsound: after the real target's own process (and this function) have moved on,
 /// nothing keeps that port reserved, and the OS can and does reissue it (observed on macOS) to a
 /// completely unrelated later listener, which then sees a spurious, wrongly-attributed connection.
-/// A pipe already held open by both ends has no such window. (Identical to `common::accept_or_die`
-/// in bindreams/cosca#232 — this copy exists because #204 and #232 fork from different bases;
-/// once #232 lands on `main` and this branch rebases past it, this becomes the shared one.)
+/// A pipe already held open by both ends has no such window.
+///
+/// **This is a KNOWN, TEMPORARY duplicate**, and no longer an identical one: `common::accept_or_die`
+/// in bindreams/cosca#232 has since been redesigned to watch the target PROCESS directly (a
+/// `pidfd` on Linux, `kqueue`'s `EVFILT_PROC` on macOS) instead of its stdout pipe — a pipe's EOF
+/// can be hidden by any descendant still holding the write end open, which this copy remains
+/// exposed to. #204 and #232 fork from different bases, so this copy cannot simply import that
+/// one yet; it stays as this older pipe-based design until #232 lands on `main` and this branch
+/// rebases past it and switches to the canonical helper — tracked, not silently shadowed.
 ///
 /// Checks the listener before the death signal when both are ready: a target that manages to
 /// connect and then immediately exits (an ordinary, successful run for most callers) must not be
