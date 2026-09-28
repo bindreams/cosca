@@ -1684,6 +1684,12 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
             let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
             run.args(std::iter::once(name).chain(common::ALONE_ARGS))
                 .env(CLOSED_SLOTS_ENV, slots);
+            // This loop's own children are ALSO `ALONE_ARGS`-shaped (so THEY skip alone()'s own
+            // re-exec too), inheriting `COSCA_TEST_ALONE` from this already-re-exec'd process —
+            // but never from `spawn_alone` itself, so any `TOKEN_FD_ENV` this process inherited
+            // names a fd that means nothing in a fresh child's own fd table. Strip it before each
+            // fan-out spawn — see `clear_inherited_completion_token`'s own doc.
+            common::clear_inherited_completion_token(&mut run);
             if deny {
                 run.env(DENY_PIDFD_ENV, "1");
             }
