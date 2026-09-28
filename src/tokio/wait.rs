@@ -197,7 +197,7 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
         return Ok(());
     };
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
-    watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
+    watch_readable(&afd, crate::wait::backend::drain_proc_exit, None).await
 }
 
 /// `AsyncFd` requires `AsRawFd`; nix's `Kqueue` exposes only `AsFd` — delegate.
@@ -231,8 +231,17 @@ impl std::os::fd::AsRawFd for KqueueFd {
 /// that consumed bytes on a DIFFERENT non-`None`-but-non-terminal path would violate that
 /// silently; `watch_readable` cannot detect that on its own, so any such closure owns
 /// re-verifying this invariant itself.
+/// `declined`: fired every time this loop sees real readiness and still does not resolve — the
+/// exact "saw readiness, declined to drain" edge a test races this future against (instead of a
+/// clock) to prove the future has genuinely reached and passed judgment on a real event, not
+/// merely been polled before the reactor registered any interest at all. `None` outside tests
+/// (see `wait_tree_drained_inner`).
 #[cfg(target_os = "macos")]
-async fn watch_readable<F>(afd: &::tokio::io::unix::AsyncFd<KqueueFd>, mut drain: F) -> Result<(), Error>
+async fn watch_readable<F>(
+    afd: &::tokio::io::unix::AsyncFd<KqueueFd>,
+    mut drain: F,
+    declined: Option<&::tokio::sync::mpsc::UnboundedSender<()>>,
+) -> Result<(), Error>
 where
     F: FnMut(&nix::sys::event::Kqueue) -> Result<Option<()>, Error>,
 {
@@ -240,7 +249,12 @@ where
         let mut guard = afd.readable().await.map_err(Error::Io)?;
         match drain(&afd.get_ref().0)? {
             Some(()) => return Ok(()),
-            None => guard.clear_ready(), // no exit drained — re-await
+            None => {
+                guard.clear_ready(); // no exit drained — re-await
+                if let Some(tx) = declined {
+                    let _ = tx.send(());
+                }
+            }
         }
     }
 }
@@ -272,7 +286,7 @@ where
 ///
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, true, None).await
+    wait_tree_drained_inner(read_end, true, None, None).await
 }
 
 /// Deadline-bounded, [`TreeDrain`](crate::containment::TreeDrain)-returning wrapper over
@@ -304,7 +318,7 @@ pub(crate) async fn wait_tree_deadline(
             Ok(TreeDrain::AllMarkersClosed)
         }
         Some(d) if d.is_zero() => crate::containment::marker_eof::probe(read_end),
-        Some(d) => match ::tokio::time::timeout(d, wait_tree_drained_inner(read_end, false, None)).await {
+        Some(d) => match ::tokio::time::timeout(d, wait_tree_drained_inner(read_end, false, None, None)).await {
             Ok(res) => res.map(|()| TreeDrain::AllMarkersClosed),
             Err(_elapsed) => Ok(TreeDrain::MembersRemain),
         },
@@ -315,12 +329,19 @@ pub(crate) async fn wait_tree_deadline(
 /// CALLER owns — no shared/global observer state, so concurrently-running tests (this file
 /// has four) cannot steal each other's notification. Always the unbounded arm, matching
 /// [`wait_tree_drained`] (its own real caller): these tests exercise the no-deadline API.
+///
+/// `declined`, if given, fires every time the watch loop sees real kqueue readiness and still
+/// does not resolve (see `watch_readable`'s own doc) — the seam a clock-free test races this
+/// future against (`tokio::select!`, not a `tokio::time::timeout`) to prove it has genuinely
+/// reached and passed judgment on a real event, not merely been raced against a future that
+/// hasn't been polled far enough to register anything yet.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) async fn wait_tree_drained_for_test(
     read_end: std::os::fd::BorrowedFd<'_>,
     armed: std::sync::mpsc::Sender<()>,
+    declined: Option<::tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, true, Some(armed)).await
+    wait_tree_drained_inner(read_end, true, Some(armed), declined).await
 }
 
 /// `unbounded_wait` must be the SAME expression the sync backend's `block_until_drained` uses
@@ -332,6 +353,7 @@ async fn wait_tree_drained_inner(
     read_end: std::os::fd::BorrowedFd<'_>,
     unbounded_wait: bool,
     armed: Option<std::sync::mpsc::Sender<()>>,
+    declined: Option<::tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
@@ -340,9 +362,11 @@ async fn wait_tree_drained_inner(
         let _ = tx.send(());
     }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
-    watch_readable(&afd, move |kq| {
-        crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait).map(|d| d.map(|_| ()))
-    })
+    watch_readable(
+        &afd,
+        move |kq| crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait).map(|d| d.map(|_| ())),
+        declined.as_ref(),
+    )
     .await
 }
 
