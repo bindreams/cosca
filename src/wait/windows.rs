@@ -73,9 +73,17 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
         Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
     };
     // SAFETY: `handle` is a live process handle held for the wait's duration.
-    #[cfg(test)]
-    real_wait_probe::note_entry();
     let waited = unsafe { WaitForSingleObject(handle, ms) };
+    // A real wait call may legitimately reach here and still resolve at once: the
+    // identity-verified handle can name an already-exited-but-not-yet-destroyed process
+    // object, which is already signaled, so `WAIT_OBJECT_0` comes back promptly. Only
+    // `WAIT_TIMEOUT` means the call genuinely spent its whole `ms` budget with nothing
+    // signaled — see `real_wait_probe`'s own doc for why that, not mere entry, is what a test
+    // must watch for.
+    #[cfg(test)]
+    if waited == WAIT_TIMEOUT {
+        real_wait_probe::note_timeout();
+    }
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
     close(handle);
@@ -188,9 +196,17 @@ pub(crate) fn block_until_exit_or_cancel(
     };
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // SAFETY: both handles are live for the wait's duration.
-    #[cfg(test)]
-    real_wait_probe::note_entry();
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+    // A real wait call may legitimately reach here and still resolve at once: the
+    // identity-verified handle can name an already-exited-but-not-yet-destroyed process
+    // object, which is already signaled, so `WAIT_OBJECT_0` comes back promptly. Only
+    // `WAIT_TIMEOUT` means the call genuinely spent its whole `ms` budget with nothing
+    // signaled — see `real_wait_probe`'s own doc for why that, not mere entry, is what a test
+    // must watch for.
+    #[cfg(test)]
+    if waited == WAIT_TIMEOUT {
+        real_wait_probe::note_timeout();
+    }
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
@@ -291,10 +307,19 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 }
 
 /// Test-only instrumentation proving whether `block_until_exit`/`block_until_exit_or_cancel`
-/// actually reached a real, blocking Win32 wait call, instead of returning early on
-/// `Opened::Gone`, `HandleIdentity::Different`, or an open failure — the fast path this module's
-/// identity check exists to provide once the original process has been reaped and its pid may
-/// have been recycled.
+/// genuinely spent a real wait's whole timeout budget with nothing signaled
+/// (`WaitForSingleObject`/`WaitForMultipleObjects` returning `WAIT_TIMEOUT`), rather than
+/// resolving promptly.
+///
+/// **Not "was the real wait call entered at all."** Measured on real Windows CI (see the PR that
+/// introduced this module): the identity-verified handle can legitimately still name an
+/// already-exited-but-not-yet-destroyed process object — the pid not yet recycled, `OpenProcess`
+/// finding the SAME process, `HandleIdentity::Same` — and a real wait call on that handle then
+/// returns `WAIT_OBJECT_0` near-instantly, because the target is already signaled. That is a
+/// correct, common outcome, not the regression class this probe exists to catch, and an
+/// entry-based counter flagged it as a false positive. `WAIT_TIMEOUT` is the unambiguous signal
+/// that the call blocked for (approximately) its whole timeout with nothing becoming signaled —
+/// the actual shape of "a root-only watch that waits out the grace."
 ///
 /// A GLOBAL atomic, not a `thread_local!` — the one place in this module that must be, and this
 /// is the justification: both instrumented calls run inside a `spawn_blocking` closure
@@ -302,22 +327,22 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 /// from the async task that later asserts on the counter. A thread-local counter would never be
 /// visible there.
 ///
-/// Callers MUST sample [`real_wait_entries`] immediately before and after the call under test
-/// and assert the delta, never an absolute count: this counter is shared by every test in the
-/// binary. Under `cargo nextest`'s one-process-per-test model that is moot, but under plain
-/// `cargo test` many `#[tokio::test]`s share one process and may tick it concurrently on their
-/// own threads (see `tests/common/mod.rs`'s identical caveat about process-wide test state).
+/// Callers MUST sample [`timeouts`] immediately before and after the call under test and assert
+/// the delta, never an absolute count: this counter is shared by every test in the binary. Under
+/// `cargo nextest`'s one-process-per-test model that is moot, but under plain `cargo test` many
+/// `#[tokio::test]`s share one process and may tick it concurrently on their own threads (see
+/// `tests/common/mod.rs`'s identical caveat about process-wide test state).
 #[cfg(test)]
 pub(crate) mod real_wait_probe {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    static REAL_WAIT_ENTRIES: AtomicU32 = AtomicU32::new(0);
+    static REAL_WAIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 
-    pub(crate) fn note_entry() {
-        REAL_WAIT_ENTRIES.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn note_timeout() {
+        REAL_WAIT_TIMEOUTS.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub(crate) fn real_wait_entries() -> u32 {
-        REAL_WAIT_ENTRIES.load(Ordering::SeqCst)
+    pub(crate) fn timeouts() -> u32 {
+        REAL_WAIT_TIMEOUTS.load(Ordering::SeqCst)
     }
 }

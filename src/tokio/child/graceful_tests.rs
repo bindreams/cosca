@@ -467,14 +467,17 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 
 // The held refusal buys a shutdown window only where a tree drain can be observed. `TreeWalk`
 // has none, so the grace-wait watches the ROOT alone — and this refusal's precondition IS that
-// the root has already exited, so `block_until_exit_or_cancel`'s identity check (a fresh
-// `OpenProcess` on the reaped pid, landing on `Opened::Gone` or `HandleIdentity::Different`)
-// must resolve the wait before it ever reaches a real `WaitForMultipleObjects` call armed with
-// the 10s grace. That is the actual claim, and it is proven structurally, by asserting the real
-// blocking wait was never entered (`crate::wait::backend::real_wait_probe`) — not by elapsed
-// wall-clock time: cosca promises no upper bound on how late a call may run past a caller's
-// deadline (docs/principles.md §8), so a timing assertion here would either be forbidden outright
-// or, on a slow/loaded runner, pass vacuously in the very world this test exists to catch.
+// the root has already exited, so `block_until_exit_or_cancel`'s identity check must resolve
+// the wait without ever genuinely spending the 10s grace. A real `WaitForMultipleObjects` call
+// MAY still be entered (the identity-verified handle can legitimately name an
+// already-exited-but-not-yet-destroyed process object — `HandleIdentity::Same` — and a wait on
+// that resolves near-instantly since it is already signaled), so the claim is not "no real wait
+// call happens" but "no real wait call ever times out" (`WAIT_TIMEOUT`, the unambiguous signal
+// that a wait genuinely blocked for its whole budget). Proven structurally
+// (`crate::wait::backend::real_wait_probe`), not by elapsed wall-clock time: cosca promises no
+// upper bound on how late a call may run past a caller's deadline (docs/principles.md §8), so a
+// timing assertion here would either be forbidden outright or, on a slow/loaded runner, pass
+// vacuously in the very world this test exists to catch.
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
@@ -500,12 +503,12 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     // `cargo test` (unlike nextest's one-process-per-test isolation) other tests in this binary
     // may tick it concurrently on their own threads. Same narrowing idiom as `log_capture::mark`
     // just above.
-    let before = crate::wait::backend::real_wait_probe::real_wait_entries();
+    let before = crate::wait::backend::real_wait_probe::timeouts();
     child
         .graceful_shutdown_tree(GRACE)
         .await
         .expect("a swept tree supersedes the held refusal");
-    let after = crate::wait::backend::real_wait_probe::real_wait_entries();
+    let after = crate::wait::backend::real_wait_probe::timeouts();
 
     // Non-vacuity, first: a `terminate_tree` that returned `Ok` would produce the same fast,
     // green run, and this test would then be measuring a path it never entered.
@@ -518,8 +521,9 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     );
     assert_eq!(
         after, before,
-        "the root-only watch must resolve on the identity fast path, without ever entering a \
-         real WaitForMultipleObjects call armed with the grace"
+        "the root-only watch must resolve without ever genuinely spending the grace — a real \
+         wait call may fire (an already-exited handle can still resolve and return instantly), \
+         but it must never time out"
     );
 }
 
