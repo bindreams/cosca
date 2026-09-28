@@ -13,8 +13,9 @@
 //! least `pub(crate)`, not merely private — see the imports below.
 
 use crate::test_isolation::{
-    alone, alone_capturing, alone_marker_matches, alone_with_env, kill_and_reap, wait_bounded, wait_on_channel,
-    DrainResult, RestoreRlimitNofile, RestoreStdio, ALONE_ARGS, PROBE_TIMEOUT, TOKEN_FD_ENV, TOKEN_PARENT_ENV,
+    alone, alone_capturing, alone_marker_matches, alone_with_env, kill_and_reap, spawn_alone, wait_bounded,
+    wait_on_channel, DrainResult, RestoreRlimitNofile, RestoreStdio, TimeoutSeam, ALONE_ARGS, LIFELINE_FD_ENV,
+    PROBE_TIMEOUT, TOKEN_FD_ENV, TOKEN_PARENT_ENV,
 };
 // `fixture_path!` IS used throughout this module (every folded probe/prover below); the
 // `unused_imports` lint just cannot see through a macro import the way it does an ordinary item.
@@ -240,6 +241,45 @@ fn a_body_that_exits_early_produces_no_token() {
         "a body that exits early (std::process::exit(0), skipping every live value's Drop) must \
          NOT produce a completion token even though its own exit status is a plain success"
     );
+}
+
+// reclaim_cloexec_on_inherited_fds (D4) =====
+
+/// `reclaim_cloexec_on_inherited_fds` (called the instant `alone()`/`alone_capturing()` recognize
+/// a genuine child) had no direct prover: with it disabled entirely, every test in this file — and
+/// the whole `--lib`/`spawn_io`/`tokio_io` suite — still passed (measured, round 8 review). This
+/// fixture asserts `FD_CLOEXEC` is actually set on BOTH of its own inherited `TOKEN_FD_ENV` and
+/// `LIFELINE_FD_ENV` fds, right after `alone()` recognizes it — exactly when
+/// `reclaim_cloexec_on_inherited_fds` itself runs, so nothing else in this process has had a
+/// chance to touch either fd yet. Plain `alone()`, not `alone_capturing`: the latter's own child
+/// branch closes `TOKEN_FD_ENV`'s fd outright (see `close_inherited_completion_token`), which
+/// would make this fixture's own check fail for the wrong reason (EBADF, not "CLOEXEC unset").
+#[test]
+fn reclaim_cloexec_on_inherited_fds_actually_sets_it() {
+    let name = fixture_path!(reclaim_cloexec_on_inherited_fds_actually_sets_it);
+    let Some(_completion) = alone(name) else {
+        return;
+    };
+    for env in [TOKEN_FD_ENV, LIFELINE_FD_ENV] {
+        let fd: i32 = std::env::var(env)
+            .unwrap_or_else(|e| panic!("{env} env var: {e}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{env}: valid fd number: {e}"));
+        // SAFETY: F_GETFD reads flags only, no ownership implications.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(
+            flags,
+            -1,
+            "fcntl(F_GETFD) on {env}'s own fd {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "reclaim_cloexec_on_inherited_fds must set FD_CLOEXEC on {env}'s own fd {fd} — got \
+             flags {flags:#x}"
+        );
+    }
 }
 
 // write_completion_token_if_child: fan-out safety (N5) =====
@@ -629,6 +669,7 @@ fn a_dead_parent_kills_its_lifeline_child_and_grandchild() {
 // spawn_alone's OWN whole-group timeout kill (N3/N4) =====
 
 const HANGING_CANARY_FD_ENV: &str = "COSCA_TEST_HANGING_CANARY_FD";
+const HANGING_READINESS_FD_ENV: &str = "COSCA_TEST_HANGING_READINESS_FD";
 
 /// `spawn_alone`'s own `wait_bounded(child, PROBE_TIMEOUT, true)` — the bounded wait EVERY
 /// `alone()`/`alone_capturing()`/`alone_with_env` call goes through — had no direct prover:
@@ -636,10 +677,21 @@ const HANGING_CANARY_FD_ENV: &str = "COSCA_TEST_HANGING_CANARY_FD";
 /// passing (measured, round 7 review). This is that prover: a fixture whose body, once recognized
 /// as `alone()`'s own child, spawns a grandchild holding the only remaining copy of a canary
 /// pipe's write end and then hangs forever (blocks on that same grandchild, which itself never
-/// exits on its own) — never returning, so `spawn_alone`'s real, hardcoded `PROBE_TIMEOUT` (30s,
-/// not a shorter one this test picks) genuinely elapses and its real `wait_on_channel` `Timeout`
-/// arm fires `kill_and_reap(child, true)`, the exact call under test, before panicking (expected,
+/// exits on its own) — never returning, so `spawn_alone`'s real `wait_on_channel` `Timeout` arm
+/// fires `kill_and_reap(child, true)`, the exact call under test, before panicking (expected,
 /// caught below — `kill_and_reap` has already run by the time that panic unwinds out).
+///
+/// Two round-8 review fixes on top of the round-7 shape:
+/// - The fixture also writes a readiness byte, AFTER spawning its grandchild and closing its own
+///   canary copy, into a SECOND inherited pipe — and this test reads it back only AFTER the
+///   `catch_unwind` below. Without this, the test rested on a pure timing bet: nothing proved the
+///   fixture had actually reached that point before the outer wait's own kill landed, so a
+///   regression that made the kill fire immediately (or the grandchild never get spawned at all)
+///   could still make the canary EOF — passing vacuously even under the exact `own_process_group
+///   = false` mutant this test exists to catch.
+/// - `TimeoutSeam` (see its own doc) replaces the real 30s `PROBE_TIMEOUT` wait with a
+///   millisecond one, fired the instant the readiness byte above actually arrives, so this test
+///   proves the identical post-Timeout code path without waiting out the real bound at all.
 ///
 /// Same one-`#[test]`-fn, dispatch-on-recognition shape as every other prover here, not a
 /// separately-named, always-passing fixture fn (principle 9).
@@ -655,6 +707,10 @@ fn spawn_alones_own_timeout_kill_reaches_a_grandchild() {
         };
         let canary_fd: i32 = std::env::var(HANGING_CANARY_FD_ENV)
             .expect("canary fd env var")
+            .parse()
+            .expect("valid fd number");
+        let readiness_fd: i32 = std::env::var(HANGING_READINESS_FD_ENV)
+            .expect("readiness fd env var")
             .parse()
             .expect("valid fd number");
         // The grandchild: same reasoning as the lifeline prover above — this process is already
@@ -674,6 +730,16 @@ fn spawn_alones_own_timeout_kill_reaches_a_grandchild() {
         unsafe {
             libc::close(canary_fd);
         }
+        // Signals the test that this fixture has ALREADY spawned its grandchild and closed its
+        // own canary copy — a real, ordered event the test waits for (and fires its TimeoutSeam
+        // on), not a guess at how long that takes. Written only after both prior steps, matching
+        // exactly what the test's own assertion on this byte needs to prove.
+        // SAFETY: `readiness_fd` was made inheritable by `spawn_alone` specifically for this
+        // write; owned exclusively from here.
+        use std::os::fd::FromRawFd;
+        let mut readiness = unsafe { std::fs::File::from_raw_fd(readiness_fd) };
+        use std::io::Write;
+        let _ = readiness.write_all(b"r");
         // Hangs forever — the point. `wait()` on the equally-hanging grandchild rather than an
         // arbitrary blocking read: this process must never return normally, and the grandchild
         // never exits on its own either, so this blocks for as long as this process itself
@@ -686,43 +752,56 @@ fn spawn_alones_own_timeout_kill_reaches_a_grandchild() {
     use std::io::Read;
     let (mut canary_read, canary_write) = std::io::pipe().expect("open canary pipe");
     let canary_fd = canary_write.as_raw_fd();
-    {
-        let _guard = super::test_spawn_lock();
-        // SAFETY: clears FD_CLOEXEC on the canary's write end so it survives exec into the
-        // fixture, and from there plain fork inheritance carries it into the grandchild — held
-        // under `test_spawn_lock()` for the same reason `spawn_alone` itself does this.
-        unsafe {
-            let flags = libc::fcntl(canary_fd, libc::F_GETFD);
-            assert_ne!(
-                flags,
-                -1,
-                "fcntl(F_GETFD) on the canary pipe: {}",
-                std::io::Error::last_os_error()
-            );
-            assert_eq!(
-                libc::fcntl(canary_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "fcntl(F_SETFD) to make the canary pipe inheritable: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-    // `alone_with_env` panics when its own `spawn_alone` call's `wait_bounded` times out (an
+    let (mut readiness_read, readiness_write) = std::io::pipe().expect("open readiness pipe");
+    let readiness_fd = readiness_write.as_raw_fd();
+
+    // D2 (round 8): a deterministic seam instead of the real 30-second PROBE_TIMEOUT — fired the
+    // instant the fixture's own readiness byte (below) actually arrives, from a background
+    // thread, since the main thread is about to block inside `spawn_alone` itself.
+    let seam = TimeoutSeam::install();
+    let readiness_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        let result = readiness_read.read_exact(&mut buf);
+        seam.fire();
+        (result, buf)
+    });
+
+    // `spawn_alone` panics when its own `wait_on_channel` call fires its Timeout arm (an
     // ordinary, expected outcome of THIS SPECIFIC scenario — every OTHER caller in this file
     // treats that panic as a genuine failure, which is exactly why this one must be the only
     // place that deliberately catches it): `kill_and_reap` has already run, synchronously,
     // before that panic unwinds out to here, so the group kill under test has already happened
-    // by the time this returns.
-    let canary_write_fd_str = canary_fd.to_string();
+    // by the time this returns. `inherit` takes ownership of both pipe write ends — `spawn_alone`
+    // itself clears their CLOEXEC and drops the caller's own copies, both under its own lock; see
+    // its own doc (D1, round 8) for why this test must not do either of those itself.
+    let canary_fd_str = canary_fd.to_string();
+    let readiness_fd_str = readiness_fd.to_string();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        alone_with_env(name, &[(HANGING_CANARY_FD_ENV, canary_write_fd_str.as_str())])
+        spawn_alone(
+            name,
+            &[
+                (HANGING_CANARY_FD_ENV, canary_fd_str.as_str()),
+                (HANGING_READINESS_FD_ENV, readiness_fd_str.as_str()),
+            ],
+            vec![canary_write.into(), readiness_write.into()],
+        )
     }));
-    drop(canary_write);
     assert!(
         result.is_err(),
-        "a hanging alone body must make spawn_alone's own wait_bounded time out and panic — a \
-         silent return here would mean the real PROBE_TIMEOUT never elapsed, or elapsed without \
-         reaching the Timeout arm under test"
+        "a hanging alone body must make spawn_alone's own wait_on_channel fire its Timeout arm \
+         and panic — a silent return here would mean the fixture never actually reached the \
+         point the seam above fires on"
+    );
+
+    let (readiness_result, readiness_buf) = readiness_thread.join().expect("join the readiness thread");
+    assert!(
+        readiness_result.is_ok(),
+        "the fixture must signal readiness (after spawning its grandchild and closing its own \
+         canary copy) before this test's own seam can ever fire — got {readiness_result:?}"
+    );
+    assert_eq!(
+        &readiness_buf, b"r",
+        "the fixture's own readiness byte must be exactly 'r' — got {readiness_buf:?}"
     );
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1038,12 +1117,76 @@ fn kill_and_reap_with_own_process_group_reaches_a_grandchild_with_high_fds_occup
     run_kill_and_reap_own_process_group_scenario();
 }
 
-fn run_kill_and_reap_own_process_group_scenario() {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
+/// D5, round 8: a direct regression test for the `dup2` sequence's own bug, forcing the EXACT
+/// numbering the review reported a failure for — `ready_write` landing AT `FIXED_CANARY_FD` (3)
+/// itself, with `canary_write` elsewhere (5) — via explicit `dup2` relocation before either fd
+/// ever reaches the shared scenario below. The OLD sequence (`dup2(canary_fd, 3)` directly, no
+/// temporary) would `dup2` canary onto 3 FIRST, which implicitly closes whatever is currently at
+/// 3 — `ready_write` itself, in this exact arrangement — before the second `dup2` (now reading
+/// from an already-closed source) ever runs, corrupting it entirely.
+#[test]
+fn kill_and_reap_with_own_process_group_reaches_a_grandchild_with_ready_at_the_canary_slot() {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
-    let (mut canary_read, canary_write) = std::io::pipe().expect("open canary pipe");
-    let canary_fd = canary_write.as_raw_fd();
+    // Relocate ALL FOUR of this test's own pipe fds to a guaranteed-clear, high range (>= 20)
+    // FIRST, via F_DUPFD — before forcing ready_write down to fd 3 specifically. Without this,
+    // whichever of canary_read/canary_write/ready_read happens to ALREADY be sitting at fd 3
+    // (their own numbers depend on this process's prior fd history, same as canary_fd/ready_fd
+    // themselves do — see the other tests' own doc) would be silently closed as a side effect of
+    // the `dup2(_, 3)` below, corrupting IT instead of proving anything about the collision this
+    // test targets — measured directly: an earlier version of this exact test aborted with "IO
+    // Safety violation: owned file descriptor already closed" from exactly that.
+    fn relocate_above_20(fd: std::os::fd::OwnedFd) -> std::os::fd::OwnedFd {
+        let raw = fd.into_raw_fd();
+        // SAFETY: F_DUPFD duplicates `raw` to a fresh number >= 20, checked below; the original
+        // closes right after, so exactly one owner remains.
+        let moved = unsafe { libc::fcntl(raw, libc::F_DUPFD, 20) };
+        assert!(
+            moved >= 20,
+            "fcntl(F_DUPFD, 20) on fd {raw}: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::close(raw);
+            std::os::fd::OwnedFd::from_raw_fd(moved)
+        }
+    }
+
+    let (canary_read, canary_write) = std::io::pipe().expect("open canary pipe");
+    let (ready_read, ready_write) = std::io::pipe().expect("open readiness pipe");
+    let canary_read: std::io::PipeReader = relocate_above_20(canary_read.into()).into();
+    let canary_write: std::io::PipeWriter = relocate_above_20(canary_write.into()).into();
+    let ready_read: std::io::PipeReader = relocate_above_20(ready_read.into()).into();
+    // Force ready_write's own fd number down to EXACTLY 3 (== FIXED_CANARY_FD below) — safe now:
+    // every OTHER fd this test holds has already been moved out of the way, above.
+    let ready_write_fd = ready_write.into_raw_fd();
+    let ready_write = unsafe {
+        assert_eq!(
+            libc::dup2(ready_write_fd, 3),
+            3,
+            "dup2({ready_write_fd}, 3) to force the collision this test targets: {}",
+            std::io::Error::last_os_error()
+        );
+        if ready_write_fd != 3 {
+            libc::close(ready_write_fd);
+        }
+        std::io::PipeWriter::from_raw_fd(3)
+    };
+    assert_eq!(
+        ready_write.as_raw_fd(),
+        3,
+        "test setup invariant: ready_write must land exactly at fd 3 to reproduce the bug"
+    );
+    assert_ne!(
+        canary_write.as_raw_fd(),
+        3,
+        "test setup invariant: canary_write must NOT also be fd 3, or this proves nothing"
+    );
+    run_kill_and_reap_own_process_group_scenario_with(canary_read, canary_write, ready_read, ready_write);
+}
+
+fn run_kill_and_reap_own_process_group_scenario() {
+    let (canary_read, canary_write) = std::io::pipe().expect("open canary pipe");
     // A SEPARATE readiness pipe, read for exactly one byte before this test ever calls
     // `kill_and_reap` — without it, killing the leader races its own script: nothing guarantees
     // the leader has reached `sleep 1000 &` (spawning the grandchild at all) before this test's
@@ -1051,7 +1194,20 @@ fn run_kill_and_reap_own_process_group_scenario() {
     // ever proven anything about, passing vacuously. The leader writes to this only AFTER both
     // backgrounding the grandchild and closing its own canary copy — a real, ordered event, not a
     // sleep guessing at how long that takes.
-    let (mut ready_read, ready_write) = std::io::pipe().expect("open readiness pipe");
+    let (ready_read, ready_write) = std::io::pipe().expect("open readiness pipe");
+    run_kill_and_reap_own_process_group_scenario_with(canary_read, canary_write, ready_read, ready_write);
+}
+
+fn run_kill_and_reap_own_process_group_scenario_with(
+    mut canary_read: std::io::PipeReader,
+    canary_write: std::io::PipeWriter,
+    mut ready_read: std::io::PipeReader,
+    ready_write: std::io::PipeWriter,
+) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let canary_fd = canary_write.as_raw_fd();
     let ready_fd = ready_write.as_raw_fd();
     // Fixed, single-digit targets for the shell script below to reference — NOT `canary_fd`
     // and `ready_fd`'s own, dynamically-allocated numbers. `dash` (Debian/Ubuntu's `/bin/sh`)
@@ -1102,28 +1258,47 @@ fn run_kill_and_reap_own_process_group_scenario() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
         // SAFETY: async-signal-safe; `setpgid` is the exact same technique `spawn_alone` itself
-        // uses. The two `dup2`s move the pipe ends to `FIXED_CANARY_FD`/`FIXED_READY_FD`
-        // regardless of their own original numbers, then close whichever original number is
-        // left over (a `dup2(fd, fd)` no-op leaves nothing to close, hence the guard) — this
+        // uses. Moves BOTH fds to temporary numbers >= 5 FIRST, via `F_DUPFD` (also
+        // async-signal-safe) — only THEN `dup2`s the temporaries onto `FIXED_CANARY_FD`/
+        // `FIXED_READY_FD`. Doing the two real `dup2`s directly on `canary_fd`/`ready_fd` (an
+        // earlier version of this fixture did) breaks the moment `ready_fd` happens to already
+        // BE `FIXED_CANARY_FD` (3): `dup2(canary_fd, 3)` implicitly closes whatever is currently
+        // AT 3 first — which, in that case, IS `ready_fd` itself — corrupting it before the
+        // second `dup2` (now reading from an already-closed number) ever runs. Measured, round 8
+        // review: `ready=3, canary=5` failed exactly this way. Temporaries first, guaranteed
+        // >= 5 by `F_DUPFD`'s own minimum argument, can never alias EITHER fixed target or each
+        // other, regardless of what `canary_fd`/`ready_fd` themselves originally were — this
         // runs in the FORKED CHILD, after `fork` and before `exec`, so it can never affect this
-        // test's own fd table.
+        // test's own fd table either way.
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::dup2(canary_fd, FIXED_CANARY_FD) == -1 {
+                let tmp_canary = libc::fcntl(canary_fd, libc::F_DUPFD, 5);
+                if tmp_canary == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::dup2(ready_fd, FIXED_READY_FD) == -1 {
+                let tmp_ready = libc::fcntl(ready_fd, libc::F_DUPFD, 5);
+                if tmp_ready == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if canary_fd != FIXED_CANARY_FD && canary_fd != FIXED_READY_FD {
-                    libc::close(canary_fd);
+                if libc::dup2(tmp_canary, FIXED_CANARY_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
                 }
-                if ready_fd != FIXED_CANARY_FD && ready_fd != FIXED_READY_FD {
-                    libc::close(ready_fd);
+                if libc::dup2(tmp_ready, FIXED_READY_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Close every number that is not one of the two fixed targets — the temporaries
+                // (always >= 5, so always distinct from both) and the originals, UNLESS one of
+                // them coincidentally already WAS a fixed target (in which case its own slot was
+                // already overwritten by a dup2 above, and closing "it" here would destroy what
+                // we just placed there instead).
+                for fd in [canary_fd, ready_fd, tmp_canary, tmp_ready] {
+                    if fd != FIXED_CANARY_FD && fd != FIXED_READY_FD {
+                        libc::close(fd);
+                    }
                 }
                 Ok(())
             });
@@ -1171,10 +1346,31 @@ fn run_kill_and_reap_own_process_group_scenario() {
 /// mechanism itself is proven directly by [`kill_and_reap_sends_sigkill`]; downcasting this
 /// panic's own payload lets this test also confirm the signal is the one THIS call path
 /// reports, not merely that some panic occurred.
+///
+/// The `Timeout` arm (see D6, round 8 review) no longer reaps immediately on its own kill — it
+/// waits for `rx` to receive SOMETHING first, the same way a real drain thread's own post-kill
+/// `waitid(WNOWAIT)` confirmation would arrive, so this synthetic channel needs a stand-in for
+/// that: a background thread that blocks on ITS OWN non-reaping `waitid` for this same child and
+/// sends once it sees the child actually exit — which only happens once `wait_on_channel`'s own
+/// kill fires, so this stays fully event-driven, never a guess at how long the kill takes.
 #[test]
 fn wait_on_channel_timeout_kills_and_reaps() {
     let (child, _write_end_keeps_it_blocked) = child_blocked_until_killed();
-    let (_tx, rx) = std::sync::mpsc::channel::<DrainResult>();
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel::<DrainResult>();
+    std::thread::spawn(move || {
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: `si` is a valid, correctly-sized out-param; `pid` stays this test's own
+            // unreaped child throughout (only `wait_on_channel`'s own `kill_and_reap`-equivalent
+            // path, downstream of THIS thread's own send below, ever reaps it).
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut si, libc::WEXITED | libc::WNOWAIT) };
+            if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        let _ = tx.send(Ok((Vec::new(), Vec::new())));
+    });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_on_channel(child, std::time::Duration::from_millis(200), rx, false)
     }));

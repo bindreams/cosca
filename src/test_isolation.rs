@@ -129,28 +129,34 @@ pub(crate) const TOKEN_PARENT_ENV: &str = "COSCA_TEST_ALONE_TOKEN_PARENT";
 /// anything.
 pub(crate) const LIFELINE_FD_ENV: &str = "COSCA_TEST_ALONE_LIFELINE_FD";
 
-/// Write the completion token to the fd [`TOKEN_FD_ENV`] names, if this process is a genuine,
-/// direct `spawn_alone` child — never merely because the fd number and env vars are present (see
+/// True if THIS process's real, immediate parent (`getppid()`) matches the pid `spawn_alone`
+/// recorded in [`TOKEN_PARENT_ENV`] when it launched this exact process — proof of a genuine,
+/// direct `spawn_alone` child, never merely that the fd numbers and env vars are present (see
 /// [`TOKEN_PARENT_ENV`]'s own doc for why a fan-out grandchild can inherit both without being
-/// one). Called once, by [`Completion`]'s own `Drop`, when it is not unwinding a panic — see there
-/// for why that, and not the moment [`alone`]/[`alone_capturing`] recognize the child, is when
-/// this must run.
+/// one).
+fn is_genuine_spawn_alone_child() -> bool {
+    let Some(expected_parent) = std::env::var_os(TOKEN_PARENT_ENV) else {
+        return false;
+    };
+    let Some(expected_parent) = expected_parent.to_str().and_then(|s| s.parse::<libc::pid_t>().ok()) else {
+        return false;
+    };
+    // SAFETY: getppid() takes no arguments and cannot fail.
+    unsafe { libc::getppid() == expected_parent }
+}
+
+/// Write the completion token to the fd [`TOKEN_FD_ENV`] names, if this process is a genuine,
+/// direct `spawn_alone` child (see [`is_genuine_spawn_alone_child`]). Called once, by
+/// [`Completion`]'s own `Drop`, when it is not unwinding a panic — see there for why that, and not
+/// the moment [`alone`]/[`alone_capturing`] recognize the child, is when this must run.
 fn write_completion_token_if_child() {
+    if !is_genuine_spawn_alone_child() {
+        return;
+    }
     let Some(fd) = std::env::var_os(TOKEN_FD_ENV) else {
         return;
     };
     let fd: i32 = fd.to_str().and_then(|s| s.parse().ok()).expect("valid fd number");
-    let Some(expected_parent) = std::env::var_os(TOKEN_PARENT_ENV) else {
-        return;
-    };
-    let expected_parent: libc::pid_t = expected_parent
-        .to_str()
-        .and_then(|s| s.parse().ok())
-        .expect("valid pid");
-    // SAFETY: getppid() takes no arguments and cannot fail.
-    if unsafe { libc::getppid() } != expected_parent {
-        return;
-    }
     // Defense in depth beyond the ppid check above, in case some OTHER bug ever lets a fd number
     // reach here that a genuine spawn_alone child was never actually given: refuse anything that
     // is not a pipe. Nothing this process opens before this point (libtest's own startup, argv/env
@@ -187,7 +193,15 @@ fn write_completion_token_if_child() {
 /// process recognizes itself — before either function returns control to the real test body, so
 /// nothing the body runs (including its own very first `Command::spawn`) can ever observe either
 /// fd as inheritable.
+///
+/// For a genuine `spawn_alone` child (`is_genuine_spawn_alone_child()`), both fds are guaranteed
+/// present and valid — an `fcntl` failure there is a real, unreachable-in-practice bug, not a
+/// tolerated outcome, so it is `debug_assert!`ed (principle 7). A fan-out GRANDCHILD's own
+/// inherited env vars, by contrast, may legitimately name a fd that means nothing in its own fd
+/// table (see [`TOKEN_PARENT_ENV`]'s own doc) — an `fcntl` failure there is expected and silently
+/// tolerated, same as today.
 fn reclaim_cloexec_on_inherited_fds() {
+    let genuine = is_genuine_spawn_alone_child();
     for env in [TOKEN_FD_ENV, LIFELINE_FD_ENV] {
         let Some(fd) = std::env::var_os(env) else { continue };
         let Some(fd) = fd.to_str().and_then(|s| s.parse::<i32>().ok()) else {
@@ -199,8 +213,19 @@ fn reclaim_cloexec_on_inherited_fds() {
         // by raw fd number, unaffected by CLOEXEC, which only ever applies across an exec).
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
+            debug_assert!(
+                !genuine || flags != -1,
+                "fcntl(F_GETFD) on a genuine spawn_alone child's own {env} fd {fd} failed: {}",
+                std::io::Error::last_os_error()
+            );
             if flags != -1 {
-                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                let ret = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                debug_assert!(
+                    !genuine || ret == 0,
+                    "fcntl(F_SETFD) to reclaim CLOEXEC on a genuine spawn_alone child's own {env} \
+                     fd {fd} failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }
@@ -288,22 +313,33 @@ impl Drop for Completion {
     }
 }
 
-/// Read `reader` to EOF on a background thread, bounded by `timeout` — an empty `Vec` if nothing
-/// arrived in time, exactly like a genuine EOF-with-no-bytes would read. The background thread
-/// itself is not joined or otherwise waited on beyond `timeout`: on a timeout it is abandoned
-/// (still blocked in its own read, if whatever holds `reader`'s write end open never closes it),
-/// which is the deliberate trade this makes — a caller-visible bound instead of a caller-visible
-/// hang, at the cost of one outstanding thread for the rest of THIS process's own life in the
-/// timeout case specifically (never in the ordinary case, where the read completes and the thread
-/// exits normally well within the bound).
-fn read_bounded(mut reader: impl std::io::Read + Send + 'static, timeout: std::time::Duration) -> Vec<u8> {
+/// Read `reader` to EOF on a background thread, bounded by `timeout`. `Ok(bytes)` once the read
+/// genuinely reaches EOF within the bound — including a genuine, immediate EOF-with-no-bytes,
+/// which is `Ok(vec![])`, indistinguishable from (and correctly treated the same as) a slow one.
+/// `Err(ReadBoundedTimeout)` if `timeout` elapses first: expiry is never proof of anything (never
+/// mapped to "no bytes", "empty", or any other verdict) — principle 8, and see the caller for why
+/// silently folding a timeout into an empty read is a real bug, not a hypothetical one, for this
+/// specific caller.
+///
+/// The background thread itself is not joined or otherwise waited on beyond `timeout`: on a
+/// timeout it is abandoned (still blocked in its own read, if whatever holds `reader`'s write end
+/// open never closes it) — a caller-visible bound instead of a caller-visible hang, at the cost of
+/// one outstanding thread for the rest of THIS process's own life in the timeout case specifically
+/// (never in the ordinary case, where the read completes and the thread exits normally well
+/// within the bound).
+struct ReadBoundedTimeout;
+
+fn read_bounded(
+    mut reader: impl std::io::Read + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, ReadBoundedTimeout> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = reader.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    rx.recv_timeout(timeout).unwrap_or_default()
+    rx.recv_timeout(timeout).map_err(|_| ReadBoundedTimeout)
 }
 
 /// Spawn a fresh copy of this test binary against `name` with the isolated `alone()` shape
@@ -311,7 +347,20 @@ fn read_bounded(mut reader: impl std::io::Read + Send + 'static, timeout: std::t
 /// [`TOKEN_FD_ENV`]) and a lifeline pipe (see [`LIFELINE_FD_ENV`]), and wait for it — the shared
 /// spawn machinery [`alone`], [`alone_capturing`] and [`alone_with_env`] all build on. Returns the
 /// captured `Output` plus whether the completion token arrived.
-fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output, bool) {
+///
+/// `inherit`: further fds a caller wants the child to inherit too (e.g. a prover's own canary
+/// pipe) — `spawn_alone` takes OWNERSHIP of them (not just a borrow) specifically so it can also
+/// be what DROPS the caller's own copy, right after `cmd.spawn()`, STILL under the same locked
+/// block the token/lifeline fds are already handled in. `CLOEXEC` is cleared on all of them
+/// inside that SAME lock too, not by the caller beforehand: clearing it outside this lock, even
+/// briefly, is exactly the round-6 N4 bug class (a concurrent, unrelated spawn on another thread
+/// could observe the momentarily-inheritable fd) — measured again, round 8 review, on a test that
+/// got this wrong by clearing CLOEXEC in its own, separate, already-released lock scope.
+pub(crate) fn spawn_alone(
+    name: &str,
+    extra_env: &[(&str, &str)],
+    inherit: Vec<std::os::fd::OwnedFd>,
+) -> (std::process::Output, bool) {
     let (token_read, token_write) = std::io::pipe().expect("open completion-token pipe");
     let token_write_fd = token_write.as_raw_fd();
     let (lifeline_read, lifeline_write) = std::io::pipe().expect("open lifeline pipe");
@@ -319,11 +368,14 @@ fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output,
     let this_pid = std::process::id();
     let child = {
         let _guard = super::test_spawn_lock();
-        // SAFETY: clears FD_CLOEXEC on our own token pipe's write end and lifeline pipe's read
-        // end so both survive into the child at the same fd numbers; held under
-        // `test_spawn_lock()`, so no concurrent, unrelated spawn in this process can observe
-        // either momentarily-inheritable fd.
-        for fd in [token_write_fd, lifeline_read_fd] {
+        // SAFETY: clears FD_CLOEXEC on our own token pipe's write end, lifeline pipe's read end,
+        // and every caller-supplied `inherit` fd, so all of them survive into the child at the
+        // same fd numbers; held under `test_spawn_lock()`, so no concurrent, unrelated spawn in
+        // this process can observe any of them momentarily-inheritable.
+        for fd in [token_write_fd, lifeline_read_fd]
+            .into_iter()
+            .chain(inherit.iter().map(|f| f.as_raw_fd()))
+        {
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 assert_ne!(
@@ -377,6 +429,10 @@ fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output,
         // it must stay open all the way past the wait below; see its own comment there.
         drop(token_write);
         drop(lifeline_read);
+        // Same reasoning, for every `inherit`ed fd: this drops the CALLER's own copy (the only
+        // one this function was ever given — `inherit`'s ownership, not a borrow, see this
+        // function's own doc), while still under the same lock.
+        drop(inherit);
         child
     };
     let out = wait_bounded(child, PROBE_TIMEOUT, true);
@@ -384,10 +440,21 @@ fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output,
     // `wait_bounded` has returned, the CHILD has already exited, so ordinarily every copy of the
     // token write end is already gone too — but `reclaim_cloexec_on_inherited_fds` is what makes
     // that actually true (a leaked copy in a still-running grandchild would otherwise hold this
-    // open indefinitely, hanging this read forever regardless of the child's own exit). This bound
-    // is what turns "some future regression re-opens that leak" into "this read times out and
-    // reports no token", never "this call hangs forever".
-    let token = read_bounded(token_read, PROBE_TIMEOUT);
+    // open indefinitely, hanging this read forever regardless of the child's own exit). A timeout
+    // here is NEVER folded into "no token" (principle 8: expiry is never proof) — that would make
+    // `alone()`'s own "no completion token: the body did not return normally" message state a
+    // false cause whenever this read merely ran out of time, and could make
+    // `a_body_that_exits_early_produces_no_token` pass for the wrong reason. It is instead a loud,
+    // distinct failure of its own: a leaked fd is a real, upstream regression in its own right,
+    // not something this call should quietly absorb.
+    let token = read_bounded(token_read, PROBE_TIMEOUT).unwrap_or_else(|ReadBoundedTimeout| {
+        panic!(
+            "the token pipe's write end was still held after the child exited — some process \
+             still holds a copy open {PROBE_TIMEOUT:?} after wait_bounded returned, which \
+             reclaim_cloexec_on_inherited_fds should have made impossible for anything this \
+             child itself spawned"
+        )
+    });
     // `lifeline_write` drops here, at the end of this function — deliberately kept alive across
     // the whole wait above. The child's own watcher thread self-destructs the instant it sees
     // THIS fd close, so closing it any earlier (even a "tidy" explicit drop right after spawning)
@@ -419,7 +486,7 @@ pub fn alone(name: &str) -> Option<Completion> {
         install_lifeline_watcher();
         return Some(Completion { _private: () });
     }
-    let (out, completed) = spawn_alone(name, &[]);
+    let (out, completed) = spawn_alone(name, &[], vec![]);
     assert!(
         out.status.success() && completed,
         "{}{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
@@ -454,7 +521,7 @@ pub fn alone_capturing(name: &str) -> Option<std::process::Output> {
         close_inherited_completion_token();
         return None;
     }
-    let (out, _completed) = spawn_alone(name, &[]);
+    let (out, _completed) = spawn_alone(name, &[], vec![]);
     Some(out)
 }
 
@@ -472,7 +539,7 @@ pub fn alone_capturing(name: &str) -> Option<std::process::Output> {
 /// pass/fail proof `alone()` asserts on internally, left here to the caller (e.g. to collect
 /// several cases' failures before asserting once), never libtest's own stdout banner text.
 pub fn alone_with_env(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output, bool) {
-    spawn_alone(name, extra_env)
+    spawn_alone(name, extra_env, vec![])
 }
 
 /// Require that this test is running alone in its own process, via [`alone`], before any caller
@@ -733,17 +800,131 @@ impl Drop for RestoreRlimitNofile {
 
 pub(crate) type DrainResult = Result<(Vec<u8>, Vec<u8>), String>;
 
+std::thread_local! {
+    /// Test-only seam (see [`TimeoutSeam`]): while `Some`, the very next [`wait_on_channel`] call
+    /// THIS THREAD makes has its own `Timeout` arm driven by an event instead of the real
+    /// `Duration` it was passed. `None` in every production build/run — nothing outside this
+    /// file's own tests ever installs one, so [`recv_or_seam`]'s fallback (a plain, unchanged
+    /// `rx.recv_timeout(timeout)`) is the ENTIRE behavior everywhere else, unconditionally.
+    static TIMEOUT_SEAM: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII seam, installed on the CURRENT thread, that makes the next [`wait_on_channel`] call THAT
+/// SAME thread makes fire its own `Timeout` arm the instant [`TimeoutSeam::fire`] is called,
+/// instead of waiting out the real `Duration` it was given. The code that runs once fired is
+/// IDENTICAL either way — see [`recv_or_seam`] — so this changes only when the arm fires, never
+/// what it does; nothing about wait_on_channel's own production behavior is touched by this
+/// existing (a seam only a test installs).
+///
+/// Exists so a prover of a real, hardcoded, multi-second bound (like `spawn_alone`'s own
+/// `PROBE_TIMEOUT`) can wait for the SPECIFIC event it actually cares about (here: its own
+/// fixture's readiness byte arriving) rather than the real duration — turning a genuinely
+/// 30-second test into a millisecond one without losing any coverage of the post-Timeout path
+/// itself, which stays exactly as exercised as it always was.
+pub(crate) struct TimeoutSeam {
+    fire_tx: std::sync::mpsc::Sender<()>,
+}
+
+impl TimeoutSeam {
+    /// Install a seam for the NEXT `wait_on_channel` call on this thread. Installing a second one
+    /// before the first is consumed (i.e. before that first `wait_on_channel` call happens)
+    /// replaces it — one seam is good for exactly one such call.
+    pub(crate) fn install() -> TimeoutSeam {
+        let (fire_tx, fire_rx) = std::sync::mpsc::channel();
+        TIMEOUT_SEAM.with(|cell| *cell.borrow_mut() = Some(fire_rx));
+        TimeoutSeam { fire_tx }
+    }
+
+    /// Fire the seam: the `wait_on_channel` call it was installed for treats this exactly like
+    /// its real `Duration` elapsing — including the kill-and-reap the real `Timeout` arm performs.
+    pub(crate) fn fire(&self) {
+        let _ = self.fire_tx.send(());
+    }
+}
+
+impl Drop for TimeoutSeam {
+    fn drop(&mut self) {
+        // If `recv_or_seam` never consumed this seam (this test's own `wait_on_channel` call
+        // never happened, or a later-installed seam already replaced it), clear the slot so a
+        // LATER, wholly unrelated `wait_on_channel` call on this same thread never picks up a
+        // stale receiver whose sender (this one) is about to disappear — which would make ITS OWN
+        // `seam_rx.recv()` return `Err` immediately, firing ITS Timeout arm instantly instead of
+        // honoring its own real Duration.
+        TIMEOUT_SEAM.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// `rx.recv_timeout(timeout)`, unless a [`TimeoutSeam`] is installed on this thread — then races
+/// the real drain result against the seam's own event instead of the real `Duration`, using two
+/// threads that each feed the SAME local, single-purpose channel (the first message wins; the
+/// other's is simply never read, harmless — an unbounded `mpsc::Sender::send` never blocks).
+/// The `Result` half is the identical type `recv_timeout` itself returns, so every arm downstream
+/// (`wait_on_channel`'s own match) is completely unaffected by which path produced it — this is
+/// what makes the post-Timeout code path IDENTICAL either way, not merely similar.
+///
+/// Also returns `rx` back, wrapped in `Some`, WHEN POSSIBLE — the no-seam path never actually
+/// consumes it (`recv_timeout` only borrows), so it costs nothing to hand back there; a caller
+/// that needs to wait on the SAME channel again afterward (`wait_on_channel`'s own `Timeout` arm,
+/// D6) can. The seam path genuinely consumes `rx` (moved into its own forwarding thread, which
+/// must keep running past this function's own return to eventually deliver the real result) —
+/// `None` there; that caller does the best it still safely can (kill first, reap right after,
+/// same as always) without the extra wait, which is acceptable: the seam is test-only and rare,
+/// and its own specific caller does not depend on that ordering for ITS OWN correctness.
+fn recv_or_seam(
+    rx: std::sync::mpsc::Receiver<DrainResult>,
+    timeout: std::time::Duration,
+) -> (
+    Result<DrainResult, std::sync::mpsc::RecvTimeoutError>,
+    Option<std::sync::mpsc::Receiver<DrainResult>>,
+) {
+    let Some(seam_rx) = TIMEOUT_SEAM.with(|cell| cell.borrow_mut().take()) else {
+        let result = rx.recv_timeout(timeout);
+        return (result, Some(rx));
+    };
+    enum Event {
+        Drained(DrainResult),
+        Disconnected,
+        TimedOut,
+    }
+    let (etx, erx) = std::sync::mpsc::channel::<Event>();
+    let drain_tx = etx.clone();
+    std::thread::spawn(move || {
+        let _ = drain_tx.send(match rx.recv() {
+            Ok(result) => Event::Drained(result),
+            Err(_) => Event::Disconnected,
+        });
+    });
+    std::thread::spawn(move || {
+        // Blocks until the test's own TimeoutSeam fires (or its Sender is simply dropped without
+        // ever firing, e.g. the test itself panicked first — either way, `recv()` returning at
+        // all is this thread's whole job).
+        let _ = seam_rx.recv();
+        let _ = etx.send(Event::TimedOut);
+    });
+    let result = match erx.recv() {
+        Ok(Event::Drained(result)) => Ok(result),
+        Ok(Event::Disconnected) => Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        Ok(Event::TimedOut) => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        // Unreachable in practice: both producer threads above always send exactly once before
+        // exiting. Treated as Disconnected rather than unwrapped, so a future change to either
+        // thread that somehow skips its send fails loudly as an ordinary panic downstream,
+        // instead of via a bare `.expect()` here that would name neither producer.
+        Err(_) => Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+    };
+    (result, None)
+}
+
 /// Kill `child` — by process GROUP if `own_process_group` (negative pid), else just its own pid —
-/// and reap it, returning the resulting `ExitStatus`. Killing the group while the leader is still
-/// an unreaped zombie (the OS has not yet let its pid, and so its pgid, be recycled) reaches any
-/// grandchildren the leader may have spawned into its own group before it hung — e.g. a three-level
-/// tree under one of #210's cgroup-lane tests, run as root.
-pub(crate) fn kill_and_reap(mut child: std::process::Child, own_process_group: bool) -> std::process::ExitStatus {
+/// WITHOUT reaping it. Killing the group while the leader is still an unreaped zombie (the OS has
+/// not yet let its pid, and so its pgid, be recycled) reaches any grandchildren the leader may
+/// have spawned into its own group before it hung — e.g. a three-level tree under one of #210's
+/// cgroup-lane tests, run as root.
+fn kill_only(child: &std::process::Child, own_process_group: bool) {
     let pid = child.id() as libc::pid_t;
     if own_process_group {
         // SAFETY: a plain signal to this process's own re-exec'd child's group; the child is still
-        // unreaped (owned exclusively by `child` until `wait()` below), so its pid — and this
-        // pgid, which the leader set to equal its own pid — cannot yet have been recycled.
+        // unreaped (owned exclusively by the caller until it reaps), so its pid — and this pgid,
+        // which the leader set to equal its own pid — cannot yet have been recycled.
         assert_eq!(
             unsafe { libc::kill(-pid, libc::SIGKILL) },
             0,
@@ -751,8 +932,21 @@ pub(crate) fn kill_and_reap(mut child: std::process::Child, own_process_group: b
             std::io::Error::last_os_error()
         );
     } else {
-        let _ = child.kill();
+        // SAFETY: a plain signal to this process's own re-exec'd child, still unreaped, same
+        // reasoning as above; a failure (e.g. ESRCH, if it raced its own natural exit) is ignored
+        // the same way `Child::kill()`'s own discarded `Result` already was.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
+}
+
+/// [`kill_only`] then reap, returning the resulting `ExitStatus`. Safe to call whenever nothing
+/// ELSE still needs `child`'s own pid to stay meaningful — in particular, NOT while a background
+/// thread might still be about to `waitid` on it non-reapingly (see [`wait_on_channel`]'s own
+/// `Timeout` arm, the one caller that cannot use this directly).
+pub(crate) fn kill_and_reap(mut child: std::process::Child, own_process_group: bool) -> std::process::ExitStatus {
+    kill_only(&child, own_process_group);
     child.wait().expect("reap the child after killing it")
 }
 
@@ -771,7 +965,8 @@ pub(crate) fn wait_on_channel(
     own_process_group: bool,
 ) -> std::process::Output {
     let pid = child.id();
-    match rx.recv_timeout(timeout) {
+    let (outcome, remaining_rx) = recv_or_seam(rx, timeout);
+    match outcome {
         Ok(Ok((stdout, stderr))) => {
             let mut child = child;
             let status = child.wait().expect("reap the child, already confirmed exited");
@@ -786,7 +981,23 @@ pub(crate) fn wait_on_channel(
             );
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            let status = kill_and_reap(child, own_process_group);
+            let mut child = child;
+            // Signal only — NOT `kill_and_reap` — because the drain thread (see `wait_bounded`)
+            // may still be mid-flight: reading `child`'s stdout/stderr pipes, about to call its
+            // own non-reaping `waitid(P_PID, pid, WNOWAIT)`. Reaping HERE, before that call runs,
+            // would let the OS recycle `pid` first, so that `waitid` could then target an
+            // entirely different, unrelated process born with the same number in between
+            // (principle 4) — worse, one that is still genuinely alive would make that call BLOCK
+            // on IT, not merely misreport. The kill below makes this resolve promptly regardless:
+            // it makes the real child exit, which unblocks whatever the drain thread was still
+            // doing and lets it reach its own `waitid` and send its result. `remaining_rx` is
+            // `None` only via a `TimeoutSeam` (test-only, rare) — that caller does not depend on
+            // this exact ordering for its own correctness; see `recv_or_seam`'s own doc.
+            kill_only(&child, own_process_group);
+            if let Some(remaining_rx) = remaining_rx {
+                let _ = remaining_rx.recv();
+            }
+            let status = child.wait().expect("reap the child after killing it");
             panic!(
                 "child pid {pid} did not exit within {timeout:?} — it hung instead of exiting, \
                  which is itself a regression somewhere upstream of this wait. Killed it and \
