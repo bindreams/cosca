@@ -411,13 +411,21 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
 
     const NAME: &str = "tokio::spawn::spawn_tests::cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio";
     const INNER: &str = "COSCA_TEST_ABANDONED_STDIO_INNER";
+    // Isolates the whole test (this outer call, and the INNER-gated re-exec below, which
+    // inherits `COSCA_TEST_ALONE` and already uses this exact re-exec shape) from the rest of
+    // the suite before it can reach its own real fd 1/2 close, gated by `require_process_per_test`
+    // just above that close below. Without this, `COSCA_TEST_ABANDONED_STDIO_INNER` alone (a
+    // plain env var, no argv verification) was the only gate on that mutation.
+    if !crate::test_isolation::alone(NAME) {
+        return;
+    }
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
     if std::env::var_os(INNER).is_none() {
         let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+            .args(std::iter::once(NAME).chain(crate::test_isolation::ALONE_ARGS))
             .env(INNER, "1")
             .output()
             .expect("run the case");
@@ -449,6 +457,7 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
             .expect("wire the slot to the file");
         }
         cmd.contain();
+        crate::test_isolation::require_process_per_test("closes process-wide fds 1, 2");
         // SAFETY: this process's own std slots, closed only across the spawn and restored from
         // copies above 2 before anything else runs.
         let saved: Vec<(i32, i32)> = [1, 2]
