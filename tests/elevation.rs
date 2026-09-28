@@ -144,9 +144,13 @@ fn controlling_terminal_probe_is_false_after_setsid() {
 // GATED: run0 client -> transient-unit kill propagation. The client is ALWAYS reaped by
 // wait(), so that proves nothing; instead the elevated PAYLOAD reports its own pid over a
 // loopback socket, and after killing the client we assert THAT (the transient-unit process) is
-// gone. run0 auths via polkit; --no-ask-password (Auth::NonInteractive) suppresses the prompt
-// and fails loud without a polkit rule (verified: it does not silently hang), so an
-// unattended run needs a passwordless polkit rule for the run0 action.
+// gone. run0 auths via polkit; --no-ask-password (Auth::NonInteractive) suppresses the prompt.
+// `run0` itself does exit (not hang) when auth fails without a polkit rule — but this test's OWN
+// `listener.accept()` used to hang forever in exactly that case, since nothing would ever
+// connect if the payload never started (measured with a fake failing run0: the earlier version
+// of this test needed an external 60s kill). Racing the accept against the client's own exit,
+// below, is what actually makes THIS TEST fail loud rather than hang — an unattended run still
+// needs a passwordless polkit rule for the run0 action to reach the propagation check at all.
 //
 // The payload's own lifetime is tied to THIS TEST PROCESS's socket, never to the client: the
 // client is what gets killed here, on purpose, to observe whether elevation's OWN kill
@@ -177,12 +181,44 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
         ])
         .elevation_backend(cosca::elevation::Backend::Run0)
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
-    let child = c.spawn().expect("run0 spawn");
+    let child = std::sync::Arc::new(c.spawn().expect("run0 spawn"));
 
-    // Blocks until the payload connects — a real event: this is the transient unit's own
-    // process, reachable only once systemd has actually started it under run0's elevation, not
-    // a timer or a pidfile polled on one.
-    let (sock, _) = listener.accept().expect("accept payload connection");
+    // Races the accept against the CLIENT's own exit — no timeout needed, since a run0 failure
+    // before the payload ever starts (a denied polkit prompt, a missing rule, run0 itself
+    // erroring out) is a real, already-existing event: the client process exiting. Without this,
+    // `listener.accept()` alone would hang forever on exactly that failure, since nothing would
+    // ever connect (measured: the reviewer confirmed this with a fake failing run0, killed only
+    // by an external 60s bound). Both arms start racing concurrently, on their own threads, before
+    // either result is awaited — `Child::wait()` takes `&self` (`SharedChild`-backed, safe to call
+    // from a second thread while this one later calls `kill()`/`wait()` on the same `Arc` clone),
+    // so the loser (usually the client-exit watch, since the client keeps running for the rest of
+    // this test) is simply abandoned rather than joined: its result is sent but never read, and it
+    // exits on its own once the client actually does.
+    enum Raced {
+        Connected(std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>),
+        ClientExited(Result<std::process::ExitStatus, cosca::error::Error>),
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Raced::Connected(listener.accept()));
+        }
+    });
+    std::thread::spawn({
+        let tx = tx.clone();
+        let child = std::sync::Arc::clone(&child);
+        move || {
+            let _ = tx.send(Raced::ClientExited(child.wait()));
+        }
+    });
+    let sock = match rx.recv().expect("neither race arm hung up") {
+        Raced::Connected(r) => r.expect("accept payload connection").0,
+        Raced::ClientExited(status) => panic!(
+            "the run0 client exited ({status:?}) before its payload ever connected — \
+             run0 failed before the payload started"
+        ),
+    };
     let mut reader = std::io::BufReader::new(sock);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read payload pid");
@@ -209,10 +245,18 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
         events: libc::POLLIN,
         revents: 0,
     };
+    // An absolute deadline, not a duration re-armed at 30s on every retry: an EINTR (e.g. a
+    // signal this test process itself receives) must not extend the total bound past 30s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let rc = loop {
+        let remaining_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .try_into()
+            .unwrap_or(i32::MAX);
         // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only within
         // its bounds, and the `1` count matches the slice length passed.
-        let rc = unsafe { libc::poll(&mut pfd, 1, 30_000) };
+        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
         if rc >= 0 {
             break rc;
         }
@@ -224,10 +268,11 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
         "the transient unit's payload (pid {payload_pid}) is still alive 30s after the run0 \
          client was killed — run0's kill propagation to the transient unit appears broken"
     );
-    assert!(
-        !pid_is_alive(payload_pid),
-        "pidfd reported the payload exited but kill(pid, 0) still finds it alive"
-    );
+    // No `!pid_is_alive(payload_pid)` check here: `POLLIN` on the pidfd fires at the payload's
+    // exit, before systemd reaps it, so `kill(pid, 0)` would still succeed against the zombie —
+    // and once it IS reaped, the pid can be reused, making a post-hoc `kill(pid, 0)` meaningless
+    // either way. Pidfd readiness is already the proof; a second, racy check on the bare pid adds
+    // nothing but a false-failure risk.
 }
 
 /// `kill(pid, 0)` performs only the existence/permission check, sending nothing. Success
