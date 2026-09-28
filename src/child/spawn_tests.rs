@@ -9,18 +9,32 @@ use crate::command::Command;
 use crate::error::Error;
 
 // A long-lived child, so a teardown leak would show as an alive process at the assert rather than
-// self-exiting. On Windows, `fault::assert_child_reaped` can only check bare `is_alive() ==
-// Liveness::Dead` (unlike Unix, whose identity-resolution check is immune to a pid simply having
-// exited on its own — see that function's own doc), so `ping -n 30`'s own natural exit after 30s
-// would let a still-not-actually-reaped bug pass once the fixture's own timer ran out, rather
-// than hang or fail. The Windows leg instead pipes stdin from a pipe this function creates and
-// LEAKS the write end of (never closed, by us or by anything `Command`/`Child`'s own `Drop` does
-// to ITS OWN, separate copy of the stdio handle): the resulting child can only die from a real
-// kill by the code under test.
+// self-exiting — on EVERY platform: `sleep 30`/`ping -n 30` is not enough even on Unix, whose
+// `fault::assert_child_reaped` identity-resolution check IS immune to a pid simply having exited
+// on its own (see that function's own doc), because several callers reach it only after a REAL
+// BLOCKING `wait()` deeper in the teardown path (`teardown_unadopted` -> `reap_unadopted`) — a
+// mutant that skips the actual kill (e.g. `kill_unadopted` returning `Ok(())` without killing, or
+// `finish_elevated` dropping its own `child.kill()`) still lets that blocking wait return
+// successfully once `sleep 30`'s own timer naturally ends it, so the reap "succeeds" and
+// `assert_child_reaped` finds a genuinely (if belatedly, and for the wrong reason) gone child —
+// measured passing after the fixture's own duration elapsed, proving nothing about whether a kill
+// ever happened. `cat`/`findstr x`, with no natural end at all, turns that same mutant into a
+// hang instead: correct, loud, and never a vacuous pass. Stdin is piped from a pipe this function
+// creates and LEAKS the write end of (never closed, by us or by anything `Command`/`Child`'s own
+// `Drop` does to ITS OWN, separate copy of the stdio handle): the resulting child can only die
+// from a real kill by the code under test.
 fn blocker() -> Command {
     let mut cmd = Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    {
+        cmd.args(["cat"]);
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        cmd.stdin(crate::stdio::Stdio::from_file(std::fs::File::from(
+            std::os::fd::OwnedFd::from(reader),
+        )))
+        .expect("set stdin pipe");
+        std::mem::forget(writer); // never closed — see this function's own doc
+    }
     #[cfg(windows)]
     {
         cmd.args(["findstr", "x"]);
