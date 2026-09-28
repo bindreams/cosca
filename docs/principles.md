@@ -169,23 +169,23 @@ signal dispositions) runs in its own re-exec'd process (`alone()` in
 through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just
 an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in [#223].
 
-`#[ignore]` marks only a specific, temporary regression on `main`: the owner (a human) accepts a
-known failure and disables that one test until it's fixed. It never disables a group of tests; only
-the owner approves it, and nobody else applies it without that approval.
+`#[ignore]` marks only a specific, temporary regression on `main`: the owner (a human) accepts the
+known failure and disables that one test until it's fixed. Never for a group.
 
 A test group whose environment support varies by host (root, cgroups, and the like) instead
-declares its own `COSCA_TEST_<GROUP>` variable, on by default: any value but the literal `0` is the
-program's to interpret, and it reads that conservatively, running the group anyway. Only an
-explicit `COSCA_TEST_<GROUP>=0` disables the group, reported as `ignored` with a reason: the shape
-a skuld `requires` predicate gives once the harness migration ([#151]) lands. An unmet `requires`
-only marks a test `ignored`, though: libtest-mimic's `--ignored`/`--include-ignored` (and nextest's
-`--run-ignored`) still run its body regardless, so once gating moves to `requires`, CI steps and
-local recipes must not pass those flags. Without the explicit `0` the test runs for real and fails
-on whatever an environment without support produces: a failed support check never turns into a
-skip. Today's gates do the opposite: some are `#[ignore]`d by default and opted into with
-`--run-ignored` plus an asserted `COSCA_TEST_CGROUP`; the early-return shape still exists at
-`src/containment/cgroup/leaf_tests.rs:60/152` and `tests/elevation.rs:129/186/208/322/457`. Both
-are tracked as tech debt in [#234].
+declares its own `COSCA_TEST_<GROUP>` variable, on by default: any value but the literal `0` runs
+the group. Only an explicit `COSCA_TEST_<GROUP>=0` disables it, reported as `ignored` with a
+reason: the shape a `requires` predicate gives in [skuld](https://github.com/bindreams/skuld), the
+test harness cosca is migrating to ([#151]). Without that explicit `0` the test runs for real and
+fails on whatever an environment without support produces: a failed support check never turns into
+a skip.
+
+Today's gates take three shapes, none matching this: some are `#[ignore]`d and opted into with
+`--run-ignored` alone, with no `COSCA_TEST_*` variable at all (the Windows probes and canaries,
+`windows_process_cwd`, the elevation routes, and `dir_tests.rs`'s unshare test); some also assert
+an opt-in variable (`COSCA_TEST_CGROUP`, `COSCA_TEST_SETUID_HELPER`, `COSCA_TEST_ELEVATION*`); and
+some return early instead (every `gated()` caller in `tests/elevation.rs`, and `leaf_tests.rs`).
+[#234] tracks the migration and is the authoritative inventory of what's left.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
@@ -204,21 +204,20 @@ or a PID the test computed. On Unix that kill reaches `kill(2)` by number, which
 child is unreaped.
 
 Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
-host support doesn't vary, so a host that won't run the group can disable it rather than fail on
-missing consent. Alongside it, the group needs a second variable, `COSCA_TEST_<GROUP>_CONSENT`,
-checked once the group itself is enabled: only an explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives
-consent. Any other value is the program's to interpret too, and it reads that just as
-conservatively, as no consent: unset included, it fails the test rather than running it. For
-example, a CI step that cannot run the group sets `COSCA_TEST_ROOT=0` to disable it outright; a
-sandboxed lane instead sets `COSCA_TEST_ROOT=1` and `COSCA_TEST_ROOT_CONSENT=1`. No consent
-variable exists yet, and today's on/off variables have the opposite, opt-in semantics (principle
-9); both gaps are tracked in [#234].
+host support doesn't vary: `=0` says this host can't support or run the group. Consent is a
+separate gate, `COSCA_TEST_<GROUP>_CONSENT`, checked once the group itself is enabled: only an
+explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent, and `=0` on the group variable is not a way
+around it. Any other value, unset included, is no consent and fails the test rather than running
+it; the check may be a skuld fixture, but either way a missing consent is a hard failure (a panic
+or an assertion), never a return. For example, a CI step that cannot run the group sets
+`COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and `COSCA_TEST_ROOT_CONSENT=1`. No
+consent variable exists yet, and some system-affecting groups have no `COSCA_TEST_<GROUP>` at all;
+see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
 4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)). Principle 9 turns every group on by default,
-so without a second, explicit gate a bare test run would touch real system state before anyone
-decided it should.
+so a bare test run would touch real system state without a second, explicit opt-in.
 
 **Applies to:** all tests. CI's cgroup lane runs in a fresh cgroup on a throwaway runner
 ([`ci.yaml`](../.github/workflows/ci.yaml)).
