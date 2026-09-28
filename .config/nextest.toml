@@ -62,9 +62,7 @@ filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
 
 [[profile.default.overrides]]
-# The kill-dropping regression hangs these tests (blocking reap of a `pause()` child); bound it so
-# it fails instead. Both normally finish in well under a second. Under `profile.default`, not
-# `profile.ci`, so it also bounds a local `cargo nextest run` — nextest falls back to the default
-# profile's overrides for settings a named profile's own overrides don't match.
+# Bounds a hang (blocking reap of a `pause()` child) if the guard stops killing, so it fails
+# instead. Under `profile.default` so `profile.ci` and local runs both inherit it.
 filter = 'test(test_support_tests)'
 slow-timeout = { period = "20s", terminate-after = 1 }

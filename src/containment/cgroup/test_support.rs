@@ -1,11 +1,10 @@
 //! Helpers the cgroup module's tests share.
 
 /// Fork a child that runs `body` and `_exit(0)`s; `body` must be async-signal-safe (this process
-/// has other threads). The child never `exec`s, so it inherits every fd this process has open,
-/// and an unreaped orphan can hold this test binary's own stdout open. The returned
-/// [`KillOnDrop`] SIGKILLs and reaps it on drop unless [`defused`](KillOnDrop::defuse).
+/// has other threads). The child never `exec`s, so an unreaped orphan keeps this binary's
+/// inherited fds (stdout) open. The returned [`KillOnDrop`] SIGKILLs and reaps it on drop unless
+/// [`defused`](KillOnDrop::defuse).
 #[cfg(target_os = "linux")]
-#[must_use = "dropping this immediately kills and reaps the child; bind it for as long as the child must live"]
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
     // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
     // `_exit`s without unwinding or running destructors.
@@ -32,25 +31,30 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
                     pidfd: Some(pidfd),
                 },
                 Err(e) => {
-                    // No guard is possible without a pidfd. The probe pidfd lets the regression
-                    // test verify the reap below without racing pid reuse; a probe failure (e.g.
-                    // the same exhaustion that failed the pidfd above) is reported, not silently
-                    // dropped, but must not skip the kill/reap that follows.
-                    match rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty()) {
+                    // The probe pidfd lets the test verify the reap without racing pid reuse. Its
+                    // failure is reported but must not skip the kill/reap.
+                    let probe = if crate::containment::cgroup::fault::take_force_fork_running_probe_pidfd_failure() {
+                        Err(rustix::io::Errno::MFILE)
+                    } else {
+                        rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty())
+                    };
+                    match probe {
                         Ok(probe) => crate::containment::cgroup::fault::record_fork_running_pidfd_failure_probe(probe),
                         Err(probe_err) => {
                             use std::io::Write;
                             let _ = writeln!(std::io::stderr(), "fork_running: probe pidfd_open: {probe_err}");
                         }
                     }
-                    // The child is still our unreaped child, so the bare pid is safe here, this
-                    // one time, before anything else could reap or recycle it.
-                    // SAFETY: `raw_pid` is this process's own child, forked immediately above.
+                    // Bare pid is safe: the child is still unreaped, so the pid can't be recycled.
+                    // SAFETY: `raw_pid` is our unreaped child.
                     let killed = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
-                    if killed == 0 {
+                    let cleanup_err = if killed != 0 {
+                        // The child may still be alive: a blocking reap here could hang forever.
+                        Some(format!("kill: {}", std::io::Error::last_os_error()))
+                    } else {
                         let mut status = 0;
                         let reaped = loop {
-                            // SAFETY: as above.
+                            // SAFETY: `raw_pid` is our unreaped child.
                             let reaped = unsafe { libc::waitpid(raw_pid, &mut status, 0) };
                             if reaped == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                             {
@@ -58,21 +62,25 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
                             }
                             break reaped;
                         };
-                        debug_assert_eq!(reaped, raw_pid, "waitpid: {}", std::io::Error::last_os_error());
-                    } else {
-                        // The child may still be alive: a blocking reap here could hang forever.
-                        debug_assert_eq!(killed, 0, "kill: {}", std::io::Error::last_os_error());
+                        (reaped != raw_pid).then(|| format!("waitpid: {}", std::io::Error::last_os_error()))
+                    };
+                    // No pre-empting assert: `e` — the reason a guard couldn't be made — is the
+                    // point of this panic, and a cleanup failure is additional detail on it, not
+                    // a replacement for it.
+                    match cleanup_err {
+                        None => panic!("pidfd_open its own just-forked child: {e}"),
+                        Some(cleanup_err) => {
+                            panic!("pidfd_open its own just-forked child: {e} (cleanup also failed: {cleanup_err})")
+                        }
                     }
-                    panic!("pidfd_open its own just-forked child: {e}");
                 }
             }
         }
     }
 }
 
-/// Targets the child by pidfd, not pid: after a reap the kernel may recycle the pid onto an
-/// unrelated process. SIGKILLs and reaps a not-yet-reaped child on drop, unless
-/// [`defuse`](Self::defuse)d.
+/// SIGKILLs and reaps a forked child on drop unless [`defuse`](Self::defuse)d. Uses a pidfd, not
+/// the pid, which the kernel may recycle after a reap.
 #[cfg(target_os = "linux")]
 #[must_use = "dropping this immediately kills and reaps the child; bind it for as long as the child must live"]
 pub(crate) struct KillOnDrop {
@@ -106,20 +114,26 @@ impl Drop for KillOnDrop {
             return;
         };
         let panicking = std::thread::panicking();
-        // A panic here mid-unwind would abort instead of completing it, so a failure is reported,
-        // not asserted, and (the kill only) doesn't block on a child that may still be alive.
-        // `eprintln!` itself panics on a closed stderr, so this writes directly and ignores that.
-        let killed = rustix::process::pidfd_send_signal(pidfd.as_fd(), rustix::process::Signal::KILL);
+        // Mid-unwind a panic would abort, so failures are reported to stderr, not asserted
+        // (`writeln!` because `eprintln!` panics on a closed stderr). After a failed kill, return
+        // without waiting: the child may still be alive.
+        let killed = if crate::containment::cgroup::fault::take_force_kill_on_drop_kill_failure() {
+            Err(rustix::io::Errno::PERM)
+        } else {
+            rustix::process::pidfd_send_signal(pidfd.as_fd(), rustix::process::Signal::KILL)
+        };
         if killed.is_err() {
-            if panicking {
-                let _ = writeln!(std::io::stderr(), "KillOnDrop: pidfd_send_signal: {killed:?}");
-                return;
+            let _ = writeln!(std::io::stderr(), "KillOnDrop: pidfd_send_signal: {killed:?}");
+            if !panicking {
+                debug_assert!(killed.is_ok(), "pidfd_send_signal: {killed:?}");
             }
-            debug_assert!(killed.is_ok(), "pidfd_send_signal: {killed:?}");
             return;
         }
 
         let reaped = loop {
+            if crate::containment::cgroup::fault::take_force_kill_on_drop_waitid_eintr() {
+                continue;
+            }
             match rustix::process::waitid(
                 rustix::process::WaitId::PidFd(pidfd.as_fd()),
                 rustix::process::WaitIdOptions::EXITED,
@@ -128,10 +142,12 @@ impl Drop for KillOnDrop {
                 other => break other,
             }
         };
-        if panicking {
-            let _ = writeln!(std::io::stderr(), "KillOnDrop: waitid: {reaped:?}");
-        } else {
-            debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");
+        if reaped.is_err() {
+            if panicking {
+                let _ = writeln!(std::io::stderr(), "KillOnDrop: waitid: {reaped:?}");
+            } else {
+                debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");
+            }
         }
     }
 }
