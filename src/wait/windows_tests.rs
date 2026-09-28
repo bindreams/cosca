@@ -4,27 +4,32 @@
 //! the "deadline-windows-never-early" bug this PR fixes.
 //!
 //! Every test here uses one or more of three seams from `crate::wait` instead of racing the
-//! wall clock:
+//! wall clock, each returning an RAII guard that restores the production default on drop (even
+//! mid-panic, from a failed assertion) rather than requiring a hand-paired `set`/clear:
 //! - `remaining_override_seam` forces a specific `remaining` duration (e.g. a sub-millisecond
-//!   one) into the NEXT `win32_timeout_ms` call, so a ceiling-vs-truncation divergence is
-//!   provable from the recorded `ms` alone — deterministically, not by racing real
-//!   OS-clock/scheduler jitter to land on a sub-millisecond remainder (real Windows wait-timer
-//!   coarseness can otherwise mask the divergence entirely; this is how an earlier, unfixed
-//!   version of `block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration` passed
-//!   against genuinely truncating code — see this PR's description).
-//! - `wait_ms_probe` records the exact `(ms, remaining)` pair a call site armed a wait with, so
-//!   a test can assert `ms == min(ceil_millis(remaining), clamp)` exactly (not merely
-//!   `ms >= remaining`, which a slack-adding regression like `ceil_millis(d) + 1` would still
-//!   satisfy), and that a clamped-and-re-armed wait's successive `remaining` values strictly
-//!   decrease (proving `remaining` is recomputed FRESH every loop iteration, never hoisted out
-//!   and reused stale).
+//!   one) into the NEXT `win32_timeout_ms` call, so a ceiling-vs-truncation divergence — or an
+//!   early, UN-clamped `WAIT_TIMEOUT` — is provable deterministically, not by racing real
+//!   OS-clock/scheduler jitter to land on one (real Windows wait-timer coarseness can otherwise
+//!   mask a truncation bug entirely; this is how an earlier, unfixed version of
+//!   `block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration` passed against
+//!   genuinely truncating code — see this PR's description).
 //! - `wait_clamp_seam` overrides the `INFINITE - 1` (~49.7 day) clamp with a tiny value, so the
 //!   "a capped wait elapsed before the real deadline, so re-arm rather than report" path is
 //!   exercised in milliseconds instead of actually waiting 49.7 days.
+//! - `wait_ms_probe` records the exact `(ms, remaining)` pair a call site armed a wait with, so
+//!   a test can assert `ms == min(ceil_millis(remaining), clamp)` exactly (not merely
+//!   `ms >= remaining`, which a slack-adding regression like `ceil_millis(d) + 1` would still
+//!   satisfy), that a re-armed wait's successive `remaining` values strictly decrease (proving
+//!   `remaining` is recomputed FRESH every loop iteration, never hoisted out and reused stale),
+//!   and — via `on_second_arm` — lets a test register a one-shot hook that fires synchronously,
+//!   on this thread, the instant a SECOND wait is armed: this ends a wait deterministically via
+//!   a real event (closing a fixture's piped stdin so it exits) exactly when the loop has
+//!   genuinely re-armed, rather than racing a fixed real-clock window (e.g. "200ms should be
+//!   enough for setup plus a few 5ms re-arms") for enough re-arms to happen in time.
 //!
 //! No test here asserts an UPPER bound on elapsed time — only ever a lower bound
-//! (`Instant::now() >= deadline`), per the deadline contract and this repo's global rule
-//! against synchronizing on time.
+//! (`Instant::now() >= deadline`, or an equivalent real-completion check), per the deadline
+//! contract and this repo's global rule against synchronizing on time.
 
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
@@ -81,11 +86,10 @@ fn expected_ms_unclamped(remaining: Duration) -> u32 {
 fn block_until_exit_arms_the_ceiling_of_the_remaining_duration() {
     let (child, id) = spawn_never_exiting();
     wait_ms_probe::take(); // clear any residue from a prior test on this thread
-    remaining_override_seam::set(Duration::from_micros(500)); // sub-ms: ceils to 1, floors to 0
+    let _override = remaining_override_seam::set(Duration::from_micros(500)); // sub-ms: ceils to 1, floors to 0
     let deadline = Instant::now() + Duration::from_millis(5);
     let result = super::block_until_exit(id, Some(Some(deadline)));
     let probed = wait_ms_probe::take();
-    remaining_override_seam::take(); // defensive: consume any unused override before it leaks
     let_child_exit(child);
     result.expect("a live never-exiting child must not report a wait failure");
     let &(first_ms, first_remaining) = probed
@@ -102,63 +106,82 @@ fn block_until_exit_arms_the_ceiling_of_the_remaining_duration() {
     );
 }
 
-/// Never-early, the deadline contract's core promise: once `block_until_exit` reports "still
-/// alive" against a deadline, the real clock must already be at or past that deadline. No
-/// upper bound on elapsed time is asserted anywhere in this file — only this lower bound.
+/// Never-early, the deadline contract's core promise: a `WAIT_TIMEOUT` must NEVER be trusted as
+/// proof the real deadline passed, whether or not this round's wait happened to be clamped. Per
+/// Microsoft's Wait Functions and Time-out Intervals, "the wait may time out in less than the
+/// specified length of time" even for an UN-clamped, correctly-ceiled interval — so a recheck
+/// conditioned on "was this arm clamped" is exactly as wrong as no recheck at all.
+/// `remaining_override_seam` simulates that directly: the FIRST arm is forced to a tiny,
+/// UN-clamped 500µs (ceils to 1ms — nowhere near the ~49.7-day production clamp) against a real
+/// deadline that is HOURS away, so an early `WAIT_TIMEOUT` here has nothing to do with the
+/// clamp. `on_second_arm` fires the instant the loop re-arms a second time, closing the
+/// fixture's piped stdin so it exits for real; the wait must resolve via that genuine exit
+/// event, never an early "still alive" verdict.
 ///
-/// This is an end-to-end regression check for the ORIGINAL bug (both the truncating `ms` and
-/// the single-shot, no-recheck wait together — see this PR's description for why a ceiling fix
-/// or a recheck-loop fix ALONE, with the other already in place, does not make this assertion
-/// fail on its own): it does not pin a single-line mutant distinct from
-/// `block_until_exit_arms_the_ceiling_of_the_remaining_duration` (the ceiling, provable
-/// deterministically via the seam) and `block_until_exit_re_arms_past_a_clamped_timeout` (the
-/// recheck loop, provable deterministically via `wait_clamp_seam`) below.
+/// Mutant: trust an un-clamped `WAIT_TIMEOUT` outright — whether via no recheck loop at all, or
+/// a recheck conditioned on "was this arm clamped" — fails: the function returns after just the
+/// first (forced, un-clamped) arm, `probed.len() == 1`, and the result wrongly claims "still
+/// alive" even though the real deadline is hours off.
 #[test]
 fn block_until_exit_never_reports_still_alive_before_the_deadline() {
-    let (child, id) = spawn_never_exiting();
-    let deadline = Instant::now() + Duration::from_millis(5);
+    let (mut child, id) = spawn_never_exiting();
+    let stdin = child.stdin.take().expect("piped stdin");
+    wait_ms_probe::take();
+    let _override = remaining_override_seam::set(Duration::from_micros(500));
+    wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> `cmd /C more` exits for real
+    let deadline = Instant::now() + Duration::from_secs(3600); // hours off: nowhere near expiry
     let result = super::block_until_exit(id, Some(Some(deadline)));
-    let_child_exit(child);
-    let alive = result.expect("a live never-exiting child must not report a wait failure");
-    assert!(!alive, "a never-exiting child must not be reported as exited");
+    let probed = wait_ms_probe::take();
+    let exited = result.expect("a genuinely-terminated child must not report a wait failure");
+    child.wait().expect("reap the child after it exits");
     assert!(
-        Instant::now() >= deadline,
-        "reported still-alive strictly before the deadline actually passed"
+        exited,
+        "must report exited once the child genuinely exits, not falsely conclude still-alive \
+         from an early, un-clamped WAIT_TIMEOUT"
+    );
+    assert!(
+        probed.len() >= 2,
+        "must re-arm past the first (forced-early, un-clamped) WAIT_TIMEOUT rather than \
+         trusting it outright, got {} arm(s)",
+        probed.len()
     );
 }
 
-/// The recheck loop's job: a wait capped below the real deadline (in production, the
+/// The recheck loop's job under a REAL clamp (distinct from the un-clamped early-timeout path
+/// the test above exercises): a wait capped below the real deadline (in production, the
 /// `INFINITE - 1` / ~49.7-day clamp) must not be trusted as proof the deadline passed — the
 /// loop must re-arm and keep waiting, recomputing `remaining` FRESH every iteration (never
-/// hoisting it out of the loop and reusing a stale value). `wait_clamp_seam` substitutes a
-/// tiny clamp for the real one so this is provable in milliseconds, not days.
+/// hoisting it out of the loop and reusing a stale value). `wait_clamp_seam` substitutes a tiny
+/// 5ms clamp for the real one against a real deadline that is hours away, so EVERY round is
+/// genuinely clamped. `on_second_arm` ends the wait deterministically via a real exit event —
+/// not a race against how much real time a fixed window (e.g. a 200ms real deadline) leaves for
+/// setup plus however many re-arms happen to complete in it.
 ///
-/// Mutant: remove the recheck-and-loop (always return/break on the first `WAIT_TIMEOUT`) ->
-/// fails deterministically: the wait would report "still alive" after only the clamped
-/// interval (a few ms), long before the real (200ms) deadline, AND only one `(ms, remaining)`
-/// pair would be recorded.
+/// Mutant: remove the recheck-and-loop -> fails deterministically: `probed.len() == 1`, and the
+/// result wrongly claims "still alive" (the hook, gated on a second arm, never fires).
 /// Mutant: hoist `crate::wait::remaining(deadline)` above the loop and reuse it every iteration
 /// -> fails the strictly-decreasing-`remaining` assertion below (every recorded `remaining`
 /// would be identical, not shrinking).
 #[test]
 fn block_until_exit_re_arms_past_a_clamped_timeout() {
-    let (child, id) = spawn_never_exiting();
+    let (mut child, id) = spawn_never_exiting();
+    let stdin = child.stdin.take().expect("piped stdin");
     wait_ms_probe::take();
-    wait_clamp_seam::set(Some(5)); // every armed wait capped to 5ms, far below the real deadline
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let _clamp = wait_clamp_seam::set(5); // every armed wait capped to 5ms
+    wait_ms_probe::on_second_arm(move || drop(stdin));
+    let deadline = Instant::now() + Duration::from_secs(3600); // hours off: always clamped
     let result = super::block_until_exit(id, Some(Some(deadline)));
-    wait_clamp_seam::set(None); // restore the production default for any later test
     let probed = wait_ms_probe::take();
-    let_child_exit(child);
-    let alive = result.expect("a live never-exiting child must not report a wait failure");
-    assert!(!alive, "a never-exiting child must not be reported as exited");
+    let exited = result.expect("a genuinely-terminated child must not report a wait failure");
+    child.wait().expect("reap the child after it exits");
     assert!(
-        Instant::now() >= deadline,
-        "a clamped wait must re-arm and keep waiting, not report still-alive at the clamp"
+        exited,
+        "must report exited once the child genuinely exits, not falsely conclude still-alive \
+         at the clamp"
     );
     assert!(
         probed.len() >= 2,
-        "a 5ms-clamped wait against a 200ms deadline must re-arm (>=2 recorded arms), got {}",
+        "a 5ms-clamped wait must re-arm (>=2 recorded arms) before the real exit event, got {}",
         probed.len()
     );
     for (ms, remaining) in &probed {
@@ -190,10 +213,9 @@ fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
     let (child, id) = spawn_never_exiting();
     let cancel = super::new_cancel_event().expect("create cancel event");
     wait_ms_probe::take();
-    remaining_override_seam::set(Duration::from_micros(500));
+    let _override = remaining_override_seam::set(Duration::from_micros(500));
     let result = super::block_until_exit_or_cancel(id, Some(Duration::from_millis(5)), &cancel);
     let probed = wait_ms_probe::take();
-    remaining_override_seam::take();
     let_child_exit(child);
     result.expect("a live never-exiting child must not report a wait failure");
     let &(first_ms, first_remaining) = probed
@@ -206,65 +228,71 @@ fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
     );
 }
 
-/// Never-early for the grace-and-cancel wait: once it reports "still alive" (`Ok(false)`)
-/// against a `grace`, the real clock must already be at or past the deadline that `grace`
-/// implies (established at function entry, mirroring `block_until_exit`'s convention). Like
-/// `block_until_exit_never_reports_still_alive_before_the_deadline` above, this is an
-/// end-to-end regression check for the ORIGINAL bug as a whole, not a distinct single-line
-/// mutant beyond the ceiling and recheck-loop tests in this file.
+/// Never-early for the grace-and-cancel wait, the same way
+/// `block_until_exit_never_reports_still_alive_before_the_deadline` proves it for
+/// `block_until_exit`: an early, UN-clamped `WAIT_TIMEOUT` (forced via `remaining_override_seam`)
+/// must never be trusted, regardless of whether this specific arm happened to be clamped. Ending
+/// the wait via `cancel` is NOT used here to distinguish "genuinely resolved" from "wrongly
+/// trusted the early timeout": both a real cancel and a real timeout collapse to the SAME
+/// `Ok(false)` return, so they would not be observably different. Closing the fixture's stdin
+/// (an `Ok(true)`, unambiguous) is used instead, exactly as at site 1.
+///
+/// Mutant: trust an un-clamped `WAIT_TIMEOUT` outright -> fails: returns after the first arm,
+/// `probed.len() == 1`, result wrongly claims "still alive" hours before the real deadline.
 #[test]
 fn block_until_exit_or_cancel_never_reports_still_alive_before_the_deadline() {
-    let (child, id) = spawn_never_exiting();
+    let (mut child, id) = spawn_never_exiting();
+    let stdin = child.stdin.take().expect("piped stdin");
     let cancel = super::new_cancel_event().expect("create cancel event");
-    let before = Instant::now();
-    let grace = Duration::from_millis(5);
+    wait_ms_probe::take();
+    let _override = remaining_override_seam::set(Duration::from_micros(500));
+    wait_ms_probe::on_second_arm(move || drop(stdin));
+    let grace = Duration::from_secs(3600); // hours off: nowhere near expiry
     let result = super::block_until_exit_or_cancel(id, Some(grace), &cancel);
-    let_child_exit(child);
-    let alive = result.expect("a live never-exiting child must not report a wait failure");
+    let probed = wait_ms_probe::take();
+    let exited = result.expect("a genuinely-terminated child must not report a wait failure");
+    child.wait().expect("reap the child after it exits");
     assert!(
-        !alive,
-        "a never-exiting, never-cancelled child must not be reported as exited"
+        exited,
+        "must report exited once the child genuinely exits, not falsely conclude still-alive \
+         from an early, un-clamped WAIT_TIMEOUT"
     );
-    // The deadline is established at function entry from `grace`; `before` predates that
-    // entry, so `before + grace` is an earlier (i.e. safe, conservative) stand-in for it —
-    // asserting against it only makes the "never early" check STRICTER, never weaker.
     assert!(
-        Instant::now() >= before + grace,
-        "reported still-alive strictly before the grace-derived deadline actually passed"
+        probed.len() >= 2,
+        "must re-arm past the first (forced-early, un-clamped) WAIT_TIMEOUT rather than \
+         trusting it outright, got {} arm(s)",
+        probed.len()
     );
 }
 
-/// Re-arm past a clamped timeout for the grace-and-cancel wait, the same way
-/// `block_until_exit_re_arms_past_a_clamped_timeout` proves it for `block_until_exit`,
-/// including the strictly-decreasing-`remaining` check that catches a hoisted-above-the-loop
-/// regression.
+/// Re-arm past a REAL clamp for the grace-and-cancel wait, the same way
+/// `block_until_exit_re_arms_past_a_clamped_timeout` proves it for `block_until_exit`: a tiny
+/// 5ms clamp against an hours-away grace, ended deterministically by a real exit event rather
+/// than a fixed real-clock window.
 ///
 /// Mutant: remove the recheck-and-loop -> fails deterministically the same way.
 /// Mutant: hoist `remaining` above the loop -> fails the strictly-decreasing check.
 #[test]
 fn block_until_exit_or_cancel_re_arms_past_a_clamped_timeout() {
-    let (child, id) = spawn_never_exiting();
+    let (mut child, id) = spawn_never_exiting();
+    let stdin = child.stdin.take().expect("piped stdin");
     let cancel = super::new_cancel_event().expect("create cancel event");
     wait_ms_probe::take();
-    wait_clamp_seam::set(Some(5));
-    let before = Instant::now();
-    let grace = Duration::from_millis(200);
+    let _clamp = wait_clamp_seam::set(5);
+    wait_ms_probe::on_second_arm(move || drop(stdin));
+    let grace = Duration::from_secs(3600); // hours off: always clamped
     let result = super::block_until_exit_or_cancel(id, Some(grace), &cancel);
-    wait_clamp_seam::set(None);
     let probed = wait_ms_probe::take();
-    let_child_exit(child);
-    let alive = result.expect("a live never-exiting child must not report a wait failure");
+    let exited = result.expect("a genuinely-terminated child must not report a wait failure");
+    child.wait().expect("reap the child after it exits");
     assert!(
-        !alive,
-        "a never-exiting, never-cancelled child must not be reported as exited"
-    );
-    assert!(
-        Instant::now() >= before + grace,
-        "a clamped wait must re-arm and keep waiting, not report still-alive at the clamp"
+        exited,
+        "must report exited once the child genuinely exits, not falsely conclude still-alive \
+         at the clamp"
     );
     assert!(
         probed.len() >= 2,
-        "a 5ms-clamped wait against a 200ms grace must re-arm (>=2 recorded arms), got {}",
+        "a 5ms-clamped wait must re-arm (>=2 recorded arms) before the real exit event, got {}",
         probed.len()
     );
     for (ms, remaining) in &probed {

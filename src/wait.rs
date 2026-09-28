@@ -1,5 +1,8 @@
 //! Non-reaping, race-free death-watch and hard-kill for a `ProcessId`. `block_until_exit`
-//! blocks the calling thread in ONE kernel syscall until exit or timeout (no sleep-poll).
+//! blocks the calling thread until exit or timeout, never a sleep-poll: one kernel syscall on
+//! Linux/macOS; on Windows, one or more `WaitForSingleObject`/`WaitForMultipleObjects` calls in
+//! a row, only ever re-armed against the caller's own real deadline (see [`win32_timeout_ms`]'s
+//! doc) — no busy-spin, no sleep in between.
 //! NEVER reaps: the target's real parent collects the zombie.
 
 use std::time::{Duration, Instant};
@@ -122,9 +125,19 @@ pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
 
 /// `d` rounded UP to whole milliseconds, not truncated. `Duration::as_millis()` floors, which
 /// for a sub-millisecond remainder (e.g. 500µs) yields `0` — a Win32 wait armed with that `0`
-/// polls immediately and can report "timed out" up to a full millisecond before the caller's
-/// real deadline, violating cosca's never-early deadline contract. `Duration::ZERO` ceils to
-/// `0`, which is correct: a zero-remaining deadline is a poll, not a wait.
+/// is a non-blocking poll rather than a genuine wait, a needless, entirely self-inflicted extra
+/// margin of earliness on top of whatever the OS itself may already introduce.
+///
+/// Ceiling does NOT, by itself, make a single wait call never-early. Per Microsoft's [Wait
+/// Functions and Time-out Intervals]: "If the time-out interval is less than the resolution of
+/// the system clock, the wait may time out in less than the specified length of time" — even a
+/// correctly-ceiled, un-clamped wait can still return early on real hardware. What actually
+/// guarantees cosca's never-early deadline contract is the unconditional recheck-and-re-arm
+/// loop at every call site (see [`win32_timeout_ms`]'s doc), which never trusts ANY
+/// `WAIT_TIMEOUT` without checking the real deadline. `Duration::ZERO` ceils to `0`, which is
+/// correct: a zero-remaining deadline is a poll, not a wait.
+///
+/// [Wait Functions and Time-out Intervals]: https://learn.microsoft.com/en-us/windows/win32/sync/wait-functions
 ///
 /// Pure and portable (no OS dependency) so it is unit-testable on every host, including this
 /// one. Not `pub(crate)`-visible on its own outside this module — call [`win32_timeout_ms`],
@@ -155,14 +168,24 @@ const WIN32_INFINITE: u32 = u32::MAX;
 /// conversion at one call site, missed exactly that case, since `try_from` SUCCEEDS for
 /// `u32::MAX`).
 ///
-/// This converts ONE call's timeout — it is not itself a retry loop. Because of the clamp,
-/// EVERY call site with a genuine deadline (`Some`) must retry on `WAIT_TIMEOUT`: recompute
-/// its `remaining` FRESH (via [`remaining`], from the real deadline) before EVERY call — never
-/// reuse a value computed before an earlier iteration — and never trust a `WAIT_TIMEOUT` as
-/// proof the real deadline passed without rechecking `remaining` against it, until it
-/// genuinely has. See the loop shape at every call site: `wait/windows.rs::block_until_exit`,
-/// `block_until_exit_or_cancel`, `containment/windows.rs::wait_drained_raw`, and
+/// This converts ONE call's timeout — it is not itself a retry loop. EVERY call site with a
+/// genuine deadline (`Some`) must retry on `WAIT_TIMEOUT` UNCONDITIONALLY, not only when this
+/// call happened to be clamped: per Microsoft's [Wait Functions and Time-out Intervals], "If
+/// the time-out interval is less than the resolution of the system clock, the wait may time
+/// out in less than the specified length of time" — an UN-clamped, correctly-ceiled wait can
+/// still return `WAIT_TIMEOUT` before its own requested interval has genuinely elapsed. The
+/// clamp (`WIN32_INFINITE - 1`, ~49.7 days) is a SECOND, independent reason a single call's
+/// timeout can undershoot the real deadline — for a much larger gap — but it is not the only
+/// one, and a recheck that only fires "if this arm was clamped" is exactly as wrong as no
+/// recheck at all. Every call site must therefore recompute its `remaining` FRESH (via
+/// [`remaining`], from the real deadline) before EVERY call — never reuse a value computed
+/// before an earlier iteration — and never trust ANY `WAIT_TIMEOUT` as proof the real deadline
+/// passed without rechecking `remaining` against it, until it genuinely has. See the loop shape
+/// at every call site: `wait/windows.rs::block_until_exit`, `block_until_exit_or_cancel`,
+/// `containment/windows.rs::wait_drained_raw`, and
 /// `child/spawn/windows_raw/proc.rs::RawChild::wait_deadline`.
+///
+/// [Wait Functions and Time-out Intervals]: https://learn.microsoft.com/en-us/windows/win32/sync/wait-functions
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
     match remaining {
@@ -213,12 +236,23 @@ pub(crate) mod wait_clamp_seam {
     thread_local! {
         static OVERRIDE_MS: Cell<Option<u32>> = const { Cell::new(None) };
     }
-    /// Override the clamp for the current thread. `None` restores the production default.
-    pub(crate) fn set(ms: Option<u32>) {
-        OVERRIDE_MS.with(|c| c.set(ms));
+    /// Override the clamp for the current thread until the returned guard drops — RAII, not a
+    /// hand-paired `set`/`set(None)`, so a test that panics before an explicit restore (e.g. a
+    /// failed assertion) still leaves the production default in place for whatever test runs
+    /// next on this thread.
+    #[must_use]
+    pub(crate) fn set(ms: u32) -> Guard {
+        OVERRIDE_MS.with(|c| c.set(Some(ms)));
+        Guard(())
     }
     pub(crate) fn get() -> Option<u32> {
         OVERRIDE_MS.with(|c| c.get())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE_MS.with(|c| c.set(None));
+        }
     }
 }
 
@@ -237,13 +271,25 @@ pub(crate) mod remaining_override_seam {
     thread_local! {
         static OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
     }
-    /// Force the next [`win32_timeout_ms`] call to use `d` instead of its real argument.
-    pub(crate) fn set(d: Duration) {
+    /// Force the next [`win32_timeout_ms`] call to use `d` instead of its real argument, until
+    /// consumed (by that call) or the returned guard drops, whichever comes first. RAII: the
+    /// guard clears any UNCONSUMED override on drop — including mid-panic during a failed
+    /// assertion — so a test can never leak a stale forced value onto a later test sharing this
+    /// thread, without a hand-written defensive `take()` at every call site.
+    #[must_use]
+    pub(crate) fn set(d: Duration) -> Guard {
         OVERRIDE.with(|c| c.set(Some(d)));
+        Guard(())
     }
-    /// Consume and return the forced value, if one is armed.
+    /// Consume and return the forced value, if one is still armed.
     pub(crate) fn take() -> Option<Duration> {
         OVERRIDE.with(|c| c.take())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(None));
+        }
     }
 }
 
@@ -261,16 +307,44 @@ pub(crate) mod wait_ms_probe {
     use std::time::Duration;
     thread_local! {
         static RECORDED: RefCell<Vec<(u32, Duration)>> = const { RefCell::new(Vec::new()) };
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
     pub(crate) fn record(ms: u32, remaining: Duration) {
-        RECORDED.with(|r| r.borrow_mut().push((ms, remaining)));
+        let count = RECORDED.with(|r| {
+            let mut r = r.borrow_mut();
+            r.push((ms, remaining));
+            r.len()
+        });
+        // Fires synchronously, on this thread, strictly BEFORE the caller's second real Win32
+        // wait call executes (this function returns to `win32_timeout_ms`, which returns to the
+        // call site, which only THEN calls `WaitForSingleObject`/`WaitForMultipleObjects`) — so
+        // a hook that ends a fixture's life (closing stdin, killing it, signalling cancel) is
+        // guaranteed to have taken effect, or be in flight, before that second wait blocks.
+        if count == 2 {
+            if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+                hook();
+            }
+        }
     }
-    /// Drain and return everything recorded on the current thread since the last `take()`.
+    /// Register a one-shot hook that runs the instant the SECOND `(ms, remaining)` pair is
+    /// recorded. Lets a test end a wait deterministically via a real event exactly when the
+    /// loop has genuinely re-armed past a first, deliberately early/clamped `WAIT_TIMEOUT` —
+    /// rather than racing a fixed real-clock window for "enough" re-arms to happen in time.
+    // Only the Windows-only test files register a hook (see `take`'s comment above).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn on_second_arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    /// Drain and return everything recorded on the current thread since the last `take()`,
+    /// clearing any unconsumed hook too (defensive — every test that arms one is expected to
+    /// reach a second arm and consume it, but a differently-behaving mutant must not leak a
+    /// hook onto a later test sharing this thread).
     // Only the Windows-only test files read the probe back; a non-Windows test build compiles
     // `record` (called unconditionally under `#[cfg(test)]` inside `win32_timeout_ms`, exercised
     // by this module's own portable tests) but never calls `take()`.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn take() -> Vec<(u32, Duration)> {
+        HOOK.with(|h| *h.borrow_mut() = None);
         RECORDED.with(|r| r.take())
     }
 }

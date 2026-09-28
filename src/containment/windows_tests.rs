@@ -156,11 +156,10 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     let (child, job) = spawn_job_member();
     let job_handle = job.as_handle().expect("freshly created job handle must be live");
     crate::wait::wait_ms_probe::take();
-    crate::wait::remaining_override_seam::set(std::time::Duration::from_micros(500));
+    let _override = crate::wait::remaining_override_seam::set(std::time::Duration::from_micros(500));
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
     let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
     let probed = crate::wait::wait_ms_probe::take();
-    crate::wait::remaining_override_seam::take(); // defensive: consume any unused override
     let_member_exit(child);
     verdict.expect("a live never-exiting member must not report a wait failure");
     let &(first_ms, first_remaining) = probed
@@ -173,65 +172,82 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     );
 }
 
-/// Never-early: once `wait_drained_raw` reports `MembersRemain` against a deadline, the real
-/// clock must already be at or past that deadline. This is an end-to-end regression check for
-/// the ORIGINAL bug as a whole (both the truncating `ms` and the return-immediately-on-
-/// `WAIT_TIMEOUT` behavior together); it does not pin a single-line mutant distinct from
-/// `wait_drained_raw_arms_the_ceiling_of_the_remaining_duration` (ceiling) and
-/// `wait_drained_raw_re_arms_past_a_clamped_timeout` (the recheck-and-continue) below — see
-/// `src/wait/windows_tests.rs`'s module doc for why a ceiling-only or recheck-only fix, with
-/// the other already in place, does not make an assertion like this one fail on its own.
+/// Never-early: a `WAIT_TIMEOUT` must NEVER be trusted as proof the real deadline passed,
+/// whether or not this round's wait happened to be clamped. Per Microsoft's Wait Functions and
+/// Time-out Intervals, "the wait may time out in less than the specified length of time" even
+/// for an UN-clamped, correctly-ceiled interval — so a recheck conditioned on "was this arm
+/// clamped" is exactly as wrong as no recheck at all. `remaining_override_seam` simulates that
+/// directly: the FIRST arm is forced to a tiny, UN-clamped 500µs against a real deadline that is
+/// HOURS away. `on_second_arm` fires the instant the outer loop re-arms a second time, closing
+/// the job member's piped stdin so it exits for real; the wait must resolve via that genuine
+/// exit event (`AllMembersExited`), never an early `MembersRemain` verdict.
+///
+/// Mutant: trust an un-clamped `WAIT_TIMEOUT` outright (no recheck at all, or a recheck
+/// conditioned on "was this arm clamped") -> fails: returns after the first (forced,
+/// un-clamped) arm, `probed.len() == 1`, and the result wrongly claims `MembersRemain` even
+/// though the real deadline is hours off.
 #[test]
 fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
-    let (child, job) = spawn_job_member();
+    let (mut child, job) = spawn_job_member();
+    let stdin = child.stdin.take().expect("piped stdin");
     let job_handle = job.as_handle().expect("freshly created job handle must be live");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    crate::wait::wait_ms_probe::take();
+    let _override = crate::wait::remaining_override_seam::set(std::time::Duration::from_micros(500));
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> member exits for real
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600); // hours off
     let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
-    let_member_exit(child);
+    let probed = crate::wait::wait_ms_probe::take();
+    child.wait().expect("reap the member after it exits");
     assert_eq!(
-        verdict.expect("a live never-exiting member must not report a wait failure"),
-        crate::containment::TreeDrain::MembersRemain
+        verdict.expect("a genuinely-drained job must not report a wait failure"),
+        crate::containment::TreeDrain::AllMembersExited,
+        "must report the real drain, not falsely conclude MembersRemain from an early, \
+         un-clamped WAIT_TIMEOUT"
     );
     assert!(
-        std::time::Instant::now() >= deadline,
-        "reported MembersRemain strictly before the deadline actually passed"
+        probed.len() >= 2,
+        "must re-arm past the first (forced-early, un-clamped) WAIT_TIMEOUT rather than \
+         trusting it outright, got {} arm(s)",
+        probed.len()
     );
 }
 
-/// The recheck loop's job: a wait capped below the real deadline (in production, the
+/// The recheck loop's job under a REAL clamp (distinct from the un-clamped early-timeout path
+/// the test above exercises): a wait capped below the real deadline (in production, the
 /// `INFINITE - 1` / ~49.7-day clamp) must not be trusted as proof the deadline passed — the
 /// existing round-loop must `continue` (re-enumerate and re-arm, recomputing `remaining` FRESH
-/// every round), not return early. `wait_clamp_seam` substitutes a tiny clamp for the real one
-/// so this is provable in milliseconds, not days.
+/// every round), not return early. `wait_clamp_seam` substitutes a tiny 5ms clamp for the real
+/// one against a real deadline that is hours away, so EVERY round is genuinely clamped.
+/// `on_second_arm` ends the wait deterministically via a real exit event — not a race against
+/// how much real time a fixed window (e.g. a 200ms real deadline) leaves for setup plus however
+/// many re-arms happen to complete in it.
 ///
 /// Mutant: replace the deadline-recheck-and-`continue` on `WAIT_TIMEOUT` with an unconditional
-/// `return Ok(TreeDrain::MembersRemain)` (the original bug) -> fails deterministically: the
-/// wait would report `MembersRemain` after only the clamped interval (a few ms), long before
-/// the real (200ms) deadline, AND only one `(ms, remaining)` pair would be recorded.
+/// `return Ok(TreeDrain::MembersRemain)` (the original bug) -> fails deterministically:
+/// `probed.len() == 1`, and the result wrongly claims `MembersRemain` (the hook, gated on a
+/// second arm, never fires).
 /// Mutant: hoist the outer loop's `remaining` computation so it is not recomputed fresh each
 /// round -> fails the strictly-decreasing-`remaining` assertion below.
 #[test]
 fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
-    let (child, job) = spawn_job_member();
+    let (mut child, job) = spawn_job_member();
+    let stdin = child.stdin.take().expect("piped stdin");
     let job_handle = job.as_handle().expect("freshly created job handle must be live");
     crate::wait::wait_ms_probe::take();
-    crate::wait::wait_clamp_seam::set(Some(5));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let _clamp = crate::wait::wait_clamp_seam::set(5);
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600); // always clamped
     let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
-    crate::wait::wait_clamp_seam::set(None);
     let probed = crate::wait::wait_ms_probe::take();
-    let_member_exit(child);
+    child.wait().expect("reap the member after it exits");
     assert_eq!(
-        verdict.expect("a live never-exiting member must not report a wait failure"),
-        crate::containment::TreeDrain::MembersRemain
-    );
-    assert!(
-        std::time::Instant::now() >= deadline,
-        "a clamped wait must re-arm and keep waiting, not report MembersRemain at the clamp"
+        verdict.expect("a genuinely-drained job must not report a wait failure"),
+        crate::containment::TreeDrain::AllMembersExited,
+        "must report the real drain, not falsely conclude MembersRemain at the clamp"
     );
     assert!(
         probed.len() >= 2,
-        "a 5ms-clamped wait against a 200ms deadline must re-arm (>=2 recorded arms), got {}",
+        "a 5ms-clamped wait must re-arm (>=2 recorded arms) before the real exit event, got {}",
         probed.len()
     );
     for (ms, remaining) in &probed {

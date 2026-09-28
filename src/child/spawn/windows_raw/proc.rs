@@ -93,13 +93,25 @@ impl RawChild {
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry). The wait is on a
     /// real external event (child exit); the timeout is the caller's deadline, not a sync bet.
     ///
-    /// Armed in rounds via the shared `crate::wait::win32_timeout_ms`: ceiled to whole
-    /// milliseconds (never truncated — a truncating floor of a sub-millisecond remainder would
-    /// arm a `0`ms poll and busy-spin this loop instead of a real wait) and clamped so a
-    /// deadline beyond the ~49.7-day cap never becomes an unbounded wait (`WAIT_TIMEOUT` is
-    /// rechecked against the real deadline and re-armed, `remaining` recomputed FRESH every
-    /// iteration, rather than trusting a clamped timeout as proof the real deadline passed) —
-    /// see docs/principles.md #13 (PR #233, not yet merged).
+    /// Armed in rounds via the shared `crate::wait::win32_timeout_ms`. Unlike the OTHER three
+    /// Windows wait sites this PR fixes, this site's loop already rechecked
+    /// `Instant::now() >= deadline` on every `WAIT_TIMEOUT` before this PR — its bug was
+    /// narrower: the pre-fix conversion truncated a sub-millisecond remainder to `0`, arming a
+    /// non-blocking poll and busy-spinning this loop (wasteful — many redundant zero-ms polls —
+    /// but not early, since the recheck already caught it correctly) instead of a real wait;
+    /// and separately, `u32::try_from(remaining.as_millis())` SUCCEEDS for a remaining-ms value
+    /// of exactly `u32::MAX`, which IS the Win32 `INFINITE` sentinel — silently turning a
+    /// finite ~49.7-day deadline into an unbounded wait. `win32_timeout_ms` fixes both: ceiling
+    /// avoids the busy-spin, and its own clamp (always `< INFINITE`) closes the sentinel
+    /// collision.
+    ///
+    /// The recheck below is, and was, UNCONDITIONAL — not fired only when a wait happened to be
+    /// clamped. Per Microsoft's Wait Functions and Time-out Intervals: "If the time-out
+    /// interval is less than the resolution of the system clock, the wait may time out in less
+    /// than the specified length of time" — even an un-clamped, correctly-ceiled `millis` can
+    /// return `WAIT_TIMEOUT` early on real hardware, which is exactly why this recheck (like
+    /// the other three sites') must never be conditioned on whether THIS round's wait was
+    /// clamped. See docs/principles.md #13 (PR #233, not yet merged).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -112,7 +124,7 @@ impl RawChild {
                 if Instant::now() >= deadline {
                     return Ok(None);
                 }
-                continue; // capped wait elapsed before the deadline; re-arm
+                continue; // WAIT_TIMEOUT fired before the real deadline (clamped or not); re-arm
             } else {
                 return Err(io::Error::last_os_error());
             }

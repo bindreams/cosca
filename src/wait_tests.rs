@@ -30,15 +30,19 @@ fn deadline_from_saturates_when_the_result_is_too_close_to_instants_ceiling() {
 }
 
 // `ceil_millis` and `win32_timeout_ms` are the fix for the "deadline windows never early" bug
-// (owner-confirmed, docs/principles.md #13 — PR #233, not yet merged as of this PR): the four
-// Windows wait sites (`block_until_exit`, `block_until_exit_or_cancel`, `wait_drained_raw`,
-// `RawChild::wait_deadline`) converted a remaining `Duration` to a Win32 millisecond timeout by
-// TRUNCATING (`.as_millis()`, or — at the fourth site — `u32::try_from(remaining.as_millis())`,
-// which additionally could succeed for a value equal to the `INFINITE` sentinel itself). A
-// 500µs remainder truncated to `ms = 0`, arming a non-blocking poll that could report "timed
-// out" before the real deadline; a remaining-ms value of exactly `u32::MAX` truncate-converted
-// to an accidentally-unbounded wait. These tests pin the fixed behaviour these sites now rely
-// on, independent of any OS call — the math itself is portable.
+// (owner-confirmed, docs/principles.md #13 — PR #233, not yet merged as of this PR): four
+// Windows wait sites converted a remaining `Duration` to a Win32 millisecond timeout by
+// TRUNCATING — `.as_millis()` at `block_until_exit`, `block_until_exit_or_cancel`,
+// `wait_drained_raw`; `u32::try_from(remaining.as_millis())` at `RawChild::wait_deadline`,
+// which additionally could succeed for a value equal to the `INFINITE` sentinel itself. A
+// 500µs remainder truncated to `ms = 0`, arming a non-blocking poll — at the first three sites,
+// which (before this PR) trusted ANY `WAIT_TIMEOUT` outright with no recheck at all, that meant
+// an early "timed out" report; at the fourth site, whose loop already rechecked the real
+// deadline on every `WAIT_TIMEOUT` before this PR, it meant a busy-spin of redundant zero-ms
+// polls instead (wasteful, not early — see `RawChild::wait_deadline`'s doc). A remaining-ms
+// value of exactly `u32::MAX` truncate-converted (at the fourth site only) to an
+// accidentally-unbounded wait. These tests pin the fixed behaviour these sites now rely on,
+// independent of any OS call — the math itself is portable.
 //
 // Mutant: revert `ceil_millis` to `d.as_millis()` (the original truncating expression) →
 // `ceil_millis_rounds_up_sub_millisecond_remainders` fails (`500µs` would floor to `0`, not
@@ -108,9 +112,9 @@ fn win32_timeout_ms_never_returns_the_infinite_sentinel_for_a_finite_remaining()
 
 #[test]
 fn win32_timeout_ms_honors_the_clamp_seam() {
-    wait_clamp_seam::set(Some(5));
+    let guard = wait_clamp_seam::set(5);
     assert_eq!(win32_timeout_ms(Some(Duration::from_secs(1))), 5);
-    wait_clamp_seam::set(None);
+    drop(guard);
     // Restored: no longer clamped to the tiny test value.
     assert_eq!(win32_timeout_ms(Some(Duration::from_millis(3))), 3);
 }
@@ -121,7 +125,7 @@ fn win32_timeout_ms_honors_the_clamp_seam() {
 /// portably, once.
 #[test]
 fn remaining_override_seam_is_consumed_exactly_once() {
-    remaining_override_seam::set(Duration::from_millis(3));
+    let guard = remaining_override_seam::set(Duration::from_millis(3));
     assert_eq!(
         win32_timeout_ms(Some(Duration::from_millis(999))),
         3,
@@ -131,5 +135,20 @@ fn remaining_override_seam_is_consumed_exactly_once() {
         win32_timeout_ms(Some(Duration::from_millis(999))),
         999,
         "the seam is single-use: the second call must see the real argument, not a stale override"
+    );
+    drop(guard); // already consumed above; dropping now must not panic or double-clear anything
+}
+
+/// The guard's OWN job, independent of consumption: an override that is armed but never
+/// consumed (e.g. a test that panics before the call it was meant for) must not leak onto a
+/// later test sharing this thread — the guard clears it on drop.
+#[test]
+fn remaining_override_seam_guard_clears_an_unconsumed_override_on_drop() {
+    let guard = remaining_override_seam::set(Duration::from_millis(3));
+    drop(guard); // never consumed by a `win32_timeout_ms` call
+    assert_eq!(
+        win32_timeout_ms(Some(Duration::from_millis(999))),
+        999,
+        "a dropped, unconsumed guard must have cleared the override"
     );
 }

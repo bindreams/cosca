@@ -68,11 +68,15 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             });
         }
     }
-    // Armed in rounds: a `WAIT_TIMEOUT` only proves the caller's real deadline passed if this
-    // call's wait was not capped short of it by `win32_timeout_ms`'s clamp (production:
-    // `INFINITE - 1`, ~49.7 days; test: `wait_clamp_seam`). `remaining` is recomputed FRESH
-    // every iteration (never hoisted above the loop) and a clamped timeout is rechecked
-    // against the real deadline and re-armed rather than trusted — see docs/principles.md #13
+    // Armed in rounds: a `WAIT_TIMEOUT` is UNCONDITIONALLY rechecked against the real deadline
+    // and re-armed rather than ever trusted outright. Per Microsoft's Wait Functions and
+    // Time-out Intervals: "If the time-out interval is less than the resolution of the system
+    // clock, the wait may time out in less than the specified length of time" — even an
+    // un-clamped, correctly-ceiled `ms` can return early on real hardware, so the recheck below
+    // is not conditional on whether `win32_timeout_ms`'s clamp (production: `INFINITE - 1`,
+    // ~49.7 days; test: `wait_clamp_seam`) fired this round — that clamp is a second, much
+    // larger-gap reason the same recheck is needed, not the only one. `remaining` is recomputed
+    // FRESH every iteration (never hoisted above the loop) — see docs/principles.md #13
     // (PR #233, not yet merged).
     let waited = loop {
         let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
@@ -178,22 +182,30 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
-    // Established once, at entry, from the relative `grace` — every re-arm below recomputes
-    // its remaining time against this SAME absolute instant (via `crate::wait::remaining`, the
-    // inverse of `deadline_from`), so a re-arm never resets the clock. `None` = unbounded,
-    // matching `deadline_from`'s own convention.
+    // Established HERE, from the relative `grace` — after `OpenProcess` and the identity check
+    // above, NOT at this function's actual entry. Every re-arm below recomputes its remaining
+    // time against this SAME absolute instant (via `crate::wait::remaining`, the inverse of
+    // `deadline_from`), so a re-arm never resets the clock — but the instant itself is measured
+    // slightly later than the caller actually asked for `grace` to start, since the open+
+    // identity work above already spent part of it. That lateness is real but out of scope
+    // here — a separate, pre-existing bug this PR does not fix (the sibling "grace armed late"
+    // PR does). `None` = unbounded, matching `deadline_from`'s own convention.
     let deadline: Option<Option<Instant>> = match grace {
         None => None,
         Some(g) => crate::wait::deadline_from(g),
     };
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
-    // Armed in rounds: a `WAIT_TIMEOUT` only proves `grace` genuinely elapsed if this call's
-    // wait was not capped short of it by `win32_timeout_ms`'s clamp (production:
-    // `INFINITE - 1`, ~49.7 days — the cancel event releases large graces early; test:
-    // `wait_clamp_seam`). `remaining` is recomputed FRESH every iteration (never hoisted above
-    // the loop) and a clamped timeout is rechecked against the real deadline and re-armed
-    // rather than trusted, so a grace longer than the clamp is still honored correctly instead
-    // of being silently capped — see docs/principles.md #13 (PR #233, not yet merged).
+    // Armed in rounds: a `WAIT_TIMEOUT` is UNCONDITIONALLY rechecked against the real deadline
+    // and re-armed rather than ever trusted outright. Per Microsoft's Wait Functions and
+    // Time-out Intervals: "If the time-out interval is less than the resolution of the system
+    // clock, the wait may time out in less than the specified length of time" — even an
+    // un-clamped, correctly-ceiled `ms` can return early on real hardware, so the recheck below
+    // is not conditional on whether `win32_timeout_ms`'s clamp (production: `INFINITE - 1`,
+    // ~49.7 days — the cancel event releases large graces early; test: `wait_clamp_seam`) fired
+    // this round — that clamp is a second, much larger-gap reason the same recheck is needed,
+    // not the only one; it is also why a grace longer than the clamp is still honored correctly
+    // instead of being silently capped. `remaining` is recomputed FRESH every iteration (never
+    // hoisted above the loop) — see docs/principles.md #13 (PR #233, not yet merged).
     let waited = loop {
         let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
         // SAFETY: both handles are live for the wait's duration.
