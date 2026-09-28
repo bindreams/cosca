@@ -1663,7 +1663,15 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     // gated there by `common::require_process_per_test`. Without this, `COSCA_TEST_CLOSED_SLOTS`
     // alone (a plain env var, no argv verification) was the only gate on that mutation — the same
     // forgeable-env-var hazard `alone()` exists to close everywhere else.
-    let Some(_completion) = common::alone(name) else {
+    //
+    // `alone_with_timeout`, not the plain `alone()` this used before — with the default
+    // `PROBE_TIMEOUT` as ITS OWN outer bound (the same as each of the 16 inner `alone_with_env`
+    // calls below), a genuinely hung inner case could make THIS OUTER wait's own Timeout arm fire
+    // FIRST, killing the whole tree and reporting a generic "child pid did not exit" — discarding
+    // which specific one of the 16 cases was actually the problem (round 8 review, D1). The outer
+    // bound must stay comfortably above the worst case of every inner one firing in sequence.
+    let outer_timeout = common::PROBE_TIMEOUT * 17; // 16 inner cases, each up to one PROBE_TIMEOUT, plus one full unit of margin
+    let Some(_completion) = common::alone_with_timeout(name, outer_timeout) else {
         return;
     };
 

@@ -784,6 +784,7 @@ fn spawn_alones_own_timeout_kill_reaches_a_grandchild() {
                 (HANGING_READINESS_FD_ENV, readiness_fd_str.as_str()),
             ],
             vec![canary_write.into(), readiness_write.into()],
+            PROBE_TIMEOUT,
         )
     }));
     assert!(

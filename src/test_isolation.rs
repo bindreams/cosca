@@ -359,10 +359,19 @@ fn read_bounded(
 /// briefly, is exactly the round-6 N4 bug class (a concurrent, unrelated spawn on another thread
 /// could observe the momentarily-inheritable fd) — measured again, round 8 review, on a test that
 /// got this wrong by clearing CLOEXEC in its own, separate, already-released lock scope.
+///
+/// `timeout`: NOT always [`PROBE_TIMEOUT`] — a caller whose OWN body does further, separately
+/// bounded work (e.g. #210's closed-std-slots fan-out, up to 16 further `alone_with_env` calls,
+/// each up to `PROBE_TIMEOUT` on its own) needs an OUTER bound large enough to let an inner one
+/// report ITS OWN, per-case diagnostic first — an outer bound that is only `PROBE_TIMEOUT` itself
+/// fires before any inner one could, discarding which specific case was the actual problem (round
+/// 8 review, #210 D1). [`alone`]/[`alone_capturing`]/[`alone_with_env`] all still pass
+/// `PROBE_TIMEOUT` here; [`alone_with_timeout`] is the one caller that passes something else.
 pub(crate) fn spawn_alone(
     name: &str,
     extra_env: &[(&str, &str)],
     inherit: Vec<std::os::fd::OwnedFd>,
+    timeout: std::time::Duration,
 ) -> (std::process::Output, bool) {
     let (token_read, token_write) = std::io::pipe().expect("open completion-token pipe");
     let token_write_fd = token_write.as_raw_fd();
@@ -438,7 +447,7 @@ pub(crate) fn spawn_alone(
         drop(inherit);
         child
     };
-    let out = wait_bounded(child, PROBE_TIMEOUT, true);
+    let out = wait_bounded(child, timeout, true);
     // Bounded the same way `wait_bounded` itself is, not a bare blocking read: by the time
     // `wait_bounded` has returned, the CHILD has already exited, so ordinarily every copy of the
     // token write end is already gone too — but `reclaim_cloexec_on_inherited_fds` is what makes
@@ -450,10 +459,10 @@ pub(crate) fn spawn_alone(
     // `a_body_that_exits_early_produces_no_token` pass for the wrong reason. It is instead a loud,
     // distinct failure of its own: a leaked fd is a real, upstream regression in its own right,
     // not something this call should quietly absorb.
-    let token = read_bounded(token_read, PROBE_TIMEOUT).unwrap_or_else(|ReadBoundedTimeout| {
+    let token = read_bounded(token_read, timeout).unwrap_or_else(|ReadBoundedTimeout| {
         panic!(
             "the token pipe's write end was still held after the child exited — some process \
-             still holds a copy open {PROBE_TIMEOUT:?} after wait_bounded returned, which \
+             still holds a copy open {timeout:?} after wait_bounded returned, which \
              reclaim_cloexec_on_inherited_fds should have made impossible for anything this \
              child itself spawned"
         )
@@ -483,13 +492,20 @@ pub(crate) fn spawn_alone(
               and hold it alive across the real body — NEVER the bare `_`, which drops it \
               immediately, before the real body runs; see Completion's own doc."]
 pub fn alone(name: &str) -> Option<Completion> {
+    alone_with_timeout(name, PROBE_TIMEOUT)
+}
+
+/// Like [`alone`], but the caller supplies its OWN bound instead of the default
+/// [`PROBE_TIMEOUT`] — see [`spawn_alone`]'s own doc for why a caller whose body does further,
+/// separately bounded work internally (e.g. #210's closed-std-slots fan-out) needs this.
+pub fn alone_with_timeout(name: &str, timeout: std::time::Duration) -> Option<Completion> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if alone_marker_matches(Some(name), &argv) {
         reclaim_cloexec_on_inherited_fds();
         install_lifeline_watcher();
         return Some(Completion { _private: () });
     }
-    let (out, completed) = spawn_alone(name, &[], vec![]);
+    let (out, completed) = spawn_alone(name, &[], vec![], timeout);
     assert!(
         out.status.success() && completed,
         "{}{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
@@ -524,7 +540,7 @@ pub fn alone_capturing(name: &str) -> Option<std::process::Output> {
         close_inherited_completion_token();
         return None;
     }
-    let (out, _completed) = spawn_alone(name, &[], vec![]);
+    let (out, _completed) = spawn_alone(name, &[], vec![], PROBE_TIMEOUT);
     Some(out)
 }
 
@@ -542,7 +558,7 @@ pub fn alone_capturing(name: &str) -> Option<std::process::Output> {
 /// pass/fail proof `alone()` asserts on internally, left here to the caller (e.g. to collect
 /// several cases' failures before asserting once), never libtest's own stdout banner text.
 pub fn alone_with_env(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output, bool) {
-    spawn_alone(name, extra_env, vec![])
+    spawn_alone(name, extra_env, vec![], PROBE_TIMEOUT)
 }
 
 /// Require that this test is running alone in its own process, via [`alone`], before any caller
@@ -997,16 +1013,46 @@ pub(crate) fn wait_on_channel(
             // `None` only via a `TimeoutSeam` (test-only, rare) — that caller does not depend on
             // this exact ordering for its own correctness; see `recv_or_seam`'s own doc.
             kill_only(&child, own_process_group);
-            if let Some(remaining_rx) = remaining_rx {
-                let _ = remaining_rx.recv();
-            }
+            // Whatever the drain thread managed to read BEFORE the kill above — printed below,
+            // when available, so a caller whose own body fans out further, separately-attributed
+            // work (e.g. #210's closed-std-slots sweep, 16 cases through one shared binary) does
+            // not lose which one was still producing output when this fired (round 8 review,
+            // #210 D1). `None` either because no drain thread exists for this call at all (a
+            // synthetic-channel test) or because a `TimeoutSeam` was involved (test-only, rare;
+            // see `recv_or_seam`'s own doc) — in both cases the panic below still fires, just
+            // without this extra detail.
+            let drained = remaining_rx.and_then(|rx| rx.recv().ok());
             let status = child.wait().expect("reap the child after killing it");
-            panic!(
-                "child pid {pid} did not exit within {timeout:?} — it hung instead of exiting, \
-                 which is itself a regression somewhere upstream of this wait. Killed it and \
-                 reaped exit status {status:?} (signal {:?}).",
-                std::os::unix::process::ExitStatusExt::signal(&status)
-            );
+            match drained {
+                Some(Ok((stdout, stderr))) => {
+                    panic!(
+                        "child pid {pid} did not exit within {timeout:?} — it hung instead of \
+                         exiting, which is itself a regression somewhere upstream of this wait. \
+                         Killed it and reaped exit status {status:?} (signal {:?}). Partial \
+                         output captured before the kill:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                        std::os::unix::process::ExitStatusExt::signal(&status),
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+                Some(Err(msg)) => {
+                    panic!(
+                        "child pid {pid} did not exit within {timeout:?} — it hung instead of \
+                         exiting, which is itself a regression somewhere upstream of this wait. \
+                         Killed it and reaped exit status {status:?} (signal {:?}). The drain \
+                         thread's own read also failed: {msg}",
+                        std::os::unix::process::ExitStatusExt::signal(&status)
+                    );
+                }
+                None => {
+                    panic!(
+                        "child pid {pid} did not exit within {timeout:?} — it hung instead of \
+                         exiting, which is itself a regression somewhere upstream of this wait. \
+                         Killed it and reaped exit status {status:?} (signal {:?}).",
+                        std::os::unix::process::ExitStatusExt::signal(&status)
+                    );
+                }
+            }
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             // The drain thread died (e.g. its own panic) without sending a result: kill and reap
