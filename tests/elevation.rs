@@ -222,14 +222,54 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
     let mut reader = std::io::BufReader::new(sock);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read payload pid");
-    let payload_pid: u32 = line.trim().parse().expect("parse payload pid");
+    let mut fields = line.split_whitespace();
+    let payload_pid: u32 = fields
+        .next()
+        .expect("payload pid field")
+        .parse()
+        .expect("parse payload pid");
+    let payload_starttime: u64 = fields
+        .next()
+        .expect("payload starttime field")
+        .parse()
+        .expect("parse payload starttime");
 
-    // Open the pidfd BEFORE killing the client: nothing has signalled the payload yet, so it
-    // cannot have exited (and freed its pid for reuse) between reading it above and opening
-    // this — opening it any later, after the kill, could race that reuse window instead.
+    // The run0 CLIENT can exit on its own (independent of the `child.kill()` below) between the
+    // payload connecting above and this `pidfd_open` — freeing `payload_pid` for reuse by an
+    // unrelated process in that window. A bare `pidfd_open(payload_pid)` could then silently name
+    // the wrong process. Guard against it two ways: (1) confirm the pidfd is NOT yet readable
+    // right after opening it — if the original payload had already exited and been reaped, a
+    // pidfd opened against its reused pid would still be for a live (different) process, so this
+    // alone doesn't fully prove correctness, which is why (2) matters — comparing the payload's
+    // self-reported `/proc/self/stat` starttime against a FRESH read of `/proc/<pid>/stat` for
+    // this exact pid confirms the pidfd names a process with the SAME start time, i.e. the same
+    // process, not a reuse.
     let rpid = rustix::process::Pid::from_raw(payload_pid as i32).expect("payload pid is positive");
     let pidfd =
         rustix::process::pidfd_open(rpid, rustix::process::PidfdFlags::empty()).expect("pidfd_open the payload");
+
+    {
+        use std::os::fd::AsRawFd as _;
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; a zero timeout makes this a
+        // non-blocking readiness check, not a wait.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        assert_eq!(
+            rc, 0,
+            "the pidfd is already readable right after pidfd_open — the payload exited before \
+             the client was even killed, so this pidfd may name a reused pid"
+        );
+    }
+    let observed_starttime = starttime_jiffies_of(payload_pid);
+    assert_eq!(
+        observed_starttime, payload_starttime,
+        "the pidfd's pid (pid {payload_pid}) has a different /proc start time than the payload \
+         reported — the pid was reused by another process before pidfd_open ran"
+    );
 
     assert!(pid_is_alive(payload_pid), "payload should be running before the kill");
     child.kill().expect("kill run0 client");
@@ -249,9 +289,12 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
     // signal this test process itself receives) must not extend the total bound past 30s.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let rc = loop {
+        // Round UP, not truncate: `as_millis()` floors any leftover sub-millisecond remainder,
+        // which would let `poll` return early on a deadline it hasn't actually reached yet.
         let remaining_ms = deadline
             .saturating_duration_since(std::time::Instant::now())
-            .as_millis()
+            .as_nanos()
+            .div_ceil(1_000_000)
             .try_into()
             .unwrap_or(i32::MAX);
         // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only within
@@ -273,6 +316,22 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
     // and once it IS reaped, the pid can be reused, making a post-hoc `kill(pid, 0)` meaningless
     // either way. Pidfd readiness is already the proof; a second, racy check on the bare pid adds
     // nothing but a false-failure risk.
+}
+
+/// `starttime` (field 22 of `/proc/<pid>/stat`, raw jiffies since boot). `comm` (field 2) is
+/// parenthesized and may itself contain spaces or `)`, so split on the LAST `)` to skip it
+/// safely; the remaining fields are whitespace-separated, with field 3 (state) at index 0 —
+/// making field 22 (starttime) index 19.
+#[cfg(target_os = "linux")]
+fn starttime_jiffies_of(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc/<pid>/stat");
+    let after_comm = stat.rsplit_once(')').expect("/proc/<pid>/stat has a comm field").1;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .expect("/proc/<pid>/stat has a starttime field")
+        .parse()
+        .expect("starttime is a u64")
 }
 
 /// `kill(pid, 0)` performs only the existence/permission check, sending nothing. Success
@@ -381,9 +440,9 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     c.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
     c.stdout(cosca::Stdio::pipe()).expect("set stdout pipe");
     let mut child = c.spawn().expect("elevated write-pid-then-block-on-stdin");
-    // Held for the rest of this function (and thus for the rest of this process's life): the
-    // payload can only exit via EOF on this pipe, which the OS delivers unconditionally once
-    // this handle — or the whole process holding it — goes away.
+    // Held until dropped explicitly below (not for the rest of this process's life): the
+    // payload can only exit via EOF on this pipe, which the OS delivers once this handle — or
+    // the whole process holding it — goes away.
     let _stdin = child.stdin().expect("piped stdin");
 
     // Block reading the payload's pid off its piped stdout — a real pipe event, strictly after
@@ -536,9 +595,10 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
     drop(child); // must return promptly (non-blocking teardown)
-                 // Only now: on the (typical) Unkillable path the child is still running (that IS the
-                 // property under test), so ending it for real is this test's own responsibility, not
-                 // `kill()`'s — dropping the socket delivers EOF, which the child exits on.
+
+    // Only now: on the (typical) Unkillable path the child is still running (that IS the
+    // property under test), so ending it for real is this test's own responsibility, not
+    // `kill()`'s — dropping the socket delivers EOF, which the child exits on.
     drop(sock);
 }
 
@@ -609,8 +669,9 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
     drop(child); // must return promptly (non-blocking async teardown)
-                 // Only now: see the sync twin's doc for why ending the child is this test's own
-                 // responsibility on the (typical) Unkillable path.
+
+    // Only now: see the sync twin's doc for why ending the child is this test's own
+    // responsibility on the (typical) Unkillable path.
     drop(sock);
 }
 

@@ -76,6 +76,24 @@ fn fake_pkexec(args: &[String]) {
     writeln!(f, "{line}").expect("append to the log");
 }
 
+/// This process's own `starttime` (field 22 of `/proc/self/stat`, raw jiffies since boot): a
+/// caller that later re-derives the same field for a pid can use it to confirm a pidfd it holds
+/// still names this exact process, not a different one that has since reused the pid. `comm`
+/// (field 2) is parenthesized and may itself contain spaces or `)`, so split on the LAST `)` to
+/// skip it safely; the remaining fields are whitespace-separated, with field 3 (state) at index
+/// 0 — making field 22 (starttime) index 19.
+#[cfg(target_os = "linux")]
+fn self_starttime_jiffies() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
+    let after_comm = stat.rsplit_once(')').expect("/proc/self/stat has a comm field").1;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .expect("/proc/self/stat has a starttime field")
+        .parse()
+        .expect("starttime is a u64")
+}
+
 /// If root, become the `uid:gid` the test names in `COSCA_TEST_DROP_TO`: one the test checked this
 /// user namespace maps. `setgroups` is skipped where the namespace denies it
 /// (`/proc/self/setgroups` reads `deny`), leaving the supplementary groups root had. Runs
@@ -1522,9 +1540,20 @@ fn main() {
         "write-pid-then-block-on-socket" => {
             let addr = &args[2];
             let mut sock = std::net::TcpStream::connect(addr).expect("connect readiness socket");
-            sock.write_all(std::process::id().to_string().as_bytes())
-                .expect("write pid");
-            sock.write_all(b"\n").expect("write pid terminator");
+            // Both the pid AND this process's own `/proc/self/stat` starttime (field 22, raw
+            // jiffies since boot): the caller opens a pidfd for `pid` only after reading this
+            // line, and by then the run0 client may already have exited on its own, freeing
+            // `pid` for reuse before the caller's `pidfd_open` runs. The starttime is what lets
+            // the caller confirm its pidfd really names THIS process, not a different one that
+            // happened to reuse the same pid in that window.
+            #[cfg(target_os = "linux")]
+            let starttime = self_starttime_jiffies();
+            // This mode is only ever invoked by run0 (Linux-only) tests; kept compiling on
+            // every platform anyway since `main`'s mode dispatch is not itself split by target.
+            #[cfg(not(target_os = "linux"))]
+            let starttime: u64 = 0;
+            sock.write_all(format!("{} {}\n", std::process::id(), starttime).as_bytes())
+                .expect("write pid and starttime");
             let mut sink = [0u8; 1];
             let _ = sock.read(&mut sink); // blocks until the caller writes back or drops its end
         }
