@@ -108,7 +108,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     let Some(kq) = arm_proc_exit(id)? else {
         return Ok(true);
     };
-    block_on_kqueue(&kq, deadline, false, |event| {
+    block_on_kqueue(&kq, deadline, false, |event, _already_elapsed| {
         if event.flags().contains(EvFlags::EV_ERROR) {
             return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
         }
@@ -116,52 +116,115 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     })
 }
 
-/// Block on an armed kqueue until `interpret` concludes, or until `deadline`. `interpret` maps
-/// ONE pending `KEvent` to `Ok(Some(verdict))` (conclusive — stop) or `Ok(None)` (nothing
-/// conclusive yet, e.g. bytes drained below a filter's own terminal condition — keep waiting).
-/// `on_timeout` is the verdict for a genuine timeout.
-///
-/// The deadline is checked explicitly at the top of every round, not inferred from `kevent`
-/// returning 0: a continuously-ready descriptor (e.g. a sustained pipe writer) keeps `kevent`
-/// returning real events even with an already-expired timeout, so relying on "0 events, timed
-/// out" alone would let the wait overrun the deadline by an unbounded number of rounds.
-/// Checking `remaining(deadline)` before each `kevent` call bounds the overrun to at most one
-/// in-flight round: once a round starts with the deadline already elapsed, an inconclusive
-/// event in THAT round returns `on_timeout` immediately rather than looping back.
-///
-/// Shared by every blocking kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in
-/// `containment::marker_eof` — so a hazard found against one filter (an already-past deadline
-/// against a sticky, already-satisfied event) is fixed once, not rediscovered per filter.
+/// Block on an armed kqueue until `interpret` concludes, or until `deadline`, checking
+/// `remaining(deadline)` fresh before every real `kevent` call and again once an event actually
+/// arrives (never inferring elapsed-ness from `kevent` returning 0, nor trusting the value
+/// sampled before a call that may have blocked long enough to cross the deadline itself) —
+/// `interpret` and the final `on_timeout` return both see this freshly-checked flag, so neither
+/// does deadline-funded work (like draining bytes) once there is no deadline left to fund it
+/// (principle 13). A round already in flight when the deadline passes is not interrupted; only
+/// the NEXT round is refused. `Ok(0)` alone is never trusted as proof the deadline passed
+/// either — a mutant (or bug) could desync the requested timeout from `remaining`, so it is
+/// re-checked before concluding, and retried as spurious otherwise. Shared by every blocking
+/// kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in `containment::marker_eof`.
 pub(crate) fn block_on_kqueue<T: Copy>(
     kq: &Kqueue,
     deadline: Option<Option<Instant>>,
     on_timeout: T,
-    mut interpret: impl FnMut(&KEvent) -> Result<Option<T>, Error>,
+    mut interpret: impl FnMut(&KEvent, bool) -> Result<Option<T>, Error>,
 ) -> Result<T, Error> {
     let mut events = [placeholder()];
+    #[cfg(test)]
+    let mut round: u32 = 0;
     loop {
-        let remaining = crate::wait::remaining(deadline);
-        let already_elapsed = remaining == Some(Duration::ZERO);
-        // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
-        let timeout = remaining.map(|d| libc::timespec {
-            tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-            tv_nsec: d.subsec_nanos() as libc::c_long,
-        });
-        match kq.kevent(&[], &mut events, timeout) {
-            Ok(0) => return Ok(on_timeout), // genuinely timed out, no events
+        #[cfg(test)]
+        test_hooks::fire_round_hook(round, kq);
+        #[cfg(test)]
+        let call_start = Instant::now();
+
+        // `EINTR` retries here, inside the SAME round, without re-firing the hook or advancing
+        // `round` — round and kevent_calls() must stay one notion.
+        #[cfg_attr(not(test), allow(unused_variables))] // `timeout` is read only for test recording
+        let (already_elapsed, timeout, outcome) = loop {
+            let remaining = crate::wait::remaining(deadline);
+            let already_elapsed = remaining == Some(Duration::ZERO);
+            // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
+            #[allow(unused_mut)] // mutated only under #[cfg(test)] below
+            let mut timeout = remaining.map(|d| libc::timespec {
+                tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
+                tv_nsec: d.subsec_nanos() as libc::c_long,
+            });
+            #[cfg(test)]
+            if let Some(forced) = test_hooks::take_timeout_override() {
+                timeout = Some(libc::timespec {
+                    tv_sec: forced.as_secs() as libc::time_t,
+                    tv_nsec: forced.subsec_nanos() as libc::c_long,
+                });
+            }
+            match kq.kevent(&[], &mut events, timeout) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                outcome => break (already_elapsed, timeout, outcome),
+            }
+        };
+        // Bounds what would otherwise be an unbounded spin under a mock clock a test forgot to
+        // advance: see `test_clock::advance_by_elapsed_if_frozen`'s own doc. A no-op outside
+        // tests and whenever the clock isn't frozen.
+        #[cfg(test)]
+        crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+        #[cfg(test)]
+        test_hooks::record_kevent_call(as_duration(timeout));
+        // Captured before incrementing: this round's own index, not the next round's.
+        #[cfg(test)]
+        let this_round = round;
+        #[cfg(test)]
+        {
+            round += 1;
+        }
+
+        match outcome {
+            Ok(0) => {
+                if crate::wait::remaining(deadline) == Some(Duration::ZERO) {
+                    return Ok(on_timeout);
+                }
+                continue; // spurious — retry
+            }
             Ok(_) => {
-                if let Some(verdict) = interpret(&events[0])? {
+                #[cfg(test)]
+                test_hooks::record_event_data(events[0].data());
+                #[cfg(test)]
+                test_hooks::fire_post_event_hook(this_round);
+                let elapsed = already_elapsed || crate::wait::remaining(deadline) == Some(Duration::ZERO);
+                if let Some(verdict) = interpret(&events[0], elapsed)? {
                     return Ok(verdict);
                 }
-                if already_elapsed {
+                if elapsed {
                     return Ok(on_timeout);
                 }
             }
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {
+                debug_assert!(false, "EINTR must be retried in the inner loop above, never reach here");
+                continue;
+            }
             Err(e) => return Err(Error::Io(e.into())),
         }
     }
 }
+
+/// The requested `kevent` timeout as a `Duration`, for test recording.
+#[cfg(test)]
+fn as_duration(timeout: Option<libc::timespec>) -> Option<Duration> {
+    timeout.map(|ts| {
+        debug_assert!(
+            ts.tv_sec >= 0 && ts.tv_nsec >= 0,
+            "a kevent timeout must never be negative"
+        );
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    })
+}
+
+#[cfg(test)]
+#[path = "macos/test_hooks.rs"]
+pub(crate) mod test_hooks;
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};
