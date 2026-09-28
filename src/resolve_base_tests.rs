@@ -723,10 +723,24 @@ fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
 #[cfg(target_os = "linux")]
 fn grandchild_reachable_path(p: &Path) -> PathBuf {
     let own_pid_prefix = format!("/proc/{}/", std::process::id());
-    let rewritten = p
+    let s = p
         .to_str()
-        .expect("fixture scratch paths are built from valid UTF-8 components")
-        .replacen(&own_pid_prefix, "/proc/self/", 1);
+        .expect("fixture scratch paths are built from valid UTF-8 components");
+    // `replacen` below silently no-ops if `own_pid_prefix` isn't a prefix of `s` — which would
+    // leave `p` unrewritten and, for a caller that then walked into that unrewritten path,
+    // indistinguishable from success (its ptrace-gated `/proc/<pid>/...` form can still resolve
+    // for as long as the fixture is alive, see this function's own doc). Asserted here rather
+    // than trusted, so a caller that passed a path NOT actually built under the fixture's scratch
+    // fd (e.g. `fixture_scratch_tempdir` silently falling back to an ambient `tempfile::tempdir()`
+    // instead of `/proc/<pid>/fd/<n>/...`) fails loudly instead of quietly resolving the wrong
+    // thing, or nothing at all, the same way either way.
+    debug_assert!(
+        s.starts_with(&own_pid_prefix),
+        "{p:?} is not under the fixture's own /proc/{}/... scratch root — did fixture_scratch_tempdir \
+         fall back to an ambient tempdir instead of the driver's fd-relative one?",
+        std::process::id(),
+    );
+    let rewritten = s.replacen(&own_pid_prefix, "/proc/self/", 1);
     PathBuf::from(rewritten)
 }
 

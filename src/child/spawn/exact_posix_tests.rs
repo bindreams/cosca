@@ -275,9 +275,15 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("tempdir");
-    // Reachable once `crate::test_privilege::drop_dac_bypass` has run — an unprivileged uid on
-    // non-Linux, or (on Linux) still uid 0 but without the capabilities that would otherwise
-    // read past `tempdir`'s own `0700` regardless of these bits.
+    // Only matters on non-Linux, where `drop_dac_bypass` actually changes uid: `root` is then
+    // entered by `UNPRIVILEGED`, not its owner, so the OTHER-class bits this chmod sets are what
+    // let that identity in. On Linux, `drop_dac_bypass` strips capabilities but never changes
+    // uid — the fixture stays the SAME uid that owns `root` (whatever the driver's own uid is),
+    // so ordinary OWNER-bit access already applies with no DAC bypass needed at all, regardless
+    // of what this chmod sets. `tempfile::tempdir()` has no fixed mode of its own either way — it
+    // uses the OS default directory mode under the calling process's umask (commonly `0755`, not
+    // some tempdir-specific `0700`), so this chmod does not merely restate what `tempdir()`
+    // already gave `root`.
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);

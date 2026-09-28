@@ -61,20 +61,38 @@ mod check_path_traversable_by_tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Every test in this module builds directly under `/tmp`, never under
+    /// `tempfile::tempdir()`'s own ambient `TMPDIR` — the ONE thing every platform this crate
+    /// targets guarantees world-traversable end to end (see `copy_exe_to_traversable_scratch`'s
+    /// own doc for the identical reasoning). Under `sudo -E` on macOS specifically, the ambient
+    /// `TMPDIR` stays the CALLING (unprivileged) user's own per-app-container directory —
+    /// `chmod 0700`, owned by neither root nor `UNPRIVILEGED` — so a test built under it would be
+    /// refused by that ANCESTOR regardless of whatever mode the test itself sets on its own leaf,
+    /// making an `Err`-expecting test pass for the WRONG reason (a `read_only_with_no_execute_bit`
+    /// case built there once did: it passed vacuously, denied by the ambient ancestor rather than
+    /// by its own intended mode) and an `Ok`-expecting one fail outright.
+    fn scratch_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("tempdir directly under /tmp")
+    }
+
     #[test]
     fn a_reachable_directory_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         chmod(dir.path(), 0o755);
-        assert!(check(dir.path()).is_ok());
+        let r = check(dir.path());
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// `0o101`: owner `--x`, other `--x` — search-only for both classes `check_path_traversable_by`
     /// can end up testing, identity-independent (see the module doc).
     #[test]
     fn search_only_for_owner_and_other_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         chmod(dir.path(), 0o101);
-        assert!(check(dir.path()).is_ok());
+        let r = check(dir.path());
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// `0o404`: owner `r--`, other `r--` — read, but no execute/search bit anywhere. The exact
@@ -84,9 +102,10 @@ mod check_path_traversable_by_tests {
     /// the refusal half.
     #[test]
     fn read_only_with_no_execute_bit_is_err() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         chmod(dir.path(), 0o404);
-        assert!(check(dir.path()).is_err());
+        let r = check(dir.path());
+        assert!(r.is_err(), "{r:?}");
     }
 
     /// `0o701`: owner `rwx`, other `--x` — restored from the pre-rewrite suite (then testing an
@@ -94,9 +113,10 @@ mod check_path_traversable_by_tests {
     /// the same way as the two cases above, since owner and other both carry `x`).
     #[test]
     fn world_searchable_only_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         chmod(dir.path(), 0o701);
-        assert!(check(dir.path()).is_ok());
+        let r = check(dir.path());
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// The reviewer's own repro shape: `real` sits behind a symlink, so a check that only
@@ -109,7 +129,7 @@ mod check_path_traversable_by_tests {
     /// `geteuid() == 0` was never actually run as root anywhere in CI.
     #[test]
     fn a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled() {
-        let base = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let base = scratch_dir();
         let real = base.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let inner = real.join("inner");
@@ -120,7 +140,9 @@ mod check_path_traversable_by_tests {
         // mode bits bind the owner too, not just other callers.
         chmod(&real, 0o000);
 
-        let err = check(&link.join("inner")).unwrap_err();
+        let r = check(&link.join("inner"));
+        assert!(r.is_err(), "{r:?}");
+        let err = r.unwrap_err();
         assert!(err.contains("link"), "{err}");
     }
 }
