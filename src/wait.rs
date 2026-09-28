@@ -52,7 +52,7 @@ pub(crate) fn block_until_exit(id: ProcessId, timeout: Option<Duration>) -> Resu
         return Err(fault::forced_watch_error());
     }
     // Convert to an absolute deadline up front so EINTR retries don't extend the total wait.
-    let deadline = timeout.map(|d| Instant::now().checked_add(d));
+    let deadline = timeout.map(|d| now().checked_add(d));
     backend::block_until_exit(id, deadline)
 }
 
@@ -75,27 +75,135 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     backend::terminate(id)
 }
 
+/// A mock clock, test-only: once frozen, `remaining` reads this instant instead of the real
+/// `Instant::now()`, so a test can drive deadline arithmetic to a deterministic value with no
+/// real sleep. Thread-local; `FrozenClockGuard` resets it on `Drop`, including during
+/// unwinding.
+#[cfg(test)]
+// `advance`, `FrozenClockGuard` and friends are exercised only by macOS's `marker_eof_tests`
+// today (the only current caller across the crate's platforms) — genuinely dead code
+// everywhere else, same pattern as `containment::cgroup::parse`'s Linux-only helpers. `now`
+// itself stays used everywhere via `remaining`, so this is a no-op for it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static FROZEN: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Freeze this thread's mock clock at the real "now", and return that instant. Until
+    /// [`reset`] (or the end of a [`FrozenClockGuard`]'s scope), [`now`] returns exactly this
+    /// value — not real elapsed time — so a test's own setup latency can never change what a
+    /// deadline computed from it means.
+    fn freeze_now() -> Instant {
+        // Nesting is not supported: the INNER guard's `Drop` would unfreeze the clock out from
+        // under the OUTER guard, which is still alive and still expects it frozen.
+        debug_assert!(
+            FROZEN.with(Cell::get).is_none(),
+            "test_clock::freeze_now called while already frozen — nesting FrozenClockGuard is \
+             not supported"
+        );
+        let at = Instant::now();
+        FROZEN.with(|f| f.set(Some(at)));
+        at
+    }
+
+    /// Advance the frozen instant by `by`. Panics if the clock isn't frozen — silently doing
+    /// nothing (advancing an unfrozen clock that's about to be overridden by real time anyway)
+    /// would hide a test bug rather than fail it loudly.
+    pub(crate) fn advance(by: Duration) {
+        FROZEN.with(|f| {
+            let cur = f.get().expect("test_clock::advance called before the clock was frozen");
+            f.set(Some(cur + by));
+        });
+    }
+
+    /// Advance the frozen instant by `real_elapsed` — a no-op if the clock isn't frozen (an
+    /// unfrozen clock already tracks real time on its own). Called automatically by
+    /// `block_on_kqueue` around every completed round's real, blocking `kevent` call, so a
+    /// frozen clock a test forgot to (or a bug failed to) advance explicitly can never make a
+    /// GENUINELY elapsed real wait invisible to `remaining`: even with no test hook ever calling
+    /// [`advance`], `now` eventually catches up to whatever real time was actually spent
+    /// blocked in the kernel, turning what would otherwise be an unbounded spin under a
+    /// never-advancing mock clock into, at worst, a wait bounded by the real timeouts genuinely
+    /// requested — never a true infinite loop.
+    pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
+        FROZEN.with(|f| {
+            if let Some(cur) = f.get() {
+                f.set(Some(cur + real_elapsed));
+            }
+        });
+    }
+
+    /// The mock "now": the frozen instant if [`FrozenClockGuard::install`] is active on this
+    /// thread, else real `Instant::now()` (this module's unfrozen default, matching production
+    /// behavior exactly).
+    pub(crate) fn now() -> Instant {
+        FROZEN.with(|f| f.get()).unwrap_or_else(Instant::now)
+    }
+
+    fn reset() {
+        FROZEN.with(|f| f.set(None));
+    }
+
+    /// RAII installer for the frozen clock: freezes on construction, resets to unfrozen on
+    /// `Drop` — including during unwinding, so a test that panics mid-assertion never leaks a
+    /// frozen clock into whatever runs on this thread next.
+    #[must_use]
+    pub(crate) struct FrozenClockGuard {
+        _private: (),
+    }
+
+    impl FrozenClockGuard {
+        /// Freeze the clock and return the guard plus the frozen instant.
+        pub(crate) fn install() -> (Self, Instant) {
+            let at = freeze_now();
+            (Self { _private: () }, at)
+        }
+    }
+
+    impl Drop for FrozenClockGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn now() -> Instant {
+    Instant::now()
+}
+
+#[cfg(test)]
+fn now() -> Instant {
+    test_clock::now()
+}
+
 /// Remaining time until `deadline` (`None` = unbounded; `Some(None)` = a duration
 /// that overflowed `Instant` ⇒ unbounded). Saturates to ZERO once past. Shared by the
 /// backends to recompute the per-syscall timeout after an `EINTR` retry.
+///
+/// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,
-        Some(Some(at)) => Some(at.saturating_duration_since(Instant::now())),
+        Some(Some(at)) => Some(at.saturating_duration_since(now())),
     }
 }
 
 /// Convert a relative `duration` into the crate's `deadline` convention
-/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): `Instant::now() + duration`,
-/// saturating to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on
-/// overflow rather than panicking. Also saturates when the result lands within a millisecond of
-/// `Instant`'s own ceiling: tokio's timer wheel rounds a deadline up by just under that much
-/// (unchecked) when arming `sleep_until`/`timeout_at`, so a `Block` carrying an instant this
-/// close to the ceiling would panic there instead of waiting. Shared by every `_timeout`/
-/// `grace`-style call that starts a fresh relative wait from "now".
+/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): [`now`]`() + duration`, saturating
+/// to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on overflow rather
+/// than panicking. Also saturates when the result lands within a millisecond of `Instant`'s own
+/// ceiling: tokio's timer wheel rounds a deadline up by just under that much (unchecked) when
+/// arming `sleep_until`/`timeout_at`, so a `Block` carrying an instant this close to the ceiling
+/// would panic there instead of waiting. Shared by every `_timeout`/`grace`-style call that
+/// starts a fresh relative wait from "now".
 pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
     Some(
-        Instant::now()
+        now()
             .checked_add(duration)
             .filter(|at| at.checked_add(Duration::from_millis(1)).is_some()),
     )

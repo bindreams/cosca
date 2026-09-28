@@ -85,13 +85,13 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     let slot = channel.slot();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    let pid = fork_running(move || {
+    let guard = fork_running(move || {
         block_on(gate);
         // SAFETY: the channel's child end is this child's inherited copy; its parent holds
         // its own end.
         let _ = unsafe { slot.send_report(crate::containment::cgroup::REPORT_PLACED) };
-    })
-    .defuse();
+    });
+    let pid = guard.pid();
     let (polling_tx, polling_rx) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
         crate::containment::cgroup::fault::set_wait_polling_notifier(polling_tx);
@@ -100,7 +100,7 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     polling_rx.recv().expect("the wait reaches its poll with nothing sent");
     gate_write.write_all(b"x").expect("release the child");
     assert_eq!(waiter.join().expect("the waiting thread"), PlacementReport::Placed);
-    reap(pid);
+    reap(guard.defuse());
 }
 
 /// A child that exits without reporting reads as `NotReported` at once, even while another process
@@ -118,13 +118,16 @@ fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_c
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
     // Inherits the child's end, and keeps it until released through the gate.
-    let holder = fork_running(move || block_on(gate)).defuse();
-    let child = fork_running(|| {}).defuse();
+    let holder = fork_running(move || block_on(gate));
+    let child = fork_running(|| {});
 
-    assert_eq!(channel.wait(child).expect("open a pidfd"), PlacementReport::NotReported);
-    reap(child);
+    assert_eq!(
+        channel.wait(child.pid()).expect("open a pidfd"),
+        PlacementReport::NotReported
+    );
+    reap(child.defuse());
     gate_write.write_all(b"x").expect("release the holder");
-    reap(holder);
+    reap(holder.defuse());
 }
 
 /// Both ends of the report channel are close-on-exec, so no program this process starts inherits

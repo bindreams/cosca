@@ -1,7 +1,8 @@
 //! Unit tests for the macOS marker EOF edge. In the library because the primitive is
 //! `pub(crate)`. Nothing here sleeps: every "the tree drained" event is caused by closing a
 //! descriptor a child is blocked on, and every "the tree has not drained" assertion is a
-//! ZERO-deadline check, which is exact rather than timed.
+//! ZERO-deadline check, which is exact rather than timed. The deadline contract and no-spin
+//! claim get their own tests, in `deadline` — see that module's own doc.
 //!
 //! Every test that opens a `marker_pipe()` write end holds `test_spawn_lock()` for its WHOLE
 //! body, whether or not that test itself spawns — the same rule `fdmarker_tests.rs` documents:
@@ -66,6 +67,21 @@ fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std:
     let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
     (child, marker, stdin)
 }
+
+/// The `FIONREAD` ioctl: how many bytes are currently buffered and unread on `fd`. Exact,
+/// kernel-reported — used to prove a drain did or did not happen, rather than inferring it
+/// from a verdict that reports the same thing (`MembersRemain`) either way.
+fn fionread(fd: BorrowedFd<'_>) -> i32 {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD via ioctl writes exactly one `c_int`; `fd` is a valid, open descriptor
+    // for the duration of this call.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut n) };
+    assert_eq!(rc, 0, "FIONREAD ioctl failed: {}", std::io::Error::last_os_error());
+    n
+}
+
+#[path = "marker_eof_tests/deadline.rs"]
+mod deadline;
 
 #[test]
 fn probe_reports_drained_when_the_last_write_end_is_gone() {
@@ -487,149 +503,6 @@ fn bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict() {
     );
     drop(stdin);
     child.wait().expect("reap");
-}
-
-#[test]
-fn a_quiet_live_holder_blocks_without_spending_cpu() {
-    // The realistic case (nothing in the crate writes to the marker) — this is the claim
-    // "poll-free" is actually supposed to stand behind, verified rather than assumed: a live
-    // holder that never writes must genuinely BLOCK in the kernel for the wait's duration, not
-    // merely return the right verdict at the right time (a verdict-only assertion cannot tell
-    // "blocked" from "busy-polled the whole time" apart — both produce `MembersRemain` at the
-    // same instant).
-    //
-    // The 300ms is a MEASUREMENT WINDOW, not a synchronization timeout: nothing is being
-    // awaited here (the holder never exits during this test), it is how long CPU usage is
-    // sampled for — there is no shorter, event-driven way to observe "no CPU was spent doing
-    // nothing" than watching for a while. This is the one deliberate, named exception to the
-    // "no synchronisation via time" global constraint, for exactly this reason.
-    //
-    // CPU is measured on THIS THREAD specifically (`CLOCK_THREAD_CPUTIME_ID`, not
-    // `getrusage(RUSAGE_SELF)`, which is process-wide and would fold in whatever CPU work other
-    // tests do on other threads during the same window under a plain `cargo test` — see
-    // `marker_pipe`'s doc).
-    let (child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
-    let deadline = Duration::from_millis(300);
-    let cpu_before = self_thread_cpu_time();
-    let wall_before = Instant::now();
-    let verdict = block_until_drained(marker.as_fd(), Some(Instant::now().checked_add(deadline)))
-        .expect("bounded wait against a quiet holder");
-    let wall_elapsed = wall_before.elapsed();
-    let cpu_elapsed = self_thread_cpu_time() - cpu_before;
-
-    assert_eq!(verdict, TreeDrain::MembersRemain);
-    // Generous (5%): proving "genuinely blocked, not spinning," not chasing a tight bound
-    // that would make this test sensitive to normal scheduling/syscall noise.
-    assert!(
-        cpu_elapsed < wall_elapsed / 20,
-        "CPU time ({cpu_elapsed:?}) too high relative to wall time ({wall_elapsed:?}) for a holder \
-         that never writes — looks like a busy-poll, not a genuine kernel block"
-    );
-
-    child.kill().expect("kill");
-    child.wait().expect("reap");
-}
-
-#[test]
-fn a_sustained_writer_never_exceeds_the_deadline() {
-    // Distinct from the quiet-holder test above, deliberately NOT claiming low CPU usage
-    // here: `yes` refills the pipe to the NOTE_LOWAT clamp about as fast as `drain_pending`
-    // can empty it, so this case genuinely IS CPU-proportional to the writer's throughput for
-    // the wait's duration — the module doc's own honest accounting, not a defect. What this
-    // test pins is the property that must ALWAYS hold regardless: the wait terminates at (not
-    // past) the deadline with the correct verdict, whatever it cost to get there —
-    // `block_until_drained` checks the deadline explicitly before every `kevent` call
-    // specifically so this holds even against a descriptor that stays continuously ready. The
-    // slack below is deliberately tight (not the >100ms scheduling margin the sync
-    // death-watch tests use elsewhere) because a regression of that fix should show up as a
-    // large, easy-to-see overrun, not something a generous slack would quietly absorb.
-    let mut cmd = crate::Command::new();
-    cmd.executable("/bin/sh").args(["sh", "-c", "exec yes >&3"]);
-    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
-    let mut child = cmd.spawn().expect("spawn yes");
-    let marker = child.fd_read_end(3.into()).expect("marker read end");
-
-    let deadline = Duration::from_millis(300);
-    let wall_before = Instant::now();
-    let verdict = block_until_drained(marker.as_fd(), Some(Instant::now().checked_add(deadline)))
-        .expect("bounded wait against a sustained writer");
-    let wall_elapsed = wall_before.elapsed();
-
-    assert_eq!(
-        verdict,
-        TreeDrain::MembersRemain,
-        "a sustained writer must still report MembersRemain"
-    );
-    assert!(
-        wall_elapsed <= deadline + Duration::from_millis(50),
-        "must not exceed the deadline by more than one round's drain work: {wall_elapsed:?}"
-    );
-
-    child.kill().expect("kill the sustained writer");
-    child.wait().expect("reap");
-}
-
-#[test]
-fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
-    // The unbounded counterpart to the quiet-holder CPU test above, and the
-    // case the sync death-watch's CPU-proportional accounting explicitly does NOT cover: with
-    // `deadline: None` there is no caller-supplied bound to pay a per-round drain against, so
-    // (per the module doc) this wait must not drain past the low-water clamp at all — the
-    // writer's own `write()` blocks against the full pipe instead, and the wait genuinely
-    // blocks in the kernel rather than busy-looping `kevent`-drain-repeat forever. A background
-    // thread kills the writer after the measurement window so the unbounded wait has a way to
-    // conclude at all; the measurement itself covers only the window BEFORE that kill, on THIS
-    // thread, same idiom and same reasoning as the quiet-holder test above.
-    let mut cmd = crate::Command::new();
-    cmd.executable("/bin/sh").args(["sh", "-c", "exec yes >&3"]);
-    cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
-    let mut child = cmd.spawn().expect("spawn yes");
-    let marker = child.fd_read_end(3.into()).expect("marker read end");
-    let window = Duration::from_millis(300);
-    let cpu_before = self_thread_cpu_time();
-    let wall_before = Instant::now();
-    let verdict = std::thread::scope(|s| {
-        s.spawn(|| {
-            std::thread::sleep(window);
-            child.kill().expect("kill the sustained writer");
-        });
-        block_until_drained(marker.as_fd(), None).expect("unbounded wait against a sustained writer")
-    });
-    let wall_elapsed = wall_before.elapsed();
-    let cpu_elapsed = self_thread_cpu_time() - cpu_before;
-
-    assert_eq!(
-        verdict,
-        TreeDrain::AllMarkersClosed,
-        "killing the writer closes the marker descriptor, which must still be observed"
-    );
-    // Generous (5%), matching the quiet-holder test's own margin: proving "genuinely blocked,
-    // not spinning," not chasing a tight bound sensitive to scheduling noise.
-    assert!(
-        cpu_elapsed < wall_elapsed / 20,
-        "CPU time ({cpu_elapsed:?}) too high relative to wall time ({wall_elapsed:?}) for an \
-         unbounded wait against a sustained writer — looks like a busy-poll, not a genuine kernel block"
-    );
-
-    child.wait().expect("reap");
-}
-
-/// This CALLING THREAD's own CPU time, via `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` — NOT
-/// `getrusage(RUSAGE_SELF)`, which is process-wide and would be contaminated by whatever other
-/// tests are running concurrently during the same measurement window under a plain `cargo test`
-/// (see `marker_pipe`'s doc). Used only to distinguish "blocked" from "busy-polled" in the
-/// quiet-holder test above — no production code depends on it.
-fn self_thread_cpu_time() -> Duration {
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    // SAFETY: clock_gettime writes a fixed-size struct; pointer matches.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    assert_eq!(
-        rc,
-        0,
-        "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed: {}",
-        std::io::Error::last_os_error()
-    );
-    Duration::from_secs(ts.tv_sec.max(0) as u64) + Duration::from_nanos(ts.tv_nsec.max(0) as u64)
 }
 
 #[cfg(feature = "tokio")]
