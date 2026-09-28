@@ -310,6 +310,32 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
         }
+        #[cfg(target_os = "linux")]
+        "report-tid-block-stdin" => {
+            // Report a LIVE NON-LEADER thread id: this process's own pid is the thread-group
+            // leader, so a second thread's tid is provably not it. Spawns a worker thread,
+            // reads its tid back over an mpsc channel (a real happens-before edge — no data
+            // race with the thread that owns it), reports `<tid>\n` on the control socket,
+            // then blocks on stdin until EOF (the caller closes its write end) or a byte —
+            // a real event, never a timer. The worker thread parks forever, so the tid it
+            // reported stays live for as long as this process runs.
+            let addr = &args[2];
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _worker = std::thread::spawn(move || {
+                // SAFETY: SYS_gettid takes no arguments and always succeeds.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                tx.send(tid as libc::pid_t).expect("send tid to the main thread");
+                loop {
+                    std::thread::park();
+                }
+            });
+            let tid = rx.recv().expect("recv tid from the worker thread");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            writeln!(sock, "{tid}").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = std::io::stdin().read(&mut buf); // blocks until stdin EOFs / a byte arrives
+        }
         #[cfg(target_os = "macos")]
         "control-block-mixed-cloexec-marker" => {
             // Like control-block, but first `F_DUPFD_CLOEXEC`s a second copy of the inherited
