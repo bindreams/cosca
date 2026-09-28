@@ -169,8 +169,23 @@ signal dispositions) runs in its own re-exec'd process (`alone()` in
 through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just
 an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in [#223].
 
-**Why:** a skipped test reports the same pass as a working one, and a process-wide mutation corrupts
-whichever tests share the process.
+`#[ignore]` marks only a specific, temporary regression on `main`: the owner accepts a known
+failure and disables that one test until it's fixed. It never disables a group of tests; only the
+owner approves it, and nobody else applies it without that approval.
+
+A test group whose environment support varies by host (root, cgroups, and the like) instead
+declares its own `COSCA_TEST_<GROUP>` variable: on by default, since any value other than the
+literal `0` runs it. Only an explicit `COSCA_TEST_<GROUP>=0` disables the group, reported as
+`ignored` with a reason: the shape a skuld `requires` predicate gives once the harness migration
+([#151]) lands. Without that explicit `0` the test runs for real and fails on whatever an
+environment without support produces: a failed support check never turns into a skip. Today's gates
+do the opposite: some are `#[ignore]`d by default and opted into with `.is_some()` checks; others
+`return` early and report a pass without running ([#80]). Both shapes are tracked as tech debt in
+[#234].
+
+**Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
+whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
+the process.
 
 **Applies to:** all tests.
 
@@ -184,9 +199,20 @@ handle cosca returned for each, before that handle reaps the child, never by pro
 or a PID the test computed. On Unix that kill reaches `kill(2)` by number, which is safe while the
 child is unreaped.
 
+Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
+host support doesn't vary, because consent below needs an on/off switch to attach to. Alongside it,
+the group needs a second variable, `COSCA_TEST_<GROUP>_CONSENT`, checked once the group itself is
+enabled: only an explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent, and anything else, unset
+included, fails the test rather than running it. A CI step that cannot run the group sets
+`COSCA_TEST_ROOT=0` to disable it outright; a sandboxed lane instead sets `COSCA_TEST_ROOT=1` and
+`COSCA_TEST_ROOT_CONSENT=1`. No consent variable exists yet, and today's on/off variables have the
+opposite, opt-in semantics (principle 9); both gaps are tracked in [#234].
+
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
-4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)).
+4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)). Principle 9 turns every group on by default,
+so without a second, explicit gate a bare test run would touch real system state before anyone
+decided it should.
 
 **Applies to:** all tests. CI's cgroup lane runs in a fresh cgroup on a throwaway runner
 ([`ci.yaml`](../.github/workflows/ci.yaml)).
@@ -218,7 +244,10 @@ step consistent with these principles.
 [tokio orphan.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/orphan.rs#L118-L124
 [tokio runtime/process.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/process.rs#L30-L39
 [tokio unix/mod.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/mod.rs#L124
+[#80]: https://github.com/bindreams/cosca/issues/80
+[#151]: https://github.com/bindreams/cosca/issues/151
 [#174]: https://github.com/bindreams/cosca/issues/174
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#210]: https://github.com/bindreams/cosca/pull/210
 [#223]: https://github.com/bindreams/cosca/issues/223
+[#234]: https://github.com/bindreams/cosca/issues/234
