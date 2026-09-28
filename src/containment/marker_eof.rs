@@ -245,17 +245,39 @@ fn interpret_read_event(
     Ok(None) // holders remain (EV_EOF was clear)
 }
 
-/// Take one pending event from an armed kqueue without blocking. `Ok(Some(_))` = the drain was
-/// observed; `Ok(None)` = nothing conclusive yet (nothing pending, or — only when `!suppress_drain`
-/// and the low-water clamp is reached — a member's bytes, discarded) — re-wait; `Err` = see
-/// `interpret_read_event`. `suppress_drain` is `interpret_read_event`'s own parameter of the
-/// same name, passed straight through — see that function's own doc for what it means and why
-/// it need not equal `arm`'s `unbounded_wait`.
+/// The three outcomes of one non-blocking `kevent` check on an armed marker kqueue, kept
+/// distinct rather than collapsed to `Option<TreeDrain>`: a caller that needs to know whether a
+/// REAL, interpreted event occurred (a test proving a watch loop "saw readiness and declined to
+/// drain", as opposed to a spurious wakeup with nothing pending at all) cannot tell those two
+/// `None`-shaped cases apart otherwise. `probe`/`block_until_drained` don't need the distinction
+/// and fold `Declined` and `Spurious` back together.
+pub(crate) enum DrainOutcome {
+    /// `EV_EOF` — a terminal verdict.
+    Drained(TreeDrain),
+    /// A genuine, non-EOF event was retrieved and interpreted by `interpret_read_event` (past
+    /// the low-water clamp, not draining) — not merely a wakeup with nothing to interpret.
+    Declined,
+    /// `kevent` reported nothing pending at all; `interpret_read_event` never ran.
+    Spurious,
+}
+
+impl DrainOutcome {
+    fn into_option(self) -> Option<TreeDrain> {
+        match self {
+            DrainOutcome::Drained(verdict) => Some(verdict),
+            DrainOutcome::Declined | DrainOutcome::Spurious => None,
+        }
+    }
+}
+
+/// Take one pending event from an armed kqueue without blocking. `suppress_drain` is
+/// `interpret_read_event`'s own parameter of the same name, passed straight through — see that
+/// function's own doc for what it means and why it need not equal `arm`'s `unbounded_wait`.
 pub(crate) fn drain_kqueue(
     kq: &Kqueue,
     read_end: BorrowedFd<'_>,
     suppress_drain: bool,
-) -> Result<Option<TreeDrain>, Error> {
+) -> Result<DrainOutcome, Error> {
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut events = [KEvent::new(
         0,
@@ -267,8 +289,13 @@ pub(crate) fn drain_kqueue(
     )];
     loop {
         match kq.kevent(&[], &mut events, Some(zero)) {
-            Ok(0) => return Ok(None), // nothing pending
-            Ok(_) => return interpret_read_event(&events[0], read_end, suppress_drain),
+            Ok(0) => return Ok(DrainOutcome::Spurious), // nothing pending
+            Ok(_) => {
+                return Ok(match interpret_read_event(&events[0], read_end, suppress_drain)? {
+                    Some(verdict) => DrainOutcome::Drained(verdict),
+                    None => DrainOutcome::Declined,
+                });
+            }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::Io(e.into())),
         }
@@ -295,10 +322,9 @@ pub(crate) fn drain_kqueue(
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
     let kq = arm(read_end, false)?;
-    match drain_kqueue(&kq, read_end, true)? {
-        Some(verdict) => Ok(verdict),
-        None => Ok(TreeDrain::MembersRemain),
-    }
+    Ok(drain_kqueue(&kq, read_end, true)?
+        .into_option()
+        .unwrap_or(TreeDrain::MembersRemain))
 }
 
 /// Block until every marker holder has exited, or until `deadline`.

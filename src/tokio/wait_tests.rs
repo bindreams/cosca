@@ -132,21 +132,17 @@ async fn watch_loop_survives_a_non_exit_drain_cycle() {
         .expect("register");
     let target_cell = std::cell::RefCell::new(None);
     let mut pending = Some(target);
-    let watch = super::watch_readable(
-        &afd,
-        |kq| {
-            let drained = crate::wait::backend::drain_proc_exit(kq)?;
-            if let Some(mut t) = pending.take() {
-                // First cycle (the decoy's event, consumed above): report "no exit" so the loop
-                // clear_readys and re-awaits; only NOW create the target's exit event.
-                t.kill().expect("kill target mid-cycle");
-                *target_cell.borrow_mut() = Some(t);
-                return Ok(None);
-            }
-            Ok(drained)
-        },
-        None,
-    );
+    let watch = super::watch_readable(&afd, |kq| {
+        let drained = crate::wait::backend::drain_proc_exit(kq)?;
+        if let Some(mut t) = pending.take() {
+            // First cycle (the decoy's event, consumed above): report "no exit" so the loop
+            // clear_readys and re-awaits; only NOW create the target's exit event.
+            t.kill().expect("kill target mid-cycle");
+            *target_cell.borrow_mut() = Some(t);
+            return Ok(None);
+        }
+        Ok(drained)
+    });
     ::tokio::time::timeout(Duration::from_secs(30), watch)
         .await
         .expect("the re-awaited loop must resolve on the target's exit")
