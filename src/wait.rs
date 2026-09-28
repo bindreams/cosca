@@ -284,9 +284,78 @@ pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
 
 /// [`remaining`] against an explicit `now`, for waits that run on another clock (tokio's).
 pub(crate) fn remaining_at(deadline: Option<Option<Instant>>, now: Instant) -> Option<Duration> {
-    match deadline {
+    let remaining = match deadline {
         None | Some(None) => None,
         Some(Some(at)) => Some(at.saturating_duration_since(now)),
+    };
+    #[cfg(test)]
+    read_probe::record(read_probe::Event::Read { deadline, remaining });
+    remaining
+}
+
+/// Test-only, thread-local log of every [`remaining_at`] read on the installing thread: the
+/// deadline it was made against and its result, in order, with the [`mark`]s a call site drops
+/// between them. A test proves which deadline a wait was armed from, and that no read precedes
+/// a step, from the log. [`current`] and [`install`] carry it onto a `spawn_blocking` closure's
+/// thread, as `armed_probe` does.
+#[cfg(test)]
+pub(crate) mod read_probe {
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
+    use std::sync::mpsc::Sender;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Read {
+            deadline: Option<Option<Instant>>,
+            remaining: Option<Duration>,
+        },
+        Mark(&'static str),
+    }
+
+    thread_local! {
+        static LOG: RefCell<Option<Sender<Event>>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls on drop, restoring what it replaced, including during an unwind. `!Send`: it
+    /// must clear the thread it was installed on.
+    #[must_use]
+    pub(crate) struct Guard(Option<Sender<Event>>, PhantomData<*const ()>);
+
+    // Windows `tokio` tests are the only non-portable-test consumers.
+    #[cfg_attr(not(all(windows, feature = "tokio")), allow(dead_code))]
+    pub(crate) fn install(tx: Sender<Event>) -> Guard {
+        let prev = LOG.with(|log| log.replace(Some(tx)));
+        debug_assert!(prev.is_none(), "read_probe::install nested on the same thread");
+        Guard(prev, PhantomData)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            LOG.with(|log| *log.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// This thread's installed log, cloned so the installation survives.
+    #[cfg_attr(not(all(windows, feature = "tokio")), allow(dead_code))]
+    pub(crate) fn current() -> Option<Sender<Event>> {
+        LOG.with(|log| log.borrow().clone())
+    }
+
+    pub(super) fn record(event: Event) {
+        LOG.with(|log| {
+            if let Some(tx) = log.borrow().as_ref() {
+                // The test may have stopped listening; that is not this read's failure.
+                _ = tx.send(event);
+            }
+        });
+    }
+
+    /// Drop a named marker into this thread's log, if one is installed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn mark(name: &'static str) {
+        record(Event::Mark(name));
     }
 }
 

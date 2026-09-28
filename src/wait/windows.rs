@@ -3,7 +3,7 @@
 //! No reaping concept on Windows.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
@@ -113,12 +113,13 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
 }
 
 /// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
-/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`;
-/// `None` = unbounded.
+/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited by `deadline`;
+/// `None` = unbounded. `deadline` is an absolute instant on the real clock, fixed by the caller
+/// before any hop to another thread; every re-arm recomputes against it.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
 pub(crate) fn block_until_exit_or_cancel(
     id: ProcessId,
-    grace: Option<Duration>,
+    deadline: Option<Instant>,
     cancel: &OwnedHandle,
 ) -> Result<bool, Error> {
     let handle = match crate::identity::windows_open_classified(
@@ -167,10 +168,8 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
-    let deadline: Option<Option<Instant>> = match grace {
-        None => None,
-        Some(g) => crate::wait::deadline_from(g),
-    };
+    #[cfg(test)]
+    crate::wait::read_probe::mark("identity verified");
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
     // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's
     // gated on `is_armed()`.
@@ -201,7 +200,9 @@ pub(crate) fn block_until_exit_or_cancel(
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
     // SAFETY: both handles are live for the wait's duration.
-    let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForMultipleObjects(&handles, false, ms) });
+    let waited = crate::wait::wait_until(deadline.map(Some), |ms| unsafe {
+        WaitForMultipleObjects(&handles, false, ms)
+    });
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);

@@ -1,6 +1,7 @@
 use super::{
-    ceil_millis, clears_tokio_timer_margin, deadline_at, deadline_from, instant_near_ceiling, rearm_until, remaining,
-    remaining_override_seam, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms, TOKIO_TIMER_ROUNDING_MARGIN,
+    ceil_millis, clears_tokio_timer_margin, deadline_at, deadline_from, instant_near_ceiling, read_probe, rearm_until,
+    remaining, remaining_override_seam, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms,
+    TOKIO_TIMER_ROUNDING_MARGIN,
 };
 use std::time::{Duration, Instant};
 
@@ -260,4 +261,75 @@ fn rearm_until_stops_at_a_round_error() {
     });
     assert_eq!(out, Err("boom"));
     assert_eq!(rounds, 2);
+}
+
+/// A probe records each `remaining` read with the deadline it was made against and its result,
+/// interleaved in order with the marks a call site drops.
+///
+/// Mutant: skip `record` in `remaining_at` -> the log is empty.
+#[test]
+fn read_probe_records_reads_and_marks_in_order() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (_clock, at) = test_clock::FrozenClockGuard::install();
+    let deadline = Some(Some(at + Duration::from_secs(5)));
+    let guard = read_probe::install(tx);
+    read_probe::mark("before");
+    remaining(deadline);
+    remaining(None);
+    drop(guard);
+    let want = [
+        read_probe::Event::Mark("before"),
+        read_probe::Event::Read {
+            deadline,
+            remaining: Some(Duration::from_secs(5)),
+        },
+        read_probe::Event::Read {
+            deadline: None,
+            remaining: None,
+        },
+    ];
+    assert_eq!(rx.try_iter().collect::<Vec<_>>(), want);
+}
+
+/// A probe does not outlive its guard, including when the guard is dropped by an unwind.
+///
+/// Mutant: make the guard's `Drop` a no-op -> the read after the panic is still recorded.
+#[test]
+fn read_probe_guard_uninstalls_on_drop_even_when_unwinding() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = read_probe::install(tx);
+        panic!("unwind with the probe installed");
+    }));
+    assert!(unwound.is_err());
+    remaining(None);
+    read_probe::mark("after");
+    assert_eq!(rx.try_iter().count(), 0);
+    assert!(read_probe::current().is_none());
+}
+
+/// A probe is per thread: another thread's reads are invisible until that thread installs the
+/// handle [`read_probe::current`] hands out, which is how a `spawn_blocking` closure joins one.
+///
+/// Mutant: make `current` return `None` -> the installed thread's read goes unrecorded.
+#[test]
+fn read_probe_reaches_another_thread_only_through_current() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _guard = read_probe::install(tx);
+    std::thread::scope(|s| {
+        s.spawn(|| remaining(None));
+    });
+    assert_eq!(rx.try_iter().count(), 0, "an uninstalled thread must not record");
+    let carried = read_probe::current().expect("installed on this thread");
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let _guard = read_probe::install(carried);
+            remaining(None);
+        });
+    });
+    assert_eq!(
+        rx.try_iter().count(),
+        1,
+        "the installed thread records into the same log"
+    );
 }

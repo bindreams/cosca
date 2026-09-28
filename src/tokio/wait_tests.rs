@@ -176,6 +176,151 @@ fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
     child.wait().expect("reap");
 }
 
+/// What one `grace_wait` on a Windows child logged on its blocking thread.
+#[cfg(windows)]
+struct Observed {
+    /// The real clock as `grace_wait` saw it: frozen a second behind the actual now.
+    real_start: std::time::Instant,
+    exited: bool,
+    log: Vec<crate::wait::read_probe::Event>,
+}
+
+/// Runs `grace_wait(id, grace)` with tokio's clock pinned at `pin` and the real clock frozen behind the
+/// blocking thread's, so a deadline `grace_wait` fixes on this thread differs from any a
+/// blocking thread would derive itself. Logs every `remaining` read and the identity step.
+/// With `release`, closes the child's stdin after the first read, so the wait ends by exit.
+#[cfg(windows)]
+async fn observed_grace_wait(
+    child: &mut std::process::Child,
+    pin: std::time::Instant,
+    grace: Duration,
+    release: bool,
+) -> Observed {
+    use crate::wait::read_probe::{install, Event};
+    use crate::wait::test_clock::FrozenClockGuard;
+
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _log = install(tx);
+    let _tokio_now = super::now_override::install(pin);
+    let (_clock, real_start) = FrozenClockGuard::install_lagging(Duration::from_secs(1));
+    let mut log = Vec::new();
+    let exited = if release {
+        // A live child's watch always logs a read before it can end, so the `recv` returns.
+        let (exited, ()) = ::tokio::join!(grace_wait(id, grace), async {
+            loop {
+                let event = rx.recv().expect("the blocking watch logs a read");
+                log.push(event);
+                if matches!(event, Event::Read { .. }) {
+                    break;
+                }
+            }
+            drop(child.stdin.take());
+        });
+        exited
+    } else {
+        grace_wait(id, grace).await
+    };
+    // The join has returned, so every send happened before this.
+    log.extend(rx.try_iter());
+    Observed {
+        real_start,
+        exited: exited.expect("grace_wait"),
+        log,
+    }
+}
+
+/// Asserts the blocking thread verified identity before its first `remaining` read, and that
+/// every read was made against `deadline`. Returns the reads' results.
+#[cfg(windows)]
+#[track_caller]
+fn assert_reads_of(
+    log: &[crate::wait::read_probe::Event],
+    deadline: Option<Option<std::time::Instant>>,
+) -> Vec<Option<Duration>> {
+    use crate::wait::read_probe::Event;
+
+    let mark = log
+        .iter()
+        .position(|e| *e == Event::Mark("identity verified"))
+        .expect("the blocking thread verified identity");
+    let mut results = Vec::new();
+    for (i, event) in log.iter().enumerate() {
+        if let Event::Read {
+            deadline: used,
+            remaining,
+        } = event
+        {
+            assert!(i > mark, "a remaining read preceded identity verification: {log:?}");
+            assert_eq!(
+                *used, deadline,
+                "a read was made against a re-derived deadline: {log:?}"
+            );
+            results.push(*remaining);
+        }
+    }
+    assert!(!results.is_empty(), "the blocking thread never read remaining: {log:?}");
+    results
+}
+
+// `grace_wait` must arm the blocking wait from the deadline it fixed before `spawn_blocking`.
+// Tokio's clock is pinned and the real clock frozen a second behind the blocking thread's, so a
+// blocking thread deriving its own deadline reads a later instant and fails the equality.
+// The deadline is already past: the wait is one non-blocking probe.
+#[cfg(windows)]
+#[tokio::test]
+async fn grace_wait_windows_arms_from_a_past_deadline_fixed_before_spawn_blocking() {
+    let mut child = std_blocker();
+    let seen = observed_grace_wait(&mut child, std::time::Instant::now(), Duration::ZERO, false).await;
+    kill_and_reap(&mut child);
+    assert!(!seen.exited, "a live child at ZERO grace must report still-alive");
+    let reads = assert_reads_of(&seen.log, Some(Some(seen.real_start)));
+    assert!(reads.iter().all(|r| *r == Some(Duration::ZERO)), "{reads:?}");
+}
+
+// A genuinely future deadline crossing `spawn_blocking`: the blocking thread's remaining time is
+// what is left of the caller's deadline, not a fresh grace.
+#[cfg(windows)]
+#[tokio::test]
+async fn grace_wait_windows_arms_from_a_future_deadline_fixed_before_spawn_blocking() {
+    let grace = Duration::from_secs(3600);
+    let mut child = std_blocker();
+    let seen = observed_grace_wait(&mut child, std::time::Instant::now(), grace, true).await;
+    child.wait().expect("reap");
+    assert!(seen.exited, "the child exited after its stdin closed");
+    let reads = assert_reads_of(&seen.log, Some(Some(seen.real_start + grace)));
+    for r in reads {
+        let r = r.expect("a bounded deadline has a remaining time");
+        assert!(r > Duration::ZERO && r <= grace, "{r:?}");
+    }
+}
+
+// A grace that overflows `Instant` is unbounded: not expired, not a panic, not a fixed fallback.
+#[cfg(windows)]
+#[tokio::test]
+async fn grace_wait_windows_treats_an_overflowing_grace_as_unbounded() {
+    let mut child = std_blocker();
+    let seen = observed_grace_wait(&mut child, std::time::Instant::now(), Duration::MAX, true).await;
+    child.wait().expect("reap");
+    assert!(seen.exited, "an unbounded watch ends only by the exit");
+    assert!(assert_reads_of(&seen.log, None).iter().all(Option::is_none));
+}
+
+// As above for a grace landing inside tokio's timer margin of `Instant`'s ceiling, which
+// `deadline_at` also makes unbounded.
+#[cfg(windows)]
+#[tokio::test]
+async fn grace_wait_windows_treats_a_grace_inside_the_timer_margin_of_the_ceiling_as_unbounded() {
+    let mut child = std_blocker();
+    let pin = std::time::Instant::now();
+    // 500us short of the ceiling: inside the 1ms margin, but not overflowing outright.
+    let grace = crate::wait::instant_near_ceiling(pin).saturating_duration_since(pin) - Duration::from_micros(500);
+    let seen = observed_grace_wait(&mut child, pin, grace, true).await;
+    child.wait().expect("reap");
+    assert!(seen.exited, "an unbounded watch ends only by the exit");
+    assert!(assert_reads_of(&seen.log, None).iter().all(Option::is_none));
+}
+
 // Drive the REAL macOS watch loop through its clear_ready + re-await cycle with genuine
 // kernel events: a DECOY second NOTE_EXIT filter on the same kqueue supplies the first wake;
 // the scripted drain consumes it (keeping the kqueue level low, so clear_ready cannot miss a
