@@ -1356,9 +1356,11 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
     // would still pass once that timer alone drains the leaf — the same vacuous-pass shape
     // measured directly (300.01s) in this file's other group-kill tests. The real protection each
     // caller below actually applies is one of: asserting the member's exit status carries
-    // `SIGKILL` (e.g. `:1239`, `:1279`), or reading whether the leaf directory was removed BEFORE
-    // ever calling the blocking `member.wait()` (`:1300`) — either one only holds if the kill,
-    // not the fixture's own end, is what happened.
+    // `SIGKILL` (`cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf`,
+    // `cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf`),
+    // or reading whether the leaf directory was removed BEFORE ever calling the blocking
+    // `member.wait()` (`cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf`)
+    // — either one only holds if the kill, not the fixture's own end, is what happened.
     let mut cmd = std::process::Command::new("cat");
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null());
@@ -3361,11 +3363,16 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn fail_closed_reports_a_drain_it_could_not_watch() {
+    use std::os::unix::process::ExitStatusExt as _;
+
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandon-unwatchable");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     std::fs::create_dir(leaf_path.join("cgroup.events")).expect("make cgroup.events unreadable");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // `/bin/sleep 300`, not a held-stdin `cat`: the assertion below is on the exit SIGNAL, which
+    // only a real kill produces — a mutant that skips the kill would otherwise let this test
+    // pass once `sleep 300`'s own timer alone ends the child (measured: 300.015s).
     let mut child = std::process::Command::new("/bin/sleep")
         .arg("300")
         .spawn()
@@ -3378,7 +3385,12 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
         .fail_closed(child.id(), channel, "the test cannot decide")
         .to_string();
     assert!(err.contains("drain could not be watched"), "got {err}");
-    child.wait().expect("reap the child");
+    let status = child.wait().expect("reap the child");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the child must be killed through the leaf, not merely reaped once it exits on its own"
+    );
 }
 
 /// A leaf's name carries 64 random bits past the pid and sequence number, which repeat across

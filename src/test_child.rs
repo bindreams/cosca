@@ -152,9 +152,11 @@ pub(crate) fn fixture_argv(test: &str) -> [&str; 4] {
 #[cfg(windows)]
 pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_TEST: &str = "test_child::fixture_survives_group_signal";
 
-/// The env var carrying the `127.0.0.1:<port>` address [`fixture_survives_group_signal`] connects
-/// back to and tags once the grandchild survivor exists in its own process group. Its mere
-/// presence also tells the fixture it was re-exec'd deliberately rather than picked up by an
+/// The env var carrying the `127.0.0.1:<port>` address the GRANDCHILD (a re-exec'd
+/// [`fixture_registers_then_blocks`]) connects back to and tags once it exists in its own
+/// process group — [`fixture_survives_group_signal`] itself never connects; it only forwards
+/// this address to the grandchild and exits. Its mere presence also tells
+/// `fixture_survives_group_signal` it was re-exec'd deliberately rather than picked up by an
 /// ordinary, unfiltered suite run — one var serves both roles, since the fixture needs the
 /// address either way.
 #[cfg(windows)]

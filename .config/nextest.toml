@@ -104,16 +104,24 @@ slow-timeout = { period = "20s", terminate-after = 3 }
 # `tokio::spawn::spawn_tests`'s `blocker()`/`opted_out_blocker()` block on a piped stdin whose
 # writer is leaked, ending only via a real kill (see #213's round-3 finding 1 and the M1/M2
 # mutants that motivated it — a mutant that skips the kill left the OLD `sleep 30` fixture's own
-# timer as the only thing that ever ended these tests). `hard_kill_reaches_a_setsid_…`,
-# `an_abandoned_child_is_killed_with_the_group_it_leads` and
-# `fail_closed_kills_the_childs_whole_process_group` are the same shape, in different files. In
-# `default`, not just `ci`, so a local run hangs no longer than CI does: `ci` inherits this
-# unless it overrides it, same as every other default setting.
+# timer as the only thing that ever ended these tests). `hard_kill_reaches_a_setsid_…` is the
+# same shape, in a different file.
+#
+# `containment::cgroup::leaf::leaf_tests` is bound WHOLE, not by individual name: round 5
+# measured that this is not just `an_abandoned_child_is_killed_with_the_group_it_leads` and
+# `fail_closed_kills_the_childs_whole_process_group` — `cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained`
+# and the three `cgroup_an_armed_drop_under_a_mount_*` tests (all `entered_real_leaf` callers,
+# which also holds a piped stdin open the same way) went past 180s, unbounded, once
+# `CgroupLeaf::hard_kill` was mutated to a no-op — and CI's cgroup lane runs this module
+# `--test-threads=1`, so one such hang eats the whole 15-minute job. Any test in this module
+# that spawns a real member is a candidate for the same shape, so the module is the unit, not a
+# hand-picked list of the ones measured so far. In `default`, not just `ci`, so a local run
+# hangs no longer than CI does: `ci` inherits this unless it overrides it, same as every other
+# default setting.
 filter = '''
     test(/^child::spawn::spawn_tests::/)
     | test(/^tokio::spawn::spawn_tests::/)
     | test(=containment::fdmarker::fdmarker_tests::hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot)
-    | test(=containment::cgroup::leaf::leaf_tests::an_abandoned_child_is_killed_with_the_group_it_leads)
-    | test(=containment::cgroup::leaf::leaf_tests::fail_closed_kills_the_childs_whole_process_group)
+    | test(/^containment::cgroup::leaf::leaf_tests::/)
 '''
 slow-timeout = { period = "20s", terminate-after = 3 }

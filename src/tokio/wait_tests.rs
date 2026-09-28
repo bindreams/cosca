@@ -32,6 +32,79 @@ fn std_blocker() -> std::process::Child {
     cmd.spawn().expect("spawn std blocker")
 }
 
+/// Local to `wait_exit_cancel_leaves_child_untouched` and (on Windows)
+/// `wait_exit_drop_releases_the_windows_watcher` — kept separate from `std_blocker` (not a
+/// modification of it) to avoid clashing with #245's own in-flight change to that shared helper.
+/// Same shape as `std_blocker`, except stdout is piped rather than nulled: these two tests need
+/// an echo round trip to prove the child is genuinely still ALIVE, not merely still resolvable,
+/// after a cancelled watch — `is_alive()` alone cannot, since `SIGKILL`/`TerminateProcess` are
+/// both delivered asynchronously, and a mutant that kills the child at the top of `wait_exit`
+/// can still read `Alive` if the check races that delivery (measured: 57/200 with a bare
+/// `is_alive()` check).
+fn std_blocker_with_stdout() -> std::process::Child {
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut cmd = std::process::Command::new(if cfg!(windows) { "findstr" } else { "cat" });
+    #[cfg(windows)]
+    cmd.arg("x");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    cmd.spawn().expect("spawn std blocker")
+}
+
+/// Proves `child` (a [`std_blocker_with_stdout`]) is genuinely still alive — see that function's
+/// own doc for why `is_alive()` alone cannot. On Unix, round-trips a byte through the piped
+/// stdout. On Windows, `findstr` does not echo: closes stdin (EOF) and requires both a clean
+/// exit and the echoed match on stdout, the same shape
+/// `child::graceful_tests::assert_still_running` uses — this consumes `child` on Windows (its
+/// own `wait()` reaps it), so callers must treat any of their own cleanup as best-effort
+/// afterward.
+fn assert_child_still_alive(child: &mut std::process::Child) {
+    use std::io::{Read as _, Write as _};
+    #[cfg(unix)]
+    {
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(b"x")
+            .expect("write to the blocker");
+        let mut echo = [0u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .expect("piped stdout")
+            .read_exact(&mut echo)
+            .expect("the blocker must still be alive to echo");
+        assert_eq!(&echo, b"x");
+    }
+    #[cfg(windows)]
+    {
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(b"x\r\n")
+            .expect("write to the blocker");
+        child.stdin = None; // close stdin: EOF, findstr can now finish and exit
+        let mut output = Vec::new();
+        child
+            .stdout
+            .as_mut()
+            .expect("piped stdout")
+            .read_to_end(&mut output)
+            .expect("read stdout to EOF");
+        let status = child.wait().expect("the blocker must exit after stdin closes");
+        assert!(
+            status.success(),
+            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
+        );
+        assert!(
+            output.windows(1).any(|w| w == b"x"),
+            "the blocker's stdout must contain the echoed match, got {output:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn grace_wait_true_for_exited_unreaped_child() {
     let mut child = std_blocker();
@@ -243,7 +316,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
     use std::future::Future;
     // Poll the unbounded watch exactly once (arms it), then drop — the watch is signal-free,
     // so the child must still be alive; it dies only by the test's own kill.
-    let mut child = std_blocker();
+    let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
         let mut fut = std::pin::pin!(wait_exit(id));
@@ -252,13 +325,13 @@ async fn wait_exit_cancel_leaves_child_untouched() {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
         }
     } // <- future dropped here; on Windows the drop-guard releases the blocking watcher
-    assert_eq!(
-        id.is_alive(),
-        crate::identity::Liveness::Alive,
-        "a cancelled watch must not affect the child"
-    );
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+      // `is_alive()` alone races SIGKILL/`TerminateProcess`'s own asynchronous delivery — see
+      // `assert_child_still_alive`'s own doc. A killed child could otherwise still read `Alive`
+      // here and this "a cancelled watch must not affect the child" claim would be unproven.
+    assert_child_still_alive(&mut child);
+    // Best-effort: `assert_child_still_alive` already reaped the child on Windows.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // Proves release without a timeout: the watcher signals a channel when it returns; recv()
@@ -269,7 +342,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     use std::future::Future;
     let (tx, rx) = std::sync::mpsc::channel();
     super::fault_observer::install_release_observer(tx);
-    let mut child = std_blocker();
+    let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
         let mut fut = std::pin::pin!(wait_exit(id));
@@ -280,13 +353,13 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     } // <- drop signals the cancel event
     rx.recv()
         .expect("the blocking watcher must return after the drop released it");
-    assert_eq!(
-        id.is_alive(),
-        crate::identity::Liveness::Alive,
-        "release must be signal-free"
-    );
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+    // `is_alive()` alone races `TerminateProcess`'s own asynchronous delivery — see
+    // `assert_child_still_alive`'s own doc. "release must be signal-free" would otherwise be
+    // unproven if a signal-sending mutant's kill just hadn't completed teardown yet.
+    assert_child_still_alive(&mut child);
+    // Best-effort: `assert_child_still_alive` already reaped the child.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on
