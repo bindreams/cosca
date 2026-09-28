@@ -35,29 +35,36 @@ as root — never a silent skip, never a false pass on every unprivileged machin
 root for exactly these tests (see `.github/workflows/ci.yaml`'s "Run root-precondition tests"
 step) on Linux and macOS.
 
-To run them locally:
+These tests spawn real children under real, different unprivileged uids and re-exec as root to do
+it — never run them against this machine's own `sudo`. Run them in a throwaway container instead:
 
 ```sh
-set -e
-cargo nextest run                                # first, unprivileged: creates target/debug/.skuld.db as you
-archive="$(mktemp -d)/root.tar.zst"               # a private path, not a predictable shared one
-cargo nextest archive --archive-file "$archive"
-sudo SKULD_LABELS=ROOT "$(command -v cargo-nextest)" nextest run \
-    --archive-file "$archive" --workspace-remap "$PWD" -E 'binary(process_root)'
-for f in target/debug/.skuld.db*; do
-    [ -e "$f" ] && sudo chown "$(id -u):$(id -g)" "$f"
-done
+( set -e
+docker run --rm --network none \
+    -v "$PWD":/repo:ro \
+    -v cosca-root-test-target:/target \
+    -e CARGO_TARGET_DIR=/target \
+    -e COSCA_TEST_ROOT_CONSENT=1 \
+    -e SKULD_LABELS=ROOT \
+    -w /repo \
+    rust:1 \
+    bash -c 'cargo install cargo-nextest --locked --quiet && cargo nextest run -E "binary(process) | binary(process_root)"'
+)
+docker volume rm cosca-root-test-target
 ```
 
-- Plain `sudo cargo ...` doesn't find `cargo` at all on a stock Debian/Ubuntu install — `sudo`'s
-  `secure_path` doesn't include `~/.cargo/bin` (rustup's install location) regardless of your own
-  `PATH`. Resolving `cargo-nextest`'s own path first, then invoking that directly, sidesteps it.
-- Running the plain suite once first, unprivileged, creates skuld's own coordination database
-  (`target/debug/.skuld.db`) under your own uid; if root creates it instead, every later
-  _unprivileged_ run in that `target/` fails outright with "attempt to write a readonly
-  database". The final loop hands root-owned WAL/SHM side files back — errors there surface
-  instead of being suppressed, so a wrong `target/` path or a failed `chown` doesn't look like
-  success.
+- The whole block is wrapped in `( set -e; … )` — a subshell, not the calling shell — so pasting
+  it into an interactive terminal cannot change that shell's own error-handling behavior.
+- The container's default user is already root, so no `sudo` (and none of its `secure_path`/PATH
+  surprises) is needed inside it; `COSCA_TEST_ROOT_CONSENT=1` is the only thing that unlocks the
+  test's real uid-switching, and it stays inside the container's own environment. The repo is
+  bind-mounted read-only, and the build goes to a throwaway named volume — nothing under `target/`
+  on the host is ever touched, so there is no unprivileged/privileged ownership conflict to clean
+  up afterward.
+- Don't lift the inner `cargo nextest run` out of the container and run it with `sudo` on the
+  host: `COSCA_TEST_ROOT_CONSENT=1` is real, standing consent to switch uids and spawn/kill
+  processes, and this project's own rule is that system-affecting tests run in a container or VM,
+  never against this machine's own services.
 
 ## License
 
