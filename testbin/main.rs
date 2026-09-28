@@ -1516,6 +1516,19 @@ fn main() {
             let (_tx, rx) = std::sync::mpsc::channel::<std::convert::Infallible>();
             let _ = rx.recv(); // never returns: `_tx`, the lone sender, is never sent on.
         }
+        // Publish our own pid, then block reading stdin until it closes — never via a chosen
+        // sleep duration or an unbounded block only a privileged kill can end. The caller pipes
+        // this process's stdin and holds the write end for exactly as long as it needs the
+        // payload alive; `sudo`/`doas`'s `closefrom` drops fds > 2 in the elevated child, but
+        // stdio (0-2) survives it (unlike an extra marker fd), so this crosses the elevation
+        // boundary cleanly. Because the write end lives in the CALLER's own process, the OS
+        // closes it — delivering EOF here — the moment that process exits, for ANY reason
+        // (normal return, panic, or being killed itself), with no privileged kill required.
+        "write-pid-then-block-on-stdin" => {
+            std::fs::write(&args[2], std::process::id().to_string()).expect("write pid");
+            let mut buf = [0u8; 1];
+            let _ = std::io::stdin().read(&mut buf);
+        }
         // A long-lived elevated child for the Windows Unkillable/drop test. Connects to the
         // loopback address in `args[2]`, sends a one-byte readiness tag, then blocks on a read
         // of that same socket and exits on EOF. A TCP address — unlike a pipe or any other

@@ -274,9 +274,19 @@ fn posix_askpass_auth_reaches_root() {
 // invoking user until it setresuid(2)s to root just before exec'ing the target. A kill()
 // delivered in that window targets a process still owned (in the permission-check sense) by
 // the invoking user, so it SUCCEEDS — racing sudo's internal privilege transition. Spawning
-// the `write-pid-then-sleep` payload and polling for its pidfile (written only once the
-// payload is running, i.e. strictly after the exec into a root-owned image) closes that
+// the `write-pid-then-block-on-stdin` payload and polling for its pidfile (written only once
+// the payload is running, i.e. strictly after the exec into a root-owned image) closes that
 // window: the poll is on a filesystem event, never a sleep.
+//
+// The payload's own lifetime is tied to THIS PROCESS, not a timer or a privileged kill: its
+// stdin is a pipe whose write end this test holds. `sudo`/`doas`'s `closefrom` drops fds > 2 in
+// the elevated child, so an extra marker fd would not survive it, but stdio does (see
+// `write-pid-then-block-on-stdin`'s own doc) — and because the write end lives HERE, the OS
+// closes it the moment this process exits for any reason (a clean return, a panic, or this
+// process itself being killed), delivering EOF to the payload with no privileged kill needed.
+// The un-killable case this test exists to prove (`kill()` returning `Unkillable`, decision A)
+// is exactly the case where cleanup CANNOT be a privileged signal from here — the payload's own
+// exit-on-EOF is the only cleanup this test can perform without privilege, matching that.
 #[cfg(unix)]
 #[test]
 fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
@@ -290,11 +300,16 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     c.executable(&exe)
         .args([
             exe.clone().into_os_string(),
-            "write-pid-then-sleep".into(),
+            "write-pid-then-block-on-stdin".into(),
             pidfile.clone().into_os_string(),
         ])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
-    let child = c.spawn().expect("elevated write-pid-then-sleep");
+    c.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = c.spawn().expect("elevated write-pid-then-block-on-stdin");
+    // Held for the rest of this function (and thus for the rest of this process's life): the
+    // payload can only exit via EOF on this pipe, which the OS delivers unconditionally once
+    // this handle — or the whole process holding it — goes away.
+    let _stdin = child.stdin().expect("piped stdin");
 
     // Wait for the payload to publish its pid on a real event (its file appears with parseable
     // content), not a timer — this is strictly after sudo's setresuid+exec into the payload.
@@ -328,8 +343,12 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
     }
     // Dropping it must return (kill_on_drop is best-effort, non-blocking) — the test itself
-    // completing is the assertion. Leave the child; the harness/OS reaps it.
+    // completing is the assertion.
     drop(child);
+    // Only now: releases the payload for real, without needing any privilege — see this
+    // function's own doc for why this is the cleanup this test uses instead of a privileged
+    // kill (which the Unkillable case this test proves cannot always be relied on).
+    drop(_stdin);
     let _ = std::fs::remove_file(&pidfile);
 }
 
