@@ -305,7 +305,7 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
 
 /// A deadline within tokio's own ~1ms round-up margin of `Instant`'s ceiling must not panic:
 /// `crate::wait::deadline_from` saturates it to unbounded before `drain_step` ever sees it, so
-/// this call takes the `listener.await` arm, never `timeout_at`.
+/// this call takes the `listener.await` arm, never the bounded one.
 #[cfg(target_os = "linux")]
 #[::tokio::test]
 async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
@@ -337,7 +337,7 @@ async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
 /// caller's own deadline. No upper bound is asserted — only that it never answers early.
 #[cfg(target_os = "linux")]
 #[::tokio::test]
-async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
+async fn cgroup_wait_tree_drained_through_sleep_until_never_answers_early() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
     use std::time::{Duration, Instant};
@@ -364,8 +364,7 @@ async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
 }
 
 /// The async wait site (`cgroup_wait_tree_drained`'s own `Block` arm) is armed with the caller's
-/// deadline instant exactly — structural, no timing: `sleep_until` is built and polled once, and
-/// its timer is never allowed to elapse.
+/// deadline instant exactly — structural, no timing.
 #[cfg(target_os = "linux")]
 #[::tokio::test]
 async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_instant() {
@@ -384,10 +383,8 @@ async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_i
     let at = Instant::now() + Duration::from_secs(3600);
     let fut = super::cgroup_wait_tree_drained(&leaf, Some(Some(at)));
     ::tokio::pin!(fut);
-    // A single poll, on this task, in `select!`'s declared (`biased`) order: `&mut fut` first,
-    // so a mutant that resolves it on this very poll is still caught by the panic, not masked by
-    // `ready(())` completing first. No thread and no rendezvous, so a mutant that drops the seam
-    // entirely fails the `try_recv` below instead of hanging anything.
+    // Poll once, `biased` so `&mut fut` is polled first: a mutant resolving on this poll panics
+    // instead of being masked by `ready(())`.
     ::tokio::select! {
         biased;
         _ = &mut fut => panic!(

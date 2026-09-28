@@ -66,3 +66,12 @@ test-group = 'windows-elevation-routes'
 # instead. Under `profile.default` so `profile.ci` and local runs both inherit it.
 filter = 'test(test_support_tests)'
 slow-timeout = { period = "20s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# `cgroup_wait_drained_tracks_two_real_members_through_exit`'s unbounded park is made
+# deterministic by a real rendezvous (kill the last member only once the wait site confirms it
+# armed a listener): a missed wake would otherwise block forever. Bounds that hang so it fails
+# instead of stalling the whole job. Under `profile.default` so `profile.ci` and local runs both
+# inherit it, same as `test_support_tests` above.
+filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
+slow-timeout = { period = "15s", terminate-after = 1 }

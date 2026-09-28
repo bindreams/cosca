@@ -359,7 +359,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
     use crate::containment::cgroup::DrainStep;
 
     loop {
-        match leaf.drain_step(deadline)? {
+        match leaf.drain_step(deadline, std::time::Instant::now())? {
             DrainStep::Done(drain) => return Ok(drain),
             DrainStep::Block {
                 listener,
@@ -371,11 +371,9 @@ pub(crate) async fn cgroup_wait_tree_drained(
                 );
                 listener.await
             }
-            // A timeout is looked at by the next step, which reads the leaf once more. Reporting
-            // `sleep.deadline()` — read back from the `Sleep` itself, after construction —
-            // rather than `at` a second time means a test can tell this apart from a version
-            // that armed some other instant: the reported value is whatever the primitive
-            // actually holds, not a separate copy a change to its own argument could leave stale.
+            // A timeout is looked at by the next step, which reads the leaf once more. The seam
+            // reports `sleep.deadline()`, read back from the `Sleep`, so it reflects what was
+            // actually armed.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),

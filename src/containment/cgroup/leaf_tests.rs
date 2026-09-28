@@ -56,7 +56,7 @@ fn drain_step_block_carries_the_original_deadline_instant() {
     // An hour out: a populated leaf never takes the zero-remaining shortcut.
     let at = Instant::now() + Duration::from_secs(3600);
     for (deadline, expected) in [(Some(Some(at)), Some(at)), (Some(None), None), (None, None)] {
-        match leaf.drain_step(deadline).expect("drain_step") {
+        match leaf.drain_step(deadline, Instant::now()).expect("drain_step") {
             DrainStep::Block { deadline, .. } => {
                 assert_eq!(
                     deadline, expected,
@@ -71,13 +71,49 @@ fn drain_step_block_carries_the_original_deadline_instant() {
 
     // Already past: the zero-remaining shortcut, not a `Block` carrying a stale instant.
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    match leaf.drain_step(Some(Some(past))).expect("drain_step") {
+    match leaf.drain_step(Some(Some(past)), Instant::now()).expect("drain_step") {
         DrainStep::Done(crate::containment::TreeDrain::MembersRemain) => {}
         DrainStep::Done(other) => {
             panic!("expected Done(MembersRemain) for an already-expired deadline, got Done({other:?})")
         }
         DrainStep::Block { .. } => {
             panic!("expected Done(MembersRemain) for an already-expired deadline, got Block")
+        }
+    }
+}
+
+/// The zero-remaining shortcut's own boundary, pinned exactly through `drain_step` itself (not
+/// just `remaining_at` in isolation, which does not prove this consumer reads it the same way):
+/// `now` one nanosecond before the deadline still takes `Block`; `now` at the deadline takes the
+/// shortcut.
+#[cfg(target_os = "linux")]
+#[test]
+fn drain_step_pins_the_exact_zero_remaining_boundary() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use std::time::{Duration, Instant};
+
+    let fake = FakeLeaf::new("cosca-drain-step-zero-boundary", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    let at = Instant::now() + Duration::from_secs(3600);
+    let deadline = Some(Some(at));
+
+    match leaf
+        .drain_step(deadline, at - Duration::from_nanos(1))
+        .expect("drain_step")
+    {
+        DrainStep::Block { .. } => {}
+        DrainStep::Done(_) => panic!("1ns before the deadline must still take Block, not the shortcut"),
+    }
+
+    match leaf.drain_step(deadline, at).expect("drain_step") {
+        DrainStep::Done(crate::containment::TreeDrain::MembersRemain) => {}
+        DrainStep::Done(other) => {
+            panic!("at the deadline exactly, expected Done(MembersRemain), got Done({other:?})")
+        }
+        DrainStep::Block { .. } => {
+            panic!("at the deadline exactly, drain_step must take the zero-remaining shortcut, not Block")
         }
     }
 }
@@ -120,15 +156,12 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
-/// full mechanism: a real park on the leaf watcher's `event_listener`, proven at the actual wait
-/// site — `wait_drained`'s own `Block` arm (`fault::set_wait_site_park_notifier`), not merely that
-/// `drain_step` reached some intermediate state — and the real kernel `populated` 1→0 transition
-/// once both members are gone.
+/// full mechanism: a real park at `wait_drained`'s `Block` arm, and the real kernel `populated`
+/// 1→0 transition once both members are gone.
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
-    use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::Member;
+    use crate::containment::cgroup::test_support::{assert_bounded_conclusion, Member, WaitObserver};
     use crate::containment::TreeDrain;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -151,9 +184,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     // leaf (see `ReportChannel`), so two members sharing it would read as whichever wrote first.
     //
     // Each member is `cat` reading from a pipe this test holds open and never writes to or closes
-    // until it explicitly kills the member (below): no fixed lifetime of its own, so the "still
-    // alive" assertions below cannot accidentally hold just because a member happened to still be
-    // within some timer.
+    // until it explicitly kills the member (below).
     let spawn_member = |leaf: &crate::containment::cgroup::CgroupLeaf,
                         channel: &crate::containment::cgroup::ReportChannel|
      -> Member {
@@ -180,16 +211,9 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     let mut a = spawn_member(&leaf, &channel_a);
     let mut b = spawn_member(&leaf, &channel_b);
 
-    // Placement, proven through a real signal — not implied by `spawn()`'s return. Per
-    // `ReportChannel`'s own module doc ("When the report is final"), `spawn` returns once std's
-    // own CLOEXEC channel reads EOF, which can happen before the child's `pre_exec` even runs if
-    // two of this process's fds 0, 1 and 2 are already closed, letting std's own channel land in
-    // one of those slots for this test's `Stdio::null()`/`Stdio::piped()` `dup2` to close early —
-    // it only avoids that here because this process's fds 0-2 are open. The report
-    // `ReportChannel::wait` waits for, by contrast, is sent only after
-    // `place_self_in_cgroup_pre_exec`'s `cgroup.procs` write itself returns, so `Placed` here is
-    // real proof both members are already in the leaf — checked, for both members, before
-    // `cgroup.procs` is read below, and before either bounded `wait_drained` call relies on it.
+    // Placement is proven by the `Placed` report, sent only after the `cgroup.procs` write
+    // returns — `spawn()` returning does not imply it (see `ReportChannel`, "When the report is
+    // final").
     for (name, member, mut channel) in [("a", &a, channel_a), ("b", &b, channel_b)] {
         assert_eq!(
             channel.wait(member.0.id()).expect("open a pidfd"),
@@ -205,85 +229,15 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         );
     }
 
-    // A bounded call concludes exactly once through the zero-remaining shortcut: that is the
-    // only path that answers `MembersRemain`, and it never fires before the caller's own
-    // deadline (never early), though nothing here bounds how much later the wake actually runs
-    // (no upper bound on scheduler lateness). Each time `drain_step` announced it was about to
-    // block, a real park at the wait site (`fault::set_wait_site_park_notifier`) must follow, so
-    // the two counts must match. At most one park can genuinely time out — `event_listener`
-    // 5.4.2's `wait_with_parker` reports "not woken" only at or after its deadline — and once
-    // that happens, `drain_step`'s very next entry finds the deadline already spent and
-    // concludes without parking again, so a timed-out park, if any, must be the last one. An
-    // earlier park CAN be `woken: true` on a real cgroup — the kernel's own `cgroup.events`
-    // writes are not guaranteed to imply a membership change. Zero parks is legitimate too: if
-    // enough real time passes before `drain_step`'s own first check, it takes the zero-remaining
-    // shortcut without ever arming a listener — this never happened in practice across the runs
-    // that shaped this test, but nothing here rules it out for correct code, so the assertions
-    // below do not require at least one park.
-    fn assert_bounded_conclusion(
-        parks: &[fault::WaitSitePark],
-        blocks: usize,
-        zero_remainings: usize,
-        expected_deadline: Instant,
-    ) {
-        assert_eq!(
-            zero_remainings, 1,
-            "a bounded call that finds a member still alive must conclude exactly once through \
-             the zero-remaining shortcut, got {zero_remainings}"
-        );
-        assert_eq!(
-            blocks,
-            parks.len(),
-            "drain_step announced blocking {blocks} times, but {} real parks were seen at the \
-             wait site — every announced block must be a real park",
-            parks.len()
-        );
-        // Structural, not timing: every park must be armed with the caller's own deadline
-        // instant exactly. A mutant that arms `wait_deadline`/`timeout_at` with some other
-        // instant (e.g. `at + 50ms`) cannot be told apart from correct code by elapsed time
-        // alone — elapsed time can only prove "not early", never "armed with the right instant".
-        assert!(
-            parks.iter().all(|p| p.deadline == Some(expected_deadline)),
-            "every park in a bounded call must be armed with the caller's own deadline instant \
-             ({expected_deadline:?}) exactly, got {parks:?}"
-        );
-        let timed_out = parks.iter().filter(|p| !p.woken).count();
-        assert!(
-            timed_out <= 1,
-            "at most one park can genuinely time out before the call concludes, got {parks:?}"
-        );
-        if let Some(pos) = parks.iter().rposition(|p| !p.woken) {
-            assert_eq!(
-                pos,
-                parks.len() - 1,
-                "a park that timed out must be the last one — nothing starts a further park \
-                 once the deadline it timed out against has already passed, got {parks:?}"
-            );
-        }
-    }
-
-    const BOUND: Duration = Duration::from_millis(250);
-    let wait_drained_through_the_block_step = || {
-        let (park_tx, park_rx) = mpsc::channel();
-        let (block_tx, block_rx) = mpsc::channel();
-        let (zero_tx, zero_rx) = mpsc::channel();
-        fault::set_wait_site_park_notifier(park_tx);
-        fault::set_drain_blocking_notifier(block_tx);
-        fault::set_drain_zero_remaining_notifier(zero_tx);
+    let bounded_wait_drained = || {
+        const BOUND: Duration = Duration::from_millis(250);
         let start = Instant::now();
         let deadline = start + BOUND;
-        let result = leaf.wait_drained(Some(Some(deadline))).expect("wait_drained");
+        let (result, parks, blocks, zero_remainings) =
+            WaitObserver::run(|| leaf.wait_drained(Some(Some(deadline))).expect("wait_drained"));
         let elapsed = start.elapsed();
-        fault::take_wait_site_park_notifier();
-        fault::take_drain_blocking_notifier();
-        fault::take_drain_zero_remaining_notifier();
-        let parks: Vec<_> = park_rx.try_iter().collect();
-        let blocks = block_rx.try_iter().count();
-        let zero_remainings = zero_rx.try_iter().count();
         assert_bounded_conclusion(&parks, blocks, zero_remainings, deadline);
-        // Never early: the deadline is the wait's own wake time, so it cannot answer before
-        // `start + BOUND`. No upper bound is asserted — how much later the wake actually runs is
-        // scheduler lateness, which this contract makes no promise about.
+        // Never early; no upper bound is asserted (scheduler lateness).
         assert!(
             elapsed >= BOUND,
             "wait_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
@@ -292,7 +246,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     };
 
     assert_eq!(
-        wait_drained_through_the_block_step(),
+        bounded_wait_drained(),
         TreeDrain::MembersRemain,
         "both members are alive; must report MembersRemain"
     );
@@ -301,30 +255,34 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     a.0.kill().expect("kill member a");
     a.0.wait().expect("reap member a");
     assert_eq!(
-        wait_drained_through_the_block_step(),
+        bounded_wait_drained(),
         TreeDrain::MembersRemain,
         "one member is still alive; must still report MembersRemain"
     );
 
-    // Both gone: an UNBOUNDED wait_drained blocks on the real kernel `populated` 1→0 edge, not a
-    // chosen interval — the "external event that might never happen" case the crate's no-sleep-
-    // sync rule allows a real wait for. A bug here hangs the test, surfaced by the CI job's own
-    // timeout, not a duration this test invented.
-    b.0.kill().expect("kill member b");
-    b.0.wait().expect("reap member b");
-    let (park_tx, park_rx) = mpsc::channel();
-    let (block_tx, block_rx) = mpsc::channel();
-    let (zero_tx, zero_rx) = mpsc::channel();
-    fault::set_wait_site_park_notifier(park_tx);
-    fault::set_drain_blocking_notifier(block_tx);
-    fault::set_drain_zero_remaining_notifier(zero_tx);
-    let result = leaf.wait_drained(None).expect("wait_drained once both are gone");
-    fault::take_wait_site_park_notifier();
-    fault::take_drain_blocking_notifier();
-    fault::take_drain_zero_remaining_notifier();
-    let parks: Vec<_> = park_rx.try_iter().collect();
-    let blocks = block_rx.try_iter().count();
-    let zero_remainings = zero_rx.try_iter().count();
+    // Both gone: an UNBOUNDED wait_drained blocks on the real kernel `populated` 1→0 edge — the
+    // "external event that might never happen" case the crate's no-sleep-sync rule allows a real
+    // wait for. Made deterministic without timing: run the wait on its own thread, and kill and
+    // reap the last member only once that thread's own `drain_blocking` signal proves it armed a
+    // listener while the leaf still read populated — a real rendezvous, not a race against how
+    // fast the kernel clears `populated` relative to `wait()` returning. A missed wake then hangs
+    // until the nextest bound on this test, not a duration this test invented.
+    let (rendezvous_tx, rendezvous_rx) = mpsc::channel();
+    let (result, parks, zero_remainings) = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            WaitObserver::run_with_block_sender(rendezvous_tx, || {
+                leaf.wait_drained(None).expect("wait_drained once both are gone")
+            })
+        });
+        rendezvous_rx
+            .recv()
+            .expect("drain_step must announce blocking before wait_drained returns");
+        b.0.kill().expect("kill member b");
+        b.0.wait().expect("reap member b");
+        handle.join().expect("wait_drained thread must not panic")
+    });
+    // The rendezvous already consumed one signal via `recv` above; count whatever else arrived.
+    let blocks = 1 + rendezvous_rx.try_iter().count();
     assert_eq!(
         result,
         TreeDrain::AllMembersExited,
@@ -341,6 +299,10 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         "drain_step announced blocking {blocks} times, but {} real parks were seen at the wait \
          site — every announced block must be a real park",
         parks.len()
+    );
+    assert!(
+        !parks.is_empty(),
+        "the rendezvous above guarantees at least one real park before the kill; got none"
     );
     assert!(
         parks.iter().all(|p| p.deadline.is_none() && p.woken),

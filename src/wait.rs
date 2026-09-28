@@ -187,9 +187,11 @@ fn now() -> Instant {
 ///
 /// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
-    remaining_at(deadline, Instant::now())
+    match deadline {
+        None | Some(None) => None,
+        Some(Some(at)) => Some(at.saturating_duration_since(now())),
+    }
 }
-
 
 /// Convert a relative `duration` into the crate's `deadline` convention
 /// (`Option<Option<Instant>>`, the inverse of [`remaining`]): [`now`]`() + duration`, saturating

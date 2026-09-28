@@ -330,10 +330,9 @@ pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
     }
 }
 
-/// A real, long-lived child placed in a leaf, guarded so a panic anywhere after it spawns cannot
-/// leak the process (or, transitively, the leaf its `Drop` may wait to remove): `Drop` kills and
-/// reaps it. Declare it after the leaf it's placed in, so it drops — and its process is gone —
-/// before the leaf itself tries to.
+/// A real child placed in a leaf; `Drop` kills and reaps it so a panic cannot leak it or block
+/// the leaf's removal. Declare it after its leaf so it drops first. Field 1 is the piped stdin,
+/// held open so `cat` never exits on its own.
 #[cfg(target_os = "linux")]
 pub(crate) struct Member(
     pub(crate) std::process::Child,
@@ -343,8 +342,117 @@ pub(crate) struct Member(
 #[cfg(target_os = "linux")]
 impl Drop for Member {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // Already killed and reaped by the test in the common case; a failure here should only
+        // ever be "already gone" — `kill`'s `InvalidInput` once exited, `wait`'s `ECHILD` once
+        // reaped — never a real signal/reap failure this guard exists to catch.
+        if let Err(e) = self.0.kill() {
+            debug_assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "Member::drop's kill failed unexpectedly: {e}"
+            );
+        }
+        if let Err(e) = self.0.wait() {
+            debug_assert_eq!(
+                e.raw_os_error(),
+                Some(libc::ECHILD),
+                "Member::drop's wait failed unexpectedly: {e}"
+            );
+        }
+    }
+}
+
+/// Installs the drain-wait seams (`set_wait_site_park_notifier`, `set_drain_blocking_notifier`,
+/// `set_drain_zero_remaining_notifier`), uninstalling all three on drop — panic-safe, so a panic
+/// in the closure passed to [`WaitObserver::run`]/[`WaitObserver::run_with_block_sender`] still
+/// leaves this thread's seams clean for whatever runs next.
+#[cfg(target_os = "linux")]
+struct WaitObserverGuard;
+
+#[cfg(target_os = "linux")]
+impl Drop for WaitObserverGuard {
+    fn drop(&mut self) {
+        crate::containment::cgroup::fault::take_wait_site_park_notifier();
+        crate::containment::cgroup::fault::take_drain_blocking_notifier();
+        crate::containment::cgroup::fault::take_drain_zero_remaining_notifier();
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct WaitObserver;
+
+#[cfg(target_os = "linux")]
+impl WaitObserver {
+    /// Run `f` with the seams installed, and return its own result alongside what they saw:
+    /// every real park, how many times `drain_step` announced it was about to block, and how
+    /// many times the zero-remaining shortcut fired.
+    pub(crate) fn run<T>(
+        f: impl FnOnce() -> T,
+    ) -> (T, Vec<crate::containment::cgroup::fault::WaitSitePark>, usize, usize) {
+        let (block_tx, block_rx) = std::sync::mpsc::channel();
+        let (result, parks, zero_remainings) = Self::run_with_block_sender(block_tx, f);
+        (result, parks, block_rx.try_iter().count(), zero_remainings)
+    }
+
+    /// Like `run`, but the caller supplies the `drain_blocking` sender itself — so it (or a
+    /// receiver on another thread, paired with this same sender) can react to the signal while
+    /// the wait is still in progress, before this call returns. The caller owns the count of
+    /// whatever it receives on the matching receiver; this returns only the parks and the
+    /// zero-remaining count.
+    pub(crate) fn run_with_block_sender<T>(
+        block_tx: std::sync::mpsc::Sender<()>,
+        f: impl FnOnce() -> T,
+    ) -> (T, Vec<crate::containment::cgroup::fault::WaitSitePark>, usize) {
+        use crate::containment::cgroup::fault;
+        let (park_tx, park_rx) = std::sync::mpsc::channel();
+        let (zero_tx, zero_rx) = std::sync::mpsc::channel();
+        fault::set_wait_site_park_notifier(park_tx);
+        fault::set_drain_blocking_notifier(block_tx);
+        fault::set_drain_zero_remaining_notifier(zero_tx);
+        let _guard = WaitObserverGuard;
+        let result = f();
+        (result, park_rx.try_iter().collect(), zero_rx.try_iter().count())
+    }
+}
+
+/// A bounded call concludes exactly once via the zero-remaining shortcut, and every announced
+/// block must be a real park (see `WaitSitePark`'s own doc for what "park" proves here). At most
+/// one park times out (event_listener reports "not woken" only at/after its deadline), and it
+/// must be last. Earlier parks may be `woken: true` (cgroup.events writes don't imply a
+/// membership change). Zero parks is legitimate: the first check may already find the deadline
+/// spent.
+#[cfg(target_os = "linux")]
+pub(crate) fn assert_bounded_conclusion(
+    parks: &[crate::containment::cgroup::fault::WaitSitePark],
+    blocks: usize,
+    zero_remainings: usize,
+    expected_deadline: std::time::Instant,
+) {
+    assert_eq!(
+        zero_remainings, 1,
+        "a bounded call that finds a member still alive must conclude exactly once through \
+         the zero-remaining shortcut, got {zero_remainings}"
+    );
+    assert_eq!(
+        blocks,
+        parks.len(),
+        "drain_step announced blocking {blocks} times, but {} real parks were seen at the \
+         wait site — every announced block must be a real park",
+        parks.len()
+    );
+    // Structural: elapsed time proves only "not early", not "armed with the right instant".
+    assert!(
+        parks.iter().all(|p| p.deadline == Some(expected_deadline)),
+        "every park in a bounded call must report the caller's own requested deadline instant \
+         exactly, got {parks:?}"
+    );
+    let timed_out = parks.iter().filter(|p| !p.woken).count();
+    assert!(
+        timed_out <= 1,
+        "at most one park can genuinely time out before the call concludes, got {parks:?}"
+    );
+    if let Some(pos) = parks.iter().rposition(|p| !p.woken) {
+        assert_eq!(pos, parks.len() - 1, "a timed-out park must be the last, got {parks:?}");
     }
 }
 

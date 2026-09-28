@@ -98,7 +98,12 @@ pub(crate) fn take_drain_blocking_notifier() {
 pub(crate) fn notify_drain_blocking() {
     DRAIN_BLOCKING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
-            let _ = notify.send(());
+            // A send failure while a notifier is installed means its receiver was dropped early
+            // — a contract violation by the test that installed it, not something to swallow.
+            debug_assert!(
+                notify.send(()).is_ok(),
+                "drain-blocking notifier's receiver was dropped"
+            );
         }
     });
 }
@@ -115,24 +120,29 @@ pub(crate) fn take_drain_zero_remaining_notifier() {
 pub(crate) fn notify_drain_zero_remaining() {
     DRAIN_ZERO_REMAINING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
-            let _ = notify.send(());
+            debug_assert!(
+                notify.send(()).is_ok(),
+                "zero-remaining notifier's receiver was dropped"
+            );
         }
     });
 }
 
-/// The instant `wait_drained`'s own `Block` arm actually armed a bounded park with — `None` for
-/// an unbounded one, which has no instant to arm. Carries the armed value itself, not merely
-/// whether one existed, so a test can assert it against the caller's own deadline exactly: a
-/// primitive armed with the wrong instant is a structural defect, not a timing one.
+/// What `wait_drained`'s own `Block` arm saw when its wait call returned — including a listener
+/// already notified at registration, before any real park. `deadline` is the caller's own
+/// requested instant for a bounded park, not necessarily the one actually armed (`wait_deadline`
+/// consumes the listener, with no way to read that back) — `None` for an unbounded park, whose
+/// `woken` is always `true`: it has no timeout to elapse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WaitSitePark {
     pub(crate) deadline: Option<std::time::Instant>,
     pub(crate) woken: bool,
 }
 
-/// Send on `notify` each time `wait_drained`'s own `Block` arm makes a real park on the leaf
-/// watcher's `event_listener` — proof of the actual wait, not merely that `drain_step` armed a
-/// listener for one. Kept until [`take_wait_site_park_notifier`].
+/// Send on `notify` each time `wait_drained`'s own `Block` arm's wait call returns — proof the
+/// call was reached, not that a real park happened: it also fires for a listener already
+/// notified at registration, before `wait_deadline`/`wait` ever parks. Kept until
+/// [`take_wait_site_park_notifier`].
 pub(crate) fn set_wait_site_park_notifier(notify: std::sync::mpsc::Sender<WaitSitePark>) {
     WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
 }
@@ -142,15 +152,16 @@ pub(crate) fn take_wait_site_park_notifier() {
 pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
     WAIT_SITE_PARK.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {
-            let _ = notify.send(park);
+            debug_assert!(
+                notify.send(park).is_ok(),
+                "wait-site-park notifier's receiver was dropped"
+            );
         }
     });
 }
 
-/// The instant the tokio twin (`cgroup_wait_tree_drained`) actually armed a bounded park with —
-/// `None` for an unbounded one. Same shape and purpose as [`WaitSitePark`], for the async wait
-/// site `timeout_at` runs at. Exists only with the `tokio` feature, since the twin it instruments
-/// does.
+/// The instant the tokio twin (`cgroup_wait_tree_drained`) armed a bounded park with (`None` if
+/// unbounded); the async counterpart of [`WaitSitePark`].
 #[cfg(feature = "tokio")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TokioWaitSitePark {
@@ -174,7 +185,10 @@ pub(crate) fn take_tokio_wait_site_park_notifier() {
 pub(crate) fn notify_tokio_wait_site_park(park: TokioWaitSitePark) {
     TOKIO_WAIT_SITE_PARK.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {
-            let _ = notify.send(park);
+            debug_assert!(
+                notify.send(park).is_ok(),
+                "tokio-wait-site-park notifier's receiver was dropped"
+            );
         }
     });
 }

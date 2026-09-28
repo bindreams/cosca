@@ -529,14 +529,13 @@ impl CgroupLeaf {
         use event_listener::Listener as _;
 
         loop {
-            match self.drain_step(deadline)? {
+            match self.drain_step(deadline, std::time::Instant::now())? {
                 DrainStep::Done(drain) => return Ok(drain),
                 DrainStep::Block {
                     listener,
                     deadline: None,
                 } => {
                     listener.wait();
-                    // No deadline to arm: this only ever returns because it was woken.
                     #[cfg(test)]
                     fault::notify_wait_site_park(fault::WaitSitePark {
                         deadline: None,
@@ -561,21 +560,24 @@ impl CgroupLeaf {
     }
 
     /// One step of a wait on the leaf's drain, shared by the sync and async waits: read the leaf,
-    /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump
-    /// (which can itself take real time — spawning its thread), and read it again: a change after
-    /// that read is always heard, so the caller may block on the returned listener until
-    /// `deadline`, then take another step. Returns `deadline`'s own instant unchanged, in
-    /// `Block` — see its doc for why.
+    /// and answer if it has drained or `deadline` has passed as of `now`. Otherwise listen,
+    /// starting the pump (which can itself take real time — spawning its thread), and read it
+    /// again: a change after that read is always heard, so the caller may block on the returned
+    /// listener until `deadline`, then take another step. Returns `deadline`'s own instant
+    /// unchanged, in `Block` — see its doc for why. `now` is the caller's own reading of the
+    /// clock, not read fresh here, so a test can pin the zero-remaining shortcut's boundary
+    /// exactly.
     pub(crate) fn drain_step(
         &self,
         deadline: Option<Option<std::time::Instant>>,
+        now: std::time::Instant,
     ) -> Result<DrainStep, crate::error::Error> {
         use crate::containment::TreeDrain;
 
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
-        if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+        if crate::wait::remaining_at(deadline, now) == Some(std::time::Duration::ZERO) {
             #[cfg(test)]
             fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
