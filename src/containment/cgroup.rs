@@ -117,9 +117,6 @@ pub(crate) use leaf::*;
 #[path = "cgroup/fault.rs"]
 pub(crate) mod fault;
 
-// Not `target_os = "linux"`: this module's own items are individually cfg-gated (most stay
-// Linux-only, since they reach real cgroup machinery), but `alone` inside it is plain std and
-// used by `child::spawn::fd_map::fd_map_tests`, which builds on every Unix — see `alone`'s own doc.
-#[cfg(all(unix, test))]
+#[cfg(all(target_os = "linux", test))]
 #[path = "cgroup/test_support.rs"]
 pub(crate) mod test_support;

@@ -34,6 +34,20 @@ pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     child::spawn::spawn_lock()
 }
 
+// Self-referential alias: `tests/common/isolation.rs` is included from both this crate's own
+// `#[cfg(test)]` unit tests (below, mounted at `crate::test_isolation`) and every integration
+// test binary in `tests/*.rs` (mounted via `tests/common/mod.rs`'s `mod isolation;`). `crate::`
+// means something different at each mount point, so that shared file names this crate's own
+// public API through the crate name `cosca` uniformly; this alias is what makes `cosca::` resolve
+// from inside the crate too.
+#[cfg(all(unix, test))]
+extern crate self as cosca;
+
+/// The lib's own copy of `tests/common/isolation.rs` — see that file's module doc.
+#[cfg(all(unix, test))]
+#[path = "../tests/common/isolation.rs"]
+pub(crate) mod test_isolation;
+
 mod command;
 // Off Windows only the `Exact` completion (`resolve::exact`) is consumed, so the lib build sees
 // the search policy as dead. The module is deliberately NOT cfg-gated: keeping it platform-independent is what makes

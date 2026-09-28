@@ -1,4 +1,5 @@
-use crate::containment::cgroup::test_support::{alone, block_on, childs_copy, fork_running, reap};
+use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
+use crate::test_isolation::alone;
 use crate::containment::cgroup::PlacementReport;
 
 /// The child's self-placement errno crosses `fork` into the parent. Deterministic and
