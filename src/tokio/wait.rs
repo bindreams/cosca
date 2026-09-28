@@ -365,9 +365,11 @@ pub(crate) async fn cgroup_wait_tree_drained(
                 listener,
                 deadline: None,
             } => listener.await,
-            // `timeout_at` takes the caller's own instant directly as its wake time: how long it
-            // took to get from `drain_step`'s entry to here changes nothing about when this
-            // wait wakes.
+            // `timeout_at` is armed with the caller's own instant directly: how long it took to
+            // get from `drain_step`'s entry to here changes nothing about that instant. Its
+            // timer wheel rounds up to its own granularity (1ms), so the wake can still land
+            // somewhat after the instant, but never before it, and never later by this step's
+            // own choice.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),

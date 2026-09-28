@@ -138,13 +138,11 @@ impl DrainWatch {
         }
     }
 
-    /// Block until the leaf drains or `deadline` passes (see [`crate::wait::remaining`]). No
-    /// interval: each round is one `poll` for the caller's own remaining time. `poll(2)`, unlike
-    /// `event_listener::Listener::wait_deadline`, has no absolute-deadline form: `remaining` is
-    /// read as the very last step before `poll`, with nothing else — not even the test-only hook
-    /// below — between that read and the call, so nothing here can let the syscall's relative
-    /// timeout go stale before it starts.
-    pub(crate) fn wait(&mut self, deadline: Option<Option<std::time::Instant>>) -> Result<TreeDrain, Error> {
+    /// Block until the leaf drains — `populated` reads 0, or the leaf is removed. Unbounded: its
+    /// one caller (`CgroupLeaf::block_until_drained`, an armed `Drop`'s own teardown) never has a
+    /// deadline to honor. A bounded wait goes through `CgroupLeaf::wait_drained`'s own `Block`
+    /// arm instead (`event_listener::Listener::wait_deadline`), which this type never sees.
+    pub(crate) fn wait(&mut self) -> Result<TreeDrain, Error> {
         use rustix::event::{poll, PollFd, PollFlags};
 
         loop {
@@ -153,19 +151,8 @@ impl DrainWatch {
             }
             #[cfg(test)]
             super::fault::notify_drain_blocking();
-            #[cfg(test)]
-            super::fault::run_before_poll_recompute_hook();
-            let remaining = crate::wait::remaining(deadline);
-            if remaining == Some(std::time::Duration::ZERO) {
-                return Ok(TreeDrain::MembersRemain);
-            }
-            let ts = remaining.map(|d| rustix::event::Timespec {
-                tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
-                tv_nsec: d.subsec_nanos() as _,
-            });
             let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
-            match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => return Ok(TreeDrain::MembersRemain),
+            match poll(&mut fds, None) {
                 Ok(_) => drop(self.consume()?),
                 Err(rustix::io::Errno::INTR) => {}
                 Err(e) => return Err(Error::Io(e.into())),

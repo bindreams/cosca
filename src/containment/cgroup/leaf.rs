@@ -87,12 +87,14 @@ pub(crate) enum DrainStep {
     /// The wait's answer.
     Done(crate::containment::TreeDrain),
     /// Block on `listener` until `deadline` (`None`: unbounded), then step again. Carries the
-    /// caller's own absolute instant, not a duration computed from it: a duration goes stale by
-    /// however long elapses between computing it and starting the wait, making the wait choose
-    /// to run past the caller's own deadline by that much. Waiting on the instant directly —
-    /// `event_listener::Listener::wait_deadline` and `tokio::time::timeout_at` both take it —
-    /// means the wait's own wake time is always the caller's deadline, not something later that
-    /// this step chose.
+    /// caller's own instant, not a duration computed from it: a duration goes stale by however
+    /// long elapses between computing it and starting the wait, making the wait choose to start
+    /// later than the caller's own deadline. The instant is armed with `event_listener::Listener::
+    /// wait_deadline`/`tokio::time::timeout_at` directly instead, so the wait is never late by
+    /// this step's own choice — never early either. Either primitive can still wake somewhat
+    /// after the instant it was armed with (`wait_deadline` goes through a relative futex
+    /// timeout under the hood; `timeout_at` rounds up to its own timer wheel's granularity), but
+    /// that lateness is the primitive's own, not something this step or its caller chose.
     Block {
         listener: event_listener::EventListener,
         deadline: Option<std::time::Instant>,
@@ -539,9 +541,10 @@ impl CgroupLeaf {
                     listener,
                     deadline: None,
                 } => listener.wait(),
-                // `wait_deadline` takes the caller's own instant directly as its wake time: how
-                // long it took to get from `drain_step`'s entry to here changes nothing about
-                // when this wait wakes.
+                // `wait_deadline` is armed with the caller's own instant directly: how long it
+                // took to get from `drain_step`'s entry to here changes nothing about that
+                // instant. It can still wake somewhat after it (a relative futex timeout under
+                // the hood), but never before, and never later by this step's own choice.
                 DrainStep::Block {
                     listener,
                     deadline: Some(at),
@@ -554,12 +557,12 @@ impl CgroupLeaf {
     /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump
     /// (which can itself take real time — spawning its thread), and read it again: a change after
     /// that read is always heard, so the caller may block on the returned listener until
-    /// `deadline`, then take another step. `Block` carries `deadline`'s own absolute instant
-    /// unchanged, never a duration computed from it here: a duration would go stale by however
-    /// long `listen()`'s own setup time — or anything else between this step and the caller's
-    /// wait — eats into it, making the wait choose to run past the caller's own deadline by that
-    /// much. Carrying the instant instead means the wait's wake time is always the caller's
-    /// deadline itself.
+    /// `deadline`, then take another step. `Block` carries `deadline`'s own instant unchanged,
+    /// never a duration computed from it here: a duration would go stale by however long
+    /// `listen()`'s own setup time — or anything else between this step and the caller's wait —
+    /// eats into it, making the wait choose to start later than the caller's own deadline.
+    /// Carrying the instant instead means the caller arms its wait with that instant directly,
+    /// so the wait is never late by this step's own choice.
     pub(crate) fn drain_step(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -570,13 +573,9 @@ impl CgroupLeaf {
             return Ok(DrainStep::Done(drain));
         }
         if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
-            #[cfg(test)]
-            fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
         }
         let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
-        #[cfg(test)]
-        fault::run_after_listen_hook();
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
@@ -627,7 +626,7 @@ impl CgroupLeaf {
     fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
         // Stops and joins the pump first: the watch is then this `Drop`'s alone.
         match self.watch.get_mut() {
-            Some(watch) => watch.wait(None).map(drop),
+            Some(watch) => watch.wait().map(drop),
             None => Ok(()),
         }
     }

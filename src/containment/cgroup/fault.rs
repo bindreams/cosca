@@ -24,9 +24,6 @@ thread_local! {
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
-    static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
-    static AFTER_LISTEN: std::cell::RefCell<Option<AfterListenHook>> = const { std::cell::RefCell::new(None) };
-    static BEFORE_POLL_RECOMPUTE: std::cell::RefCell<Option<BeforePollRecomputeHook>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
@@ -96,57 +93,6 @@ pub(crate) fn notify_drain_blocking() {
             let _ = notify.send(());
         }
     });
-}
-
-/// Send on `notify` each time a leaf's drain step on this thread takes its zero-remaining
-/// shortcut — answers `MembersRemain` from a step that arms no listener.
-pub(crate) fn notify_drain_zero_remaining() {
-    DRAIN_ZERO_REMAINING.with(|d| {
-        if let Some(notify) = d.borrow().as_ref() {
-            let _ = notify.send(());
-        }
-    });
-}
-
-/// A rendezvous for the NEXT `drain_step` call on this thread that reaches the point right after
-/// `Watcher::listen()` succeeds: `ready` and `release`, respectively sent and awaited by
-/// [`run_after_listen_hook`]. Nothing in this PR arms it — it is the lost-wakeup recheck's seam,
-/// left as production instrumentation for the next test that needs to pause `drain_step` there.
-type AfterListenHook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
-
-/// Run the hook armed on this thread, if any: send on `ready`, proving `drain_step` reached this
-/// point, then block on `release` until the test lets it continue — a real wait, never a sleep.
-/// A no-op if unarmed.
-pub(crate) fn run_after_listen_hook() {
-    let Some((ready, release)) = AFTER_LISTEN.with(|h| h.borrow_mut().take()) else {
-        return;
-    };
-    let _ = ready.send(());
-    let _ = release.recv();
-}
-
-/// A rendezvous for the NEXT `DrainWatch::wait` round on this thread that reaches the point right
-/// before it (re)reads [`crate::wait::remaining`]: `ready` and `release`, respectively sent and
-/// awaited by [`run_before_poll_recompute_hook`].
-type BeforePollRecomputeHook = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
-
-/// Arm the rendezvous above. Take semantics: consumed by the next [`run_before_poll_recompute_hook`]
-/// call on this thread, so a second `wait` round on the same thread runs unhooked.
-pub(crate) fn set_before_poll_recompute_hook(
-    ready: std::sync::mpsc::Sender<()>,
-    release: std::sync::mpsc::Receiver<()>,
-) {
-    BEFORE_POLL_RECOMPUTE.with(|h| *h.borrow_mut() = Some((ready, release)));
-}
-/// Run the hook armed on this thread, if any: send on `ready`, proving `wait` reached this point
-/// with nothing left to do but read `remaining` and poll, then block on `release` until the test
-/// lets it continue — a real wait, never a sleep. A no-op if unarmed.
-pub(crate) fn run_before_poll_recompute_hook() {
-    let Some((ready, release)) = BEFORE_POLL_RECOMPUTE.with(|h| h.borrow_mut().take()) else {
-        return;
-    };
-    let _ = ready.send(());
-    let _ = release.recv();
 }
 
 /// Record, on this thread, each `cgroup.kill` write (`"kill"`) and each `rmdir` of a leaf, the

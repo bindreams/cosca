@@ -45,7 +45,7 @@ fn unrelated_errnos_are_not_removed_after_drain() {
 /// duration to `wait_drained`'s `listener.wait_timeout(left)`. Any real time spent between the
 /// two points — a slow thread spawn, say — meant the wait chose to run for the ORIGINAL `left`
 /// all over again once started, past the caller's own deadline by however long that gap was: the
-/// wait's wake time was no longer the caller's deadline, but something later this step chose.
+/// wait was armed with something later than the caller's own deadline, chosen by this step.
 ///
 /// `Block` now carries `deadline`'s own instant unchanged instead, for `wait_deadline`/
 /// `timeout_at` to wait against directly — there is no duration to go stale, so this is a
@@ -75,10 +75,10 @@ fn drain_step_block_carries_the_original_deadline_instant() {
             "Block must carry the caller's own deadline instant unchanged, not a duration \
              recomputed from it here: a recomputed duration goes stale by however long elapses \
              between this step returning and the caller actually starting its wait, making the \
-             wait choose a wake time later than the caller's own deadline. Carrying the instant \
-             itself, for `wait_deadline`/`timeout_at` to wait against directly, keeps the wait's \
-             wake time exactly the caller's deadline regardless of any such delay — no timing \
-             needed to prove it, since the value is asserted structurally"
+             wait choose to arm itself with something later than the caller's own deadline. \
+             Carrying the instant itself, for `wait_deadline`/`timeout_at` to arm against \
+             directly, keeps that armed instant exactly the caller's deadline regardless of any \
+             such delay — no timing needed to prove it, since the value is asserted structurally"
         ),
         DrainStep::Done(_) => {
             panic!("expected Block: a populated fake leaf with an hour left must not shortcut to Done")
