@@ -700,10 +700,12 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     // below has genuinely reached and passed judgment on a real event. `tokio::select!` polls
     // both branches with the REAL task waker — not a hand-rolled one — so the reactor
     // registration and wake-up are exactly what any other caller of this future gets, not a
-    // synthetic substitute this test would have to trust on faith. `armed_rx` is unused past
-    // the handshake, kept only so the channel doesn't fill; this test does not need to
-    // synchronize on it separately; the future's own first poll, inside `select!` below, is
-    // what arms it.
+    // synthetic substitute this test would have to trust on faith. `armed_tx` exists only
+    // because `wait_tree_drained_for_test`'s signature requires it (other callers, like the
+    // two-concurrent-waiters test above, DO need to synchronize on it); `_armed_rx` is bound and
+    // immediately unused here — `std::sync::mpsc::channel` is unbounded, and the send inside
+    // `wait_tree_drained_inner` discards its own result either way, so this test simply has no
+    // reason to read it.
     let (armed_tx, _armed_rx) = std::sync::mpsc::channel();
     let (declined_tx, mut declined_rx) = ::tokio::sync::mpsc::unbounded_channel();
     let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(

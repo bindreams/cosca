@@ -249,8 +249,10 @@ fn interpret_read_event(
 /// distinct rather than collapsed to `Option<TreeDrain>`: a caller that needs to know whether a
 /// REAL, interpreted event occurred (a test proving a watch loop "saw readiness and declined to
 /// drain", as opposed to a spurious wakeup with nothing pending at all) cannot tell those two
-/// `None`-shaped cases apart otherwise. `probe`/`block_until_drained` don't need the distinction
-/// and fold `Declined` and `Spurious` back together.
+/// `None`-shaped cases apart otherwise. `probe` (the only production caller of `drain_kqueue`
+/// itself — `block_until_drained` calls `interpret_read_event` directly, through
+/// `wait::backend::block_on_kqueue`) doesn't need the distinction and folds `Declined` and
+/// `Spurious` back together.
 pub(crate) enum DrainOutcome {
     /// `EV_EOF` — a terminal verdict.
     Drained(TreeDrain),
@@ -304,10 +306,10 @@ pub(crate) fn drain_kqueue(
 
 /// One-shot drain check: exact, not heuristic — arms a private kqueue and reads its
 /// zero-timeout verdict off `EV_EOF`, the same signal `block_until_drained` uses (advisory, per
-/// this module's `TreeDrain::AllMarkersClosed` — see that type's own doc). `Ok(None)` from
-/// `drain_kqueue` (nothing pending yet) means a write end is open with nothing queued:
-/// `MembersRemain`, correctly, since `AllMarkersClosed` is only ever reported when the kernel
-/// itself said `EV_EOF`.
+/// this module's `TreeDrain::AllMarkersClosed` — see that type's own doc). `drain_kqueue`
+/// returning `DrainOutcome::Declined` or `DrainOutcome::Spurious` (nothing pending, or something
+/// pending but not `EV_EOF`) both fold to `MembersRemain` here, correctly, since
+/// `AllMarkersClosed` is only ever reported when the kernel itself said `EV_EOF`.
 ///
 /// A zero-timeout check IS a check at expiry (principle 13) — see `interpret_read_event`'s doc
 /// for why this always passes `suppress_drain = true` to `drain_kqueue` while still arming
