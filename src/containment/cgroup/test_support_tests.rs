@@ -276,37 +276,55 @@ fn defuse_disarms_the_guard() {
 
 /// `fork_running` must hold `spawn_lock()` across its `fork()`, not just release it before —
 /// otherwise a concurrent cosca spawn elsewhere in this test binary can inherit an fd that
-/// exists only inside that spawn's own `spawn_lock` section (`#200`'s finding).
+/// exists only inside that spawn's own `spawn_lock` section.
 ///
-/// Proved through a seam, observed AFTER the fork, not before it: the hook fires on
-/// `fork_running`'s own thread right after its `fork()` returns in the parent, still holding
-/// `spawn_lock`, and blocks there until this test releases it. Two independent, deterministic
-/// checks while it is blocked, neither timing-dependent:
-/// - the hook is handed the child's real pid, which only exists once `fork()` has actually
-///   returned — this test confirms it independently of the hook's own honesty, via `kill(pid, 0)`
-///   asking the kernel directly whether that pid is a live process right now;
-/// - a `#[cfg(test)]` non-blocking `try_spawn_lock_for_test` on the very same mutex either
-///   refuses immediately (`WouldBlock`, the lock is genuinely held) or succeeds (it is not) — a
-///   real `Mutex::try_lock` never spins or blocks waiting to find out.
+/// Two independent, deterministic checks, neither timing-dependent:
 ///
-/// Together they rule out both a seam that fires before the fork (no real pid to hand it) and a
-/// `fork_running` that never takes the lock at all (`try_lock` would simply succeed).
+/// - **From the child, not the parent.** The child reports, over a pipe with a raw `write(2)`,
+///   its own inherited copy of a thread-local flag `spawn_lock_tracked` set on the forking
+///   thread right before the fork. A check the PARENT makes after the fork returns cannot tell
+///   "held across the fork" apart from "dropped just before the fork and re-acquired just after
+///   it" — both look identical from the parent's later vantage point — but the child already
+///   forked away, with its own copy of the flag, before any such re-acquisition could happen. A
+///   plain `Cell<bool>` read plus `write(2)` are both async-signal-safe.
+///   (A prior version of this test used a non-blocking `try_lock` from a second thread instead;
+///   that is provably unreliable outside this one test process — under plain `cargo test`, any
+///   OTHER test's own concurrent hold of the same process-global lock also makes `try_lock`
+///   refuse, for a reason that has nothing to do with `fork_running`. It failed to catch a
+///   before-the-fork mutant for the opposite reason: by the time the parent-side check ran, a
+///   mutant that drops the lock before the fork and re-acquires it in the parent arm had already
+///   made it true again.)
+/// - **A seam that cannot compile before the fork.** `fork_running`'s post-fork hook is handed
+///   the child's real pid, which only exists once `fork()` has actually returned — a hook moved
+///   to before the fork this lock is meant to cover has no pid to pass, so it cannot compile as
+///   this same call. This test blocks the hook and independently confirms the pid it was handed
+///   names a live process right now, via `kill(pid, 0)`, sending nothing.
 #[cfg(target_os = "linux")]
 #[test]
 fn fork_running_holds_spawn_lock_across_the_fork() {
+    use std::os::fd::AsRawFd;
     use std::sync::mpsc;
+
+    let (report_read, report_write) = std::io::pipe().expect("open the report pipe");
+    let report_write_fd = report_write.as_raw_fd();
 
     let (tx_started, rx_started) = mpsc::channel::<u32>();
     let (tx_release, rx_release) = mpsc::channel::<()>();
 
     let fork_thread = std::thread::spawn(move || {
-        crate::containment::cgroup::fault::set_between_spawn_lock_and_fork(move |child_pid| {
+        // Set on THIS thread, not the test's own: `fork_running` runs here, and the report seam
+        // is a thread-local — the forked child inherits whichever thread's own copy called
+        // `fork()`, not the test's.
+        crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_write_fd);
+        crate::containment::cgroup::fault::set_after_fork_still_locked(move |child_pid| {
             tx_started
                 .send(child_pid)
                 .expect("the test thread is still waiting to receive");
-            rx_release
-                .recv()
-                .expect("the test thread still holds the release sender");
+            // Not `.expect(...)`: a panic here, on this thread, must not matter — `fork_running`
+            // has already built the child's `KillOnDrop` before calling this hook, so however
+            // this recv ends, the caller below still reaps the child through `fork_thread`'s
+            // returned value or its own unwind.
+            let _ = rx_release.recv();
         });
         fork_running(|| {
             // SAFETY: `pause` is async-signal-safe.
@@ -320,9 +338,8 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
         .expect("fork_thread must reach the hook before this returns");
 
     // The hook can only be called with a real pid from the PARENT arm, after `fork()` has
-    // already returned — a hook moved to before the `fork()` this lock is meant to cover has no
-    // pid to pass. Confirmed independently of the hook's own honesty: `kill(pid, 0)` asks the
-    // kernel directly whether a process at that pid exists right now, sending nothing.
+    // already returned — confirmed independently of the hook's own honesty: `kill(pid, 0)` asks
+    // the kernel directly whether a process at that pid exists right now, sending nothing.
     // SAFETY: signal 0 sends nothing; it only queries existence/permission.
     assert_eq!(
         unsafe { libc::kill(child_pid as i32, 0) },
@@ -331,22 +348,26 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
         std::io::Error::last_os_error()
     );
 
-    assert!(
-        matches!(
-            crate::child::spawn::try_spawn_lock_for_test(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ),
-        "spawn_lock must still be held on fork_running's own thread, after its fork, while the \
-         hook is blocked"
-    );
-
     tx_release
         .send(())
         .expect("fork_thread's hook is still waiting to receive");
 
-    // Not re-checked as free afterward: `spawn_lock` is process-global, shared with every other
-    // test in this binary that may spawn concurrently, so its state right after this thread's
-    // own release is not this test's to assert on.
     let guard = fork_thread.join().expect("fork_thread must not panic");
+
+    // Our own copy of the write end, dropped so only the child's keeps the pipe open: the
+    // blocking read below waits for the child's report (written before it ever reaches `body()`,
+    // no ordering assumed relative to `fork_thread`'s own join above) or, if the child never
+    // wrote one, for its own exit to close its inherited copy — read then answers `0`, not `1`.
+    drop(report_write);
+    let mut held = 0u8;
+    // SAFETY: `report_read`'s fd is an open read end; `held` is a valid one-byte buffer.
+    let n = unsafe { libc::read(report_read.as_raw_fd(), (&raw mut held).cast(), 1) };
+    assert_eq!(n, 1, "the child must have reported before exiting");
+    assert_eq!(
+        held, 1,
+        "spawn_lock must have been held, from the forking thread's own point of view, at the \
+         exact instant of the fork"
+    );
+
     drop(guard);
 }

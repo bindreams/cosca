@@ -380,18 +380,49 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 
 static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A non-blocking probe on the exact same mutex [`spawn_lock`] locks, for a test to prove the
-/// lock is genuinely held at a given point — a real contended `Mutex::try_lock` either refuses
-/// immediately (`WouldBlock`) or succeeds; it never spins or blocks waiting to find out, so this
-/// cannot pass by scheduling luck the way racing two threads against a shared flag can.
-///
-/// `cfg`'d to match its one caller's own reachability (`fork_running`'s test, Linux-only): a
-/// wider `#[cfg(test)]` alone would compile this on every OS while never being called on most of
-/// them, a real `dead_code` warning, not a false one.
+thread_local! {
+    /// Whether THIS thread currently holds `SPAWN_MUTEX`, set and cleared only by
+    /// [`spawn_lock_tracked`]'s guard. A plain `Cell<bool>`: reading or writing it is a memory
+    /// access only, no allocation or syscall, so async-signal-safe — a forked child may read its
+    /// own inherited copy (whatever the forking thread's copy held at the instant of the fork)
+    /// from inside the child, after `fork()`, without waiting on anything external.
+    ///
+    /// `cfg`'d to match its one use (`fork_running`'s own acquisition and its test, both
+    /// Linux-only): a wider `#[cfg(test)]` alone would compile this on every OS while it stays
+    /// unused on most of them, a real `dead_code` warning, not a false one.
+    #[cfg(all(target_os = "linux", test))]
+    static SPAWN_LOCK_HELD_BY_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`spawn_lock`]'s guard, plus clearing the held-by-this-thread flag on drop.
 #[cfg(all(target_os = "linux", test))]
-pub(crate) fn try_spawn_lock_for_test(
-) -> Result<std::sync::MutexGuard<'static, ()>, std::sync::TryLockError<std::sync::MutexGuard<'static, ()>>> {
-    SPAWN_MUTEX.try_lock()
+pub(crate) struct TrackedSpawnLockGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(target_os = "linux", test))]
+impl Drop for TrackedSpawnLockGuard {
+    fn drop(&mut self) {
+        SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(false));
+    }
+}
+
+/// Locks the exact same mutex [`spawn_lock`] does — a real cosca spawn contending with this test
+/// helper's own fork blocks on, and is blocked by, the very same `Mutex` — while also recording,
+/// for [`spawn_lock_held_by_this_thread`], that this thread now holds it. Test-only: production
+/// spawns use the plain [`spawn_lock`]; only `fork_running`'s own test needs the thread-local
+/// record.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn spawn_lock_tracked() -> TrackedSpawnLockGuard {
+    let guard = SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(true));
+    TrackedSpawnLockGuard { _guard: guard }
+}
+
+/// Whether THIS thread currently holds `spawn_lock`'s mutex, per [`spawn_lock_tracked`].
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
+    SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.get())
 }
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {

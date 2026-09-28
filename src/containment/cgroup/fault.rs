@@ -39,7 +39,8 @@ thread_local! {
     static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static BETWEEN_SPAWN_LOCK_AND_FORK: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
+    static AFTER_FORK_STILL_LOCKED: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
+    static FORK_RUNNING_LOCK_HELD_REPORT_FD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -459,19 +460,35 @@ pub(crate) fn run_before_exit_wait() {
 }
 
 /// Run `hook` in the NEXT `fork_running` call on this thread, with the child's real pid, in the
-/// parent arm right after `fork()` returns, still holding `spawn_lock`. Takes the pid (not `()`)
-/// so a test can independently confirm the fork already happened by this point (a live process
-/// exists at that pid) — a hook moved to BEFORE the `fork()` this lock is meant to cover has no
-/// real pid to pass and cannot compile as this call. Shares `PidHook` (`AFTER_FINAL_READ`'s
-/// type) rather than a fresh single-use closure type, which is what tripped clippy's
-/// `type_complexity` under `-D warnings`.
-pub(crate) fn set_between_spawn_lock_and_fork(hook: impl FnOnce(u32) + 'static) {
-    BETWEEN_SPAWN_LOCK_AND_FORK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+/// parent arm right after `fork()` returns and its `KillOnDrop` is built, still holding
+/// `spawn_lock`. Takes the pid (not `()`) so a test can independently confirm the fork already
+/// happened by this point (a live process exists at that pid) — a hook moved to BEFORE the
+/// `fork()` this lock is meant to cover has no real pid to pass and cannot compile as this call.
+/// Shares `PidHook` (`AFTER_FINAL_READ`'s type) rather than a fresh single-use closure type,
+/// which is what tripped clippy's `type_complexity` under `-D warnings`.
+pub(crate) fn set_after_fork_still_locked(hook: impl FnOnce(u32) + 'static) {
+    AFTER_FORK_STILL_LOCKED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
 }
-pub(crate) fn run_between_spawn_lock_and_fork(child_pid: u32) {
-    if let Some(hook) = BETWEEN_SPAWN_LOCK_AND_FORK.with(|h| h.borrow_mut().take()) {
+pub(crate) fn run_after_fork_still_locked(child_pid: u32) {
+    if let Some(hook) = AFTER_FORK_STILL_LOCKED.with(|h| h.borrow_mut().take()) {
         hook(child_pid);
     }
+}
+
+/// Give the NEXT `fork_running` CHILD (not the parent) a raw fd to report, as a single byte (`1`
+/// or `0`), whether `spawn_lock` was held — from the forking thread's own point of view, at the
+/// exact instant of the fork — via
+/// [`spawn_lock_held_by_this_thread`](crate::child::spawn::spawn_lock_held_by_this_thread)'s
+/// inherited copy. Unlike a check the PARENT makes after the fork returns, this cannot be fooled
+/// by a lock dropped before the fork and re-acquired afterward, nor by an unrelated concurrent
+/// spawn elsewhere holding the SAME global lock: the child already forked away with its own
+/// private copy of the flag before either could happen. Take semantics, read in the child (a
+/// separate address space after `fork()`, so taking it there cannot race the parent).
+pub(crate) fn set_fork_running_lock_held_report_fd(fd: std::os::fd::RawFd) {
+    FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.set(Some(fd)));
+}
+pub(crate) fn take_fork_running_lock_held_report_fd() -> Option<std::os::fd::RawFd> {
+    FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.take())
 }
 
 /// Count an abandoned child signalled by its bare pid on this thread.
