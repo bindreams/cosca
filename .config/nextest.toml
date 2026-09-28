@@ -1,7 +1,20 @@
 nextest-version = { required = "0.9.137" }
 
+# A failure bound for `accept_or_die`'s own regression test (tests/process.rs): it asserts that a
+# dead-before-connecting target panics rather than hanging the caller. A mutant that broke that
+# guarantee back into a hang would otherwise wedge the whole run instead of just failing this one
+# test — this bound turns that into a fast, attributable failure. Set on both `default` (so a
+# local run gets it too) and `ci`.
+[[profile.default.overrides]]
+filter = 'test(accept_or_die_panics_loudly_when_the_target_dies_first)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 [profile.ci]
 fail-fast = false
+
+[[profile.ci.overrides]]
+filter = 'test(accept_or_die_panics_loudly_when_the_target_dies_first)'
+slow-timeout = { period = "10s", terminate-after = 1 }
 
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every
