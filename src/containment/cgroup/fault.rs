@@ -29,6 +29,12 @@ thread_local! {
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
+    static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
+        const { std::cell::RefCell::new(None) };
+    static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
+    static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -396,4 +402,49 @@ pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
             let _ = notify.send(notified);
         }
     }
+}
+
+/// Make the NEXT `fork_running` on this thread fail its `pidfd_open` (as `RLIMIT_NOFILE` would);
+/// consumed by that call.
+pub(crate) fn set_force_fork_running_pidfd_failure(on: bool) {
+    FORCE_FORK_RUNNING_PIDFD_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_fork_running_pidfd_failure() -> bool {
+    FORCE_FORK_RUNNING_PIDFD_FAILURE.with(|f| f.replace(false))
+}
+
+/// The independent pidfd `fork_running`'s failure path opened on the child before killing it, so
+/// a test can confirm the reap without racing pid reuse.
+pub(crate) fn take_fork_running_pidfd_failure_probe() -> Option<std::os::fd::OwnedFd> {
+    FORK_RUNNING_PIDFD_FAILURE_PROBE.with(|p| p.borrow_mut().take())
+}
+pub(crate) fn record_fork_running_pidfd_failure_probe(probe: std::os::fd::OwnedFd) {
+    FORK_RUNNING_PIDFD_FAILURE_PROBE.with(|p| *p.borrow_mut() = Some(probe));
+}
+
+/// Make the NEXT `fork_running` pidfd-failure path's own probe `pidfd_open` fail too, separately
+/// from `set_force_fork_running_pidfd_failure`. Consumed by that call.
+pub(crate) fn set_force_fork_running_probe_pidfd_failure(on: bool) {
+    FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_fork_running_probe_pidfd_failure() -> bool {
+    FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE.with(|f| f.replace(false))
+}
+
+/// Make `KillOnDrop::drop`'s NEXT `waitid` on this thread report one synthetic `EINTR` before its
+/// real call, exercising the retry loop deterministically. Consumed by that one iteration.
+pub(crate) fn set_force_kill_on_drop_waitid_eintr(on: bool) {
+    FORCE_KILL_ON_DROP_WAITID_EINTR.with(|f| f.set(on));
+}
+pub(crate) fn take_force_kill_on_drop_waitid_eintr() -> bool {
+    FORCE_KILL_ON_DROP_WAITID_EINTR.with(|f| f.replace(false))
+}
+
+/// Make `KillOnDrop::drop`'s NEXT `pidfd_send_signal` on this thread fail with `EPERM`, without
+/// sending a real signal. Consumed by that call.
+pub(crate) fn set_force_kill_on_drop_kill_failure(on: bool) {
+    FORCE_KILL_ON_DROP_KILL_FAILURE.with(|f| f.set(on));
+}
+pub(crate) fn take_force_kill_on_drop_kill_failure() -> bool {
+    FORCE_KILL_ON_DROP_KILL_FAILURE.with(|f| f.replace(false))
 }

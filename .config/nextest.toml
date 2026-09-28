@@ -30,7 +30,7 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # an indefinite CI stall (the one sanctioned use of a timeout — docs/principles.md §8). With
 # correct code the test resolves in well under a second (the root is already exited by the time
 # the wait is reached), so 120s is pure headroom, never load-bearing in the passing case.
-filter = 'binary(cosca) & test(=windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
+filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
@@ -78,5 +78,11 @@ test-group = 'windows-elevation-routes'
 [[profile.default.overrides]]
 # Same failure-bound rationale as the `profile.ci` override above — this test's grace is
 # deliberately near-unbounded, so a local `cargo nextest run` needs the same backstop CI gets.
-filter = 'binary(cosca) & test(=windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
+filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# Bounds a hang (blocking reap of a `pause()` child) if the guard stops killing, so it fails
+# instead. Under `profile.default` so `profile.ci` and local runs both inherit it.
+filter = 'test(test_support_tests)'
+slow-timeout = { period = "20s", terminate-after = 1 }
