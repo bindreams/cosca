@@ -28,27 +28,36 @@ fn fixture_command_removes_rust_test_nocapture_from_its_env() {
     );
 }
 
-/// Unit tests for [`super::check_traversable_by`] — the non-Linux precondition
+/// Unit tests for [`super::check_path_traversable_by`] — the non-Linux precondition
 /// [`super::run_fixture`] fails loudly on, rather than tries to fix, for a root driver whose
-/// ambient `TMPDIR` the post-drop identity could not otherwise reach.
+/// ambient `TMPDIR` (or exec path — see [`super::copy_exe_to_traversable_scratch`]) the post-drop
+/// identity could not otherwise reach.
 #[cfg(all(unix, not(target_os = "linux")))]
-mod check_traversable_by_tests {
+mod check_path_traversable_by_tests {
     use std::os::unix::fs::PermissionsExt as _;
+
+    fn check(path: &std::path::Path, uid: libc::uid_t) -> Result<(), String> {
+        super::super::check_path_traversable_by(path, uid, uid)
+    }
 
     #[test]
     fn a_directory_owned_by_the_dropped_uid_is_traversable_regardless_of_other_bits() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let this_uid = unsafe { libc::geteuid() };
-        assert!(super::super::check_traversable_by(dir.path(), this_uid).is_ok());
+        assert!(check(dir.path(), this_uid).is_ok());
     }
 
     #[test]
     fn a_world_searchable_directory_owned_by_someone_else_is_traversable() {
-        let dir = tempfile::tempdir().unwrap();
+        // Directly under `/tmp`, not `tempfile::tempdir()`'s ambient `TMPDIR`: checking a
+        // FOREIGN uid's access must not depend on the REAL system `TMPDIR`'s own ancestors (a
+        // per-user macOS `TMPDIR` is itself `0700`) also happening to be world-traversable — only
+        // `/tmp` itself is guaranteed to be.
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o701)).unwrap();
         let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        assert!(super::super::check_traversable_by(dir.path(), some_other_uid).is_ok());
+        assert!(check(dir.path(), some_other_uid).is_ok());
     }
 
     #[test]
@@ -56,7 +65,50 @@ mod check_traversable_by_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        let err = super::super::check_traversable_by(dir.path(), some_other_uid).unwrap_err();
-        assert!(err.contains("not traversable"), "{err}");
+        let err = check(dir.path(), some_other_uid).unwrap_err();
+        assert!(err.contains("does not grant"), "{err}");
+    }
+
+    /// The whole point of walking ancestors rather than checking only the leaf: a `TMPDIR` (or
+    /// exec path) that is itself wide open is still unreachable if something ABOVE it refuses
+    /// entry — reproducing #200's own F3 finding (a `chmod 0750` `$HOME` blocking a leaf `TMPDIR`
+    /// underneath it that was, on its own, perfectly traversable).
+    #[test]
+    fn a_traversable_leaf_under_an_unreachable_ancestor_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let leaf = root.path().join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o701)).unwrap();
+        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        let err = check(&leaf, some_other_uid).unwrap_err();
+        assert!(err.contains(root.path().to_str().unwrap()), "{err}");
+    }
+
+    #[test]
+    fn group_membership_grants_search_via_group_bits() {
+        // Directly under `/tmp` — see the world-searchable test above for why.
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o710)).unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let some_other_uid = meta.uid().wrapping_add(1);
+        assert!(super::super::check_path_traversable_by(dir.path(), some_other_uid, meta.gid()).is_ok());
+    }
+
+    #[test]
+    fn a_leaf_file_needs_read_and_execute_not_just_search() {
+        // Directly under `/tmp` — see the world-searchable test above for why.
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o701)).unwrap();
+        let file = dir.path().join("exe");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o701)).unwrap(); // x only, no r
+        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        let err = check(&file, some_other_uid).unwrap_err();
+        assert!(err.contains("read+execute"), "{err}");
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o705)).unwrap(); // r+x
+        assert!(check(&file, some_other_uid).is_ok());
     }
 }
