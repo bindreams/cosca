@@ -243,24 +243,26 @@ step consistent with these principles.
 
 ## 13. A deadline is never early, and never late by its own choice
 
-Every caller-supplied deadline cosca accepts (`wait_timeout`, `wait_tree_timeout`,
+Every caller-supplied deadline cosca accepts (for example `wait_timeout`, `wait_tree_timeout`,
 `graceful_shutdown`'s grace) gets exactly two promises, both checked against a monotonic clock:
 
 - **Never early.** cosca never reports a timeout outcome (`wait_timeout`'s `Ok(None)`/`Ok(false)`,
-  `wait_tree_timeout`'s `MembersRemain`, a grace escalating to a kill) before `now >= deadline`.
-  Tests assert `elapsed >= deadline` exactly, with no slack: scheduling can only push a call later,
-  never earlier, so a passing test never needed a tolerance band.
-- **Never late by cosca's own choice.** Every block is armed with the caller's deadline itself,
-  passed through the waiting primitive's own deadline API — an absolute instant, not a duration
-  cosca computed earlier and reused — and no new round of work starts once the deadline has
-  passed. That API is the boundary of cosca's responsibility: kqueue's per-round recompute of the
-  remaining time, `event_listener::wait_deadline`, tokio's `timeout_at`, and their equivalents all
-  take the caller's `Instant` directly. What happens BELOW that API is not cosca's choice: parking
-  through a futex, a timer wheel rounded to its own tick (tokio: up to 1 ms), and OS scheduling all
-  introduce lateness cosca neither causes nor controls. This is proved structurally, not by timing:
-  a `#[cfg(test)]` seam reports the instant (or the deadline) a wait was actually armed with, or
-  whether a blocking call happened at all, and a test clock advanced past the deadline shows the
-  next check returning without another round.
+  `wait_tree_timeout`'s `MembersRemain`, a grace escalating to a kill) before `now >= deadline`, or
+  `elapsed >= timeout` for an API expressed as a relative timeout instead of an absolute deadline.
+  Tests assert this exactly, with no slack: scheduling can only push a call later, never earlier,
+  so a passing test never needed a tolerance band.
+- **Never late by its own choice.** Every block is armed from the caller's deadline at the moment
+  of arming: through the primitive's absolute-deadline API where it has one (tokio's `timeout_at`,
+  `event_listener::wait_deadline`), otherwise a remaining time recomputed from that deadline
+  immediately before each blocking call — `kevent`, `ppoll` and `WaitFor*` all take a relative
+  timeout, not an absolute deadline, so this is the common case, not the exception. Never a
+  duration computed earlier and reused. No new round of work starts once the deadline has passed.
+  A single non-blocking final check at expiry (principle 8's "re-reads state at expiry and reports
+  what it finds") is required and is not itself a new round of work: it looks once, at most, and
+  reports what it finds, without starting further work contingent on the answer. This is proved
+  structurally, not by timing: a `#[cfg(test)]` seam reports the deadline (or remaining time) a
+  wait was actually armed with, or whether a blocking call happened at all, and a test clock
+  advanced past the deadline shows the next check returning without another round.
 
 cosca promises no upper bound on how late after the deadline it actually reports the outcome —
 scheduler, load, a suspended process, or a waiting primitive's own rounding below its API can delay
@@ -273,6 +275,9 @@ promptly") is a bet that the test machine, and the waiting primitive's own inter
 enough that day — it passes by luck and fails under load, and the slack itself is exactly wide
 enough to hide the busy-poll and early-return bugs it exists to catch. A structural check proves
 the property regardless of machine speed or of what a dependency does below its own API.
+
+`main` does not fully follow this yet: [#242] tracks the known violations, each closed by the
+stacked fix PR that resolves it.
 
 **Applies to:** every caller-supplied deadline and every wait that arms one.
 
@@ -290,3 +295,4 @@ the property regardless of machine speed or of what a dependency does below its 
 [#210]: https://github.com/bindreams/cosca/pull/210
 [#223]: https://github.com/bindreams/cosca/issues/223
 [#234]: https://github.com/bindreams/cosca/issues/234
+[#242]: https://github.com/bindreams/cosca/issues/242

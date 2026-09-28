@@ -349,10 +349,9 @@ pub(crate) fn write_end_check(read_end: BorrowedFd<'_>) -> WriteEndCheck {
 
 /// Refuse to watch an edge that provably cannot fire. `Unassessable` proceeds UNLESS the
 /// caller intends to wait with no deadline: an inconclusive scan combined with a bounded wait
-/// still stops starting new rounds once the caller's own deadline passes regardless, but
-/// combined with an UNBOUNDED wait it is
-/// exactly the condition under which this primitive could hang forever with no elevated
-/// runtime signal at all — so only that combination is refused.
+/// still stops starting new rounds once the caller's own deadline passes regardless, but combined
+/// with an UNBOUNDED wait it is exactly the condition under which this primitive could hang
+/// forever with no elevated runtime signal at all — so only that combination is refused.
 fn refuse_if_write_end_held(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<(), Error> {
     match write_end_check(read_end) {
         WriteEndCheck::Clear => Ok(()),
