@@ -246,9 +246,9 @@ jobs:
       #
       # `test(/members_remain/)` is also selected here, not just `test(/cgroup/)`:
       # `*_members_remain_still_reaps_an_already_exited_root`'s own `MembersRemain` branch
-      # (vs. the non-drain-observable fallback) exists only under a drain-observable,
-      # non-authoritative mechanism — cgroup v2 is the only one this CI matrix can reach —
-      # so without this real cgroup lane those tests never exercise it at all, anywhere.
+      # also fires under macOS's FdMarker (the darwin jobs measure it, ~2.03s), but this is
+      # the only Linux lane where this branch runs: cgroup v2 is authoritative here, and
+      # without this real cgroup lane those tests never exercise the Linux path at all.
       #
       # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
       # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
