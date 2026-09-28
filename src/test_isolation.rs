@@ -3,7 +3,9 @@
 //! running, unrelated test thread can be corrupted by it. This is ONE file, included by both of
 //! this crate's separate compilation units:
 //! - `src/lib.rs`: a normal `mod test_isolation;` (this file lives under `src/`, so no `#[path]`
-//!   or crate self-alias is needed — `crate::` already means `cosca` here).
+//!   or crate self-alias is needed — `crate::` already means `cosca` here). Its own unit tests
+//!   live separately, in `src/test_isolation_tests.rs` (a lib-only, ordinary sibling module — see
+//!   its own doc for why it is NOT nested inside this file).
 //! - `tests/common/mod.rs`: `#[path = "../../src/test_isolation.rs"] mod isolation;`, for every
 //!   integration test binary. `super::test_spawn_lock` is how this file reaches
 //!   `cosca::test_spawn_lock` from that mount point — `tests/common/mod.rs` re-exports it under
@@ -17,22 +19,29 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Builds the fully-qualified libtest `--exact` path of the `#[test] fn` named `$name`, the same
 /// way `crate::test_child::fixture_path!` does (that macro cannot be reused directly: it names
 /// `crate::test_child`, a lib-only module invisible to the integration-test mount point). Ties the
-/// call site to the fixture so they cannot drift into two independently hand-typed strings — see
-/// `strip_crate_prefix`'s doc for the two checks this performs.
+/// call site to the fixture so they cannot drift into two independently hand-typed strings.
+///
+/// `unused_macros` is allowed here, not fixed by using it below: nothing in THIS file invokes it
+/// any more (its only caller, `isolation_tests`, moved out to the lib-only `src/
+/// test_isolation_tests.rs` — see that file's own doc for why it could not stay nested here). At
+/// the lib mount point that invocation is enough to mark it used; at every integration-test mount
+/// point (a SEPARATE compilation of this same file, which that lib-only caller never reaches) it
+/// genuinely is not, since no integration test currently calls `common::fixture_path!` either.
+#[allow(unused_macros)]
 macro_rules! fixture_path {
     ($name:ident) => {{
         let _: fn() = $name;
         // Strips the crate-name segment `module_path!()` always carries as its own first
-        // component (e.g. `"cosca::test_isolation"` or `"spawn_io::common::isolation"`), since
-        // libtest's `--exact` filter never includes it. Inlined rather than a named helper
-        // function: this macro is used from a nested module (`isolation_tests`) at a DIFFERENT
-        // mount point than where it is defined, and macro hygiene does not resolve a bare
-        // function call across that gap the way a fully local expression does.
+        // component (e.g. `"cosca::test_isolation_tests"` or `"spawn_io::common::isolation"`),
+        // since libtest's `--exact` filter never includes it. Inlined rather than a named helper
+        // function: this macro is used from `src/test_isolation_tests.rs`, a module at a
+        // DIFFERENT location than where it is defined here, and macro hygiene does not resolve a
+        // bare function call across that gap the way a fully local expression does.
         let path: &'static str = concat!(module_path!(), "::", stringify!($name));
         match path.split_once("::") {
             Some((_, rest)) => rest,
@@ -53,7 +62,7 @@ pub const ALONE_ARGS: [&str; 4] = ["--exact", "--include-ignored", "--nocapture"
 /// `COSCA_TEST_ALONE` alone is not proof: it is inherited by children and can leak from a shell or
 /// outer re-exec into an ordinary many-threads run. Argv is set by whoever invoked this process,
 /// so a genuine isolated child (invoked by [`alone`]) is the only one that matches.
-fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool {
+pub(crate) fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool {
     let Some(value) = value else { return false };
     argv.len() == ALONE_ARGS.len() + 1
         && argv[0] == value
@@ -62,105 +71,221 @@ fn alone_marker_matches(value: Option<&str>, argv: &[String]) -> bool {
 
 /// A completion token a re-exec'd child writes to an inherited pipe right before its own test body
 /// returns normally — proof the body ran to completion, not merely that the process exited zero
-/// (which a premature, silent `_exit` could also produce). [`alone`]/[`alone_capturing`] decide
-/// pass/fail from this token plus the exit status, never by scanning libtest's own stdout banner
-/// for human text like `"1 passed"` — this repo's own convention against parsing human text
-/// applies to reading OUR OWN child's output just as much as any external tool's.
+/// (which a premature, silent `std::process::exit` could also produce — see [`Completion`]).
+/// [`alone`]/[`alone_capturing`] decide pass/fail from this token plus the exit status, never by
+/// scanning libtest's own stdout banner for human text like `"1 passed"` — this repo's own
+/// convention against parsing human text applies to reading OUR OWN child's output just as much as
+/// any external tool's.
 ///
 /// The write end's `CLOEXEC` flag is cleared so it survives into the child at the SAME fd number,
 /// which the child is told via [`TOKEN_FD_ENV`] — clearing it happens while this process holds
 /// `test_spawn_lock()`, the same lock that already serializes every raw fork here, so no
 /// concurrent, unrelated spawn can observe the momentarily-inheritable fd.
-const TOKEN_FD_ENV: &str = "COSCA_TEST_ALONE_TOKEN_FD";
+pub(crate) const TOKEN_FD_ENV: &str = "COSCA_TEST_ALONE_TOKEN_FD";
 
-/// Write the completion token to the fd [`TOKEN_FD_ENV`] names, if set (unset when this process
-/// was not re-exec'd by [`alone`]/[`alone_capturing`] — an ordinary suite run must not try to
-/// write to a nonexistent fd). Called once, by [`alone`]/[`alone_capturing`] themselves, right
-/// before they return control to the child's real test body — NOT at the end of the body, so a
-/// body that never returns (a probe whose whole point is to panic) does not need to remember to
-/// call it, and correctly never produces a token in exactly that case.
+/// The pid `spawn_alone` recorded as this child's own immediate parent, set alongside
+/// [`TOKEN_FD_ENV`] — the ONLY thing [`write_completion_token_if_child`] trusts before writing.
+///
+/// A caller that fans out its OWN further `ALONE_ARGS`-shaped children (like the closed-std-slots
+/// sweep in `tests/spawn_io.rs`) has each one inherit `TOKEN_FD_ENV` from ITS parent too — an
+/// ordinary env var, unaffected by that parent's own copy of the pipe fd having already closed —
+/// naming a fd number that means nothing in the grandchild's own, freshly-forked fd table.
+/// Trusting the fd number alone, even after confirming it happens to BE a pipe right now, is only
+/// probabilistic: a fan-out that itself spawns enough children can make that number alias one of
+/// ITS OWN, entirely unrelated pipes. `getppid()` is not: a grandchild's real immediate parent is
+/// always the process that actually forked it, never the original `spawn_alone` caller further up
+/// — so comparing it against the pid `spawn_alone` recorded for THIS specific pipe refuses every
+/// such grandchild deterministically, regardless of what the leaked fd number happens to alias.
+pub(crate) const TOKEN_PARENT_ENV: &str = "COSCA_TEST_ALONE_TOKEN_PARENT";
+
+/// The read end of a pipe only `spawn_alone`'s own caller holds the write end of — inherited by
+/// the re-exec'd child, whose [`install_lifeline_watcher`] blocks a background thread reading it.
+///
+/// `spawn_alone` already puts the child in its OWN, fresh process group (`setpgid(0, 0)`) so a
+/// bounded wait THIS process detects (a hung child) can kill the whole group, reaching any
+/// grandchildren the child spawned into it. That same separate group is exactly what makes the
+/// child UNREACHABLE by a signal sent to the group of whatever process ran `spawn_alone` — measured
+/// with a real nextest TIMEOUT (nextest runs each test in its own process): nextest kills only the
+/// ONE process it manages and waits on, not a process group, and that process's own group is not
+/// the re-exec'd child's — so the child survived as an orphan (parent pid 1), immune to the kill
+/// that ended the run.
+///
+/// This closes that gap from the other end: the lifeline's write end lives only in the process
+/// `spawn_alone` calls from, and is deliberately kept open for exactly as long as that process is
+/// still around to wait for the child — closing early (an explicit drop before the wait, "tidying
+/// up") would kill a child that is still legitimately running, so nothing does that. Whether that
+/// process exits cleanly (its own last reference to the write end closes as part of ordinary
+/// process teardown) or is itself killed out from under the child (a SIGKILL closes every fd a
+/// process holds, same as any other exit), the child's watcher thread observes EOF and
+/// self-destructs its own process group — reaching itself and anything it spawned into that group,
+/// exactly like the bounded-wait kill path does for a hang THIS process detects itself. The two
+/// mechanisms are complementary: one covers a hang this process notices; this one covers the
+/// hanging (or promptly killed) process itself disappearing before it gets the chance to notice
+/// anything.
+pub(crate) const LIFELINE_FD_ENV: &str = "COSCA_TEST_ALONE_LIFELINE_FD";
+
+/// Write the completion token to the fd [`TOKEN_FD_ENV`] names, if this process is a genuine,
+/// direct `spawn_alone` child — never merely because the fd number and env vars are present (see
+/// [`TOKEN_PARENT_ENV`]'s own doc for why a fan-out grandchild can inherit both without being
+/// one). Called once, by [`Completion`]'s own `Drop`, when it is not unwinding a panic — see there
+/// for why that, and not the moment [`alone`]/[`alone_capturing`] recognize the child, is when
+/// this must run.
 fn write_completion_token_if_child() {
     let Some(fd) = std::env::var_os(TOKEN_FD_ENV) else {
         return;
     };
     let fd: i32 = fd.to_str().and_then(|s| s.parse().ok()).expect("valid fd number");
-    // Defense in depth against [`clear_inherited_completion_token`]'s own hazard (see there): a
-    // caller that fans out further `ALONE_ARGS`-shaped children without clearing `TOKEN_FD_ENV`
-    // first leaves a STALE fd number in that grandchild's environment, meaning nothing in its own
-    // fd table. Refuse to touch it unless it is actually a pipe — nothing this process opens
-    // before this point (libtest's own startup, argv/env parsing) is one, so a real, intended
-    // token fd (freshly inherited from `spawn_alone`, never yet touched by this process) always
-    // passes this check, and a stale/coincidental number essentially never does.
+    let Some(expected_parent) = std::env::var_os(TOKEN_PARENT_ENV) else {
+        return;
+    };
+    let expected_parent: libc::pid_t = expected_parent
+        .to_str()
+        .and_then(|s| s.parse().ok())
+        .expect("valid pid");
+    // SAFETY: getppid() takes no arguments and cannot fail.
+    if unsafe { libc::getppid() } != expected_parent {
+        return;
+    }
+    // Defense in depth beyond the ppid check above, in case some OTHER bug ever lets a fd number
+    // reach here that a genuine spawn_alone child was never actually given: refuse anything that
+    // is not a pipe. Nothing this process opens before this point (libtest's own startup, argv/env
+    // parsing) is one, so a real, intended token fd always passes this too.
     // SAFETY: `fstat` on a caller-supplied fd number; reads only, never touches ownership.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
         return;
     }
-    // SAFETY: `fd` was made inheritable by this exact process's own parent (see TOKEN_FD_ENV's
-    // doc), specifically for this write; confirmed a pipe just above; owned exclusively from here.
+    // SAFETY: `fd` was made inheritable by this exact process's own parent (confirmed above),
+    // specifically for this write; confirmed a pipe just above; owned exclusively from here.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     use std::io::Write;
     let _ = file.write_all(b"1");
 }
 
-/// Strip this process's own [`TOKEN_FD_ENV`] from `cmd`'s environment before spawning it.
+/// Close this process's own inherited [`TOKEN_FD_ENV`] fd without writing to it — for a child
+/// spawned via [`alone_capturing`], whose caller inspects the re-exec'd child's raw `Output`
+/// directly and never reads the completion token. Unlike [`alone`]'s child (see [`Completion`]),
+/// there is nothing to defer: closing immediately, rather than leaving it open for the rest of
+/// this process's life (or leaking it into anything this body itself forks), is strictly better
+/// hygiene with nothing to trade it against.
+fn close_inherited_completion_token() {
+    let Some(fd) = std::env::var_os(TOKEN_FD_ENV) else {
+        return;
+    };
+    let Some(fd) = fd.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+        return;
+    };
+    // SAFETY: `fd` was made inheritable by `spawn_alone` specifically for this child; an
+    // `alone_capturing` child never uses it for anything else.
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+/// Spawn the background thread that blocks reading [`LIFELINE_FD_ENV`], and on EOF (or any read
+/// error) self-destructs this process's own group — see that const's own doc for the full
+/// scenario. Called once, by the child branch of both [`alone`] and [`alone_capturing`], right
+/// after this process recognizes itself as a `spawn_alone`-launched child. A no-op if
+/// `LIFELINE_FD_ENV` is unset (an ordinary suite run was not re-exec'd by `spawn_alone` at all).
+fn install_lifeline_watcher() {
+    let Some(fd) = std::env::var_os(LIFELINE_FD_ENV) else {
+        return;
+    };
+    let fd: i32 = fd.to_str().and_then(|s| s.parse().ok()).expect("valid fd number");
+    std::thread::spawn(move || {
+        // SAFETY: `fd` was made inheritable by `spawn_alone` specifically for this read, and is
+        // owned exclusively by this thread from here on.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut buf = [0u8; 1];
+        use std::io::Read;
+        // Blocks until the parent's own write end closes — a clean drop once it is done waiting
+        // for us (harmless: we will already have exited normally by then too, so nothing is left
+        // for the SIGKILL below to reach), or that whole process dying instead (the scenario this
+        // exists for). Either way, whoever launched us is gone or done with us.
+        let _ = file.read(&mut buf);
+        // SAFETY: pid 0 means "this process's own process group" — every process this child
+        // itself has spawned into that SAME group (it is the leader, from `spawn_alone`'s own
+        // `setpgid(0, 0)`), never any unrelated process.
+        unsafe {
+            libc::kill(0, libc::SIGKILL);
+        }
+    });
+}
+
+/// An RAII marker [`alone`]/[`alone_capturing`] return to the re-exec'd child — hold it (even as
+/// `_`) across the real test body. Its `Drop` is the ONLY place that calls
+/// [`write_completion_token_if_child`], and only when the current thread is not unwinding from a
+/// panic (`std::thread::panicking()`).
 ///
-/// For a caller that reuses the [`ALONE_ARGS`] re-exec SHAPE to fan out ITS OWN further children
-/// (each one also matching [`alone_marker_matches`], so each also runs through
-/// [`write_completion_token_if_child`] when it starts) — not for an ordinary, single-level
-/// `alone()`/`alone_capturing()` caller, which never needs this.
-///
-/// Without this, such a grandchild inherits `TOKEN_FD_ENV` from ITS parent (an ordinary env var,
-/// unaffected by the parent's own copy of the pipe fd having already been closed) naming a fd
-/// number that means nothing in the grandchild's own, freshly-forked fd table —
-/// [`write_completion_token_if_child`] would trust it anyway, per its SAFETY comment's own
-/// precondition ("made inheritable by this exact process's own parent, specifically for this
-/// write"), which this exact call path violates: the fd number is stale, coincidental, and may
-/// alias something the grandchild's own code already owns. Writing into it, then closing it via
-/// the `File`'s `Drop`, races that real owner's own later close of the SAME number — observed as
-/// `std`'s `OwnedFd`/`File` double-close abort ("IO Safety violation: owned file descriptor
-/// already closed").
-pub fn clear_inherited_completion_token(cmd: &mut std::process::Command) {
-    cmd.env_remove(TOKEN_FD_ENV);
+/// This is what makes "the token arrived" prove "the body ran to completion", not merely "the
+/// process exited zero": writing the token at the moment [`alone`] first recognizes the child
+/// (before the real body has even started) would let a body that calls `std::process::exit(0)`
+/// partway through — which skips every live value's `Drop`, this one included — report as a full
+/// pass despite never reaching whatever it was still supposed to do. Measured: it did, before this
+/// fix (see [`a_body_that_exits_early_produces_no_token`] in `src/test_isolation_tests.rs`).
+pub struct Completion {
+    _private: (),
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            write_completion_token_if_child();
+        }
+    }
 }
 
 /// Spawn a fresh copy of this test binary against `name` with the isolated `alone()` shape
-/// (`COSCA_TEST_ALONE=name`, argv [`ALONE_ARGS`]), give it a token pipe (see [`TOKEN_FD_ENV`]),
-/// and wait for it — the shared spawn machinery [`alone`] and [`alone_capturing`] both build on.
-/// Returns the captured `Output` plus whether the completion token arrived.
-fn spawn_alone(name: &str) -> (std::process::Output, bool) {
-    let (mut read_end, write_end) = std::io::pipe().expect("open completion-token pipe");
-    let write_fd = write_end.as_raw_fd();
+/// (`COSCA_TEST_ALONE=name`, argv [`ALONE_ARGS`]) plus `extra_env`, give it a token pipe (see
+/// [`TOKEN_FD_ENV`]) and a lifeline pipe (see [`LIFELINE_FD_ENV`]), and wait for it — the shared
+/// spawn machinery [`alone`], [`alone_capturing`] and [`alone_with_env`] all build on. Returns the
+/// captured `Output` plus whether the completion token arrived.
+fn spawn_alone(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output, bool) {
+    let (mut token_read, token_write) = std::io::pipe().expect("open completion-token pipe");
+    let token_write_fd = token_write.as_raw_fd();
+    let (lifeline_read, lifeline_write) = std::io::pipe().expect("open lifeline pipe");
+    let lifeline_read_fd = lifeline_read.as_raw_fd();
+    let this_pid = std::process::id();
     let child = {
         let _guard = super::test_spawn_lock();
-        // SAFETY: clears FD_CLOEXEC on our own pipe write end so it survives into the child at
-        // the same fd number; held under `test_spawn_lock()`, so no concurrent, unrelated spawn
-        // in this process can observe it inheritable.
-        unsafe {
-            let flags = libc::fcntl(write_fd, libc::F_GETFD);
-            assert_ne!(
-                flags,
-                -1,
-                "fcntl(F_GETFD) on the token pipe: {}",
-                std::io::Error::last_os_error()
-            );
-            assert_eq!(
-                libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "fcntl(F_SETFD) to make the token pipe inheritable: {}",
-                std::io::Error::last_os_error()
-            );
+        // SAFETY: clears FD_CLOEXEC on our own token pipe's write end and lifeline pipe's read
+        // end so both survive into the child at the same fd numbers; held under
+        // `test_spawn_lock()`, so no concurrent, unrelated spawn in this process can observe
+        // either momentarily-inheritable fd.
+        for fd in [token_write_fd, lifeline_read_fd] {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                assert_ne!(
+                    flags,
+                    -1,
+                    "fcntl(F_GETFD) on fd {fd}: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(
+                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                    0,
+                    "fcntl(F_SETFD) to make fd {fd} inheritable: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
         cmd.args(std::iter::once(name).chain(ALONE_ARGS))
             .env("COSCA_TEST_ALONE", name)
-            .env(TOKEN_FD_ENV, write_fd.to_string())
+            .env(TOKEN_FD_ENV, token_write_fd.to_string())
+            .env(TOKEN_PARENT_ENV, this_pid.to_string())
+            .env(LIFELINE_FD_ENV, lifeline_read_fd.to_string())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for &(k, v) in extra_env {
+            cmd.env(k, v);
+        }
         // SAFETY: async-signal-safe; puts the child in its OWN new process group (pgid == its own
-        // pid) before it execs, so a later bounded-wait timeout can kill that WHOLE group — not
-        // just this direct child — reaching any grandchildren it spawned into that same group
-        // before hanging (e.g. a three-level tree under a cgroup-lane test run as root).
+        // pid) before it execs, so a later bounded-wait timeout (`wait_bounded` below) can kill
+        // that WHOLE group — not just this direct child — reaching any grandchildren it spawned
+        // into that same group before hanging. This same separate group is what makes the
+        // lifeline pipe above necessary in the first place — see [`LIFELINE_FD_ENV`]'s own doc for
+        // why the two are complementary, not redundant.
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
@@ -170,33 +295,52 @@ fn spawn_alone(name: &str) -> (std::process::Output, bool) {
                 Ok(())
             });
         }
-        cmd.spawn().expect("spawn the test alone")
+        let child = cmd.spawn().expect("spawn the test alone");
+        // Both of OUR OWN copies must close HERE, before `test_spawn_lock()` releases below — not
+        // merely before this function returns. Dropping them any later would extend the window
+        // these exact fd numbers stay inheritable past what the lock actually serializes, so a
+        // concurrent, unrelated spawn racing right after this block released the lock could still
+        // observe one of them (this was exactly the token pipe's own bug, previously).
+        //
+        // `lifeline_write` (the OTHER end of the lifeline pipe) is deliberately NOT touched here —
+        // it must stay open all the way past the wait below; see its own comment there.
+        drop(token_write);
+        drop(lifeline_read);
+        child
     };
-    // Our own copy of the write end must close so EOF on `read_end` is observable once every
-    // child copy closes too (on exit, whether or not it wrote — see `write_completion_token_if_child`).
-    drop(write_end);
     let out = wait_bounded(child, PROBE_TIMEOUT, true);
     let mut token = Vec::new();
     use std::io::Read;
-    let _ = read_end.read_to_end(&mut token);
+    let _ = token_read.read_to_end(&mut token);
+    // `lifeline_write` drops here, at the end of this function — deliberately kept alive across
+    // the whole wait above. The child's own watcher thread self-destructs the instant it sees
+    // THIS fd close, so closing it any earlier (even a "tidy" explicit drop right after spawning)
+    // would kill a child that is still legitimately running. Dropping it here, after the child has
+    // already exited, is a no-op for a child that finished normally — which it always has, by this
+    // point, in the ordinary case `wait_bounded` returning at all represents.
+    drop(lifeline_write);
     (out, token == b"1")
 }
 
 /// Run the test `name` (its full path, as libtest reports it) alone, in a fresh copy of this test
-/// binary, and assert it passed. `true` in the copy, which must then run the test's real body;
-/// `false` in the original caller, which must return immediately.
+/// binary, and assert it passed. `Some(Completion)` in the copy — hold it (even as `_`) across the
+/// test's real body, whose normal return is what makes its `Drop` report completion (see
+/// [`Completion`]'s own doc for why that, not the moment of recognition, is when it must run);
+/// `None` in the original caller, which must return immediately — the real work already ran, in
+/// isolation, in the re-exec'd child.
 ///
-/// Pass/fail is decided from the re-exec'd child's exit status AND its completion token (see
-/// [`TOKEN_FD_ENV`]), never by scanning its stdout for libtest's own banner text.
-#[must_use = "the caller must return immediately when this is false — the real work already ran, \
-              in isolation, in the re-exec'd child"]
-pub fn alone(name: &str) -> bool {
+/// Pass/fail is decided from the re-exec'd child's exit status AND its completion token, never by
+/// scanning its stdout for libtest's own banner text.
+#[must_use = "the caller must return immediately when this is None — the real work already ran, \
+              in isolation, in the re-exec'd child. Hold the Some(Completion) alive across the \
+              real body (even bound to `_`): its own Drop is what reports completion."]
+pub fn alone(name: &str) -> Option<Completion> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if alone_marker_matches(Some(name), &argv) {
-        write_completion_token_if_child();
-        return true;
+        install_lifeline_watcher();
+        return Some(Completion { _private: () });
     }
-    let (out, completed) = spawn_alone(name);
+    let (out, completed) = spawn_alone(name, &[]);
     assert!(
         out.status.success() && completed,
         "{}{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
@@ -204,29 +348,51 @@ pub fn alone(name: &str) -> bool {
         if completed {
             ""
         } else {
-            " (no completion token: the body did not return normally)"
+            " (no completion token: the body did not return normally — it may have panicked, \
+              called std::process::exit early, or otherwise never reached the point where the \
+              Completion guard alone() returned to it would have dropped)"
         },
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    false
+    None
 }
 
 /// Like [`alone`], but the parent gets the re-exec'd child's captured `Output` instead of a
 /// pass/fail assertion — for a prover whose body must inspect the child's exit code and stderr
 /// content (e.g. a fixture that is SUPPOSED to panic), not just "did it pass."
 ///
-/// Returns `None` in the child (proceed with the real body); `Some(output)` in the parent. Unlike
-/// `alone`, does not itself assert anything about `output` — a body that panics never reaches
-/// [`write_completion_token_if_child`], so this function does not read the token either; the
-/// caller decides what `output` means.
+/// Returns `None` in the child (proceed with the real body — there is nothing to hold: this
+/// caller never reads the completion token, so its inherited copy of the token fd is closed
+/// immediately instead, see [`close_inherited_completion_token`]); `Some(output)` in the parent.
+/// Unlike `alone`, does not itself assert anything about `output` — the caller decides what it
+/// means.
 pub fn alone_capturing(name: &str) -> Option<std::process::Output> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if alone_marker_matches(Some(name), &argv) {
+        install_lifeline_watcher();
+        close_inherited_completion_token();
         return None;
     }
-    let (out, _completed) = spawn_alone(name);
+    let (out, _completed) = spawn_alone(name, &[]);
     Some(out)
+}
+
+/// Like [`alone`], but for a caller that must pass its OWN further env vars into the re-exec'd
+/// child — e.g. one case of a larger sweep, such as the closed-std-slots fan-out in
+/// `tests/spawn_io.rs`, which needs a different `COSCA_TEST_CLOSED_SLOTS` per re-exec on top of
+/// the ordinary `alone()` shape.
+///
+/// Always called from the SAME side `alone()`'s own parent branch is: this is not itself a
+/// dispatch point. A caller reaches it only after ITS OWN, earlier `alone(name)` call already
+/// recognized this process as the child for the surrounding, outer test — so there is no "am I
+/// the child" question left to ask here; this always spawns and waits.
+///
+/// Returns the re-exec'd child's `Output` plus whether its completion token arrived — the same
+/// pass/fail proof `alone()` asserts on internally, left here to the caller (e.g. to collect
+/// several cases' failures before asserting once), never libtest's own stdout banner text.
+pub fn alone_with_env(name: &str, extra_env: &[(&str, &str)]) -> (std::process::Output, bool) {
+    spawn_alone(name, extra_env)
 }
 
 /// Require that this test is running alone in its own process, via [`alone`], before any caller
@@ -485,20 +651,25 @@ impl Drop for RestoreRlimitNofile {
     }
 }
 
-type DrainResult = Result<(Vec<u8>, Vec<u8>), String>;
+pub(crate) type DrainResult = Result<(Vec<u8>, Vec<u8>), String>;
 
 /// Kill `child` — by process GROUP if `own_process_group` (negative pid), else just its own pid —
 /// and reap it, returning the resulting `ExitStatus`. Killing the group while the leader is still
 /// an unreaped zombie (the OS has not yet let its pid, and so its pgid, be recycled) reaches any
 /// grandchildren the leader may have spawned into its own group before it hung — e.g. a three-level
 /// tree under one of #210's cgroup-lane tests, run as root.
-fn kill_and_reap(mut child: std::process::Child, own_process_group: bool) -> std::process::ExitStatus {
+pub(crate) fn kill_and_reap(mut child: std::process::Child, own_process_group: bool) -> std::process::ExitStatus {
     let pid = child.id() as libc::pid_t;
     if own_process_group {
         // SAFETY: a plain signal to this process's own re-exec'd child's group; the child is still
         // unreaped (owned exclusively by `child` until `wait()` below), so its pid — and this
         // pgid, which the leader set to equal its own pid — cannot yet have been recycled.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        assert_eq!(
+            unsafe { libc::kill(-pid, libc::SIGKILL) },
+            0,
+            "kill(-{pid}, SIGKILL) (own process group): {}",
+            std::io::Error::last_os_error()
+        );
     } else {
         let _ = child.kill();
     }
@@ -513,7 +684,7 @@ fn kill_and_reap(mut child: std::process::Child, own_process_group: bool) -> std
 ///
 /// `own_process_group`: see [`kill_and_reap`]. The caller — not this function — is responsible for
 /// having put `child` in its own group before spawning it, if it passes `true` here.
-fn wait_on_channel(
+pub(crate) fn wait_on_channel(
     child: std::process::Child,
     timeout: std::time::Duration,
     rx: std::sync::mpsc::Receiver<DrainResult>,
@@ -572,7 +743,7 @@ fn wait_on_channel(
 /// the child is itself blocked writing to the undrained stderr pipe.
 ///
 /// `own_process_group`: see [`kill_and_reap`].
-fn wait_bounded(
+pub(crate) fn wait_bounded(
     mut child: std::process::Child,
     timeout: std::time::Duration,
     own_process_group: bool,
@@ -651,659 +822,6 @@ pub fn spawn_without_alone_shape(
             .expect("spawn the probe")
     };
     wait_bounded(child, PROBE_TIMEOUT, false)
-}
-
-#[cfg(test)]
-mod isolation_tests {
-    use super::{alone_capturing, kill_and_reap, wait_bounded, wait_on_channel, RestoreRlimitNofile, RestoreStdio};
-    // `fixture_path!` IS used throughout this module (every folded probe/prover below); the
-    // `unused_imports` lint just cannot see through a macro import the way it does an ordinary
-    // item.
-    #[allow(unused_imports)]
-    use super::fixture_path;
-    use super::spawn_without_alone_shape;
-
-    // Overlap contract: a hard assert, before anything is closed =====
-
-    /// Opens a SECOND `RestoreStdio` on fd 2 while the first is still alive. Must panic
-    /// immediately — before the second guard closes or registers anything — with the fix's own
-    /// message reaching stderr, in every build profile (a plain `assert!`, not `debug_assert!`).
-    ///
-    /// The intervening `tempfile::tempfile()` matters: without it, the second `close(&[2])` would
-    /// dup an ALREADY-CLOSED fd 2 (closed by the first guard) and panic on THAT `fcntl` failure
-    /// instead — a different failure than the one this proves. Opening a throwaway file first
-    /// lands something valid back at the freed fd 2, so the second `close(&[2])` reaches the
-    /// overlap check.
-    #[test]
-    fn two_overlapping_fd2_closes_panics_cleanly() {
-        let Some(out) = alone_capturing(fixture_path!(two_overlapping_fd2_closes_panics_cleanly)) else {
-            let _first = RestoreStdio::close(&[2]);
-            let _file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
-            let _second = RestoreStdio::close(&[2]); // must panic cleanly, not deadlock or overwrite
-            return;
-        };
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "the second, overlapping RestoreStdio::close(&[2]) must panic cleanly (exit 101), not \
-             hang, abort, or silently succeed — got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("SAVED_STDERR already occupied"),
-            "the overlap panic's own message must reach stderr — got:\n{combined}"
-        );
-    }
-
-    /// A rejected second guard must not clear the FIRST guard's still-live registration. The
-    /// panic hook fires synchronously at the SECOND guard's own panic (before any unwinding, so
-    /// before either guard's `Drop` runs), which is why [`two_overlapping_fd2_closes_panics_cleanly`]
-    /// passes even if the overlap check runs AFTER the push (that panic's own message is
-    /// delivered through the FIRST guard's still-untouched registration regardless). This test
-    /// instead CATCHES that first panic, so a LATER, separate panic — while the first guard is
-    /// still alive — is what proves whether the rejected second guard's own `Drop` corrupted
-    /// `SAVED_STDERR` on its way out.
-    #[test]
-    fn a_rejected_second_guard_does_not_clear_the_first_guards_slot() {
-        let Some(out) = alone_capturing(fixture_path!(
-            a_rejected_second_guard_does_not_clear_the_first_guards_slot
-        )) else {
-            let _first = RestoreStdio::close(&[2]);
-            let _file = tempfile::tempfile().expect("open a file that lands at the freed fd 2");
-            let result = std::panic::catch_unwind(|| {
-                let _second = RestoreStdio::close(&[2]); // rejected; caught, not propagated
-            });
-            assert!(result.is_err(), "the second, overlapping close must panic");
-            drop(_file);
-            // `_first` is STILL alive here — this is the whole point: does ITS registration
-            // survive the rejected second guard's own unwind?
-            panic!(
-                "REJECTED_SECOND_GUARD_MARKER: this message must reach real stderr via the \
-                 FIRST guard's still-live registration"
-            );
-        };
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "the deliberate panic after the caught overlap must exit 101 — got {:?}\n--- stdout \
-             ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("REJECTED_SECOND_GUARD_MARKER"),
-            "the first guard's registration must survive the rejected second guard's own Drop — \
-             got:\n{combined}"
-        );
-    }
-
-    // Panic-hook mechanism =====
-
-    /// A panic while `RestoreStdio` holds fd 2 closed must still reach stderr: before the fix, the
-    /// default hook's write to a closed fd 2 failed, and the hook dropped that failure rather than
-    /// panicking again.
-    #[test]
-    fn a_panic_while_fd2_is_closed_still_reaches_stderr() {
-        let Some(out) = alone_capturing(fixture_path!(a_panic_while_fd2_is_closed_still_reaches_stderr)) else {
-            let _restore = RestoreStdio::close(&[2]);
-            panic!("PANIC_WHILE_FD2_CLOSED_MARKER: this message must survive fd 2 being closed");
-        };
-        // Exit code EXACTLY 101 (an ordinary libtest panic), not merely nonzero: an abort has no
-        // defined exit code (commonly reported as 134/SIGABRT).
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "the probe must fail with an ordinary libtest panic exit (101), not an abort — got \
-             {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("PANIC_WHILE_FD2_CLOSED_MARKER"),
-            "the probe's own panic message must survive fd 2 being closed while it panicked — \
-             got:\n{combined}"
-        );
-    }
-
-    // require_process_per_test's gate =====
-
-    #[test]
-    fn gate_rejects_a_non_alone_process() {
-        const TRIGGER: &str = "COSCA_TEST_TRIGGER_GATE_REJECTS_A_NON_ALONE_PROCESS";
-        if std::env::var_os(TRIGGER).is_some() {
-            // The deliberately-spawned, non-alone child: call the gated operation directly.
-            let _ = RestoreStdio::close(&[2]);
-            return;
-        }
-        let out = spawn_without_alone_shape(fixture_path!(gate_rejects_a_non_alone_process), None, &[(TRIGGER, "1")]);
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "a process not running under alone() must have RestoreStdio::close panic (exit 101) \
-             — got {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("call this from inside alone()"),
-            "the gate's own panic message must reach stderr — got:\n{combined}"
-        );
-    }
-
-    #[test]
-    fn gate_rejects_a_matching_env_var_with_a_non_alone_argv() {
-        const TRIGGER: &str = "COSCA_TEST_TRIGGER_GATE_REJECTS_A_MATCHING_ENV_VAR_WITH_A_NON_ALONE_ARGV";
-        if std::env::var_os(TRIGGER).is_some() {
-            let _ = RestoreStdio::close(&[2]);
-            return;
-        }
-        let fixture = fixture_path!(gate_rejects_a_matching_env_var_with_a_non_alone_argv);
-        let out = spawn_without_alone_shape(fixture, Some(fixture), &[(TRIGGER, "1")]);
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "a matching COSCA_TEST_ALONE with the WRONG argv shape must still be rejected (exit \
-             101) — an env-var-only gate would wrongly accept this. got {:?}\n--- stdout ---\n{}\n\
-             --- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("call this from inside alone()"),
-            "the gate's own panic message must reach stderr — got:\n{combined}"
-        );
-    }
-
-    // write_completion_token_if_child: fan-out safety =====
-
-    /// A caller that fans out its OWN further `ALONE_ARGS`-shaped children (like
-    /// `linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child` in
-    /// `tests/spawn_io.rs`) must call [`clear_inherited_completion_token`] on each one, or that
-    /// grandchild inherits a stale [`TOKEN_FD_ENV`] naming a fd number that means nothing in its
-    /// own fd table. This proves the fallback for a caller that does NOT: forges exactly that
-    /// situation directly (a re-exec'd child, shaped like `alone()`'s own, but with `TOKEN_FD_ENV`
-    /// pointing at a REGULAR FILE instead of a real pipe — indistinguishable, from an env var
-    /// alone, from a stale inherited one) and asserts the child neither aborts nor writes into it.
-    #[test]
-    fn a_stale_token_fd_pointing_at_a_non_pipe_is_not_touched() {
-        use std::os::fd::AsRawFd;
-
-        let name = fixture_path!(a_stale_token_fd_pointing_at_a_non_pipe_is_not_touched);
-        const MARKER_PATH_ENV: &str = "COSCA_TEST_STALE_FD_MARKER_PATH";
-        let argv: Vec<String> = std::env::args().skip(1).collect();
-        if super::alone_marker_matches(Some(name), &argv) {
-            // The forged child: `alone(name)` below runs the exact same dispatch a real fixture's
-            // does, including `write_completion_token_if_child` — against the FORGED, non-pipe
-            // `TOKEN_FD_ENV` our own (non-`spawn_alone`) parent below set up.
-            assert!(
-                super::alone(name),
-                "alone() must recognize this re-exec'd process as its own child"
-            );
-            let path = std::env::var(MARKER_PATH_ENV).expect("marker path env var");
-            let contents = std::fs::read_to_string(&path).expect("read the marker file back");
-            assert_eq!(
-                contents, "untouched",
-                "write_completion_token_if_child must never write into a fd that is not a pipe"
-            );
-            return;
-        }
-
-        let path = std::env::temp_dir().join(format!("cosca-stale-fd-marker-{}", std::process::id()));
-        std::fs::write(&path, "untouched").expect("write the marker file");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .expect("reopen the marker file");
-        let file_fd = file.as_raw_fd();
-        let child = {
-            let _guard = super::super::test_spawn_lock();
-            // SAFETY: clears FD_CLOEXEC on `file`'s own fd so it survives into the child at the
-            // same number — exactly what a REAL stale inheritance would also do, and exactly what
-            // `spawn_alone` does for its own, real pipe; held under `test_spawn_lock()` for the
-            // same reason.
-            unsafe {
-                let flags = libc::fcntl(file_fd, libc::F_GETFD);
-                assert_ne!(
-                    flags,
-                    -1,
-                    "fcntl(F_GETFD) on the marker file: {}",
-                    std::io::Error::last_os_error()
-                );
-                assert_eq!(
-                    libc::fcntl(file_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                    0,
-                    "fcntl(F_SETFD) to make the marker file inheritable: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            std::process::Command::new(std::env::current_exe().expect("this test binary"))
-                .args(std::iter::once(name).chain(super::ALONE_ARGS))
-                .env("COSCA_TEST_ALONE", name)
-                .env(super::TOKEN_FD_ENV, file_fd.to_string())
-                .env(MARKER_PATH_ENV, &path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn the forged child")
-        };
-        drop(file);
-        let out = wait_bounded(child, super::PROBE_TIMEOUT, false);
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            out.status.success(),
-            "a stale, non-pipe TOKEN_FD_ENV must never abort or panic the child — got {:?}\n--- \
-             stdout ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// [`clear_inherited_completion_token`] must actually remove [`TOKEN_FD_ENV`] from the
-    /// `Command` it is given — not merely leave the inherited value in place — or a fan-out
-    /// caller using it gets no protection at all.
-    #[test]
-    fn clear_inherited_completion_token_removes_the_env_var() {
-        let mut cmd = std::process::Command::new("/bin/true");
-        cmd.env(super::TOKEN_FD_ENV, "3");
-        super::clear_inherited_completion_token(&mut cmd);
-        let removed = cmd
-            .get_envs()
-            .any(|(key, value)| key == std::ffi::OsStr::new(super::TOKEN_FD_ENV) && value.is_none());
-        assert!(
-            removed,
-            "clear_inherited_completion_token must remove {}, not merely leave it set",
-            super::TOKEN_FD_ENV
-        );
-    }
-
-    // RestoreStdio: duplicate fd, mid-loop restore, no double panic (c4586e0f) =====
-
-    /// `RestoreStdio::close` rejects a repeated fd. In debug, the `debug_assert!` fires first
-    /// ("fds must be distinct"); in release it no-ops, but the second pass then tries to dup an
-    /// ALREADY-CLOSED fd 2 and panics on THAT `fcntl` failure instead — so this panics, with a
-    /// different message, in every build profile.
-    #[test]
-    fn close_rejects_a_duplicate_fd() {
-        let Some(out) = alone_capturing(fixture_path!(close_rejects_a_duplicate_fd)) else {
-            let _guard = RestoreStdio::close(&[2, 2]);
-            return;
-        };
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "close(&[2, 2]) must panic in every build profile — got {:?}\n--- stdout ---\n{}\n--- \
-             stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // In debug, the upfront `debug_assert!` ("fds must be distinct") fires before the loop
-        // even starts. In release that's a no-op, so the loop runs: the first `2` registers
-        // `SAVED_STDERR`, and the SECOND `2` now hits the overlap check — moved BEFORE the dup and
-        // the push by finding 1's fix — which sees ITS OWN prior registration as "already
-        // occupied" and rejects it the same way a genuinely different second guard would, before
-        // ever reaching the dup-aside step.
-        let expected = if cfg!(debug_assertions) {
-            "fds must be distinct"
-        } else {
-            "SAVED_STDERR already occupied"
-        };
-        assert!(
-            combined.contains(expected),
-            "expected {expected:?} in the panic reachable in this build profile — got:\n{combined}"
-        );
-    }
-
-    /// When a later fd in the list fails, the guard built so far must still restore the EARLIER
-    /// fds it already closed — proving `close`'s incremental-guard construction, not just its
-    /// existence. -1 is never a valid fd, so its own `fcntl` dup-aside fails immediately after fd
-    /// 2 has already been closed and pushed into the guard, with no dependence on what happens to
-    /// be open at any particular number.
-    #[test]
-    fn close_mid_loop_failure_restores_earlier_fds() {
-        let Some(out) = alone_capturing(fixture_path!(close_mid_loop_failure_restores_earlier_fds)) else {
-            // SAFETY: -1 is never a valid fd; confirm it is rejected the expected way before
-            // relying on that failure to drive the guard's own mid-loop restore below.
-            let probe = unsafe { libc::fcntl(-1, libc::F_GETFD) };
-            assert_eq!(
-                probe, -1,
-                "fd -1 must already be invalid before this probe relies on that"
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().kind(),
-                std::io::Error::from_raw_os_error(libc::EBADF).kind(),
-                "fd -1 must fail with EBADF specifically"
-            );
-            let result = std::panic::catch_unwind(|| {
-                let _guard = RestoreStdio::close(&[2, -1]);
-            });
-            assert!(result.is_err(), "close(&[2, -1]) must panic: fd -1 is never valid");
-            // The guard (holding only fd 2, since -1 never got pushed) dropped during unwind and
-            // restored fd 2. A closed fd fails F_GETFD with EBADF; the real fd 2 here (piped by
-            // `alone_capturing`) accepts it once restored.
-            // SAFETY: F_GETFD reads flags only, no ownership implications.
-            let flags = unsafe { libc::fcntl(2, libc::F_GETFD) };
-            assert_ne!(
-                flags,
-                -1,
-                "fd 2 must be restored after the mid-loop panic unwound the guard: {}",
-                std::io::Error::last_os_error()
-            );
-            eprintln!("CLOSE_MID_LOOP_RESTORE_MARKER: fd 2 is usable again");
-            return;
-        };
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "the probe catches its own panic and must finish normally — got {:?}\n--- stdout \
-             ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("CLOSE_MID_LOOP_RESTORE_MARKER"),
-            "the probe must observe fd 2 restored after the mid-loop panic — got:\n{combined}"
-        );
-    }
-
-    /// `Drop` must not panic a SECOND time while already unwinding an earlier panic (which would
-    /// abort the process, `SIGABRT`): sabotages the guard's own restore by tightening
-    /// `RLIMIT_NOFILE` to 1 AFTER fd 2 is already closed and dup'd aside — `dup2`ing anything onto
-    /// fd 2 (>= the new limit) then fails — then panics for an unrelated reason while the guard is
-    /// still alive. `Drop` must report the sabotaged restore without panicking again.
-    ///
-    /// `rlim_max` comes from a real `getrlimit`, never a hand-picked constant: hardcoding it below
-    /// the host's actual hard limit would make `setrlimit` merely LOWER `rlim_max` too (fine on
-    /// its own), but hardcoding it ABOVE a LOWER real hard limit would fail outright trying to
-    /// RAISE it — passing vacuously either way, since this probe's own setup assert would panic
-    /// for a reason that has nothing to do with the scenario under test.
-    #[test]
-    fn drop_does_not_double_panic() {
-        let Some(out) = alone_capturing(fixture_path!(drop_does_not_double_panic)) else {
-            let _restore_stdio = RestoreStdio::close(&[2]);
-            let mut original: libc::rlimit = unsafe { std::mem::zeroed() };
-            // SAFETY: `original` is a valid, correctly-sized out-param.
-            assert_eq!(
-                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
-                0,
-                "getrlimit(RLIMIT_NOFILE): {}",
-                std::io::Error::last_os_error()
-            );
-            #[cfg(target_os = "linux")]
-            drop_cap_sys_resource(); // a root probe must sabotage itself too — see finding 11
-            let tight = libc::rlimit {
-                rlim_cur: 1,
-                rlim_max: original.rlim_max,
-            };
-            assert_eq!(
-                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) },
-                0,
-                "tighten RLIMIT_NOFILE for the probe: {}",
-                std::io::Error::last_os_error()
-            );
-            // No `eprintln!` marker here: fd 2 is ALREADY closed by `_restore_stdio` at this
-            // point, so an ordinary write to it (which is what `eprintln!` does) would be
-            // silently dropped — exactly the failure mode `RestoreStdio::drop`'s own direct
-            // write-to-dup exists to avoid. The prover below checks for THAT report instead,
-            // which doubles as proving this probe reached its sabotage and as finding 2's own
-            // "assert its text in the prover" requirement.
-            panic!("triggering an unwind while RestoreStdio::drop's own restore is sabotaged");
-        };
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "an ordinary panic while the guard's restore is sabotaged must exit 101 (Drop's own \
-             report, not a second panic) — an abort (no code, commonly 134/SIGABRT) means Drop \
-             panicked again while already unwinding. got {:?}\n--- stdout ---\n{}\n--- stderr \
-             ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // `RestoreStdio::drop`'s own report of the sabotaged restore must reach stderr — written
-        // directly to the guard's saved dup, not through real fd 2 (which is exactly what the
-        // sabotage broke). This is also finding 2's own required check: a mutant that deletes
-        // that report must fail THIS assertion even though it would leave the exit code alone.
-        assert!(
-            combined.contains("RestoreStdio::drop:") && combined.contains("while restoring a guarded fd failed"),
-            "the guard's own restore-failure report must reach stderr, proving both that the \
-             probe reached its sabotage (not an earlier, unrelated failure) and that the report \
-             itself was not silently dropped — got:\n{combined}"
-        );
-    }
-
-    /// Drop CAP_SYS_RESOURCE from this process's own effective/permitted/inheritable sets. As
-    /// root (the cgroup lane's own uid), `dup2`'s rlimit check is unaffected by capabilities, but
-    /// `setrlimit`'s own — raising `rlim_cur` back past a lowered value — is not, so a root probe
-    /// process must strip its own privilege before relying on a tightened rlimit to hold. No
-    /// wrapper exists in the `libc` crate for `capget`/`capset`; both are plain syscalls.
-    #[cfg(target_os = "linux")]
-    fn drop_cap_sys_resource() {
-        #[repr(C)]
-        struct CapHeader {
-            version: u32,
-            pid: i32,
-        }
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct CapData {
-            effective: u32,
-            permitted: u32,
-            inheritable: u32,
-        }
-        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-        const CAP_SYS_RESOURCE: u32 = 24;
-        let mut header = CapHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = [CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        }; 2];
-        // SAFETY: `header`/`data` are correctly-sized, valid out-params for this process's own
-        // capability sets (pid 0 means "self").
-        let ret = unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(header), data.as_mut_ptr()) };
-        assert_eq!(ret, 0, "capget: {}", std::io::Error::last_os_error());
-        let idx = (CAP_SYS_RESOURCE / 32) as usize;
-        let bit = 1u32 << (CAP_SYS_RESOURCE % 32);
-        data[idx].effective &= !bit;
-        data[idx].permitted &= !bit;
-        data[idx].inheritable &= !bit;
-        // SAFETY: as above; `header` is the SAME struct capget just filled in (same version).
-        let ret = unsafe { libc::syscall(libc::SYS_capset, std::ptr::addr_of_mut!(header), data.as_ptr()) };
-        assert_eq!(ret, 0, "capset: {}", std::io::Error::last_os_error());
-    }
-
-    // RestoreRlimitNofile: gate (757129d8) =====
-
-    #[test]
-    fn gate_rejects_a_non_alone_process_for_rlimit() {
-        const TRIGGER: &str = "COSCA_TEST_TRIGGER_GATE_REJECTS_A_NON_ALONE_PROCESS_FOR_RLIMIT";
-        if std::env::var_os(TRIGGER).is_some() {
-            let _guard = RestoreRlimitNofile::lower_to(64);
-            return;
-        }
-        let out = spawn_without_alone_shape(
-            fixture_path!(gate_rejects_a_non_alone_process_for_rlimit),
-            None,
-            &[(TRIGGER, "1")],
-        );
-        assert_eq!(
-            out.status.code(),
-            Some(101),
-            "a process not running under alone() must have lower_to panic (exit 101) — got \
-             {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            combined.contains("call this from inside alone()"),
-            "the gate's own panic message must reach stderr — got:\n{combined}"
-        );
-    }
-
-    // wait_bounded's real drain thread =====
-
-    /// `wait_bounded` must drain stdout and stderr CONCURRENTLY, not one after the other: a child
-    /// that writes more than one pipe buffer to stderr while producing little or no stdout would
-    /// otherwise deadlock it, since reading stdout to EOF blocks until the child exits while the
-    /// child is itself blocked writing to the undrained stderr pipe. Exercises the real drain
-    /// thread `wait_bounded` spawns — the `wait_on_channel_*` tests below bypass it with a
-    /// synthetic channel.
-    #[test]
-    fn wait_bounded_drains_stdout_and_stderr_concurrently() {
-        const STDERR_BYTES: usize = 200_000;
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(format!("head -c {STDERR_BYTES} /dev/zero | tr '\\0' 'x' 1>&2"))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = {
-            let _guard = super::super::test_spawn_lock();
-            cmd.spawn().expect("spawn the child")
-        };
-        let out = wait_bounded(child, super::PROBE_TIMEOUT, false);
-        assert!(out.status.success(), "the child must exit cleanly: {:?}", out.status);
-        assert_eq!(
-            out.stderr.len(),
-            STDERR_BYTES,
-            "must drain all of stderr, not hang or truncate it while stdout sits empty"
-        );
-    }
-
-    // wait_on_channel's Timeout/Disconnected arms, and the kill they must perform (665960be) =====
-
-    /// A child that exits ONLY when killed — blocked forever reading `stdin`, whose write end THIS
-    /// test holds open — not a timed sleep: a mutant that deletes the kill call must make these
-    /// tests hang or fail, not silently pass a few seconds late because the fixture's own lifetime
-    /// happened to end anyway.
-    fn child_blocked_until_killed() -> (std::process::Child, std::io::PipeWriter) {
-        let (read_end, write_end) = std::io::pipe().expect("open blocking pipe");
-        let child = {
-            let _guard = super::super::test_spawn_lock();
-            std::process::Command::new("cat")
-                .stdin(read_end)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn a child blocked on stdin")
-        };
-        (child, write_end)
-    }
-
-    /// Proves [`kill_and_reap`] actually terminates a child that would otherwise never exit, via
-    /// the exit status's own signal — not `kill(pid, 0)` after the reap, which would test whether
-    /// SOME process currently holds this pid, quite possibly a different, later, unrelated one the
-    /// OS has already recycled the number for.
-    #[test]
-    fn kill_and_reap_sends_sigkill() {
-        let (child, _write_end_keeps_it_blocked) = child_blocked_until_killed();
-        let status = kill_and_reap(child, false);
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(libc::SIGKILL),
-            "a child that only exits when killed must show SIGKILL in its own exit status: {status:?}"
-        );
-    }
-
-    /// `wait_on_channel`'s `Timeout` arm must actually invoke the kill-and-reap path promptly,
-    /// rather than hang forever waiting for a child that would otherwise never exit. The SIGKILL
-    /// mechanism itself is proven directly by [`kill_and_reap_sends_sigkill`]; downcasting this
-    /// panic's own payload lets this test also confirm the signal is the one THIS call path
-    /// reports, not merely that some panic occurred.
-    #[test]
-    fn wait_on_channel_timeout_kills_and_reaps() {
-        let (child, _write_end_keeps_it_blocked) = child_blocked_until_killed();
-        let (_tx, rx) = std::sync::mpsc::channel::<super::DrainResult>();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wait_on_channel(child, std::time::Duration::from_millis(200), rx, false)
-        }));
-        let payload = result.expect_err("a blocked-forever child must still make this panic");
-        let message = payload
-            .downcast_ref::<String>()
-            .expect("wait_on_channel's panic payload must be a String");
-        assert!(
-            message.contains(&format!("signal {:?}", Some(libc::SIGKILL))),
-            "the panic message must report the child's own SIGKILL exit status — got: {message}"
-        );
-    }
-
-    /// `wait_on_channel`'s `Disconnected` arm (the drain side died without a result) must ALSO
-    /// kill and reap, exactly like `Timeout` — not just panic and leave the child running. Drops
-    /// the sender immediately, so `recv_timeout` observes `Disconnected` right away.
-    #[test]
-    fn wait_on_channel_disconnected_kills_and_reaps() {
-        let (child, _write_end_keeps_it_blocked) = child_blocked_until_killed();
-        let (tx, rx) = std::sync::mpsc::channel::<super::DrainResult>();
-        drop(tx);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wait_on_channel(child, std::time::Duration::from_secs(10), rx, false)
-        }));
-        let payload = result.expect_err("a disconnected channel must still make this panic");
-        let message = payload
-            .downcast_ref::<String>()
-            .expect("wait_on_channel's panic payload must be a String");
-        assert!(
-            message.contains(&format!("signal {:?}", Some(libc::SIGKILL))),
-            "the panic message must report the child's own SIGKILL exit status — got: {message}"
-        );
-    }
 }
 
 #[cfg(test)]

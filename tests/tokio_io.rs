@@ -572,9 +572,9 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
-    if !common::alone("async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort") {
+    let Some(_completion) = common::alone("async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort") else {
         return;
-    }
+    };
     let _rlimit_guard = common::RestoreRlimitNofile::lower_to(256);
 
     let mut cmd = cosca::tokio::Command::new();
@@ -628,9 +628,10 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
 #[cfg(unix)]
 #[tokio::test]
 async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
-    if !common::alone("async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed") {
+    let Some(_completion) = common::alone("async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed")
+    else {
         return;
-    }
+    };
     use tokio::io::AsyncReadExt;
 
     let _restore = common::RestoreStdio::close(&[2]);
@@ -667,9 +668,9 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
 #[cfg(unix)]
 #[tokio::test]
 async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
-    if !common::alone("async_relocating_a_low_parent_fd_keeps_spawn_errors_reported") {
+    let Some(_completion) = common::alone("async_relocating_a_low_parent_fd_keeps_spawn_errors_reported") else {
         return;
-    }
+    };
     use std::io::{Read, Seek, SeekFrom};
 
     let out_f = tempfile::tempfile().expect("tempfile for stdout target");

@@ -40,6 +40,13 @@ pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 /// is excluded from the package; a `src/lib.rs` `#[path]` into it would break that build).
 #[cfg(all(unix, test))]
 pub(crate) mod test_isolation;
+/// Unit tests for [`test_isolation`] — a lib-only, ordinary sibling module, deliberately NOT
+/// declared from within `test_isolation.rs` itself. See its own module doc for why: that file is
+/// `#[path]`-shared into every integration test binary too, where `cfg(test)` is equally true, so
+/// a `mod` declared there would run this whole module's real child-process-spawning tests again
+/// in each one.
+#[cfg(all(unix, test))]
+mod test_isolation_tests;
 
 mod command;
 // Off Windows only the `Exact` completion (`resolve::exact`) is consumed, so the lib build sees

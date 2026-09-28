@@ -13,7 +13,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 
-/// Re-exported so `tests/common/isolation.rs`'s `#[path]`-included copy (mounted as
+/// Re-exported so `src/test_isolation.rs`'s `#[path]`-included copy (mounted as
 /// `common::isolation` here, `crate::test_isolation` in the lib) can reach it as `super::
 /// test_spawn_lock` from either mount point without an `extern crate self as cosca;` alias.
 #[cfg(unix)]
@@ -24,8 +24,8 @@ pub(crate) use cosca::test_spawn_lock;
 mod isolation;
 #[cfg(unix)]
 pub(crate) use isolation::{
-    alone, alone_capturing, clear_inherited_completion_token, fixture_path, require_process_per_test,
-    spawn_without_alone_shape, RestoreRlimitNofile, RestoreStdio, ALONE_ARGS,
+    alone, alone_capturing, alone_with_env, fixture_path, require_process_per_test, spawn_without_alone_shape,
+    RestoreRlimitNofile, RestoreStdio, ALONE_ARGS,
 };
 
 pub fn testbin() -> &'static str {

@@ -375,11 +375,11 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 /// through fd 3 instead of the mapping's real source.
 #[test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
-    if !crate::test_isolation::alone(
+    let Some(_completion) = crate::test_isolation::alone(
         "child::spawn::fd_map::fd_map_tests::a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it",
-    ) {
+    ) else {
         return;
-    }
+    };
     let _restore = crate::test_isolation::RestoreStdio::close(&[2]);
     // The next fd opened lands at 2 (just closed above by `RestoreStdio::close(&[2])`) — this IS the
     // mapping's source, at the exact number the bug needs to reproduce.
@@ -427,11 +427,11 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 /// purposes across the fork, corrupting whichever one loses.
 #[test]
 fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
-    if !crate::test_isolation::alone(
+    let Some(_completion) = crate::test_isolation::alone(
         "child::spawn::fd_map::fd_map_tests::a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops",
-    ) {
+    ) else {
         return;
-    }
+    };
     let _restore = crate::test_isolation::RestoreStdio::close(&[2]);
     // The next fd opened lands at 2 (just closed above by `RestoreStdio::close(&[2])`).
     let owned: OwnedFd = file_with("kept-open").into();

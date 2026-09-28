@@ -456,9 +456,9 @@ fn unix_fd3_inherit_is_rejected() {
 #[cfg(unix)]
 #[test]
 fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
-    if !common::alone("unix_fd_out_of_range_fails_spawn_cleanly_not_abort") {
+    let Some(_completion) = common::alone("unix_fd_out_of_range_fails_spawn_cleanly_not_abort") else {
         return;
-    }
+    };
     let _rlimit_guard = common::RestoreRlimitNofile::lower_to(256);
 
     let mut cmd = Command::new();
@@ -515,9 +515,9 @@ fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
 #[cfg(unix)]
 #[test]
 fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
-    if !common::alone("a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed") {
+    let Some(_completion) = common::alone("a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed") else {
         return;
-    }
+    };
     use std::io::{Seek, SeekFrom};
 
     let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
@@ -558,9 +558,9 @@ fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
 #[cfg(unix)]
 #[test]
 fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
-    if !common::alone("relocating_a_low_parent_fd_keeps_spawn_errors_reported") {
+    let Some(_completion) = common::alone("relocating_a_low_parent_fd_keeps_spawn_errors_reported") else {
         return;
-    }
+    };
     use std::io::{Seek, SeekFrom};
 
     let out_f = tempfile::tempfile().expect("tempfile for stdout target");

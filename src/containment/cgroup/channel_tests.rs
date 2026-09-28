@@ -224,9 +224,11 @@ fn reset_by_the_parent(proceed: bool) -> (std::os::fd::OwnedFd, crate::containme
 #[cfg(target_os = "linux")]
 #[test]
 fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
-    if !alone("containment::cgroup::channel::channel_tests::a_reset_channel_ends_the_exchange_as_a_closed_one_does") {
+    let Some(_completion) =
+        alone("containment::cgroup::channel::channel_tests::a_reset_channel_ends_the_exchange_as_a_closed_one_does")
+    else {
         return;
-    }
+    };
     // The setup gives a real `ECONNRESET`, which a plain send shows.
     let (_end, slot) = reset_by_the_parent(false);
     // SAFETY: `_end` keeps the child's end open; the buffer is on this frame.
@@ -255,9 +257,11 @@ fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
 #[cfg(target_os = "linux")]
 #[test]
 fn proceed_reads_what_was_sent_before_it_closes() {
-    if !alone("containment::cgroup::channel::channel_tests::proceed_reads_what_was_sent_before_it_closes") {
+    let Some(_completion) =
+        alone("containment::cgroup::channel::channel_tests::proceed_reads_what_was_sent_before_it_closes")
+    else {
         return;
-    }
+    };
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let (_end, slot) = childs_copy(&channel);
     // SAFETY: the channel is open.
