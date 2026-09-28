@@ -2249,18 +2249,18 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    let pid = fork_running(move || {
+    let guard = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
         let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    })
-    .defuse();
+    });
     // SAFETY: the parent's own copy, closed once; the child keeps its own.
     unsafe { libc::close(procs_fd) };
     let received = channel.shut();
     assert!(received.pid.is_none(), "the child was held before its hook");
     gate_write.write_all(b"x").expect("release the child");
 
+    let pid = guard.defuse();
     let mut status = 0;
     // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
     assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
@@ -2640,16 +2640,15 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
-    let pid = fork_running(move || {
+    let guard = fork_running(move || {
         // SAFETY: this child's inherited copy of the channel's child end.
         let _ = unsafe { slot.send_intent() };
         block_on(gate);
-    })
-    .defuse();
+    });
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
     gate_write.write_all(b"x").expect("release the child");
     // Reaped as `std` reaps it: before the exchange is abandoned.
-    reap(pid);
+    reap(guard.defuse());
 
     assert_eq!(
         leaf.abandon_before_verdict(),
@@ -3003,12 +3002,11 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    let pid = fork_running(move || {
+    let guard = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
         let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    })
-    .defuse();
+    });
     // SAFETY: the parent's own copy, closed once.
     unsafe { libc::close(procs_fd) };
     drop(gate_read);
@@ -3024,9 +3022,12 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
             rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
         ) {}
     });
-    let err = leaf.fail_closed(pid, channel, "the test cannot decide").to_string();
+    let err = leaf
+        .fail_closed(guard.pid(), channel, "the test cannot decide")
+        .to_string();
     assert!(err.contains("could not be signalled"), "got {err}");
 
+    let pid = guard.defuse();
     let mut status = 0;
     // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
     assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
