@@ -1,20 +1,20 @@
 nextest-version = { required = "0.9.137" }
 
-# A failure bound for `accept_or_die`'s own regression test (tests/process.rs): it asserts that a
-# dead-before-connecting target panics rather than hanging the caller. A mutant that broke that
-# guarantee back into a hang would otherwise wedge the whole run instead of just failing this one
-# test — this bound turns that into a fast, attributable failure. Set on both `default` (so a
-# local run gets it too) and `ci`.
+# A failure bound for every "must panic, not hang" death-watch regression test (the shared
+# `accept_or_die`/`accept_or_die_async` primitives in tests/process.rs and tests/tokio_io.rs, and
+# the per-helper "reverted to a plain accept" tests in the same two files plus
+# tests/windows_breakaway.rs): each asserts that a dead-before-connecting target panics rather
+# than hanging the caller. A mutant that broke that guarantee back into a hang would otherwise
+# wedge the whole run instead of just failing this one test — this bound turns that into a fast,
+# attributable failure. `[profile.default.overrides]` alone is enough: nextest applies it to
+# every profile, `ci` included, so a duplicate `[profile.ci.overrides]` entry for the same filter
+# would just be dead weight.
 [[profile.default.overrides]]
-filter = 'test(accept_or_die_panics_loudly_when_the_target_dies_first)'
+filter = 'test(/panics_loudly_when_the_target_dies_first|panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
 [profile.ci]
 fail-fast = false
-
-[[profile.ci.overrides]]
-filter = 'test(accept_or_die_panics_loudly_when_the_target_dies_first)'
-slow-timeout = { period = "10s", terminate-after = 1 }
 
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every

@@ -310,6 +310,17 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf); // blocks until the socket closes (our death) / test writes
         }
+        "control-once" => {
+            // Like control-block, but exits immediately after the tag instead of blocking — for
+            // proving `accept_or_die`'s "connect then exit immediately" race: the connection is
+            // in the listener's backlog and this process has already exited by the time a caller
+            // gets around to checking either.
+            let addr = &args[2];
+            let tag = args.get(3).map(String::as_str).unwrap_or("?");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.write_all(tag.as_bytes()).unwrap();
+            sock.flush().unwrap();
+        }
         #[cfg(target_os = "macos")]
         "control-block-mixed-cloexec-marker" => {
             // Like control-block, but first `F_DUPFD_CLOEXEC`s a second copy of the inherited
