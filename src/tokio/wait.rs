@@ -365,11 +365,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
                 listener,
                 deadline: None,
             } => listener.await,
-            // `timeout_at` is armed with the caller's own instant directly: how long it took to
-            // get from `drain_step`'s entry to here changes nothing about that instant. Its
-            // timer wheel rounds up to its own granularity (1ms), so the wake can still land
-            // somewhat after the instant, but never before it, and never later by this step's
-            // own choice.
+            // A timeout is looked at by the next step, which reads the leaf once more.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),

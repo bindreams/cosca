@@ -37,7 +37,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use rustix::fs::inotify;
 
 use super::{above_stdio, fd_path, read_populated, removed_after_drain, LeafDir};
-use crate::containment::TreeDrain;
 use crate::error::Error;
 
 /// A watch on one leaf's drain. See the module docs.
@@ -138,17 +137,13 @@ impl DrainWatch {
         }
     }
 
-    /// Block until the leaf drains — `populated` reads 0, or the leaf is removed. Unbounded: its
-    /// one caller (`CgroupLeaf::block_until_drained`, `Drop`'s own teardown — both the armed path
-    /// and the disarmed-but-killed path use it) never has a deadline to honor. A bounded wait
-    /// goes through `CgroupLeaf::wait_drained`'s own `Block` arm instead
-    /// (`event_listener::Listener::wait_deadline`), which this type never sees.
-    pub(crate) fn wait(&mut self) -> Result<TreeDrain, Error> {
+    /// Block until the leaf drains — `populated` reads 0, or the leaf is removed. Unbounded.
+    pub(crate) fn wait(&mut self) -> Result<(), Error> {
         use rustix::event::{poll, PollFd, PollFlags};
 
         loop {
             if !self.populated()? {
-                return Ok(TreeDrain::AllMembersExited);
+                return Ok(());
             }
             #[cfg(test)]
             super::fault::notify_drain_blocking();
