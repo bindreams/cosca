@@ -98,12 +98,12 @@ pub(crate) fn take_drain_blocking_notifier() {
 pub(crate) fn notify_drain_blocking() {
     DRAIN_BLOCKING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
-            // A send failure while a notifier is installed means its receiver was dropped early
-            // — a contract violation by the test that installed it, not something to swallow.
-            debug_assert!(
-                notify.send(()).is_ok(),
-                "drain-blocking notifier's receiver was dropped"
-            );
+            // The send must always run — `debug_assert!` does not evaluate its condition in a
+            // release build, so it cannot gate the call itself, only check its result. A send
+            // failure while a notifier is installed means its receiver was dropped early — a
+            // contract violation by the test that installed it, not something to swallow.
+            let sent = notify.send(());
+            debug_assert!(sent.is_ok(), "drain-blocking notifier's receiver was dropped");
         }
     });
 }
@@ -120,10 +120,10 @@ pub(crate) fn take_drain_zero_remaining_notifier() {
 pub(crate) fn notify_drain_zero_remaining() {
     DRAIN_ZERO_REMAINING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
-            debug_assert!(
-                notify.send(()).is_ok(),
-                "zero-remaining notifier's receiver was dropped"
-            );
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(());
+            debug_assert!(sent.is_ok(), "zero-remaining notifier's receiver was dropped");
         }
     });
 }
@@ -152,10 +152,10 @@ pub(crate) fn take_wait_site_park_notifier() {
 pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
     WAIT_SITE_PARK.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {
-            debug_assert!(
-                notify.send(park).is_ok(),
-                "wait-site-park notifier's receiver was dropped"
-            );
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(park);
+            debug_assert!(sent.is_ok(), "wait-site-park notifier's receiver was dropped");
         }
     });
 }
@@ -185,10 +185,10 @@ pub(crate) fn take_tokio_wait_site_park_notifier() {
 pub(crate) fn notify_tokio_wait_site_park(park: TokioWaitSitePark) {
     TOKIO_WAIT_SITE_PARK.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {
-            debug_assert!(
-                notify.send(park).is_ok(),
-                "tokio-wait-site-park notifier's receiver was dropped"
-            );
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(park);
+            debug_assert!(sent.is_ok(), "tokio-wait-site-park notifier's receiver was dropped");
         }
     });
 }
