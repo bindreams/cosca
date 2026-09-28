@@ -621,7 +621,11 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
 /// taken between them could climb further right after — measured 16384, then 65536. Returns the
 /// `FIONREAD` count once full.
 #[cfg(feature = "tokio")]
-fn fill_pipe_to_capacity(w: &std::io::PipeWriter) -> i32 {
+/// `r` is the SAME pipe's read end, used only to query `FIONREAD` — on macOS that ioctl reads 0
+/// on the write end of a pipe regardless of how much is actually buffered (measured: the write
+/// end alone reported 0 right after filling it to capacity), so the byte count must come from
+/// the read end even though nothing here ever reads from it.
+fn fill_pipe_to_capacity(r: &std::io::PipeReader, w: &std::io::PipeWriter) -> i32 {
     let fd = w.as_raw_fd();
     // SAFETY: `fd` is a valid, open descriptor for the whole call; `F_GETFL`/`F_SETFL` is a
     // well-formed pair on it.
@@ -642,7 +646,7 @@ fn fill_pipe_to_capacity(w: &std::io::PipeWriter) -> i32 {
             Err(e) => panic!("write failed: {e}"),
         }
     }
-    fionread(w.as_fd())
+    fionread(r.as_fd())
 }
 
 #[cfg(feature = "tokio")]
@@ -665,7 +669,7 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     // earlier version of this test, which piped a `yes | head` pipeline through a process group
     // it had to `killpg` by a PID it computed itself.
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
-    let queued_before = fill_pipe_to_capacity(&marker_w);
+    let queued_before = fill_pipe_to_capacity(&marker_r, &marker_w);
     assert!(
         queued_before >= 16384,
         "the pipe must be filled to at least its un-grown 16 KiB capacity, got {queued_before}"
