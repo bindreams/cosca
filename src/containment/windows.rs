@@ -27,7 +27,7 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     THREAD_SUSPEND_RESUME,
 };
 
@@ -651,18 +651,6 @@ fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
 /// The largest handle count a single `WaitForMultipleObjects` call accepts (`MAXIMUM_WAIT_OBJECTS`).
 const MAXIMUM_WAIT_OBJECTS: usize = 64;
 
-/// The clamp applied to a computed wait timeout (production: `INFINITE - 1`, ~49.7 days —
-/// `WaitForMultipleObjects` reserves `INFINITE` itself as the "no timeout" sentinel). A test
-/// can override it via `crate::wait::wait_clamp_seam` to exercise the "clamped wait elapsed
-/// before the real deadline, re-arm" path deterministically, without an actual 49.7-day wait.
-fn wait_max_ms() -> u32 {
-    #[cfg(test)]
-    if let Some(v) = crate::wait::wait_clamp_seam::get() {
-        return v;
-    }
-    INFINITE - 1
-}
-
 impl JobHandle {
     /// Block until every process in this job has EXITED (not reaped), or until `deadline`.
     ///
@@ -930,16 +918,7 @@ pub(crate) fn wait_drained_raw(
         // opened above — the ZERO-probe semantics fall out of the real API rather than a
         // pre-emptive return, so this round's `handles` (real, live members) still get one
         // real look before `WAIT_TIMEOUT` reports `MembersRemain` below.
-        let ms: u32 = match remaining {
-            None => INFINITE,
-            Some(d) => {
-                let clamp = wait_max_ms();
-                let ms = crate::wait::ceil_millis(d).min(clamp as u128) as u32;
-                #[cfg(test)]
-                crate::wait::wait_ms_probe::record(ms, d);
-                ms
-            }
-        };
+        let ms: u32 = crate::wait::win32_timeout_ms(remaining);
 
         // SAFETY: every handle in `handles` was just opened above and stays open for the
         // duration of this call; `cancel`, if present, is kept alive by its caller for the
@@ -956,11 +935,13 @@ pub(crate) fn wait_drained_raw(
 
         if waited == WAIT_TIMEOUT {
             // A `WAIT_TIMEOUT` only proves the caller's real deadline passed if this round's
-            // wait was not capped short of it by `wait_max_ms()`'s clamp (production:
-            // `INFINITE - 1`, ~49.7 days; test: `wait_clamp_seam`). Recheck against the real
-            // deadline rather than trust the raw verdict: if it has not actually elapsed, loop
-            // back — the outer loop re-enumerates and this round's `ms` computation re-arms
-            // with the (now shorter) remaining time. See docs/principles.md #13.
+            // wait was not capped short of it by `win32_timeout_ms`'s clamp (production:
+            // `INFINITE - 1`, ~49.7 days; test: `wait_clamp_seam`). `remaining` above is
+            // recomputed FRESH every round (never hoisted out of the outer `loop`). Recheck
+            // against the real deadline rather than trust the raw verdict: if it has not
+            // actually elapsed, loop back — the outer loop re-enumerates and next round's `ms`
+            // computation re-arms with the (now shorter) remaining time. See
+            // docs/principles.md #13 (PR #233, not yet merged).
             if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
                 return Ok(TreeDrain::MembersRemain);
             }

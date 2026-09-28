@@ -92,12 +92,18 @@ impl RawChild {
 
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry). The wait is on a
     /// real external event (child exit); the timeout is the caller's deadline, not a sync bet.
+    ///
+    /// Armed in rounds via the shared `crate::wait::win32_timeout_ms`: ceiled to whole
+    /// milliseconds (never truncated — a truncating floor of a sub-millisecond remainder would
+    /// arm a `0`ms poll and busy-spin this loop instead of a real wait) and clamped so a
+    /// deadline beyond the ~49.7-day cap never becomes an unbounded wait (`WAIT_TIMEOUT` is
+    /// rechecked against the real deadline and re-armed, `remaining` recomputed FRESH every
+    /// iteration, rather than trusting a clamped timeout as proof the real deadline passed) —
+    /// see docs/principles.md #13 (PR #233, not yet merged).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            // Cap below INFINITE so a >49-day deadline never becomes an unbounded wait; the loop
-            // re-arms against the true deadline if the OS wait returns early on the cap.
-            let millis = u32::try_from(remaining.as_millis()).unwrap_or(INFINITE - 1);
+            let millis = crate::wait::win32_timeout_ms(Some(remaining));
             // SAFETY: `handle` is our live, owned process handle.
             let r = unsafe { WaitForSingleObject(self.handle(), millis) };
             if r == WAIT_OBJECT_0 {

@@ -127,21 +127,87 @@ pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
 /// `0`, which is correct: a zero-remaining deadline is a poll, not a wait.
 ///
 /// Pure and portable (no OS dependency) so it is unit-testable on every host, including this
-/// one — the Windows wait sites are the only current callers, but the math itself is not
-/// Windows-specific.
-#[cfg_attr(not(any(test, windows)), allow(dead_code))] // only wired into the Windows wait sites
-pub(crate) fn ceil_millis(d: Duration) -> u128 {
+/// one. Not `pub(crate)`-visible on its own outside this module — call [`win32_timeout_ms`],
+/// which wraps it with the clamp every real call site needs.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+fn ceil_millis(d: Duration) -> u128 {
     let nanos = d.as_nanos();
     let ms = nanos.div_ceil(1_000_000);
     debug_assert!(ms * 1_000_000 >= nanos, "ceil_millis must round UP, never down");
     ms
 }
 
-/// Test-only seam: lets a test override the clamp the Windows wait sites apply to a computed
-/// millisecond timeout (production default: `INFINITE - 1`, ~49.7 days) so the "clamped wait
-/// elapsed before the real deadline, re-arm" path is exercised deterministically — without
-/// actually waiting 49.7 days for a real clamp to fire.
-#[cfg(all(test, windows))]
+/// The Win32 `WaitForSingleObject`/`WaitForMultipleObjects` "no timeout" sentinel value
+/// (`INFINITE` = `u32::MAX`). Defined locally rather than imported from the `windows` crate,
+/// which is a Windows-only dependency unavailable to this portable module — so
+/// [`win32_timeout_ms`]'s "never returns this for a finite `remaining`" contract has one
+/// value, shared by every Windows wait site, to check itself against.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+const WIN32_INFINITE: u32 = u32::MAX;
+
+/// Convert a REMAINING duration into the millisecond timeout a SINGLE Win32 wait call
+/// (`WaitForSingleObject`/`WaitForMultipleObjects`) should be armed with. `None` (unbounded)
+/// -> [`WIN32_INFINITE`]. `Some(d)` -> `d` ceiled to whole milliseconds (see [`ceil_millis`] —
+/// never truncated) and clamped to `WIN32_INFINITE - 1` (~49.7 days: `WIN32_INFINITE` itself
+/// is the "no timeout" sentinel, so a finite deadline must never be allowed to collide with
+/// it — not even where an UN-clamped `d`'s own ms value happens to equal `u32::MAX` exactly;
+/// `u32::try_from(remaining.as_millis()).unwrap_or(INFINITE - 1)`, an earlier shape of this
+/// conversion at one call site, missed exactly that case, since `try_from` SUCCEEDS for
+/// `u32::MAX`).
+///
+/// This converts ONE call's timeout — it is not itself a retry loop. Because of the clamp,
+/// EVERY call site with a genuine deadline (`Some`) must retry on `WAIT_TIMEOUT`: recompute
+/// its `remaining` FRESH (via [`remaining`], from the real deadline) before EVERY call — never
+/// reuse a value computed before an earlier iteration — and never trust a `WAIT_TIMEOUT` as
+/// proof the real deadline passed without rechecking `remaining` against it, until it
+/// genuinely has. See the loop shape at every call site: `wait/windows.rs::block_until_exit`,
+/// `block_until_exit_or_cancel`, `containment/windows.rs::wait_drained_raw`, and
+/// `child/spawn/windows_raw/proc.rs::RawChild::wait_deadline`.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
+    match remaining {
+        None => WIN32_INFINITE,
+        Some(d) => {
+            // Test-only, single-use override: lets a test force a specific (e.g.
+            // sub-millisecond) `d` for exactly the NEXT call, so the ceiling-vs-truncation
+            // divergence is provable from the recorded `ms` alone — deterministically, not by
+            // racing real OS-clock/scheduler jitter to land on a sub-millisecond remainder
+            // (which real Windows wait-timer coarseness can otherwise mask; see
+            // `wait_ms_probe`/`remaining_override_seam` callers).
+            #[cfg(test)]
+            let d = remaining_override_seam::take().unwrap_or(d);
+            let clamp = win32_wait_clamp();
+            let ms = ceil_millis(d).min(clamp as u128) as u32;
+            debug_assert!(
+                ms != WIN32_INFINITE,
+                "a finite remaining duration must never clamp up to the Win32 INFINITE sentinel"
+            );
+            #[cfg(test)]
+            wait_ms_probe::record(ms, d);
+            ms
+        }
+    }
+}
+
+/// The clamp [`win32_timeout_ms`] applies to a finite `remaining` (production:
+/// `WIN32_INFINITE - 1`, ~49.7 days). A test can override it via [`wait_clamp_seam`] to
+/// exercise the "clamped wait elapsed before the real deadline, re-arm" path
+/// deterministically, without an actual 49.7-day wait.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+fn win32_wait_clamp() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = wait_clamp_seam::get() {
+        return v;
+    }
+    WIN32_INFINITE - 1
+}
+
+/// Test-only seam: lets a test override the clamp [`win32_timeout_ms`] applies (production
+/// default: `WIN32_INFINITE - 1`, ~49.7 days) so the "clamped wait elapsed before the real
+/// deadline, re-arm" path is exercised deterministically — without actually waiting 49.7 days
+/// for a real clamp to fire. Portable (no OS dependency): usable from a pure unit test of
+/// [`win32_timeout_ms`] on any host, not just from the Windows-only call sites.
+#[cfg(test)]
 pub(crate) mod wait_clamp_seam {
     use std::cell::Cell;
     thread_local! {
@@ -156,12 +222,40 @@ pub(crate) mod wait_clamp_seam {
     }
 }
 
-/// Test-only seam: records, for every Win32 wait a call site arms, the millisecond count it
-/// chose alongside the exact `remaining` duration it was computed from — so a test can assert
-/// the ceiling relationship (`armed_ms >= remaining`) structurally, without depending on
-/// wall-clock timing around the call (which real OS/syscall jitter makes unreliable to assert
-/// on directly).
-#[cfg(all(test, windows))]
+/// Test-only seam: forces the NEXT call to [`win32_timeout_ms`] (with a `Some` `remaining`) to
+/// use this exact duration instead of the value its caller computed — consumed once. Landing
+/// on a sub-millisecond remainder naturally (real deadline minus real elapsed setup time) is
+/// likely but not deterministic, and real Windows wait-timer coarseness can mask a
+/// ceiling-vs-truncation divergence measured only by wall-clock elapsed time (this is exactly
+/// how a prior, unfixed version of `*_arms_the_ceiling_of_the_remaining_duration` for
+/// `block_until_exit_or_cancel` passed against genuinely truncating code — see this PR's
+/// description). This seam makes the divergence provable from the recorded `ms` alone.
+#[cfg(test)]
+pub(crate) mod remaining_override_seam {
+    use std::cell::Cell;
+    use std::time::Duration;
+    thread_local! {
+        static OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+    /// Force the next [`win32_timeout_ms`] call to use `d` instead of its real argument.
+    pub(crate) fn set(d: Duration) {
+        OVERRIDE.with(|c| c.set(Some(d)));
+    }
+    /// Consume and return the forced value, if one is armed.
+    pub(crate) fn take() -> Option<Duration> {
+        OVERRIDE.with(|c| c.take())
+    }
+}
+
+/// Test-only seam: records, for every Win32 wait a call site arms via [`win32_timeout_ms`],
+/// the millisecond count it chose alongside the EXACT `remaining` duration it was computed
+/// from (after any [`remaining_override_seam`] substitution) — so a test can assert the exact
+/// relationship `ms == min(ceil_millis(remaining), clamp)`, not merely a looser
+/// `ms >= remaining` bound, and — across a clamped-and-re-armed wait's several calls — that
+/// each round's recorded `remaining` is strictly less than the previous round's (proving
+/// `remaining` was recomputed fresh each time, not hoisted out of the retry loop and reused
+/// stale).
+#[cfg(test)]
 pub(crate) mod wait_ms_probe {
     use std::cell::RefCell;
     use std::time::Duration;
@@ -172,6 +266,10 @@ pub(crate) mod wait_ms_probe {
         RECORDED.with(|r| r.borrow_mut().push((ms, remaining)));
     }
     /// Drain and return everything recorded on the current thread since the last `take()`.
+    // Only the Windows-only test files read the probe back; a non-Windows test build compiles
+    // `record` (called unconditionally under `#[cfg(test)]` inside `win32_timeout_ms`, exercised
+    // by this module's own portable tests) but never calls `take()`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn take() -> Vec<(u32, Duration)> {
         RECORDED.with(|r| r.take())
     }

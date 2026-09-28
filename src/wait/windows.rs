@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
@@ -19,19 +19,6 @@ fn close(handle: HANDLE) {
     // violation, asserted in debug.
     let closed = unsafe { CloseHandle(handle) };
     debug_assert!(closed.is_ok(), "CloseHandle of an owned process handle should not fail");
-}
-
-/// The clamp applied to a computed wait timeout (production: `INFINITE - 1`, ~49.7 days —
-/// `WaitForSingleObject`/`WaitForMultipleObjects` reserve `INFINITE` itself as the "no
-/// timeout" sentinel). A test can override it via `crate::wait::wait_clamp_seam` to exercise
-/// the "clamped wait elapsed before the real deadline, re-arm" path deterministically, without
-/// an actual 49.7-day wait.
-fn wait_max_ms() -> u32 {
-    #[cfg(test)]
-    if let Some(v) = crate::wait::wait_clamp_seam::get() {
-        return v;
-    }
-    INFINITE - 1
 }
 
 pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
@@ -81,21 +68,14 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             });
         }
     }
-    // Armed in rounds: a `WAIT_TIMEOUT` only proves the caller's real deadline passed if the
-    // wait was not capped short of it by `wait_max_ms()`'s clamp (production: `INFINITE - 1`,
-    // ~49.7 days; test: `wait_clamp_seam`). A clamped timeout is rechecked against the real
-    // deadline and re-armed rather than trusted — see docs/principles.md #13.
+    // Armed in rounds: a `WAIT_TIMEOUT` only proves the caller's real deadline passed if this
+    // call's wait was not capped short of it by `win32_timeout_ms`'s clamp (production:
+    // `INFINITE - 1`, ~49.7 days; test: `wait_clamp_seam`). `remaining` is recomputed FRESH
+    // every iteration (never hoisted above the loop) and a clamped timeout is rechecked
+    // against the real deadline and re-armed rather than trusted — see docs/principles.md #13
+    // (PR #233, not yet merged).
     let waited = loop {
-        let ms: u32 = match crate::wait::remaining(deadline) {
-            None => INFINITE,
-            Some(d) => {
-                let clamp = wait_max_ms();
-                let ms = crate::wait::ceil_millis(d).min(clamp as u128) as u32;
-                #[cfg(test)]
-                crate::wait::wait_ms_probe::record(ms, d);
-                ms
-            }
-        };
+        let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
         // SAFETY: `handle` is a live process handle held for the wait's duration.
         let w = unsafe { WaitForSingleObject(handle, ms) };
         if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
@@ -199,34 +179,23 @@ pub(crate) fn block_until_exit_or_cancel(
         }
     }
     // Established once, at entry, from the relative `grace` — every re-arm below recomputes
-    // its remaining time against this SAME absolute instant, so a re-arm never resets the
-    // clock (mirrors `crate::wait::deadline_from`'s convention: `None` = unbounded).
-    let deadline: Option<Option<Instant>> = grace.map(|g| Instant::now().checked_add(g));
+    // its remaining time against this SAME absolute instant (via `crate::wait::remaining`, the
+    // inverse of `deadline_from`), so a re-arm never resets the clock. `None` = unbounded,
+    // matching `deadline_from`'s own convention.
+    let deadline: Option<Option<Instant>> = match grace {
+        None => None,
+        Some(g) => crate::wait::deadline_from(g),
+    };
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
-    // Armed in rounds: a `WAIT_TIMEOUT` only proves `grace` genuinely elapsed if the wait was
-    // not capped short of it by `wait_max_ms()`'s clamp (production: `INFINITE - 1`, ~49.7
-    // days — the cancel event releases large graces early; test: `wait_clamp_seam`). A
-    // clamped timeout is rechecked against the real deadline and re-armed rather than
-    // trusted — see docs/principles.md #13.
+    // Armed in rounds: a `WAIT_TIMEOUT` only proves `grace` genuinely elapsed if this call's
+    // wait was not capped short of it by `win32_timeout_ms`'s clamp (production:
+    // `INFINITE - 1`, ~49.7 days — the cancel event releases large graces early; test:
+    // `wait_clamp_seam`). `remaining` is recomputed FRESH every iteration (never hoisted above
+    // the loop) and a clamped timeout is rechecked against the real deadline and re-armed
+    // rather than trusted, so a grace longer than the clamp is still honored correctly instead
+    // of being silently capped — see docs/principles.md #13 (PR #233, not yet merged).
     let waited = loop {
-        let ms = match crate::wait::remaining(deadline) {
-            None => INFINITE,
-            Some(d) => {
-                let clamp = wait_max_ms();
-                let clamped = crate::wait::ceil_millis(d).min(clamp as u128) as u32;
-                // Checked against the REAL production clamp (never the test-seam override
-                // above): this flags a caller's raw grace genuinely exceeding ~49.7 days, not
-                // a test's deliberately-tiny injected clamp.
-                debug_assert!(
-                    d.as_millis() <= (INFINITE - 1) as u128,
-                    "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
-                    d.as_secs()
-                );
-                #[cfg(test)]
-                crate::wait::wait_ms_probe::record(clamped, d);
-                clamped
-            }
-        };
+        let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
         // SAFETY: both handles are live for the wait's duration.
         let w = unsafe { WaitForMultipleObjects(&handles, false, ms) };
         if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
