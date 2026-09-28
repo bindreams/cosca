@@ -86,3 +86,15 @@ slow-timeout = { period = "20s", terminate-after = 1 }
 # above.
 filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
 slow-timeout = { period = "15s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp`'s own
+# `tokio::select!` is what makes the test fail loud on a real regression (see the test's own
+# doc), but that only works if `wait_tree_drained`'s future ever gets polled again after arming.
+# A mutant that arms the kqueue with `EV_DISABLE` (never delivering ANY event, not even the
+# `declined` seam's) leaves both `select!` arms permanently pending — nothing in-process ever
+# fails that. Without this override such a mutant blocks until the darwin job's own 15-minute
+# CI timeout; this turns it into a bounded, per-test failure instead. Under `default`, so a
+# local run is bounded the same way CI is.
+filter = 'test(=containment::marker_eof::marker_eof_tests::async_wait_never_drains_past_the_low_water_clamp)'
+slow-timeout = { period = "20s", terminate-after = 3 }
