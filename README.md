@@ -6,12 +6,18 @@ Unified cross-platform subprocess management: spawning, stdio, process trees, st
 
 The API is not stable; expect breaking changes in any 0.x release.
 
+The design rules every change follows are in [docs/principles.md](docs/principles.md).
+
 ## Running tests
 
 Use [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`), run as `cargo nextest
-run`. It's what CI runs, and it's the recommended way to run cosca's suite locally: nextest
+run`. It's what CI runs, and it's the recommended way to run cosca's suite: nextest
 isolates each test in its own process, rather than sharing one process across the whole run the
 way plain `cargo test` does.
+
+The suite signals process groups and creates cgroup leaves and Job Objects, so run it in a VM
+([`scripts/devvm`](scripts/README.md)), a container or CI, never directly on your machine. See
+[principle 10](docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
 
 nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
 today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an
