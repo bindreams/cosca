@@ -364,12 +364,24 @@ pub(crate) async fn cgroup_wait_tree_drained(
             DrainStep::Block {
                 listener,
                 deadline: None,
-            } => listener.await,
+            } => {
+                #[cfg(test)]
+                crate::containment::cgroup::fault::notify_tokio_wait_site_park(
+                    crate::containment::cgroup::fault::TokioWaitSitePark { deadline: None },
+                );
+                listener.await
+            }
             // A timeout is looked at by the next step, which reads the leaf once more.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),
-            } => drop(::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), listener).await),
+            } => {
+                #[cfg(test)]
+                crate::containment::cgroup::fault::notify_tokio_wait_site_park(
+                    crate::containment::cgroup::fault::TokioWaitSitePark { deadline: Some(at) },
+                );
+                drop(::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), listener).await)
+            }
         }
     }
 }

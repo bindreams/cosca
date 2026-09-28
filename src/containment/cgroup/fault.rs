@@ -149,22 +149,28 @@ pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
 
 /// The instant the tokio twin (`cgroup_wait_tree_drained`) actually armed a bounded park with —
 /// `None` for an unbounded one. Same shape and purpose as [`WaitSitePark`], for the async wait
-/// site `timeout_at` runs at.
+/// site `timeout_at` runs at. Exists only with the `tokio` feature, since the twin it instruments
+/// does.
+#[cfg(feature = "tokio")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TokioWaitSitePark {
     pub(crate) deadline: Option<std::time::Instant>,
 }
 
+#[cfg(feature = "tokio")]
 thread_local! {
     static TOKIO_WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<TokioWaitSitePark>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(feature = "tokio")]
 pub(crate) fn set_tokio_wait_site_park_notifier(notify: std::sync::mpsc::Sender<TokioWaitSitePark>) {
     TOKIO_WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
 }
+#[cfg(feature = "tokio")]
 pub(crate) fn take_tokio_wait_site_park_notifier() {
     TOKIO_WAIT_SITE_PARK.with(|p| p.borrow_mut().take());
 }
+#[cfg(feature = "tokio")]
 pub(crate) fn notify_tokio_wait_site_park(park: TokioWaitSitePark) {
     TOKIO_WAIT_SITE_PARK.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {

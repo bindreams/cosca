@@ -362,3 +362,52 @@ async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
         "cgroup_wait_tree_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
     );
 }
+
+/// The async wait site (`cgroup_wait_tree_drained`'s own `Block` arm) is armed with the caller's
+/// deadline instant exactly — structural, no timing: the future is cancelled the moment the seam
+/// fires, never letting `timeout_at` actually run.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_instant() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use std::time::{Duration, Instant};
+
+    let fake = FakeLeaf::new("cosca-async-wait-site-deadline", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+
+    let (park_tx, park_rx) = std::sync::mpsc::channel();
+    fault::set_tokio_wait_site_park_notifier(park_tx);
+    let (cancel_tx, cancel_rx) = ::tokio::sync::oneshot::channel::<()>();
+
+    // A real rendezvous on its own OS thread, independent of the tokio runtime driving the
+    // future below: once the wait site arms a park, cancel that future — nothing here needs
+    // `timeout_at` to actually run.
+    let watcher = std::thread::spawn(move || {
+        let park = park_rx
+            .recv()
+            .expect("the wait site must arm a park before this call returns");
+        fault::take_tokio_wait_site_park_notifier();
+        let _ = cancel_tx.send(());
+        park
+    });
+
+    // Far enough out that a populated fake leaf never takes the zero-remaining shortcut; how far
+    // is irrelevant, since the future is cancelled before it ever waits that long.
+    let at = Instant::now() + Duration::from_secs(3600);
+    let fut = super::cgroup_wait_tree_drained(&leaf, Some(Some(at)));
+    ::tokio::select! {
+        _ = fut => panic!(
+            "the fake leaf never drains and the deadline is an hour out; this must not resolve"
+        ),
+        _ = cancel_rx => {}
+    }
+
+    let park = watcher.join().expect("watcher thread must not panic");
+    assert_eq!(
+        park.deadline,
+        Some(at),
+        "the tokio wait site must arm `timeout_at` with the caller's own deadline instant \
+         exactly, got {park:?}"
+    );
+}
