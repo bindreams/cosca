@@ -116,42 +116,17 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     })
 }
 
-/// Block on an armed kqueue until `interpret` concludes, or until `deadline`. `interpret` maps
-/// ONE pending `KEvent`, plus whether THIS round started with the deadline already elapsed, to
-/// `Ok(Some(verdict))` (conclusive — stop) or `Ok(None)` (nothing conclusive yet, e.g. bytes
-/// drained below a filter's own terminal condition — keep waiting). `on_timeout` is the verdict
-/// for a genuine timeout.
-///
-/// The deadline is checked explicitly at the top of every round, not inferred from `kevent`
-/// returning 0: a continuously-ready descriptor (e.g. a sustained pipe writer) keeps `kevent`
-/// returning real events even with an already-expired timeout, so relying on "0 events, timed
-/// out" alone would let the wait overrun the deadline by an unbounded number of rounds.
-/// Checking `remaining(deadline)` before each `kevent` call bounds the overrun to at most one
-/// in-flight round: once a round starts with the deadline already elapsed, an inconclusive
-/// event in THAT round returns `on_timeout` immediately rather than looping back — and
-/// `interpret` is told the deadline already elapsed for that round too, so it can stop doing
-/// deadline-funded work (like draining bytes) on the caller's behalf once there is no more
-/// deadline left to fund it (principle 13).
-///
-/// The elapsed flag `interpret` sees is NOT just the one sampled before this round's `kevent`
-/// call: a real, positive timeout can legitimately block long enough that the deadline passes
-/// WHILE the syscall is in flight, so once an event actually arrives, `remaining(deadline)` is
-/// re-checked fresh and OR'd with the pre-call sample before either telling `interpret` or
-/// deciding whether to return `on_timeout` — the round's own funding is judged at the moment
-/// it's spent, not at the moment it started.
-///
-/// `Ok(0)` alone is not trusted as proof the deadline passed: that is only true if the
-/// requested timeout faithfully reflected `remaining(deadline)`, which is exactly the
-/// invariant a bug (or a mutant) could break. Before concluding on `Ok(0)`, `remaining(deadline)`
-/// is re-checked fresh; if it does NOT show zero, the round is treated as spurious and retried
-/// with a freshly computed timeout rather than trusted at face value. For correct code this is
-/// a no-op (a real, positive requested timeout that legitimately expired always re-reads as
-/// zero immediately after), but it makes the never-early guarantee true by construction
-/// instead of merely true in practice.
-///
-/// Shared by every blocking kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in
-/// `containment::marker_eof` — so a hazard found against one filter (an already-past deadline
-/// against a sticky, already-satisfied event) is fixed once, not rediscovered per filter.
+/// Block on an armed kqueue until `interpret` concludes, or until `deadline`, checking
+/// `remaining(deadline)` fresh before every real `kevent` call and again once an event actually
+/// arrives (never inferring elapsed-ness from `kevent` returning 0, nor trusting the value
+/// sampled before a call that may have blocked long enough to cross the deadline itself) —
+/// `interpret` and the final `on_timeout` return both see this freshly-checked flag, so neither
+/// does deadline-funded work (like draining bytes) once there is no deadline left to fund it
+/// (principle 13). A round already in flight when the deadline passes is not interrupted; only
+/// the NEXT round is refused. `Ok(0)` alone is never trusted as proof the deadline passed
+/// either — a mutant (or bug) could desync the requested timeout from `remaining`, so it is
+/// re-checked before concluding, and retried as spurious otherwise. Shared by every blocking
+/// kqueue wait this crate arms — `EVFILT_PROC` here, `EVFILT_READ` in `containment::marker_eof`.
 pub(crate) fn block_on_kqueue<T: Copy>(
     kq: &Kqueue,
     deadline: Option<Option<Instant>>,
@@ -159,64 +134,65 @@ pub(crate) fn block_on_kqueue<T: Copy>(
     mut interpret: impl FnMut(&KEvent, bool) -> Result<Option<T>, Error>,
 ) -> Result<T, Error> {
     let mut events = [placeholder()];
-    // 0-based count of real `kevent` syscalls attempted on THIS kqueue so far — incremented on
-    // EVERY pass, including one interrupted by `EINTR`, so it accurately answers "how many
-    // times has this loop gone around" independent of whether any particular attempt happened
-    // to record itself (`test_hooks::record_kevent_call` skips `EINTR`, see its own doc).
     #[cfg(test)]
     let mut round: u32 = 0;
     loop {
-        // Fires before this round's `remaining(deadline)` is computed, so a hook that advances
-        // the mock clock (`crate::wait::test_clock`) changes what THIS round sees, not just a
-        // later one. Nothing but that computation and the `kevent` call itself follows before
-        // the next hook firing, so this is also "right before the real, blocking kevent call"
-        // for a hook that only cares about that.
         #[cfg(test)]
         test_hooks::fire_round_hook(round, kq);
+        #[cfg(test)]
+        let call_start = Instant::now();
 
-        let remaining = crate::wait::remaining(deadline);
-        let already_elapsed = remaining == Some(Duration::ZERO);
-        // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
-        let timeout = remaining.map(|d| libc::timespec {
-            tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-            tv_nsec: d.subsec_nanos() as libc::c_long,
-        });
-        let outcome = kq.kevent(&[], &mut events, timeout);
-        // Captured BEFORE incrementing: `fire_post_event_hook` below must see the index of the
-        // round THIS event belongs to — the same index `fire_round_hook` was just called with
-        // — not the next round's.
+        // `EINTR` retries here, inside the SAME round, without re-firing the hook or advancing
+        // `round` — round and kevent_calls() must stay one notion.
+        #[cfg_attr(not(test), allow(unused_variables))] // `timeout` is read only for test recording
+        let (already_elapsed, timeout, outcome) = loop {
+            let remaining = crate::wait::remaining(deadline);
+            let already_elapsed = remaining == Some(Duration::ZERO);
+            // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
+            #[allow(unused_mut)] // mutated only under #[cfg(test)] below
+            let mut timeout = remaining.map(|d| libc::timespec {
+                tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
+                tv_nsec: d.subsec_nanos() as libc::c_long,
+            });
+            #[cfg(test)]
+            if let Some(forced) = test_hooks::take_timeout_override() {
+                timeout = Some(libc::timespec {
+                    tv_sec: forced.as_secs() as libc::time_t,
+                    tv_nsec: forced.subsec_nanos() as libc::c_long,
+                });
+            }
+            match kq.kevent(&[], &mut events, timeout) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                outcome => break (already_elapsed, timeout, outcome),
+            }
+        };
+        // Bounds what would otherwise be an unbounded spin under a mock clock a test forgot to
+        // advance: see `test_clock::advance_by_elapsed_if_frozen`'s own doc. A no-op outside
+        // tests and whenever the clock isn't frozen.
+        #[cfg(test)]
+        crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+        #[cfg(test)]
+        test_hooks::record_kevent_call(as_duration(timeout));
+        // Captured before incrementing: this round's own index, not the next round's.
         #[cfg(test)]
         let this_round = round;
         #[cfg(test)]
         {
             round += 1;
         }
+
         match outcome {
             Ok(0) => {
-                // See this function's own doc: re-verify before trusting a 0-event return as
-                // proof the deadline passed.
                 if crate::wait::remaining(deadline) == Some(Duration::ZERO) {
-                    #[cfg(test)]
-                    test_hooks::record_kevent_call(as_duration(timeout));
                     return Ok(on_timeout);
                 }
-                #[cfg(test)]
-                test_hooks::record_kevent_call(as_duration(timeout));
-                continue; // spurious — recompute a fresh timeout and try again
+                continue; // spurious — retry
             }
             Ok(_) => {
                 #[cfg(test)]
-                {
-                    test_hooks::record_kevent_call(as_duration(timeout));
-                    test_hooks::record_event_data(events[0].data());
-                }
-                // A hook to let a test move the clock (or otherwise change the world) in the
-                // gap between "the event arrived" and "we decide what it means" — exercising
-                // exactly the staleness the re-check below closes. No-op outside tests.
+                test_hooks::record_event_data(events[0].data());
                 #[cfg(test)]
                 test_hooks::fire_post_event_hook(this_round);
-                // Re-checked fresh, not just the value sampled before this round's `kevent`
-                // call — see this function's own doc.
                 let elapsed = already_elapsed || crate::wait::remaining(deadline) == Some(Duration::ZERO);
                 if let Some(verdict) = interpret(&events[0], elapsed)? {
                     return Ok(verdict);
@@ -225,195 +201,30 @@ pub(crate) fn block_on_kqueue<T: Copy>(
                     return Ok(on_timeout);
                 }
             }
-            // Not recorded: an EINTR-interrupted attempt reached no usable outcome, so it is
-            // not a "call" for the counter's purpose (which answers "how many rounds actually
-            // told us something"); `round` above still advances, since it counts passes, not
-            // outcomes.
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {
+                debug_assert!(false, "EINTR must be retried in the inner loop above, never reach here");
+                continue;
+            }
             Err(e) => return Err(Error::Io(e.into())),
         }
     }
 }
 
-/// The requested-timeout `libc::timespec` argument, converted back to a `Duration` for test
-/// recording. `#[cfg(test)]`-only caller; kept as a free function so `block_on_kqueue` reads
-/// the same conversion at both its `record_kevent_call` sites.
+/// The requested `kevent` timeout as a `Duration`, for test recording.
 #[cfg(test)]
 fn as_duration(timeout: Option<libc::timespec>) -> Option<Duration> {
-    timeout.map(|ts| Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.max(0) as u32))
+    timeout.map(|ts| {
+        debug_assert!(
+            ts.tv_sec >= 0 && ts.tv_nsec >= 0,
+            "a kevent timeout must never be negative"
+        );
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    })
 }
 
-/// Test-only structural seams for `block_on_kqueue`: a per-round hook and counters that let a
-/// test prove "checks the deadline every round, blocks for real, never spins" without timing
-/// anything. Thread-local — the test harness runs each test on its own OS thread, so state
-/// starts fresh with nothing to reset — but [`HookGuard`] resets it explicitly regardless
-/// (including on panic), for the same reason [`crate::wait::test_clock::FrozenClockGuard`]
-/// does. A hook set on one thread only ever fires for `block_on_kqueue` calls made on THAT
-/// thread — a test that needs to act partway through a call in progress (e.g. killing the
-/// process being waited on, right before the next real `kevent`) installs the hook and reads
-/// the counters back from the SAME thread that makes the call, never by peeking at another
-/// thread's thread-local directly (see `marker_eof_tests`'s unbounded sustained-writer test,
-/// which kills the writer from inside its own round hook for exactly this reason — no second
-/// thread, no cross-thread race).
 #[cfg(test)]
-pub(crate) mod test_hooks {
-    use std::cell::{Cell, RefCell};
-    use std::time::Duration;
-
-    use nix::sys::event::Kqueue;
-
-    type RoundHook = Box<dyn FnMut(u32, &Kqueue)>;
-    type PostEventHook = Box<dyn FnMut(u32)>;
-
-    thread_local! {
-        static ROUND_HOOK: RefCell<Option<RoundHook>> = const { RefCell::new(None) };
-        static POST_EVENT_HOOK: RefCell<Option<PostEventHook>> = const { RefCell::new(None) };
-        static KEVENT_CALLS: Cell<u32> = const { Cell::new(0) };
-        static REQUESTED_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
-        static LAST_EVENT_DATA: Cell<Option<isize>> = const { Cell::new(None) };
-        // Set for the duration of any hook call, cleared right after — lets `fire_round_hook`
-        // and `fire_post_event_hook` catch a hook that re-enters `block_on_kqueue` (which would
-        // try to fire a hook of its own while the outer one's `RefCell` borrow is still held)
-        // with a clear message, instead of `RefCell`'s own generic "already borrowed" panic.
-        static IN_HOOK: Cell<bool> = const { Cell::new(false) };
-        // Sanity flag for `HookGuard`'s own nesting guard — see `HookGuard::install`.
-        static GUARD_ACTIVE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    const REENTRANCY_MESSAGE: &str = "a test hook must not re-enter block_on_kqueue: its own \
-         RefCell borrow is held for the hook's whole call — drive any nested wait through a \
-         separate, already-armed kqueue instead (see block_until_marker_ready_again in \
-         marker_eof_tests)";
-
-    /// Install a closure `block_on_kqueue` invokes once at the top of every loop iteration on
-    /// THIS thread, with the 0-based round index and a borrow of the SAME kqueue
-    /// `block_on_kqueue` is driving — e.g. to run a manual, out-of-band `kevent` check or a
-    /// second, independently-armed kqueue on the same descriptor from inside the hook.
-    fn set_round_hook(hook: impl FnMut(u32, &Kqueue) + 'static) {
-        ROUND_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    /// Install a closure `block_on_kqueue` invokes once a real event has actually arrived
-    /// (`Ok(n > 0)`), with the 0-based round index, BEFORE `elapsed` is (re)computed for that
-    /// event — e.g. to move the mock clock (`crate::wait::test_clock::advance`) past the
-    /// deadline in the gap between "the event arrived" and "we decided what it means",
-    /// proving the elapsed check is re-verified fresh at that point rather than trusting a
-    /// value sampled before the (possibly long) `kevent` call even started.
-    fn set_post_event_hook(hook: impl FnMut(u32) + 'static) {
-        POST_EVENT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    pub(crate) fn fire_round_hook(round: u32, kq: &Kqueue) {
-        debug_assert!(!IN_HOOK.with(Cell::get), "{REENTRANCY_MESSAGE}");
-        IN_HOOK.with(|f| f.set(true));
-        ROUND_HOOK.with(|h| {
-            if let Some(hook) = h.borrow_mut().as_mut() {
-                hook(round, kq);
-            }
-        });
-        IN_HOOK.with(|f| f.set(false));
-    }
-
-    pub(crate) fn fire_post_event_hook(round: u32) {
-        debug_assert!(!IN_HOOK.with(Cell::get), "{REENTRANCY_MESSAGE}");
-        IN_HOOK.with(|f| f.set(true));
-        POST_EVENT_HOOK.with(|h| {
-            if let Some(hook) = h.borrow_mut().as_mut() {
-                hook(round);
-            }
-        });
-        IN_HOOK.with(|f| f.set(false));
-    }
-
-    /// Count of real `kq.kevent(...)` calls `block_on_kqueue` has issued on THIS thread that
-    /// reached a usable outcome (`Ok(0)` or `Ok(n > 0)`) — an `EINTR`-interrupted attempt is
-    /// not counted, since it told the caller nothing and was immediately retried; see
-    /// `block_on_kqueue`'s own doc for why a round (a loop pass) and a counted call can differ.
-    pub(crate) fn kevent_calls() -> u32 {
-        KEVENT_CALLS.with(Cell::get)
-    }
-
-    /// The ACTUAL timeout argument passed to each counted `kevent` call so far, in call order
-    /// (recorded from the literal argument at the call site, not from `remaining(deadline)`
-    /// upstream of it) — proof the requested timeout is both a live recomputation every round
-    /// AND the value that really reached the syscall, not a duration cached once before the
-    /// loop or one that diverges from what was actually requested.
-    pub(crate) fn requested_timeouts() -> Vec<Option<Duration>> {
-        REQUESTED_TIMEOUTS.with(|v| v.borrow().clone())
-    }
-
-    pub(crate) fn record_kevent_call(requested: Option<Duration>) {
-        KEVENT_CALLS.with(|c| c.set(c.get() + 1));
-        REQUESTED_TIMEOUTS.with(|v| v.borrow_mut().push(requested));
-    }
-
-    /// The raw `KEvent::data()` field from the most recent `Ok(n > 0)` `kevent` call on THIS
-    /// thread — e.g. the byte count a non-EOF `EVFILT_READ` event reported. Lets a later
-    /// round's hook assert that nothing was drained since (by comparing this against a fresh
-    /// `FIONREAD` read on the same descriptor).
-    pub(crate) fn last_event_data() -> Option<isize> {
-        LAST_EVENT_DATA.with(Cell::get)
-    }
-
-    pub(crate) fn record_event_data(data: isize) {
-        LAST_EVENT_DATA.with(|c| c.set(Some(data)));
-    }
-
-    /// Clear every seam back to its default (no hooks, zero counters, no recorded data).
-    /// Idempotent — safe to call whether or not anything was ever installed.
-    fn reset() {
-        ROUND_HOOK.with(|h| *h.borrow_mut() = None);
-        POST_EVENT_HOOK.with(|h| *h.borrow_mut() = None);
-        KEVENT_CALLS.with(|c| c.set(0));
-        REQUESTED_TIMEOUTS.with(|v| v.borrow_mut().clear());
-        LAST_EVENT_DATA.with(|c| c.set(None));
-        IN_HOOK.with(|f| f.set(false));
-        GUARD_ACTIVE.with(|f| f.set(false));
-    }
-
-    /// RAII installer for a round hook (and, optionally, a post-event hook): resets every seam,
-    /// installs the hook(s), and resets again on `Drop` — including during unwinding, so a test
-    /// that panics mid-assertion (e.g. the round-count guard a test's own hook asserts, see
-    /// `marker_eof_tests`) never leaks a hook or stale counters into whatever runs on this
-    /// thread next.
-    #[must_use]
-    pub(crate) struct HookGuard {
-        _private: (),
-    }
-
-    impl HookGuard {
-        pub(crate) fn install(hook: impl FnMut(u32, &Kqueue) + 'static) -> Self {
-            // Nesting is not supported: the INNER guard's `Drop` would reset the hooks out from
-            // under the OUTER guard, which is still alive and still expects them installed.
-            debug_assert!(
-                !GUARD_ACTIVE.with(Cell::get),
-                "HookGuard::install called while another HookGuard is already active on this \
-                 thread — nesting is not supported"
-            );
-            reset();
-            set_round_hook(hook);
-            GUARD_ACTIVE.with(|f| f.set(true));
-            Self { _private: () }
-        }
-
-        /// Same as [`install`](Self::install), plus a post-event hook (see
-        /// [`set_post_event_hook`]'s own doc).
-        pub(crate) fn install_with_post_event(
-            round_hook: impl FnMut(u32, &Kqueue) + 'static,
-            post_event_hook: impl FnMut(u32) + 'static,
-        ) -> Self {
-            let guard = Self::install(round_hook);
-            set_post_event_hook(post_event_hook);
-            guard
-        }
-    }
-
-    impl Drop for HookGuard {
-        fn drop(&mut self) {
-            reset();
-        }
-    }
-}
+#[path = "macos/test_hooks.rs"]
+pub(crate) mod test_hooks;
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};

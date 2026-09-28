@@ -52,7 +52,7 @@ pub(crate) fn block_until_exit(id: ProcessId, timeout: Option<Duration>) -> Resu
         return Err(fault::forced_watch_error());
     }
     // Convert to an absolute deadline up front so EINTR retries don't extend the total wait.
-    let deadline = timeout.map(|d| Instant::now().checked_add(d));
+    let deadline = timeout.map(|d| now().checked_add(d));
     backend::block_until_exit(id, deadline)
 }
 
@@ -75,18 +75,10 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     backend::terminate(id)
 }
 
-/// A mock clock, test-only: once frozen, `remaining` reads THIS instant instead of the real
-/// `Instant::now()`, so a test can drive deadline arithmetic to an exact, deterministic value
-/// (including "past the deadline") with no real sleep and no dependence on how much real wall
-/// time a test's own setup happened to take.
-///
-/// Thread-local, not global: the test harness runs each test on its own OS thread by default,
-/// so the clock starts unfrozen for every test with nothing to reset — but [`FrozenClockGuard`]
-/// resets it explicitly regardless (including on panic), since a thread-local alone doesn't
-/// protect against reuse if the harness or a future test ever runs multiple cases on one
-/// thread. A test that needs to advance the clock from WITHIN a call already in progress
-/// (rather than before making it) does so through a `#[cfg(test)]` hook invoked on the same
-/// thread mid-call — see `wait::macos::test_hooks::set_round_hook`.
+/// A mock clock, test-only: once frozen, `remaining` reads this instant instead of the real
+/// `Instant::now()`, so a test can drive deadline arithmetic to a deterministic value with no
+/// real sleep. Thread-local; `FrozenClockGuard` resets it on `Drop`, including during
+/// unwinding.
 #[cfg(test)]
 // `advance`, `FrozenClockGuard` and friends are exercised only by macOS's `marker_eof_tests`
 // today (the only current caller across the crate's platforms) — genuinely dead code
@@ -125,6 +117,23 @@ pub(crate) mod test_clock {
         FROZEN.with(|f| {
             let cur = f.get().expect("test_clock::advance called before the clock was frozen");
             f.set(Some(cur + by));
+        });
+    }
+
+    /// Advance the frozen instant by `real_elapsed` — a no-op if the clock isn't frozen (an
+    /// unfrozen clock already tracks real time on its own). Called automatically by
+    /// `block_on_kqueue` around every completed round's real, blocking `kevent` call, so a
+    /// frozen clock a test forgot to (or a bug failed to) advance explicitly can never make a
+    /// GENUINELY elapsed real wait invisible to `remaining`: even with no test hook ever calling
+    /// [`advance`], `now` eventually catches up to whatever real time was actually spent
+    /// blocked in the kernel, turning what would otherwise be an unbounded spin under a
+    /// never-advancing mock clock into, at worst, a wait bounded by the real timeouts genuinely
+    /// requested — never a true infinite loop.
+    pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
+        FROZEN.with(|f| {
+            if let Some(cur) = f.get() {
+                f.set(Some(cur + real_elapsed));
+            }
         });
     }
 
@@ -176,10 +185,7 @@ fn now() -> Instant {
 /// that overflowed `Instant` ⇒ unbounded). Saturates to ZERO once past. Shared by the
 /// backends to recompute the per-syscall timeout after an `EINTR` retry.
 ///
-/// Reads the clock through [`now`], which in test builds returns a frozen mock instant when
-/// one is installed (see [`test_clock`]) and real `Instant::now()` otherwise; in non-test
-/// builds `now` is `Instant::now()` with zero indirection, so this function's behavior outside
-/// tests is unchanged.
+/// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,
@@ -188,12 +194,12 @@ pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
 }
 
 /// Convert a relative `duration` into the crate's `deadline` convention
-/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): `Instant::now() + duration`,
-/// saturating to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on
-/// overflow rather than panicking. Shared by every `_timeout`/`grace`-style call that starts
-/// a fresh relative wait from "now".
+/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): [`now`]`() + duration`, saturating
+/// to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on overflow rather
+/// than panicking. Shared by every `_timeout`/`grace`-style call that starts a fresh relative
+/// wait from "now".
 pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
-    Some(Instant::now().checked_add(duration))
+    Some(now().checked_add(duration))
 }
 
 #[cfg(test)]
