@@ -75,13 +75,57 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     backend::terminate(id)
 }
 
+/// A mock clock offset for deadline arithmetic, test-only. `remaining` adds this on top of the
+/// real `Instant::now()` so a test can push the deadline check from "still open" to "elapsed"
+/// deterministically, with no real sleep — e.g. to prove a loop stops taking new rounds once a
+/// deadline has passed, without waiting out a real deadline to observe it.
+///
+/// Thread-local, not global: the test harness runs each test on its own OS thread by default,
+/// so the offset starts at `Duration::ZERO` for every test with nothing to reset. A test that
+/// needs to advance the clock from WITHIN a call already in progress (rather than before
+/// making it) does so through a `#[cfg(test)]` hook invoked on the same thread mid-call — see
+/// `wait::macos::test_hooks::set_round_hook`.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static OFFSET: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    /// The mock "now": real `Instant::now()` plus this thread's accumulated offset.
+    pub(crate) fn now() -> Instant {
+        Instant::now() + OFFSET.with(Cell::get)
+    }
+
+    /// Advance this thread's offset by `by`, moving the mock "now" further into the future.
+    pub(crate) fn advance(by: Duration) {
+        OFFSET.with(|o| o.set(o.get() + by));
+    }
+}
+
+#[cfg(not(test))]
+fn now() -> Instant {
+    Instant::now()
+}
+
+#[cfg(test)]
+fn now() -> Instant {
+    test_clock::now()
+}
+
 /// Remaining time until `deadline` (`None` = unbounded; `Some(None)` = a duration
 /// that overflowed `Instant` ⇒ unbounded). Saturates to ZERO once past. Shared by the
 /// backends to recompute the per-syscall timeout after an `EINTR` retry.
+///
+/// Reads the clock through [`now`], which in test builds is the real clock plus a per-thread
+/// mock offset (see [`test_clock`]); in non-test builds `now` is `Instant::now()` with zero
+/// indirection, so this function's behavior outside tests is unchanged.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,
-        Some(Some(at)) => Some(at.saturating_duration_since(Instant::now())),
+        Some(Some(at)) => Some(at.saturating_duration_since(now())),
     }
 }
 

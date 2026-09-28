@@ -139,7 +139,17 @@ pub(crate) fn block_on_kqueue<T: Copy>(
     mut interpret: impl FnMut(&KEvent) -> Result<Option<T>, Error>,
 ) -> Result<T, Error> {
     let mut events = [placeholder()];
+    #[cfg(test)]
+    let mut round: u32 = 0;
     loop {
+        // Fires before this round's `remaining(deadline)` is computed, so a hook that advances
+        // the mock clock (`crate::wait::test_clock`) changes what THIS round sees, not just a
+        // later one. Nothing but that computation and the `kevent` call itself follows before
+        // the next hook firing, so this is also "right before the real, blocking kevent call"
+        // for a hook that only cares about that.
+        #[cfg(test)]
+        test_hooks::fire_round_hook(round);
+
         let remaining = crate::wait::remaining(deadline);
         let already_elapsed = remaining == Some(Duration::ZERO);
         // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
@@ -147,6 +157,13 @@ pub(crate) fn block_on_kqueue<T: Copy>(
             tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
             tv_nsec: d.subsec_nanos() as libc::c_long,
         });
+        // Recorded from `timeout` itself (the literal argument about to reach `kevent`), not
+        // from `remaining` — so a mutant that decouples the two (e.g. always passing `None`
+        // regardless of what `remaining` computed) shows up in the recording too.
+        #[cfg(test)]
+        test_hooks::record_kevent_call(
+            timeout.map(|ts| Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.max(0) as u32)),
+        );
         match kq.kevent(&[], &mut events, timeout) {
             Ok(0) => return Ok(on_timeout), // genuinely timed out, no events
             Ok(_) => {
@@ -160,6 +177,67 @@ pub(crate) fn block_on_kqueue<T: Copy>(
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::Io(e.into())),
         }
+        #[cfg(test)]
+        {
+            round += 1;
+        }
+    }
+}
+
+/// Test-only structural seams for `block_on_kqueue`: a per-round hook and counters that let a
+/// test prove "checks the deadline every round, blocks for real, never spins" without timing
+/// anything. Thread-local — the test harness runs each test on its own OS thread, so state
+/// starts fresh with nothing to reset. A hook set on one thread only ever fires for
+/// `block_on_kqueue` calls made on THAT thread — a test that needs to act partway through a
+/// call in progress (e.g. killing the process being waited on, right before the next real
+/// `kevent`) installs the hook and reads the counters back from the SAME thread that makes the
+/// call, never by peeking at another thread's thread-local directly (see
+/// `marker_eof_tests`'s unbounded sustained-writer test, which kills the writer from inside
+/// its own round hook for exactly this reason — no second thread, no cross-thread race).
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::{Cell, RefCell};
+    use std::time::Duration;
+
+    type RoundHook = Box<dyn FnMut(u32)>;
+
+    thread_local! {
+        static ROUND_HOOK: RefCell<Option<RoundHook>> = const { RefCell::new(None) };
+        static KEVENT_CALLS: Cell<u32> = const { Cell::new(0) };
+        static REQUESTED_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Install a closure `block_on_kqueue` invokes once at the top of every loop iteration on
+    /// THIS thread, with the 0-based round index.
+    pub(crate) fn set_round_hook(hook: impl FnMut(u32) + 'static) {
+        ROUND_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn fire_round_hook(round: u32) {
+        ROUND_HOOK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(round);
+            }
+        });
+    }
+
+    /// Count of real `kq.kevent(...)` calls `block_on_kqueue` has issued on THIS thread.
+    pub(crate) fn kevent_calls() -> u32 {
+        KEVENT_CALLS.with(Cell::get)
+    }
+
+    /// The ACTUAL timeout argument passed to each real `kevent` call so far, in round order
+    /// (recorded from the literal argument at the call site, not from `remaining(deadline)`
+    /// upstream of it) — proof the requested timeout is both a live recomputation every round
+    /// AND the value that really reached the syscall, not a duration cached once before the
+    /// loop or one that diverges from what was actually requested.
+    pub(crate) fn requested_timeouts() -> Vec<Option<Duration>> {
+        REQUESTED_TIMEOUTS.with(|v| v.borrow().clone())
+    }
+
+    pub(crate) fn record_kevent_call(requested: Option<Duration>) {
+        KEVENT_CALLS.with(|c| c.set(c.get() + 1));
+        REQUESTED_TIMEOUTS.with(|v| v.borrow_mut().push(requested));
     }
 }
 
