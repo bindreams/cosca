@@ -10,25 +10,34 @@
 /// inherits EVERY fd this process has open at the moment of the fork — not just ones a spawn
 /// deliberately marks inheritable — including an fd that exists only transiently, opened non-
 /// `CLOEXEC`, inside another `spawn_lock` holder's own critical section. Held across the `fork()`
-/// call and the one pidfd-open syscall right after it in the parent (so a failure there can still
-/// build a [`KillOnDrop`] to reap the child by), not the reap/cleanup that follows.
+/// call itself; released once the parent's `pidfd_open` resolves either way. In the `Ok` arm that
+/// release is one beat later, after [`KillOnDrop`] is built — purely so that arm's own test hook
+/// has somewhere safe to run (the child already exists and is reapable by then, so a hook that
+/// panics still unwinds through a real guard); the lock itself has nothing to do with building
+/// `KillOnDrop`.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
     let guard = crate::child::spawn::spawn_lock_tracked();
+    // Taken once here, in the parent, still holding the lock and before the fork: `fork()`'s own
+    // memory copy hands the child this resolved LOCAL value, so the child never touches the fault
+    // module's thread-local itself, and a concurrent `fork_running` elsewhere (serialized on the
+    // same lock) can't observe or clear it first.
+    let report_fd = crate::containment::cgroup::fault::take_fork_running_lock_held_report_fd();
     // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
     // `_exit`s without unwinding or running destructors.
     let raw_pid = unsafe { libc::fork() };
     match raw_pid {
         -1 => panic!("fork: {}", std::io::Error::last_os_error()),
         0 => {
-            // Report to a test, if one asked: whether THIS thread held `spawn_lock` at the exact
-            // instant of the fork, from the CHILD's own point of view. `held` reads this
-            // process's inherited copy of a thread-local flag `spawn_lock_tracked` sets — a
-            // plain memory read, no allocation or syscall, so async-signal-safe — then a raw
-            // `write(2)` reports it, also async-signal-safe. Unlike a check the PARENT makes
-            // after the fork returns, this cannot be fooled by a lock dropped before the fork
-            // and re-acquired afterward: the child already forked away before any re-acquisition.
-            if let Some(fd) = crate::containment::cgroup::fault::take_fork_running_lock_held_report_fd() {
+            // Report to a test, if one asked (`report_fd`, captured above): whether THIS thread
+            // held `spawn_lock` at the exact instant of the fork, from the CHILD's own point of
+            // view. `held` reads this process's inherited copy of a thread-local flag
+            // `spawn_lock_tracked` sets — a plain memory read, no allocation or syscall, so
+            // async-signal-safe — then a raw `write(2)` reports it, also async-signal-safe.
+            // Unlike a check the PARENT makes after the fork returns, this cannot be fooled by a
+            // lock dropped before the fork and re-acquired afterward: the child already forked
+            // away before any re-acquisition.
+            if let Some(fd) = report_fd {
                 let held: u8 = crate::child::spawn::spawn_lock_held_by_this_thread().into();
                 // SAFETY: `fd` is a pipe write end a test provided for exactly this; `held` is a
                 // valid one-byte buffer.

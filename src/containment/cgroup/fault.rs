@@ -459,15 +459,30 @@ pub(crate) fn run_before_exit_wait() {
     }
 }
 
+/// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if
+/// `fork_running` never ran it (its `pidfd_open` can fail before the hook's own call site) — so
+/// an unrun hook can't leak into whichever `fork_running` call, on this thread, comes next.
+#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
+pub(crate) struct AfterForkStillLockedGuard(());
+impl Drop for AfterForkStillLockedGuard {
+    fn drop(&mut self) {
+        AFTER_FORK_STILL_LOCKED.with(|h| *h.borrow_mut() = None);
+    }
+}
+
 /// Run `hook` in the NEXT `fork_running` call on this thread, with the child's real pid, in the
 /// parent arm right after `fork()` returns and its `KillOnDrop` is built, still holding
-/// `spawn_lock`. Takes the pid (not `()`) so a test can independently confirm the fork already
-/// happened by this point (a live process exists at that pid) — a hook moved to BEFORE the
-/// `fork()` this lock is meant to cover has no real pid to pass and cannot compile as this call.
-/// Shares `PidHook` (`AFTER_FINAL_READ`'s type) rather than a fresh single-use closure type,
-/// which is what tripped clippy's `type_complexity` under `-D warnings`.
-pub(crate) fn set_after_fork_still_locked(hook: impl FnOnce(u32) + 'static) {
+/// `spawn_lock`. Takes the pid (not `()`) so a test can also confirm the fork already happened by
+/// this point (a live process exists at that pid) — though that alone is a weak check: a mutant
+/// that hardcodes a literal pid, rather than passing the real one, defeats it while still
+/// compiling. A test wanting a real "still locked" proof asserts
+/// [`crate::child::spawn::spawn_lock_held_by_this_thread`] from inside the hook itself, which
+/// runs on the SAME (forking) thread. Shares `PidHook` (`AFTER_FINAL_READ`'s type) rather than a
+/// fresh single-use closure type, which is what tripped clippy's `type_complexity` under
+/// `-D warnings`.
+pub(crate) fn set_after_fork_still_locked(hook: impl FnOnce(u32) + 'static) -> AfterForkStillLockedGuard {
     AFTER_FORK_STILL_LOCKED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    AfterForkStillLockedGuard(())
 }
 pub(crate) fn run_after_fork_still_locked(child_pid: u32) {
     if let Some(hook) = AFTER_FORK_STILL_LOCKED.with(|h| h.borrow_mut().take()) {
@@ -475,17 +490,30 @@ pub(crate) fn run_after_fork_still_locked(child_pid: u32) {
     }
 }
 
-/// Give the NEXT `fork_running` CHILD (not the parent) a raw fd to report, as a single byte (`1`
-/// or `0`), whether `spawn_lock` was held — from the forking thread's own point of view, at the
+/// RAII: dropping this clears the fd [`set_fork_running_lock_held_report_fd`] registered, even if
+/// `fork_running` never consumed it, so it can't leak into a later call on this thread.
+#[must_use = "dropping this immediately clears the registered fd; bind it for the scope that needs it"]
+pub(crate) struct ForkRunningLockHeldReportFdGuard(());
+impl Drop for ForkRunningLockHeldReportFdGuard {
+    fn drop(&mut self) {
+        FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.set(None));
+    }
+}
+
+/// Give the NEXT `fork_running` call on this thread a raw fd to report, as a single byte (`1` or
+/// `0`), whether `spawn_lock` was held — from the forking thread's own point of view, at the
 /// exact instant of the fork — via
 /// [`spawn_lock_held_by_this_thread`](crate::child::spawn::spawn_lock_held_by_this_thread)'s
-/// inherited copy. Unlike a check the PARENT makes after the fork returns, this cannot be fooled
-/// by a lock dropped before the fork and re-acquired afterward, nor by an unrelated concurrent
-/// spawn elsewhere holding the SAME global lock: the child already forked away with its own
-/// private copy of the flag before either could happen. Take semantics, read in the child (a
-/// separate address space after `fork()`, so taking it there cannot race the parent).
-pub(crate) fn set_fork_running_lock_held_report_fd(fd: std::os::fd::RawFd) {
+/// inherited copy. `fork_running` takes this fd once, itself, still holding `spawn_lock`, right
+/// before the fork — not the child, which only ever sees the already-resolved local value fork
+/// copies for it — so a concurrent `fork_running` elsewhere (serialized on the same lock) cannot
+/// observe or clear it first. Unlike a check the PARENT makes after the fork returns, reporting
+/// from the CHILD cannot be fooled by a lock dropped before the fork and re-acquired afterward:
+/// the child already forked away, with its own private copy of the flag, before any
+/// re-acquisition could happen.
+pub(crate) fn set_fork_running_lock_held_report_fd(fd: std::os::fd::RawFd) -> ForkRunningLockHeldReportFdGuard {
     FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.set(Some(fd)));
+    ForkRunningLockHeldReportFdGuard(())
 }
 pub(crate) fn take_fork_running_lock_held_report_fd() -> Option<std::os::fd::RawFd> {
     FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.take())

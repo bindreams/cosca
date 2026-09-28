@@ -294,18 +294,45 @@ fn defuse_disarms_the_guard() {
 ///   before-the-fork mutant for the opposite reason: by the time the parent-side check ran, a
 ///   mutant that drops the lock before the fork and re-acquires it in the parent arm had already
 ///   made it true again.)
-/// - **A seam that cannot compile before the fork.** `fork_running`'s post-fork hook is handed
-///   the child's real pid, which only exists once `fork()` has actually returned — a hook moved
-///   to before the fork this lock is meant to cover has no pid to pass, so it cannot compile as
-///   this same call. This test blocks the hook and independently confirms the pid it was handed
-///   names a live process right now, via `kill(pid, 0)`, sending nothing.
+/// - **From inside the post-fork hook itself.** The hook asserts
+///   `spawn_lock_held_by_this_thread()` — it runs on the forking thread, so this reads the SAME
+///   thread-local the fork used, not a copy. This is what actually catches a lock released right
+///   after the fork, before `pidfd_open` and the hook: `kill(pid, 0)` (still checked below, as a
+///   sanity check that `fork()` really happened) does NOT catch that — sending signal 0 to
+///   whatever pid the hook is handed always succeeds once a real fork occurred, mutated or not,
+///   so a mutant that hardcodes a bogus pid there would defeat a "the hook cannot compile before
+///   the fork" argument; no such claim is made here.
+///
+/// **Never hangs**, even if the fix regresses so the child never reports: the child's
+/// [`KillOnDrop`] is killed and reaped BEFORE the read below, so its copy of the write end is
+/// always closed by the time this reads, and the read end is `O_NONBLOCK` — a broken `write` in
+/// the child (or, in the worst case, some unrelated fork still holding a copy of the write end)
+/// answers `WouldBlock`, read as "not reported" and failed loudly, never blocks forever. The pipe
+/// itself is opened while holding `spawn_lock` too, so an unrelated concurrent `fork_running`
+/// elsewhere in this binary — serialized on the very same lock — cannot fork and inherit its
+/// write end while this test is creating it.
 #[cfg(target_os = "linux")]
 #[test]
 fn fork_running_holds_spawn_lock_across_the_fork() {
     use std::os::fd::AsRawFd;
     use std::sync::mpsc;
 
-    let (report_read, report_write) = std::io::pipe().expect("open the report pipe");
+    let (report_read, report_write) = {
+        let _lock = crate::child::spawn::spawn_lock();
+        std::io::pipe().expect("open the report pipe")
+    };
+    // SAFETY: fcntl(F_GETFL/F_SETFL) on a live, owned fd; no pointer args beyond the flags.
+    unsafe {
+        let flags = libc::fcntl(report_read.as_raw_fd(), libc::F_GETFL);
+        assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
+        let rc = libc::fcntl(report_read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        assert_eq!(
+            rc,
+            0,
+            "fcntl F_SETFL O_NONBLOCK failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     let report_write_fd = report_write.as_raw_fd();
 
     let (tx_started, rx_started) = mpsc::channel::<u32>();
@@ -315,8 +342,12 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
         // Set on THIS thread, not the test's own: `fork_running` runs here, and the report seam
         // is a thread-local — the forked child inherits whichever thread's own copy called
         // `fork()`, not the test's.
-        crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_write_fd);
-        crate::containment::cgroup::fault::set_after_fork_still_locked(move |child_pid| {
+        let _report_guard = crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_write_fd);
+        let _hook_guard = crate::containment::cgroup::fault::set_after_fork_still_locked(move |child_pid| {
+            assert!(
+                crate::child::spawn::spawn_lock_held_by_this_thread(),
+                "spawn_lock must still be held when the post-fork hook runs"
+            );
             tx_started
                 .send(child_pid)
                 .expect("the test thread is still waiting to receive");
@@ -337,14 +368,11 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
         .recv()
         .expect("fork_thread must reach the hook before this returns");
 
-    // The hook can only be called with a real pid from the PARENT arm, after `fork()` has
-    // already returned — confirmed independently of the hook's own honesty: `kill(pid, 0)` asks
-    // the kernel directly whether a process at that pid exists right now, sending nothing.
     // SAFETY: signal 0 sends nothing; it only queries existence/permission.
     assert_eq!(
         unsafe { libc::kill(child_pid as i32, 0) },
         0,
-        "the child must already exist by the time the hook runs, proving fork() already happened: {}",
+        "the child must already exist by the time the hook runs: {}",
         std::io::Error::last_os_error()
     );
 
@@ -354,20 +382,34 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
 
     let guard = fork_thread.join().expect("fork_thread must not panic");
 
-    // Our own copy of the write end, dropped so only the child's keeps the pipe open: the
-    // blocking read below waits for the child's report (written before it ever reaches `body()`,
-    // no ordering assumed relative to `fork_thread`'s own join above) or, if the child never
-    // wrote one, for its own exit to close its inherited copy — read then answers `0`, not `1`.
+    // Killed and reaped BEFORE the read: a child that never reports (a broken `write`, say) must
+    // not hang this test waiting for a byte that will never come. Once it is dead, its own copy
+    // of the write end is closed by the kernel no matter what it did.
+    drop(guard);
     drop(report_write);
+
     let mut held = 0u8;
-    // SAFETY: `report_read`'s fd is an open read end; `held` is a valid one-byte buffer.
+    // SAFETY: `report_read`'s fd is an open, non-blocking read end; `held` is a valid one-byte
+    // buffer.
     let n = unsafe { libc::read(report_read.as_raw_fd(), (&raw mut held).cast(), 1) };
-    assert_eq!(n, 1, "the child must have reported before exiting");
+    let n = if n == -1 {
+        let e = std::io::Error::last_os_error();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "read failed unexpectedly: {e}"
+        );
+        0 // Deterministically "not reported" — never a hang.
+    } else {
+        n
+    };
+    assert_eq!(
+        n, 1,
+        "the child never reported whether it saw spawn_lock held (0 = not reported)"
+    );
     assert_eq!(
         held, 1,
         "spawn_lock must have been held, from the forking thread's own point of view, at the \
          exact instant of the fork"
     );
-
-    drop(guard);
 }
