@@ -84,10 +84,12 @@ pub(crate) fn run_fixture(fixture: &str) {
         // cgroup test support, `fork_running` in `containment/cgroup/test_support.rs`, does that —
         // copies the whole fd table regardless of `O_CLOEXEC`, which only takes effect at `exec`.
         // Serializing against every OTHER cosca-originated fork that ALSO takes `spawn_lock()`
-        // closes the window against those. It does NOT close it against `fork_running` itself:
-        // that helper does not take `spawn_lock()` today, so a cgroup test's own bare fork can
-        // still race this window. Making `fork_running` take it too belongs to
-        // `test_support.rs`, owned by a separate PR stack — not fixed here.
+        // closes the window against those. `fork_running` does not take that lock today, so its
+        // own bare fork can still land inside this window and inherit a copy of `fd` — harmlessly:
+        // `fd` is a read-only `O_DIRECTORY` descriptor, and `fork_running`'s child never `exec`s,
+        // so the inherited copy is never written to, never leaked further, and closes with that
+        // child same as any other fd it happens to hold. A separate PR, off `main`, is already
+        // giving `fork_running` its own `spawn_lock()` — not duplicated here.
         let child = {
             let _guard = crate::child::spawn::spawn_lock();
             let fd = open_scratch_fd(scratch.path());
@@ -260,8 +262,8 @@ fn assert_dropped_identity_can_traverse_tmpdir() {
 /// Whether [`crate::test_privilege::UNPRIVILEGED`] can actually reach `path` on disk. Forks, drops
 /// the CHILD to that uid/gid when this process is root — a no-op otherwise, mirroring
 /// [`crate::test_privilege::drop_root_uid`]'s own "nothing to drop" case, so this call never fails
-/// to drop; there is simply nothing to drop when the caller is not root — and `open`s `path`
-/// there, asking the kernel directly rather than modelling its permission rules by hand.
+/// to drop; there is simply nothing to drop when the caller is not root — and checks `path` there,
+/// asking the kernel directly rather than modelling its permission rules by hand.
 ///
 /// **Act and fail, don't model.** An earlier version walked every ancestor's own mode/owner/group
 /// bits in Rust. That missed a symlink resolved along the way: it checked the SYMLINK's own
@@ -269,34 +271,44 @@ fn assert_dropped_identity_can_traverse_tmpdir() {
 /// follows a symlink at an intermediate path component with no way to opt out (unlike the final
 /// component's `O_NOFOLLOW`) — see `a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled` in
 /// `test_child_tests.rs` for the reviewer's repro shape (`/tmp/base/link` -> `/tmp/base/real/inner`,
-/// `real` at `0700`). A hand-rolled model also has no way to know about any OTHER kernel-side rule
+/// `real` locked). A hand-rolled model also has no way to know about any OTHER kernel-side rule
 /// (ACLs, mount options, a MAC policy). Letting the kernel itself resolve `path` end to end, under
 /// the real dropped identity, cannot be wrong about anything a model could miss.
 ///
-/// `open`, not `stat`: `stat` only requires SEARCH permission on `path`'s ANCESTORS, never any
-/// permission on `path` itself — which would silently pass the exact bug this precondition exists
-/// to catch (a `TMPDIR` that is ITSELF `chmod 0700`, with perfectly traversable ancestors above
-/// it — measured on `resolve_root_lane_macos`'s first real run). `open`'s own permission check on
-/// the final component is what closes that gap.
+/// `access(path, X_OK)`, not `open`: every caller of this function is checking whether the dropped
+/// identity can ENTER `path` (a directory) or EXECUTE it (the copied fixture binary) — search and
+/// execute permission, not read. `open(O_RDONLY)`, tried first, checks READ permission instead, so
+/// a root-owned `0711`/`0701` directory (search-only for group/other, the exact shape a directory
+/// needs — never read) was falsely REFUSED, and a `0744`/`0704` file or directory (read for
+/// group/other, but no search/execute bit) falsely PASSED — backwards from what every caller
+/// actually needs. `access` is async-signal-safe (safe to call in the forked child below), and
+/// with the real uid already changed by `setuid` above (root's `setuid()` sets real, effective AND
+/// saved uid together — `credentials(7)`), `access`'s own real-uid-based check is exactly the
+/// dropped identity's answer, not a stale effective-uid one.
 ///
-/// No `spawn_lock()`: that lock exists to keep another thread's transient, still-open, non-`CLOEXEC`
-/// fd (a script mid-write, an about-to-be-`exec`'d fixture's scratch fd) from being inherited into
-/// a DIFFERENT thread's fork-then-exec child. This fork never execs and opens nothing but `path`
-/// itself `O_RDONLY`, closed automatically at `_exit` — there is no write-fd to race and no
-/// `exec`'d child for an inherited fd to matter to.
+/// Holds [`crate::child::spawn::spawn_lock()`] across the fork: a bare `fork()` without it can
+/// still land inside another concurrently running test's fd-marker window (see
+/// [`spawn_a_process_that_exits`]'s doc) — that fd would transiently leak into THIS child too, and
+/// a sweep watching for it could then find and signal this bystander. Holding the same lock every
+/// other cosca-originated fork in this binary takes closes that window here as well; neither of
+/// this function's own callers holds it already.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn check_path_traversable_by(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
     let c_path =
         std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| format!("{path:?} has an interior NUL"))?;
 
-    // SAFETY: a plain `fork()` from this (multithreaded) test binary. The child below touches no
-    // shared mutable state the fork could have raced (`c_path` is read-only and already fully
-    // built) and takes no lock another thread might be holding across the fork, because it never
-    // allocates — every call past this point is a raw, async-signal-safe libc syscall — and it
-    // always terminates via `_exit`, never by returning into this stack frame or running Rust's
-    // normal shutdown path (which would rerun the PARENT's own destructors a second time).
-    let pid = unsafe { libc::fork() };
+    let pid = {
+        let _guard = crate::child::spawn::spawn_lock();
+        // SAFETY: a plain `fork()` from this (multithreaded) test binary, under `spawn_lock()` (see
+        // this function's own doc). The child below touches no shared mutable state the fork could
+        // have raced (`c_path` is read-only and already fully built) and takes no lock another
+        // thread might be holding across the fork, because it never allocates — every call past
+        // this point is a raw, async-signal-safe libc syscall — and it always terminates via
+        // `_exit`, never by returning into this stack frame or running Rust's normal shutdown path
+        // (which would rerun the PARENT's own destructors a second time).
+        unsafe { libc::fork() }
+    };
     if pid < 0 {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
@@ -310,7 +322,7 @@ fn check_path_traversable_by(path: &std::path::Path) -> Result<(), String> {
                     libc::_exit(126); // distinct from any real errno below
                 }
             }
-            if libc::open(c_path.as_ptr(), libc::O_RDONLY) >= 0 {
+            if libc::access(c_path.as_ptr(), libc::X_OK) == 0 {
                 libc::_exit(0);
             }
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(125);
@@ -318,9 +330,18 @@ fn check_path_traversable_by(path: &std::path::Path) -> Result<(), String> {
         }
     }
     let mut status: libc::c_int = 0;
-    // SAFETY: `pid` is this call's own freshly forked child, reaped exactly once, here.
-    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        return Err(format!("waitpid: {}", std::io::Error::last_os_error()));
+    // SAFETY: `pid` is this call's own freshly forked child, reaped exactly once, here. Retried on
+    // `EINTR` — a signal delivered to this (multithreaded) process while waiting must not be
+    // mistaken for the child's own exit.
+    loop {
+        // SAFETY: `status` is a valid, writable int; `pid` is this call's own child throughout.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("waitpid: {e}"));
+        }
     }
     if !libc::WIFEXITED(status) {
         return Err(format!(
