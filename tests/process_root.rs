@@ -16,74 +16,6 @@ use common::consent_root;
 #[cfg(unix)]
 const ENV_TARGET_PID: &str = "COSCA_FOREIGN_KILL_TARGET_PID";
 
-/// Blocks until either `listener` gets an incoming connection, or `dead_watch` (the target's own
-/// stdout pipe, which it never writes to) reaches EOF or errors — meaning the target died before
-/// connecting. A plain blocking `accept()` would hang forever in that case instead of failing.
-#[cfg(unix)]
-fn accept_or_die(listener: &std::net::TcpListener, dead_watch: &mut std::process::ChildStdout) -> std::net::TcpStream {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
-
-    let mut fds = [
-        libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: dead_watch.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: `fds` is a valid, correctly-sized array for the call's duration.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic!("poll while waiting for the target's control connection: {e}");
-        }
-        if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            let mut buf = [0u8; 1];
-            match dead_watch.read(&mut buf) {
-                Ok(0) => panic!("the target died (its stdout EOF'd) before it connected"),
-                Ok(n) => panic!("the target wrote {n} unexpected byte(s) to stdout before connecting"),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // spurious wakeup
-                Err(e) => panic!("reading the target's death-watch pipe: {e}"),
-            }
-        }
-        if fds[0].revents & libc::POLLIN != 0 {
-            let (sock, _) = listener.accept().expect("accept the target's control connection");
-            return sock;
-        }
-    }
-}
-
-/// Regression test for `accept_or_die`'s reason to exist: a dead-before-connecting target must
-/// panic, not hang the caller forever. Runs unprivileged — `true` needs no uid drop to exit
-/// immediately, so this needs no root and no label.
-#[cfg(unix)]
-#[skuld::test]
-fn accept_or_die_panics_loudly_when_the_target_dies_first() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let mut child = std::process::Command::new("true")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn a child that exits immediately");
-    let mut dead_watch = child.stdout.take().expect("piped stdout");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        accept_or_die(&listener, &mut dead_watch)
-    }));
-    assert!(
-        result.is_err(),
-        "accept_or_die must panic, not hang, when the target dies before connecting"
-    );
-    let _ = child.wait();
-}
-
 /// See the module doc. Runs only once its `ROOT` group's switch AND consent both hold
 /// (`common::preconditions::root`, `#[fixture(consent_root)]`, label `ROOT`) — this test changes
 /// real system state (two uid switches), so it needs explicit consent, not just the switch being
@@ -101,7 +33,6 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
 #[cfg(unix)]
 #[skuld::test(requires = [common::preconditions::root], labels = [common::ROOT])]
 fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &()) {
-    use std::io::Read;
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -124,10 +55,12 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
     let target_bin = common::world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
 
     // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
-    // such concept), so this one spawn uses `std::process::Command` directly. It gets a piped
-    // stdout it never writes to, purely as a death-watch: see `accept_or_die`.
+    // such concept), so this one spawn uses `std::process::Command` directly. `control-echo-pid`,
+    // not `control-block`: the survival check below needs a target that stays responsive, not
+    // merely present, to prove the denied kill didn't land. It gets a piped stdout it never
+    // writes to, purely as a death-watch: see `common::accept_or_die`.
     let target = std::process::Command::new(&target_bin)
-        .args(["control-block", &addr, "R"])
+        .args(["control-echo-pid", &addr, "R"])
         .uid(common::TARGET_UID)
         .gid(common::TARGET_UID)
         .stdout(std::process::Stdio::piped())
@@ -137,9 +70,13 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
     let target_pid = target.id();
     let mut dead_watch = target.take_stdout().expect("target was spawned with a piped stdout");
 
-    let mut sock = accept_or_die(&listener, &mut dead_watch);
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("read the target's ready tag");
+    let mut sock = common::accept_or_die(&listener, &mut dead_watch);
+    let (tag, reported_pid) = common::read_tag_and_pid(&mut sock);
+    assert_eq!(tag, b'R', "unexpected control tag from the target");
+    assert_eq!(
+        reported_pid, target_pid,
+        "the target's self-reported pid must match what we spawned"
+    );
     drop(dead_watch); // no longer needed
 
     // The actual caller under test: re-exec THIS SAME test binary (another world-executable
@@ -163,12 +100,11 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
     );
 
     // Restores the "must not kill" half of the contract: a kill that both delivers the signal
-    // AND returns Err(EPERM) would otherwise still pass the assertion above.
-    assert_eq!(
-        target.try_wait().expect("try_wait on our own child must not error"),
-        None,
-        "the denied kill must not have reached the target"
-    );
+    // AND returns Err(EPERM) would otherwise still pass the assertion above. A bare
+    // `try_wait() == None` would be a timing race (a SIGKILL can be in flight, not yet reaped) —
+    // a ping/pong round trip on the target's own control socket instead PROVES it is still alive
+    // AND responsive, not merely "not yet observed dead".
+    common::assert_echoes(&mut sock, "the target");
 }
 
 /// [`foreign_kill_surfaces_permission_denied`]'s re-exec'd helper mode — dispatched from `fn
