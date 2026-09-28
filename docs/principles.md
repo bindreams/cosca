@@ -250,20 +250,29 @@ Every caller-supplied deadline cosca accepts (`wait_timeout`, `wait_tree_timeout
   `wait_tree_timeout`'s `MembersRemain`, a grace escalating to a kill) before `now >= deadline`.
   Tests assert `elapsed >= deadline` exactly, with no slack: scheduling can only push a call later,
   never earlier, so a passing test never needed a tolerance band.
-- **Never late by its own choice.** Every block that waits for the deadline is armed with the
-  deadline itself — not a duration computed earlier and reused — as its wake time, and no new round
-  of work starts once the deadline has passed. This is proved structurally: a `#[cfg(test)]` seam
-  reports the instant a wait actually blocked until, or whether a blocking call happened at all, and
-  a test clock advanced past the deadline shows the next check returning without another round —
-  not by timing a wall-clock run and checking it against a tolerance band.
+- **Never late by cosca's own choice.** Every block is armed with the caller's deadline itself,
+  passed through the waiting primitive's own deadline API — an absolute instant, not a duration
+  cosca computed earlier and reused — and no new round of work starts once the deadline has
+  passed. That API is the boundary of cosca's responsibility: kqueue's per-round recompute of the
+  remaining time, `event_listener::wait_deadline`, tokio's `timeout_at`, and their equivalents all
+  take the caller's `Instant` directly. What happens BELOW that API is not cosca's choice: parking
+  through a futex, a timer wheel rounded to its own tick (tokio: up to 1 ms), and OS scheduling all
+  introduce lateness cosca neither causes nor controls. This is proved structurally, not by timing:
+  a `#[cfg(test)]` seam reports the instant (or the deadline) a wait was actually armed with, or
+  whether a blocking call happened at all, and a test clock advanced past the deadline shows the
+  next check returning without another round.
 
-cosca promises no upper bound on how late after the deadline it actually reports the outcome: OS
-scheduling, load or a suspended process can delay that by any amount. No test may assert one.
+cosca promises no upper bound on how late after the deadline it actually reports the outcome —
+scheduler, load, a suspended process, or a waiting primitive's own rounding below its API can delay
+that by any amount. No test may assert one, including a "returns promptly" check: an assertion of
+the shape "elapsed is small" or "elapsed is less than X" is the forbidden upper bound regardless of
+how generous X is or how the assertion is phrased.
 
-**Why:** a wall-clock assertion with a tolerance band (`elapsed <= deadline + slack`) is a bet that
-the test machine is fast enough that day — it passes by luck and fails under load, and the slack
-itself is exactly wide enough to hide the busy-poll and early-return bugs it exists to catch. A
-structural check proves the property regardless of machine speed.
+**Why:** a wall-clock assertion with a tolerance band (`elapsed <= deadline + slack`, or "returns
+promptly") is a bet that the test machine, and the waiting primitive's own internals, are fast
+enough that day — it passes by luck and fails under load, and the slack itself is exactly wide
+enough to hide the busy-poll and early-return bugs it exists to catch. A structural check proves
+the property regardless of machine speed or of what a dependency does below its own API.
 
 **Applies to:** every caller-supplied deadline and every wait that arms one.
 
