@@ -5,28 +5,6 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::wait::fault;
 
-/// Blocks until `pid` is a zombie (exited, not yet reaped), without reaping it — mirrors
-/// `child::graceful_tests::await_zombie` (see there for the full rationale). A short, bounded
-/// block on a real kernel event, not a sleep — the same shape this file's Windows twins already
-/// accept for a blocking `TcpListener::accept` inside a `#[tokio::test]`.
-#[cfg(unix)]
-fn await_zombie(pid: u32) {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    loop {
-        // SAFETY: a well-formed `waitid` call; `info` is a valid, owned, zeroed `siginfo_t` the
-        // kernel fills in. WNOWAIT leaves the child reapable by the caller's later `wait()`.
-        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        if rc == 0 {
-            return;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        panic!("waitid failed: {err}");
-    }
-}
-
 /// Async twin of `child::graceful_tests::blocker` — see there for the full rationale. A
 /// contained child that blocks reading from a piped stdin this function's caller holds open,
 /// never via a chosen sleep duration. Stdout is piped, not nulled, so a Unix caller can prove
@@ -358,8 +336,9 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
 // trap-installation race, why the backgrounded `cat` needs `exec 3<&0; cat <&3 ... 3<&-` rather
 // than a bare `cat &` (a non-interactive shell gives an asynchronous command with no explicit
 // stdin redirection `/dev/null`, not the shell's own stdin, so a bare `cat &` exits on EOF
-// immediately instead of blocking), and why `await_zombie` — not the readiness byte alone — is
-// what the root's own `exit 0` is blocked on before `graceful_shutdown_tree` is ever called.
+// immediately instead of blocking), and why `child.wait()` — not the readiness byte alone, and
+// not a raw `waitid` on the bare pid — is what the root's own `exit 0` is blocked on before
+// `graceful_shutdown_tree` is ever called.
 #[cfg(unix)]
 #[tokio::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
@@ -385,9 +364,10 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
         .await
         .expect("readiness byte");
     let id = child.id();
-    // Block until the root is genuinely a zombie — see this test's sync twin's own doc for why
-    // the readiness byte alone does not prove the root's own `exit 0` has completed.
-    await_zombie(id.pid());
+    // Block until the root has genuinely exited — see this test's sync twin's own doc for why
+    // the readiness byte alone does not prove the root's own `exit 0` has completed, and why
+    // this is `child.wait()` rather than a raw `waitid` on the bare pid.
+    child.wait().await.expect("the root must exit on its own");
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child

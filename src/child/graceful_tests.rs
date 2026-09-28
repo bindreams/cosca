@@ -6,28 +6,6 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::wait::fault;
 
-/// Blocks until `pid` is a zombie (exited, not yet reaped), without reaping it — mirrors
-/// `containment::unix::group_tests::await_zombie`. Used where a test needs the root to have
-/// GENUINELY exited already, deterministically, rather than betting that a shell script's own
-/// `exit` happens to complete before some later check runs.
-#[cfg(unix)]
-fn await_zombie(pid: u32) {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    loop {
-        // SAFETY: a well-formed `waitid` call; `info` is a valid, owned, zeroed `siginfo_t` the
-        // kernel fills in. WNOWAIT leaves the child reapable by the caller's later `wait()`.
-        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        if rc == 0 {
-            return;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        panic!("waitid failed: {err}");
-    }
-}
-
 /// A contained child that blocks reading from a piped stdin this function's caller holds open
 /// — never via a chosen sleep duration. `cat`/`findstr x` unblock only on EOF (the pipe
 /// dropped) or a real kill, so a test that needs the child provably still alive at some later
@@ -421,9 +399,18 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // `MembersRemain` branch requires the root to have ALREADY exited by the time it is called, and
 // betting that `exit 0` always beats the 2-second grace is exactly the timed-fixture hazard this
 // crate's tests avoid elsewhere: measured with a deliberately slow root (`sleep 3` before
-// `exit 0`) this bet fails at 2.01s. So the test blocks a second time, on `await_zombie`, which
-// is a real happens-before edge on the root's exit (not a sleep or a grace-duration guess) —
-// `graceful_shutdown_tree` is called only once the root is provably already a zombie.
+// `exit 0`) this bet fails at 2.01s. So the test blocks a second time, on `child.wait()` — a
+// real happens-before edge on the root's exit, not a sleep or a grace-duration guess.
+//
+// `child.wait()`, not a raw `waitid` on the bare pid: `SharedChild::new` (which every sync
+// `crate::Child` is backed by) can itself reap a fast-exiting child from inside `spawn()` —
+// this fixture's shell is trivial enough to race that internal probe and lose (measured:
+// intermittent `ECHILD` from a hand-rolled `waitid`, gone once `child.wait()` replaced it).
+// `wait()` is safe here for the SAME reason it is safe to call from more than one place at
+// all — `SharedChild` caches the exit status the first time anything observes it, so this
+// call and `graceful_shutdown_tree`'s own later one both return the same status; the function
+// under test still runs its own best-effort-reap code path and still exercises it, regardless
+// of which caller's `wait()` was the one the kernel actually serviced.
 //
 // `exec 3<&0` duplicates the shell's OWN stdin (our pipe) to fd 3 while it is still the
 // foreground command — POSIX has a non-interactive shell give an asynchronous (`&`) command
@@ -462,9 +449,10 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
         .read_exact(&mut readiness)
         .expect("readiness byte");
     let id = child.id();
-    // Block until the root is genuinely a zombie — see this test's own doc for why the
-    // readiness byte alone does not prove the root's own `exit 0` has completed.
-    await_zombie(id.pid());
+    // Block until the root has genuinely exited — see this test's own doc for why the
+    // readiness byte alone does not prove the root's own `exit 0` has completed, and why this
+    // is `child.wait()` rather than a raw `waitid` on the bare pid.
+    child.wait().expect("the root must exit on its own");
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
