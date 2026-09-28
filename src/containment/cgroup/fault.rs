@@ -39,6 +39,7 @@ thread_local! {
     static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static BETWEEN_SPAWN_LOCK_AND_FORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -453,6 +454,17 @@ impl Drop for BeforeExitWaitGuard {
 }
 pub(crate) fn run_before_exit_wait() {
     if let Some(hook) = BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Run `hook` in the NEXT `fork_running` call on this thread, after `spawn_lock` is acquired but
+/// before the `fork()` that lock guards against a concurrent spawn's inheritable-fd window.
+pub(crate) fn set_between_spawn_lock_and_fork(hook: impl FnOnce() + 'static) {
+    BETWEEN_SPAWN_LOCK_AND_FORK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn run_between_spawn_lock_and_fork() {
+    if let Some(hook) = BETWEEN_SPAWN_LOCK_AND_FORK.with(|h| h.borrow_mut().take()) {
         hook();
     }
 }

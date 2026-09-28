@@ -4,11 +4,21 @@
 /// has other threads). The child never `exec`s, so an unreaped orphan keeps this binary's
 /// inherited fds (stdout) open. The returned [`KillOnDrop`] SIGKILLs and reaps it on drop unless
 /// [`defused`](KillOnDrop::defuse).
+///
+/// Forks under [`spawn_lock`](crate::child::spawn::spawn_lock): a bare `fork()` here would race a
+/// concurrent cosca spawn elsewhere in this test binary that momentarily holds a non-`CLOEXEC` fd
+/// open across its own inheritable-fd window, and this fork would inherit it too (`#200`'s
+/// finding). Held only across the `fork()` call itself, not the pidfd/cleanup that follows.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
-    // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
-    // `_exit`s without unwinding or running destructors.
-    match unsafe { libc::fork() } {
+    let raw_pid = {
+        let _guard = crate::child::spawn::spawn_lock();
+        crate::containment::cgroup::fault::run_between_spawn_lock_and_fork();
+        // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
+        // `_exit`s without unwinding or running destructors.
+        unsafe { libc::fork() }
+    };
+    match raw_pid {
         -1 => panic!("fork: {}", std::io::Error::last_os_error()),
         0 => {
             body();

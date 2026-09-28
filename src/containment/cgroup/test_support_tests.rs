@@ -273,3 +273,77 @@ fn defuse_disarms_the_guard() {
         "a defused guard must not have killed the child before it could ack"
     );
 }
+
+/// `fork_running` must hold `spawn_lock()` across its `fork()`, not just release it before —
+/// otherwise a concurrent cosca spawn elsewhere in this test binary can inherit an fd
+/// `fork_running`'s caller holds open at that moment (`#200`'s finding).
+///
+/// Proved through a seam, not timing: a hook fires on `fork_running`'s own thread right after it
+/// acquires `spawn_lock` and blocks there until this test releases it. While blocked, another
+/// thread's own `spawn_lock()` call can only be a real, contended `Mutex::lock()` — it either
+/// waits for the release, or (if the guard were missing) races ahead of it. Which one happened is
+/// read back through a flag the hook sets, still holding the lock, immediately before releasing
+/// it: `Mutex`'s own unlock-then-lock happens-before edge (not this test) is what guarantees the
+/// probe thread cannot observe `written == false` once it has legitimately acquired the lock, so
+/// the assertion below cannot pass by scheduling luck.
+#[cfg(target_os = "linux")]
+#[test]
+fn fork_running_holds_spawn_lock_across_the_fork() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    let written = Arc::new(AtomicBool::new(false));
+    let (tx_started, rx_started) = mpsc::channel::<()>();
+    let (tx_release, rx_release) = mpsc::channel::<()>();
+
+    let fork_thread = {
+        let written = Arc::clone(&written);
+        std::thread::spawn(move || {
+            crate::containment::cgroup::fault::set_between_spawn_lock_and_fork(move || {
+                tx_started
+                    .send(())
+                    .expect("the test thread is still waiting to receive");
+                rx_release
+                    .recv()
+                    .expect("the test thread still holds the release sender");
+                written.store(true, Ordering::Release);
+            });
+            fork_running(|| {
+                // SAFETY: `pause` is async-signal-safe.
+                unsafe { libc::pause() };
+            })
+        })
+    };
+
+    // Blocks until fork_running's hook is running — i.e. spawn_lock is held on that thread — not
+    // a fixed duration.
+    rx_started
+        .recv()
+        .expect("fork_thread must reach the hook before this returns");
+
+    // A second, genuinely concurrent attempt on the SAME process-global lock. If fork_running
+    // still holds it, this call blocks in the kernel/libstd's own mutex until `tx_release` fires
+    // below; if fork_running does not hold it, this acquires immediately.
+    let probe_thread = {
+        let written = Arc::clone(&written);
+        std::thread::spawn(move || {
+            let _guard = crate::child::spawn::spawn_lock();
+            written.load(Ordering::Acquire)
+        })
+    };
+
+    tx_release
+        .send(())
+        .expect("fork_thread's hook is still waiting to receive");
+
+    let guard = fork_thread.join().expect("fork_thread must not panic");
+    let probe_saw_written = probe_thread.join().expect("probe_thread must not panic");
+
+    assert!(
+        probe_saw_written,
+        "a concurrent spawn_lock() must not succeed until fork_running's own fork() is done"
+    );
+
+    drop(guard);
+}
