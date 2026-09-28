@@ -32,106 +32,56 @@ fn fixture_command_removes_rust_test_nocapture_from_its_env() {
 /// [`super::run_fixture`] fails loudly on, rather than tries to fix, for a root driver whose
 /// ambient `TMPDIR` (or exec path — see [`super::copy_exe_to_traversable_scratch`]) the post-drop
 /// identity could not otherwise reach.
+///
+/// The function now acts and fails (forks, drops to `UNPRIVILEGED`, `open`s the path, reports the
+/// real errno) rather than modelling permission bits in Rust — see its own doc for why. That
+/// means a REAL denial can only be observed by a process that can actually BECOME a different,
+/// unprivileged identity, which needs root. Both tests below run unconditionally and assert
+/// something true in either environment: as root, the fork really drops to `UNPRIVILEGED` and the
+/// kernel really denies it; as a non-root, already-unprivileged caller, the drop is the
+/// documented no-op (same shape as [`crate::test_privilege::drop_root_uid`]'s own), so the check
+/// runs as the CURRENT identity — which owns the directories these tests build, and so can always
+/// reach them, `0700` or not. Neither branch skips the check; each asserts the outcome that
+/// identity actually produces.
 #[cfg(all(unix, not(target_os = "linux")))]
 mod check_path_traversable_by_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn check(path: &std::path::Path, uid: libc::uid_t) -> Result<(), String> {
-        super::super::check_path_traversable_by(path, uid, uid)
+    fn check(path: &std::path::Path) -> Result<(), String> {
+        super::super::check_path_traversable_by(path)
     }
 
     #[test]
-    fn a_directory_owned_by_the_dropped_uid_is_traversable_regardless_of_other_bits() {
+    fn a_reachable_directory_is_ok() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let this_uid = unsafe { libc::geteuid() };
-        assert!(check(dir.path(), this_uid).is_ok());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check(dir.path()).is_ok());
     }
 
+    /// The reviewer's own repro shape: `real` (`0700`) sits behind a symlink, so a check that
+    /// only inspected the symlink's own (conventionally always-permissive) mode — rather than
+    /// letting the kernel resolve through it, as `open` does — would miss the denial entirely.
     #[test]
-    fn a_world_searchable_directory_owned_by_someone_else_is_traversable() {
-        // Directly under `/tmp`, not `tempfile::tempdir()`'s ambient `TMPDIR`: checking a
-        // FOREIGN uid's access must not depend on the REAL system `TMPDIR`'s own ancestors (a
-        // per-user macOS `TMPDIR` is itself `0700`) also happening to be world-traversable — only
-        // `/tmp` itself is guaranteed to be.
-        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o701)).unwrap();
-        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        assert!(check(dir.path(), some_other_uid).is_ok());
-    }
-
-    #[test]
-    fn a_0700_directory_owned_by_someone_else_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        let err = check(dir.path(), some_other_uid).unwrap_err();
-        assert!(err.contains("does not grant"), "{err}");
-    }
-
-    /// The whole point of walking ancestors rather than checking only the leaf: a `TMPDIR` (or
-    /// exec path) that is itself wide open is still unreachable if something ABOVE it refuses
-    /// entry — reproducing #200's own F3 finding (a `chmod 0750` `$HOME` blocking a leaf `TMPDIR`
-    /// underneath it that was, on its own, perfectly traversable).
-    #[test]
-    fn a_traversable_leaf_under_an_unreachable_ancestor_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let leaf = root.path().join("leaf");
-        std::fs::create_dir(&leaf).unwrap();
-        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o701)).unwrap();
-        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        let err = check(&leaf, some_other_uid).unwrap_err();
-        assert!(err.contains(root.path().to_str().unwrap()), "{err}");
-    }
-
-    /// The kernel always follows a symlink at an intermediate path component — there is no way to
-    /// opt out of that for anything but the FINAL component (`O_NOFOLLOW`) — so a check reporting
-    /// on the symlink's OWN (conventionally always-permissive) mode instead of its target's would
-    /// silently pass something the real path resolution would refuse. `/tmp` on macOS is exactly
-    /// this shape (`-> /private/tmp`); this test does not rely on that coincidence, building its
-    /// own symlink over a deliberately restrictive target instead.
-    #[test]
-    fn a_symlink_ancestor_is_checked_against_its_target_not_its_own_mode() {
+    fn a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled() {
         let base = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        let real_target = base.path().join("real");
-        std::fs::create_dir(&real_target).unwrap();
-        std::fs::set_permissions(&real_target, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let inner = real_target.join("inner");
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let inner = real.join("inner");
         std::fs::create_dir(&inner).unwrap();
-        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o701)).unwrap();
         let link = base.path().join("link");
-        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        let err = check(&link.join("inner"), some_other_uid).unwrap_err();
-        assert!(err.contains("0700") || err.contains("700"), "{err}");
-    }
-
-    #[test]
-    fn group_membership_grants_search_via_group_bits() {
-        // Directly under `/tmp` — see the world-searchable test above for why.
-        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o710)).unwrap();
-        let meta = std::fs::metadata(dir.path()).unwrap();
-        use std::os::unix::fs::MetadataExt as _;
-        let some_other_uid = meta.uid().wrapping_add(1);
-        assert!(super::super::check_path_traversable_by(dir.path(), some_other_uid, meta.gid()).is_ok());
-    }
-
-    #[test]
-    fn a_leaf_file_needs_read_and_execute_not_just_search() {
-        // Directly under `/tmp` — see the world-searchable test above for why.
-        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o701)).unwrap();
-        let file = dir.path().join("exe");
-        std::fs::write(&file, b"x").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o701)).unwrap(); // x only, no r
-        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        let err = check(&file, some_other_uid).unwrap_err();
-        assert!(err.contains("read+execute"), "{err}");
-
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o705)).unwrap(); // r+x
-        assert!(check(&file, some_other_uid).is_ok());
+        let result = check(&link.join("inner"));
+        if unsafe { libc::geteuid() } == 0 {
+            // Root: the fork really becomes UNPRIVILEGED, which does not own `real` — denied.
+            let err = result.unwrap_err();
+            assert!(err.contains("link"), "{err}");
+        } else {
+            // Not root: the drop no-ops, so the check runs as THIS test's own identity — which
+            // owns `real`, and so can always enter its own `0700` directory. Still exercises the
+            // same fork+open path through the symlink, just without an identity that gets denied.
+            assert!(result.is_ok(), "{result:?}");
+        }
     }
 }
