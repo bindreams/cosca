@@ -16,7 +16,7 @@ async fn async_id_is_a_real_stable_identity() {
     // id() returns the stored ProcessId — a real, resolvable identity that survives wait (tokio's
     // own Child::id() would be None after reap).
     use std::io::Write as _;
-    let (mut child, mut sock) = common::spawn_blocker_async();
+    let (mut child, mut sock) = common::spawn_blocker_async().await;
     let id = child.id();
     let p = cosca::Process::from_id(id);
     assert_eq!(p.id(), id);
@@ -33,7 +33,7 @@ async fn async_id_is_a_real_stable_identity() {
 #[tokio::test]
 async fn async_try_wait_is_none_before_exit_then_some_after() {
     // A blocker child is structurally wedged on its never-written socket → still running.
-    let (mut child, mut sock) = common::spawn_blocker_async();
+    let (mut child, mut sock) = common::spawn_blocker_async().await;
     assert!(
         child.try_wait().expect("try_wait").is_none(),
         "wedged child must be running"
@@ -247,7 +247,7 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
 #[tokio::test]
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     // The containment assert guards the EOFs below from passing for unrelated reasons.
     assert_ne!(
@@ -277,7 +277,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
     // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
     use std::io::{Read as _, Write as _};
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
@@ -303,7 +303,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
 #[tokio::test]
 async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
-    let (mut child, mut root, grand) = common::spawn_grandchild_async(true);
+    let (mut child, mut root, grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     child.detach();
@@ -335,7 +335,7 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     // containment resource's own drop, which
     // `async_kill_on_drop_false_leaves_a_contained_tree_running` covers separately.
     use std::io::{Read as _, Write as _};
-    let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false);
+    let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false).await;
     let root_id = child.id();
     drop(child); // kill_on_drop(false) → Drop early-returns; teardown must NOT run
     assert_eq!(
@@ -359,7 +359,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     // cgroup lane this is a process group, whose disarm is a no-op;
     // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
     use std::io::{Read as _, Write as _};
-    let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false);
+    let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false).await;
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
@@ -390,7 +390,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
     common::cgroup::require_lane();
-    assert_async_opted_out_tree_survives(true, |mut child| child.detach());
+    assert_async_opted_out_tree_survives(true, |mut child| child.detach()).await;
 }
 
 /// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does (see
@@ -400,7 +400,7 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
     common::cgroup::require_lane();
-    assert_async_opted_out_tree_survives(false, drop);
+    assert_async_opted_out_tree_survives(false, drop).await;
 }
 
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
@@ -430,7 +430,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_
         root,
         grand,
         grand_pid,
-    } = common::spawn_echo_tree_async(false);
+    } = common::spawn_echo_tree_async(false).await;
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
 
@@ -455,13 +455,13 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_
 /// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
 /// the handle through `opt_out`, prove both members alive, then remove the leaf the tree keeps.
 #[cfg(target_os = "linux")]
-fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce(cosca::tokio::Child)) {
+async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce(cosca::tokio::Child)) {
     let common::AsyncEchoTree {
         child,
         mut root,
         mut grand,
         grand_pid,
-    } = common::spawn_echo_tree_async(kill_on_drop);
+    } = common::spawn_echo_tree_async(kill_on_drop).await;
     assert_eq!(
         child.containment(),
         cosca::Containment::CgroupV2,
@@ -967,7 +967,7 @@ async fn async_fd3_source_merges_into_piped_stdin() {
 async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
     use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     assert_eq!(
         child.containment(),
         cosca::Containment::JobObject,
@@ -984,4 +984,84 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
             other => panic!("{who} not torn down: {other:?}"),
         }
     }
+}
+
+/// Async sibling of the sync `spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
+/// regression in `tests/process.rs` — same mutant coverage, for `spawn_control_async`.
+#[tokio::test]
+async fn spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let result = ::tokio::spawn(common::spawn_control_async("--not-a-real-mode", &[], false)).await;
+    let join_err = match result {
+        Ok(_) => panic!("spawn_control_async did not panic for a target that died before connecting"),
+        Err(e) => e,
+    };
+    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
+    let payload = join_err.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    assert!(
+        message.contains("before it connected"),
+        "expected a \"before it connected\" panic, got: {message:?}"
+    );
+}
+
+/// Async sibling of `spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`.
+#[tokio::test]
+async fn spawn_tree_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let result = ::tokio::spawn(common::spawn_tree_async("--not-a-real-mode", |_| {})).await;
+    let join_err = match result {
+        Ok(_) => panic!("spawn_tree_async did not panic for a target that died before connecting"),
+        Err(e) => e,
+    };
+    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
+    let payload = join_err.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    assert!(
+        message.contains("before it connected"),
+        "expected a \"before it connected\" panic, got: {message:?}"
+    );
+}
+
+/// Regression test for `common::accept_or_die_async`'s reason to exist: a dead-before-connecting
+/// target must panic (not hang) the task awaiting it, on the "before it connected" message
+/// specifically — and the error case is reported as itself, never folded into "died"/"exited".
+/// Uses `cosca::tokio::Command` directly (not a raw `tokio::process::Command`) since
+/// `accept_or_die_async` races the SAME `cosca::tokio::Child::wait()` every helper below uses,
+/// not a generic `AsyncRead`.
+#[tokio::test]
+async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set the listener nonblocking for tokio");
+    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "--not-a-real-mode"]); // exits immediately on an unknown mode
+    let mut child = cmd.spawn().expect("spawn a child that exits immediately");
+
+    let result = ::tokio::spawn(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
+
+    let join_err = match result {
+        Ok(_) => panic!("accept_or_die_async did not panic for a target that died before connecting"),
+        Err(e) => e,
+    };
+    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
+    let payload = join_err.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    assert!(
+        message.contains("before it connected"),
+        "expected a \"before it connected\" panic, got: {message:?}"
+    );
 }

@@ -248,15 +248,12 @@ fn is_alive_is_false_for_a_real_zombie() {
     // do NOT prepend "cosca_testbin" the way the crate's Command requires.
     let mut raw = std::process::Command::new(common::testbin())
         .args(["control-block", &addr, "Z"])
-        .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn raw child");
-    let mut dead_watch = raw.stdout.take().expect("piped stdout");
     let p = cosca::Process::from_pid(raw.id()).found().expect("raw child resolves");
-    let mut sock = common::accept_or_die(&listener, &mut dead_watch);
+    let mut sock = common::accept_or_die(&listener, raw.id());
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
-    drop(dead_watch);
 
     sock.write_all(b"x").expect("trigger exit");
     p.wait().expect("death-watch"); // the OS exit edge — non-reaping, but not yet the zombie edge
@@ -279,7 +276,7 @@ fn is_alive_is_false_for_a_real_zombie() {
 
 /// Regression test for `common::accept_or_die`'s reason to exist: a dead-before-connecting
 /// target must panic, not hang the caller forever — and specifically on the "died" message, not
-/// merely on ANY panic (a wrongly-classified I/O error would still make this pass otherwise).
+/// merely on ANY panic (a wrongly-classified error would still make this pass otherwise).
 /// `accept_or_die` itself is unix-only (see its own doc).
 #[cfg(unix)]
 #[test]
@@ -288,13 +285,10 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut child = std::process::Command::new(common::testbin())
         .args(["--not-a-real-mode"]) // testbin exits immediately on an unknown mode
-        .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn a child that exits immediately");
-    let mut dead_watch = child.stdout.take().expect("piped stdout");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        common::accept_or_die(&listener, &mut dead_watch)
-    }));
+    let pid = child.id();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| common::accept_or_die(&listener, pid)));
     let payload = result.expect_err("accept_or_die must panic, not hang, when the target dies before connecting");
     let message = payload
         .downcast_ref::<String>()
@@ -306,4 +300,76 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
         "expected a \"died before it connected\" panic, got: {message:?}"
     );
     child.wait().expect("reap the already-exited child");
+}
+
+/// The other half of `accept_or_die`'s contract: a target that connects and then exits
+/// immediately must NOT be misreported as having died before connecting — the exit notification
+/// racing the connection already in the backlog must resolve in the connection's favor. Mutant
+/// coverage for "the exit signal alone is treated as proof" (it must only be a PROMPT to check
+/// the listener again, via `final_peek_or_die` — see its doc).
+///
+/// Deterministic, not timing-luck: this waits for the target to fully exit BEFORE calling
+/// `accept_or_die` at all, so by the time it starts watching, the connection is already queued
+/// in the listener's backlog AND the process has already exited — the exact race `final_peek_or_die`
+/// exists to resolve, guaranteed on every call rather than hoped for.
+#[cfg(unix)]
+#[test]
+fn accept_or_die_returns_the_connection_when_the_target_already_exited() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut child = std::process::Command::new(common::testbin())
+        .args(["control-once", &addr, "R"]) // connects, sends the tag, exits immediately
+        .spawn()
+        .expect("spawn a target that connects and exits immediately");
+    let pid = child.id();
+    let status = child.wait().expect("wait for the target to exit");
+    assert!(status.success(), "control-once should exit 0, got {status:?}");
+
+    let mut sock = common::accept_or_die(&listener, pid);
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag)
+        .expect("read the tag the already-exited target sent before dying");
+    assert_eq!(tag, *b"R");
+}
+
+/// Mutant coverage for "a helper's own call to `accept_or_die` gets reverted to a plain
+/// `.accept()`": exercises `spawn_control`/`spawn_tree` themselves, end to end, not just the
+/// shared primitive in isolation — a plain `.accept()` here would hang instead of panicking, so
+/// nextest's own timeout (not this test) is what would catch a silent revert; this test asserts
+/// on the FAST, correct outcome, so a revert shows up as a timeout instead of a quiet pass.
+#[cfg(unix)]
+#[test]
+fn spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        common::spawn_control("--not-a-real-mode", &[], false)
+    }));
+    let payload = result.expect_err("spawn_control must panic, not hang, when its target dies before connecting");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    assert!(
+        message.contains("died before it connected"),
+        "expected a \"died before it connected\" panic, got: {message:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        common::spawn_tree("--not-a-real-mode", false)
+    }));
+    let payload = result.expect_err("spawn_tree must panic, not hang, when its target dies before connecting");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    assert!(
+        message.contains("died before it connected"),
+        "expected a \"died before it connected\" panic, got: {message:?}"
+    );
 }
