@@ -126,8 +126,13 @@ jobs:
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
 
+      # THROWAWAY, PR #215 round-6 CI mutant proof only — filtered to just this module so an
+      # EV_DISABLE mutant on `arm()` (which also breaks every OTHER unbounded fd-marker wait
+      # crate-wide, not just this module's own tests) can't starve nextest's limited test-thread
+      # slots and hang the whole job to its 15-minute ceiling before this module's own tests ever
+      # get to run. Never meant to land.
       - name: Run tests
-        run: cargo nextest run --locked --target ${{ matrix.target }} --profile ci
+        run: cargo nextest run --locked --target ${{ matrix.target }} --profile ci -E 'test(marker_eof_tests)'
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
       # logon session) is `#[ignore]`d everywhere else. This step opts in to exactly that test.
@@ -140,14 +145,14 @@ jobs:
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Run tests (pty feature)
-        run: cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci
+        run: cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci -E 'test(marker_eof_tests)'
 
       - name: Run tests (tokio feature)
-        run: cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci
+        run: cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci -E 'test(marker_eof_tests)'
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
       - name: Run tests (serde feature)
-        run: cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
+        run: cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci -E 'test(marker_eof_tests)'
 
       # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16); this is
       # the only step in this job that still uses plain `cargo test`. cosca has no doctests today.
@@ -194,9 +199,10 @@ jobs:
       # Release lane (debug_assertions off): exercises the calm-release arm of the
       # should_panic oracles in the macOS-gated kinfo_tests.rs, and the Linux cgroup tests of what
       # release builds do where debug builds assert a broken precondition instead.
+      # THROWAWAY filter (see the "Run tests" step above) — never meant to land.
       - name: Unit tests (release — debug_assertions off)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
-        run: cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci
+        run: cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci -E 'test(marker_eof_tests)'
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
       # backend) and `cfg(target_os = "macos")` code are otherwise never
