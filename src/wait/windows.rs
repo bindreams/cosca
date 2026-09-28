@@ -73,6 +73,8 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
         Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
     };
     // SAFETY: `handle` is a live process handle held for the wait's duration.
+    #[cfg(test)]
+    real_wait_probe::note_entry();
     let waited = unsafe { WaitForSingleObject(handle, ms) };
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
@@ -186,6 +188,8 @@ pub(crate) fn block_until_exit_or_cancel(
     };
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // SAFETY: both handles are live for the wait's duration.
+    #[cfg(test)]
+    real_wait_probe::note_entry();
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
@@ -284,4 +288,36 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
                  child use graceful_shutdown_tree (CTRL_BREAK to the group)"
             .into(),
     })
+}
+
+/// Test-only instrumentation proving whether `block_until_exit`/`block_until_exit_or_cancel`
+/// actually reached a real, blocking Win32 wait call, instead of returning early on
+/// `Opened::Gone`, `HandleIdentity::Different`, or an open failure — the fast path this module's
+/// identity check exists to provide once the original process has been reaped and its pid may
+/// have been recycled.
+///
+/// A GLOBAL atomic, not a `thread_local!` — the one place in this module that must be, and this
+/// is the justification: both instrumented calls run inside a `spawn_blocking` closure
+/// (`crate::tokio::wait::blocking_watch`), dispatched to a tokio blocking-pool thread distinct
+/// from the async task that later asserts on the counter. A thread-local counter would never be
+/// visible there.
+///
+/// Callers MUST sample [`real_wait_entries`] immediately before and after the call under test
+/// and assert the delta, never an absolute count: this counter is shared by every test in the
+/// binary. Under `cargo nextest`'s one-process-per-test model that is moot, but under plain
+/// `cargo test` many `#[tokio::test]`s share one process and may tick it concurrently on their
+/// own threads (see `tests/common/mod.rs`'s identical caveat about process-wide test state).
+#[cfg(test)]
+pub(crate) mod real_wait_probe {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static REAL_WAIT_ENTRIES: AtomicU32 = AtomicU32::new(0);
+
+    pub(crate) fn note_entry() {
+        REAL_WAIT_ENTRIES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn real_wait_entries() -> u32 {
+        REAL_WAIT_ENTRIES.load(Ordering::SeqCst)
+    }
 }

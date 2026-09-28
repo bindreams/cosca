@@ -467,14 +467,17 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 
 // The held refusal buys a shutdown window only where a tree drain can be observed. `TreeWalk`
 // has none, so the grace-wait watches the ROOT alone — and this refusal's precondition IS that
-// the root has already exited, so the watch resolves at once and the sweep follows immediately.
-// The assertion is on elapsed time because that is the entire claim: checking only for `Ok`
-// passes just as well in the world where the full grace is spent.
+// the root has already exited, so `block_until_exit_or_cancel`'s identity check (a fresh
+// `OpenProcess` on the reaped pid, landing on `Opened::Gone` or `HandleIdentity::Different`)
+// must resolve the wait before it ever reaches a real `WaitForMultipleObjects` call armed with
+// the 10s grace. That is the actual claim, and it is proven structurally, by asserting the real
+// blocking wait was never entered (`crate::wait::backend::real_wait_probe`) — not by elapsed
+// wall-clock time: cosca promises no upper bound on how late a call may run past a caller's
+// deadline (docs/principles.md §8), so a timing assertion here would either be forbidden outright
+// or, on a slow/loaded runner, pass vacuously in the very world this test exists to catch.
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
-    // Wide enough that the two worlds are three orders of magnitude apart, so the split below
-    // cannot be reached by jitter: this path is measured in milliseconds.
     const GRACE: Duration = Duration::from_secs(10);
     let mut cmd = crate::tokio::Command::new();
     cmd.args(["ping", "-n", "30", "127.0.0.1"]);
@@ -491,12 +494,18 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
 
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let started = std::time::Instant::now();
+    // Sampled immediately around the exercised call, and compared as a DELTA rather than an
+    // absolute count: this counter is process-wide (it must be, since the real wait runs on a
+    // spawn_blocking thread distinct from this task — see the probe's own doc), and under plain
+    // `cargo test` (unlike nextest's one-process-per-test isolation) other tests in this binary
+    // may tick it concurrently on their own threads. Same narrowing idiom as `log_capture::mark`
+    // just above.
+    let before = crate::wait::backend::real_wait_probe::real_wait_entries();
     child
         .graceful_shutdown_tree(GRACE)
         .await
         .expect("a swept tree supersedes the held refusal");
-    let elapsed = started.elapsed();
+    let after = crate::wait::backend::real_wait_probe::real_wait_entries();
 
     // Non-vacuity, first: a `terminate_tree` that returned `Ok` would produce the same fast,
     // green run, and this test would then be measuring a path it never entered.
@@ -507,10 +516,10 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
         ),
         "the refusal must have reached the hold-and-continue arm"
     );
-    assert!(
-        elapsed < GRACE / 2,
-        "the root-only watch must resolve at once on an already-exited root rather than spend \
-         the grace: took {elapsed:?} of {GRACE:?}"
+    assert_eq!(
+        after, before,
+        "the root-only watch must resolve on the identity fast path, without ever entering a \
+         real WaitForMultipleObjects call armed with the grace"
     );
 }
 
