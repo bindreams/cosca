@@ -361,12 +361,15 @@ pub(crate) async fn cgroup_wait_tree_drained(
     loop {
         match leaf.drain_step(deadline)? {
             DrainStep::Done(drain) => return Ok(drain),
-            DrainStep::Block { listener, left: None } => listener.await,
+            DrainStep::Block {
+                listener,
+                deadline: None,
+            } => listener.await,
             // A timeout is looked at by the next step, which reads the leaf once more.
             DrainStep::Block {
                 listener,
-                left: Some(left),
-            } => drop(::tokio::time::timeout(left, listener).await),
+                deadline: Some(at),
+            } => drop(::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), listener).await),
         }
     }
 }

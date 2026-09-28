@@ -86,10 +86,12 @@ fn proc_state(pid: u32) -> Option<char> {
 pub(crate) enum DrainStep {
     /// The wait's answer.
     Done(crate::containment::TreeDrain),
-    /// Block on `listener` for `left` (`None`: unbounded), then step again.
+    /// Block on `listener` until `deadline` (`None`: unbounded), then step again. Carries the
+    /// caller's instant, not a duration: a duration would go stale between computing it and
+    /// starting the wait.
     Block {
         listener: event_listener::EventListener,
-        left: Option<std::time::Duration>,
+        deadline: Option<std::time::Instant>,
     },
 }
 
@@ -529,20 +531,25 @@ impl CgroupLeaf {
         loop {
             match self.drain_step(deadline)? {
                 DrainStep::Done(drain) => return Ok(drain),
-                DrainStep::Block { listener, left: None } => listener.wait(),
+                DrainStep::Block {
+                    listener,
+                    deadline: None,
+                } => listener.wait(),
                 // A timeout is looked at by the next step, which reads the leaf once more.
                 DrainStep::Block {
                     listener,
-                    left: Some(left),
-                } => drop(listener.wait_timeout(left)),
+                    deadline: Some(at),
+                } => drop(listener.wait_deadline(at)),
             }
         }
     }
 
     /// One step of a wait on the leaf's drain, shared by the sync and async waits: read the leaf,
-    /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump,
-    /// and read it again: a change after that read is always heard, so the caller may block on
-    /// the returned listener for the time left, then take another step.
+    /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump
+    /// (which can itself take real time — spawning its thread), and read it again: a change after
+    /// that read is always heard, so the caller may block on the returned listener until
+    /// `deadline`, then take another step. Returns `deadline`'s own instant unchanged, in
+    /// `Block` — see its doc for why.
     pub(crate) fn drain_step(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -552,8 +559,7 @@ impl CgroupLeaf {
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
-        let left = crate::wait::remaining(deadline);
-        if left == Some(std::time::Duration::ZERO) {
+        if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
         }
         let listener = self.watch.listen().map_err(crate::error::Error::Io)?;
@@ -562,7 +568,10 @@ impl CgroupLeaf {
         }
         #[cfg(test)]
         fault::notify_drain_blocking();
-        Ok(DrainStep::Block { listener, left })
+        Ok(DrainStep::Block {
+            listener,
+            deadline: deadline.flatten(),
+        })
     }
 
     /// `Some(AllMembersExited)` if the leaf has drained or is gone; `None` if it still holds a
@@ -604,7 +613,7 @@ impl CgroupLeaf {
     fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
         // Stops and joins the pump first: the watch is then this `Drop`'s alone.
         match self.watch.get_mut() {
-            Some(watch) => watch.wait(None).map(drop),
+            Some(watch) => watch.wait(),
             None => Ok(()),
         }
     }

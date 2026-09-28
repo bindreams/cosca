@@ -169,8 +169,27 @@ signal dispositions) runs in its own re-exec'd process (`alone()` in
 through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just
 an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in [#223].
 
-**Why:** a skipped test reports the same pass as a working one, and a process-wide mutation corrupts
-whichever tests share the process.
+`#[ignore]` marks only a specific, temporary regression on `main`: the owner (a human) accepts the
+known failure and disables that one test until it's fixed. Never for a group.
+
+A test group whose environment support varies by host (root, cgroups, and the like) instead
+declares its own `COSCA_TEST_<GROUP>` variable, on by default: any value but the literal `0` runs
+the group. Only an explicit `COSCA_TEST_<GROUP>=0` disables it, reported as `ignored` with a
+reason: the shape a `requires` predicate gives in [skuld](https://github.com/bindreams/skuld), the
+test harness cosca is migrating to ([#151]). Without that explicit `0` the test runs for real and
+fails on whatever an environment without support produces: a failed support check never turns into
+a skip.
+
+Today's gates take three shapes, none matching this: some are `#[ignore]`d and opted into with
+`--run-ignored` alone, with no `COSCA_TEST_*` variable at all (the Windows probes and canaries,
+`windows_process_cwd`, the elevation routes, and `dir_tests.rs`'s unshare test); some also assert
+an opt-in variable (`COSCA_TEST_CGROUP`, `COSCA_TEST_SETUID_HELPER`, `COSCA_TEST_ELEVATION*`); and
+some return early instead (every `gated()` caller in `tests/elevation.rs`, and `leaf_tests.rs`).
+[#234] tracks the migration and is the authoritative inventory of what's left.
+
+**Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
+whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
+the process.
 
 **Applies to:** all tests.
 
@@ -184,9 +203,21 @@ handle cosca returned for each, before that handle reaps the child, never by pro
 or a PID the test computed. On Unix that kill reaches `kill(2)` by number, which is safe while the
 child is unreaped.
 
+Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
+host support doesn't vary: `=0` says this host can't support or run the group. Consent is a
+separate gate, `COSCA_TEST_<GROUP>_CONSENT`: disabling a group with `=0` is itself an explicit
+decision, so consent is only asked of an enabled group, and nothing else stands in for it. Only an
+explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent; any other value, unset included, fails the
+test rather than running it. The check may be a skuld fixture, but either way a missing consent is
+a hard failure (a panic or an assertion), never a return. For example, a CI step that cannot run
+the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and
+`COSCA_TEST_ROOT_CONSENT=1`. No consent variable exists yet, and some system-affecting groups have
+no `COSCA_TEST_<GROUP>` at all; see [#234].
+
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
-4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)).
+4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)). Principle 9 turns every group on by default,
+so a bare test run would touch real system state without a second, explicit opt-in.
 
 **Applies to:** all tests. CI's cgroup lane runs in a fresh cgroup on a throwaway runner
 ([`ci.yaml`](../.github/workflows/ci.yaml)).
@@ -218,7 +249,9 @@ step consistent with these principles.
 [tokio orphan.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/orphan.rs#L118-L124
 [tokio runtime/process.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/process.rs#L30-L39
 [tokio unix/mod.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/mod.rs#L124
+[#151]: https://github.com/bindreams/cosca/issues/151
 [#174]: https://github.com/bindreams/cosca/issues/174
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#210]: https://github.com/bindreams/cosca/pull/210
 [#223]: https://github.com/bindreams/cosca/issues/223
+[#234]: https://github.com/bindreams/cosca/issues/234
