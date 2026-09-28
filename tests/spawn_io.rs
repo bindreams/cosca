@@ -1654,7 +1654,7 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
-    const NAME: &str = "linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child";
+    let name = common::fixture_path!(linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child);
 
     // Isolates the WHOLE test (this outer call, and every one of the 16 per-case re-execs below,
     // which inherit `COSCA_TEST_ALONE` and already use this exact re-exec shape) from the rest of
@@ -1662,7 +1662,7 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     // gated there by `common::require_process_per_test`. Without this, `COSCA_TEST_CLOSED_SLOTS`
     // alone (a plain env var, no argv verification) was the only gate on that mutation — the same
     // forgeable-env-var hazard `alone()` exists to close everywhere else.
-    if !common::alone(NAME) {
+    if !common::alone(name) {
         return;
     }
 
@@ -1682,7 +1682,7 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
         .flat_map(|deny| slot_cases.map(|slots| (slots, deny)))
         .filter_map(|(slots, deny)| {
             let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-            run.args(std::iter::once(NAME).chain(common::ALONE_ARGS))
+            run.args(std::iter::once(name).chain(common::ALONE_ARGS))
                 .env(CLOSED_SLOTS_ENV, slots);
             if deny {
                 run.env(DENY_PIDFD_ENV, "1");
@@ -1776,98 +1776,47 @@ fn parse_closed_slots(slots: &str) -> Vec<i32> {
 
 /// Spawn `cmd` with `slots` closed in this process across the spawn, and restore them.
 ///
-/// Asserts [`common::require_process_per_test`] before touching anything: this process-wide fd
-/// 0/1/2 close is exactly what that guard exists for. Reachable only via the outer test's own
-/// `common::alone` isolation (see there) — every path down to here inherits `COSCA_TEST_ALONE`
-/// and keeps the same re-exec shape.
+/// `RestoreStdio::close` asserts `common::require_process_per_test` before touching anything:
+/// this process-wide fd 0/1/2 close is exactly what that guard exists for. Reachable only via the
+/// outer test's own `common::alone` isolation (see there) — every path down to here inherits
+/// `COSCA_TEST_ALONE` and keeps the same re-exec shape.
 #[cfg(target_os = "linux")]
 fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
-    common::require_process_per_test(&format!(
-        "closes process-wide std slot{} {slots:?}",
-        if slots.len() == 1 { "" } else { "s" }
-    ));
-    // Everything this process needs open is opened already, so nothing fills the gaps but the
-    // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
-    // SAFETY: each slot is one of this process's own std descriptors; it is closed only across
-    // the spawn and restored from its saved copy before anything else runs.
-    let saved: Vec<(i32, i32)> = slots
-        .iter()
-        .map(|&slot| unsafe {
-            let saved = libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3);
-            assert!(saved >= 3, "dup({slot}): {}", std::io::Error::last_os_error());
-            (slot, saved)
-        })
-        .collect();
-    for &(slot, _) in &saved {
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::close(slot) }, 0, "close({slot})");
-    }
+    // Closed only across the spawn, and restored right after: checks every dup/close/restore
+    // result (the hand-rolled version this replaces left `dup2`'s own result unchecked), and its
+    // `Drop` restores even a partial set if a later slot fails partway through.
+    let _restore = common::RestoreStdio::close(slots);
     // One CPU for parent and child makes it likely that `spawn` returns before the child has
     // reported — the case a report read at `spawn`'s return would get wrong. It orders nothing:
     // the verdict below compares cosca's answer with where the child really is, and holds
     // whichever side runs first.
-    let spawned = on_one_cpu(|| cmd.spawn());
-    for &(slot, saved) in &saved {
-        // SAFETY: `saved` is this process's own open descriptor, duplicated above.
-        unsafe {
-            assert_eq!(libc::dup2(saved, slot), slot, "restore fd {slot}");
-            libc::close(saved);
-        }
-    }
-    spawned
+    on_one_cpu(|| cmd.spawn())
 }
 
-/// A deliberate probe for `spawn_with_std_slots_closed`'s own `require_process_per_test` gate:
-/// calls it directly, deliberately NOT wrapped in `common::alone()` first, and without touching
-/// cgroups at all — `require_process_per_test` is the very first thing the function does, well
-/// before anything cgroup-related runs. `#[ignore]`d and env-gated exactly like this file's other
-/// probes so a bare `--include-ignored` sweep fails loudly instead of silently no-oping.
-///
-/// Its invoker, [`gate_rejects_a_non_alone_process_for_closed_std_slots`] below, spawns this
-/// probe directly with neither `COSCA_TEST_ALONE` set nor the `common::ALONE_ARGS` shape as its
-/// argv.
-#[cfg(target_os = "linux")]
-#[test]
-#[ignore = "probe"]
-fn closed_std_slots_without_alone_probe() {
-    assert!(
-        std::env::var_os("COSCA_TEST_TRIGGER_CLOSED_STD_SLOTS_WITHOUT_ALONE_PROBE").is_some(),
-        "this probe must only be invoked via \
-         gate_rejects_a_non_alone_process_for_closed_std_slots (which sets \
-         COSCA_TEST_TRIGGER_CLOSED_STD_SLOTS_WITHOUT_ALONE_PROBE) — a bare --include-ignored \
-         sweep that reaches here without it is not exercising the probe, and must not pass \
-         vacuously"
-    );
-    let mut cmd = Command::new();
-    let _ = spawn_with_std_slots_closed(&mut cmd, &[2]);
-}
-
-/// Proves `spawn_with_std_slots_closed`'s own gate: a process that calls it without first going
-/// through `common::alone()` must panic with the gate's own message, not silently proceed to
-/// touch process-wide fd state. Spawns the probe above directly — not via
-/// `common::run_probe_directly`, which always sets up the full `alone()` shape — with neither
-/// `COSCA_TEST_ALONE` set nor `common::ALONE_ARGS` as its argv, so the gate itself is what is
-/// under test. No cgroup needed: `require_process_per_test` is the very first thing
+/// Proves `spawn_with_std_slots_closed`'s own `require_process_per_test` gate: a process that
+/// calls it without first going through `common::alone()` must panic with the gate's own
+/// message, not silently proceed to touch process-wide fd state. Folded probe/prover, matching
+/// `src/test_isolation.rs`'s `gate_rejects_a_non_alone_process`: this same `#[test] fn` re-execs
+/// itself via `common::spawn_without_alone_shape`, with neither `COSCA_TEST_ALONE` set nor
+/// `common::ALONE_ARGS` as its argv, and the re-exec'd child dispatches on its own trigger env
+/// var — not on `common::alone`'s argv/env shape, since this run is deliberately shaped to NOT
+/// match it. No cgroup needed: `require_process_per_test` is the very first thing
 /// `spawn_with_std_slots_closed` does, before anything cgroup-related runs.
 #[cfg(target_os = "linux")]
 #[test]
 fn gate_rejects_a_non_alone_process_for_closed_std_slots() {
-    const PROBE: &str = "closed_std_slots_without_alone_probe";
-    let child = {
-        // Every raw `std::process::Command` fork in this test surface must go through
-        // `cosca::test_spawn_lock()` — see `tests/common/mod.rs`'s `output_locked` doc. Held only
-        // around `spawn()`, not the wait, matching `common::alone`'s own pattern.
-        let _guard = cosca::test_spawn_lock();
-        std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
-            .env("COSCA_TEST_TRIGGER_CLOSED_STD_SLOTS_WITHOUT_ALONE_PROBE", "1")
-            .env_remove("COSCA_TEST_ALONE")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the probe")
-    };
-    let out = common::wait_bounded(child, std::time::Duration::from_secs(30));
+    const TRIGGER: &str = "COSCA_TEST_TRIGGER_GATE_REJECTS_A_NON_ALONE_PROCESS_FOR_CLOSED_STD_SLOTS";
+    if std::env::var_os(TRIGGER).is_some() {
+        // The deliberately-spawned, non-alone child: call the gated operation directly.
+        let mut cmd = Command::new();
+        let _ = spawn_with_std_slots_closed(&mut cmd, &[2]);
+        return;
+    }
+    let out = common::spawn_without_alone_shape(
+        common::fixture_path!(gate_rejects_a_non_alone_process_for_closed_std_slots),
+        None,
+        &[(TRIGGER, "1")],
+    );
     assert_eq!(
         out.status.code(),
         Some(101),
@@ -1889,27 +1838,23 @@ fn gate_rejects_a_non_alone_process_for_closed_std_slots() {
 }
 
 /// The gate must reject a FORGED-BUT-MATCHING `COSCA_TEST_ALONE` too, not just a missing one — the
-/// same gap `tests/common/isolation.rs`'s `gate_rejects_a_matching_env_var_with_a_non_alone_argv`
-/// closes for `RestoreStdio::close`. An implementation that only checked
+/// same gap `src/test_isolation.rs`'s `gate_rejects_a_matching_env_var_with_a_non_alone_argv`
+/// closes for `RestoreStdio::close` directly. An implementation that only checked
 /// `var_os("COSCA_TEST_ALONE").is_some()` would pass
 /// [`gate_rejects_a_non_alone_process_for_closed_std_slots`] above just as well as the real
 /// check does, since that prover never sets the env var at all.
 #[cfg(target_os = "linux")]
 #[test]
 fn gate_rejects_a_matching_env_var_with_a_non_alone_argv_for_closed_std_slots() {
-    const PROBE: &str = "closed_std_slots_without_alone_probe";
-    let child = {
-        let _guard = cosca::test_spawn_lock();
-        std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([PROBE, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
-            .env("COSCA_TEST_TRIGGER_CLOSED_STD_SLOTS_WITHOUT_ALONE_PROBE", "1")
-            .env("COSCA_TEST_ALONE", PROBE)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the probe")
-    };
-    let out = common::wait_bounded(child, std::time::Duration::from_secs(30));
+    const TRIGGER: &str =
+        "COSCA_TEST_TRIGGER_GATE_REJECTS_A_MATCHING_ENV_VAR_WITH_A_NON_ALONE_ARGV_FOR_CLOSED_STD_SLOTS";
+    if std::env::var_os(TRIGGER).is_some() {
+        let mut cmd = Command::new();
+        let _ = spawn_with_std_slots_closed(&mut cmd, &[2]);
+        return;
+    }
+    let fixture = common::fixture_path!(gate_rejects_a_matching_env_var_with_a_non_alone_argv_for_closed_std_slots);
+    let out = common::spawn_without_alone_shape(fixture, Some(fixture), &[(TRIGGER, "1")]);
     assert_eq!(
         out.status.code(),
         Some(101),
