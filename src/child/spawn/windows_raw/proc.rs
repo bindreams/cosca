@@ -116,11 +116,17 @@ impl RawChild {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let millis = crate::wait::win32_timeout_ms(Some(remaining));
+            // MUTANT B (recheck-only-when-clamped): only recheck the real deadline if THIS arm
+            // hit the production clamp exactly; any other WAIT_TIMEOUT is trusted outright.
+            let was_clamped = millis == u32::MAX - 1;
             // SAFETY: `handle` is our live, owned process handle.
             let r = unsafe { WaitForSingleObject(self.handle(), millis) };
             if r == WAIT_OBJECT_0 {
                 return Ok(Some(exit_status(self.handle())?));
             } else if r == WAIT_TIMEOUT {
+                if !was_clamped {
+                    return Ok(None);
+                }
                 if Instant::now() >= deadline {
                     return Ok(None);
                 }
