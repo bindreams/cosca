@@ -85,6 +85,29 @@ mod check_path_traversable_by_tests {
         assert!(err.contains(root.path().to_str().unwrap()), "{err}");
     }
 
+    /// The kernel always follows a symlink at an intermediate path component — there is no way to
+    /// opt out of that for anything but the FINAL component (`O_NOFOLLOW`) — so a check reporting
+    /// on the symlink's OWN (conventionally always-permissive) mode instead of its target's would
+    /// silently pass something the real path resolution would refuse. `/tmp` on macOS is exactly
+    /// this shape (`-> /private/tmp`); this test does not rely on that coincidence, building its
+    /// own symlink over a deliberately restrictive target instead.
+    #[test]
+    fn a_symlink_ancestor_is_checked_against_its_target_not_its_own_mode() {
+        let base = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let real_target = base.path().join("real");
+        std::fs::create_dir(&real_target).unwrap();
+        std::fs::set_permissions(&real_target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let inner = real_target.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o701)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        let some_other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        let err = check(&link.join("inner"), some_other_uid).unwrap_err();
+        assert!(err.contains("0700") || err.contains("700"), "{err}");
+    }
+
     #[test]
     fn group_membership_grants_search_via_group_bits() {
         // Directly under `/tmp` — see the world-searchable test above for why.

@@ -278,7 +278,13 @@ fn check_path_traversable_by(path: &std::path::Path, uid: libc::uid_t, gid: libc
     let mut ancestors: Vec<&std::path::Path> = path.ancestors().collect();
     ancestors.reverse(); // root first, `path` itself last
     for (i, component) in ancestors.iter().enumerate() {
-        let meta = std::fs::symlink_metadata(component).map_err(|e| format!("stat {component:?}: {e}"))?;
+        // `metadata`, not `symlink_metadata`: the kernel ALWAYS follows a symlink at an
+        // intermediate path component during real path resolution (there is no way to opt out of
+        // that, unlike the final component with `O_NOFOLLOW`) — checking the SYMLINK's own mode
+        // instead of its target's would report on the wrong inode. `/tmp` itself is exactly this
+        // on macOS (`-> /private/tmp`); its permissive symlink mode happening to agree with its
+        // target's real one there is coincidence, not something to rely on in general.
+        let meta = std::fs::metadata(component).map_err(|e| format!("stat {component:?}: {e}"))?;
         let is_leaf_file = i + 1 == ancestors.len() && meta.is_file();
         let required: u32 = if is_leaf_file { 0o5 } else { 0o1 }; // r+x for a final file, x (search) for a directory
         let mode = meta.permissions().mode();
