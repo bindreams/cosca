@@ -84,11 +84,44 @@ fn write_completion_token_if_child() {
         return;
     };
     let fd: i32 = fd.to_str().and_then(|s| s.parse().ok()).expect("valid fd number");
+    // Defense in depth against [`clear_inherited_completion_token`]'s own hazard (see there): a
+    // caller that fans out further `ALONE_ARGS`-shaped children without clearing `TOKEN_FD_ENV`
+    // first leaves a STALE fd number in that grandchild's environment, meaning nothing in its own
+    // fd table. Refuse to touch it unless it is actually a pipe — nothing this process opens
+    // before this point (libtest's own startup, argv/env parsing) is one, so a real, intended
+    // token fd (freshly inherited from `spawn_alone`, never yet touched by this process) always
+    // passes this check, and a stale/coincidental number essentially never does.
+    // SAFETY: `fstat` on a caller-supplied fd number; reads only, never touches ownership.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return;
+    }
     // SAFETY: `fd` was made inheritable by this exact process's own parent (see TOKEN_FD_ENV's
-    // doc), specifically for this write; owned exclusively from here.
+    // doc), specifically for this write; confirmed a pipe just above; owned exclusively from here.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     use std::io::Write;
     let _ = file.write_all(b"1");
+}
+
+/// Strip this process's own [`TOKEN_FD_ENV`] from `cmd`'s environment before spawning it.
+///
+/// For a caller that reuses the [`ALONE_ARGS`] re-exec SHAPE to fan out ITS OWN further children
+/// (each one also matching [`alone_marker_matches`], so each also runs through
+/// [`write_completion_token_if_child`] when it starts) — not for an ordinary, single-level
+/// `alone()`/`alone_capturing()` caller, which never needs this.
+///
+/// Without this, such a grandchild inherits `TOKEN_FD_ENV` from ITS parent (an ordinary env var,
+/// unaffected by the parent's own copy of the pipe fd having already been closed) naming a fd
+/// number that means nothing in the grandchild's own, freshly-forked fd table —
+/// [`write_completion_token_if_child`] would trust it anyway, per its SAFETY comment's own
+/// precondition ("made inheritable by this exact process's own parent, specifically for this
+/// write"), which this exact call path violates: the fd number is stale, coincidental, and may
+/// alias something the grandchild's own code already owns. Writing into it, then closing it via
+/// the `File`'s `Drop`, races that real owner's own later close of the SAME number — observed as
+/// `std`'s `OwnedFd`/`File` double-close abort ("IO Safety violation: owned file descriptor
+/// already closed").
+pub fn clear_inherited_completion_token(cmd: &mut std::process::Command) {
+    cmd.env_remove(TOKEN_FD_ENV);
 }
 
 /// Spawn a fresh copy of this test binary against `name` with the isolated `alone()` shape
@@ -809,6 +842,109 @@ mod isolation_tests {
         assert!(
             combined.contains("call this from inside alone()"),
             "the gate's own panic message must reach stderr — got:\n{combined}"
+        );
+    }
+
+    // write_completion_token_if_child: fan-out safety =====
+
+    /// A caller that fans out its OWN further `ALONE_ARGS`-shaped children (like
+    /// `linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child` in
+    /// `tests/spawn_io.rs`) must call [`clear_inherited_completion_token`] on each one, or that
+    /// grandchild inherits a stale [`TOKEN_FD_ENV`] naming a fd number that means nothing in its
+    /// own fd table. This proves the fallback for a caller that does NOT: forges exactly that
+    /// situation directly (a re-exec'd child, shaped like `alone()`'s own, but with `TOKEN_FD_ENV`
+    /// pointing at a REGULAR FILE instead of a real pipe — indistinguishable, from an env var
+    /// alone, from a stale inherited one) and asserts the child neither aborts nor writes into it.
+    #[test]
+    fn a_stale_token_fd_pointing_at_a_non_pipe_is_not_touched() {
+        use std::os::fd::AsRawFd;
+
+        let name = fixture_path!(a_stale_token_fd_pointing_at_a_non_pipe_is_not_touched);
+        const MARKER_PATH_ENV: &str = "COSCA_TEST_STALE_FD_MARKER_PATH";
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if super::alone_marker_matches(Some(name), &argv) {
+            // The forged child: `alone(name)` below runs the exact same dispatch a real fixture's
+            // does, including `write_completion_token_if_child` — against the FORGED, non-pipe
+            // `TOKEN_FD_ENV` our own (non-`spawn_alone`) parent below set up.
+            assert!(
+                super::alone(name),
+                "alone() must recognize this re-exec'd process as its own child"
+            );
+            let path = std::env::var(MARKER_PATH_ENV).expect("marker path env var");
+            let contents = std::fs::read_to_string(&path).expect("read the marker file back");
+            assert_eq!(
+                contents, "untouched",
+                "write_completion_token_if_child must never write into a fd that is not a pipe"
+            );
+            return;
+        }
+
+        let path = std::env::temp_dir().join(format!("cosca-stale-fd-marker-{}", std::process::id()));
+        std::fs::write(&path, "untouched").expect("write the marker file");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen the marker file");
+        let file_fd = file.as_raw_fd();
+        let child = {
+            let _guard = super::super::test_spawn_lock();
+            // SAFETY: clears FD_CLOEXEC on `file`'s own fd so it survives into the child at the
+            // same number — exactly what a REAL stale inheritance would also do, and exactly what
+            // `spawn_alone` does for its own, real pipe; held under `test_spawn_lock()` for the
+            // same reason.
+            unsafe {
+                let flags = libc::fcntl(file_fd, libc::F_GETFD);
+                assert_ne!(
+                    flags,
+                    -1,
+                    "fcntl(F_GETFD) on the marker file: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(
+                    libc::fcntl(file_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                    0,
+                    "fcntl(F_SETFD) to make the marker file inheritable: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            std::process::Command::new(std::env::current_exe().expect("this test binary"))
+                .args(std::iter::once(name).chain(super::ALONE_ARGS))
+                .env("COSCA_TEST_ALONE", name)
+                .env(super::TOKEN_FD_ENV, file_fd.to_string())
+                .env(MARKER_PATH_ENV, &path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the forged child")
+        };
+        drop(file);
+        let out = wait_bounded(child, super::PROBE_TIMEOUT, false);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "a stale, non-pipe TOKEN_FD_ENV must never abort or panic the child — got {:?}\n--- \
+             stdout ---\n{}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// [`clear_inherited_completion_token`] must actually remove [`TOKEN_FD_ENV`] from the
+    /// `Command` it is given — not merely leave the inherited value in place — or a fan-out
+    /// caller using it gets no protection at all.
+    #[test]
+    fn clear_inherited_completion_token_removes_the_env_var() {
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env(super::TOKEN_FD_ENV, "3");
+        super::clear_inherited_completion_token(&mut cmd);
+        let removed = cmd
+            .get_envs()
+            .any(|(key, value)| key == std::ffi::OsStr::new(super::TOKEN_FD_ENV) && value.is_none());
+        assert!(
+            removed,
+            "clear_inherited_completion_token must remove {}, not merely leave it set",
+            super::TOKEN_FD_ENV
         );
     }
 

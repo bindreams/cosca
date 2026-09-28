@@ -24,8 +24,8 @@ pub(crate) use cosca::test_spawn_lock;
 mod isolation;
 #[cfg(unix)]
 pub(crate) use isolation::{
-    alone, alone_capturing, fixture_path, require_process_per_test, spawn_without_alone_shape, RestoreRlimitNofile,
-    RestoreStdio, ALONE_ARGS,
+    alone, alone_capturing, clear_inherited_completion_token, fixture_path, require_process_per_test,
+    spawn_without_alone_shape, RestoreRlimitNofile, RestoreStdio, ALONE_ARGS,
 };
 
 pub fn testbin() -> &'static str {
