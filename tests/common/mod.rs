@@ -417,19 +417,24 @@ pub fn accept_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
     // SAFETY: both handles are live and owned by this function for the call's duration.
     let woken = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
 
-    // WSAEventSelect(s, None, 0) is the documented way to cancel the association and return the
-    // socket to blocking mode — not `set_nonblocking`/`ioctlsocket(FIONBIO)`, which WSAEventSelect
-    // itself supersedes. Without this, `final_peek_or_die`'s own `set_nonblocking` calls below
-    // (and any later call on the SAME listener, e.g. `spawn_tree`'s second accept) would be
-    // fighting the event-select association instead of plain blocking-mode toggles.
+    // WSAEventSelect(s, None, 0) cancels the association, documented as also returning the
+    // socket to blocking mode — measured in CI to NOT actually be reliable: a real run hit
+    // WSAEWOULDBLOCK on the very next `accept()` below without the explicit `set_nonblocking`
+    // that follows it. Both calls stay: the first cancels the FD_ACCEPT association (skipping it
+    // and going straight to `set_nonblocking` left the association armed, which — same CI
+    // evidence — is its own source of spurious wakeups), the second is what the socket's
+    // blocking mode has actually been observed to need.
     // SAFETY: `sock` is still the listener's own live socket.
     let rc = unsafe { WSAEventSelect(sock, None, 0) };
     assert_eq!(
         rc,
         0,
-        "WSAEventSelect(0) to restore the control listener to blocking mode: {}",
+        "WSAEventSelect(0) to cancel the accept-readiness association: {}",
         std::io::Error::last_os_error()
     );
+    listener
+        .set_nonblocking(false)
+        .expect("restore the control listener to blocking mode");
     // SAFETY: closes only the two handles this function opened above.
     unsafe {
         let _ = WSACloseEvent(accept_event);
