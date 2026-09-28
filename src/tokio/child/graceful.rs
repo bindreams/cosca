@@ -308,11 +308,16 @@ impl Child {
                 Err(e) => (false, false, Some(e)),
             }
         } else {
-            // NON-reaping grace-wait on the root only.
-            match crate::tokio::wait::grace_wait(self.id(), grace).await {
-                Ok(exited) => (false, exited, None),
-                Err(e) => (false, false, Some(e)),
+            // MUTANT B (throwaway, induced for CI verification — see PR description): hollow
+            // out the root-only grace-wait to a bare sleep, so nothing ever reaches
+            // `block_until_exit_or_cancel` at all — `armed_probe` cannot observe a call that
+            // never happens.
+            {
+                ::tokio::time::sleep(grace).await;
+                Ok::<bool, Error>(true)
             }
+            .map(|exited| (false, exited, None))
+            .unwrap_or_else(|e| (false, false, Some(e)))
         };
         if let Some(e) = &watch_err {
             log::debug!(
