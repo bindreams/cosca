@@ -413,9 +413,9 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
     // `alone()` already isolates this whole test (and, transitively, `RestoreStdio::close` below,
     // which reasserts it via `require_process_per_test`) in its own process — a second, INNER
     // re-exec layer with the same `ALONE_ARGS` shape predates that and is now pure duplication.
-    if !crate::test_isolation::alone(NAME) {
+    let Some(_completion) = crate::test_isolation::alone(NAME) else {
         return;
-    }
+    };
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"

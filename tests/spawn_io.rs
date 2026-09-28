@@ -1662,9 +1662,9 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     // gated there by `common::require_process_per_test`. Without this, `COSCA_TEST_CLOSED_SLOTS`
     // alone (a plain env var, no argv verification) was the only gate on that mutation — the same
     // forgeable-env-var hazard `alone()` exists to close everywhere else.
-    if !common::alone(name) {
+    let Some(_completion) = common::alone(name) else {
         return;
-    }
+    };
 
     stderr_log::install();
     assert!(
@@ -1681,24 +1681,24 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
         .into_iter()
         .flat_map(|deny| slot_cases.map(|slots| (slots, deny)))
         .filter_map(|(slots, deny)| {
-            let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-            run.args(std::iter::once(name).chain(common::ALONE_ARGS))
-                .env(CLOSED_SLOTS_ENV, slots);
-            // This loop's own children are ALSO `ALONE_ARGS`-shaped (so THEY skip alone()'s own
-            // re-exec too), inheriting `COSCA_TEST_ALONE` from this already-re-exec'd process —
-            // but never from `spawn_alone` itself, so any `TOKEN_FD_ENV` this process inherited
-            // names a fd that means nothing in a fresh child's own fd table. Strip it before each
-            // fan-out spawn — see `clear_inherited_completion_token`'s own doc.
-            common::clear_inherited_completion_token(&mut run);
-            if deny {
-                run.env(DENY_PIDFD_ENV, "1");
-            }
-            let out = run.output().expect("run this test with the slots closed");
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
+            // `alone_with_env` — real `spawn_alone` machinery, not a hand-rolled `Command` — so
+            // this fan-out child gets its OWN, correctly-scoped token/lifeline pipes, tied to
+            // THIS process specifically (`TOKEN_PARENT_ENV`/`getppid()`), instead of inheriting
+            // whatever this already-re-exec'd process's own `TOKEN_FD_ENV` happens to still name.
+            // Pass/fail comes from the real completion token, never libtest's own `"1 passed"`
+            // stdout banner text.
+            let extra_env: &[(&str, &str)] = if deny {
+                &[(CLOSED_SLOTS_ENV, slots), (DENY_PIDFD_ENV, "1")]
+            } else {
+                &[(CLOSED_SLOTS_ENV, slots)]
+            };
+            let (out, completed) = common::alone_with_env(name, extra_env);
+            (!(out.status.success() && completed)).then(|| {
                 format!(
-                    "slots [{slots}], pidfd denied: {deny}: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                    "slots [{slots}], pidfd denied: {deny}: {}{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
                     out.status,
+                    if completed { "" } else { " (no completion token)" },
+                    String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 )
             })
