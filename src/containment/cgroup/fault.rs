@@ -39,7 +39,7 @@ thread_local! {
     static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static BETWEEN_SPAWN_LOCK_AND_FORK: std::cell::RefCell<Option<Box<dyn FnOnce(i32)>>> = std::cell::RefCell::new(None);
+    static BETWEEN_SPAWN_LOCK_AND_FORK: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -462,11 +462,13 @@ pub(crate) fn run_before_exit_wait() {
 /// parent arm right after `fork()` returns, still holding `spawn_lock`. Takes the pid (not `()`)
 /// so a test can independently confirm the fork already happened by this point (a live process
 /// exists at that pid) — a hook moved to BEFORE the `fork()` this lock is meant to cover has no
-/// real pid to pass and cannot compile as this same call.
-pub(crate) fn set_between_spawn_lock_and_fork(hook: impl FnOnce(i32) + 'static) {
+/// real pid to pass and cannot compile as this call. Shares `PidHook` (`AFTER_FINAL_READ`'s
+/// type) rather than a fresh single-use closure type, which is what tripped clippy's
+/// `type_complexity` under `-D warnings`.
+pub(crate) fn set_between_spawn_lock_and_fork(hook: impl FnOnce(u32) + 'static) {
     BETWEEN_SPAWN_LOCK_AND_FORK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
 }
-pub(crate) fn run_between_spawn_lock_and_fork(child_pid: i32) {
+pub(crate) fn run_between_spawn_lock_and_fork(child_pid: u32) {
     if let Some(hook) = BETWEEN_SPAWN_LOCK_AND_FORK.with(|h| h.borrow_mut().take()) {
         hook(child_pid);
     }

@@ -296,7 +296,7 @@ fn defuse_disarms_the_guard() {
 fn fork_running_holds_spawn_lock_across_the_fork() {
     use std::sync::mpsc;
 
-    let (tx_started, rx_started) = mpsc::channel::<i32>();
+    let (tx_started, rx_started) = mpsc::channel::<u32>();
     let (tx_release, rx_release) = mpsc::channel::<()>();
 
     let fork_thread = std::thread::spawn(move || {
@@ -325,7 +325,7 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
     // kernel directly whether a process at that pid exists right now, sending nothing.
     // SAFETY: signal 0 sends nothing; it only queries existence/permission.
     assert_eq!(
-        unsafe { libc::kill(child_pid, 0) },
+        unsafe { libc::kill(child_pid as i32, 0) },
         0,
         "the child must already exist by the time the hook runs, proving fork() already happened: {}",
         std::io::Error::last_os_error()

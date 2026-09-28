@@ -31,11 +31,11 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
             unsafe { libc::_exit(0) }
         }
         raw_pid => {
+            let pid = raw_pid as u32;
             // Observed here, not before the fork: this is the seam a test uses to prove the lock
             // is still held across the fork itself, not just up to the moment before it.
-            crate::containment::cgroup::fault::run_between_spawn_lock_and_fork(raw_pid);
+            crate::containment::cgroup::fault::run_between_spawn_lock_and_fork(pid);
             drop(guard);
-            let pid = raw_pid as u32;
             // Opened right after the fork: only our still-unreaped child can hold this pid now,
             // so the pidfd names it exactly.
             let child = rustix::process::Pid::from_raw(raw_pid).expect("fork returned a positive pid");
